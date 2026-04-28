@@ -1,0 +1,5240 @@
+use super::*;
+use crate::provider::{
+    list_models_for_available_providers, merge_provider_profile, normalize_chatgpt_model_slug,
+    resolve_provider_model_selection,
+};
+use crate::session::{
+    append_log_line, cap_latest_log_buffer, render_limited_lines, validate_session_name,
+};
+use crate::tools::{self, is_parallel_safe_tool};
+use serde_json::json;
+use std::net::TcpListener;
+use std::sync::OnceLock;
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::test_env_lock().lock().expect("env lock")
+}
+
+fn temp_test_dir(label: &str) -> PathBuf {
+    let unique = format!(
+        "wolf-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+fn test_agent(root: &Path) -> Agent {
+    Agent {
+        client: Arc::new(OnceLock::new()),
+        provider_id: "test".to_string(),
+        api_key: "test-key".to_string(),
+        key_source: "test".to_string(),
+        provider_requires_api_key: true,
+        base_url: "http://127.0.0.1".to_string(),
+        model: "test-model".to_string(),
+        api_provider: ApiProvider::Anthropic,
+        thinking_effort: ThinkingEffort::Medium,
+        system: "test-system".to_string(),
+        history: Vec::new(),
+        tools: tool_definitions()
+            .into_iter()
+            .filter(|t| t.name != "browser")
+            .collect(),
+        allowed: HashSet::new(),
+        deny_tools: HashSet::new(),
+        sandbox_root: root.to_path_buf(),
+        git_context: None,
+        silent: true,
+        pretty: false,
+        max_iterations: Some(1),
+        session_usage: Usage::default(),
+        interrupt: Arc::new(AtomicBool::new(false)),
+        hooks: Hooks::default(),
+        state_lock: None,
+        session_enabled: true,
+        latest_session_path: latest_session_path(root),
+        latest_log_path: latest_log_path(root),
+        pending_login_provider: None,
+        suppress_checkpoints: false,
+        last_checkpoint_at: None,
+        session_model_pins: HashMap::new(),
+        partial_stream_text: None,
+        compact_threshold_chars: None,
+        compact_threshold_percent: None,
+        approval_profile: ApprovalProfile::default(),
+        sandbox_profile: SandboxProfile::default(),
+        browser_recipe: BrowserRecipe::default(),
+        context_mode: ContextMode::default(),
+        tool_profile: ToolProfile::default(),
+        budget_cap: None,
+        budget_exhausted: false,
+        builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
+        sink: Box::new(NullSink),
+        steering_rx: None,
+        steering_tx: Agent::noop_steering_tx(),
+        read_cache: Arc::new(Mutex::new(ReadFileCache::default())),
+        work_ledger: WorkLedger::default(),
+        provider_health: ProviderHealthLedger::default(),
+    }
+}
+
+struct SessionReplayFixture {
+    header: SessionHeader,
+    history: Vec<Message>,
+}
+
+impl SessionReplayFixture {
+    fn load(name: &str) -> Result<Self> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/session-replays")
+            .join(format!("{name}.jsonl"));
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading replay fixture {}", path.display()))?;
+        let mut lines = content.lines();
+        let header = parse_session_header(lines.next().context("empty replay fixture")?)?;
+        let mut history = Vec::new();
+        for (i, line) in lines.enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            history.push(
+                serde_json::from_str::<Message>(line)
+                    .with_context(|| format!("bad replay message on line {}", i + 2))?,
+            );
+        }
+        Ok(Self { header, history })
+    }
+
+    fn assistant_text(&self) -> String {
+        assistant_text(&self.history)
+    }
+
+    fn tool_call_count(&self, name: &str) -> usize {
+        history_tool_count(&self.history, name)
+    }
+
+    fn tool_names_after_marker(&self, marker: &str) -> Vec<String> {
+        let mut after = false;
+        let mut names = Vec::new();
+        for msg in &self.history {
+            for block in &msg.content {
+                if block_contains_marker(block, marker) {
+                    after = true;
+                    continue;
+                }
+                if after && let Block::ToolUse { name, .. } = block {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
+    }
+
+    fn tool_inputs_after_marker(&self, marker: &str, tool_name: &str) -> Vec<String> {
+        let mut after = false;
+        let mut inputs = Vec::new();
+        for msg in &self.history {
+            for block in &msg.content {
+                if block_contains_marker(block, marker) {
+                    after = true;
+                    continue;
+                }
+                if after
+                    && let Block::ToolUse { name, input, .. } = block
+                    && name == tool_name
+                {
+                    inputs.push(input.to_string());
+                }
+            }
+        }
+        inputs
+    }
+
+    fn tool_results_containing(&self, needle: &str) -> Vec<(String, Option<bool>)> {
+        let mut out = Vec::new();
+        for msg in &self.history {
+            for block in &msg.content {
+                if let Block::ToolResult {
+                    content, is_error, ..
+                } = block
+                    && content.contains(needle)
+                {
+                    out.push((content.clone(), *is_error));
+                }
+            }
+        }
+        out
+    }
+
+    fn text_blocks_containing(&self, needle: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for msg in &self.history {
+            for block in &msg.content {
+                if let Block::Text { text } = block
+                    && text.contains(needle)
+                {
+                    out.push(text.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
+fn block_contains_marker(block: &Block, marker: &str) -> bool {
+    match block {
+        Block::Text { text } | Block::PartialStream { text } | Block::Thinking { text } => {
+            text.contains(marker)
+        }
+        Block::ToolUse { name, input, .. } => {
+            name.contains(marker) || input.to_string().contains(marker)
+        }
+        Block::ToolResult { content, .. } => content.contains(marker),
+    }
+}
+
+fn tool_result_block(tool_use_id: &str, content: &str, is_error: Option<bool>) -> Block {
+    Block::ToolResult {
+        tool_use_id: tool_use_id.to_string(),
+        content: content.to_string(),
+        is_error,
+        metadata: ToolResultMetadata::default(),
+    }
+}
+
+#[test]
+fn injected_steering_is_ledger_visible_and_final_required() {
+    let root = temp_test_dir("steering-ledger-visible");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_steering(rx, tx.clone());
+    tx.send("fix the rg border overflow and tell me what happened".to_string())
+        .expect("send steering");
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+
+    assert!(agent.inject_queued_steering(&mut turn_state, 3, 7, true));
+    let ledger = agent.work_ledger_prompt();
+    assert!(ledger.contains("steering:"), "{ledger}");
+    assert!(ledger.contains("rg border overflow"), "{ledger}");
+    assert!(ledger.contains("respond to queued steering"), "{ledger}");
+    let injected = agent
+        .history
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .find_map(|b| match b {
+            Block::Text { text } if text.contains("[steering]") => Some(text.clone()),
+            _ => None,
+        })
+        .expect("steering prompt injected");
+    assert!(
+        injected.contains("must explicitly address it"),
+        "{injected}"
+    );
+    assert!(
+        injected.contains("Do not let the final answer omit this steering"),
+        "{injected}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn steering_received_event_serializes_preview() {
+    let ev = AgentEvent::SteeringReceived {
+        messages: 1,
+        preview: "fix rg border overflow".to_string(),
+    };
+    let value = serde_json::to_value(ev).expect("serialize event");
+    assert_eq!(value["event"], "steering_received");
+    assert_eq!(value["data"]["messages"], 1);
+    assert_eq!(value["data"]["preview"], "fix rg border overflow");
+}
+
+#[test]
+fn steering_delivery_line_includes_preview_and_final_requirement() {
+    let text = crate::tui::steering_delivered_text_for_test(1, "fix rg border overflow", 80);
+    let rendered = text
+        .lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(rendered.contains("final must address it"), "{rendered}");
+    assert!(rendered.contains("fix rg border overflow"), "{rendered}");
+}
+
+#[test]
+fn steering_acknowledgement_detects_final_that_mentions_steered_scope() {
+    let item = "queued during active turn (1 message): fix the rg border overflow and tell me what happened";
+    let missing = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "Done.".to_string(),
+        }],
+    }];
+    assert!(!steering_item_acknowledged(item, &missing));
+
+    let acknowledged = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "I fixed the rg border overflow and explained what happened.".to_string(),
+        }],
+    }];
+    assert!(steering_item_acknowledged(item, &acknowledged));
+}
+
+#[test]
+fn normalize_login_secret_extracts_access_token_from_multiline_json() {
+    let raw = "{\n  \"accessToken\": \"abc123xyz456\",\n  \"expires\": \"later\"\n}";
+    assert_eq!(normalize_login_secret(raw).as_deref(), Some("abc123xyz456"));
+}
+
+#[test]
+fn looks_like_login_secret_input_accepts_multiline_json() {
+    let raw = "{\n  \"accessToken\": \"abc123xyz456\",\n  \"expires\": \"later\"\n}";
+    assert!(looks_like_login_secret_input(raw));
+}
+
+#[test]
+fn session_replay_fixture_circuit_breaker_stops_retrying_blocked_host() -> Result<()> {
+    let replay = SessionReplayFixture::load("circuit_breaker")?;
+    assert_eq!(replay.header.version, 2);
+    assert_eq!(replay.header.model, "fixture-model");
+    assert_eq!(replay.tool_call_count("bash"), 2);
+
+    let breaker_hits = replay.tool_results_containing("[circuit-breaker]");
+    assert_eq!(breaker_hits.len(), 1, "{:?}", breaker_hits);
+    assert!(
+        replay
+            .tool_names_after_marker("[circuit-breaker]")
+            .is_empty(),
+        "no more tool calls should happen after the breaker trips"
+    );
+    assert!(
+        replay.assistant_text().contains("need credentials"),
+        "{}",
+        replay.assistant_text()
+    );
+    Ok(())
+}
+
+#[test]
+fn session_replay_fixture_feasibility_gate_requires_probe_before_scale() -> Result<()> {
+    let replay = SessionReplayFixture::load("feasibility_gate")?;
+    let gate_hits = replay.tool_results_containing("source feasibility gate");
+    assert_eq!(gate_hits.len(), 1, "{:?}", gate_hits);
+
+    let probe_inputs = replay.tool_inputs_after_marker("source feasibility gate", "bash");
+    assert!(
+        probe_inputs.iter().any(|input| input.contains("/items/1")),
+        "expected a single-item probe after the gate, got {:?}",
+        probe_inputs
+    );
+    assert!(
+        replay.assistant_text().contains("probe succeeded"),
+        "{}",
+        replay.assistant_text()
+    );
+    Ok(())
+}
+
+#[test]
+fn session_replay_fixture_partial_delivery_hint_avoids_write_fallback() -> Result<()> {
+    let replay = SessionReplayFixture::load("partial_delivery_hint")?;
+    let hint = orchestrator::partial_delivery_hint();
+    assert_eq!(replay.text_blocks_containing(hint).len(), 1);
+
+    let later_tools = replay.tool_names_after_marker(hint);
+    assert!(
+        !later_tools
+            .iter()
+            .any(|name| { matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit") }),
+        "partial-delivery hint should prevent a weak file-write fallback, got {:?}",
+        later_tools
+    );
+    let assistant = replay.assistant_text();
+    assert!(assistant.contains("Partial deliverable"), "{assistant}");
+    assert!(assistant.contains("credentials"), "{assistant}");
+    Ok(())
+}
+
+#[test]
+fn session_replay_fixture_dedupe_cache_preserves_success_and_error_hits() -> Result<()> {
+    let replay = SessionReplayFixture::load("dedupe_cache")?;
+    assert_eq!(replay.tool_call_count("bash"), 4);
+
+    let hits = replay.tool_results_containing("request dedupe cache hit");
+    assert_eq!(hits.len(), 2, "{:?}", hits);
+    assert!(
+        hits.iter().any(|(_, is_error)| is_error.is_none()),
+        "expected a cached success hit: {:?}",
+        hits
+    );
+    assert!(
+        hits.iter().any(|(_, is_error)| *is_error == Some(true)),
+        "expected a cached error hit: {:?}",
+        hits
+    );
+    assert!(
+        replay.assistant_text().contains("deduped"),
+        "{}",
+        replay.assistant_text()
+    );
+    Ok(())
+}
+
+#[test]
+fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("resume-roundtrip");
+    let sessions_dir = root.join("sessions");
+    let sandbox = root.join("sandbox");
+    let other = root.join("other");
+    std::fs::create_dir_all(&sandbox)?;
+    std::fs::create_dir_all(&other)?;
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe { std::env::set_var("WOLF_SESSIONS_DIR", &sessions_dir) };
+    let result = (|| -> Result<()> {
+        let sandbox = std::fs::canonicalize(&sandbox)?;
+
+        let mut saved = test_agent(&sandbox);
+        saved.model = "saved-model".to_string();
+        saved.thinking_effort = ThinkingEffort::XHigh;
+        saved.system = "saved-system".to_string();
+        saved.allowed.insert("read_file".to_string());
+        saved.allowed.insert("write_file".to_string());
+        saved.work_ledger.objective = "preserve session metadata".to_string();
+        saved.work_ledger.current_phase = "synthesize".to_string();
+        saved
+            .work_ledger
+            .done
+            .push("run verification checks".to_string());
+        saved
+            .work_ledger
+            .next_actions
+            .push("deliver requested outcome with verifiable steps".to_string());
+        saved
+            .work_ledger
+            .files_changed
+            .push("src/main.rs".to_string());
+        saved
+            .work_ledger
+            .files_changed
+            .push("/tmp/scratch.py".to_string());
+        saved.work_ledger.verification.push(VerificationRecord {
+            name: "cargo test focused".to_string(),
+            command: "cargo test focused".to_string(),
+            status: "passed".to_string(),
+            exit_code: Some(0),
+            duration_ms: 123,
+            artifact: Some(".wolf/artifacts/verify.json".to_string()),
+            validates: vec!["session roundtrip".to_string()],
+        });
+        saved.provider_health.providers.insert(
+            "chatgpt".to_string(),
+            ProviderHealthState {
+                auth: "present".to_string(),
+                last_error: Some("HTTP 429".to_string()),
+                retry_after: Some(10),
+                mode: Some("chatgpt-responses".to_string()),
+                disabled_for_turn: true,
+            },
+        );
+        saved.session_usage = Usage {
+            input: 11,
+            output: 7,
+            cache_create: 3,
+            cache_read: 5,
+        };
+        saved.history = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![Block::Text {
+                    text: "hello from disk".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![Block::Text {
+                    text: "saved reply".to_string(),
+                }],
+            },
+        ];
+        saved.save_latest_session()?;
+        let saved_header_line = std::fs::read_to_string(latest_session_path(&sandbox))?
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            saved_header_line.contains("\"work_ledger\""),
+            "{saved_header_line}"
+        );
+        assert!(
+            saved_header_line.contains("\"exposed_tools\""),
+            "{saved_header_line}"
+        );
+        assert!(
+            saved_header_line.contains("\"approval_required_tools\""),
+            "{saved_header_line}"
+        );
+        assert!(
+            saved_header_line.contains("\"auto_approved_tools\""),
+            "{saved_header_line}"
+        );
+        assert!(
+            saved_header_line.contains("\"provider_health\""),
+            "{saved_header_line}"
+        );
+        assert!(
+            saved_header_line.contains("\"provenance\""),
+            "{saved_header_line}"
+        );
+
+        let saved_header: SessionHeader = serde_json::from_str(&saved_header_line)?;
+        assert!(
+            saved_header
+                .exposed_tools
+                .contains(&"read_file".to_string())
+        );
+        assert!(saved_header.exposed_tools.contains(&"rg".to_string()));
+        assert!(
+            saved_header
+                .approval_required_tools
+                .contains(&"write_file".to_string())
+        );
+        assert!(
+            saved_header
+                .auto_approved_tools
+                .contains(&"read_file".to_string())
+        );
+        assert!(saved_header.auto_approved_tools.contains(&"rg".to_string()));
+        assert!(
+            saved_header
+                .auto_approved_tools
+                .contains(&"write_file".to_string())
+        );
+        assert_eq!(saved_header.work_ledger.current_phase, "done");
+        assert!(saved_header.work_ledger.next_actions.is_empty());
+        assert_eq!(
+            saved_header.work_ledger.files_changed,
+            vec!["src/main.rs".to_string()]
+        );
+
+        let mut loaded = test_agent(&other);
+        loaded.model = "other-model".to_string();
+        loaded.system = "other-system".to_string();
+        loaded.load_latest_session()?;
+
+        assert_eq!(loaded.model, "saved-model");
+        assert_eq!(loaded.thinking_effort, ThinkingEffort::XHigh);
+        assert_eq!(loaded.system, "saved-system");
+        assert_eq!(loaded.sandbox_root, sandbox);
+        assert_eq!(loaded.session_usage.input, 11);
+        assert_eq!(loaded.session_usage.output, 7);
+        assert!(loaded.allowed.contains("read_file"));
+        assert!(loaded.allowed.contains("write_file"));
+        assert_eq!(loaded.work_ledger.objective, "preserve session metadata");
+        assert_eq!(loaded.work_ledger.verification[0].status, "passed");
+        assert!(
+            loaded
+                .work_ledger
+                .files_changed
+                .contains(&"src/main.rs".to_string())
+        );
+        assert!(
+            !loaded
+                .work_ledger
+                .files_changed
+                .contains(&"/tmp/scratch.py".to_string())
+        );
+        let header = saved.session_header();
+        assert_eq!(
+            loaded.provider_health.providers["chatgpt"].retry_after,
+            Some(10)
+        );
+        assert_eq!(header.version, SESSION_FORMAT_VERSION);
+        assert_eq!(header.provenance.thinking_effort, ThinkingEffort::XHigh);
+        assert_eq!(header.provenance.tool_catalog_version, TOOL_CATALOG_VERSION);
+        assert!(!header.provenance.system_prompt_hash.is_empty());
+        assert_eq!(loaded.history.len(), 2);
+        assert_eq!(assistant_text(&loaded.history), "saved reply");
+        Ok(())
+    })();
+    // Safe: test holds a global lock around env mutation.
+    unsafe { std::env::remove_var("WOLF_SESSIONS_DIR") };
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn session_html_export_renders_and_escapes_transcript() -> Result<()> {
+    let root = temp_test_dir("session-html-export");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "hello <script>alert(1)</script> & bye".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                Block::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command":"echo '<ok>'"}),
+                },
+                Block::Text {
+                    text: "done".to_string(),
+                },
+            ],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("tool-1", "line <ok> & done", Some(false))],
+        },
+    ];
+
+    let out = root.join("session.html");
+    agent.export_session_html_to_path(&out)?;
+    let html = std::fs::read_to_string(&out)?;
+
+    assert!(
+        html.contains("hello &lt;script&gt;alert(1)&lt;/script&gt; &amp; bye"),
+        "{html}"
+    );
+    assert!(!html.contains("<script>alert(1)</script>"), "{html}");
+    assert!(html.contains("tool_use bash"), "{html}");
+    assert!(html.contains("tool_result"), "{html}");
+    assert!(html.contains("line &lt;ok&gt; &amp; done"), "{html}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("session-listing-latest");
+    let wolf_home = root.join("wolf-home");
+    let project = root.join("project");
+    std::fs::create_dir_all(&wolf_home)?;
+    std::fs::create_dir_all(&project)?;
+
+    unsafe {
+        std::env::set_var("WOLF_HOME", &wolf_home);
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+    }
+    let result = (|| -> Result<()> {
+        let project = std::fs::canonicalize(&project)?;
+        let mut agent = test_agent(&project);
+        agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "hello latest".to_string(),
+            }],
+        });
+        agent.save_latest_session()?;
+
+        let listing = render_session_listing(&project);
+        assert!(listing.contains("project latest:"), "{listing}");
+        assert!(listing.contains("latest: 1 messages"), "{listing}");
+        assert!(listing.contains("named sessions:"), "{listing}");
+        assert!(listing.contains("use /save <name>"), "{listing}");
+        assert!(!listing.contains("(no sessions"), "{listing}");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn session_export_target_parses_html_and_jsonl() {
+    let (format, path) = parse_session_export_target("html report.html");
+    assert_eq!(format, SessionExportFormat::Html);
+    assert_eq!(path, PathBuf::from("report.html"));
+
+    let (format, path) = parse_session_export_target("report.html");
+    assert_eq!(format, SessionExportFormat::Html);
+    assert_eq!(path, PathBuf::from("report.html"));
+
+    let (format, path) = parse_session_export_target("archive.jsonl");
+    assert_eq!(format, SessionExportFormat::Jsonl);
+    assert_eq!(path, PathBuf::from("archive.jsonl"));
+}
+
+#[test]
+fn latest_state_defaults_are_project_scoped() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("project-scoped-state");
+    let wolf_home = root.join("wolf-home");
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    std::fs::create_dir_all(&alpha)?;
+    std::fs::create_dir_all(&beta)?;
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::set_var("WOLF_HOME", &wolf_home);
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::remove_var("WOLF_LOGS_DIR");
+    }
+    let result = (|| -> Result<()> {
+        let alpha = std::fs::canonicalize(&alpha)?;
+        let beta = std::fs::canonicalize(&beta)?;
+        let alpha_session = latest_session_path(&alpha);
+        let beta_session = latest_session_path(&beta);
+        let alpha_log = latest_log_path(&alpha);
+        let beta_log = latest_log_path(&beta);
+
+        assert_ne!(alpha_session, beta_session);
+        assert_ne!(alpha_log, beta_log);
+        assert!(alpha_session.starts_with(wolf_home.join("projects")));
+        assert!(alpha_log.starts_with(wolf_home.join("projects")));
+        Ok(())
+    })();
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::remove_var("WOLF_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn project_state_lock_blocks_second_owner_until_release() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("state-lock-owner");
+    let root = std::fs::canonicalize(&root)?;
+    let first = ProjectStateLock::acquire(&root)?;
+    let err = ProjectStateLock::acquire(&root).expect_err("second owner should fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("another wolf process already owns project state"),
+        "{msg}"
+    );
+    drop(first);
+    let second = ProjectStateLock::acquire(&root)?;
+    drop(second);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn set_sandbox_root_rejects_locked_project() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("sandbox-lock-switch");
+    let alpha = std::fs::canonicalize(
+        std::fs::create_dir_all(root.join("alpha")).map(|_| root.join("alpha"))?,
+    )?;
+    let beta = std::fs::canonicalize(
+        std::fs::create_dir_all(root.join("beta")).map(|_| root.join("beta"))?,
+    )?;
+
+    let mut agent = test_agent(&alpha);
+    let held = ProjectStateLock::acquire(&beta)?;
+    let before = agent.sandbox_root.clone();
+    let err = agent
+        .set_sandbox_root(beta.clone())
+        .expect_err("locked target project should fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("another wolf process already owns project state"),
+        "{msg}"
+    );
+    assert_eq!(agent.sandbox_root, before);
+    drop(held);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn session_names_reject_path_traversal() {
+    assert!(validate_session_name("../escape").is_err());
+    assert!(validate_session_name("..\\escape").is_err());
+    assert!(validate_session_name("safe-name_01").is_ok());
+}
+
+#[test]
+fn builtin_parallel_policy_only_allows_read_only_rounds() {
+    assert!(should_parallelize_builtin_tools(&["read_file", "rg", "fd"]));
+    assert!(!should_parallelize_builtin_tools(&[
+        "read_file",
+        "write_file"
+    ]));
+    assert!(!should_parallelize_builtin_tools(&["bash"]));
+    assert!(!should_parallelize_builtin_tools(&["http", "rg"]));
+    assert!(!should_parallelize_builtin_tools(&[]));
+}
+
+#[test]
+fn fangs_out_toggle_controls_gated_allowlist() {
+    let root = temp_test_dir("fangs-toggle");
+    let mut agent = test_agent(&root);
+    assert!(!agent.fangs_out_active());
+
+    let enabled = agent.set_fangs_out(true);
+    assert!(enabled > 0, "expected gated tools to be added");
+    assert!(agent.fangs_out_active());
+    assert_eq!(agent.approval_profile(), ApprovalProfile::Always);
+
+    let disabled = agent.set_fangs_out(false);
+    assert!(disabled > 0, "expected gated tools to be removed");
+    assert!(!agent.fangs_out_active());
+    assert_eq!(agent.approval_profile(), ApprovalProfile::Ask);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn slash_fangs_emits_profile_update_for_tui_status() {
+    let root = temp_test_dir("fangs-slash-status");
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(handle_slash("/fangs on", &mut agent), Some(true));
+    let mut saw_profile = false;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentEvent::ApprovalProfileChanged { profile } = event {
+            saw_profile = true;
+            assert_eq!(profile, ApprovalProfile::Always);
+        }
+    }
+    assert!(
+        saw_profile,
+        "expected ApprovalProfileChanged after /fangs on"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn approval_and_sandbox_profiles_enforce_policy() {
+    let root = temp_test_dir("approval-sandbox-profiles");
+    let mut agent = test_agent(&root);
+    let read = json!({"command": "pwd"});
+    let write = json!({"path": "out.txt", "content": "x"});
+
+    agent.set_approval_profile(ApprovalProfile::AutoRead);
+    assert!(agent.tool_auto_approved("bash", &read));
+    assert!(!agent.tool_auto_approved("write_file", &write));
+
+    agent.set_approval_profile(ApprovalProfile::AutoWrite);
+    assert!(agent.tool_auto_approved("write_file", &write));
+    assert!(!agent.tool_auto_approved("bash", &json!({"command": "sudo reboot"})));
+
+    agent.set_sandbox_profile(SandboxProfile::ReadOnly);
+    assert!(agent.sandbox_policy_denial("write_file", &write).is_some());
+    assert!(agent.sandbox_policy_denial("bash", &read).is_none());
+    assert!(
+        agent
+            .sandbox_policy_denial("read_file", &json!({"path": "/tmp/outside"}))
+            .is_none()
+    );
+    assert!(
+        agent
+            .sandbox_policy_denial("git_diff", &json!({"stat": true}))
+            .is_none()
+    );
+    assert!(
+        agent
+            .sandbox_policy_denial("todo_read", &json!({}))
+            .is_none()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn browser_recipe_toggles_browser_tool() {
+    let root = temp_test_dir("browser-recipe");
+    let mut agent = test_agent(&root);
+    assert!(agent.tools.iter().all(|t| t.name != "browser"));
+
+    agent.set_browser_recipe(BrowserRecipe::AgentBrowser);
+    assert!(agent.tools.iter().any(|t| t.name == "browser"));
+    assert_eq!(agent.browser_recipe(), BrowserRecipe::AgentBrowser);
+
+    agent.set_browser_recipe(BrowserRecipe::Disabled);
+    assert!(agent.tools.iter().all(|t| t.name != "browser"));
+    assert_eq!(agent.browser_recipe(), BrowserRecipe::Disabled);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn thinking_effort_parse_and_cycle() {
+    assert_eq!(ThinkingEffort::parse("low"), Some(ThinkingEffort::Low));
+    assert_eq!(ThinkingEffort::parse("MED"), Some(ThinkingEffort::Medium));
+    assert_eq!(ThinkingEffort::parse("x-high"), Some(ThinkingEffort::XHigh));
+    assert_eq!(ThinkingEffort::parse("unknown"), None);
+    assert_eq!(ThinkingEffort::Low.cycle(-1), ThinkingEffort::XHigh);
+    assert_eq!(ThinkingEffort::XHigh.cycle(1), ThinkingEffort::Low);
+}
+
+#[test]
+fn provider_tool_result_id_bug_detects_claude_and_chatgpt_patterns() {
+    assert!(is_provider_tool_result_id_bug(
+        "ClaudeContentBlockToolResult has no attribute 'id'"
+    ));
+    assert!(is_provider_tool_result_id_bug(
+        r#"No tool call found for function call output with call_id call_abc123."#
+    ));
+    assert!(!is_provider_tool_result_id_bug("rate limited"));
+    assert!(!is_provider_tool_result_id_bug(
+        "ClaudeContentBlockToolResult but no id substring"
+    ));
+}
+
+#[test]
+fn provider_bug_fallback_flattens_latest_tool_results() {
+    let root = temp_test_dir("provider-workaround");
+    let mut agent = test_agent(&root);
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_123", "missing path", Some(true))],
+    });
+
+    assert!(agent.rewrite_latest_tool_results_as_text_fallback());
+    match &agent.history.last().expect("history").content[..] {
+        [Block::Text { text }] => {
+            assert!(text.contains("provider rejected structured tool_result blocks"));
+            assert!(text.contains("call_123"));
+        }
+        other => panic!("expected flattened text block, got: {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn parse_tool_input_json_handles_stringified_json() {
+    let parsed = parse_tool_input_json("\"{\\\"task\\\":\\\"hello\\\",\\\"max_iterations\\\":1}\"");
+    assert_eq!(parsed["task"], "hello");
+    assert_eq!(parsed["max_iterations"], 1);
+}
+
+#[test]
+fn append_tool_input_json_fragment_replaces_empty_placeholder() {
+    let mut raw = "{}".to_string();
+    append_tool_input_json_fragment(&mut raw, "{\"task\":\"hello\"}");
+    let parsed = parse_tool_input_json(&raw);
+    assert_eq!(parsed["task"], "hello");
+}
+
+#[tokio::test]
+async fn external_runner_times_out() {
+    let root = temp_test_dir("external-timeout");
+    let args = vec!["-lc".to_string(), "sleep 2".to_string()];
+    let err = execute_external_async(
+        "bash",
+        &args,
+        None,
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_millis(150),
+    )
+    .await
+    .expect_err("expected timeout");
+    assert!(err.contains("timed out after"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn external_runner_honors_interrupts() {
+    let root = temp_test_dir("external-interrupt");
+    let args = vec!["-lc".to_string(), "sleep 5".to_string()];
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let trigger = interrupt.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        trigger.store(true, Ordering::SeqCst);
+    });
+
+    let err = execute_external_async(
+        "bash",
+        &args,
+        None,
+        &root,
+        interrupt,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .expect_err("expected interrupt");
+    assert!(err.contains("killed by interrupt"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn fast_bash_command_returns_without_100ms_poll_tail() {
+    let root = temp_test_dir("bash-fastpath");
+    let start = std::time::Instant::now();
+    let out = execute_bash_async_with_timeout(
+        "true",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("expected success");
+    let elapsed = start.elapsed();
+    assert!(out.contains("exit: 0"), "{out}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(90),
+        "expected <90ms (old busy-poll capped at 100ms); got {elapsed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn bash_runner_times_out() {
+    let root = temp_test_dir("bash-timeout");
+    let err = execute_bash_async_with_timeout(
+        "sleep 2",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_millis(150),
+    )
+    .await
+    .expect_err("expected timeout");
+    assert!(err.contains("timed out after"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sync_runner_times_out() {
+    let root = temp_test_dir("sync-timeout");
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc").arg("sleep 2").current_dir(&root);
+    let err = run_sync_command_limited(
+        cmd,
+        None,
+        PROCESS_STREAM_CAPTURE_CAP,
+        "bash",
+        std::time::Duration::from_millis(150),
+    )
+    .expect_err("expected timeout");
+    assert!(err.contains("timed out after"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn bash_runner_reaps_background_children_after_shell_exit() {
+    let root = temp_test_dir("bash-grandchild-reap");
+    let start = std::time::Instant::now();
+    let out = execute_bash_async_with_timeout(
+        "sleep 2 & echo done",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("expected success");
+    let elapsed = start.elapsed();
+    assert!(out.contains("exit: 0"), "{out}");
+    assert!(out.contains("done"), "{out}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(900),
+        "background child kept pipe open for {elapsed:?}; output={out}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sync_runner_reaps_background_children_after_shell_exit() {
+    let root = temp_test_dir("sync-grandchild-reap");
+    let mut cmd = Command::new("bash");
+    cmd.arg("-lc").arg("sleep 2 & echo done").current_dir(&root);
+    let start = std::time::Instant::now();
+    let (out, _, status) = run_sync_command_limited(
+        cmd,
+        None,
+        PROCESS_STREAM_CAPTURE_CAP,
+        "bash",
+        std::time::Duration::from_secs(5),
+    )
+    .expect("expected success");
+    let elapsed = start.elapsed();
+    assert_eq!(status, 0);
+    assert!(out.render("stdout").contains("done"));
+    assert!(
+        elapsed < std::time::Duration::from_millis(900),
+        "background child kept pipe open for {elapsed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tool_result_metadata_parses_status_and_artifact_hints() {
+    let failed = "exit: 101\n--- stdout ---\n--- stderr ---\ncompile failed";
+    assert_eq!(parse_tool_exit_code("bash", false, failed), Some(101));
+    assert_eq!(parse_tool_exit_code("rg", true, "match\n"), None);
+    assert!(looks_like_verification_command("cargo nextest run ui"));
+
+    let capped = cap_bytes_with_hint(
+        "x".repeat(128),
+        8,
+        "Full verification output saved as a structured artifact: /tmp/verify.json",
+    );
+    assert!(capped.contains("/tmp/verify.json"), "{capped}");
+}
+
+#[test]
+fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
+    let root = temp_test_dir("read-file-explicit-cache");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut content = String::new();
+    for i in 1..=120 {
+        content.push_str(&format!("line-{i:03}-{}\n", "x".repeat(120)));
+    }
+    std::fs::write(root.join("big.txt"), content).expect("write big file");
+    let metadata = std::fs::metadata(root.join("big.txt")).expect("metadata");
+    let signature = file_signature_from_metadata(&metadata);
+    let cache_path = std::fs::canonicalize(root.join("big.txt")).expect("canonical file");
+    let cache = Arc::new(Mutex::new(ReadFileCache::default()));
+
+    let out = execute_tool_with_cache(
+        "read_file",
+        &json!({"path": "big.txt", "offset": 1, "limit": 110}),
+        &root,
+        Some(&cache),
+    )
+    .expect("explicit read should succeed");
+    assert!(
+        out.len() > TOOL_RESULT_CAP,
+        "explicit window should exceed generic cap: {}",
+        out.len()
+    );
+    assert!(
+        out.len() <= READ_FILE_EXPLICIT_CAPTURE_CAP + 140,
+        "{}",
+        out.len()
+    );
+    assert_eq!(
+        tool_result_context_cap(
+            "read_file",
+            &json!({"path": "big.txt", "offset": 1, "limit": 110}),
+            &Usage::default(),
+            "test-model",
+            ContextMode::Standard,
+        ),
+        READ_FILE_EXPLICIT_CAPTURE_CAP
+    );
+
+    let cached = cache
+        .lock()
+        .expect("cache lock")
+        .get_window(
+            &cache_path,
+            signature,
+            10,
+            10,
+            READ_FILE_EXPLICIT_CAPTURE_CAP,
+        )
+        .expect("overlap should be served from cached union");
+    assert!(cached.contains("10\tline-010"), "{cached}");
+    assert!(cached.contains("19\tline-019"), "{cached}");
+
+    std::fs::remove_file(root.join("big.txt")).expect("remove source after cache fill");
+    let cached = execute_tool_with_cache(
+        "read_file",
+        &json!({"path": "big.txt", "offset": 10, "limit": 10}),
+        &root,
+        Some(&cache),
+    );
+    assert!(
+        cached.is_err(),
+        "metadata signature lookup should prevent serving stale cache after file removal"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_returns_symbol_block_with_context() {
+    let root = temp_test_dir("read-symbol");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("lib.rs"),
+        "fn helper() {}\n\nfn target() {\n    let value = 1;\n    println!(\"{}\", value);\n}\n\nfn tail() {}\n",
+    )
+    .expect("write source");
+
+    let out = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "target", "context": 1}),
+        &root,
+    )
+    .expect("read_symbol should succeed");
+    assert!(out.contains("3\tfn target()"), "{out}");
+    assert!(out.contains("6\t}"), "{out}");
+    assert!(out.contains("7\t"), "{out}");
+    assert!(!out.contains("1\tfn helper"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_line_mode_returns_enclosing_block_without_extra_allocations() {
+    let root = temp_test_dir("read-symbol-line");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("lib.rs"),
+        "fn before() {}\n\nfn target() {\n    if true {\n        println!(\"hit\");\n    }\n}\n\nfn after() {}\n",
+    )
+    .expect("write source");
+
+    let out = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "line": 5, "context": 0}),
+        &root,
+    )
+    .expect("line mode should succeed");
+    assert!(out.contains("3\tfn target()"), "{out}");
+    assert!(out.contains("5\t        println!"), "{out}");
+    assert!(out.contains("7\t}"), "{out}");
+    assert!(!out.contains("1\tfn before"), "{out}");
+    assert!(!out.contains("9\tfn after"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_requires_exactly_one_selector() {
+    assert_eq!(
+        tool_policy::tool_input_issue("read_symbol", &json!({"path": "lib.rs", "line": 12})),
+        None
+    );
+    let neither = tool_policy::tool_input_issue("read_symbol", &json!({"path": "lib.rs"}))
+        .expect("missing selector should be rejected");
+    assert!(neither.contains("provide symbol or line"), "{neither}");
+    let both = tool_policy::tool_input_issue(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "target", "line": 12}),
+    )
+    .expect("both selectors should be rejected");
+    assert!(both.contains("only one"), "{both}");
+
+    let root = temp_test_dir("read-symbol-selector-validation");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(root.join("lib.rs"), "fn target() {}\n").expect("write source");
+    let err = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "target", "line": 1}),
+        &root,
+    )
+    .expect_err("runtime should reject ambiguous selector");
+    assert!(err.contains("exactly one"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_file_caps_large_output_and_suggests_resume_offset() {
+    let root = temp_test_dir("read-file-cap");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let path = root.join("big.txt");
+    let mut content = String::new();
+    for i in 1..=300 {
+        content.push_str(&format!("line-{i:03}-{}\n", "x".repeat(60)));
+    }
+    std::fs::write(&path, content).expect("write big file");
+
+    let out = execute_tool("read_file", &json!({"path": "big.txt"}), &root)
+        .expect("read_file should succeed");
+    assert!(out.contains("output capped after"), "{out}");
+    assert!(out.contains("Pass offset="), "{out}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compaction_preserves_recent_tool_messages_and_summarizes_older_context() {
+    let root = temp_test_dir("compact-preserve-tools");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let agent = test_agent(&root);
+    let mut old = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Find where startup loads config".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "I will inspect main.rs first".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "src/main.rs"}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_1", "1\tfn main() {}", Some(false))],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Now wire in memory loading".to_string(),
+            }],
+        },
+    ];
+    for i in 0..5 {
+        old.push(Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: format!("call_recent_{i}"),
+                name: "read_file".to_string(),
+                input: json!({"path": format!("src/recent_{i}.rs")}),
+            }],
+        });
+        old.push(Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block(
+                &format!("call_recent_{i}"),
+                &format!("{i}\trecent output"),
+                Some(false),
+            )],
+        });
+    }
+
+    let (summary_msgs, preserved) = agent.split_compaction_inputs(&old);
+    assert_eq!(
+        preserved.len(),
+        10,
+        "expected recent tool use/result pairs to be kept"
+    );
+    assert!(preserved.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, Block::ToolResult { .. }))
+    }));
+    assert!(
+        summary_msgs.len() >= 3,
+        "older text/tool turns should remain for summarization; got {}",
+        summary_msgs.len()
+    );
+    assert!(summary_msgs.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, Block::Text { text } if text.contains("Find where startup")))
+    }));
+    assert!(summary_msgs.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, Block::ToolUse { id, .. } if id == "call_1"))
+    }));
+    assert!(summary_msgs.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, Block::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"))
+    }));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn find_compact_split_stays_near_tail_even_without_recent_user_boundary() {
+    let root = temp_test_dir("compact-tail-split");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "start a long code investigation".to_string(),
+        }],
+    });
+    for i in 0..40 {
+        agent.history.push(Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: format!("call_{i}"),
+                name: "read_file".to_string(),
+                input: json!({"path": format!("src/{i}.rs")}),
+            }],
+        });
+        agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block(
+                &format!("call_{i}"),
+                &"x".repeat(2048),
+                Some(false),
+            )],
+        });
+    }
+
+    let split = agent
+        .find_compact_split()
+        .expect("tool-heavy history should still compact");
+    assert!(
+        split
+            >= agent
+                .history
+                .len()
+                .saturating_sub(COMPACT_KEEP_MESSAGES + 8),
+        "split={split}, len={}",
+        agent.history.len()
+    );
+    assert!(Agent::compact_split_is_pair_safe(&agent.history, split));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compaction_summary_caps_old_tool_results() {
+    let root = temp_test_dir("compact-summary-tool-cap");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let agent = test_agent(&root);
+    let mut old = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_old".to_string(),
+                name: "bash".to_string(),
+                input: json!({"command": "cat huge.log"}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block(
+                "call_old",
+                &"x".repeat(COMPACT_SUMMARY_TOOL_RESULT_CAP + 500),
+                Some(false),
+            )],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "after old tool".to_string(),
+            }],
+        },
+    ];
+    for i in 0..5 {
+        old.push(Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: format!("call_new_{i}"),
+                name: "read_file".to_string(),
+                input: json!({"path": format!("src/new_{i}.rs")}),
+            }],
+        });
+        old.push(Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block(
+                &format!("call_new_{i}"),
+                "small recent output",
+                Some(false),
+            )],
+        });
+    }
+
+    let (summary_msgs, preserved) = agent.split_compaction_inputs(&old);
+    assert_eq!(preserved.len(), 10, "recent pairs should be retained");
+    let tool_result = summary_msgs
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .find_map(|b| match b {
+            Block::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .expect("tool result included in summary input");
+    assert!(
+        tool_result.contains("Tool result truncated before compaction summary"),
+        "{tool_result}"
+    );
+    assert!(
+        tool_result.len() < COMPACT_SUMMARY_TOOL_RESULT_CAP + 200,
+        "{}",
+        tool_result.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn run_external_caps_streamed_stdout() {
+    let root = temp_test_dir("external-cap");
+    let args = vec![
+        "-lc".to_string(),
+        "for i in {1..7000}; do printf x; done".to_string(),
+    ];
+
+    let out = run_external("bash", &args, None, &root).expect("external run should succeed");
+    assert!(out.contains("stdout capped after"), "{out}");
+    assert!(out.contains("kept first 6000"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn prepare_http_tool_request_parses_httpie_style_args() {
+    let request = prepare_http_tool_request(
+        &json!({
+            "args": [
+                "POST",
+                "https://example.com/api?existing=1",
+                "Accept: application/json",
+                "page==2",
+                "name=john",
+                "count:=3"
+            ]
+        }),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("prepare http tool request");
+
+    assert_eq!(request.method, reqwest::Method::POST);
+    assert_eq!(
+        request.url.as_str(),
+        "https://example.com/api?existing=1&page=2"
+    );
+    assert_eq!(
+        request.headers,
+        vec![("Accept".to_string(), "application/json".to_string())]
+    );
+    match request.body.expect("json body") {
+        HttpToolBody::Json(Value::Object(map)) => {
+            assert_eq!(map.get("name"), Some(&Value::String("john".to_string())));
+            assert_eq!(map.get("count"), Some(&Value::from(3)));
+        }
+        other => panic!("expected json body, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn builtin_http_tool_executes_without_xh_dependency() {
+    let root = temp_test_dir("http-built-in");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        let mut header_end = None;
+        while header_end.is_none() {
+            let n = stream.read(&mut buf).expect("read request headers");
+            assert!(n > 0, "client closed before sending headers");
+            request.extend_from_slice(&buf[..n]);
+            header_end = request.windows(4).position(|w| w == b"\r\n\r\n");
+        }
+
+        let header_end = header_end.expect("header terminator") + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let n = stream.read(&mut buf).expect("read request body");
+            assert!(n > 0, "client closed before sending body");
+            request.extend_from_slice(&buf[..n]);
+        }
+
+        let body = String::from_utf8_lossy(&request[header_end..header_end + content_length]);
+        assert!(
+            headers.starts_with("POST /submit HTTP/1.1\r\n"),
+            "{headers}"
+        );
+        assert!(
+            headers.contains("accept: application/json\r\n"),
+            "{headers}"
+        );
+        assert!(
+            headers.contains("content-type: application/json"),
+            "{headers}"
+        );
+        assert!(body.contains(r#""name":"john""#), "{body}");
+        assert!(body.contains(r#""count":3"#), "{body}");
+
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+            )
+            .expect("write response");
+    });
+
+    let out = execute_builtin_call(
+        "http".to_string(),
+        json!({
+            "args": [
+                "POST",
+                format!("http://{addr}/submit"),
+                "Accept: application/json",
+                "name=john",
+                "count:=3"
+            ]
+        }),
+        root.clone(),
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await
+    .expect("http request should succeed without xh installed");
+
+    assert!(out.contains("{\"ok\":true}"), "{out}");
+    server.join().expect("server thread");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rg_falls_back_to_grep_when_not_on_path() {
+    // When rg is missing binary_on_path returns false; grep is always present.
+    // Directly test the fallback output by preparing the tool and checking
+    // the result matches what we'd get with no rg on PATH.
+    let root = temp_test_dir("rg-fallback");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+
+    // If rg IS on PATH we get rg; if not we get grep. Either is valid.
+    let (bin, args, stdin) = prepare_external_tool(
+        "rg",
+        &json!({"pattern": "fn main", "path": root.to_str().unwrap()}),
+        &root,
+    )
+    .expect("prepare rg tool");
+
+    if bin == "grep" {
+        assert!(args.contains(&"-rn".to_string()));
+        assert!(args.contains(&"-E".to_string()));
+        assert!(args.contains(&"fn main".to_string()));
+    } else {
+        assert_eq!(bin, "rg");
+        assert!(args.contains(&"--line-number".to_string()));
+        assert!(args.contains(&"fn main".to_string()));
+    }
+    assert!(stdin.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fd_falls_back_to_find_when_not_on_path() {
+    let root = temp_test_dir("fd-fallback");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+
+    let (bin, args, stdin) = prepare_external_tool(
+        "fd",
+        &json!({"pattern": ".*\\.rs$", "path": root.to_str().unwrap()}),
+        &root,
+    )
+    .expect("prepare fd tool");
+
+    if bin == "find" {
+        assert_eq!(args[0], root.to_string_lossy());
+        assert_eq!(&args[1..3], &["-type", "f"]);
+        assert!(args.iter().any(|a| a.contains(".rs")));
+    } else {
+        assert_eq!(bin, "fd");
+        assert!(args.iter().any(|a| a.contains(".rs")));
+    }
+    assert!(stdin.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn git_log_builds_separate_flag_and_count_args() {
+    // Regression: `git log "--oneline -8"` is a single arg, rejected by git.
+    // Must be two separate argv entries: ["log", "--oneline", "-8"].
+    let root = temp_test_dir("git-log-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, _) =
+        prepare_external_tool("git_log", &json!({"count": 8, "oneline": true}), &root)
+            .expect("prepare git_log");
+    assert_eq!(bin, "git");
+    assert_eq!(args, vec!["log", "--oneline", "-8"]);
+
+    let (_, args_no_oneline, _) =
+        prepare_external_tool("git_log", &json!({"count": 5, "oneline": false}), &root)
+            .expect("prepare git_log without oneline");
+    assert_eq!(args_no_oneline, vec!["log", "-5"]);
+
+    let (_, args_with_path, _) = prepare_external_tool(
+        "git_log",
+        &json!({"count": 3, "oneline": true, "path": "src/main.rs"}),
+        &root,
+    )
+    .expect("prepare git_log with path");
+    assert_eq!(
+        args_with_path,
+        vec!["log", "--oneline", "-3", "--", "src/main.rs"]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fd_rejects_empty_pattern_early() {
+    let root = temp_test_dir("fd-empty-pattern");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let err = prepare_external_tool(
+        "fd",
+        &json!({"pattern": "", "path": root.to_str().unwrap()}),
+        &root,
+    )
+    .expect_err("empty pattern should be rejected");
+    assert!(err.contains("empty"), "{err}");
+
+    let err_ws = prepare_external_tool(
+        "fd",
+        &json!({"pattern": "   ", "path": root.to_str().unwrap()}),
+        &root,
+    )
+    .expect_err("whitespace-only pattern should be rejected");
+    assert!(err_ws.contains("empty"), "{err_ws}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn jq_tool_builds_file_mode_argv() {
+    let root = temp_test_dir("jq-file-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let file = root.join("data.json");
+    std::fs::write(&file, b"{}").unwrap();
+
+    let (bin, args, stdin) =
+        prepare_external_tool("jq", &json!({"filter": ".foo", "path": "data.json"}), &root)
+            .expect("prepare jq file mode");
+    assert_eq!(bin, "jq");
+    assert_eq!(args.len(), 2);
+    assert_eq!(args[0], ".foo");
+    assert!(args[1].ends_with("data.json"), "{}", args[1]);
+    assert!(stdin.is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn jq_tool_builds_inline_json_mode_argv() {
+    let root = temp_test_dir("jq-inline-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, stdin) = prepare_external_tool(
+        "jq",
+        &json!({"filter": ".name", "json": "{\"name\":\"wolf\"}"}),
+        &root,
+    )
+    .expect("prepare jq inline mode");
+    assert_eq!(bin, "jq");
+    assert_eq!(args, vec![".name"]);
+    assert_eq!(stdin.as_deref(), Some("{\"name\":\"wolf\"}"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn jq_tool_errors_without_path_or_json() {
+    let root = temp_test_dir("jq-missing-source");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let err = prepare_external_tool("jq", &json!({"filter": "."}), &root)
+        .expect_err("jq with neither path nor json should error");
+    assert!(
+        err.contains("path") && err.contains("json"),
+        "unexpected error: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fzf_tool_pipes_items_as_stdin() {
+    let root = temp_test_dir("fzf-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, stdin) = prepare_external_tool(
+        "fzf",
+        &json!({"query": "foo", "items": ["foo.rs", "bar.rs", "foobar.rs"]}),
+        &root,
+    )
+    .expect("prepare fzf");
+    assert_eq!(bin, "fzf");
+    assert_eq!(args, vec!["--filter", "foo"]);
+    assert_eq!(stdin.as_deref(), Some("foo.rs\nbar.rs\nfoobar.rs"));
+
+    let err = prepare_external_tool("fzf", &json!({"query": "foo", "items": []}), &root)
+        .expect_err("fzf with empty items should error");
+    assert!(err.contains("items"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn awk_tool_passes_args_and_stdin_verbatim() {
+    let root = temp_test_dir("awk-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, stdin) = prepare_external_tool(
+        "awk",
+        &json!({
+            "args": ["-F,", "{print $2}"],
+            "stdin": "a,b,c\nd,e,f"
+        }),
+        &root,
+    )
+    .expect("prepare awk");
+    assert_eq!(bin, "awk");
+    assert_eq!(args, vec!["-F,", "{print $2}"]);
+    assert_eq!(stdin.as_deref(), Some("a,b,c\nd,e,f"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn csvkit_tool_uses_subcommand_as_binary() {
+    let root = temp_test_dir("csvkit-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, stdin) = prepare_external_tool(
+        "csvkit",
+        &json!({
+            "subcommand": "csvcut",
+            "args": ["-c", "1,3"],
+            "stdin": "a,b,c\n1,2,3"
+        }),
+        &root,
+    )
+    .expect("prepare csvkit");
+    assert_eq!(bin, "csvcut");
+    assert_eq!(args, vec!["-c", "1,3"]);
+    assert_eq!(stdin.as_deref(), Some("a,b,c\n1,2,3"));
+
+    let err = prepare_external_tool("csvkit", &json!({"args": ["-c", "1"]}), &root)
+        .expect_err("csvkit without subcommand should error");
+    assert!(err.contains("subcommand"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rg_tool_threads_extra_args_on_happy_path() {
+    // Only meaningful when rg is on PATH. Skip otherwise rather than assert.
+    if !binary_on_path("rg") {
+        return;
+    }
+    let root = temp_test_dir("rg-extra-args");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, _) = prepare_external_tool(
+        "rg",
+        &json!({
+            "pattern": "fn main",
+            "path": root.to_str().unwrap(),
+            "extra_args": ["-i", "--glob=*.rs", "--glob", "!node_modules"]
+        }),
+        &root,
+    )
+    .expect("prepare rg with extras");
+    assert_eq!(bin, "rg");
+    // First two are always base flags, then extras in order, then pattern + path.
+    assert_eq!(&args[0..2], &["--line-number", "--no-heading"]);
+    assert!(args.contains(&"-i".to_string()), "{args:?}");
+    assert!(args.contains(&"--glob=*.rs".to_string()), "{args:?}");
+    assert!(
+        args.contains(&"!**/node_modules/**".to_string()),
+        "{args:?}"
+    );
+    let pattern_idx = args.iter().position(|a| a == "fn main").expect("pattern");
+    let path_idx = pattern_idx + 1;
+    assert_eq!(args.get(path_idx).map(String::as_str), root.to_str());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rg_grep_fallback_translates_glob_flag() {
+    // Simulate the grep fallback branch by asserting the documented translation:
+    // --glob=X becomes --include=X, -i passes through, others are dropped.
+    // This matches prepare_external_tool's grep arm when rg isn't on PATH.
+    // We can't easily simulate rg-missing inside a unit test, so we verify the
+    // translation directly via the prepare_external_tool_fallback helper which
+    // shares the same translation logic.
+    let root = temp_test_dir("rg-grep-fallback-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, _) = prepare_external_tool_fallback(
+        "rg",
+        &json!({
+            "pattern": "needle",
+            "path": root.to_str().unwrap(),
+            "extra_args": ["-i", "--glob=*.rs", "--glob", "!node_modules", "--unsupported-flag"]
+        }),
+        &root,
+    );
+    assert_eq!(bin, "grep");
+    assert_eq!(&args[0..3], &["-rn", "-E", "--color=never"]);
+    assert!(args.contains(&"-i".to_string()), "{args:?}");
+    assert!(
+        args.contains(&"--exclude-dir=node_modules".to_string()),
+        "{args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a == "--unsupported-flag"),
+        "unknown flags must be dropped in grep fallback: {args:?}"
+    );
+    assert_eq!(args[args.len() - 2], "needle");
+    assert_eq!(args.last().map(String::as_str), root.to_str(), "{args:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fd_find_fallback_translates_type_and_consumes_value() {
+    let root = temp_test_dir("fd-find-fallback-type");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, _) = prepare_external_tool_fallback(
+        "fd",
+        &json!({
+            "pattern": "^WOLF(\\.memory)?\\.md$",
+            "path": root.to_str().unwrap(),
+            "extra_args": ["-H", "--type", "f"]
+        }),
+        &root,
+    );
+    assert_eq!(bin, "find");
+    assert_eq!(args[0], root.to_string_lossy());
+    assert_eq!(
+        &args[1..7],
+        &[
+            "-type",
+            "f",
+            "-regextype",
+            "posix-extended",
+            "-regex",
+            ".*^WOLF(\\.memory)?\\.md$.*"
+        ]
+    );
+    assert!(
+        !args.iter().any(|a| a == "--type" || a == "-H"),
+        "fd-only flags should not leak into find argv: {args:?}"
+    );
+
+    let args_with_glob = build_fd_find_fallback_args(
+        &root,
+        "table|tui",
+        &[
+            "-t".to_string(),
+            "f".to_string(),
+            "--glob=*.rs".to_string(),
+            "--exclude".to_string(),
+            ".turbo".to_string(),
+            "--glob".to_string(),
+            "!node_modules".to_string(),
+            "--hidden".to_string(),
+        ],
+    );
+    assert!(
+        args_with_glob.iter().any(|a| a == "-name"),
+        "{args_with_glob:?}"
+    );
+    assert!(
+        args_with_glob.iter().any(|a| a == "*.rs"),
+        "{args_with_glob:?}"
+    );
+    assert!(
+        args_with_glob.iter().any(|a| a == "*/.turbo/*"),
+        "{args_with_glob:?}"
+    );
+    assert!(
+        args_with_glob.iter().any(|a| a == "*/node_modules/*"),
+        "{args_with_glob:?}"
+    );
+    assert!(
+        !args_with_glob
+            .iter()
+            .any(|a| a == "--glob=*.rs" || a == "--hidden" || a == "--exclude"),
+        "fd-only flags should not leak into find argv: {args_with_glob:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fd_runtime_find_error_triggers_fallback_policy() {
+    assert!(should_retry_external_tool_with_fallback(
+        "fd",
+        "fd",
+        "exit 1: find: paths must precede expression: `.'\nfind: possible unquoted pattern after predicate `-regex'?"
+    ));
+    assert!(!should_retry_external_tool_with_fallback(
+        "fd",
+        "find",
+        "exit 1: find: paths must precede expression"
+    ));
+    assert!(should_retry_external_tool_with_fallback(
+        "rg",
+        "rg",
+        "failed to spawn rg: No such file or directory"
+    ));
+}
+
+#[test]
+fn fd_find_fallback_maps_directory_type() {
+    let root = temp_test_dir("fd-find-fallback-dir");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, _) = prepare_external_tool_fallback(
+        "fd",
+        &json!({
+            "pattern": "src",
+            "path": root.to_str().unwrap(),
+            "extra_args": ["--type", "d"]
+        }),
+        &root,
+    );
+    assert_eq!(bin, "find");
+    assert_eq!(&args[1..3], &["-type", "d"]);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fd_tool_threads_extra_args_on_happy_path() {
+    if !binary_on_path("fd") {
+        return;
+    }
+    let root = temp_test_dir("fd-extra-args");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (bin, args, _) = prepare_external_tool(
+        "fd",
+        &json!({
+            "pattern": "\\.rs$",
+            "path": root.to_str().unwrap(),
+            "extra_args": ["-H", "--type", "f"]
+        }),
+        &root,
+    )
+    .expect("prepare fd with extras");
+    assert_eq!(bin, "fd");
+    // extras prepended, then pattern, then path (per prepare_external_tool).
+    assert_eq!(&args[0..3], &["-H", "--type", "f"]);
+    assert_eq!(args[3], "\\.rs$");
+    assert_eq!(args.get(4).map(String::as_str), root.to_str());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn git_diff_builds_expected_argv() {
+    let root = temp_test_dir("git-diff-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (_, args, _) = prepare_external_tool(
+        "git_diff",
+        &json!({"staged": true, "path": "src/main.rs"}),
+        &root,
+    )
+    .expect("prepare git_diff");
+    assert_eq!(args, vec!["diff", "--cached", "--", "src/main.rs"]);
+
+    let (_, args_commit, _) =
+        prepare_external_tool("git_diff", &json!({"commit": "HEAD~1"}), &root)
+            .expect("prepare git_diff commit");
+    assert_eq!(args_commit, vec!["diff", "HEAD~1"]);
+
+    let (_, args_stat, _) = prepare_external_tool(
+        "git_diff",
+        &json!({"stat": true, "staged": true, "path": "src/main.rs"}),
+        &root,
+    )
+    .expect("prepare git_diff stat");
+    assert_eq!(
+        args_stat,
+        vec!["diff", "--stat", "--cached", "--", "src/main.rs"]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stream_error_classification_retries_chunked_eof() {
+    let plan = orchestrator::classify_stream_error(
+        "error decoding response body: error reading a body from connection: unexpected EOF during chunk size line",
+    );
+    assert!(plan.retry);
+}
+
+#[test]
+fn partial_stream_preserve_only_text_blocks() {
+    let blocks = vec![Block::Text {
+        text: "partial".to_string(),
+    }];
+    let mut history = Vec::new();
+    assert!(maybe_preserve_partial_stream(&blocks, &mut history));
+    assert_eq!(history.len(), 1);
+    assert!(!maybe_preserve_partial_stream(&blocks, &mut history));
+    assert_eq!(history.len(), 1);
+
+    let tool_only = vec![Block::ToolUse {
+        id: "call_1".to_string(),
+        name: "todo_read".to_string(),
+        input: json!({}),
+    }];
+    assert!(!maybe_preserve_partial_stream(&tool_only, &mut history));
+}
+
+#[test]
+fn parse_compact_slash_accepts_status_auto_and_percentage_override() {
+    assert!(matches!(
+        parse_compact_slash("/compact"),
+        Some(Ok(CompactSlash::RunNow))
+    ));
+    assert!(matches!(
+        parse_compact_slash(" /compact  "),
+        Some(Ok(CompactSlash::RunNow))
+    ));
+    assert!(matches!(
+        parse_compact_slash("/compact status"),
+        Some(Ok(CompactSlash::Status))
+    ));
+    assert!(matches!(
+        parse_compact_slash("/compact auto"),
+        Some(Ok(CompactSlash::Auto))
+    ));
+    assert!(matches!(
+        parse_compact_slash("/compact 20"),
+        Some(Ok(CompactSlash::SetPercent(20)))
+    ));
+    assert!(matches!(
+        parse_compact_slash("/compact 20%"),
+        Some(Ok(CompactSlash::SetPercent(20)))
+    ));
+    assert!(matches!(
+        parse_compact_slash("/compact now"),
+        Some(Err("usage: /compact [status|auto|<percent>|<percent>%]"))
+    ));
+    assert!(matches!(
+        parse_compact_slash("/compacted"),
+        Some(Err("usage: /compact [status|auto|<percent>|<percent>%]"))
+    ));
+}
+
+#[test]
+fn auto_compact_depends_on_history_size_not_cumulative_output_usage() {
+    let root = temp_test_dir("compact-threshold");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.session_usage.output = 1_000_000;
+    assert!(
+        !agent.should_auto_compact(),
+        "high cumulative output usage alone should not force compaction"
+    );
+
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "x".repeat(agent.compact_threshold_chars() + 10),
+        }],
+    });
+    assert!(
+        agent.should_auto_compact(),
+        "history beyond the budget should trigger compaction"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn manual_compact_threshold_percent_override_beats_model_default() {
+    let root = temp_test_dir("compact-threshold-override");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let default_budget = agent.compact_threshold_chars();
+    assert!(default_budget > 64, "{default_budget}");
+
+    let chars = agent.set_compact_threshold_percent(20);
+    assert_eq!(agent.compact_threshold_override_percent(), Some(20));
+    assert_eq!(agent.compact_threshold_chars(), chars);
+    assert_eq!(chars, compact_threshold_chars_for_percent(&agent.model, 20));
+
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "x".repeat(chars + 8),
+        }],
+    });
+    assert!(agent.should_auto_compact());
+
+    agent.set_compact_threshold_auto();
+    assert_eq!(agent.compact_threshold_override(), None);
+    assert_eq!(agent.compact_threshold_chars(), default_budget);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn runtime_control_command_updates_effort_mid_run() {
+    let root = temp_test_dir("runtime-control-effort");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let mut out = Vec::new();
+
+    let handled = apply_runtime_control_command(&mut agent, "/effort high", |msg| out.push(msg));
+    assert!(handled);
+    assert_eq!(agent.thinking_effort(), ThinkingEffort::High);
+    assert!(
+        out.iter().any(|msg| msg.contains("thinking effort -> high")
+            && msg.contains("model reasoning depth")
+            && msg.contains("next model request")),
+        "{out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn runtime_control_command_updates_compact_threshold_by_percent() {
+    let root = temp_test_dir("runtime-control-compact");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let mut out = Vec::new();
+
+    let handled = apply_runtime_control_command(&mut agent, "/compact 25%", |msg| out.push(msg));
+    assert!(handled);
+    assert_eq!(agent.compact_threshold_override_percent(), Some(25));
+    assert_eq!(
+        agent.compact_threshold_chars(),
+        compact_threshold_chars_for_percent(&agent.model, 25)
+    );
+    assert!(
+        out.iter()
+            .any(|msg| msg.contains("compact threshold set to 25% ->")),
+        "{out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compaction_evidence_includes_ledger_verification_provider_health_and_tool_refs() {
+    let mut ledger = WorkLedger {
+        objective: "fix session discovery".to_string(),
+        files_changed: vec!["src/main.rs".to_string()],
+        ..Default::default()
+    };
+    ledger.verification.push(VerificationRecord {
+        name: "focused tests".to_string(),
+        command: "cargo test session_discovery".to_string(),
+        status: "passed".to_string(),
+        exit_code: Some(0),
+        duration_ms: 42,
+        artifact: Some(".wolf/artifacts/verify.json".to_string()),
+        validates: vec!["session discovery".to_string()],
+    });
+    let mut health = ProviderHealthLedger::default();
+    health.providers.insert(
+        "chatgpt".to_string(),
+        ProviderHealthState {
+            auth: "failed".to_string(),
+            last_error: Some("HTTP 401 unauthorized".to_string()),
+            retry_after: None,
+            mode: Some("chatgpt-responses".to_string()),
+            disabled_for_turn: true,
+        },
+    );
+    let msgs = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call-read".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "src/main.rs", "offset": 10, "limit": 20}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call-read", "10\tfn main()", Some(false))],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "continue implementing recommendations".to_string(),
+            }],
+        },
+    ];
+
+    let evidence = render_compaction_evidence(&msgs, &ledger, &health);
+    assert!(evidence.contains("[ledger:active]"), "{evidence}");
+    assert!(evidence.contains("focused tests: passed"), "{evidence}");
+    assert!(evidence.contains("[provider_health:active]"), "{evidence}");
+    assert!(evidence.contains("HTTP 401"), "{evidence}");
+    assert!(
+        evidence.contains("[tool:call-read] ok read_file"),
+        "{evidence}"
+    );
+    assert!(
+        evidence.contains("[intent:latest] continue implementing recommendations"),
+        "{evidence}"
+    );
+}
+
+#[test]
+fn compaction_prompt_requests_structured_resume_packet() {
+    let prompt = compaction_user_text("[user] fix compaction\n");
+    assert!(prompt.contains("Task"), "{prompt}");
+    assert!(prompt.contains("Decisions"), "{prompt}");
+    assert!(prompt.contains("Files"), "{prompt}");
+    assert!(prompt.contains("Open work"), "{prompt}");
+    assert!(prompt.contains("Recent state"), "{prompt}");
+    let evidence_prompt =
+        compaction_user_text_with_evidence("[user] hi\n", "[ledger:active]\nobjective: test");
+    assert!(
+        evidence_prompt.contains("Deterministic evidence packet"),
+        "{evidence_prompt}"
+    );
+    assert!(
+        evidence_prompt.contains("[ledger:active]"),
+        "{evidence_prompt}"
+    );
+}
+
+#[test]
+fn format_compacted_summary_mentions_retained_tool_context() {
+    let out = format_compacted_summary(
+        "Task\n- Fix compaction\n\nDecisions\n- Keep summaries structured",
+        2,
+    );
+    assert!(
+        out.contains("[prior conversation, summarized for resume]"),
+        "{out}"
+    );
+    assert!(
+        out.contains("retained 2 recent tool message(s) verbatim"),
+        "{out}"
+    );
+}
+
+#[test]
+fn build_compacted_history_keeps_resume_packet_then_retained_context_then_tail() {
+    let preserved = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            input: json!({"path": "src/main.rs"}),
+        }],
+    }];
+    let tail = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "continue now".to_string(),
+        }],
+    }];
+
+    let history = build_compacted_history(
+        "Task\n- Fix compaction\n\nDecisions\n- Preserve continuity",
+        preserved,
+        &tail,
+    );
+
+    assert_eq!(history.len(), 4);
+    match &history[0].content[0] {
+        Block::Text { text } => {
+            assert!(text.contains("Task"), "{text}");
+            assert!(text.contains("Decisions"), "{text}");
+        }
+        other => panic!("expected text summary, got {other:?}"),
+    }
+    match &history[1].content[0] {
+        Block::Text { text } => {
+            assert!(text.contains("resume packet"), "{text}");
+        }
+        other => panic!("expected assistant ack, got {other:?}"),
+    }
+    assert!(matches!(history[2].content[0], Block::ToolUse { .. }));
+    match &history[3].content[0] {
+        Block::Text { text } => assert_eq!(text, "continue now"),
+        other => panic!("expected tail text message, got {other:?}"),
+    }
+}
+
+#[test]
+fn transcript_summary_is_capped() {
+    let msgs = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "x".repeat(SUMMARY_TRANSCRIPT_CAP + 5_000),
+        }],
+    }];
+
+    let out = render_transcript_for_summary(&msgs, ContextMode::Standard);
+    assert!(out.contains("Older transcript content omitted"), "{out}");
+    assert!(out.len() < SUMMARY_TRANSCRIPT_CAP + 500, "{}", out.len());
+}
+
+#[test]
+fn session_analysis_surfaces_provenance_and_verification() {
+    let header = SessionHeader {
+        version: SESSION_FORMAT_VERSION,
+        model: "gpt-5.4".to_string(),
+        system: "sys".to_string(),
+        provenance: SessionProvenance {
+            wolf_version: "test-version".to_string(),
+            provider: "chatgpt".to_string(),
+            api_provider: ApiProvider::ChatGpt,
+            model: "gpt-5.4".to_string(),
+            thinking_effort: ThinkingEffort::XHigh,
+            system_prompt_hash: "abcdef1234567890".to_string(),
+            tool_catalog_version: TOOL_CATALOG_VERSION,
+            ..Default::default()
+        },
+        work_ledger: WorkLedger {
+            verification: vec![VerificationRecord {
+                name: "focused tests".to_string(),
+                command: "cargo test focused".to_string(),
+                status: "passed".to_string(),
+                exit_code: Some(0),
+                duration_ms: 10,
+                artifact: Some("artifact.json".to_string()),
+                validates: Vec::new(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let history = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "Fix auth retry".to_string(),
+        }],
+    }];
+    let analysis = analyze_session_history(&header, &history);
+    let rendered = render_session_analysis(Path::new("session.jsonl"), &header, &analysis);
+    assert!(rendered.contains("provider: chatgpt"), "{rendered}");
+    assert!(rendered.contains("provenance:"), "{rendered}");
+    assert!(rendered.contains("thinking_effort: xhigh"), "{rendered}");
+    assert!(rendered.contains("focused tests: passed"), "{rendered}");
+}
+
+#[test]
+fn latest_log_buffer_is_capped_and_marks_truncation() {
+    let input = format!("[1] tool_ok {}", "x".repeat(LATEST_LOG_CAP + 5_000));
+    let out = cap_latest_log_buffer(input);
+    assert!(out.len() <= LATEST_LOG_CAP, "{}", out.len());
+    assert!(out.contains("log_truncated kept latest"), "{out}");
+    assert!(out.ends_with('x'), "{out}");
+}
+
+#[test]
+fn render_limited_lines_shows_latest_entries_with_notice() {
+    let items: Vec<String> = (1..=60).map(|i| format!("session-{i:02}")).collect();
+    let out = render_limited_lines(&items, 5, true, "sessions");
+    assert!(out.contains("session-56"), "{out}");
+    assert!(out.contains("session-60"), "{out}");
+    assert!(!out.contains("session-01"), "{out}");
+    assert!(out.contains("earlier sessions omitted"), "{out}");
+}
+
+#[test]
+fn render_limited_csv_truncates_with_notice() {
+    let items: Vec<String> = (1..=60).map(|i| format!("tool-{i:02}")).collect();
+    let out = render_limited_csv(&items, 3, "(none)", "tools");
+    assert!(out.starts_with("tool-01, tool-02, tool-03"), "{out}");
+    assert!(out.contains("more tools"), "{out}");
+}
+
+#[test]
+fn summarize_call_bash_collapses_newlines() {
+    let summary = summarize_call("bash", &json!({"command": "echo one\n&& echo two"}));
+    assert!(!summary.contains('\n'), "{summary}");
+    assert!(
+        summary.starts_with("bash: echo one && echo two"),
+        "{summary}"
+    );
+}
+
+#[test]
+fn summarize_call_surfaces_invalid_tool_args() {
+    let summary = summarize_call("write_file", &json!({}));
+    assert!(summary.contains("invalid args"), "{summary}");
+    assert!(summary.contains("missing path, content"), "{summary}");
+}
+
+#[test]
+fn partial_delivery_hint_triggers_only_once_per_turn() {
+    let should_emit = orchestrator::should_emit_partial_delivery_hint(false, 1, 2, 0);
+    assert!(should_emit, "first qualifying check should emit hint");
+
+    let should_emit_again = orchestrator::should_emit_partial_delivery_hint(true, 1, 2, 0);
+    assert!(
+        !should_emit_again,
+        "once emitted in a turn, hint must not re-emit"
+    );
+}
+
+#[test]
+fn external_failure_counting_does_not_double_count_auth_failures() {
+    let mut round_external_failures = 0usize;
+
+    round_external_failures = round_external_failures
+        .saturating_add(orchestrator::external_failure_increment(false, true));
+
+    assert_eq!(
+        round_external_failures, 1,
+        "failed+auth attempt should count as exactly one external failure"
+    );
+}
+
+#[test]
+fn dedupe_cache_short_circuit_preserves_cached_error_semantics_regression() {
+    let mut cache: HashMap<String, (String, Option<bool>)> = HashMap::new();
+    cache.insert("ok-key".to_string(), ("cached success".to_string(), None));
+    cache.insert(
+        "err-key".to_string(),
+        ("cached failure".to_string(), Some(true)),
+    );
+
+    let ok = orchestrator::dedupe_cache_short_circuit(&cache, Some("ok-key"))
+        .expect("expected dedupe hit");
+    assert_eq!(ok.1, None, "success cache hit should not be marked error");
+
+    let err = orchestrator::dedupe_cache_short_circuit(&cache, Some("err-key"))
+        .expect("expected dedupe hit");
+    assert_eq!(
+        err.1,
+        Some(true),
+        "error cache hit should preserve error semantics"
+    );
+}
+
+#[test]
+fn subagent_quality_gate_requires_structured_handoff_headings() {
+    let good = "source inspected: src/main.rs\nverification run: cargo test\nfiles touched: src/main.rs\nuncertainty/open questions: none\nconfidence: high\nexact recommended edits: applied\nremaining risks: TUI manual check";
+    assert!(subagent_quality_gate_missing(good).is_empty());
+
+    let bad = "I looked around and it seems fine. No remaining risks were found.";
+    let missing = subagent_quality_gate_missing(bad);
+    assert!(missing.contains(&"source inspected"), "{missing:?}");
+    assert!(missing.contains(&"verification run"), "{missing:?}");
+    assert!(missing.contains(&"exact recommended edits"), "{missing:?}");
+    assert!(missing.contains(&"remaining risks"), "{missing:?}");
+}
+
+#[test]
+fn summarize_call_subagent_is_compact() {
+    let summary = summarize_call(
+        "subagent",
+        &json!({
+            "task": "Investigate startup latency and map blocking calls in main and tui modules",
+            "allowed_tools": ["read_file", "rg", "fd"],
+            "max_iterations": 20
+        }),
+    );
+    assert!(
+        summary.starts_with("subagent: \"Investigate startup latency"),
+        "{summary}"
+    );
+    assert!(summary.contains("tools=read_file,rg,fd"), "{summary}");
+    assert!(summary.contains("max_iter=20"), "{summary}");
+    assert!(
+        summary.chars().count() <= TOOL_SUMMARY_CHAR_CAP + 50,
+        "{summary}"
+    );
+}
+
+#[test]
+fn hooks_capture_is_capped() {
+    let root = temp_test_dir("hook-cap");
+    let hooks = Hooks {
+        pre_tool: vec![Hook {
+            tool_match: Some("*".to_string()),
+            command: "for i in {1..5000}; do printf x; done".to_string(),
+        }],
+        ..Default::default()
+    };
+
+    let out = hooks.fire("pre_tool", "read_file", &[], &root);
+    assert_eq!(out.len(), 1);
+    assert!(
+        out[0].0.contains("hook stdout capped after"),
+        "{}",
+        out[0].0
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compose_system_parts_caps_wolf_md() {
+    let root = temp_test_dir("wolf-md-cap");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("WOLF.md"),
+        "x".repeat(PROJECT_CONTEXT_CAP + 5_000),
+    )
+    .expect("write WOLF.md");
+
+    let agent = test_agent(&root);
+    let (stable, _env) = agent.compose_system_parts();
+    assert!(stable.contains("WOLF.md truncated"), "{stable}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
+    let root = temp_test_dir("compact-env-ledger");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.work_ledger.objective = "keep prompt small".to_string();
+    agent.work_ledger.pending = (0..8)
+        .map(|idx| {
+            format!(
+                "pending item with enough detail to grow the ledger {idx}: {}",
+                "x".repeat(500)
+            )
+        })
+        .collect();
+    agent.provider_health.providers.insert(
+        "chatgpt".to_string(),
+        ProviderHealthState {
+            auth: "present".to_string(),
+            mode: Some("chatgpt-responses".to_string()),
+            last_error: Some("temporary upstream error ".repeat(2000)),
+            retry_after: None,
+            disabled_for_turn: false,
+        },
+    );
+
+    let (_stable, env) = agent.compose_system_parts();
+    assert!(env.starts_with("## Environment\ncwd="), "{env}");
+    assert!(!env.contains("session_event_refs"), "{env}");
+    assert!(!env.contains("auth_source"), "{env}");
+    assert!(
+        env.contains("work ledger trimmed for prompt budget"),
+        "{env}"
+    );
+    assert!(env.contains("last_error="), "{env}");
+    assert!(
+        env.len() < 4_000,
+        "standard environment should stay compact, got {} bytes: {env}",
+        env.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn default_tool_profile_is_lean_for_prompt_budget() {
+    assert_eq!(ToolProfile::default(), ToolProfile::Lean);
+}
+
+#[test]
+fn compose_system_parts_includes_wolf_memory_md() {
+    let root = temp_test_dir("wolf-memory-md");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("WOLF.memory.md"),
+        "## Decisions\n- keep tool evidence concise",
+    )
+    .expect("write WOLF.memory.md");
+
+    let agent = test_agent(&root);
+    let (stable, _env) = agent.compose_system_parts();
+    assert!(
+        stable.contains("Persistent memory (WOLF.memory.md"),
+        "{stable}"
+    );
+    assert!(stable.contains("keep tool evidence concise"), "{stable}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn context_window_and_history_budget_are_model_aware_and_overridable() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("WOLF_CONTEXT_WINDOW");
+        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+        std::env::remove_var("WOLF_MAX_HISTORY_CHARS");
+    }
+
+    assert_eq!(model_context_window("demo-128k"), 128_000);
+    assert_eq!(
+        history_char_budget_with_override("demo-128k", None, ContextMode::Standard),
+        121_600
+    );
+    assert_eq!(
+        history_char_budget_with_override("tiny-1k", None, ContextMode::Standard),
+        HISTORY_CHAR_BUDGET_MIN
+    );
+    assert_eq!(
+        history_char_budget_with_override("huge-1m", None, ContextMode::Standard),
+        950_000
+    );
+
+    unsafe {
+        std::env::set_var("WOLF_CONTEXT_WINDOW_TOKENS", "64000");
+    }
+    assert_eq!(model_context_window("demo-128k"), 64_000);
+
+    unsafe {
+        std::env::set_var("WOLF_MAX_HISTORY_CHARS", "77777");
+    }
+    assert_eq!(
+        history_char_budget_with_override("any-model", None, ContextMode::Standard),
+        77_777
+    );
+
+    unsafe {
+        std::env::remove_var("WOLF_CONTEXT_WINDOW");
+        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+        std::env::remove_var("WOLF_MAX_HISTORY_CHARS");
+    }
+}
+
+#[test]
+fn context_window_reads_from_provider_catalog() -> Result<()> {
+    // Resolution order: env > catalog override > built-in catalog > family heuristic > 200k fallback.
+    // This test isolates the catalog path: write a providers.json with a custom
+    // provider and per-model override, then confirm model_context_window reads it.
+    let _guard = env_lock();
+    let root = temp_test_dir("ctx-window-catalog");
+    let root = std::fs::canonicalize(&root)?;
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::remove_var("WOLF_CONTEXT_WINDOW");
+        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+    }
+
+    let result = (|| -> Result<()> {
+        let mut per_model = std::collections::HashMap::new();
+        per_model.insert("special-1m-model".to_string(), 1_000_000u64);
+        let catalog = ProviderCatalog {
+            version: 1,
+            active_provider: "custom".to_string(),
+            providers: vec![ProviderProfile {
+                id: "custom".to_string(),
+                display_name: "Custom".to_string(),
+                api_provider: ApiProvider::OpenAi,
+                base_url: "https://example.invalid".to_string(),
+                default_model: "custom-default".to_string(),
+                models: vec!["custom-default".to_string(), "special-1m-model".to_string()],
+                env_vars: Vec::new(),
+                requires_api_key: false,
+                login_url: None,
+                oauth_flow: None,
+                notes: None,
+                context_window: Some(333_000),
+                model_context_windows: per_model,
+            }],
+        };
+        save_provider_catalog(&catalog)?;
+
+        // Provider-default applies for a model listed but not per-model-overridden.
+        assert_eq!(model_context_window("custom-default"), 333_000);
+        // Per-model override wins over provider default.
+        assert_eq!(model_context_window("special-1m-model"), 1_000_000);
+        // Family heuristics beat a catalog provider default when a foreign built-in model
+        // was accidentally saved under the wrong provider.
+        let mut polluted = catalog.clone();
+        polluted.providers[0].models.push("gpt-4o".to_string());
+        save_provider_catalog(&polluted)?;
+        assert_eq!(model_context_window("gpt-4o"), 128_000);
+        save_provider_catalog(&catalog)?;
+        // Env var beats the catalog.
+        unsafe {
+            std::env::set_var("WOLF_CONTEXT_WINDOW_TOKENS", "42000");
+        }
+        assert_eq!(model_context_window("custom-default"), 42_000);
+        unsafe {
+            std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+        }
+        // Model unknown to any provider falls through to heuristic + default.
+        assert_eq!(model_context_window("unknown-model"), 200_000);
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn builtin_chatgpt_profile_declares_codex_context_window() {
+    // The 272k window for Codex must come from provider profile data, not hardcoded
+    // in model_context_window(). This pins the data-driven default.
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|p| p.id == "chatgpt")
+        .expect("chatgpt profile");
+    assert_eq!(
+        profile.context_window,
+        Some(272_000),
+        "ChatGPT default context window must come from the catalog as 272k (Codex)"
+    );
+    assert_eq!(profile.default_model, "gpt-5.4");
+    // gpt-4.1 override should still be 1M via model_context_windows.
+    assert_eq!(
+        profile.model_context_windows.get("gpt-4.1").copied(),
+        Some(1_000_000)
+    );
+}
+
+#[test]
+fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("ctx-window-builtin-chatgpt");
+    let root = std::fs::canonicalize(&root)?;
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::remove_var("WOLF_CONTEXT_WINDOW");
+        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+    }
+
+    let result = {
+        assert_eq!(model_context_window("gpt-5.4"), 272_000);
+        Ok(())
+    };
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("WOLF_CONTEXT_WINDOW");
+        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn builtin_provider_merge_preserves_context_window_overrides() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|p| p.id == "chatgpt")
+        .expect("chatgpt profile");
+    let mut stored = builtin.clone();
+    stored.default_model = "gpt-5-4".to_string();
+    stored.context_window = Some(300_000);
+    stored
+        .model_context_windows
+        .insert("gpt-5-4".to_string(), 350_000);
+    stored
+        .model_context_windows
+        .insert("gpt-5.4-mini".to_string(), 180_000);
+    let merged = merge_provider_profile(builtin, stored);
+    assert_eq!(merged.default_model, "gpt-5.4");
+    assert_eq!(merged.context_window, Some(300_000));
+    assert_eq!(merged.model_context_windows.get("gpt-5.4"), Some(&350_000));
+    assert_eq!(
+        merged.model_context_windows.get("gpt-5.4-mini"),
+        Some(&180_000)
+    );
+}
+
+#[test]
+fn builtin_provider_merge_drops_foreign_builtin_models_from_non_chatgpt_profiles() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|p| p.id == "glm")
+        .expect("glm profile");
+    let mut stored = builtin.clone();
+    stored.models.push("gpt-5.4".to_string());
+    let merged = merge_provider_profile(builtin, stored);
+    assert!(!merged.models.iter().any(|m| m == "gpt-5.4"));
+}
+
+#[test]
+fn release_registered_locks_drops_files_and_registry() -> Result<()> {
+    // Hold the env_lock so parallel tests' locks aren't in the shared registry
+    // when we sweep it.
+    let _guard = env_lock();
+    let root = temp_test_dir("lock-cleanup-registry");
+    let root = std::fs::canonicalize(&root)?;
+    let lock = ProjectStateLock::acquire(&root)?;
+    let lock_path = lock.path.clone();
+    assert!(lock_path.exists());
+
+    std::mem::forget(lock);
+    release_registered_locks();
+    assert!(
+        !lock_path.exists(),
+        "lock file should be removed by registry"
+    );
+
+    let fresh = ProjectStateLock::acquire(&root)?;
+    drop(fresh);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn log_rotation_archives_when_enabled() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("log-rotation");
+    let path = root.join("latest.log");
+    // Safe: test holds a global lock around env mutation.
+    unsafe { std::env::set_var("WOLF_LOG_ARCHIVES", "3") };
+    let result = (|| -> Result<()> {
+        let big = "y".repeat(LATEST_LOG_CAP);
+        std::fs::write(&path, &big)?;
+        append_log_line(&path, "fresh-line");
+        let archive1 = path.with_extension("log.1");
+        assert!(archive1.exists(), "archive .1 should exist");
+        let after = std::fs::read_to_string(&path)?;
+        assert!(after.contains("fresh-line"), "{after}");
+        assert!(after.len() < LATEST_LOG_CAP, "current log should be small");
+        Ok(())
+    })();
+    // Safe: test holds a global lock around env mutation.
+    unsafe { std::env::remove_var("WOLF_LOG_ARCHIVES") };
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn log_rotation_defaults_to_truncation_only() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("log-no-rotation");
+    let path = root.join("latest.log");
+    // Safe: test holds a global lock around env mutation.
+    unsafe { std::env::remove_var("WOLF_LOG_ARCHIVES") };
+    std::fs::create_dir_all(&root)?;
+    let big = "y".repeat(LATEST_LOG_CAP);
+    std::fs::write(&path, &big)?;
+    append_log_line(&path, "fresh-line");
+    assert!(!path.with_extension("log.1").exists());
+    let after = std::fs::read_to_string(&path)?;
+    assert!(after.contains("log_truncated kept latest"), "{after}");
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn checkpoint_latest_session_writes_session_and_log() {
+    let _guard = env_lock();
+    let root = temp_test_dir("checkpoint-session");
+    let sessions = root.join("sessions");
+    let logs = root.join("logs");
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::set_var("WOLF_SESSIONS_DIR", &sessions);
+        std::env::set_var("WOLF_LOGS_DIR", &logs);
+    }
+
+    let result = (|| -> Result<()> {
+        let root = std::fs::canonicalize(&root)?;
+        let mut agent = test_agent(&root);
+        agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "hello".to_string(),
+            }],
+        });
+        agent.checkpoint_latest_session("test_reason");
+
+        let session_path = sessions.join("_latest.jsonl");
+        let log_path = logs.join("latest.log");
+        assert!(session_path.exists(), "missing {}", session_path.display());
+        assert!(log_path.exists(), "missing {}", log_path.display());
+        let log = std::fs::read_to_string(&log_path)?;
+        assert!(log.contains("session_checkpoint"), "{log}");
+
+        let mut session_entries: Vec<String> = std::fs::read_dir(&sessions)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let mut log_entries: Vec<String> = std::fs::read_dir(&logs)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        session_entries.sort();
+        log_entries.sort();
+        assert_eq!(session_entries, vec!["_latest.jsonl"]);
+        assert_eq!(log_entries, vec!["latest.log"]);
+        Ok(())
+    })();
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::remove_var("WOLF_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result.expect("checkpoint latest session");
+}
+
+#[test]
+fn max_concurrent_builtins_reads_env_and_defaults() {
+    let _guard = env_lock();
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::remove_var("WOLF_MAX_CONCURRENT_BUILTINS");
+    }
+    assert_eq!(max_concurrent_builtins(), 8);
+    // Safe: guarded by env_lock.
+    unsafe {
+        std::env::set_var("WOLF_MAX_CONCURRENT_BUILTINS", "3");
+    }
+    assert_eq!(max_concurrent_builtins(), 3);
+    // Safe: guarded by env_lock.
+    unsafe {
+        std::env::set_var("WOLF_MAX_CONCURRENT_BUILTINS", "0");
+    }
+    assert_eq!(
+        max_concurrent_builtins(),
+        8,
+        "zero should be rejected and fall back to default"
+    );
+    // Safe: guarded by env_lock.
+    unsafe {
+        std::env::set_var("WOLF_MAX_CONCURRENT_BUILTINS", "garbage");
+    }
+    assert_eq!(
+        max_concurrent_builtins(),
+        8,
+        "non-numeric should fall back to default"
+    );
+    // Safe: guarded by env_lock.
+    unsafe {
+        std::env::remove_var("WOLF_MAX_CONCURRENT_BUILTINS");
+    }
+}
+
+#[test]
+fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()> {
+    let root = temp_test_dir("cli-parse");
+    let task_file = root.join("task.txt");
+    std::fs::write(&task_file, "from file")?;
+
+    let opts = parse_cli_options(vec![
+        "--no-session".to_string(),
+        "--cd".to_string(),
+        root.display().to_string(),
+        "--output=stream-json".to_string(),
+        "--fork".to_string(),
+        "--budget=250k tokens".to_string(),
+        "--approval=auto-read".to_string(),
+        "--sandbox-profile=read-only".to_string(),
+        "--browser=agent-browser".to_string(),
+        "--frugal".to_string(),
+        "--context-mode=frugal".to_string(),
+        "--tool-profile=lean".to_string(),
+        format!("@{}", task_file.display()),
+        "tail".to_string(),
+    ])?;
+
+    assert!(opts.no_session);
+    assert!(opts.fork);
+    assert_eq!(opts.cd, Some(root.clone()));
+    assert_eq!(opts.output, OutputMode::StreamJson);
+    assert_eq!(opts.budget_cap.and_then(|cap| cap.tokens), Some(250_000));
+    assert_eq!(opts.approval_profile, Some(ApprovalProfile::AutoRead));
+    assert_eq!(opts.sandbox_profile, Some(SandboxProfile::ReadOnly));
+    assert_eq!(opts.browser_recipe, Some(BrowserRecipe::AgentBrowser));
+    assert_eq!(opts.context_mode, Some(ContextMode::Frugal));
+    assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
+    assert_eq!(
+        opts.positional,
+        vec!["from file".to_string(), "tail".to_string()]
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn no_session_agent_skips_checkpoints_and_state_lock() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("no-session");
+    let root = std::fs::canonicalize(&root)?;
+    let sessions = root.join("sessions");
+    let logs = root.join("logs");
+    unsafe {
+        std::env::set_var("WOLF_SESSIONS_DIR", &sessions);
+        std::env::set_var("WOLF_LOGS_DIR", &logs);
+    }
+
+    let result = {
+        let mut agent = test_agent(&root);
+        agent.session_enabled = false;
+        agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "hello".to_string(),
+            }],
+        });
+        agent.checkpoint_latest_session("no_session_test");
+        assert!(!agent.latest_session_path.exists());
+        assert!(!agent.latest_log_path.exists());
+        Ok(())
+    };
+
+    unsafe {
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::remove_var("WOLF_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn final_objective_warning_lists_unresolved_checkpoints() {
+    let objective = orchestrator::ObjectiveTracker::from_user_prompt("Implement it and test it");
+    let history = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "Implemented the change.".to_string(),
+        }],
+    }];
+    let warning = final_objective_warning(&objective, &history).expect("warning");
+    assert!(warning.contains("run verification checks"), "{warning}");
+}
+
+#[test]
+fn json_sink_serializes_agent_events() {
+    let ev = AgentEvent::ToolCallStart {
+        call_id: "call-1".to_string(),
+        name: "bash".to_string(),
+        summary: "bash: echo ok".to_string(),
+    };
+    let value = serde_json::to_value(ev).expect("serialize event");
+    assert_eq!(value["event"], "tool_call_start");
+    assert_eq!(value["data"]["name"], "bash");
+}
+
+#[test]
+fn turn_diagnostics_serializes_runtime_observability() {
+    let ev = AgentEvent::TurnDiagnostics {
+        provider: "chatgpt".to_string(),
+        api_family: "chatgpt-responses".to_string(),
+        auth_source: "auth:chatgpt".to_string(),
+        model: "gpt-5".to_string(),
+        last_retry_reason: Some("429".to_string()),
+        workaround_fired: true,
+        turn_duration_ms: Some(123),
+        context_mode: Some(ContextMode::Frugal),
+        tool_profile: Some("lean".to_string()),
+        compacted: Some(true),
+    };
+    let value = serde_json::to_value(ev).expect("serialize event");
+    assert_eq!(value["event"], "turn_diagnostics");
+    assert_eq!(value["data"]["turn_duration_ms"], 123);
+    assert_eq!(value["data"]["context_mode"], "Frugal");
+    assert_eq!(value["data"]["tool_profile"], "lean");
+    assert_eq!(value["data"]["compacted"], true);
+}
+
+#[tokio::test]
+async fn builtin_semaphore_caps_concurrency() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(3));
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let sem = sem.clone();
+        let live = live.clone();
+        let peak = peak.clone();
+        handles.push(tokio::spawn(async move {
+            let _p = sem.acquire_owned().await.unwrap();
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            live.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert!(
+        peak.load(Ordering::SeqCst) <= 3,
+        "peak concurrency {} exceeded cap 3",
+        peak.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn tokens_report_highlights_largest_messages() {
+    let hist = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "short".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "x".repeat(8000),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("id1", &"y".repeat(4000), None)],
+        },
+    ];
+    let report = render_tokens_report(&hist);
+    assert!(report.contains("approx tokens in history:"), "{report}");
+    assert!(report.contains("top hogs:"), "{report}");
+    assert!(report.contains("[1] assistant"), "{report}");
+    assert!(report.contains("[2] user"), "{report}");
+    let big_idx = report.find("[1] assistant").unwrap();
+    let mid_idx = report.find("[2] user").unwrap();
+    assert!(
+        big_idx < mid_idx,
+        "largest message should come first: {report}"
+    );
+}
+
+#[test]
+fn jittered_backoff_respects_range_and_varies() {
+    for base in [1u64, 2, 4, 8, 30] {
+        let half = base / 2;
+        let samples: Vec<u64> = (0..64).map(|_| jittered_backoff_secs(base)).collect();
+        for &w in &samples {
+            assert!(
+                w >= half.max(1) || (base == 1 && w >= 1),
+                "base={base} wait={w} below half={half}"
+            );
+            assert!(w <= base, "base={base} wait={w} exceeds base");
+        }
+        if base > 2 {
+            let min_seen = samples.iter().copied().min().unwrap();
+            let max_seen = samples.iter().copied().max().unwrap();
+            assert!(
+                max_seen > min_seen,
+                "jitter produced constant value for base={base}: {samples:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checkpoint_debounce_skips_rapid_non_critical_writes() {
+    let _guard = env_lock();
+    let root = temp_test_dir("checkpoint-debounce");
+    let sessions = root.join("sessions");
+    let logs = root.join("logs");
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::set_var("WOLF_SESSIONS_DIR", &sessions);
+        std::env::set_var("WOLF_LOGS_DIR", &logs);
+        std::env::set_var("WOLF_CHECKPOINT_DEBOUNCE_MS", "10000");
+    }
+
+    let result = (|| -> Result<()> {
+        let root = std::fs::canonicalize(&root)?;
+        let mut agent = test_agent(&root);
+        agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "first".to_string(),
+            }],
+        });
+        agent.checkpoint_latest_session("after_tool_results");
+
+        let session_path = sessions.join("_latest.jsonl");
+        let after_first = std::fs::read_to_string(&session_path)?;
+        assert!(after_first.contains("first"), "{after_first}");
+
+        agent.history.push(Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "second".to_string(),
+            }],
+        });
+        agent.checkpoint_latest_session("after_tool_results");
+        let after_second = std::fs::read_to_string(&session_path)?;
+        assert!(
+            !after_second.contains("second"),
+            "rapid non-critical checkpoint should have been debounced: {after_second}"
+        );
+
+        agent.checkpoint_latest_session("after_compact");
+        let after_critical = std::fs::read_to_string(&session_path)?;
+        assert!(
+            after_critical.contains("second"),
+            "critical reason must bypass debounce: {after_critical}"
+        );
+        Ok(())
+    })();
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::remove_var("WOLF_LOGS_DIR");
+        std::env::remove_var("WOLF_CHECKPOINT_DEBOUNCE_MS");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result.expect("checkpoint debounce");
+}
+
+#[test]
+fn suppressed_checkpoints_do_not_clobber_parent_session() {
+    let _guard = env_lock();
+    let root = temp_test_dir("subagent-no-clobber");
+    let sessions = root.join("sessions");
+    // Safe: test holds a global lock around env mutation.
+    unsafe { std::env::set_var("WOLF_SESSIONS_DIR", &sessions) };
+
+    let result = (|| -> Result<()> {
+        let root_canon = std::fs::canonicalize(&root)?;
+        let session_path = sessions.join("_latest.jsonl");
+
+        let mut parent = test_agent(&root_canon);
+        parent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "parent-message".to_string(),
+            }],
+        });
+        parent.checkpoint_latest_session("parent_write");
+        let written = std::fs::read_to_string(&session_path)?;
+        assert!(written.contains("parent-message"), "{written}");
+
+        let mut sub = test_agent(&root_canon);
+        sub.suppress_checkpoints = true;
+        sub.latest_session_path = parent.latest_session_path.clone();
+        sub.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "subagent-message".to_string(),
+            }],
+        });
+        sub.checkpoint_latest_session("sub_should_noop");
+
+        let after_sub = std::fs::read_to_string(&session_path)?;
+        assert!(
+            after_sub.contains("parent-message"),
+            "parent session was clobbered by subagent: {after_sub}"
+        );
+        assert!(
+            !after_sub.contains("subagent-message"),
+            "subagent leaked into parent session: {after_sub}"
+        );
+        Ok(())
+    })();
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe { std::env::remove_var("WOLF_SESSIONS_DIR") };
+    let _ = std::fs::remove_dir_all(&root);
+    result.expect("subagent checkpoint suppression");
+}
+
+#[test]
+fn sse_scan_handles_mixed_lf_and_crlf_delimiters() {
+    let mut stream = Vec::new();
+    stream.extend_from_slice(b"event: content_block_delta\n");
+    stream.extend_from_slice(b"data: {\"n\":1}\n\n");
+    stream.extend_from_slice(b"event: content_block_delta\r\n");
+    stream.extend_from_slice(b"data: {\"n\":2}\r\n\r\n");
+    stream.extend_from_slice(b"event: message_stop\n");
+    stream.extend_from_slice(b"data: {}\n\n");
+
+    let mut recovered: Vec<Value> = Vec::new();
+    let mut buf: Vec<u8> = stream;
+    while let Some((event_text, consumed)) = next_sse_event(&buf) {
+        for line in event_text.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                let rest = rest.trim_start();
+                if let Ok(v) = serde_json::from_str::<Value>(rest) {
+                    recovered.push(v);
+                }
+            }
+        }
+        buf.drain(..consumed);
+    }
+    assert_eq!(recovered.len(), 3, "got {recovered:?}");
+    assert_eq!(recovered[0]["n"], 1);
+    assert_eq!(recovered[1]["n"], 2);
+    assert!(buf.is_empty(), "trailing {:?}", buf);
+}
+
+#[tokio::test]
+async fn bash_tool_honors_input_timeout() {
+    let root = temp_test_dir("bash-input-timeout");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let err = execute_builtin_call(
+        "bash".to_string(),
+        json!({"command": "sleep 2", "timeout": 1}),
+        root.clone(),
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await
+    .expect_err("expected input timeout");
+    assert!(err.contains("timed out after 1s running bash"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn process_output_warns_on_suspicious_stderr_with_success_status() {
+    let out = format_process_output(
+        "ok\n".to_string(),
+        "bash: line 1: nope: command not found\n".to_string(),
+        0,
+    )
+    .expect("status 0 still returns output");
+    assert!(
+        out.contains("command exited 0 but stderr contains"),
+        "{out}"
+    );
+    assert!(out.contains("command not found"), "{out}");
+}
+
+#[test]
+fn git_diff_tool_builds_correct_args() {
+    let root = temp_test_dir("git-diff-args");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let out = execute_tool(
+        "git_diff",
+        &json!({"staged": true, "path": "src/main.rs"}),
+        &root,
+    );
+    let err = out.expect_err("expected git to fail in temp dir without repo");
+    assert!(err.contains("git"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn git_log_tool_builds_correct_args() {
+    let root = temp_test_dir("git-log-args");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let out = execute_tool("git_log", &json!({"count": 5, "oneline": true}), &root);
+    let err = out.expect_err("expected git to fail in temp dir without repo");
+    assert!(err.contains("git"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn edit_file_returns_diff_and_summary() {
+    let root = temp_test_dir("edit-file-diff");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let path = root.join("note.txt");
+    std::fs::write(&path, "hello\nworld\n").unwrap();
+
+    let out = execute_tool(
+        "edit_file",
+        &json!({"path": "note.txt", "old_string": "world", "new_string": "wolf"}),
+        &root,
+    )
+    .expect("edit_file should succeed");
+
+    assert!(out.contains("@@"), "{out}");
+    assert!(out.contains("-world"), "{out}");
+    assert!(out.contains("+wolf"), "{out}");
+    assert!(out.contains("edited "), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn multi_edit_returns_diff_and_summary() {
+    let root = temp_test_dir("multi-edit-diff");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let path = root.join("note.txt");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+    let out = execute_tool(
+        "multi_edit",
+        &json!({
+            "path": "note.txt",
+            "edits": [
+                {"old_string": "alpha", "new_string": "ALPHA"},
+                {"old_string": "gamma", "new_string": "GAMMA"}
+            ]
+        }),
+        &root,
+    )
+    .expect("multi_edit should succeed");
+
+    assert!(out.contains("@@"), "{out}");
+    assert!(out.contains("-alpha"), "{out}");
+    assert!(out.contains("+ALPHA"), "{out}");
+    assert!(out.contains("-gamma"), "{out}");
+    assert!(out.contains("+GAMMA"), "{out}");
+    assert!(out.contains("applied 2 edits to"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn todo_write_creates_and_todo_read_returns() {
+    let root = temp_test_dir("todo-roundtrip");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let write_result = execute_tool(
+        "todo_write",
+        &json!({
+            "todos": [
+                {"text": "Implement feature X", "status": "in_progress"},
+                {"text": "Write tests", "status": "pending"},
+                {"text": "Update docs", "status": "completed"}
+            ]
+        }),
+        &root,
+    );
+    assert!(
+        write_result.is_ok(),
+        "todo_write failed: {:?}",
+        write_result
+    );
+    let msg = write_result.unwrap();
+    assert!(msg.contains("► Implement feature X [in_progress]"), "{msg}");
+    assert!(msg.contains("○ Write tests [pending]"), "{msg}");
+    assert!(msg.contains("✓ Update docs [completed]"), "{msg}");
+    assert!(
+        msg.contains("1 pending, 1 in progress, 1 completed"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("delta: +1 pending · +1 in_progress · +1 completed"),
+        "{msg}"
+    );
+
+    let read_result = execute_tool("todo_read", &json!({}), &root);
+    assert!(read_result.is_ok(), "todo_read failed: {:?}", read_result);
+    let content = read_result.unwrap();
+    assert!(content.contains("Implement feature X"), "{content}");
+    assert!(content.contains("Write tests"), "{content}");
+    assert!(content.contains("Update docs"), "{content}");
+    assert!(content.contains("1 pending"), "{content}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn todo_write_reports_status_delta_against_existing_list() {
+    let root = temp_test_dir("todo-delta");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    execute_tool(
+        "todo_write",
+        &json!({
+            "todos": [
+                {"text": "Plan", "status": "pending"},
+                {"text": "Code", "status": "pending"}
+            ]
+        }),
+        &root,
+    )
+    .unwrap();
+
+    let msg = execute_tool(
+        "todo_write",
+        &json!({
+            "todos": [
+                {"text": "Plan", "status": "completed"},
+                {"text": "Code", "status": "in_progress"},
+                {"text": "Verify", "status": "pending"}
+            ]
+        }),
+        &root,
+    )
+    .unwrap();
+
+    assert!(
+        msg.contains("1 pending, 1 in progress, 1 completed"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("delta: -1 pending · +1 in_progress · +1 completed"),
+        "{msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn todo_read_returns_empty_when_no_file() {
+    let root = temp_test_dir("todo-empty");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let result = execute_tool("todo_read", &json!({}), &root).unwrap();
+    assert!(result.contains("no todos"), "{result}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn todo_write_rejects_invalid_status() {
+    let root = temp_test_dir("todo-bad-status");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let result = execute_tool(
+        "todo_write",
+        &json!({
+            "todos": [{"text": "test", "status": "bogus"}]
+        }),
+        &root,
+    );
+    assert!(result.is_err(), "expected error for invalid status");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn api_provider_detects_openai_base_url() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::set_var("WOLF_API_PROVIDER", "");
+    }
+
+    unsafe {
+        std::env::set_var("ANTHROPIC_BASE_URL", "http://localhost:11434/v1");
+    }
+    assert_eq!(ApiProvider::from_env(), ApiProvider::OpenAi);
+
+    unsafe {
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://api.openai.com/v1");
+    }
+    assert_eq!(ApiProvider::from_env(), ApiProvider::OpenAi);
+
+    unsafe {
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    }
+    assert_eq!(ApiProvider::from_env(), ApiProvider::Anthropic);
+
+    unsafe {
+        std::env::set_var("WOLF_API_PROVIDER", "openai");
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    }
+    assert_eq!(ApiProvider::from_env(), ApiProvider::OpenAi);
+
+    unsafe {
+        std::env::remove_var("WOLF_API_PROVIDER");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+}
+
+#[test]
+fn git_tools_are_parallel_safe_and_read_only() {
+    assert!(is_parallel_safe_tool("git_diff"));
+    assert!(is_parallel_safe_tool("git_log"));
+    assert!(is_parallel_safe_tool("todo_read"));
+    assert!(!is_parallel_safe_tool("git_commit"));
+    assert!(!is_parallel_safe_tool("todo_write"));
+}
+
+#[test]
+fn new_tools_in_correct_permission_category() {
+    assert!(needs_permission("git_commit"));
+    assert!(needs_permission("todo_write"));
+    assert!(!needs_permission("git_diff"));
+    assert!(!needs_permission("git_log"));
+    assert!(!needs_permission("todo_read"));
+}
+
+#[test]
+fn runtime_provider_reroutes_away_from_stale_cross_provider_default_model() -> Result<()> {
+    // Reproduces the live bug: an older build saved `glm-5.1` as chatgpt's
+    // default_model (via `/model glm-5.1` without provider switch). On startup
+    // with chatgpt active, resolve_runtime_provider used to return
+    // (chatgpt, glm-5.1), and the first turn 400'd with "The 'glm-5.1' model
+    // is not supported when using Codex with a ChatGPT account." After the
+    // fix, resolve_runtime_provider must auto-reroute to the glm provider
+    // (authenticated) since it owns glm-5.1 in its models[] list.
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-stale-default-reroute");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::remove_var("WOLF_PROVIDER");
+        std::env::remove_var("WOLF_MODEL");
+        std::env::remove_var("WOLF_MODEL_CHATGPT");
+        std::env::remove_var("WOLF_MODEL_GLM");
+        std::env::remove_var("WOLF_MODEL_FORCE");
+    }
+
+    let result = (|| -> Result<()> {
+        // Seed: both providers authenticated, chatgpt active, chatgpt's
+        // default_model stale-set to a glm model.
+        let mut catalog = load_provider_catalog()?;
+        catalog.active_provider = "chatgpt".to_string();
+        for profile in &mut catalog.providers {
+            if canonical_provider_id(&profile.id) == "chatgpt" {
+                profile.default_model = "glm-5.1".to_string();
+            }
+        }
+        save_provider_catalog(&catalog)?;
+
+        let mut store = load_auth_store()?;
+        store.providers.insert(
+            "chatgpt".to_string(),
+            StoredCredential::ApiKey {
+                key: "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string(),
+            },
+        );
+        store.providers.insert(
+            "glm".to_string(),
+            StoredCredential::ApiKey {
+                key: "glm-test-key".to_string(),
+            },
+        );
+        save_auth_store(&store)?;
+
+        let resolved = resolve_runtime_provider(None, false)?;
+        assert_eq!(
+            resolved.profile.id, "glm",
+            "expected auto-reroute to glm when stale default_model belongs there"
+        );
+        assert_eq!(resolved.model, "glm-5.1");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn runtime_provider_allows_missing_key_when_requested() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-missing-key");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("WOLF_PROVIDER", "glm");
+        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("ZAI_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let loose = resolve_runtime_provider(None, false)?;
+        assert_eq!(loose.profile.id, "glm");
+        assert!(loose.requires_api_key);
+        assert!(loose.api_key.is_empty());
+        assert!(resolve_runtime_provider(None, true).is_err());
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("WOLF_PROVIDER");
+        std::env::remove_var("ZAI_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn global_model_override_respects_provider_compatibility() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-model-compat");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("WOLF_PROVIDER", "chatgpt");
+        std::env::set_var("WOLF_MODEL", "glm-5.1");
+        std::env::remove_var("WOLF_MODEL_CHATGPT");
+        std::env::remove_var("WOLF_MODEL_FORCE");
+    }
+
+    let result = (|| -> Result<()> {
+        let resolved = resolve_runtime_provider(None, false)?;
+        assert_eq!(resolved.profile.id, "chatgpt");
+        assert_eq!(resolved.model, "gpt-5.4");
+
+        unsafe {
+            std::env::set_var("WOLF_MODEL_CHATGPT", "gpt-4o");
+        }
+        let resolved_with_provider_override = resolve_runtime_provider(None, false)?;
+        assert_eq!(resolved_with_provider_override.model, "gpt-4o");
+
+        unsafe {
+            std::env::remove_var("WOLF_MODEL_CHATGPT");
+            std::env::set_var("WOLF_MODEL_FORCE", "1");
+        }
+        let resolved_forced = resolve_runtime_provider(None, false)?;
+        assert_eq!(resolved_forced.model, "glm-5.1");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("WOLF_PROVIDER");
+        std::env::remove_var("WOLF_MODEL");
+        std::env::remove_var("WOLF_MODEL_CHATGPT");
+        std::env::remove_var("WOLF_MODEL_FORCE");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn provider_default_model_persists_and_is_listed() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-default-model");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        set_provider_default_model_in_catalog("glm", "glm-5.9")?;
+        let catalog = load_provider_catalog()?;
+        let glm = find_provider_profile(&catalog, "glm").context("glm profile")?;
+        assert_eq!(glm.default_model, "glm-5.9");
+        assert!(glm.models.iter().any(|m| m == "glm-5.9"));
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn chatgpt_default_model_is_normalized_when_saved() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-chatgpt-model-normalize");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        set_provider_default_model_in_catalog("chatgpt", "gpt-4o")?;
+        let catalog = load_provider_catalog()?;
+        let chatgpt = find_provider_profile(&catalog, "chatgpt").context("chatgpt profile")?;
+        assert_eq!(chatgpt.default_model, "gpt-4o");
+        assert!(chatgpt.models.iter().any(|m| m == "gpt-4o"));
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stale_chatgpt_catalog_entry_is_upgraded_on_load() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-chatgpt-catalog-upgrade");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let path = provider_catalog_path();
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "active_provider": "chatgpt",
+  "providers": [
+{
+  "id": "chatgpt",
+  "display_name": "ChatGPT",
+  "api_provider": "chatgpt",
+  "base_url": "https://chatgpt.com/backend-api",
+  "default_model": "gpt-4o",
+  "models": ["gpt-4o"],
+  "env_vars": ["CHATGPT_ACCESS_TOKEN"],
+  "requires_api_key": true,
+  "login_url": "https://chatgpt.com/auth/login",
+  "notes": "old note"
+}
+  ]
+}"#,
+        )?;
+
+        let catalog = load_provider_catalog()?;
+        let chatgpt = find_provider_profile(&catalog, "chatgpt").context("chatgpt profile")?;
+        assert_eq!(resolve_active_provider_id(&catalog), "chatgpt");
+        assert_eq!(chatgpt.default_model, "gpt-4o");
+        assert!(chatgpt.models.iter().any(|m| m == "gpt-4o"));
+        assert_eq!(chatgpt.login_url.as_deref(), Some("https://chatgpt.com"));
+        assert!(
+            chatgpt
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.contains("OAuth"))
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-prune-legacy-builtin");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let path = provider_catalog_path();
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "active_provider": "openai",
+  "providers": [
+{"id":"openai","display_name":"OpenAI","api_provider":"openai","base_url":"https://api.openai.com","default_model":"gpt-5","models":["gpt-5"],"env_vars":["OPENAI_API_KEY"],"requires_api_key":true},
+{"id":"anthropic","display_name":"Anthropic","api_provider":"anthropic","base_url":"https://api.anthropic.com","default_model":"claude-sonnet-4-5","models":["claude-sonnet-4-5"],"env_vars":["ANTHROPIC_API_KEY"],"requires_api_key":true},
+{"id":"openrouter","display_name":"OpenRouter","api_provider":"openai","base_url":"https://openrouter.ai/api/v1","default_model":"openai/gpt-4.1-mini","models":["openai/gpt-4.1-mini"],"env_vars":["OPENROUTER_API_KEY"],"requires_api_key":true},
+{"id":"ollama","display_name":"Ollama","api_provider":"openai","base_url":"http://localhost:11434/v1","default_model":"qwen2.5-coder:latest","models":["qwen2.5-coder:latest"],"env_vars":[],"requires_api_key":false}
+  ]
+}"#,
+        )?;
+
+        let catalog = load_provider_catalog()?;
+        let ids = catalog
+            .providers
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["glm", "chatgpt"]);
+        assert_eq!(resolve_active_provider_id(&catalog), "glm");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn auth_store_reads_legacy_provider_map() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("auth-legacy-map");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let path = auth_store_path();
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(&path, r#"{"openai":{"type":"api_key","key":"legacy-key"}}"#)?;
+
+        let store = load_auth_store()?;
+        let profile = ProviderProfile {
+            id: "openai".to_string(),
+            display_name: "OpenAI API".to_string(),
+            api_provider: ApiProvider::OpenAi,
+            base_url: "https://api.openai.com".to_string(),
+            default_model: "gpt-5".to_string(),
+            models: vec!["gpt-5".to_string()],
+            env_vars: vec!["OPENAI_API_KEY".to_string()],
+            requires_api_key: true,
+            login_url: None,
+            oauth_flow: None,
+            notes: None,
+            context_window: None,
+            model_context_windows: HashMap::new(),
+        };
+        let (key, source) = resolve_provider_api_key(&profile, &store).context("resolve key")?;
+        assert_eq!(key, "legacy-key");
+        assert_eq!(source, "auth:openai");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn login_imports_env_key_and_reuses_stored_key() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("login-import-env");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("ZAI_API_KEY", "env-glm-key");
+        std::env::remove_var("WOLF_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let msg = login_provider_with_key(Some("glm"), None, false)?;
+        assert!(msg.contains("imported credentials"), "{msg}");
+
+        let store = load_auth_store()?;
+        let entry = store
+            .providers
+            .get("glm")
+            .context("missing glm credentials in auth store")?;
+        let key = entry
+            .resolve_secret()
+            .context("unresolved glm credential")?;
+        assert_eq!(key, "env-glm-key");
+
+        unsafe {
+            std::env::remove_var("ZAI_API_KEY");
+        }
+        let msg2 = login_provider_with_key(Some("glm"), None, false)?;
+        assert!(msg2.contains("already authenticated"), "{msg2}");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("ZAI_API_KEY");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn provider_selector_accepts_index_and_id() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-selector");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let first = provider_id_from_selector(&catalog, "1")?;
+        assert_eq!(first, canonical_provider_id(&catalog.providers[0].id));
+        assert_eq!(provider_id_from_selector(&catalog, "chatgpt")?, "chatgpt");
+        assert!(provider_id_from_selector(&catalog, "999").is_err());
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-model-selection-auth");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let mut store = load_auth_store()?;
+        store.providers.insert(
+            "chatgpt".to_string(),
+            StoredCredential::ApiKey {
+                key: "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string(),
+            },
+        );
+        store.providers.insert(
+            "glm".to_string(),
+            StoredCredential::ApiKey {
+                key: "glm-test-key".to_string(),
+            },
+        );
+        save_auth_store(&store)?;
+
+        let selection = resolve_provider_model_selection(&catalog, &store, "glm", "gpt-4o")?;
+        assert_eq!(selection.provider_id, "chatgpt");
+        assert_eq!(selection.model, "gpt-4o");
+
+        let compact = resolve_provider_model_selection(&catalog, &store, "glm", "gpt5.3codex")?;
+        assert_eq!(compact.provider_id, "chatgpt");
+        assert_eq!(compact.model, "gpt-5.3-codex");
+
+        let glm = resolve_provider_model_selection(&catalog, &store, "chatgpt", "glm 5.1")?;
+        assert_eq!(glm.provider_id, "glm");
+        assert_eq!(glm.model, "glm-5.1");
+
+        let explicit =
+            resolve_provider_model_selection(&catalog, &store, "glm", "chatgpt/gpt-5-4")?;
+        assert_eq!(explicit.provider_id, "chatgpt");
+        assert_eq!(explicit.model, "gpt-5.4");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn list_models_for_available_providers_shows_authenticated_sections() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("models-all-authenticated");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let mut store = load_auth_store()?;
+        store.providers.insert(
+            "glm".to_string(),
+            StoredCredential::ApiKey {
+                key: "glm-test-key".to_string(),
+            },
+        );
+        store.providers.insert(
+            "chatgpt".to_string(),
+            StoredCredential::ApiKey {
+                key: "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string(),
+            },
+        );
+        save_auth_store(&store)?;
+
+        let rendered = list_models_for_available_providers(&catalog, &store, "glm")?;
+        assert!(rendered.contains("* provider 'glm' models:"), "{rendered}");
+        assert!(
+            rendered.contains("provider 'chatgpt' models:"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("- glm-4.6"), "{rendered}");
+        assert!(rendered.contains("- gpt-4o"), "{rendered}");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn auth_store_parses_oauth_access_shape() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("auth-oauth-shape");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let path = auth_store_path();
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(
+            &path,
+            r#"{"chatgpt":{"type":"oauth","access":"access-token","refresh":"refresh-token","expires":4102444800}}"#,
+        )?;
+
+        let store = load_auth_store()?;
+        let profile = find_provider_profile(&load_provider_catalog()?, "chatgpt")
+            .context("missing chatgpt profile")?;
+        let (secret, source) =
+            resolve_provider_api_key(&profile, &store).context("resolve oauth")?;
+        assert_eq!(secret, "access-token");
+        assert_eq!(source, "auth:chatgpt");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("login-chatgpt-pi-auth");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("HOME", &root);
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("WOLF_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let pi_auth = PathBuf::from(&root).join(".pi/agent/auth.json");
+        std::fs::create_dir_all(pi_auth.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(
+            &pi_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"pi-codex-token","refresh":"rr","expires":4102444800}}"#,
+        )?;
+
+        let login = login_provider(Some("chatgpt"), Some("import"), false)?;
+        assert!(!login.awaiting_credentials);
+        assert!(
+            login.message.contains("imported credentials"),
+            "{}",
+            login.message
+        );
+        assert!(
+            login.message.contains("pi-auth:openai-codex"),
+            "{}",
+            login.message
+        );
+
+        let store = load_auth_store()?;
+        let entry = store
+            .providers
+            .get("chatgpt")
+            .context("missing chatgpt credential")?;
+        let secret = entry.resolve_secret().context("missing secret")?;
+        assert_eq!(secret, "pi-codex-token");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("HOME");
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn login_chatgpt_default_mode_now_uses_pi_auth_import() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("login-chatgpt-default-mode");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("HOME", &root);
+        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("WOLF_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let pi_auth = PathBuf::from(&root).join(".pi/agent/auth.json");
+        std::fs::create_dir_all(pi_auth.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(
+            &pi_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"pi-codex-token","refresh":"rr","expires":4102444800}}"#,
+        )?;
+
+        let login = login_provider(Some("chatgpt"), None, false)?;
+        assert!(!login.awaiting_credentials);
+        assert!(
+            login.message.contains("imported credentials"),
+            "{}",
+            login.message
+        );
+
+        let store = load_auth_store()?;
+        assert!(store.providers.contains_key("chatgpt"));
+
+        let catalog = load_provider_catalog()?;
+        assert_eq!(resolve_active_provider_id(&catalog), "chatgpt");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("HOME");
+        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn login_web_mode_skips_pi_auth_import() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("login-chatgpt-web-mode");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("HOME", &root);
+        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("WOLF_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let pi_auth = PathBuf::from(&root).join(".pi/agent/auth.json");
+        std::fs::create_dir_all(pi_auth.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(
+            &pi_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"pi-codex-token","refresh":"rr","expires":4102444800}}"#,
+        )?;
+
+        let login = login_provider(Some("chatgpt"), Some("web"), false)?;
+        assert!(login.awaiting_credentials);
+        assert!(
+            login.message.contains("browser open disabled")
+                || login.message.contains("opened ChatGPT in your browser"),
+            "{}",
+            login.message
+        );
+        assert!(
+            !login.message.contains("imported credentials"),
+            "{}",
+            login.message
+        );
+
+        let store = load_auth_store()?;
+        assert!(!store.providers.contains_key("chatgpt"));
+
+        let catalog = load_provider_catalog()?;
+        assert_eq!(resolve_active_provider_id(&catalog), "chatgpt");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("HOME");
+        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn chatgpt_oauth_authorize_url_uses_wolf_originator_by_default() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("login-chatgpt-originator-default");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("HOME", &root);
+        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
+        std::env::remove_var("WOLF_OAUTH_ORIGINATOR");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("WOLF_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let login = login_provider(Some("chatgpt"), Some("web"), false)?;
+        assert!(login.awaiting_credentials);
+        assert!(
+            login.message.contains("originator=wolf"),
+            "{}",
+            login.message
+        );
+        assert!(
+            !login.message.contains("originator=pi"),
+            "{}",
+            login.message
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("HOME");
+        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
+        std::env::remove_var("WOLF_OAUTH_ORIGINATOR");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("WOLF_API_KEY");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn oauth_code_parser_accepts_callback_url_and_plain_authorization_code() {
+    let callback = "http://localhost:1455/auth/callback?code=ac_test_code.abc123&state=deadbeef";
+    assert_eq!(
+        extract_oauth_code_from_callback(callback).as_deref(),
+        Some("ac_test_code.abc123")
+    );
+
+    assert_eq!(
+        extract_oauth_code_from_callback("ac_test_code.abc123").as_deref(),
+        Some("ac_test_code.abc123")
+    );
+
+    assert!(extract_oauth_code_from_callback("sk-proj-123").is_none());
+}
+
+#[test]
+fn login_chatgpt_authorization_code_uses_oauth_completion_path() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("login-chatgpt-authorization-code");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = {
+        for code in ["ac_test_code.abc123", "tmp_manual_code_123456"] {
+            let err = login_provider(Some("chatgpt"), Some(code), false)
+                .expect_err("authorization code should require pending OAuth state");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("no pending OAuth session found"),
+                "unexpected error for {code}: {msg}"
+            );
+            assert!(
+                !msg.contains("invalid ChatGPT access token format"),
+                "authorization code must not be validated as JWT for {code}: {msg}"
+            );
+        }
+        Ok(())
+    };
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn oauth_exchange_failure_stays_retryable() {
+    let message = oauth_exchange_failure_result_message(
+        "chatgpt",
+        "If the browser callback doesn't auto-complete, paste the callback URL.",
+    );
+    assert!(message.contains("OAuth token exchange failed"), "{message}");
+    assert!(
+        message.contains("paste the callback URL or authorization code into wolf to retry"),
+        "{message}"
+    );
+}
+
+#[test]
+fn chatgpt_oauth_defaults_match_pi_flow() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("chatgpt-oauth-defaults");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let chatgpt = find_provider_profile(&catalog, "chatgpt").context("chatgpt profile")?;
+        let oauth = chatgpt.oauth_flow.context("missing chatgpt oauth flow")?;
+        assert_eq!(oauth.scope, "openid profile email offline_access");
+        assert_eq!(
+            oauth.redirect_uri.as_deref(),
+            Some("http://localhost:1455/auth/callback")
+        );
+        assert_eq!(oauth.callback_host.as_deref(), Some("127.0.0.1"));
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn chatgpt_oauth_callback_host_env_override_is_respected() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("chatgpt-oauth-callback-host-override");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
+        std::env::set_var("WOLF_OAUTH_CALLBACK_HOST", "256.0.0.1");
+    }
+
+    let result = (|| -> Result<()> {
+        let login = login_provider(Some("chatgpt"), Some("web"), false)?;
+        assert!(login.awaiting_credentials);
+        assert!(
+            login.message.contains("256.0.0.1:1455"),
+            "{}",
+            login.message
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
+        std::env::remove_var("WOLF_OAUTH_CALLBACK_HOST");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn login_chatgpt_accepts_access_token_json_and_rejects_api_key() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("login-chatgpt-access-token");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let invalid = login_provider(Some("chatgpt"), Some("sk-test-key-1234567890abcdef"), false)
+            .expect_err("platform api key should be rejected for chatgpt provider");
+        assert!(
+            format!("{invalid:#}").contains("invalid ChatGPT access token format"),
+            "{invalid:#}"
+        );
+
+        let jwt = r#"{"accessToken":"eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature"}"#;
+        let login = login_provider(Some("chatgpt"), Some(jwt), false)?;
+        assert!(!login.awaiting_credentials);
+        assert!(
+            login.message.contains("provider 'chatgpt'"),
+            "{}",
+            login.message
+        );
+
+        let store = load_auth_store()?;
+        let entry = store
+            .providers
+            .get("chatgpt")
+            .context("missing chatgpt credential")?;
+        let secret = entry.resolve_secret().context("missing secret")?;
+        assert_eq!(
+            secret,
+            "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature"
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn slash_logout_ignores_extra_words_after_provider() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("slash-logout-chatgpt-web");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let mut catalog = load_provider_catalog()?;
+        catalog.active_provider = "chatgpt".to_string();
+        save_provider_catalog(&catalog)?;
+
+        let mut store = load_auth_store()?;
+        store.providers.insert(
+            "chatgpt".to_string(),
+            StoredCredential::ApiKey {
+                key: "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string(),
+            },
+        );
+        save_auth_store(&store)?;
+
+        let mut agent = test_agent(&root);
+        agent.reload_provider(Some("chatgpt"), false)?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_sink(Box::new(ChannelSink { tx }));
+
+        assert_eq!(handle_slash("/logout chatgpt web", &mut agent), Some(true));
+
+        let mut slash = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::Slash(msg) = event {
+                slash = msg;
+            }
+        }
+        assert!(
+            slash.contains("removed stored credentials for provider 'chatgpt'"),
+            "{slash}"
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn handle_slash_model_switches_provider_when_model_belongs_elsewhere() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("slash-model-cross-provider");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let mut store = load_auth_store()?;
+        store.providers.insert(
+            "chatgpt".to_string(),
+            StoredCredential::ApiKey {
+                key: "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string(),
+            },
+        );
+        store.providers.insert(
+            "glm".to_string(),
+            StoredCredential::ApiKey {
+                key: "glm-test-key".to_string(),
+            },
+        );
+        save_auth_store(&store)?;
+
+        let mut agent = test_agent(&root);
+        agent.reload_provider(Some("glm"), false)?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.set_sink(Box::new(ChannelSink { tx }));
+
+        assert_eq!(handle_slash("/model gpt-4o", &mut agent), Some(true));
+        assert_eq!(agent.provider_id, "chatgpt");
+        assert_eq!(agent.model, "gpt-4o");
+
+        let mut slash = String::new();
+        let mut diagnostics = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::Slash(msg) => slash = msg,
+                AgentEvent::TurnDiagnostics {
+                    provider, model, ..
+                } => {
+                    diagnostics = Some((provider, model));
+                }
+                _ => {}
+            }
+        }
+        assert!(slash.contains("provider -> chatgpt"), "{slash}");
+        assert_eq!(
+            diagnostics,
+            Some(("chatgpt".to_string(), "gpt-4o".to_string()))
+        );
+
+        assert_eq!(handle_slash("/model glm 5.1", &mut agent), Some(true));
+        assert_eq!(agent.provider_id, "glm");
+        assert_eq!(agent.model, "glm-5.1");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn slash_model_pins_runtime_model_against_global_override() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("slash-model-runtime-pin");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("WOLF_PROVIDER", "chatgpt");
+        std::env::set_var("WOLF_MODEL", "glm-5.1");
+        std::env::set_var("WOLF_MODEL_FORCE", "1");
+    }
+
+    let result = (|| -> Result<()> {
+        let mut store = load_auth_store()?;
+        store.providers.insert(
+            "chatgpt".to_string(),
+            StoredCredential::ApiKey {
+                key: "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string(),
+            },
+        );
+        save_auth_store(&store)?;
+
+        let mut agent = test_agent(&root);
+        agent.reload_provider(Some("chatgpt"), false)?;
+        assert_eq!(agent.model, "glm-5.1");
+
+        assert_eq!(handle_slash("/model gpt5.3codex", &mut agent), Some(true));
+        assert_eq!(agent.provider_id, "chatgpt");
+        assert_eq!(agent.model, "gpt-5.3-codex");
+
+        agent.reload_provider(None, false)?;
+        assert_eq!(agent.model, "gpt-5.3-codex");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("WOLF_PROVIDER");
+        std::env::remove_var("WOLF_MODEL");
+        std::env::remove_var("WOLF_MODEL_FORCE");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn normalize_chatgpt_model_slug_accepts_compact_aliases() {
+    assert_eq!(normalize_chatgpt_model_slug("gpt5.3codex"), "gpt-5.3-codex");
+    assert_eq!(
+        normalize_chatgpt_model_slug("GPT 5 3 CODEX"),
+        "gpt-5.3-codex"
+    );
+    assert_eq!(normalize_chatgpt_model_slug("gpt5codex"), "gpt-5-codex");
+}
+
+#[test]
+fn anthropic_request_strips_wolf_only_tool_result_metadata() -> Result<()> {
+    let root = temp_test_dir("anthropic-strip-tool-metadata");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.history = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "tool-1".to_string(),
+                name: "bash".to_string(),
+                input: json!({"command": "false"}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                content: "exit: 1".to_string(),
+                is_error: Some(true),
+                metadata: ToolResultMetadata {
+                    status: Some("failed".to_string()),
+                    exit_code: Some(1),
+                    duration_ms: Some(25),
+                    artifact: Some("artifact.json".to_string()),
+                },
+            }],
+        },
+    ];
+    let stable = "sys";
+    let env = "env";
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: stable,
+        cache_control: None,
+    }];
+    let (_, body) = agent.build_streaming_request(stable, env, &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    let result = &value["messages"][1]["content"][0];
+    assert_eq!(result["type"], "tool_result");
+    assert!(result.get("metadata").is_none(), "{result}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn chatgpt_input_serializes_function_call_without_id_field() {
+    // Regression: Codex rejects `input[].id` that doesn't start with `fc_`.
+    // Wolf stores the server's call_id on Block::ToolUse.id and must not echo it
+    // as `id` on replay — only `call_id` (optional `id` gets auto-assigned).
+    let root = temp_test_dir("chatgpt-input-no-id");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call_abc123".to_string(),
+            name: "todo_read".to_string(),
+            input: json!({}),
+        }],
+    });
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_abc123", "(no todos)", None)],
+    });
+
+    let items = agent.history_to_chatgpt_input();
+    let fc = items
+        .iter()
+        .find(|i| i["type"] == "function_call")
+        .expect("function_call item missing");
+    assert!(
+        fc.get("id").is_none(),
+        "function_call must not include id field (server rejects non-fc_ ids): {fc}"
+    );
+    assert_eq!(fc["call_id"], "call_abc123");
+
+    let fco = items
+        .iter()
+        .find(|i| i["type"] == "function_call_output")
+        .expect("function_call_output item missing");
+    assert_eq!(fco["call_id"], "call_abc123");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn chatgpt_input_strips_orphaned_tool_results_without_matching_tool_use() {
+    // Regression: ChatGPT Responses API returns HTTP 400 "No tool call found for
+    // function call output with call_id ..." when a function_call_output references
+    // a call_id whose function_call was compacted away or lost. The serialization
+    // layer must silently drop such orphaned ToolResult blocks.
+    let root = temp_test_dir("chatgpt-orphan-strip");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+
+    // ToolUse + ToolResult pair that is valid — must survive.
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call_valid".to_string(),
+            name: "read_file".to_string(),
+            input: json!({ "path": "a.rs" }),
+        }],
+    });
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_valid", "fn main() {}", None)],
+    });
+
+    // Orphaned ToolResult — no matching ToolUse in history.
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_orphan", "stale result", None)],
+    });
+
+    let items = agent.history_to_chatgpt_input();
+
+    let call_ids: Vec<&str> = items
+        .iter()
+        .filter(|i| i["type"] == "function_call")
+        .map(|i| i["call_id"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(call_ids, vec!["call_valid"]);
+
+    let output_ids: Vec<&str> = items
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .map(|i| i["call_id"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        output_ids,
+        vec!["call_valid"],
+        "orphaned tool result must be stripped"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn chatgpt_summary_request_body_matches_current_responses_api_expectations() {
+    let root = temp_test_dir("chatgpt-summary-body-fields");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.model = "gpt-5.4".to_string();
+
+    let body = build_chatgpt_summary_request(&agent.model, COMPACT_SYSTEM, "resume this work");
+    assert_eq!(body["store"], false, "store must be false");
+    assert_eq!(body["stream"], true, "summary requests must stream");
+    assert_eq!(body["tool_choice"], "none", "summary should disable tools");
+    assert_eq!(
+        body["parallel_tool_calls"], false,
+        "summary should disable parallel tools"
+    );
+    assert_eq!(
+        body["include"][0], "reasoning.encrypted_content",
+        "missing include"
+    );
+    assert_eq!(body["text"]["verbosity"], "low", "missing low verbosity");
+    assert_eq!(body["reasoning"]["effort"], "low", "missing low effort");
+    assert_eq!(body["reasoning"]["summary"], "auto", "missing summary mode");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn chatgpt_request_body_maps_xhigh_to_actual_reasoning_effort_and_summary() {
+    // Regression: Codex silently refuses to emit function_call items unless the
+    // request body contains tool_choice, parallel_tool_calls, include (reasoning
+    // encrypted_content), text.verbosity, and reasoning.effort.
+    let root = temp_test_dir("chatgpt-body-fields");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.model = "gpt-5.4".to_string();
+    agent.thinking_effort = ThinkingEffort::XHigh;
+
+    let body = build_chatgpt_request(
+        &agent.model,
+        agent.thinking_effort,
+        "sys",
+        "sess-1",
+        agent.history_to_chatgpt_input(),
+        agent.wire_tools_chatgpt(),
+    );
+    assert_eq!(body["tool_choice"], "auto", "missing tool_choice");
+    assert_eq!(
+        body["parallel_tool_calls"], true,
+        "missing parallel_tool_calls"
+    );
+    assert_eq!(
+        body["include"][0], "reasoning.encrypted_content",
+        "missing include"
+    );
+    assert_eq!(
+        body["text"]["verbosity"], "medium",
+        "missing text.verbosity"
+    );
+    assert_eq!(
+        body["reasoning"]["effort"], "xhigh",
+        "xhigh must be sent to the provider, not just shown in UI"
+    );
+    assert_eq!(
+        body["reasoning"]["summary"], "auto",
+        "missing reasoning.summary"
+    );
+    assert_eq!(body["store"], false, "store must be false");
+    assert_eq!(body["stream"], true, "stream must be true");
+    assert_eq!(body["prompt_cache_key"], "sess-1");
+    let body_json = body.to_string();
+    assert!(
+        body_json.contains("\"reasoning\":{\"effort\":\"xhigh\",\"summary\":\"auto\"}"),
+        "{body_json}"
+    );
+    assert!(
+        body_json.contains("\"include\":[\"reasoning.encrypted_content\"]"),
+        "{body_json}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
+    let root = temp_test_dir("chatgpt-reasoning-stream");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        let body = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking \"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"ignored because delta already populated\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+    });
+
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    let resp = reqwest::get(format!("http://{addr}/stream"))
+        .await
+        .expect("response");
+    let (blocks, _stop, _usage) = agent.read_stream_chatgpt(resp).await.expect("parse stream");
+    assert!(
+        matches!(
+            blocks.first(),
+            Some(Block::Thinking { text }) if text == "thinking "
+        ),
+        "{blocks:?}"
+    );
+    assert!(
+        matches!(
+            blocks.get(1),
+            Some(Block::Text { text }) if text == "answer"
+        ),
+        "{blocks:?}"
+    );
+    server.join().expect("server thread");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
+    let read_file = tool_definitions()
+        .into_iter()
+        .find(|tool| tool.name == "read_file")
+        .expect("read_file tool");
+    let wired = tools::wire_tools(&[read_file], ToolProfile::Lean);
+    assert_eq!(
+        wired[0].description,
+        "Read capped line-numbered file window. Prefer offset+limit."
+    );
+    assert!(
+        wired[0].input_schema.to_string().contains("\"offset\""),
+        "{}",
+        wired[0].input_schema
+    );
+    assert!(
+        !wired[0].input_schema.to_string().contains("description"),
+        "{}",
+        wired[0].input_schema
+    );
+}
+
+#[test]
+fn chatgpt_tools_are_responses_api_shape() {
+    let root = temp_test_dir("chatgpt-tools-shape");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    let tools = agent.wire_tools_chatgpt();
+    assert!(!tools.is_empty(), "test_agent should have default tools");
+    for t in &tools {
+        assert_eq!(t["type"], "function");
+        assert!(t["name"].is_string(), "tool missing name: {t}");
+        assert!(t["parameters"].is_object(), "tool missing parameters: {t}");
+        assert!(
+            t["strict"].is_null(),
+            "tool strict must be explicit null for Codex: {t}"
+        );
+        // Chat-completions nested shape would have `function: {...}`. Responses API
+        // is flat — guard against accidental regression.
+        assert!(
+            t.get("function").is_none(),
+            "tool must not be chat-completions shape: {t}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn every_schema_backed_tool_validates_happy_and_missing_paths() {
+    // Every tool with a non-empty required_fields list must:
+    //   (a) surface a clear issue when fields are missing,
+    //   (b) pass validation when minimal required fields are present.
+    // Prevents regressions like todo_write silently accepting no args.
+    let cases: &[(&str, Value)] = &[
+        ("read_file", json!({"path": "foo.txt"})),
+        ("read_symbol", json!({"path": "foo.txt", "symbol": "foo"})),
+        ("write_file", json!({"path": "foo.txt", "content": "x"})),
+        (
+            "edit_file",
+            json!({"path": "foo.txt", "old_string": "a", "new_string": "b"}),
+        ),
+        ("multi_edit", json!({"path": "foo.txt", "edits": []})),
+        ("bash", json!({"command": "echo hi"})),
+        ("fd", json!({"pattern": "*.rs"})),
+        ("rg", json!({"pattern": "foo"})),
+        ("jq", json!({"filter": "."})),
+        ("fzf", json!({"query": "x", "items": []})),
+        ("http", json!({"args": ["GET", "https://x"]})),
+        ("awk", json!({"args": ["{print}"]})),
+        ("csvkit", json!({"subcommand": "csvcut", "args": ["-n"]})),
+        ("subagent", json!({"task": "do a thing"})),
+        ("git_commit", json!({"message": "c"})),
+        (
+            "todo_write",
+            json!({"todos": [{"text": "t", "status": "pending"}]}),
+        ),
+    ];
+
+    for (name, good) in cases {
+        assert!(
+            tool_policy::tool_input_issue(name, good).is_none(),
+            "{name}: valid input flagged as invalid: {good}"
+        );
+        let empty = json!({});
+        let issue = tool_policy::tool_input_issue(name, &empty);
+        assert!(
+            issue.is_some(),
+            "{name}: empty input should surface a required-field issue"
+        );
+    }
+}
+
+#[test]
+fn split_compaction_inputs_keeps_tool_pairs_intact_when_budget_would_orphan() {
+    // Regression: when the reverse-budget loop keeps a ToolResult whose paired
+    // ToolUse is too large to fit, the ChatGPT Responses API rejects the
+    // compacted request with "No tool call found for function call output with
+    // call_id ...". The pair-closure pass must pull the ToolUse back in so
+    // preserved_tool_msgs never contains an orphan half.
+    let root = temp_test_dir("compact-pair-close");
+    let mut agent = test_agent(&root);
+
+    // A small earlier pair that will not survive the budget cut-off.
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call_A".to_string(),
+            name: "read_file".to_string(),
+            input: json!({ "path": "a.rs" }),
+        }],
+    });
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_A", "file contents", None)],
+    });
+
+    // The pair under test: a massively oversized ToolUse (over the byte budget
+    // on its own) followed by a tiny ToolResult. The reverse-budget loop will
+    // keep the ToolResult first, then reject the ToolUse for exceeding budget.
+    let huge_payload = "x".repeat(COMPACT_PRESERVE_TOOL_BYTES);
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call_B".to_string(),
+            name: "bash".to_string(),
+            input: json!({ "payload": huge_payload }),
+        }],
+    });
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_B", "ok", None)],
+    });
+
+    let old = agent.history.clone();
+    let (_summary, preserved) = agent.split_compaction_inputs(&old);
+
+    let mut uses: HashSet<String> = HashSet::new();
+    let mut results: HashSet<String> = HashSet::new();
+    for msg in &preserved {
+        for block in &msg.content {
+            match block {
+                Block::ToolUse { id, .. } => {
+                    uses.insert(id.clone());
+                }
+                Block::ToolResult { tool_use_id, .. } => {
+                    results.insert(tool_use_id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    for call_id in &results {
+        assert!(
+            uses.contains(call_id),
+            "orphan tool_result with call_id {call_id}: preserved call_ids with tool_use = {uses:?}"
+        );
+    }
+    for call_id in &uses {
+        assert!(
+            results.contains(call_id),
+            "orphan tool_use with call_id {call_id}: preserved call_ids with tool_result = {results:?}"
+        );
+    }
+    assert!(
+        results.contains("call_B"),
+        "expected call_B tool_result in preserved set"
+    );
+    assert!(
+        uses.contains("call_B"),
+        "expected call_B tool_use to be pulled back in via pair closure"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pair_close_drops_tool_result_whose_tool_use_is_missing_entirely() {
+    // Defensive: if history has a ToolResult whose paired ToolUse is nowhere
+    // in `old` (corruption or partial-checkpoint replay), the orphan must be
+    // dropped from preserved_tool_msgs rather than sent to the API.
+    let root = temp_test_dir("compact-orphan-drop");
+    let mut agent = test_agent(&root);
+
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "kick off".into(),
+        }],
+    });
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_missing", "ghost result", None)],
+    });
+
+    let old = agent.history.clone();
+    let (_summary, preserved) = agent.split_compaction_inputs(&old);
+
+    for msg in &preserved {
+        for block in &msg.content {
+            if let Block::ToolResult { tool_use_id, .. } = block {
+                assert_ne!(
+                    tool_use_id, "call_missing",
+                    "orphan tool_result with no matching tool_use must be dropped"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn compact_uses_deterministic_evidence_fallback_when_summary_request_errors() {
+    // Regression: if the summary HTTP call fails mid-compact, deterministic evidence
+    // should still allow compaction to finish so the TUI clears its spinner.
+    let root = temp_test_dir("compact-failed-event");
+    let mut agent = test_agent(&root);
+    agent.work_ledger.objective = "keep deterministic evidence".to_string();
+
+    // Build enough history for find_compact_split to return Some. Must be more
+    // than COMPACT_KEEP_MESSAGES, with a user text message at the split point.
+    for i in 0..10 {
+        let role = if i % 2 == 0 { "user" } else { "assistant" };
+        agent.history.push(Message {
+            role: role.to_string(),
+            content: vec![Block::Text {
+                text: format!("msg {i}"),
+            }],
+        });
+    }
+
+    // Sink recording: capture every event emitted during compact().
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    // base_url 127.0.0.1 with no listener makes one_shot_summary fail.
+    let result = agent.compact().await;
+    assert!(
+        result.is_ok(),
+        "expected deterministic evidence fallback to compact"
+    );
+
+    let mut saw_start = false;
+    let mut saw_failed = false;
+    let mut saw_end = false;
+    let mut saw_fallback = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AgentEvent::CompactStart => saw_start = true,
+            AgentEvent::CompactFailed { message } => {
+                saw_failed = true;
+                assert!(!message.is_empty(), "CompactFailed must carry a message");
+            }
+            AgentEvent::CompactEnd { .. } => saw_end = true,
+            AgentEvent::Warn(message) if message.contains("compact fallback") => {
+                saw_fallback = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_start, "CompactStart must fire before fallback");
+    assert!(
+        !saw_failed,
+        "fallback compaction should not emit CompactFailed"
+    );
+    assert!(
+        saw_fallback,
+        "summary failure should be visible as a fallback warning"
+    );
+    assert!(
+        saw_end,
+        "CompactEnd must fire when deterministic fallback compaction succeeds"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

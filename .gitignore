@@ -1,0 +1,26 @@
+/target
+/.env
+/nul
+
+# Runtime/project state
+/.wolf/
+/.pi/
+/wolf-session-*.jsonl
+/wolf-session-*.html
+/semi_stderr.log
+/steering.txt
+/WOLF.todo.json
+
+# Scratch files, docs, screenshots, and local session copies
+/htmk
+/sprompt.md
+/docs/pi-session-discovery-recommendations.md
+/docs/BugUI*.jpg
+/docs/Toolsfeatureupdater*.txt
+/docs/gptconvo.md
+/docs/improve*.md
+/docs/Improve*.md
+/docs/tui-markdown-migration.md
+/docs/wolf-review-and-improvements.md
+Screenshot*.jpg
+Screenshot*.png
