@@ -1,0 +1,7 @@
+{"version":2,"model":"fixture-model","system":"fixture-system","allowed":[],"sandbox":"/tmp/replay","usage":{"input":0,"output":0,"cache_create":0,"cache_read":0},"thinking_effort":"medium"}
+{"role":"user","content":[{"type":"text","text":"Fetch the incident summary from api.example.com and tell me the latest status."}]}
+{"role":"assistant","content":[{"type":"tool_use","id":"cb-1","name":"bash","input":{"command":"curl -fsSL https://api.example.com/v1/incidents/latest"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"cb-1","content":"HTTP 401 unauthorized from api.example.com","is_error":true}]}
+{"role":"assistant","content":[{"type":"tool_use","id":"cb-2","name":"bash","input":{"command":"curl -fsSL -H 'Authorization: Bearer ???' https://api.example.com/v1/incidents/latest"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"cb-2","content":"HTTP 401 unauthorized from api.example.com\n\n[circuit-breaker] repeated auth failures for host(s): api.example.com. Stop retrying this source in this turn; pivot to another provider or ask the user for credentials.","is_error":true}]}
+{"role":"assistant","content":[{"type":"text","text":"The API returned repeated auth failures and the circuit breaker tripped, so I stopped retrying api.example.com. I need credentials or an alternate source to continue."}]}

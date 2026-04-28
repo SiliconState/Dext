@@ -1,0 +1,7 @@
+{"version":2,"model":"fixture-model","system":"fixture-system","allowed":[],"sandbox":"/tmp/replay","usage":{"input":0,"output":0,"cache_create":0,"cache_read":0},"thinking_effort":"medium"}
+{"role":"user","content":[{"type":"text","text":"Collect 100 issue records from api.example.com and summarize them."}]}
+{"role":"assistant","content":[{"type":"tool_use","id":"fg-1","name":"bash","input":{"command":"for i in 1 2 3 4 5; do curl -fsSL https://api.example.com/items/$i; done"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"fg-1","content":"source feasibility gate: host(s) api.example.com have not passed a single-item probe yet. First query one representative item and confirm required fields before bulk collection.","is_error":true}]}
+{"role":"assistant","content":[{"type":"tool_use","id":"fg-2","name":"bash","input":{"command":"curl -fsSL https://api.example.com/items/1"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"fg-2","content":"{\"id\":1,\"title\":\"First item\",\"status\":\"open\"}"}]}
+{"role":"assistant","content":[{"type":"text","text":"The bulk request was blocked by the feasibility gate, so I probed a single item first. The probe succeeded and exposed id/title/status; next step would be to scale safely."}]}

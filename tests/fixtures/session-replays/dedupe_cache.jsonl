@@ -1,0 +1,11 @@
+{"version":2,"model":"fixture-model","system":"fixture-system","allowed":[],"sandbox":"/tmp/replay","usage":{"input":0,"output":0,"cache_create":0,"cache_read":0},"thinking_effort":"medium"}
+{"role":"user","content":[{"type":"text","text":"Check the status endpoint twice and then retry a missing endpoint so I can compare what happened."}]}
+{"role":"assistant","content":[{"type":"tool_use","id":"dd-1","name":"bash","input":{"command":"curl -fsSL https://api.example.com/status"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"dd-1","content":"{\"status\":\"ok\",\"count\":3}"}]}
+{"role":"assistant","content":[{"type":"tool_use","id":"dd-2","name":"bash","input":{"command":"curl -fsSL https://api.example.com/status"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"dd-2","content":"request dedupe cache hit: reused prior result for identical external request (bash curl -fsSL <url>)\n\n{\"status\":\"ok\",\"count\":3}"}]}
+{"role":"assistant","content":[{"type":"tool_use","id":"dd-3","name":"bash","input":{"command":"curl -fsSL https://api.example.com/missing"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"dd-3","content":"HTTP 404 not found from api.example.com/missing","is_error":true}]}
+{"role":"assistant","content":[{"type":"tool_use","id":"dd-4","name":"bash","input":{"command":"curl -fsSL https://api.example.com/missing"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"dd-4","content":"request dedupe cache hit: reused prior result for identical external request (bash curl -fsSL <url>)\n\nHTTP 404 not found from api.example.com/missing","is_error":true}]}
+{"role":"assistant","content":[{"type":"text","text":"Repeated identical GETs were deduped; the cached success stayed ok and the cached 404 stayed an error."}]}
