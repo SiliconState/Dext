@@ -343,7 +343,7 @@ fn current_pid() -> u32 {
 }
 
 #[cfg(windows)]
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -370,7 +370,7 @@ fn process_exists(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
@@ -380,15 +380,29 @@ fn process_exists(pid: u32) -> bool {
     }
 
     let rc = unsafe { kill(pid as i32, 0) };
-    if rc == 0 {
-        true
-    } else {
-        !matches!(io::Error::last_os_error().raw_os_error(), Some(3))
+    if rc != 0 && matches!(io::Error::last_os_error().raw_os_error(), Some(3)) {
+        return false;
     }
+
+    !linux_process_is_zombie(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_string()))
+        .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+        .is_some_and(|state| state == "Z")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn linux_process_is_zombie(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(not(any(windows, unix)))]
-fn process_exists(pid: u32) -> bool {
+pub(crate) fn process_exists(pid: u32) -> bool {
     pid != 0
 }
 

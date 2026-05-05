@@ -37,7 +37,7 @@ fn tui_smoke_launches_real_binary_in_pty() {
     assert_visible(
         &mut pty,
         &mut child,
-        "insert newline",
+        "insertnewline",
         Duration::from_secs(2),
     );
 

@@ -4,11 +4,14 @@ use crate::provider::{
     resolve_provider_model_selection,
 };
 use crate::session::{
-    append_log_line, cap_latest_log_buffer, render_limited_lines, validate_session_name,
+    append_log_line, cap_latest_log_buffer, process_exists, render_limited_lines,
+    validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
 use std::net::TcpListener;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use std::sync::OnceLock;
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -737,6 +740,28 @@ fn project_state_lock_blocks_second_owner_until_release() -> Result<()> {
     drop(second);
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn process_exists_treats_zombies_as_dead_for_stale_lock_recovery() -> Result<()> {
+    let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn()?;
+    let pid = child.id();
+    for _ in 0..100 {
+        if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_string()))
+            .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+            .is_some_and(|state| state == "Z")
+        {
+            assert!(!process_exists(pid));
+            let _ = child.wait();
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = child.wait();
+    anyhow::bail!("child did not become zombie before wait")
 }
 
 #[test]
@@ -4221,7 +4246,7 @@ fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
 }
 
 #[test]
-fn login_chatgpt_default_mode_now_uses_pi_auth_import() -> Result<()> {
+fn login_chatgpt_default_mode_ignores_pi_auth_import() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-default-mode");
     unsafe {
@@ -4241,15 +4266,15 @@ fn login_chatgpt_default_mode_now_uses_pi_auth_import() -> Result<()> {
         )?;
 
         let login = login_provider(Some("chatgpt"), None, false)?;
-        assert!(!login.awaiting_credentials);
+        assert!(login.awaiting_credentials);
         assert!(
-            login.message.contains("imported credentials"),
+            !login.message.contains("imported credentials"),
             "{}",
             login.message
         );
 
         let store = load_auth_store()?;
-        assert!(store.providers.contains_key("chatgpt"));
+        assert!(!store.providers.contains_key("chatgpt"));
 
         let catalog = load_provider_catalog()?;
         assert_eq!(resolve_active_provider_id(&catalog), "chatgpt");

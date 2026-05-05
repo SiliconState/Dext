@@ -264,7 +264,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 callback_host: Some("127.0.0.1".to_string()),
             }),
             notes: Some(
-                "ChatGPT/Codex login follows Pi OAuth flow: open browser, then callback URL or authorization code paste fallback."
+                "ChatGPT/Codex login opens an OpenAI OAuth flow; paste the callback URL or authorization code if browser callback is unavailable."
                     .to_string(),
             ),
             context_window: Some(272_000),
@@ -1007,7 +1007,7 @@ pub(crate) fn apply_provider_headers(
         ApiProvider::ChatGpt => {
             let account_id = chatgpt_account_id_from_token(api_key).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "could not extract chatgpt account id from token. re-run /login chatgpt or import Pi auth again."
+                    "could not extract chatgpt account id from token. re-run /login chatgpt."
                 )
             })?;
             let mut req = req
@@ -2691,22 +2691,11 @@ pub(crate) fn login_provider(
                     awaiting_credentials: false,
                 });
             }
-        } else if !explicit_web
-            && let Some(source) = import_provider_credential_from_pi_auth(&profile, &mut store)
-        {
-            save_auth_store(&store)?;
-            catalog.active_provider = profile.id.clone();
-            save_provider_catalog(&catalog)?;
-            return Ok(LoginResult {
-                message: format!(
-                    "imported credentials for provider '{}' from {} into {} and set it active",
-                    profile.id,
-                    source,
-                    auth_store_path().display()
-                ),
-                provider_id: profile.id.clone(),
-                awaiting_credentials: false,
-            });
+            anyhow::bail!(
+                "no reusable Pi credential found for provider '{}'. Run `wolf auth login {} web` or paste a token/key directly.",
+                profile.id,
+                profile.id
+            );
         }
 
         if let Some(oauth) = &profile.oauth_flow {

@@ -74,7 +74,7 @@ impl PermissionTier {
     fn accent(self) -> Color {
         match self {
             Self::Read => Color::Yellow,
-            Self::Write => Color::Rgb(255, 149, 0),
+            Self::Write => Color::Yellow,
             Self::Danger => Color::Red,
         }
     }
@@ -1558,10 +1558,7 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
         if !tail.is_empty() {
             return Some(Line::from(vec![
                 Span::styled("  ▸ ", Style::default().fg(Color::Blue)),
-                Span::styled(
-                    clamp_chars(tail, max_cells),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(clamp_chars(tail, max_cells), Style::default()),
             ]));
         }
     }
@@ -1573,7 +1570,7 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
     if let Some(tool) = running_tools.iter().find(|tool| !tool.summary.is_empty()) {
         return Some(live_detail_line(
             tool.summary.clone(),
-            Color::White,
+            Color::Reset,
             max_cells,
         ));
     }
@@ -1591,7 +1588,7 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
         } else {
             format!("batch active · {} entries", batch.entries.len())
         };
-        return Some(live_detail_line(detail, Color::White, max_cells));
+        return Some(live_detail_line(detail, Color::Reset, max_cells));
     }
     if !state.streaming_thinking.is_empty() {
         let tail = state
@@ -1601,7 +1598,7 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
             .unwrap_or(&state.streaming_thinking)
             .trim();
         if !tail.is_empty() {
-            return Some(live_detail_line(tail.to_string(), Color::White, max_cells));
+            return Some(live_detail_line(tail.to_string(), Color::Reset, max_cells));
         }
     }
     live_indicator_todo_detail(state, max_cells)
@@ -2743,8 +2740,6 @@ impl MarkdownStyleSheet for WolfMarkdownStyleSheet {
 
     fn code(&self) -> MdStyle {
         MdStyle::default()
-            .fg(MdColor::White)
-            .bg(MdColor::Indexed(236))
     }
 
     fn link(&self) -> MdStyle {
@@ -2784,7 +2779,7 @@ fn md_color_to_color(color: MdColor) -> Color {
         MdColor::LightBlue => Color::LightBlue,
         MdColor::LightMagenta => Color::LightMagenta,
         MdColor::LightCyan => Color::LightCyan,
-        MdColor::White => Color::White,
+        MdColor::White => Color::Reset,
         MdColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
         MdColor::Indexed(i) => Color::Indexed(i),
     }
@@ -3197,11 +3192,7 @@ fn table_spacing(table: &ParsedTable, max_total: usize) -> usize {
 }
 
 fn table_header_style(base_style: Style) -> Style {
-    base_style.patch(
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )
+    base_style.patch(Style::default().add_modifier(Modifier::BOLD))
 }
 
 fn table_column_widths(table: &ParsedTable, spacing: usize, max_total: usize) -> Vec<usize> {
@@ -3752,10 +3743,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 } else if let Some((label, value)) = raw.split_once("  ") {
                     lines.push(Line::from(vec![
                         Span::styled(format!("{label:<9}"), Style::default().fg(Color::Green)),
-                        Span::styled(
-                            value.trim_start().to_string(),
-                            Style::default().fg(Color::White),
-                        ),
+                        Span::styled(value.trim_start().to_string(), Style::default()),
                     ]));
                 } else {
                     lines.push(Line::from(Span::styled(
@@ -3782,7 +3770,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 "you",
                 Color::Magenta,
                 s,
-                Style::default().fg(Color::White),
+                Style::default(),
                 width,
             );
         }
@@ -3796,7 +3784,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                     Color::Blue
                 },
                 text,
-                Style::default().fg(Color::White),
+                Style::default(),
                 width,
             );
         }
@@ -4841,7 +4829,7 @@ fn help_overlay_text() -> Text<'static> {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled((*desc).to_string(), Style::default().fg(Color::White)),
+            Span::styled((*desc).to_string(), Style::default()),
         ]));
     }
     lines.push(Line::from(""));
@@ -4855,7 +4843,7 @@ fn help_overlay_text() -> Text<'static> {
     for (sym, desc) in legend_rows {
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<20}", sym), Style::default().fg(Color::Green)),
-            Span::styled((*desc).to_string(), Style::default().fg(Color::White)),
+            Span::styled((*desc).to_string(), Style::default()),
         ]));
     }
     lines.push(Line::from(""));
@@ -5002,7 +4990,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let prompt_style = if state.agent_busy && state.pending_perm.is_none() {
         Style::default().fg(Color::DarkGray)
     } else {
-        Style::default().fg(Color::White)
+        Style::default()
     };
 
     let wrap_cols = input_area.width.saturating_sub(2).max(1) as usize;
@@ -5972,7 +5960,7 @@ mod tests {
         let danger_style = span_style_for(&danger, "▌ ").expect("danger border");
 
         assert_eq!(read_style.fg, Some(Color::Yellow));
-        assert_eq!(write_style.fg, Some(Color::Rgb(255, 149, 0)));
+        assert_eq!(write_style.fg, Some(Color::Yellow));
         assert_eq!(danger_style.fg, Some(Color::Red));
     }
 
@@ -7517,7 +7505,10 @@ mod tests {
             .find(|span| span.content.contains("Key"))
             .map(|span| span.style)
             .expect("header span");
-        assert_eq!(header_style.fg, Some(Color::White));
+        assert!(
+            header_style.fg.is_none() || header_style.fg == Some(Color::Reset),
+            "header fg should inherit terminal default/reset: {header_style:?}"
+        );
         assert!(header_style.add_modifier.contains(Modifier::BOLD));
     }
 
