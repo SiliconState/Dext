@@ -582,10 +582,7 @@ pub(crate) fn adaptive_tool_ui_cap(
     default_cap: usize,
 ) -> usize {
     let window = crate::model_context_window(model) as f64;
-    let used = (session_usage.input
-        + session_usage.output
-        + session_usage.cache_create
-        + session_usage.cache_read) as f64;
+    let used = session_usage.context_tokens() as f64;
     if window <= 0.0 || used <= 0.0 {
         return default_cap;
     }
@@ -613,10 +610,7 @@ pub(crate) fn adaptive_tool_result_cap(
         MIN_DYNAMIC_TOOL_RESULT_CAP
     };
     let window = crate::model_context_window(model) as f64;
-    let used = (session_usage.input
-        + session_usage.output
-        + session_usage.cache_create
-        + session_usage.cache_read) as f64;
+    let used = session_usage.context_tokens() as f64;
     if window <= 0.0 || used <= 0.0 {
         return default_cap;
     }

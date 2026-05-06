@@ -84,6 +84,7 @@ fn test_agent(root: &Path) -> Agent {
         read_cache: Arc::new(Mutex::new(ReadFileCache::default())),
         work_ledger: WorkLedger::default(),
         provider_health: ProviderHealthLedger::default(),
+        track_origin: None,
     }
 }
 
@@ -261,6 +262,32 @@ fn steering_received_event_serializes_preview() {
 }
 
 #[test]
+fn non_tui_busy_input_routes_to_steering_channel_immediately() {
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+    let busy = AtomicBool::new(true);
+
+    let route = route_interactive_input_line(
+        "adjust the current fix\n".to_string(),
+        &busy,
+        &input_tx,
+        &steering_tx,
+    );
+
+    assert_eq!(route, InteractiveInputRoute::SteeringQueued);
+    assert_eq!(
+        steering_rx.try_recv().ok().as_deref(),
+        Some("adjust the current fix")
+    );
+    assert!(input_rx.try_recv().is_err());
+
+    let route =
+        route_interactive_input_line("/effort high\n".to_string(), &busy, &input_tx, &steering_tx);
+    assert_eq!(route, InteractiveInputRoute::Submitted);
+    assert_eq!(input_rx.try_recv().ok().as_deref(), Some("/effort high"));
+}
+
+#[test]
 fn steering_delivery_line_includes_preview_and_final_requirement() {
     let text = crate::tui::steering_delivered_text_for_test(1, "fix rg border overflow", 80);
     let rendered = text
@@ -294,6 +321,72 @@ fn steering_acknowledgement_detects_final_that_mentions_steered_scope() {
 }
 
 #[test]
+fn queued_steering_done_only_after_acknowledged_final() {
+    let root = temp_test_dir("steering-done-after-ack");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent
+        .work_ledger
+        .steering
+        .push("queued during active turn (1 message): add a space between thinking history and next tool call".to_string());
+    agent
+        .work_ledger
+        .pending
+        .push("respond to queued steering".to_string());
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "Done.".to_string(),
+        }],
+    });
+
+    let unresolved = agent
+        .work_ledger
+        .steering
+        .iter()
+        .filter(|item| !steering_item_acknowledged(item, &agent.history))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(unresolved.len(), 1);
+    assert!(
+        agent
+            .work_ledger
+            .pending
+            .contains(&"respond to queued steering".to_string())
+    );
+
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "I addressed your steering by adding a space between thinking history and the next tool call.".to_string(),
+        }],
+    });
+    let unresolved = agent
+        .work_ledger
+        .steering
+        .iter()
+        .filter(|item| !steering_item_acknowledged(item, &agent.history))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(unresolved.is_empty());
+    agent.mark_work_done("respond to queued steering");
+    assert!(
+        agent
+            .work_ledger
+            .done
+            .contains(&"respond to queued steering".to_string())
+    );
+    assert!(
+        !agent
+            .work_ledger
+            .pending
+            .contains(&"respond to queued steering".to_string())
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn normalize_login_secret_extracts_access_token_from_multiline_json() {
     let raw = "{\n  \"accessToken\": \"abc123xyz456\",\n  \"expires\": \"later\"\n}";
     assert_eq!(normalize_login_secret(raw).as_deref(), Some("abc123xyz456"));
@@ -303,6 +396,162 @@ fn normalize_login_secret_extracts_access_token_from_multiline_json() {
 fn looks_like_login_secret_input_accepts_multiline_json() {
     let raw = "{\n  \"accessToken\": \"abc123xyz456\",\n  \"expires\": \"later\"\n}";
     assert!(looks_like_login_secret_input(raw));
+}
+
+fn build_test_work_map() -> WorkMap {
+    let header = SessionHeader {
+        model: "test-model".to_string(),
+        provenance: SessionProvenance {
+            provider: "test".to_string(),
+            ..Default::default()
+        },
+        work_ledger: WorkLedger {
+            objective: "fix failing tests".to_string(),
+            decisions: vec!["keep map non-tree".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Fix failing tests".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_write".to_string(),
+                name: "write_file".to_string(),
+                input: json!({"path":"src/lib.rs","content":"x"}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "call_write".to_string(),
+                content: "wrote file".to_string(),
+                is_error: None,
+                metadata: ToolResultMetadata::default(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_test".to_string(),
+                name: "bash".to_string(),
+                input: json!({"command":"cargo test --release"}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "call_test".to_string(),
+                content: "exit: 1\nfailed".to_string(),
+                is_error: Some(true),
+                metadata: ToolResultMetadata {
+                    status: Some("failed".to_string()),
+                    exit_code: Some(1),
+                    duration_ms: Some(10),
+                    artifact: Some("artifact.json".to_string()),
+                },
+            }],
+        },
+    ];
+    build_session_work_map(Path::new("test-session.jsonl"), &header, &history)
+}
+
+#[test]
+fn work_map_derives_waypoints_and_packets() {
+    let map = build_test_work_map();
+    let rendered = render_work_map(&map);
+    assert!(rendered.contains("Work map"), "{rendered}");
+    assert!(rendered.contains("@w"), "{rendered}");
+    assert!(
+        map.waypoints
+            .iter()
+            .any(|wp| wp.kind == WorkMapKind::Change)
+    );
+    assert!(
+        map.waypoints
+            .iter()
+            .any(|wp| wp.kind == WorkMapKind::Failure)
+    );
+    let failure = map
+        .waypoints
+        .iter()
+        .find(|wp| wp.kind == WorkMapKind::Failure)
+        .expect("failure waypoint");
+    let selection = parse_work_map_selection(&failure.id, &map).expect("select waypoint");
+    let packet = render_work_map_packet(&map, &selection);
+    assert!(packet.contains("[wolf packet"), "{packet}");
+    assert!(packet.contains("Failures/blockers"), "{packet}");
+    assert!(
+        packet.contains("Focus changes model context only"),
+        "{packet}"
+    );
+}
+
+#[test]
+fn work_map_focus_includes_safety_and_exact_mode() {
+    let map = build_test_work_map();
+    let selection = parse_work_map_selection("@w01", &map).expect("select waypoint");
+    let focus = render_work_map_focus(&map, &selection, &FocusMode::Exact);
+    assert!(focus.contains("mode=exact"), "{focus}");
+    assert!(focus.contains("does not rewind files"), "{focus}");
+}
+
+#[test]
+fn work_map_args_accept_waypoint_before_or_after_selector() -> Result<()> {
+    let args = parse_work_map_command_args("@w02 latest --exact");
+    let (id, selector, mode_args) = parse_work_map_operation_args(&args, "current")?;
+    assert_eq!(id, "@w02");
+    assert_eq!(selector, "current");
+    assert_eq!(mode_args, vec!["--exact".to_string()]);
+
+    let args = parse_work_map_command_args("latest @w03 exact");
+    let (id, selector, mode_args) = parse_work_map_operation_args(&args, "current")?;
+    assert_eq!(id, "@w03");
+    assert_eq!(selector, "latest");
+    assert_eq!(mode_args, vec!["exact".to_string()]);
+
+    let args = parse_work_map_command_args("latest @w04 track-name --exact");
+    let (id, selector, name, mode_args) = parse_track_open_args(&args, "current")?;
+    assert_eq!(id, "@w04");
+    assert_eq!(selector, "latest");
+    assert_eq!(name, Some("track-name"));
+    assert_eq!(mode_args, vec!["--exact".to_string()]);
+    Ok(())
+}
+
+#[test]
+fn track_origin_serializes_in_session_header() -> Result<()> {
+    let root = temp_test_dir("work-map-track-origin");
+    let _guard = env_lock();
+    let sessions_dir = root.join("sessions");
+    std::fs::create_dir_all(&sessions_dir)?;
+    unsafe { std::env::set_var("WOLF_SESSIONS_DIR", &sessions_dir) };
+    let result = (|| -> Result<()> {
+        let agent = test_agent(&root);
+        let map = build_test_work_map();
+        let selection = parse_work_map_selection("@w01", &map)?;
+        let path = create_track_from_work_map(
+            &agent,
+            &map,
+            &selection,
+            Some("work-map-track"),
+            &FocusMode::Exact,
+        )?;
+        let (header, history) = read_session_jsonl(&path)?;
+        let origin = header.track_origin.expect("track origin");
+        assert_eq!(origin.source_waypoint, "@w01");
+        assert_eq!(origin.mode, "exact");
+        assert_eq!(history.len(), 2);
+        Ok(())
+    })();
+    unsafe { std::env::remove_var("WOLF_SESSIONS_DIR") };
+    result
 }
 
 #[test]
@@ -654,8 +903,65 @@ fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<(
         assert!(listing.contains("project latest:"), "{listing}");
         assert!(listing.contains("latest: 1 messages"), "{listing}");
         assert!(listing.contains("named sessions:"), "{listing}");
+        let project_named_dir = named_sessions_dir_for_root(&project);
+        assert!(
+            listing.contains(&format!("none in {}", project_named_dir.display())),
+            "{listing}"
+        );
         assert!(listing.contains("use /save <name>"), "{listing}");
         assert!(!listing.contains("(no sessions"), "{listing}");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn named_sessions_are_project_scoped_by_default() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("project-scoped-named-sessions");
+    let wolf_home = root.join("wolf-home");
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    std::fs::create_dir_all(&wolf_home)?;
+    std::fs::create_dir_all(&alpha)?;
+    std::fs::create_dir_all(&beta)?;
+
+    unsafe {
+        std::env::set_var("WOLF_HOME", &wolf_home);
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+    }
+    let result = (|| -> Result<()> {
+        let alpha = std::fs::canonicalize(&alpha)?;
+        let beta = std::fs::canonicalize(&beta)?;
+        let mut alpha_agent = test_agent(&alpha);
+        alpha_agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "alpha".to_string(),
+            }],
+        });
+        let alpha_path = alpha_agent.save_session("shared")?;
+
+        let mut beta_agent = test_agent(&beta);
+        beta_agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "beta".to_string(),
+            }],
+        });
+        let beta_path = beta_agent.save_session("shared")?;
+
+        assert_ne!(alpha_path, beta_path);
+        assert_eq!(resolve_session_selector(&alpha, "shared")?, alpha_path);
+        assert_eq!(resolve_session_selector(&beta, "shared")?, beta_path);
+        assert!(render_session_listing(&alpha).contains(&alpha_path.display().to_string()));
+        assert!(render_session_listing(&beta).contains(&beta_path.display().to_string()));
         Ok(())
     })();
 
@@ -680,6 +986,45 @@ fn session_export_target_parses_html_and_jsonl() {
     let (format, path) = parse_session_export_target("archive.jsonl");
     assert_eq!(format, SessionExportFormat::Jsonl);
     assert_eq!(path, PathBuf::from("archive.jsonl"));
+}
+
+#[test]
+fn session_jsonl_reads_tool_metadata_duration() -> Result<()> {
+    let root = temp_test_dir("session-jsonl-metadata-duration");
+    let path = root.join("session.jsonl");
+    let header = SessionHeader {
+        model: "test-model".to_string(),
+        ..SessionHeader::default()
+    };
+    let message = Message {
+        role: "user".to_string(),
+        content: vec![Block::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: "ok".to_string(),
+            is_error: None,
+            metadata: ToolResultMetadata {
+                status: Some("ok".to_string()),
+                exit_code: Some(0),
+                duration_ms: Some(25),
+                artifact: None,
+            },
+        }],
+    };
+    let data = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&header)?,
+        serde_json::to_string(&message)?
+    );
+    std::fs::write(&path, data)?;
+
+    let (_header, history) = read_session_jsonl(&path)?;
+    let Block::ToolResult { metadata, .. } = &history[0].content[0] else {
+        panic!("expected tool result")
+    };
+    assert_eq!(metadata.duration_ms, Some(25));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 #[test]
@@ -1535,6 +1880,7 @@ fn prepare_http_tool_request_parses_httpie_style_args() {
     .expect("prepare http tool request");
 
     assert_eq!(request.method, reqwest::Method::POST);
+    assert_eq!(request.output_mode, HttpOutputMode::Raw);
     assert_eq!(
         request.url.as_str(),
         "https://example.com/api?existing=1&page=2"
@@ -1550,6 +1896,33 @@ fn prepare_http_tool_request_parses_httpie_style_args() {
         }
         other => panic!("expected json body, got {other:?}"),
     }
+}
+
+#[test]
+fn http_extract_html_text_strips_script_and_decodes_entities() {
+    let html = r#"
+        <!doctype html><html><head><title>Docs &amp; Research</title><style>.x{}</style></head>
+        <body><h1>Session Trees</h1><script>bad_noise()</script><p>Jump &amp; teleport&nbsp;ideas</p></body></html>
+    "#;
+    let text = extract_response_text(html.to_string(), Some("text/html; charset=utf-8"));
+
+    assert!(text.contains("Docs & Research"), "{text}");
+    assert!(text.contains("Session Trees"), "{text}");
+    assert!(text.contains("Jump & teleport"), "{text}");
+    assert!(!text.contains("bad_noise"), "{text}");
+    assert!(!text.contains(".x"), "{text}");
+}
+
+#[test]
+fn prepare_http_tool_request_accepts_extract_text_flag() {
+    let request = prepare_http_tool_request(
+        &json!({"args": ["GET", "https://example.com", "--extract-text"]}),
+        std::time::Duration::from_secs(30),
+    )
+    .expect("prepare http tool request");
+
+    assert_eq!(request.method, reqwest::Method::GET);
+    assert_eq!(request.output_mode, HttpOutputMode::Text);
 }
 
 #[tokio::test]
@@ -3209,6 +3582,66 @@ async fn builtin_semaphore_caps_concurrency() {
         "peak concurrency {} exceeded cap 3",
         peak.load(Ordering::SeqCst)
     );
+}
+
+#[test]
+fn usage_total_and_input_tokens_match_status_semantics() {
+    let usage = Usage {
+        input: 120_000,
+        output: 5_400,
+        cache_create: 2_000,
+        cache_read: 40_000,
+    };
+
+    assert_eq!(usage.actual_input_tokens(), 120_000);
+    assert_eq!(usage.cached_input_tokens(), 42_000);
+    assert_eq!(usage.context_tokens(), 167_400);
+    assert_eq!(usage.total_tokens(), 167_400);
+    assert!(usage.line().contains("in=120000"));
+    assert!(usage.line().contains("cached=42000"));
+    assert!(usage.line().contains("total=167400"));
+}
+
+#[test]
+fn anthropic_usage_parse_subtracts_cache_from_actual_input() {
+    let usage = Usage::parse(&json!({
+        "input_tokens": 1000,
+        "output_tokens": 50,
+        "cache_creation_input_tokens": 100,
+        "cache_read_input_tokens": 300
+    }));
+
+    assert_eq!(usage.actual_input_tokens(), 600);
+    assert_eq!(usage.cached_input_tokens(), 400);
+    assert_eq!(usage.context_tokens(), 1050);
+}
+
+#[test]
+fn openai_usage_parse_splits_cached_prompt_tokens() {
+    let usage = Usage::parse_openai(&json!({
+        "prompt_tokens": 1000,
+        "completion_tokens": 50,
+        "prompt_tokens_details": {"cached_tokens": 300}
+    }));
+
+    assert_eq!(usage.actual_input_tokens(), 700);
+    assert_eq!(usage.cache_read, 300);
+    assert_eq!(usage.context_tokens(), 1050);
+}
+
+#[test]
+fn message_approx_tokens_uses_ceil_char_quarter() {
+    let message = Message {
+        role: "user".to_string(),
+        content: vec![
+            Block::Text {
+                text: "12345".to_string(),
+            },
+            tool_result_block("id1", "123", None),
+        ],
+    };
+
+    assert_eq!(message_approx_tokens(&message), 2);
 }
 
 #[test]

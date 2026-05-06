@@ -30,8 +30,9 @@ through pi-memory with `--project wolf`. Keep this file compact and curated.
   and overlap cache; `read_symbol` supports symbol-first source reads.
 - Compaction should split near the tail, preserve recent tool evidence, and use
   capped old tool results so summaries retain tool-derived facts.
-- Steering is queued-only: inject only at safe boundaries, keep it visible in
-  session/work-ledger state, and explicitly address it in the next/final answer.
+- Steering is queued-only: route active-turn user input directly to the steering
+  channel (not behind the main command queue), inject only at safe boundaries, keep
+  it visible in session/work-ledger state, and explicitly address it in the next/final answer.
 - Session state is evidence-backed: headers persist prompt/runtime provenance,
   exposed/approval/auto-approved tools, cleaned work ledger, provider health,
   verification records, and lightweight tool-result metadata.
@@ -42,6 +43,10 @@ through pi-memory with `--project wolf`. Keep this file compact and curated.
 - TUI design stays text-first and sparse in the regular terminal buffer. Keep
   permission prompts inline/compact, transcript content sanitized/wrapped, and
   use the PTY smoke test for TUI verification.
+- Benchmark/simple-CLI work should avoid unnecessary todo churn, prefer stdlib or repo-declared test runners, compare structured output semantically, and avoid broad rereads of freshly written files.
+- Usage displays should split actual non-cached input from cache reads/writes;
+  TUI status keeps the cached marker visible after first usage even when zero.
+  Context pressure may still include cache because providers count it in request context.
 
 ## User preferences
 - Favor context engineering and memory quality over adding more tools.
@@ -49,12 +54,29 @@ through pi-memory with `--project wolf`. Keep this file compact and curated.
 - Prefer Wolf's built-in reqwest-backed `http` tool before shelling to curl/xh.
 - Use proper OAuth/web flows; do not copy Pi auth credentials manually.
 - Prefer live/thinking/scroll progress above the input box only.
+- Agent browser is allowed when useful for browser automation.
 - Keep repo source-first and reviewable; avoid runtime clutter.
 
 ## Current focus
-- Validate session analysis/ledger/session-discovery behavior in live long Wolf
-  sessions and continue expanding real-world eval coverage.
-- Continue low-bloat modularization into focused modules before adding new ones.
+- Work Map/cache-status cleanup is complete in the dirty tree and required
+  verification passed: `cargo build --release`, `cargo test --release`,
+  `cargo test --release --test tui_smoke -- --nocapture`, and
+  `cargo install --path . --force`.
+- Usage status now splits actual input/cache/output and keeps the cache marker
+  visible as `↻0` after first usage if there were no cache hits; installed Wolf
+  at `/home/abaka/.cargo/bin/wolf` contains the cache-status strings.
+- Work Map includes derived waypoints/packets/focus/tracks, slash + CLI commands
+  including `wolf session track open`, and a command-inserting TUI composer drawer
+  for `/map` so navigation does not rewrite terminal scrollback.
+- TUI thinking is visible by default; Ctrl+V toggles hidden thinking mode. Completed
+  streamed thinking wraps within the internal vertical lane with a terminal auto-wrap
+  guard column, but live/thinking progress may use the full terminal width and break
+  at the outer border.
+- Local linker blocker was resolved with project-local Cargo config forcing system
+  `cc` and bfd instead of global `rust-lld` self-contained linking.
+- Final dirty files to review/commit: `WORKMAP.md`, `.gitignore`, `MEMORY.md`,
+  `WOLF.memory.md`, `src/main.rs`, `src/main_tests.rs`, `src/orchestrator.rs`,
+  `src/session.rs`, `src/tools.rs`, and `src/tui.rs`.
 
 ## Open question
 - How much historical detail should remain prompt-injected versus only in

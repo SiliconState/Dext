@@ -27,7 +27,7 @@ use tui_markdown::{
 
 use crate::provider::{curated_provider_models, provider_has_available_credentials};
 use crate::{
-    Agent, AgentEvent, ApprovalProfile, Choice, EventSink, ThinkingEffort, Usage,
+    Agent, AgentEvent, ApprovalProfile, Choice, EventSink, ThinkingEffort, Usage, WorkMapEventKind,
     canonical_provider_id, git_summary, handle_slash, history_char_budget_with_override,
     load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
     parse_compact_slash, provider_auth_status, resolve_active_provider_id, summarize_call,
@@ -38,6 +38,11 @@ const VIEWPORT_HEIGHT: u16 = 10;
 const COLLAPSED_PREVIEW_LINES: usize = 4;
 const TOOL_DENSITY_SEPARATOR_EVERY: usize = 10;
 const RG_LINE_TRUNCATE_CELLS: usize = 220;
+const TRANSCRIPT_WRAP_GUARD_COLS: u16 = 1;
+const WORK_MAP_DRAWER_MAX_ROWS: usize = 10;
+const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 8;
+const WORK_MAP_DRAWER_MIN_EDITOR_ROWS: usize = 1;
+const THINKING_BG: Color = Color::Indexed(235);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 fn is_subagent_call_id(call_id: &str) -> bool {
@@ -94,6 +99,15 @@ struct PendingPermission {
     responder: std::sync::mpsc::SyncSender<Choice>,
 }
 
+#[derive(Clone)]
+struct WorkMapDrawer {
+    text: String,
+    waypoint_ids: Vec<String>,
+    selector: Option<String>,
+    selected: usize,
+    scroll: usize,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Line_ {
     Banner(String),
@@ -138,6 +152,14 @@ enum Line_ {
         preview: String,
     },
     Thinking(String),
+    WorkMap {
+        kind: WorkMapEventKind,
+        text: String,
+        waypoint_ids: Vec<String>,
+        selector: Option<String>,
+        selected: usize,
+    },
+    Blank,
     TurnSep,
 }
 
@@ -152,7 +174,6 @@ enum ToTui {
 
 enum FromTui {
     Submit(String),
-    Steering(String),
     CycleEffort(i8),
     Quit,
 }
@@ -364,6 +385,31 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "load session",
     },
     SlashCmd {
+        name: "/map",
+        args: "[session]",
+        help: "open Work Map drawer",
+    },
+    SlashCmd {
+        name: "/packet",
+        args: "@wNN [session]",
+        help: "waypoint packet",
+    },
+    SlashCmd {
+        name: "/focus",
+        args: "@wNN [--exact]",
+        help: "load focus packet",
+    },
+    SlashCmd {
+        name: "/track",
+        args: "open @wNN [name]",
+        help: "create continuation",
+    },
+    SlashCmd {
+        name: "/tracks",
+        args: "",
+        help: "list continuations",
+    },
+    SlashCmd {
         name: "/sessions",
         args: "",
         help: "list project latest + named",
@@ -397,6 +443,8 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
 
 static FANGS_ARGS: &[&str] = &["on", "off", "status"];
 static EFFORT_ARGS: &[&str] = &["low", "medium", "high", "xhigh"];
+static WORK_MAP_SESSION_ARGS: &[&str] = &["current", "latest"];
+static TRACK_ARGS: &[&str] = &["open", "list"];
 const SLASH_COMPLETION_MAX_VISIBLE: usize = 7;
 
 struct SlashCompletion {
@@ -590,6 +638,8 @@ fn slash_completions(input: &str) -> Vec<SlashCompletion> {
         let sub_args = match cmd_part {
             "fangs" => Some(FANGS_ARGS),
             "effort" => Some(EFFORT_ARGS),
+            "map" | "packet" | "focus" => Some(WORK_MAP_SESSION_ARGS),
+            "track" => Some(TRACK_ARGS),
             _ => None,
         };
         if let Some(args) = sub_args {
@@ -720,6 +770,7 @@ struct TuiState {
     turn_error_count: usize,
     turn_start_at: Option<Instant>,
     todo_progress: Option<TodoProgress>,
+    work_map: Option<WorkMapDrawer>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -790,7 +841,7 @@ impl TuiState {
             turn_seq: 0,
             call_tags: HashMap::new(),
             sub_batch: None,
-            verbose: false,
+            verbose: true,
             input_display_override: None,
             external_telemetry: ExternalTelemetry::default(),
             retry_status: None,
@@ -806,6 +857,7 @@ impl TuiState {
             turn_error_count: 0,
             turn_start_at: None,
             todo_progress: None,
+            work_map: None,
         }
     }
 
@@ -822,7 +874,17 @@ impl TuiState {
     }
 
     fn queue(&mut self, line: Line_) {
+        if matches!(line, Line_::Tool { .. }) && self.last_line_is_completed_thinking() {
+            self.pending_insert.push(Line_::Blank);
+        }
         self.pending_insert.push(line);
+    }
+
+    fn last_line_is_completed_thinking(&self) -> bool {
+        self.pending_insert
+            .last()
+            .or_else(|| self.transcript.last())
+            .is_some_and(|line| matches!(line, Line_::Thinking(_)))
     }
 
     fn scroll_transcript_by(&mut self, delta: isize) {
@@ -937,6 +999,64 @@ impl TuiState {
         true
     }
 
+    fn work_map_is_active(&self) -> bool {
+        self.work_map
+            .as_ref()
+            .is_some_and(|drawer| !drawer.waypoint_ids.is_empty())
+    }
+
+    fn set_work_map_selection(&mut self, selected: usize) {
+        if let Some(drawer) = self.work_map.as_mut() {
+            let max = drawer.waypoint_ids.len().saturating_sub(1);
+            drawer.selected = selected.min(max);
+            let visible_rows = drawer
+                .waypoint_ids
+                .len()
+                .min(WORK_MAP_DRAWER_MAX_BODY_ROWS)
+                .max(1);
+            sync_work_map_scroll(drawer, visible_rows);
+        }
+    }
+
+    fn move_work_map_selection(&mut self, delta: isize) -> bool {
+        self.move_work_map_selection_for_rows(delta, WORK_MAP_DRAWER_MAX_BODY_ROWS)
+    }
+
+    fn move_work_map_selection_for_rows(&mut self, delta: isize, visible_rows: usize) -> bool {
+        let Some(drawer) = self.work_map.as_mut() else {
+            return false;
+        };
+        if drawer.waypoint_ids.is_empty() {
+            return false;
+        }
+        let current = drawer
+            .selected
+            .min(drawer.waypoint_ids.len().saturating_sub(1));
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(drawer.waypoint_ids.len().saturating_sub(1))
+        };
+        if next == current {
+            return false;
+        }
+        drawer.selected = next;
+        sync_work_map_scroll(drawer, visible_rows);
+        true
+    }
+
+    fn selected_work_map_command_arg(&self) -> Option<String> {
+        let drawer = self.work_map.as_ref()?;
+        let id = drawer.waypoint_ids.get(drawer.selected)?;
+        if let Some(selector) = drawer.selector.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(format!("{} {id}", selector.trim()))
+        } else {
+            Some(id.clone())
+        }
+    }
+
     fn managed_region_contains(&self, column: u16, row: u16) -> bool {
         let transcript = self.transcript_area;
         let input = self.input_area;
@@ -999,9 +1119,10 @@ impl TuiState {
                 self.turn_error_count = 0;
                 self.turn_start_at = Some(Instant::now());
             }
-            AgentEvent::HistoryContextUpdated { chars } => {
+            AgentEvent::HistoryContextUpdated { chars, tokens } => {
                 self.history_chars = chars as u64;
-                self.last_turn_context_tokens = ((self.history_chars.saturating_add(3)) / 4).max(1);
+                self.last_turn_context_tokens =
+                    tokens.unwrap_or_else(|| ((self.history_chars.saturating_add(3)) / 4).max(1));
             }
             AgentEvent::TextDelta(t) => {
                 self.retry_status = None;
@@ -1040,9 +1161,13 @@ impl TuiState {
                 if !full.is_empty() {
                     let word_count = full.split_whitespace().count();
                     if self.verbose {
-                        self.queue(Line_::Thinking(full.clone()));
+                        self.queue(Line_::Thinking(full));
                     }
-                    self.status = format!("thinking done ({} words)", word_count);
+                    self.status = if self.verbose {
+                        format!("thinking done ({} words)", word_count)
+                    } else {
+                        format!("thinking hidden ({} words)", word_count)
+                    };
                 }
                 self.streaming_thinking.clear();
             }
@@ -1246,10 +1371,7 @@ impl TuiState {
                 // provider-side normalization, input/cache_read/cache_create
                 // are disjoint sets across every supported provider, so the
                 // actual context the model saw is their sum.
-                let turn_ctx = turn
-                    .input
-                    .saturating_add(turn.cache_read)
-                    .saturating_add(turn.cache_create);
+                let turn_ctx = turn.context_tokens();
                 if turn_ctx > 0 {
                     self.last_turn_context_tokens = turn_ctx;
                     self.history_chars = turn_ctx.saturating_mul(4);
@@ -1312,6 +1434,44 @@ impl TuiState {
                 self.status = "ready".into();
                 self.queue(Line_::Info(s));
             }
+            AgentEvent::WorkMap {
+                kind,
+                text,
+                waypoint_ids,
+                selector,
+            } => {
+                self.compacting = false;
+                self.compacting_resume_busy = false;
+                self.streaming_text.clear();
+                self.streaming_thinking.clear();
+                self.stream_started_at = None;
+                self.stream_chars = 0;
+                self.live_tools.clear();
+                self.sub_batch = None;
+                self.agent_busy = false;
+                let visible_ids = visible_work_map_ids(&text, &waypoint_ids);
+                if matches!(kind, WorkMapEventKind::Map) && !visible_ids.is_empty() {
+                    self.work_map = Some(WorkMapDrawer {
+                        text,
+                        waypoint_ids: visible_ids,
+                        selector,
+                        selected: 0,
+                        scroll: 0,
+                    });
+                    self.status = "work map open in composer: ↑/↓ select · Enter focus · p packet · t track · Esc close"
+                        .into();
+                } else {
+                    self.work_map = None;
+                    self.status = "work map ready".into();
+                    self.queue(Line_::WorkMap {
+                        kind,
+                        text,
+                        waypoint_ids: visible_ids,
+                        selector,
+                        selected: 0,
+                    });
+                }
+            }
             AgentEvent::TurnEnd { .. } => {
                 self.compacting = false;
                 self.compacting_resume_busy = false;
@@ -1359,7 +1519,9 @@ impl TuiState {
                 self.compacting = false;
                 self.compacting_resume_busy = false;
                 self.agent_busy = resume_busy;
-                self.last_turn_context_tokens = ((self.history_chars.saturating_add(3)) / 4).max(1);
+                self.last_turn_context_tokens = self
+                    .last_turn_context_tokens
+                    .max(((self.history_chars.saturating_add(3)) / 4).max(1));
                 self.queue(Line_::Info(format!(
                     "compacted {before} → {after} messages"
                 )));
@@ -1535,6 +1697,17 @@ fn live_detail_line(detail: String, color: Color, max_cells: usize) -> Line<'sta
     ])
 }
 
+fn live_thinking_detail_line(detail: String, max_cells: usize) -> Line<'static> {
+    let style = Style::default().fg(Color::Gray).bg(THINKING_BG);
+    Line::from(vec![
+        Span::styled(
+            "  ↳ ",
+            Style::default().fg(Color::Indexed(244)).bg(THINKING_BG),
+        ),
+        Span::styled(clamp_chars(&detail, max_cells), style),
+    ])
+}
+
 fn live_indicator_todo_detail(state: &TuiState, max_cells: usize) -> Option<Line<'static>> {
     state
         .todo_progress
@@ -1590,7 +1763,7 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
         };
         return Some(live_detail_line(detail, Color::Reset, max_cells));
     }
-    if !state.streaming_thinking.is_empty() {
+    if state.verbose && !state.streaming_thinking.is_empty() {
         let tail = state
             .streaming_thinking
             .lines()
@@ -1598,10 +1771,18 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
             .unwrap_or(&state.streaming_thinking)
             .trim();
         if !tail.is_empty() {
-            return Some(live_detail_line(tail.to_string(), Color::Reset, max_cells));
+            return Some(live_thinking_detail_line(tail.to_string(), max_cells));
         }
     }
     live_indicator_todo_detail(state, max_cells)
+}
+
+fn display_busy_status(status: String) -> String {
+    if status == "thinking" {
+        "Thinking".to_string()
+    } else {
+        status
+    }
 }
 
 fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
@@ -1636,11 +1817,17 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
     }
 
     let usage = &state.usage;
-    let total_in = usage.input + usage.cache_read + usage.cache_create;
-    if total_in + usage.output > 0 {
+    let actual_in = usage.actual_input_tokens();
+    let cached_in = usage.cached_input_tokens();
+    if actual_in + cached_in + usage.output > 0 {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!("↑{}", format_count(total_in)),
+            format!("↑{}", format_count(actual_in)),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("↻{}", format_count(cached_in)),
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::raw(" "));
@@ -1914,6 +2101,48 @@ fn wrap_plain_visual(text: &str, max_cols: usize) -> Vec<String> {
     wrap_input_visual(&sanitize_display_text(text), text.len(), max_cols.max(1)).0
 }
 
+fn wrap_plain_words_visual(text: &str, max_cols: usize) -> Vec<String> {
+    let max_cols = max_cols.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for word in text.split_whitespace() {
+        let mut rest = word.to_string();
+        while !rest.is_empty() {
+            let rest_width = text_width(&rest);
+            if current_width == 0 {
+                if rest_width <= max_cols {
+                    current_width = rest_width;
+                    current = rest;
+                    break;
+                }
+                let (chunk, tail) = split_display_cells(&rest, max_cols);
+                if !chunk.is_empty() {
+                    lines.push(chunk);
+                }
+                rest = tail;
+            } else if current_width + 1 + rest_width <= max_cols {
+                current.push(' ');
+                current.push_str(&rest);
+                current_width += 1 + rest_width;
+                break;
+            } else {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn permission_prompt_text(
     tool: &str,
     command: &str,
@@ -1976,6 +2205,17 @@ fn replace_last_permission_entry(items: &mut [Line_], replacement: Line_) -> boo
     } else {
         false
     }
+}
+
+fn visible_work_map_ids(text: &str, waypoint_ids: &[String]) -> Vec<String> {
+    waypoint_ids
+        .iter()
+        .filter(|id| {
+            text.lines()
+                .any(|line| line.trim_start().starts_with(id.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 fn extract_path_from_summary(summary: &str) -> Option<String> {
@@ -2654,8 +2894,31 @@ fn input_panel_height(state: &TuiState, area_height: u16, area_width: u16) -> u1
     let cols = area_width.saturating_sub(2).max(1) as usize;
     let (wrapped, _, _) = wrap_input_visual(&state.input, state.cursor, cols);
     let text_rows = wrapped.len().max(1) as u16;
-    let desired = text_rows.saturating_add(3);
+    let drawer_rows = work_map_drawer_height(state, area_width) as u16;
+    let desired = text_rows.saturating_add(3).saturating_add(drawer_rows);
     desired.clamp(min_panel, max_panel)
+}
+
+fn work_map_drawer_body_rows(state: &TuiState) -> usize {
+    state
+        .work_map
+        .as_ref()
+        .map(|drawer| {
+            drawer
+                .waypoint_ids
+                .len()
+                .min(WORK_MAP_DRAWER_MAX_BODY_ROWS)
+                .max(1)
+        })
+        .unwrap_or(0)
+}
+
+fn work_map_drawer_height(state: &TuiState, area_width: u16) -> usize {
+    if !state.work_map_is_active() || area_width == 0 {
+        return 0;
+    }
+    let body_rows = work_map_drawer_body_rows(state);
+    (body_rows + 2).min(WORK_MAP_DRAWER_MAX_ROWS)
 }
 
 fn count_words(s: &str) -> usize {
@@ -2869,7 +3132,7 @@ fn is_plain_text_code_fence_opener(line: &Line<'_>) -> bool {
     let Some(info) = trimmed.strip_prefix("```") else {
         return false;
     };
-    let lang = info.trim_start().split_whitespace().next().unwrap_or("");
+    let lang = info.split_whitespace().next().unwrap_or("");
     matches!(
         lang.to_ascii_lowercase().as_str(),
         "text" | "txt" | "plain" | "plaintext"
@@ -3374,6 +3637,10 @@ fn text_width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
 }
 
+fn transcript_render_width(width: u16) -> u16 {
+    width.saturating_sub(TRANSCRIPT_WRAP_GUARD_COLS).max(1)
+}
+
 fn is_table_separator_line(line: &str) -> bool {
     is_md_separator_row(line) || is_ascii_border_row(line)
 }
@@ -3537,6 +3804,23 @@ fn push_prefixed_wrapped_line(
         Text::from(wrapped),
         prefix,
         prefix_style,
+        target_width,
+    );
+}
+
+fn push_prefixed_wrapped_spans(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    prefix_style: Style,
+    body_spans: Vec<Span<'static>>,
+    target_width: u16,
+) {
+    let prefix_span = Span::styled(prefix.to_string(), prefix_style);
+    push_wrapped_spans_with_prefix(
+        lines,
+        vec![prefix_span.clone()],
+        vec![prefix_span],
+        body_spans,
         target_width,
     );
 }
@@ -3721,6 +4005,27 @@ fn push_density_separator(
         Span::styled(label, Style::default().fg(Color::Indexed(242))),
         Span::styled("─".repeat(right), Style::default().fg(Color::Indexed(236))),
     ]));
+}
+
+fn push_thinking_body_lines(
+    lines: &mut Vec<Line<'static>>,
+    body: &str,
+    border_style: Style,
+    thinking_style: Style,
+    width: u16,
+) {
+    let max_width = width.max(1) as usize;
+    let prefix = "│ ";
+    let prefix_width = text_width(prefix);
+    let body_width = max_width.saturating_sub(prefix_width).max(1);
+    for raw in sanitize_display_text(body).lines().take(20) {
+        for row in wrap_plain_words_visual(raw, body_width) {
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), border_style),
+                Span::styled(row, thinking_style),
+            ]));
+        }
+    }
 }
 
 fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
@@ -4246,42 +4551,114 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
             ]));
         }
         Line_::Thinking(s) => {
-            let word_count = s.split_whitespace().count();
-            lines.push(Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("thinking ({} words)", word_count),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]));
-            for raw in s.lines().take(20) {
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(Color::Indexed(236))),
-                    Span::styled(
-                        raw.to_string(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ]));
-            }
-            let remaining = s.lines().count().saturating_sub(20);
+            let sanitized = sanitize_display_text(s);
+            let thinking_style = Style::default()
+                .fg(Color::Gray)
+                .bg(THINKING_BG)
+                .add_modifier(Modifier::ITALIC);
+            let border_style = Style::default().fg(Color::Indexed(244)).bg(THINKING_BG);
+            push_thinking_body_lines(&mut lines, &sanitized, border_style, thinking_style, width);
+            let remaining = sanitized.lines().count().saturating_sub(20);
             if remaining > 0 {
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(Color::Indexed(236))),
-                    Span::styled(
+                push_prefixed_wrapped_spans(
+                    &mut lines,
+                    "│ ",
+                    border_style,
+                    vec![Span::styled(
                         format!("… ({remaining} more lines)"),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ]));
+                        thinking_style,
+                    )],
+                    width,
+                );
             }
         }
+        Line_::WorkMap {
+            kind,
+            text,
+            waypoint_ids,
+            selected,
+            ..
+        } => push_work_map_lines(&mut lines, *kind, text, waypoint_ids, *selected, width),
+        Line_::Blank => lines.push(Line::from("")),
     }
     Text::from(lines)
+}
+
+fn work_map_line_style(raw: &str, is_selected: bool) -> Style {
+    let trimmed = raw.trim_start();
+    let mut style = if trimmed.starts_with("Work map") || trimmed.starts_with("[wolf") {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("commands:") {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    if is_selected {
+        style = style
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
+fn push_work_map_lines(
+    lines: &mut Vec<Line<'static>>,
+    kind: WorkMapEventKind,
+    text: &str,
+    waypoint_ids: &[String],
+    selected: usize,
+    width: u16,
+) {
+    let title = match kind {
+        WorkMapEventKind::Map => "work map",
+        WorkMapEventKind::Packet => "work packet",
+        WorkMapEventKind::Focus => "work focus",
+        WorkMapEventKind::Tracks => "work tracks",
+    };
+    let selected_id = waypoint_ids.get(selected).map(String::as_str);
+    let border_style = Style::default().fg(Color::Cyan);
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    lines.push(Line::from(vec![
+        Span::styled("▌ ", border_style),
+        Span::styled(title.to_string(), title_style),
+        Span::styled("  ".to_string(), Style::default()),
+        Span::styled(
+            if waypoint_ids.is_empty() {
+                "printed in transcript".to_string()
+            } else {
+                "↑/↓ select · Enter focus · p packet · t track · Esc close".to_string()
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    let body_width = width.saturating_sub(2).max(1);
+    for raw in sanitize_display_text(text).lines() {
+        let trimmed = raw.trim_start();
+        let is_selected = selected_id.is_some_and(|id| trimmed.starts_with(id));
+        let body_style = work_map_line_style(raw, is_selected);
+        let prefix_style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let prefix = if is_selected { "▶ " } else { "│ " };
+        for (idx, wrapped) in wrap_plain_visual(raw, body_width as usize)
+            .into_iter()
+            .enumerate()
+        {
+            let line_prefix = if idx == 0 { prefix } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(line_prefix.to_string(), prefix_style),
+                Span::styled(wrapped, body_style),
+            ]));
+        }
+    }
 }
 
 fn rg_display_content(content: &str) -> String {
@@ -4449,15 +4826,16 @@ fn cached_transcript_render(
             heights: HashMap::new(),
         });
 
+    let render_width = transcript_render_width(width);
     let text = entry
         .renders
-        .entry(width)
-        .or_insert_with(|| line_to_text(item, width))
+        .entry(render_width)
+        .or_insert_with(|| line_to_text(item, render_width))
         .clone();
     let height = *entry
         .heights
-        .entry(width)
-        .or_insert_with(|| text_visual_height(&text, width));
+        .entry(render_width)
+        .or_insert_with(|| text_visual_height(&text, render_width));
 
     let mut text = text;
     if transcript_item_should_dim(item, state) {
@@ -4478,12 +4856,7 @@ fn sync_last_expandable(state: &mut TuiState, items: &[Line_]) {
             ..
         } = item
         {
-            state.last_expandable = if *group_count > 1 {
-                Some(ExpandableBlock {
-                    name: name.clone(),
-                    expanded: *expanded,
-                })
-            } else if content_has_more_than_preview(content) {
+            state.last_expandable = if *group_count > 1 || content_has_more_than_preview(content) {
                 Some(ExpandableBlock {
                     name: name.clone(),
                     expanded: *expanded,
@@ -4520,7 +4893,10 @@ fn insert_transcript_item<B: Backend>(
     tool_tint_parity: &mut bool,
 ) -> io::Result<()> {
     let (text, height) = cached_transcript_render(state, item, width);
-    let tint_bg = next_transcript_tint(item, tool_tint_parity);
+    let tint_bg = match item {
+        Line_::Thinking(_) => Some(THINKING_BG),
+        _ => next_transcript_tint(item, tool_tint_parity),
+    };
     terminal.insert_before(height, |buf| {
         let para = Paragraph::new(text).wrap(Wrap { trim: false });
         Widget::render(para, buf.area, buf);
@@ -4630,6 +5006,8 @@ fn set_last_tool_expanded(items: &mut [Line_], name: &str, expanded: bool) -> bo
 fn input_hint_text(state: &TuiState) -> &'static str {
     if state.pending_perm.is_some() {
         "  press y / a / n to respond"
+    } else if state.work_map_is_active() {
+        "  Work Map drawer  ·  Enter focuses selection  ·  p packet  ·  t track  ·  Esc close"
     } else if state.input_display_override.is_some() {
         "  large paste collapsed visually  ·  Enter sends full input  ·  any edit reveals full text"
     } else if state.agent_busy {
@@ -4650,7 +5028,7 @@ fn transcript_live_indicator_text(state: &TuiState, width: u16) -> Option<Text<'
         ),
         Span::raw("  "),
         Span::styled(
-            derived_busy_status(state),
+            display_busy_status(derived_busy_status(state)),
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -4695,7 +5073,7 @@ fn collect_wrapped_lines(text: &Text<'static>, width: u16) -> Vec<Line<'static>>
 }
 
 fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcript_area: Rect) {
-    let content_width = transcript_area.width.max(1);
+    let content_width = transcript_render_width(transcript_area.width);
     let live_text = transcript_live_indicator_text(state, content_width);
     let live_lines = live_text
         .as_ref()
@@ -4801,15 +5179,15 @@ fn help_overlay_text() -> Text<'static> {
         ("Ctrl+C", "interrupt agent (twice = quit)"),
         ("Ctrl+D", "quit"),
         ("Ctrl+O", "toggle last tool output"),
-        ("Ctrl+V", "toggle verbose (show thinking)"),
+        ("Ctrl+V", "toggle thinking visibility"),
         ("Ctrl+E", "cycle reasoning depth"),
         ("PgUp / PgDn", "scroll transcript"),
         ("Up / Down", "history (single-line input only)"),
         ("?", "toggle this help"),
     ];
     let legend_rows: &[(&str, &str)] = &[
-        ("↑N ↓N", "input/output tokens"),
-        ("% [████░░░░░░]", "context window usage"),
+        ("↑N ↻N ↓N", "actual input / cached input / output tokens"),
+        ("% [████░░░░░░]", "last request context window usage"),
         ("● / ⠋", "ready / busy spinner"),
         ("(branch)", "git branch in sandbox"),
     ];
@@ -4972,6 +5350,122 @@ fn slash_popup_layout(
     })
 }
 
+fn work_map_drawer_rows(drawer: &WorkMapDrawer) -> Vec<String> {
+    let sanitized = sanitize_display_text(&drawer.text);
+    let text_lines = sanitized.lines().collect::<Vec<_>>();
+    drawer
+        .waypoint_ids
+        .iter()
+        .map(|id| {
+            text_lines
+                .iter()
+                .find(|line| line.trim_start().starts_with(id.as_str()))
+                .map(|line| line.trim_start().to_string())
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect()
+}
+
+fn sync_work_map_scroll(drawer: &mut WorkMapDrawer, visible_rows: usize) {
+    if visible_rows == 0 || drawer.waypoint_ids.is_empty() {
+        drawer.scroll = 0;
+        return;
+    }
+    let max_selected = drawer.waypoint_ids.len().saturating_sub(1);
+    drawer.selected = drawer.selected.min(max_selected);
+    if drawer.selected < drawer.scroll {
+        drawer.scroll = drawer.selected;
+    } else if drawer.selected >= drawer.scroll.saturating_add(visible_rows) {
+        drawer.scroll = drawer
+            .selected
+            .saturating_add(1)
+            .saturating_sub(visible_rows);
+    }
+    let max_scroll = drawer.waypoint_ids.len().saturating_sub(visible_rows);
+    drawer.scroll = drawer.scroll.min(max_scroll);
+}
+
+fn work_map_drawer_lines(state: &mut TuiState, width: u16, height: usize) -> Vec<Line<'static>> {
+    if height < 3 || width == 0 {
+        return Vec::new();
+    }
+    let Some(drawer) = state.work_map.as_mut() else {
+        return Vec::new();
+    };
+    if drawer.waypoint_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let body_rows = height.saturating_sub(2).min(WORK_MAP_DRAWER_MAX_BODY_ROWS);
+    if body_rows == 0 {
+        return Vec::new();
+    }
+    sync_work_map_scroll(drawer, body_rows);
+
+    let rows = work_map_drawer_rows(drawer);
+    let total = drawer.waypoint_ids.len();
+    let selected = drawer.selected.min(total.saturating_sub(1));
+    let selected_id = drawer
+        .waypoint_ids
+        .get(selected)
+        .map(String::as_str)
+        .unwrap_or("?");
+    let inner_width = width.max(1) as usize;
+    let mut lines = Vec::with_capacity(height);
+    let title = format!("▌ Work Map  {selected_id}  {}/{}", selected + 1, total);
+    lines.push(Line::from(vec![Span::styled(
+        clamp_chars(&title, inner_width),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
+
+    for idx in drawer.scroll..drawer.scroll.saturating_add(body_rows).min(total) {
+        let raw = rows.get(idx).map(String::as_str).unwrap_or_else(|| {
+            drawer
+                .waypoint_ids
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or("?")
+        });
+        let is_selected = idx == selected;
+        let prefix = if is_selected { "▶ " } else { "  " };
+        let prefix_style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let body_width = inner_width.saturating_sub(text_width(prefix)).max(1);
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), prefix_style),
+            Span::styled(
+                clamp_chars(raw, body_width),
+                work_map_line_style(raw, is_selected),
+            ),
+        ]));
+    }
+
+    while lines.len() < height.saturating_sub(1) {
+        lines.push(Line::from(""));
+    }
+
+    let first_visible = drawer.scroll.saturating_add(1).min(total);
+    let last_visible = drawer.scroll.saturating_add(body_rows).min(total);
+    let scroll_hint = if total > body_rows {
+        format!("showing {first_visible}-{last_visible}/{total} · ")
+    } else {
+        String::new()
+    };
+    lines.push(Line::from(Span::styled(
+        clamp_chars(
+            &format!("  {scroll_hint}Enter focus · p packet · t track · Esc close"),
+            inner_width,
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
 fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let area = frame.area();
     render_widget_safe(frame, Clear, area);
@@ -4996,8 +5490,18 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let wrap_cols = input_area.width.saturating_sub(2).max(1) as usize;
     let (wrapped, cursor_row, cursor_col) =
         wrap_input_visual(&state.input, state.cursor, wrap_cols);
-    let inner_rows = input_area.height.saturating_sub(2).max(1);
-    let text_rows_visible = inner_rows.saturating_sub(1).max(1) as usize;
+    let inner_rows = input_area.height.saturating_sub(2).max(1) as usize;
+    let drawer_height = work_map_drawer_height(state, input_area.width).min(inner_rows);
+    let hint_rows = 1usize;
+    let mut text_rows_visible = inner_rows
+        .saturating_sub(drawer_height)
+        .saturating_sub(hint_rows)
+        .max(WORK_MAP_DRAWER_MIN_EDITOR_ROWS);
+    let drawer_rows = drawer_height.min(inner_rows.saturating_sub(text_rows_visible + hint_rows));
+    text_rows_visible = inner_rows
+        .saturating_sub(drawer_rows)
+        .saturating_sub(hint_rows)
+        .max(WORK_MAP_DRAWER_MIN_EDITOR_ROWS);
 
     let mut start_row = 0usize;
     if wrapped.len() > text_rows_visible {
@@ -5014,6 +5518,9 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     while lines.len() < text_rows_visible {
         lines.push(Line::from(""));
     }
+    if drawer_rows > 0 {
+        lines.extend(work_map_drawer_lines(state, wrap_cols as u16, drawer_rows));
+    }
     lines.push(Line::from(Span::styled(
         input_hint_text(state),
         Style::default().fg(Color::DarkGray),
@@ -5028,6 +5535,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
 
     if state.pending_perm.is_none()
         && !state.show_help
+        && !state.work_map_is_active()
         && input_area.width > 0
         && input_area.height > 0
     {
@@ -5061,6 +5569,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
 
     if !state.show_help
         && state.pending_perm.is_none()
+        && !state.work_map_is_active()
         && (!state.agent_busy || state.input.starts_with('/'))
     {
         let completions = slash_completions(&state.input);
@@ -5157,13 +5666,105 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
     }
 }
 
+fn insert_command_into_input(state: &mut TuiState, command: String) {
+    state.input = command;
+    state.cursor = state.input.len();
+    state.clear_slash_completion_selection();
+    state.input_display_override = None;
+}
+
+fn handle_work_map_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    if !state.work_map_is_active() {
+        return false;
+    }
+    let handled = match key.code {
+        KeyCode::Esc => {
+            state.work_map = None;
+            state.status = "work map drawer closed".to_string();
+            true
+        }
+        KeyCode::Up => {
+            if state.move_work_map_selection(-1) {
+                state.status = "work map selection moved".to_string();
+            }
+            true
+        }
+        KeyCode::Down => {
+            if state.move_work_map_selection(1) {
+                state.status = "work map selection moved".to_string();
+            }
+            true
+        }
+        KeyCode::PageUp => {
+            let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
+            if state.move_work_map_selection_for_rows(-step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
+                state.status = "work map selection moved".to_string();
+            }
+            true
+        }
+        KeyCode::PageDown => {
+            let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
+            if state.move_work_map_selection_for_rows(step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
+                state.status = "work map selection moved".to_string();
+            }
+            true
+        }
+        KeyCode::Home => {
+            state.set_work_map_selection(0);
+            state.status = "work map selection moved".to_string();
+            true
+        }
+        KeyCode::End => {
+            if let Some(last) = state
+                .work_map
+                .as_ref()
+                .map(|drawer| drawer.waypoint_ids.len().saturating_sub(1))
+            {
+                state.set_work_map_selection(last);
+                state.status = "work map selection moved".to_string();
+            }
+            true
+        }
+        KeyCode::Enter | KeyCode::Char('f') | KeyCode::Char('F') => {
+            if let Some(arg) = state.selected_work_map_command_arg() {
+                insert_command_into_input(state, format!("/focus {arg}"));
+                state.work_map = None;
+                state.status = "inserted /focus command".to_string();
+            }
+            true
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            if let Some(arg) = state.selected_work_map_command_arg() {
+                insert_command_into_input(state, format!("/packet {arg}"));
+                state.work_map = None;
+                state.status = "inserted /packet command".to_string();
+            }
+            true
+        }
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            if let Some(arg) = state.selected_work_map_command_arg() {
+                insert_command_into_input(state, format!("/track open {arg}"));
+                state.work_map = None;
+                state.status = "inserted /track command".to_string();
+            }
+            true
+        }
+        _ => false,
+    };
+    handled
+}
+
 fn handle_key(
     state: &mut TuiState,
     key: KeyEvent,
     agent_input: &tokio::sync::mpsc::UnboundedSender<FromTui>,
+    steering_input: &tokio::sync::mpsc::UnboundedSender<String>,
     interrupt: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     if key.kind != KeyEventKind::Press {
+        return;
+    }
+    if state.work_map_is_active() && handle_work_map_key(state, key) {
         return;
     }
     if state.pending_perm.is_some() {
@@ -5289,13 +5890,16 @@ fn handle_key(
         (KeyCode::Char('v'), m) if is_ctrl(m) => {
             state.verbose = !state.verbose;
             state.status = if state.verbose {
-                "verbose: showing thinking blocks".to_string()
+                "thinking visible".to_string()
             } else {
-                "verbose: hiding thinking blocks".to_string()
+                "thinking hidden".to_string()
             };
         }
         (KeyCode::Esc, _) => {
-            if state.show_help {
+            if state.work_map_is_active() {
+                state.work_map = None;
+                state.status = "work map drawer closed".to_string();
+            } else if state.show_help {
                 state.show_help = false;
             } else if state.agent_busy {
                 if interrupt.swap(true, Ordering::SeqCst) {
@@ -5329,13 +5933,18 @@ fn handle_key(
             state.input_display_override = None;
         }
         (KeyCode::Enter, _) => {
+            state.work_map = None;
             let text = state.input.clone();
             if text.trim().is_empty() {
                 return;
             }
             if state.agent_busy && !text.starts_with('/') {
                 state.queue(Line_::Steering(text.clone()));
-                let _ = agent_input.send(FromTui::Steering(text));
+                if steering_input.send(text).is_ok() {
+                    state.status = "steering queued for next safe boundary".to_string();
+                } else {
+                    state.status = "steering queue unavailable".to_string();
+                }
                 state.input.clear();
                 state.cursor = 0;
                 state.clear_slash_completion_selection();
@@ -5522,15 +6131,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn apply_runtime_control_input(agent: &mut Agent, text: &str) -> bool {
-    let mut out = Vec::new();
-    let handled = crate::apply_runtime_control_command(agent, text, |msg| out.push(msg));
-    for msg in out {
-        agent.sink.emit(AgentEvent::Slash(msg));
-    }
-    handled
-}
-
 pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let model = agent.model.clone();
     let sandbox = agent.sandbox_root.display().to_string();
@@ -5599,6 +6199,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     // Move agent into a task; communicate via channels
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<FromTui>();
     let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let direct_steer_tx = steer_tx.clone();
     agent.install_steering(steer_rx, steer_tx);
     let handle = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
@@ -5697,11 +6298,6 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                     )));
                 }
                 FromTui::Quit => break,
-                FromTui::Steering(text) => {
-                    if !apply_runtime_control_input(&mut agent, &text) {
-                        let _ = agent.steering_sender().send(text);
-                    }
-                }
             }
         }
     });
@@ -5742,7 +6338,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
             maybe_key = key_rx.recv() => {
                 if let Some(ev) = maybe_key {
                     match ev {
-                        Event::Key(k) => handle_key(&mut state, k, &in_tx, &interrupt),
+                        Event::Key(k) => handle_key(&mut state, k, &in_tx, &direct_steer_tx, &interrupt),
                         Event::Mouse(mouse) => handle_mouse(&mut state, mouse),
                         Event::Paste(pasted) => handle_paste(&mut state, pasted),
                         _ => {}
@@ -6273,6 +6869,310 @@ mod tests {
     }
 
     #[test]
+    fn completed_thinking_is_visible_by_default_before_next_event() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "I need to inspect the implementation".to_string(),
+        ));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "I need to inspect the implementation before using tools".to_string(),
+        ));
+        state.apply_event(AgentEvent::ToolCallResult {
+            call_id: "call_1".to_string(),
+            name: "rg".to_string(),
+            ok: true,
+            preview: "rg: thinking".to_string(),
+            content: "matched line".to_string(),
+        });
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Thinking(_), Line_::Blank, Line_::Tool { name, .. }] if name == "rg"
+        ));
+    }
+
+    #[test]
+    fn inserts_blank_between_thinking_history_and_next_tool() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "thinking history".to_string(),
+        ));
+        state.apply_event(AgentEvent::ToolCallResult {
+            call_id: "call_1".to_string(),
+            name: "read_symbol".to_string(),
+            ok: true,
+            preview: "read_symbol: src/main.rs".to_string(),
+            content: "line".to_string(),
+        });
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Thinking(_), Line_::Blank, Line_::Tool { name, .. }] if name == "read_symbol"
+        ));
+        assert_eq!(
+            flatten_lines(&line_to_text(&Line_::Blank, 80)),
+            vec![String::new()]
+        );
+    }
+
+    #[test]
+    fn work_map_packet_still_renders_in_transcript() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::WorkMap {
+            kind: WorkMapEventKind::Packet,
+            text: "[wolf packet @w01]\nsource: current".to_string(),
+            waypoint_ids: vec!["@w01".to_string()],
+            selector: None,
+        });
+
+        assert!(!state.work_map_is_active());
+        assert!(matches!(
+            state.pending_insert.last(),
+            Some(Line_::WorkMap { .. })
+        ));
+        let lines = flatten_lines(&line_to_text(state.pending_insert.last().unwrap(), 80));
+        assert!(
+            lines.iter().any(|line| line.contains("work packet")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn work_map_event_opens_input_drawer_and_keyboard_inserts_commands() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::WorkMap {
+            kind: WorkMapEventKind::Map,
+            text: "Work map — current\n@w01 intent #1  first\n@w02 change #2  second\ncommands: /packet @wNN".to_string(),
+            waypoint_ids: vec!["@w01".to_string(), "@w02".to_string(), "@w99".to_string()],
+            selector: None,
+        });
+
+        assert!(state.work_map_is_active());
+        assert!(state.pending_insert.is_empty());
+        let lines = flatten_lines(&Text::from(work_map_drawer_lines(&mut state, 80, 4)));
+        assert!(
+            lines.iter().any(|line| line.contains("Work Map")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("▶ @w01")),
+            "{lines:?}"
+        );
+
+        handle_work_map_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        let lines = flatten_lines(&Text::from(work_map_drawer_lines(&mut state, 80, 4)));
+        assert!(
+            lines.iter().any(|line| line.starts_with("▶ @w02")),
+            "{lines:?}"
+        );
+        handle_work_map_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.input, "/packet @w02");
+        assert!(!state.work_map_is_active());
+
+        state.input.clear();
+        state.cursor = 0;
+        state.apply_event(AgentEvent::WorkMap {
+            kind: WorkMapEventKind::Map,
+            text: "Work map — old-session\n@w01 intent #1  first".to_string(),
+            waypoint_ids: vec!["@w01".to_string()],
+            selector: Some("old-session".to_string()),
+        });
+        handle_work_map_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(state.input, "/focus old-session @w01");
+    }
+
+    #[test]
+    fn completed_thinking_can_be_hidden() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.verbose = false;
+
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "I need to inspect the implementation".to_string(),
+        ));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "I need to inspect the implementation before using tools".to_string(),
+        ));
+        state.apply_event(AgentEvent::ToolCallResult {
+            call_id: "call_1".to_string(),
+            name: "rg".to_string(),
+            ok: true,
+            preview: "rg: thinking".to_string(),
+            content: "matched line".to_string(),
+        });
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Tool { name, .. }] if name == "rg"
+        ));
+        assert!(state.streaming_thinking.is_empty());
+    }
+
+    #[test]
+    fn thinking_block_wraps_inside_available_width() {
+        let text = line_to_text(
+            &Line_::Thinking("**Logging decisions and findings** ".repeat(12)),
+            32,
+        );
+        let lines = flatten_lines(&text);
+        assert!(lines.len() > 1, "thinking block should wrap: {lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) <= 32),
+            "thinking block lines must stay inside transcript width: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .skip(1)
+                .all(|line| line.starts_with("│ ") || line.starts_with("  ")),
+            "wrapped thinking lines should keep an internal lane prefix: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_render_width_reserves_guard_column() {
+        assert_eq!(transcript_render_width(0), 1);
+        assert_eq!(transcript_render_width(1), 1);
+        assert_eq!(transcript_render_width(80), 79);
+    }
+
+    #[test]
+    fn live_thinking_indicator_uses_full_width() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.streaming_thinking = "x".repeat(80);
+
+        let text = transcript_live_indicator_text(&state, 80).expect("live indicator");
+        let lines = flatten_lines(&text);
+
+        assert!(lines[0].contains("Thinking"), "live status: {lines:?}");
+        assert!(
+            !lines[0].contains("  thinking"),
+            "live thinking status should be capitalized: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) == 80),
+            "live indicator should be allowed to fill/break at terminal border: {lines:?}"
+        );
+        let style = span_style_for(&text, "xxx").expect("streaming thinking detail");
+        assert_eq!(style.bg, Some(THINKING_BG));
+    }
+
+    #[test]
+    fn cached_thinking_render_reserves_terminal_wrap_guard() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let item = Line_::Thinking("**Addressing user frustration** ".repeat(8));
+        let (text, _) = cached_transcript_render(&mut state, &item, 32);
+        let lines = flatten_lines(&text);
+        assert!(
+            lines
+                .iter()
+                .all(|line| unicode_width::UnicodeWidthStr::width(line.as_str()) <= 31),
+            "thinking render must leave a guard column for terminal auto-wrap: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| line.starts_with("│ ")),
+            "wrapped thinking lines should stay in the internal lane: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_history_has_muted_background_without_header_spacer() {
+        let text = line_to_text(&Line_::Thinking("checking the next step".to_string()), 80);
+        let body_style = span_style_for(&text, "checking").expect("thinking body");
+        let lines = flatten_lines(&text);
+
+        assert_eq!(body_style.bg, Some(THINKING_BG));
+        assert_eq!(body_style.fg, Some(Color::Gray));
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("│ checking the next step")
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains('▸')),
+            "thinking marker should be hidden without adding a spacer row: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("thinking (")),
+            "thinking word-count title should stay hidden without adding a spacer row: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn thinking_body_wraps_on_word_boundaries_with_stable_lane_prefix() {
+        let text = line_to_text(
+            &Line_::Thinking("I need to keep working on fixing Clippy. It seems like I should read the SessionHeader struct and check its default nested provenance. I might be able to patch it directly, but I should inspect the imports too.".to_string()),
+            74,
+        );
+        let lines = flatten_lines(&text);
+
+        assert!(
+            lines.iter().all(|line| line.starts_with("│ ")),
+            "thinking body lines should all stay in the vertical lane: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.starts_with("  ")),
+            "thinking body should not create hanging indent continuation rows: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("│ ruct") || line.starts_with("│ d ")),
+            "thinking body should avoid mid-word wrap fragments like the reported UX issue: {lines:?}"
+        );
+    }
+
+    #[test]
     fn repeated_assistant_prefix_is_dimmed_after_first_response() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -6517,11 +7417,13 @@ mod tests {
         });
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(AtomicBool::new(false));
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             &tx,
+            &steering_tx,
             &interrupt,
         );
 
@@ -6792,7 +7694,9 @@ mod tests {
         assert_eq!(state.usage.input, 828_300);
         assert_eq!(state.usage.output, 5_400);
         assert_eq!(state.usage.cache_read, 40_000);
-        assert_eq!(state.last_turn_context_tokens, 160_000);
+        assert_eq!(state.usage.actual_input_tokens(), 828_300);
+        assert_eq!(state.usage.cached_input_tokens(), 40_000);
+        assert_eq!(state.last_turn_context_tokens, 165_400);
     }
 
     #[test]
@@ -6820,15 +7724,52 @@ mod tests {
                 session,
             });
         }
-        assert_eq!(state.last_turn_context_tokens, 66_000);
+        assert_eq!(state.last_turn_context_tokens, 66_400);
         assert_eq!(state.usage.input, 60_000);
         assert_eq!(state.usage.cache_read, 600_000);
     }
 
     #[test]
-    fn ctx_meter_sums_anthropic_cache_create_and_read() {
-        // For Anthropic, input / cache_create / cache_read are three
-        // disjoint buckets; the request's real context is their sum.
+    fn status_splits_actual_and_cached_input() {
+        let mut state = TuiState::new(
+            "gpt-5.4".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.usage = Usage {
+            input: 47_000,
+            output: 5_300,
+            cache_create: 0,
+            cache_read: 268_000,
+        };
+        let line = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(line.contains("↑47.0k"), "{line}");
+        assert!(line.contains("↻268.0k"), "{line}");
+        assert!(line.contains("↓5.3k"), "{line}");
+
+        state.usage = Usage {
+            input: 47_000,
+            output: 5_300,
+            cache_create: 0,
+            cache_read: 0,
+        };
+        let line = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(line.contains("↑47.0k"), "{line}");
+        assert!(line.contains("↻0"), "{line}");
+        assert!(line.contains("↓5.3k"), "{line}");
+    }
+
+    #[test]
+    fn ctx_meter_sums_anthropic_cache_create_read_and_output() {
+        // Native usage totals include output tokens; Pi's context-token helper
+        // uses input + output + cacheRead + cacheWrite.
         let mut state = TuiState::new(
             "claude-opus-4-6".to_string(),
             ".".to_string(),
@@ -6845,7 +7786,7 @@ mod tests {
             turn,
             session: turn,
         });
-        assert_eq!(state.last_turn_context_tokens, 60_000);
+        assert_eq!(state.last_turn_context_tokens, 60_500);
     }
 
     #[test]
@@ -7128,11 +8069,13 @@ mod tests {
         state.history.push_back("previous prompt".to_string());
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
             &tx,
+            &steering_tx,
             &interrupt,
         );
 
@@ -7146,9 +8089,45 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
             &tx,
+            &steering_tx,
             &interrupt,
         );
         assert_eq!(state.slash_acomp_sel, Some(0));
+    }
+
+    #[test]
+    fn busy_enter_sends_steering_directly_without_command_queue_delay() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.input = "please adjust the current fix".to_string();
+        state.cursor = state.input.len();
+
+        let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &submit_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert_eq!(
+            steering_rx.try_recv().ok().as_deref(),
+            Some("please adjust the current fix")
+        );
+        assert!(submit_rx.try_recv().is_err());
+        assert!(state.input.is_empty());
+        assert_eq!(state.status, "steering queued for next safe boundary");
+        assert!(
+            matches!(state.pending_insert.last(), Some(Line_::Steering(s)) if s == "please adjust the current fix")
+        );
     }
 
     #[test]
@@ -7163,12 +8142,14 @@ mod tests {
         state.cursor = state.input.len();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
         for _ in 0..SLASH_COMPLETION_MAX_VISIBLE {
             handle_key(
                 &mut state,
                 KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
                 &tx,
+                &steering_tx,
                 &interrupt,
             );
         }
@@ -7189,17 +8170,20 @@ mod tests {
         state.cursor = state.input.len();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
             &tx,
+            &steering_tx,
             &interrupt,
         );
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &tx,
+            &steering_tx,
             &interrupt,
         );
 
@@ -7369,6 +8353,35 @@ mod tests {
         assert!(state.live_indicator_visible);
         assert_eq!(state.live_indicator_top_padding, 5);
         assert_eq!(state.live_indicator_line_layout, Some((5, 6)));
+    }
+
+    #[test]
+    fn work_map_drawer_expands_input_without_exceeding_half_viewport() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 80, 30);
+        let baseline = compute_layout(area, &state);
+        state.apply_event(AgentEvent::WorkMap {
+            kind: WorkMapEventKind::Map,
+            text: (1..=12)
+                .map(|n| format!("@w{n:02} change #{n}  waypoint {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            waypoint_ids: (1..=12).map(|n| format!("@w{n:02}")).collect(),
+            selector: None,
+        });
+        let with_drawer = compute_layout(area, &state);
+
+        assert!(with_drawer.input_area.height > baseline.input_area.height);
+        assert!(with_drawer.input_area.height <= area.height / 2);
+        assert_eq!(
+            with_drawer.status_area.y + with_drawer.status_area.height,
+            area.height
+        );
     }
 
     #[test]

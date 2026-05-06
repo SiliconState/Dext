@@ -1,5 +1,6 @@
 /target
 /.env
+/.cargo/config.toml
 /nul
 
 # Runtime/project state

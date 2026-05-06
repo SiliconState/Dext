@@ -10,16 +10,11 @@ pub(crate) struct Tool {
     pub(crate) input_schema: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum ToolProfile {
     Full,
+    #[default]
     Lean,
-}
-
-impl Default for ToolProfile {
-    fn default() -> Self {
-        ToolProfile::Lean
-    }
 }
 
 impl ToolProfile {
@@ -188,7 +183,7 @@ pub(crate) fn tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "http",
-            description: "HTTP request via Wolf's built-in client. Args are HTTPie-ish, e.g. ['GET','https://api.x','Auth:Bearer abc'] or ['POST','url','name=john']. Response output is capped.",
+            description: "HTTP request via Wolf's built-in client. Args are HTTPie-ish, e.g. ['GET','https://api.x','Auth:Bearer abc'] or ['POST','url','name=john']. Response output is capped. Add --extract-text (or --text) to strip HTML/script/style noise and pretty-print JSON for research pages.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

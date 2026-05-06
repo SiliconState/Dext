@@ -12,18 +12,17 @@
 ## Project State
 
 <!-- pi-memory:state:start -->
-**Phase:** Pi session-discovery recommendations implemented  
-**Updated:** 2026-04-27  
-**Summary:** Implemented lightweight long-session improvements: larger/cached explicit read windows, read_symbol, structured work/provider/verification ledgers, evidence-backed compaction, session analysis commands, artifact-backed verification records, subagent quality gates, crash snapshots, and provider reasoning/streamed thinking checks. Release build/test/install passed.  
+**Phase:** Work Map/cache status cleanup verified
+**Updated:** 2026-05-06
+**Summary:** Work Map session navigation and cache-visible usage status are implemented, verified, and installed.
 
 **Next:**
-- Validate session analysis and ledger output in a live long Wolf session
-- Continue expanding real-world eval coverage
-- Use the PTY-backed TUI smoke test for non-interactive TUI verification
+- Use live sessions to validate Work Map drawer ergonomics
+- Watch cache marker/status behavior under real ChatGPT/Codex usage
 
-**Session Stats:** 17 sessions · 213083614 tokens · $63.68 total cost
+**Session Stats:** 18 sessions · 213878271 tokens · $64.05 total cost
 **Last Model:** openai-codex/gpt-5.3-codex
-**Last Session:** 019dacec-7f13-7469-9be9-b212bc909ace
+**Last Session:** 019df92c-4835-71cc-b5a8-35c3563c2fc0
 <!-- pi-memory:state:end -->
 
 ---
@@ -31,35 +30,35 @@
 ## Recent Decisions
 
 <!-- pi-memory:decisions:start -->
-- **Frugal context mode**  
-  *Choice:* Added --frugal, /context frugal, lean tool-profile schemas, smaller prompt/tool/history caps, and deterministic fact-card compaction for low-token operation.  
-  *Why:* Wolf should preserve capability while avoiding repeated prompt/schema/tool-result bloat; frugal mode makes large context emergency capacity rather than default payload.  
+- **Usage status shows prompt-cache visibility**
+  *Choice:* Wolf usage displays split actual non-cached input, cached input reads/writes, and output; the TUI status line keeps the cached-input marker visible after first usage even when it is zero so cache status is not hidden.
+  *Why:* ChatGPT/Codex and Anthropic report prompt-cache usage differently, and users need to see whether cache reads are happening without mistaking cached tokens for fresh input.
+  `2026-05-06` `active`
+
+- **Work Map TUI uses composer drawer, not scrollback navigation**
+  *Choice:* /map opens a compact drawer inside the composer/input panel, with selection inserting editable /focus, /packet, or /track open commands; packet/focus/tracks outputs still render as transcript output.
+  *Why:* Navigation should feel first-class without rewriting terminal history or reviving the older floating input popup.
+  `2026-05-06` `active`
+
+- **Work Map uses non-tree waypoint model from JSONL**
+  *Choice:* Implement session navigation as a derived Work Map using Map, Waypoint, Packet, Focus, and Track; avoid tree/leaf terminology; JSONL/session headers remain the source of truth; Focus loads context only and never rewinds filesystem state; Tracks are additive sessions with origin metadata.
+  *Why:* Deterministic local evidence should resolve transcript conflicts and support rebuildable packets/focus, while pi-memory remains durable curated recall rather than exact transcript storage.
+  `2026-05-05` `active`
+
+- **Session map/teleport architecture separates JSONL evidence from Pi memory**
+  *Choice:* Keep Wolf JSONL/session headers as source of truth for exact navigation and build derived SessionMap/teleport packets from local evidence; use pi-memory/MEMORY.md for curated durable decisions, cross-session semantic recall, and optional tags/links, not for direct transcript storage or mutation.
+  *Why:* Pi is shared external memory and already canonical for durable Wolf knowledge, but exact session replay, offsets, verification artifacts, and forks must remain local, deterministic, and source-first.
+  `2026-05-05` `active`
+
+- **Frugal context mode**
+  *Choice:* Added --frugal, /context frugal, lean tool-profile schemas, smaller prompt/tool/history caps, and deterministic fact-card compaction for low-token operation.
+  *Why:* Wolf should preserve capability while avoiding repeated prompt/schema/tool-result bloat; frugal mode makes large context emergency capacity rather than default payload.
   `2026-04-27` `active`
 
-- **PTY-backed TUI verification**  
-  *Choice:* Added a Unix integration smoke test (cargo test --release --test tui_smoke -- --nocapture) that launches the real wolf binary in an openpty pseudo-terminal, answers cursor-position queries, verifies banner/help/key handling, exits via Ctrl+D, and uses isolated WOLF_HOME/sandbox paths.  
-  *Why:* Replaces the manual-only TUI caveat with a real terminal-path check while adding no runtime code or dependencies.  
+- **PTY-backed TUI verification**
+  *Choice:* Added a Unix integration smoke test (cargo test --release --test tui_smoke -- --nocapture) that launches the real wolf binary in an openpty pseudo-terminal, answers cursor-position queries, verifies banner/help/key handling, exits via Ctrl+D, and uses isolated WOLF_HOME/sandbox paths.
+  *Why:* Replaces the manual-only TUI caveat with a real terminal-path check while adding no runtime code or dependencies.
   `2026-04-27` `active`
-
-- **TUI Critic remaining density/progress polish**  
-  *Choice:* Implemented the remaining docs/Critic.md TUI items: consecutive read_file results to the same file now merge across flushes into one grouped block with read counts and line-span hints; dense tool streams get separators every 10 calls and grouped read_file blocks are dimmed; todo_read/todo_write progress is persisted in status/live indicators; rg output middle-truncates absurdly long individual lines; repeated assistant wolf labels dim after the first response.  
-  *Why:* These changes address long-turn scanability without adding new tools or moving away from Wolf's sparse text-first TUI architecture.  
-  `2026-04-27` `active`
-
-- **TUI critique Tier 1 pass**  
-  *Choice:* Implemented docs/Critic.md Tier 1 fixes with low-bloat inline UI changes: todo_write now returns checklist output plus status delta; tool/result truncation summaries include explicit hidden line/char metadata; permission prompts collapse to compact two-line ask/keys copy; Ctrl+O toggles the original tool block inline instead of creating a secondary expansion block.  
-  *Why:* The critique identified high-impact scanability issues in long Wolf TUI sessions; these fixes preserve existing transcript architecture and same-target tool grouping while reducing duplicate UI and opaque summaries.  
-  `2026-04-27` `active`
-
-- **TUI transcript headings and tool borders**  
-  *Choice:* Markdown H1 transcript headings render as bold light-cyan text without a blue background; prefixed transcript/tool output lines wrap within the remaining content width instead of relying on padding, preventing long rg/bash/read output from bleeding into swim-lane borders.  
-  *Why:* The blue title background was visually distracting, and long tool-result rows could exceed the prefixed card width and visually collide with the vertical border.  
-  `2026-04-26` `active`
-
-- **Tool stream capture minimum is 6KB**  
-  *Choice:* Raise process-backed tool stream capture from 4000 to 6000 bytes and keep adaptive model-result caps from shrinking below 6000 bytes.  
-  *Why:* The user was still seeing a 4000-byte cap in fd/rg/bash results; the floor should match the expected 6000-byte read/tool output budget while explicit read_file windows remain larger.  
-  `2026-04-26` `active`
 
 <!-- pi-memory:decisions:end -->
 

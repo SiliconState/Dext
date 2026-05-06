@@ -22,11 +22,11 @@ pub(crate) fn wolf_state_dir() -> PathBuf {
     PathBuf::from(home).join(".wolf")
 }
 
-pub(crate) fn named_sessions_dir() -> PathBuf {
+pub(crate) fn named_sessions_dir_for_root(root: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("WOLF_SESSIONS_DIR") {
         return PathBuf::from(p);
     }
-    wolf_state_dir().join("sessions")
+    project_state_dir(root).join("sessions")
 }
 
 pub(crate) fn canonicalize_or_clone(path: &Path) -> PathBuf {
@@ -589,9 +589,9 @@ pub(crate) fn validate_session_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn named_session_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn named_session_path_for_root(root: &Path, name: &str) -> Result<PathBuf> {
     validate_session_name(name)?;
-    Ok(named_sessions_dir().join(format!("{name}.jsonl")))
+    Ok(named_sessions_dir_for_root(root).join(format!("{name}.jsonl")))
 }
 
 #[derive(Clone)]
@@ -628,8 +628,8 @@ pub(crate) fn list_session_records_for_dir(dir: &Path) -> Result<Vec<SessionReco
     Ok(records)
 }
 
-pub(crate) fn list_session_records() -> Result<Vec<SessionRecord>> {
-    list_session_records_for_dir(&named_sessions_dir())
+pub(crate) fn list_session_records_for_root(root: &Path) -> Result<Vec<SessionRecord>> {
+    list_session_records_for_dir(&named_sessions_dir_for_root(root))
 }
 
 pub(crate) fn render_limited_csv(
@@ -764,5 +764,8 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         work_ledger: serde_json::from_value(meta["work_ledger"].clone()).unwrap_or_default(),
         provider_health: serde_json::from_value(meta["provider_health"].clone())
             .unwrap_or_default(),
+        track_origin: serde_json::from_value(meta["track_origin"].clone())
+            .ok()
+            .flatten(),
     })
 }
