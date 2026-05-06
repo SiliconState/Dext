@@ -3917,7 +3917,12 @@ fn execute_tool_with_cache(
             } else {
                 let symbol = symbol.expect("selector count checked");
                 let Some(window) = find_symbol_window(&content, &starts, symbol, context) else {
-                    return Err(format!("symbol '{symbol}' not found in {}", path.display()));
+                    let hint = tool_policy::tool_input_advisory("read_symbol", &input)
+                        .unwrap_or_else(|| format!("Search first with rg -n '{symbol}' {}, then retry read_symbol with an exact symbol or line.", path.display()));
+                    return Err(format!(
+                        "symbol '{symbol}' not found in {}\n{hint}",
+                        path.display()
+                    ));
                 };
                 window
             };
@@ -4618,7 +4623,7 @@ Project state:
 
 Discovery and reading:
 - Prefer fd for file discovery and rg for content search.
-- Read source symbol-first: find exact functions/types/line hits, then use read_symbol or focused read_file windows.
+- Read source symbol-first: use rg to find exact functions/types/line hits unless the exact symbol is already known, then use read_symbol or focused read_file windows.
 - Avoid broad or overlapping reads. If output is capped, narrow the query, paginate intentionally, or request a summary/stat view.
 - read_file output is line-numbered and capped; use offset+limit unless a whole file is truly needed.
 - Use independent read-only tools in parallel when useful.
@@ -4635,6 +4640,7 @@ Git:
 
 Shell and external operations:
 - For bash pipelines, preserve failures with pipefail and avoid brittle silent-success checks.
+- API tools are not shell binaries; use Wolf rg/fd/jq/http tools directly, or probe shell commands with `command -v` before assuming they exist in bash.
 - For complex quoting, prefer arrays, single-quoted args, or heredocs.
 - Inspect stderr even when exit code is 0.
 - Validate external/data sources with one representative probe before scaling.
@@ -8499,8 +8505,10 @@ impl Agent {
                 }
 
                 if plan.is_none()
-                    && let Some(msg) =
-                        turn_state.bash_similarity_guard(bash_similarity_key.as_deref())
+                    && let Some(msg) = turn_state.bash_similarity_guard(
+                        bash_similarity_key.as_deref(),
+                        input["command"].as_str(),
+                    )
                 {
                     emit_external_telemetry(self.sink.as_mut(), &turn_state);
                     plan = Some(Plan::Immediate {
@@ -8768,6 +8776,9 @@ impl Agent {
                 let ran_builtin = matches!(plan, Plan::Builtin);
                 let ui_summary = summary.clone();
                 let mut followup_warnings: Vec<String> = Vec::new();
+                if let Some(advisory) = tool_policy::tool_input_advisory(&name, &input) {
+                    followup_warnings.push(advisory);
+                }
 
                 let (mut content, is_error) = match plan {
                     Plan::Immediate { content, is_error } => (content, is_error),
@@ -8805,6 +8816,7 @@ impl Agent {
                     &hosts,
                     cache_key.as_deref(),
                     bash_similarity_key.as_deref(),
+                    input["command"].as_str(),
                     &mut content,
                     is_error,
                 );

@@ -1,7 +1,8 @@
 # WOLF persistent memory
 
 Prompt-facing cache only. Durable project memory lives in `MEMORY.md`, synced
-through pi-memory with `--project wolf`. Keep this file compact and curated.
+through the external pi-memory tool with `--project wolf`. pi-memory is not part
+of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
 
 ## Workflow
 - Query `MEMORY.md` / pi-memory for durable history before major decisions.

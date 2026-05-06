@@ -877,6 +877,9 @@ impl TuiState {
         if matches!(line, Line_::Tool { .. }) && self.last_line_is_completed_thinking() {
             self.pending_insert.push(Line_::Blank);
         }
+        if matches!(line, Line_::Thinking(_)) && self.last_line_is_tool() {
+            self.pending_insert.push(Line_::Blank);
+        }
         self.pending_insert.push(line);
     }
 
@@ -885,6 +888,13 @@ impl TuiState {
             .last()
             .or_else(|| self.transcript.last())
             .is_some_and(|line| matches!(line, Line_::Thinking(_)))
+    }
+
+    fn last_line_is_tool(&self) -> bool {
+        self.pending_insert
+            .last()
+            .or_else(|| self.transcript.last())
+            .is_some_and(|line| matches!(line, Line_::Tool { .. }))
     }
 
     fn scroll_transcript_by(&mut self, delta: isize) {
@@ -1827,7 +1837,7 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!("↻{}", format_count(cached_in)),
+            format!("↻ {}", format_count(cached_in)),
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::raw(" "));
@@ -5186,7 +5196,7 @@ fn help_overlay_text() -> Text<'static> {
         ("?", "toggle this help"),
     ];
     let legend_rows: &[(&str, &str)] = &[
-        ("↑N ↻N ↓N", "actual input / cached input / output tokens"),
+        ("↑N ↻ N ↓N", "actual input / cached input / output tokens"),
         ("% [████░░░░░░]", "last request context window usage"),
         ("● / ⠋", "ready / busy spinner"),
         ("(branch)", "git branch in sandbox"),
@@ -6928,6 +6938,32 @@ mod tests {
     }
 
     #[test]
+    fn inserts_blank_between_tool_and_next_completed_thinking() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+
+        state.apply_event(AgentEvent::ToolCallResult {
+            call_id: "call_1".to_string(),
+            name: "bash".to_string(),
+            ok: true,
+            preview: "bash: echo ok".to_string(),
+            content: "exit: 0".to_string(),
+        });
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "Considering the next step".to_string(),
+        ));
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Tool { name, .. }, Line_::Blank, Line_::Thinking(_)] if name == "bash"
+        ));
+    }
+
+    #[test]
     fn work_map_packet_still_renders_in_transcript() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -7748,7 +7784,7 @@ mod tests {
             .map(|span| span.content.into_owned())
             .collect::<String>();
         assert!(line.contains("↑47.0k"), "{line}");
-        assert!(line.contains("↻268.0k"), "{line}");
+        assert!(line.contains("↻ 268.0k"), "{line}");
         assert!(line.contains("↓5.3k"), "{line}");
 
         state.usage = Usage {
@@ -7762,7 +7798,7 @@ mod tests {
             .map(|span| span.content.into_owned())
             .collect::<String>();
         assert!(line.contains("↑47.0k"), "{line}");
-        assert!(line.contains("↻0"), "{line}");
+        assert!(line.contains("↻ 0"), "{line}");
         assert!(line.contains("↓5.3k"), "{line}");
     }
 

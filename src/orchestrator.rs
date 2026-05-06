@@ -142,8 +142,12 @@ impl TurnRuntimeState {
     pub(crate) fn bash_similarity_guard(
         &mut self,
         bash_similarity_key: Option<&str>,
+        command: Option<&str>,
     ) -> Option<String> {
         let sim_key = bash_similarity_key?;
+        if command.is_some_and(is_safe_repeated_validation_command) {
+            return None;
+        }
         let similar_unproductive = self
             .bash_attempt_history
             .iter()
@@ -191,6 +195,7 @@ impl TurnRuntimeState {
         hosts: &[String],
         cache_key: Option<&str>,
         bash_similarity_key: Option<&str>,
+        command: Option<&str>,
         content: &mut String,
         is_error: Option<bool>,
     ) -> ExternalObservation {
@@ -245,7 +250,10 @@ impl TurnRuntimeState {
         }
 
         if let Some(sim_key) = bash_similarity_key {
-            let productive = ok && !auth_failure && content.trim().chars().count() >= 80;
+            let productive = ok
+                && !auth_failure
+                && (content.trim().chars().count() >= 80
+                    || command.is_some_and(is_safe_repeated_validation_command));
             self.bash_attempt_history
                 .push((sim_key.to_string(), productive));
             if self.bash_attempt_history.len() > 64 {
@@ -740,6 +748,22 @@ pub(crate) fn dedupe_cache_short_circuit(
         ),
         *cached_err,
     ))
+}
+
+pub(crate) fn is_safe_repeated_validation_command(command: &str) -> bool {
+    let normalized = command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("set "))
+        .collect::<Vec<_>>()
+        .join(" && ")
+        .to_ascii_lowercase();
+    let normalized = normalized.trim();
+    matches!(
+        normalized,
+        "git status --short" | "git diff --check" | "cargo fmt --check"
+    ) || normalized.starts_with("cargo test ")
+        || normalized == "cargo test"
 }
 
 pub(crate) fn normalize_bash_similarity_key(command: &str) -> String {
@@ -1274,6 +1298,7 @@ mod tests {
             &hosts,
             None,
             Some("curl <url>"),
+            None,
             &mut first,
             Some(true),
         );
@@ -1283,6 +1308,7 @@ mod tests {
             &hosts,
             None,
             Some("curl <url>"),
+            None,
             &mut second,
             Some(true),
         );
@@ -1292,12 +1318,13 @@ mod tests {
             &hosts,
             None,
             Some("curl <url>"),
+            None,
             &mut third,
             Some(true),
         );
 
         let similarity = state
-            .bash_similarity_guard(Some("curl <url>"))
+            .bash_similarity_guard(Some("curl <url>"), Some("curl https://api.example.com"))
             .expect("similarity guard should trigger after repeated unproductive attempts");
         assert!(similarity.contains("pivot strategy"), "{similarity}");
     }
@@ -1313,6 +1340,7 @@ mod tests {
             &hosts,
             Some("cache-key"),
             Some("curl one"),
+            None,
             &mut first,
             Some(true),
         );
@@ -1326,6 +1354,7 @@ mod tests {
             &hosts,
             Some("cache-key-2"),
             Some("curl two"),
+            None,
             &mut second,
             Some(true),
         );
@@ -1341,6 +1370,26 @@ mod tests {
         assert!(state.should_emit_partial_delivery_hint(2));
         state.mark_partial_delivery_hint_emitted();
         assert!(!state.should_emit_partial_delivery_hint(2));
+
+        let mut validation_state = TurnRuntimeState::new();
+        for _ in 0..4 {
+            let mut output = "exit: 0".to_string();
+            validation_state.record_external_outcome(
+                "bash",
+                &[],
+                None,
+                Some("git diff --check"),
+                Some("git diff --check"),
+                &mut output,
+                Some(false),
+            );
+        }
+        assert!(
+            validation_state
+                .bash_similarity_guard(Some("git diff --check"), Some("git diff --check"))
+                .is_none(),
+            "safe validation reruns should not trigger similarity guard"
+        );
 
         let cached = state
             .dedupe_guard(Some("cache-key"))

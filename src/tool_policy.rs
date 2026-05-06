@@ -141,6 +141,141 @@ pub(crate) fn validate_tool_input(name: &str, input: &Value) -> std::result::Res
     Ok(())
 }
 
+pub(crate) fn tool_input_advisory(name: &str, input: &Value) -> Option<String> {
+    match name {
+        "bash" => bash_command_advisory(input["command"].as_str().unwrap_or("")),
+        "read_symbol" => read_symbol_advisory(input["symbol"].as_str().unwrap_or("")),
+        _ => None,
+    }
+}
+
+fn read_symbol_advisory(symbol: &str) -> Option<String> {
+    let trimmed = symbol.trim();
+    let token = trimmed
+        .strip_prefix("struct ")
+        .or_else(|| trimmed.strip_prefix("fn "))
+        .or_else(|| trimmed.strip_prefix("impl "))
+        .or_else(|| trimmed.strip_prefix("enum "))
+        .or_else(|| trimmed.strip_prefix("trait "))?
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+    if token.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "read_symbol expects the exact symbol name, not a declaration. Try rg -n '{token}' first, then read_symbol with symbol='{token}' or a focused line window."
+        ))
+    }
+}
+
+fn bash_command_advisory(command: &str) -> Option<String> {
+    if let Some(msg) = cargo_test_multi_filter_advisory(command) {
+        return Some(msg);
+    }
+    if bare_python_without_probe(command) {
+        return Some(
+            "bash advisory: this environment may not provide bare `python`; prefer `python3` or probe with `command -v python`.".to_string(),
+        );
+    }
+    if let Some(tool) = api_tool_used_as_shell_filter(command) {
+        return Some(format!(
+            "bash advisory: `{tool}` is available as a Wolf API tool but may not be installed as a shell binary. Use the native {tool} tool, use grep/awk, or probe with `command -v {tool}`."
+        ));
+    }
+    None
+}
+
+fn cargo_test_multi_filter_advisory(command: &str) -> Option<String> {
+    let words = shell_words(command);
+    for (idx, word) in words.iter().enumerate() {
+        if word == "cargo" && words.get(idx + 1).is_some_and(|next| next == "test") {
+            let mut filters = 0usize;
+            for arg in words.iter().skip(idx + 2) {
+                if arg == "--" || matches!(arg.as_str(), "&&" | ";" | "|") {
+                    break;
+                }
+                if arg.starts_with('-') {
+                    continue;
+                }
+                filters += 1;
+            }
+            if filters > 1 {
+                return Some(
+                    "bash advisory: `cargo test` accepts one test filter before `--`; run separate tests or use one broader filter.".to_string(),
+                );
+            }
+        }
+    }
+    None
+}
+
+fn bare_python_without_probe(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("command -v python") || lower.contains("which python") {
+        return false;
+    }
+    command_segments(command).any(|segment| segment.split_whitespace().next() == Some("python"))
+}
+
+fn api_tool_used_as_shell_filter(command: &str) -> Option<&'static str> {
+    for segment in command_segments(command) {
+        let mut words = segment.split_whitespace();
+        let Some(first) = words.next() else {
+            continue;
+        };
+        if !matches!(first, "rg" | "fd" | "jq") {
+            continue;
+        }
+        if command.contains(&format!("command -v {first}"))
+            || command.contains(&format!("which {first}"))
+        {
+            continue;
+        }
+        return match first {
+            "rg" => Some("rg"),
+            "fd" => Some("fd"),
+            "jq" => Some("jq"),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn command_segments(command: &str) -> impl Iterator<Item = &str> {
+    command.split(['|', ';', '\n', '&']).map(str::trim)
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    for ch in command.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            ';' | '|' | '&' if !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+                words.push(ch.to_string());
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
 pub(crate) fn extract_url_hosts(text: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
@@ -255,9 +390,43 @@ pub(crate) fn classify_command_risk(name: &str, input: &Value) -> CommandRisk {
         }
         "read_file" | "read_symbol" | "fd" | "rg" | "jq" | "fzf" | "git_diff" | "git_log"
         | "todo_read" => CommandRisk::Read,
-        "awk" | "csvkit" => CommandRisk::Read,
+        "awk" => classify_argv_tool_risk(&input["args"]),
+        "csvkit" => classify_csvkit_risk(input),
         _ => CommandRisk::Write,
     }
+}
+
+fn args_contain_write_or_escape(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let trimmed = arg.trim().to_ascii_lowercase();
+        trimmed == "--in-place"
+            || trimmed.contains('>')
+            || trimmed.contains("system(")
+            || trimmed.contains("| sh")
+            || trimmed.contains("|sh")
+            || trimmed.contains("| bash")
+            || trimmed.contains("|bash")
+    })
+}
+
+fn classify_argv_tool_risk(args_value: &Value) -> CommandRisk {
+    let args: Vec<String> = args_value
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if args_contain_write_or_escape(&args) {
+        CommandRisk::Write
+    } else {
+        CommandRisk::Read
+    }
+}
+
+fn classify_csvkit_risk(input: &Value) -> CommandRisk {
+    classify_argv_tool_risk(&input["args"])
 }
 
 fn shell_chunk_is_read_only(chunk: &str) -> bool {
@@ -458,6 +627,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_input_advisories_catch_common_misuse_without_blocking() {
+        let cargo = tool_input_advisory(
+            "bash",
+            &json!({"command": "cargo test --release one_test another_test -- --nocapture"}),
+        )
+        .expect("cargo multi-filter should warn");
+        assert!(cargo.contains("one test filter"), "{cargo}");
+
+        let python =
+            tool_input_advisory("bash", &json!({"command": "python - <<'PY'\nprint(1)\nPY"}))
+                .expect("bare python should warn");
+        assert!(python.contains("python3"), "{python}");
+
+        let rg = tool_input_advisory(
+            "bash",
+            &json!({"command": "git show HEAD:file | rg needle"}),
+        )
+        .expect("shell rg should warn");
+        assert!(rg.contains("Wolf API tool"), "{rg}");
+
+        assert!(
+            tool_input_advisory(
+                "bash",
+                &json!({"command": "command -v rg >/dev/null && git show HEAD:file | rg needle"}),
+            )
+            .is_none()
+        );
+
+        let symbol = tool_input_advisory(
+            "read_symbol",
+            &json!({"path": "src/main.rs", "symbol": "struct Usage"}),
+        )
+        .expect("declaration-shaped symbol should warn");
+        assert!(symbol.contains("symbol='Usage'"), "{symbol}");
+    }
+
+    #[test]
     fn command_risk_classifies_common_tool_calls() {
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git status && rg foo src"})),
@@ -482,6 +688,28 @@ mod tests {
         assert_eq!(
             classify_command_risk("todo_read", &json!({})),
             CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("awk", &json!({"args": ["{print $1}"]})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("awk", &json!({"args": ["{system(\"touch pwned\")}"]})),
+            CommandRisk::Write
+        );
+        assert_eq!(
+            classify_command_risk(
+                "csvkit",
+                &json!({"subcommand": "csvcut", "args": ["-c", "1"]})
+            ),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk(
+                "csvkit",
+                &json!({"subcommand": "csvformat", "args": ["--in-place", "data.csv"]})
+            ),
+            CommandRisk::Write
         );
         assert_eq!(
             classify_command_risk("http", &json!({"args": ["GET", "https://example.com"]})),
