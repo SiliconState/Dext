@@ -11,6 +11,7 @@ pub(crate) struct Tool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum ToolProfile {
     Full,
     #[default]
@@ -219,13 +220,13 @@ pub(crate) fn tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "subagent",
-            description: "Delegate a self-contained task to a fresh subagent. The subagent runs its own tool loop silently and returns ONE final text summary. It cannot see your conversation — describe the task fully. Use for surveys ('list every file that X'), research that would bloat your context with tool output, or tasks needing a specialist system prompt. Do NOT use for linear external data-fetch pipelines (run those in the main agent).",
+            description: "Delegate a self-contained task to a detached worker. User-invoked /subagent opens tmux/new terminal when available (else background process) and writes a report path; parent stays in control. In model tool calls, subagent is explicit-user only and returns guidance to use /subagent.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "task": {"type": "string", "description": "The full task description for the subagent. Must be self-contained."},
                     "system": {"type": "string", "description": "Optional system prompt override. Default is a terse worker prompt."},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional whitelist of tool names. Default: all tools except subagent (no recursion). For read-only research pass e.g. ['read_file','rg','fd','jq','git_diff']."},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional whitelist of tool names. Default: inherited full toolset except recursive subagent."},
                     "max_iterations": {"type": "number", "description": "Maximum tool-use cycles. Default 20."}
                 },
                 "required": ["task"]

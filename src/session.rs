@@ -767,5 +767,6 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         track_origin: serde_json::from_value(meta["track_origin"].clone())
             .ok()
             .flatten(),
+        privacy: serde_json::from_value(meta["privacy"].clone()).unwrap_or_default(),
     })
 }

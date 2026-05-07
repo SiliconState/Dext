@@ -44,8 +44,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -986,8 +986,9 @@ impl EventSink for ConsoleSink {
             AgentEvent::ThinkingDelta(_) => {}
             AgentEvent::ThinkingBlockComplete(_) => {}
             AgentEvent::SteeringReceived { messages, preview } => {
+                let noun = if messages == 1 { "update" } else { "updates" };
                 eprintln!(
-                    "[steering: {messages} message(s) injected — {}]",
+                    "[queued {messages} {noun}; folding into next response — {}]",
                     summarize_inline(&preview, 120)
                 );
             }
@@ -1123,6 +1124,314 @@ impl EventSink for NullSink {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentMode {
+    Inline,
+    Detached,
+}
+
+impl SubagentMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "inline" | "foreground" | "fg" => Some(Self::Inline),
+            "detached" | "background" | "bg" | "window" | "tmux" | "terminal" => {
+                Some(Self::Detached)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+struct SubagentRequest {
+    task: String,
+    system: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+    max_iterations: u64,
+    approval_profile: ApprovalProfile,
+    sandbox_profile: SandboxProfile,
+    browser_recipe: BrowserRecipe,
+    thinking_effort: ThinkingEffort,
+    context_mode: ContextMode,
+    tool_profile: ToolProfile,
+    budget_cap: Option<BudgetCap>,
+    privacy_enabled: bool,
+}
+
+impl Default for SubagentRequest {
+    fn default() -> Self {
+        Self {
+            task: String::new(),
+            system: None,
+            allowed_tools: None,
+            max_iterations: 20,
+            approval_profile: ApprovalProfile::default(),
+            sandbox_profile: SandboxProfile::default(),
+            browser_recipe: BrowserRecipe::default(),
+            thinking_effort: ThinkingEffort::default(),
+            context_mode: ContextMode::default(),
+            tool_profile: ToolProfile::default(),
+            budget_cap: None,
+            privacy_enabled: true,
+        }
+    }
+}
+
+impl SubagentRequest {
+    fn from_input(agent: &Agent, input: &Value) -> std::result::Result<Self, String> {
+        let task = input["task"].as_str().ok_or("missing task")?.to_string();
+        let system = input["system"].as_str().map(ToString::to_string);
+        let allowed_tools = input["allowed_tools"].as_array().map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+        Ok(Self {
+            task,
+            system,
+            allowed_tools,
+            max_iterations: input["max_iterations"].as_u64().unwrap_or(20),
+            approval_profile: agent.approval_profile,
+            sandbox_profile: agent.sandbox_profile,
+            browser_recipe: agent.browser_recipe,
+            thinking_effort: agent.thinking_effort,
+            context_mode: agent.context_mode,
+            tool_profile: agent.tool_profile,
+            budget_cap: agent.budget_cap,
+            privacy_enabled: agent.privacy.enabled,
+        })
+    }
+
+    fn to_tool_input(&self) -> Value {
+        let mut input = json!({
+            "task": self.task,
+            "max_iterations": self.max_iterations,
+        });
+        if let Some(system) = &self.system {
+            input["system"] = json!(system);
+        }
+        if let Some(tools) = &self.allowed_tools {
+            input["allowed_tools"] = json!(tools);
+        }
+        input
+    }
+}
+
+#[derive(Debug)]
+struct DetachedSubagentLaunch {
+    label: String,
+    report_path: PathBuf,
+    stdout_path: PathBuf,
+    command: String,
+}
+
+#[cfg(unix)]
+fn shell_single_quote(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
+
+fn subagent_requests_dir(root: &Path) -> PathBuf {
+    project_state_dir(root).join("subagents")
+}
+
+fn write_subagent_request(root: &Path, request: &SubagentRequest) -> Result<(PathBuf, PathBuf)> {
+    let dir = subagent_requests_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    let run_id = next_subagent_run_id();
+    let request_path = dir.join(format!("subagent-{run_id}.request.json"));
+    let report_path = dir.join(format!("subagent-{run_id}.report.md"));
+    let bytes = serde_json::to_vec_pretty(request)?;
+    if let Some(parent) = request_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write_bytes(&request_path, &bytes)?;
+    Ok((request_path, report_path))
+}
+
+fn spawn_detached_subagent_process(
+    root: &Path,
+    request_path: &Path,
+    report_path: &Path,
+) -> Result<DetachedSubagentLaunch> {
+    let exe = std::env::current_exe().context("resolve current wolf executable")?;
+    let stdout_path = report_path.with_extension("stdout.log");
+    let task = format!(
+        "wolf subagent worker {} {}",
+        request_path.display(),
+        report_path.display()
+    );
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut args = vec![
+        "subagent-worker".to_string(),
+        request_path.display().to_string(),
+        report_path.display().to_string(),
+    ];
+    let mut label;
+
+    #[cfg(unix)]
+    {
+        if binary_on_path("tmux") {
+            label = "tmux".to_string();
+            let quoted: Vec<String> = std::iter::once(exe.display().to_string())
+                .chain(args.iter().cloned())
+                .map(|s| shell_single_quote(&s))
+                .collect();
+            let command = format!(
+                "{}; printf '\\n[subagent complete — report: {}]\\n'; printf 'press Enter to close '; read _",
+                quoted.join(" "),
+                shell_single_quote(&report_path.display().to_string())
+            );
+            let status = Command::new("tmux")
+                .args(["new-window", "-n", "wolf-subagent", &command])
+                .current_dir(root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("launch tmux subagent window")?;
+            if status.success() {
+                return Ok(DetachedSubagentLaunch {
+                    label,
+                    report_path: report_path.to_path_buf(),
+                    stdout_path,
+                    command: task,
+                });
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if binary_on_path("osascript") {
+            label = "Terminal.app".to_string();
+            let quoted: Vec<String> = std::iter::once(exe.display().to_string())
+                .chain(args.iter().cloned())
+                .map(|s| shell_single_quote(&s))
+                .collect();
+            let command = format!(
+                "cd {}; {}; printf '\\n[subagent complete — report: {}]\\n'",
+                shell_single_quote(&root.display().to_string()),
+                quoted.join(" "),
+                shell_single_quote(&report_path.display().to_string())
+            );
+            let script = format!(
+                "tell application \"Terminal\" to do script {}",
+                serde_json::to_string(&command)?
+            );
+            Command::new("osascript")
+                .args(["-e", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("launch Terminal.app subagent window")?;
+            return Ok(DetachedSubagentLaunch {
+                label,
+                report_path: report_path.to_path_buf(),
+                stdout_path,
+                command: task,
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        label = "new console".to_string();
+        let exe_arg = exe.display().to_string();
+        let mut cmd_args = vec![
+            "/C".to_string(),
+            "start".to_string(),
+            "wolf-subagent".to_string(),
+            exe_arg,
+        ];
+        cmd_args.append(&mut args);
+        Command::new("cmd")
+            .args(cmd_args)
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("launch Windows subagent console")?;
+        return Ok(DetachedSubagentLaunch {
+            label,
+            report_path: report_path.to_path_buf(),
+            stdout_path,
+            command: task,
+        });
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for terminal in ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"] {
+            if !binary_on_path(terminal) {
+                continue;
+            }
+            let launched = match terminal {
+                "gnome-terminal" => Command::new(terminal)
+                    .arg("--working-directory")
+                    .arg(root)
+                    .arg("--")
+                    .arg(&exe)
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn(),
+                "konsole" => Command::new(terminal)
+                    .arg("--workdir")
+                    .arg(root)
+                    .arg("-e")
+                    .arg(&exe)
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn(),
+                _ => Command::new(terminal)
+                    .arg("-e")
+                    .arg(&exe)
+                    .args(&args)
+                    .current_dir(root)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn(),
+            };
+            if launched.is_ok() {
+                return Ok(DetachedSubagentLaunch {
+                    label: terminal.to_string(),
+                    report_path: report_path.to_path_buf(),
+                    stdout_path,
+                    command: task,
+                });
+            }
+        }
+    }
+
+    label = "background process".to_string();
+    let stdout = std::fs::File::create(&stdout_path)?;
+    let stderr = stdout.try_clone()?;
+    Command::new(exe)
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .context("launch background subagent process")?;
+    Ok(DetachedSubagentLaunch {
+        label,
+        report_path: report_path.to_path_buf(),
+        stdout_path,
+        command: task,
+    })
+}
+
 #[derive(Clone)]
 struct SubagentToolTrace {
     call_id: String,
@@ -1198,6 +1507,76 @@ fn subagent_quality_gate_missing(final_text: &str) -> Vec<&'static str> {
         .iter()
         .filter_map(|(label, aliases)| (!heading_present(&lower, aliases)).then_some(*label))
         .collect()
+}
+
+fn render_subagent_report(report: &SubagentRunReport) -> String {
+    let mut summary = format!(
+        "=== SUBAGENT RESULT ===\n\
+         task: {}\n\
+         iterations: {}/{}, tool calls: {} ({} failed)\n\
+         elapsed: {:.1}s\n\
+         {}\n\
+         === OUTPUT ===\n{}\n=== END ===",
+        report.task,
+        report.iterations,
+        report.max_iterations,
+        report.calls,
+        report.failed_calls,
+        report.elapsed.as_secs_f64(),
+        report
+            .halted_reason
+            .as_ref()
+            .map(|r| format!("HALTED: {r}"))
+            .unwrap_or_default(),
+        report.final_text,
+    );
+
+    let trace_summary = render_subagent_ui_content(report);
+    if !trace_summary.is_empty() {
+        summary.push_str(&format!("\n--- tool trace ---\n{trace_summary}"));
+    }
+    let missing_quality_fields = subagent_quality_gate_missing(&report.final_text);
+    if !missing_quality_fields.is_empty() {
+        summary.push_str(&format!(
+            "\n--- quality gate ---\nmissing required handoff field(s): {}\nParent must verify before using this output.\n",
+            missing_quality_fields.join(", ")
+        ));
+    }
+    summary
+}
+
+async fn run_subagent_worker(request_path: &Path, report_path: &Path) -> Result<()> {
+    let request: SubagentRequest = serde_json::from_slice(
+        &std::fs::read(request_path)
+            .with_context(|| format!("reading subagent request {}", request_path.display()))?,
+    )?;
+    let root = std::env::current_dir()?;
+    let mut agent = Agent::new_with_sandbox(Some(root), false)?;
+    agent.silent = false;
+    agent.pretty = io::stdout().is_terminal();
+    agent.sink = Box::new(ConsoleSink::new(agent.pretty, false));
+    agent.set_approval_profile(request.approval_profile);
+    agent.set_sandbox_profile(request.sandbox_profile);
+    agent.set_browser_recipe(request.browser_recipe);
+    agent.set_thinking_effort(request.thinking_effort);
+    agent.context_mode = request.context_mode;
+    agent.tool_profile = request.tool_profile;
+    agent.set_budget_cap(request.budget_cap);
+    if !request.privacy_enabled {
+        agent.privacy.enabled = false;
+    }
+    agent.refresh_tools_for_context();
+    let report = agent
+        .run_subagent(&request.to_tool_input())
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let rendered = render_subagent_report(&report);
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    atomic_write_bytes(report_path, rendered.as_bytes())?;
+    println!("\n[subagent report written: {}]", report_path.display());
+    Ok(())
 }
 
 fn render_subagent_ui_content(report: &SubagentRunReport) -> String {
@@ -1463,6 +1842,448 @@ impl FocusMode {
             Self::Exact => "exact",
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+struct PrivacyPolicy {
+    enabled: bool,
+    strict_paths: bool,
+    findings: PrivacyFindingCounts,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+struct PrivacyFindingCounts {
+    ssn: u64,
+    credit_card: u64,
+    api_key: u64,
+    private_key: u64,
+    account_number: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PrivacyRedaction {
+    text: String,
+    counts: PrivacyFindingCounts,
+}
+
+impl Default for PrivacyPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strict_paths: true,
+            findings: PrivacyFindingCounts::default(),
+        }
+    }
+}
+
+impl PrivacyPolicy {
+    fn from_env() -> Self {
+        let mut policy = Self::default();
+        if let Ok(v) = std::env::var("WOLF_PRIVACY") {
+            policy.enabled = matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "redact" | "strict"
+            );
+            if v.trim().eq_ignore_ascii_case("strict") {
+                policy.strict_paths = true;
+            }
+        }
+        policy
+    }
+
+    fn mode_label(&self) -> &'static str {
+        if self.enabled { "redact" } else { "off" }
+    }
+
+    fn prompt_status_line(&self) -> String {
+        if self.enabled {
+            "privacy=redact (tool outputs/session logs locally redact SSN, card, API key, private key, account-like numbers before model context)".to_string()
+        } else {
+            "privacy=off".to_string()
+        }
+    }
+
+    fn status_text(&self) -> String {
+        let mut out = format!(
+            "privacy: {}\nstrict path guard: {}\nredacts: ssn, credit-card, api-key/token, private-key, account-like long numbers",
+            self.mode_label(),
+            if self.strict_paths { "on" } else { "off" }
+        );
+        if self.findings.total() > 0 {
+            out.push_str(&format!(
+                "\nredacted this session: {}",
+                self.findings.summary()
+            ));
+        }
+        out
+    }
+
+    fn redact_text(&self, text: &str) -> PrivacyRedaction {
+        if !self.enabled || text.is_empty() {
+            return PrivacyRedaction {
+                text: text.to_string(),
+                counts: PrivacyFindingCounts::default(),
+            };
+        }
+        redact_sensitive_text(text)
+    }
+
+    fn redact_log_detail(&self, text: &str) -> String {
+        if !self.enabled || text.is_empty() {
+            return text.to_string();
+        }
+        redact_sensitive_text(text).text
+    }
+
+    fn apply_tool_output(
+        &mut self,
+        tool_name: &str,
+        _input: &Value,
+        content: String,
+    ) -> PrivacyRedaction {
+        let mut redacted = self.redact_text(&content);
+        if self.enabled && redacted.counts.total() > 0 {
+            let summary = redacted.counts.summary();
+            self.findings.add(&redacted.counts);
+            redacted.text.push_str(&format!(
+                "\n\n[privacy] Redacted {summary} from {tool_name} output before model context/session logging. Raw values withheld."
+            ));
+        }
+        redacted
+    }
+
+    fn path_denial(&mut self, tool_name: &str, input: &Value) -> Option<String> {
+        if !(self.enabled && self.strict_paths && matches!(tool_name, "read_file" | "read_symbol"))
+        {
+            return None;
+        }
+        let path = input["path"].as_str()?;
+        if !privacy_sensitive_path(path) {
+            return None;
+        }
+        self.findings.private_key = self.findings.private_key.saturating_add(1);
+        Some(format!(
+            "[privacy] blocked {tool_name} for sensitive-looking path `{path}`. Raw file content withheld. Ask the user to disable `/privacy` or provide a sanitized excerpt if this read is necessary."
+        ))
+    }
+}
+
+impl PrivacyFindingCounts {
+    fn add(&mut self, other: &Self) {
+        self.ssn = self.ssn.saturating_add(other.ssn);
+        self.credit_card = self.credit_card.saturating_add(other.credit_card);
+        self.api_key = self.api_key.saturating_add(other.api_key);
+        self.private_key = self.private_key.saturating_add(other.private_key);
+        self.account_number = self.account_number.saturating_add(other.account_number);
+    }
+
+    fn total(&self) -> u64 {
+        self.ssn
+            .saturating_add(self.credit_card)
+            .saturating_add(self.api_key)
+            .saturating_add(self.private_key)
+            .saturating_add(self.account_number)
+    }
+
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.ssn > 0 {
+            parts.push(format!("{} SSN", self.ssn));
+        }
+        if self.credit_card > 0 {
+            parts.push(format!("{} card", self.credit_card));
+        }
+        if self.api_key > 0 {
+            parts.push(format!("{} API/token", self.api_key));
+        }
+        if self.private_key > 0 {
+            parts.push(format!("{} private-key/path", self.private_key));
+        }
+        if self.account_number > 0 {
+            parts.push(format!("{} account-like", self.account_number));
+        }
+        if parts.is_empty() {
+            "0 items".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
+fn redact_sensitive_text(text: &str) -> PrivacyRedaction {
+    let mut counts = PrivacyFindingCounts::default();
+    let mut out = redact_private_key_blocks(text, &mut counts);
+    out = redact_secret_assignments(&out, &mut counts);
+    out = redact_ssns(&out, &mut counts);
+    out = redact_digit_sequences(&out, &mut counts);
+    PrivacyRedaction { text: out, counts }
+}
+
+fn redact_private_key_blocks(text: &str, counts: &mut PrivacyFindingCounts) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_key = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !in_key && trimmed.starts_with("-----BEGIN ") && trimmed.contains("PRIVATE KEY-----") {
+            counts.private_key = counts.private_key.saturating_add(1);
+            out.push_str("[REDACTED_PRIVATE_KEY]\n");
+            in_key = true;
+            continue;
+        }
+        if in_key {
+            if trimmed.starts_with("-----END ") && trimmed.contains("PRIVATE KEY-----") {
+                in_key = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn redact_secret_assignments(text: &str, counts: &mut PrivacyFindingCounts) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let secretish = [
+            "api_key",
+            "apikey",
+            "access_token",
+            "auth_token",
+            "bearer ",
+            "client_secret",
+            "secret_key",
+            "private_key",
+            "password",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        if secretish {
+            if let Some(pos) = line.find('=') {
+                counts.api_key = counts.api_key.saturating_add(1);
+                out.push_str(line[..=pos].trim_end());
+                out.push_str(" [REDACTED_SECRET]\n");
+                continue;
+            }
+            if let Some(pos) = line.find(':') {
+                counts.api_key = counts.api_key.saturating_add(1);
+                out.push_str(line[..=pos].trim_end());
+                out.push_str(" [REDACTED_SECRET]\n");
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn redact_ssns(text: &str, counts: &mut PrivacyFindingCounts) -> String {
+    redact_by_byte_spans(text, find_ssn_spans(text, counts), "[REDACTED_SSN]")
+}
+
+fn redact_digit_sequences(text: &str, counts: &mut PrivacyFindingCounts) -> String {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut digits = String::new();
+    let mut digit_count = 0usize;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_ascii_digit() {
+            if start.is_none() {
+                start = Some(idx);
+                digits.clear();
+                digit_count = 0;
+            }
+            digits.push(ch);
+            digit_count += 1;
+        } else if start.is_some() && matches!(ch, ' ' | '-' | '_' | '.') {
+            digits.push(ch);
+        } else if let Some(s) = start.take() {
+            classify_digit_span(text, s, idx, &digits, digit_count, &mut spans, counts);
+            digits.clear();
+            digit_count = 0;
+        }
+    }
+    if let Some(s) = start {
+        classify_digit_span(
+            text,
+            s,
+            text.len(),
+            &digits,
+            digit_count,
+            &mut spans,
+            counts,
+        );
+    }
+    redact_by_labeled_spans(text, spans)
+}
+
+fn classify_digit_span(
+    text: &str,
+    start: usize,
+    end: usize,
+    raw_digits: &str,
+    digit_count: usize,
+    spans: &mut Vec<(usize, usize, &'static str)>,
+    counts: &mut PrivacyFindingCounts,
+) {
+    if digit_count < 9 {
+        return;
+    }
+    let digits: String = raw_digits.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digit_count == 9 && looks_like_ssn_context(text, start) {
+        counts.ssn = counts.ssn.saturating_add(1);
+        spans.push((start, end, "[REDACTED_SSN]"));
+    } else if (13..=19).contains(&digit_count) && luhn_valid(&digits) {
+        counts.credit_card = counts.credit_card.saturating_add(1);
+        spans.push((start, end, "[REDACTED_CARD]"));
+    } else if (10..=17).contains(&digit_count) && looks_like_account_context(text, start) {
+        counts.account_number = counts.account_number.saturating_add(1);
+        spans.push((start, end, "[REDACTED_ACCOUNT]"));
+    }
+}
+
+fn find_ssn_spans(text: &str, counts: &mut PrivacyFindingCounts) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i + 11 <= bytes.len() {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3] == b'-'
+            && bytes[i + 4].is_ascii_digit()
+            && bytes[i + 5].is_ascii_digit()
+            && bytes[i + 6] == b'-'
+            && bytes[i + 7].is_ascii_digit()
+            && bytes[i + 8].is_ascii_digit()
+            && bytes[i + 9].is_ascii_digit()
+            && bytes[i + 10].is_ascii_digit()
+            && byte_boundary_ok(bytes, i, i + 11)
+        {
+            counts.ssn = counts.ssn.saturating_add(1);
+            spans.push((i, i + 11));
+            i += 11;
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+fn byte_boundary_ok(bytes: &[u8], start: usize, end: usize) -> bool {
+    let before = start.checked_sub(1).and_then(|i| bytes.get(i)).copied();
+    let after = bytes.get(end).copied();
+    !before.is_some_and(|b| b.is_ascii_alphanumeric())
+        && !after.is_some_and(|b| b.is_ascii_alphanumeric())
+}
+
+fn redact_by_byte_spans(text: &str, spans: Vec<(usize, usize)>, replacement: &str) -> String {
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for (start, end) in spans {
+        if start < last {
+            continue;
+        }
+        out.push_str(&text[last..start]);
+        out.push_str(replacement);
+        last = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+fn redact_by_labeled_spans(text: &str, mut spans: Vec<(usize, usize, &'static str)>) -> String {
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    spans.sort_by_key(|(s, _, _)| *s);
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for (start, end, replacement) in spans {
+        if start < last {
+            continue;
+        }
+        out.push_str(&text[last..start]);
+        out.push_str(replacement);
+        last = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+fn looks_like_ssn_context(text: &str, start: usize) -> bool {
+    let prefix = byte_suffix_at_char_boundary(&text[..start], 32).to_ascii_lowercase();
+    prefix.contains("ssn") || prefix.contains("social security")
+}
+
+fn looks_like_account_context(text: &str, start: usize) -> bool {
+    let context = byte_suffix_at_char_boundary(&text[..start], 40).to_ascii_lowercase();
+    [
+        "account",
+        "acct",
+        "routing",
+        "iban",
+        "member id",
+        "customer id",
+    ]
+    .iter()
+    .any(|needle| context.contains(needle))
+}
+
+fn luhn_valid(digits: &str) -> bool {
+    let mut sum = 0u32;
+    let mut double = false;
+    for ch in digits.chars().rev() {
+        let Some(mut n) = ch.to_digit(10) else {
+            return false;
+        };
+        if double {
+            n *= 2;
+            if n > 9 {
+                n -= 9;
+            }
+        }
+        sum += n;
+        double = !double;
+    }
+    sum > 0 && sum % 10 == 0
+}
+
+fn privacy_sensitive_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("secret")
+        || lower.contains("credential")
+        || lower.contains("private")
+        || lower.contains("id_rsa")
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
+        || lower.ends_with(".p12")
+        || lower.ends_with(".pfx")
+    {
+        return true;
+    }
+    Path::new(path)
+        .components()
+        .any(|component| match component {
+            Component::Normal(name) => {
+                let n = name.to_string_lossy().to_ascii_lowercase();
+                matches!(n.as_str(), ".env" | ".netrc" | "credentials" | "secrets")
+            }
+            _ => false,
+        })
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -4296,6 +5117,22 @@ async fn execute_builtin_call(
     interrupt: Arc<AtomicBool>,
     read_cache: Option<Arc<Mutex<ReadFileCache>>>,
 ) -> std::result::Result<String, String> {
+    if name == "subagent" {
+        let request = serde_json::from_value::<SubagentRequest>(input.clone())
+            .map_err(|e| format!("invalid subagent request: {e}"))?;
+        let (request_path, report_path) = write_subagent_request(&root, &request)
+            .map_err(|e| format!("write subagent request: {e:#}"))?;
+        let launch = spawn_detached_subagent_process(&root, &request_path, &report_path)
+            .map_err(|e| format!("launch detached subagent: {e:#}"))?;
+        return Ok(format!(
+            "detached subagent launched in {}\ncommand: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nUse `read_file` on the report path after it completes.",
+            launch.label,
+            launch.command,
+            request_path.display(),
+            launch.report_path.display(),
+            launch.stdout_path.display()
+        ));
+    }
     if name == "bash" {
         let cmd = input["command"].as_str().unwrap_or("").to_string();
         let guarded = tool_policy::apply_bash_guardrails(&cmd)?;
@@ -4303,20 +5140,6 @@ async fn execute_builtin_call(
         execute_bash_async_with_timeout(&guarded, &root, interrupt, timeout).await
     } else if name == "http" {
         execute_http_tool_async(&input, interrupt, external_tool_timeout()).await
-    } else if name == "browser" {
-        let args = str_array(&input["args"]);
-        if args.is_empty() {
-            return Err("missing args".to_string());
-        }
-        execute_external_async(
-            "agent-browser",
-            &args,
-            input["stdin"].as_str(),
-            &root,
-            interrupt,
-            external_tool_timeout(),
-        )
-        .await
     } else if is_external_process_tool(&name) {
         let (bin, args, stdin) = prepare_external_tool(&name, &input, &root)?;
         let result = execute_external_async(
@@ -4549,7 +5372,7 @@ fn summarize_call(name: &str, input: &Value) -> String {
                 }
                 None => "default".to_string(),
             };
-            format!("subagent: \"{task}\" · tools={tools} · max_iter={max_iter}")
+            format!("subagent: \"{task}\" · detached · tools={tools} · max_iter={max_iter}")
         }
         _ => {
             let compact = summarize_inline(&input.to_string(), TOOL_SUMMARY_CHAR_CAP);
@@ -4650,7 +5473,7 @@ Shell and external operations:
 Subagents:
 - Do not call subagent directly. The user invokes delegation with /subagent.
 - If the user asks you to delegate, suggest an appropriate /subagent command.
-- After subagent output is provided, review it before acting on it.
+- After subagent output/report is provided, review it before acting on it.
 
 Verification:
 - Run the narrowest useful checks first and use realistic timeouts for long builds/tests.
@@ -5018,6 +5841,8 @@ struct SessionHeader {
     provider_health: ProviderHealthLedger,
     #[serde(default)]
     track_origin: Option<TrackOrigin>,
+    #[serde(default)]
+    privacy: PrivacyPolicy,
 }
 
 impl Default for SessionHeader {
@@ -5045,6 +5870,7 @@ impl Default for SessionHeader {
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
             track_origin: None,
+            privacy: PrivacyPolicy::default(),
         }
     }
 }
@@ -5064,7 +5890,7 @@ fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
         ("in_progress", &ledger.in_progress),
         ("pending", &ledger.pending),
         ("blocked", &ledger.blocked),
-        ("steering", &ledger.steering),
+        ("queued_user_updates", &ledger.steering),
         ("files_changed", &ledger.files_changed),
         ("next_actions", &ledger.next_actions),
     ] {
@@ -5753,6 +6579,7 @@ struct Agent {
     work_ledger: WorkLedger,
     provider_health: ProviderHealthLedger,
     track_origin: Option<TrackOrigin>,
+    privacy: PrivacyPolicy,
 }
 
 impl Agent {
@@ -5854,7 +6681,7 @@ impl Agent {
             system,
             history: Vec::new(),
             tools,
-            allowed: HashSet::new(),
+            allowed: HashSet::from(["subagent".to_string()]),
             deny_tools: HashSet::new(),
             hooks: Hooks::load(&sandbox_root),
             sandbox_root,
@@ -5890,6 +6717,7 @@ impl Agent {
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
             track_origin: None,
+            privacy: PrivacyPolicy::from_env(),
         })
     }
 
@@ -6294,7 +7122,8 @@ impl Agent {
         if !self.session_enabled {
             return;
         }
-        session::append_latest_log(&self.sandbox_root, event, detail);
+        let detail = self.privacy.redact_log_detail(detail);
+        session::append_latest_log(&self.sandbox_root, event, &detail);
     }
 
     fn compose_system_parts(&self) -> (String, String) {
@@ -6473,6 +7302,8 @@ impl Agent {
                     self.browser_recipe.as_str()
                 ));
             }
+            env.push_str(&self.privacy.prompt_status_line());
+            env.push('\n');
             return (stable, env);
         }
 
@@ -6540,6 +7371,8 @@ impl Agent {
                 self.browser_recipe.as_str()
             ));
         }
+        env.push_str(&self.privacy.prompt_status_line());
+        env.push('\n');
         (stable, env)
     }
 
@@ -6582,6 +7415,15 @@ impl Agent {
         }
     }
 
+    fn unresolved_steering_items(&self) -> Vec<String> {
+        self.work_ledger
+            .steering
+            .iter()
+            .filter(|item| !steering_item_acknowledged(item, &self.history))
+            .cloned()
+            .collect()
+    }
+
     fn note_steering_messages(&mut self, messages: &[String]) -> String {
         let combined = messages.join("\n\n");
         let preview = summarize_inline(&combined, 180);
@@ -6602,16 +7444,16 @@ impl Agent {
             .work_ledger
             .pending
             .iter()
-            .any(|item| item == "respond to queued steering")
+            .any(|item| item == "respond to queued user update")
             && !self
                 .work_ledger
                 .done
                 .iter()
-                .any(|item| item == "respond to queued steering")
+                .any(|item| item == "respond to queued user update")
         {
             self.work_ledger
                 .pending
-                .push("respond to queued steering".to_string());
+                .push("respond to queued user update".to_string());
         }
         preview
     }
@@ -6630,12 +7472,12 @@ impl Agent {
         let combined = steering_messages.join("\n\n");
         let preview = self.note_steering_messages(&steering_messages);
         let progress = format!(
-            "[steering] The user sent this while you were working. This is active scope, not an aside. \
+            "[queued-user-update] The user sent this while you were working. This is active scope, not an aside. \
              You must explicitly address it in your next assistant response and say what changed, what you did about it, or why it is blocked. \
-             If it adds/removes work, update any active todo list before continuing. Do not let the final answer omit this steering.\n\n\
+             If it adds/removes work, update any active todo list before continuing. Do not let the final answer omit this queued update.\n\n\
              Progress: completed {iterations} iterations, {tool_count} tool calls so far. \
              Phase: {}. Injection point: {}.\n\
-             User's steering message:\n{combined}",
+             User update:\n{combined}",
             turn_state.phase().label(),
             if before_final {
                 "before final response"
@@ -7058,6 +7900,7 @@ impl Agent {
             work_ledger: self.cleaned_work_ledger(),
             provider_health: self.provider_health.clone(),
             track_origin,
+            privacy: self.privacy.clone(),
         }
     }
 
@@ -7186,6 +8029,7 @@ impl Agent {
             work_ledger,
             provider_health,
             track_origin,
+            privacy,
             ..
         } = parse_session_header(header)?;
 
@@ -7207,6 +8051,7 @@ impl Agent {
         self.work_ledger = work_ledger;
         self.provider_health = provider_health;
         self.track_origin = track_origin;
+        self.privacy = privacy;
         self.context_mode = context_mode;
         self.tool_profile = if self.context_mode.is_frugal() {
             ToolProfile::Lean
@@ -7865,6 +8710,7 @@ impl Agent {
         let mut max_iter: u64 = 20;
         let mut system_override: Option<String> = None;
         let mut readonly = false;
+        let mut mode = SubagentMode::Detached;
 
         let mut tokens = raw.split_whitespace().peekable();
         while let Some(tok) = tokens.next() {
@@ -7894,6 +8740,19 @@ impl Agent {
                 "--readonly" => {
                     readonly = true;
                 }
+                "--inline" | "--foreground" => {
+                    mode = SubagentMode::Inline;
+                }
+                "--detached" | "--background" | "--window" | "--tmux" => {
+                    mode = SubagentMode::Detached;
+                }
+                "--mode" => {
+                    if let Some(value) = tokens.next()
+                        && let Some(parsed) = SubagentMode::parse(value)
+                    {
+                        mode = parsed;
+                    }
+                }
                 other => task_parts.push(other.to_string()),
             }
         }
@@ -7901,7 +8760,7 @@ impl Agent {
         let task = task_parts.join(" ");
         if task.is_empty() {
             self.sink.emit(AgentEvent::Slash(
-                "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly]".into(),
+                "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]".into(),
             ));
             return Ok(());
         }
@@ -7923,8 +8782,39 @@ impl Agent {
             input["system"] = json!(sys);
         }
 
+        let request = SubagentRequest::from_input(self, &input).map_err(anyhow::Error::msg)?;
+        if mode == SubagentMode::Detached {
+            let (request_path, report_path) = write_subagent_request(&self.sandbox_root, &request)?;
+            let launch =
+                spawn_detached_subagent_process(&self.sandbox_root, &request_path, &report_path)?;
+            let summary = format!(
+                "▶ subagent detached: \"{}\"{} · max_iter={}\nlauncher: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nParent remains usable; read the report path when complete.",
+                task,
+                if readonly { " [readonly]" } else { "" },
+                max_iter,
+                launch.label,
+                request_path.display(),
+                launch.report_path.display(),
+                launch.stdout_path.display()
+            );
+            self.sink.emit(AgentEvent::Slash(summary.clone()));
+            self.history.push(Message {
+                role: "user".to_string(),
+                content: vec![Block::Text {
+                    text: format!(
+                        "[subagent detached]\nTask: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\n\nThe subagent is running outside the parent transcript. When it completes, inspect the report and decide whether to use, verify, revise, or discard it.",
+                        task,
+                        request_path.display(),
+                        launch.report_path.display(),
+                        launch.stdout_path.display()
+                    ),
+                }],
+            });
+            return Ok(());
+        }
+
         self.sink.emit(AgentEvent::Slash(format!(
-            "▶ subagent: \"{task}\"{} · max_iter={max_iter}",
+            "▶ subagent inline: \"{task}\"{} · max_iter={max_iter}",
             if readonly { " [readonly]" } else { "" },
         )));
 
@@ -7933,38 +8823,7 @@ impl Agent {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let mut summary = format!(
-            "=== SUBAGENT RESULT ===\n\
-             task: {}\n\
-             iterations: {}/{}, tool calls: {} ({} failed)\n\
-             elapsed: {:.1}s\n\
-             {}\n\
-             === OUTPUT ===\n{}\n=== END ===",
-            report.task,
-            report.iterations,
-            report.max_iterations,
-            report.calls,
-            report.failed_calls,
-            report.elapsed.as_secs_f64(),
-            report
-                .halted_reason
-                .as_ref()
-                .map(|r| format!("HALTED: {r}"))
-                .unwrap_or_default(),
-            report.final_text,
-        );
-
-        let trace_summary = render_subagent_ui_content(&report);
-        if !trace_summary.is_empty() {
-            summary.push_str(&format!("\n--- tool trace ---\n{trace_summary}"));
-        }
-        let missing_quality_fields = subagent_quality_gate_missing(&report.final_text);
-        if !missing_quality_fields.is_empty() {
-            summary.push_str(&format!(
-                "\n--- quality gate ---\nmissing required handoff field(s): {}\nParent must verify before using this output.\n",
-                missing_quality_fields.join(", ")
-            ));
-        }
+        let summary = render_subagent_report(&report);
 
         self.sink.emit(AgentEvent::Slash(summary.clone()));
 
@@ -8077,6 +8936,7 @@ impl Agent {
         let mut turn_state = orchestrator::TurnRuntimeState::new();
         let read_cache = self.read_cache.clone();
         let mut objective_warning_emitted = false;
+        let mut steering_final_followup_emitted = false;
         let mut last_retry_reason: Option<String> = None;
         let mut workaround_fired_this_turn = false;
 
@@ -8410,6 +9270,28 @@ impl Agent {
                         turn_state.phase().label()
                     )));
                 }
+                if !steering_final_followup_emitted {
+                    let unresolved_steering = self.unresolved_steering_items();
+                    if !unresolved_steering.is_empty() {
+                        steering_final_followup_emitted = true;
+                        let followup = format!(
+                            "[queued-update] Your previous final response missed a queued user update. \
+                             Reply now with only a concise final addendum that addresses the update and states the outcome.\n\n\
+                             Queued update(s): {}",
+                            unresolved_steering.join("; ")
+                        );
+                        self.append_latest_log(
+                            "steering_final_followup",
+                            &summarize_inline(&unresolved_steering.join("; "), 240),
+                        );
+                        self.history.push(Message {
+                            role: "user".to_string(),
+                            content: vec![Block::Text { text: followup }],
+                        });
+                        self.checkpoint_latest_session("after_queued_update_followup");
+                        continue;
+                    }
+                }
                 self.append_latest_log(
                     "chat_response_complete",
                     "assistant replied without tool calls",
@@ -8461,9 +9343,9 @@ impl Agent {
             }
 
             let mut plans: Vec<PlannedCall> = Vec::new();
-            for (ordinal, (id, name, input)) in tool_calls.into_iter().enumerate() {
+            for (ordinal, (id, name, mut input)) in tool_calls.into_iter().enumerate() {
                 let event_call_id = normalize_tool_call_id(&id, 0, ordinal);
-                let input_str = input.to_string();
+                let mut input_str = input.to_string();
                 let summary = summarize_call(&name, &input);
                 let call_sig = format!("{name}\n{input_str}");
                 let hosts = tool_policy::hosts_for_tool_call(&name, &input);
@@ -8486,9 +9368,10 @@ impl Agent {
                     });
                 }
 
+                // Subagents are intentionally explicit-user only; the model may not spawn them as a tool.
                 if plan.is_none() && name == "subagent" {
                     plan = Some(Plan::Immediate {
-                        content: "subagent is not available as an automatic tool. Use /subagent slash command to invoke it.".to_string(),
+                        content: "subagent runs detached in a separate terminal/tmux/window when possible. It inherits the main runtime capabilities but reports back by artifact path; the parent stays in control. Use /subagent for explicit delegation.".to_string(),
                         is_error: Some(true),
                     });
                 }
@@ -8544,8 +9427,55 @@ impl Agent {
                     });
                 }
 
+                if plan.is_none()
+                    && let Some(msg) = self.privacy.path_denial(&name, &input)
+                {
+                    plan = Some(Plan::Immediate {
+                        content: msg,
+                        is_error: Some(true),
+                    });
+                }
+
+                if plan.is_none() && name == "subagent" {
+                    match SubagentRequest::from_input(self, &input) {
+                        Ok(request) => {
+                            input = serde_json::to_value(request).unwrap_or_else(|_| input.clone());
+                            input_str = input.to_string();
+                            let detached_sig = format!("{name}\n{input_str}");
+                            if denied_signatures.contains(&detached_sig) {
+                                plan = Some(Plan::Immediate {
+                                    content: "permission denied by user — do not retry this tool call; ask the user instead".to_string(),
+                                    is_error: Some(true),
+                                });
+                            } else {
+                                match self.sink.request_permission(&name, &input) {
+                                    Choice::Once => {}
+                                    Choice::Always => {
+                                        self.allowed.insert(name.clone());
+                                    }
+                                    Choice::Deny => {
+                                        denied_signatures.insert(detached_sig);
+                                        plan = Some(Plan::Immediate {
+                                            content: "permission denied by user — do not retry this tool call; ask the user instead".to_string(),
+                                            is_error: Some(true),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Err(msg) => {
+                            plan = Some(Plan::Immediate {
+                                content: msg,
+                                is_error: Some(true),
+                            });
+                        }
+                    }
+                }
+
                 if plan.is_none() {
-                    let approved = if self.deny_tools.contains(&name)
+                    let approved = if name == "subagent" {
+                        true
+                    } else if self.deny_tools.contains(&name)
                         || denied_signatures.contains(&call_sig)
                         || (needs_permission(&name)
                             && self.approval_profile == ApprovalProfile::Never)
@@ -8811,6 +9741,15 @@ impl Agent {
                 }
 
                 let ok = !is_error.unwrap_or(false);
+                let privacy_redaction = self.privacy.apply_tool_output(&name, &input, content);
+                let redacted_count = privacy_redaction.counts.total();
+                content = privacy_redaction.text;
+                if redacted_count > 0 {
+                    followup_warnings.push(format!(
+                        "privacy redacted {} from {name} output before model context",
+                        privacy_redaction.counts.summary()
+                    ));
+                }
                 let observation = turn_state.record_external_outcome(
                     &name,
                     &hosts,
@@ -9013,36 +9952,17 @@ impl Agent {
             .blocked
             .retain(|item| !item.starts_with("final objective warning:"));
         if !self.work_ledger.steering.is_empty() {
-            let unresolved_steering = self
-                .work_ledger
-                .steering
-                .iter()
-                .filter(|item| !steering_item_acknowledged(item, &self.history))
-                .cloned()
-                .collect::<Vec<_>>();
+            let unresolved_steering = self.unresolved_steering_items();
+            self.work_ledger
+                .blocked
+                .retain(|item| !item.starts_with("queued update unresolved:"));
             if unresolved_steering.is_empty() {
-                self.mark_work_done("respond to queued steering");
-                self.work_ledger
-                    .blocked
-                    .retain(|item| !item.starts_with("final steering reminder:"));
+                self.mark_work_done("respond to queued user update");
             } else {
-                self.work_ledger
-                    .blocked
-                    .retain(|item| !item.starts_with("final steering reminder:"));
-                let steering_reminder = format!(
-                    "final steering reminder: explicitly mention queued steering and outcome before ending: {}",
-                    unresolved_steering.join("; ")
+                self.append_latest_log(
+                    "steering_unresolved_after_final",
+                    &summarize_inline(&unresolved_steering.join("; "), 240),
                 );
-                self.sink.emit(AgentEvent::Warn(steering_reminder.clone()));
-                self.append_latest_log("steering_final_reminder", &steering_reminder);
-                if !self
-                    .work_ledger
-                    .blocked
-                    .iter()
-                    .any(|item| item == &steering_reminder)
-                {
-                    self.work_ledger.blocked.push(steering_reminder);
-                }
             }
         }
         if let Some(reminder) = final_objective_warning(&objective, &self.history) {
@@ -9762,22 +10682,31 @@ impl Agent {
         }
 
         let started_at = std::time::Instant::now();
-        let task = input["task"].as_str().ok_or("missing task")?.to_string();
-        let system = input["system"]
-            .as_str()
-            .unwrap_or(DEFAULT_SUBAGENT_SYSTEM)
-            .to_string();
-        let max_iter = input["max_iterations"].as_u64().unwrap_or(20) as u32;
-        let whitelist: Option<Vec<String>> = input["allowed_tools"].as_array().map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        });
+        let request = SubagentRequest::from_input(self, input)?;
+        let task = request.task.clone();
+        let system = request
+            .system
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SUBAGENT_SYSTEM.to_string());
+        let max_iter = request.max_iterations as u32;
+        let whitelist = request.allowed_tools.clone();
 
         let tools: Vec<Tool> = tool_definitions()
             .into_iter()
             .filter(|t| t.name != "subagent")
-            .filter(|t| self.browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser")
+            .filter(|t| {
+                request.browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser"
+            })
+            .filter(|t| {
+                tool_name_allowed_in_profile(
+                    t.name,
+                    if request.context_mode.is_frugal() {
+                        ToolContextProfile::Lean
+                    } else {
+                        ToolContextProfile::Full
+                    },
+                )
+            })
             .filter(|t| match &whitelist {
                 Some(w) => w.iter().any(|n| n == t.name),
                 None => true,
@@ -9821,13 +10750,13 @@ impl Agent {
             partial_stream_text: None,
             compact_threshold_chars: self.compact_threshold_chars,
             compact_threshold_percent: self.compact_threshold_percent,
-            approval_profile: self.approval_profile,
-            sandbox_profile: self.sandbox_profile,
-            browser_recipe: self.browser_recipe,
-            context_mode: self.context_mode,
-            tool_profile: self.tool_profile,
-            budget_cap: self.budget_cap,
-            budget_exhausted: self.budget_exhausted,
+            approval_profile: request.approval_profile,
+            sandbox_profile: request.sandbox_profile,
+            browser_recipe: request.browser_recipe,
+            context_mode: request.context_mode,
+            tool_profile: request.tool_profile,
+            budget_cap: request.budget_cap,
+            budget_exhausted: false,
             builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
             sink: Box::new(ChannelSink { tx: ev_tx }),
             steering_rx: None,
@@ -9836,7 +10765,14 @@ impl Agent {
             work_ledger: self.work_ledger.clone(),
             provider_health: self.provider_health.clone(),
             track_origin: self.track_origin.clone(),
+            privacy: self.privacy.clone(),
         };
+
+        if !request.privacy_enabled {
+            sub.privacy.enabled = false;
+        }
+        sub.set_approval_profile(request.approval_profile);
+        sub.refresh_tools_for_context();
 
         {
             let chat_fut = Box::pin(sub.chat(task.clone()));
@@ -11584,6 +12520,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
+                "  /privacy [on|off|status]  redact sensitive tool output before model context"
+            );
+            let _ = writeln!(
+                w,
                 "  /approval [profile]       ask|auto-read|auto-write|never|always"
             );
             let _ = writeln!(
@@ -11692,7 +12632,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 w,
                 "  /plan <task>              run a read-only planner, seed the plan into history"
             );
-            let _ = writeln!(w, "  /subagent <task> [opts]   run a disposable subagent");
+            let _ = writeln!(
+                w,
+                "  /subagent <task> [opts]   run a detached subagent (tmux/window if available)"
+            );
             let _ = writeln!(w, "    --tools t1,t2           restrict tool whitelist");
             let _ = writeln!(
                 w,
@@ -11703,6 +12646,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 "    --system PROMPT         override subagent system prompt"
             );
             let _ = writeln!(w, "    --readonly              read-only tools only");
+            let _ = writeln!(
+                w,
+                "    --inline                legacy foreground mode; default is detached"
+            );
             let _ = writeln!(
                 w,
                 "  /hooks [reload]           show hook config or reload from disk"
@@ -11849,6 +12796,29 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
             _ => {
                 let _ = writeln!(w, "usage: /fangs [on|off|status]");
+            }
+        },
+        "privacy" => match arg {
+            "" | "status" => {
+                let _ = writeln!(w, "{}", agent.privacy.status_text());
+            }
+            "on" | "redact" | "strict" => {
+                agent.privacy.enabled = true;
+                agent.privacy.strict_paths = true;
+                let _ = writeln!(w, "privacy -> redact");
+                let _ = writeln!(
+                    w,
+                    "raw sensitive-looking tool output will be withheld before model context/session logging"
+                );
+                agent.checkpoint_latest_session("privacy_changed");
+            }
+            "off" | "none" | "disabled" => {
+                agent.privacy.enabled = false;
+                let _ = writeln!(w, "privacy -> off");
+                agent.checkpoint_latest_session("privacy_changed");
+            }
+            _ => {
+                let _ = writeln!(w, "usage: /privacy [on|off|status]");
             }
         },
         "approval" | "approval-profile" => {
@@ -13621,6 +14591,16 @@ async fn main() -> Result<()> {
     }));
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|a| a == "subagent-worker") {
+        if argv.len() != 3 {
+            eprintln!("usage: wolf subagent-worker REQUEST_JSON REPORT_MD");
+            release_registered_locks();
+            std::process::exit(2);
+        }
+        let result = run_subagent_worker(Path::new(&argv[1]), Path::new(&argv[2])).await;
+        release_registered_locks();
+        return result;
+    }
     if argv.iter().any(|a| a == "-V" || a == "--version") {
         println!("wolf {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -13646,6 +14626,7 @@ async fn main() -> Result<()> {
         println!("       wolf session tracks");
         println!("       wolf session track open [latest|NAME|PATH] @wNN [name]");
         println!("       wolf session export [latest|NAME|PATH] [html|jsonl] [OUT]");
+        println!("       wolf subagent-worker REQUEST_JSON REPORT_MD");
         println!("       wolf session analyze|grep|failures|verify-log|decisions [session]");
         println!(
             "       wolf --no-session     run without project state lock, latest session, or log writes"
@@ -13893,7 +14874,7 @@ async fn main() -> Result<()> {
                         if route_interactive_input_line(line, &busy, &input_tx, &steering_tx)
                             == InteractiveInputRoute::SteeringQueued
                         {
-                            eprintln!("[steering queued]");
+                            eprintln!("[queued for next response]");
                         }
                     }
                 }
@@ -13929,7 +14910,7 @@ async fn main() -> Result<()> {
                 continue;
             }
             let _ = agent.steering_sender().send(input.clone());
-            println!("[steering queued]");
+            println!("[queued for next response]");
             autosave_latest(&mut agent);
             continue;
         }
@@ -13996,7 +14977,7 @@ async fn main() -> Result<()> {
             let raw = input.strip_prefix("/subagent").unwrap_or("").trim();
             if raw.is_empty() {
                 println!(
-                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly]"
+                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]"
                 );
             } else {
                 agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);

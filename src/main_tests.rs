@@ -47,9 +47,10 @@ fn test_agent(root: &Path) -> Agent {
         history: Vec::new(),
         tools: tool_definitions()
             .into_iter()
+            .filter(|t| t.name != "subagent")
             .filter(|t| t.name != "browser")
             .collect(),
-        allowed: HashSet::new(),
+        allowed: HashSet::from(["subagent".to_string()]),
         deny_tools: HashSet::new(),
         sandbox_root: root.to_path_buf(),
         git_context: None,
@@ -85,6 +86,7 @@ fn test_agent(root: &Path) -> Agent {
         work_ledger: WorkLedger::default(),
         provider_health: ProviderHealthLedger::default(),
         track_origin: None,
+        privacy: PrivacyPolicy::default(),
     }
 }
 
@@ -225,24 +227,24 @@ fn injected_steering_is_ledger_visible_and_final_required() {
 
     assert!(agent.inject_queued_steering(&mut turn_state, 3, 7, true));
     let ledger = agent.work_ledger_prompt();
-    assert!(ledger.contains("steering:"), "{ledger}");
+    assert!(ledger.contains("queued_user_updates:"), "{ledger}");
     assert!(ledger.contains("rg border overflow"), "{ledger}");
-    assert!(ledger.contains("respond to queued steering"), "{ledger}");
+    assert!(ledger.contains("respond to queued user update"), "{ledger}");
     let injected = agent
         .history
         .iter()
         .flat_map(|m| m.content.iter())
         .find_map(|b| match b {
-            Block::Text { text } if text.contains("[steering]") => Some(text.clone()),
+            Block::Text { text } if text.contains("[queued-user-update]") => Some(text.clone()),
             _ => None,
         })
-        .expect("steering prompt injected");
+        .expect("queued update prompt injected");
     assert!(
         injected.contains("must explicitly address it"),
         "{injected}"
     );
     assert!(
-        injected.contains("Do not let the final answer omit this steering"),
+        injected.contains("Do not let the final answer omit this queued update"),
         "{injected}"
     );
 
@@ -288,7 +290,7 @@ fn non_tui_busy_input_routes_to_steering_channel_immediately() {
 }
 
 #[test]
-fn steering_delivery_line_includes_preview_and_final_requirement() {
+fn steering_delivery_line_includes_preview_and_queue_status() {
     let text = crate::tui::steering_delivered_text_for_test(1, "fix rg border overflow", 80);
     let rendered = text
         .lines
@@ -296,7 +298,7 @@ fn steering_delivery_line_includes_preview_and_final_requirement() {
         .flat_map(|line| line.spans.iter())
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(rendered.contains("final must address it"), "{rendered}");
+    assert!(rendered.contains("queued for next response"), "{rendered}");
     assert!(rendered.contains("fix rg border overflow"), "{rendered}");
 }
 
@@ -332,7 +334,7 @@ fn queued_steering_done_only_after_acknowledged_final() {
     agent
         .work_ledger
         .pending
-        .push("respond to queued steering".to_string());
+        .push("respond to queued user update".to_string());
     agent.history.push(Message {
         role: "assistant".to_string(),
         content: vec![Block::Text {
@@ -352,7 +354,7 @@ fn queued_steering_done_only_after_acknowledged_final() {
         agent
             .work_ledger
             .pending
-            .contains(&"respond to queued steering".to_string())
+            .contains(&"respond to queued user update".to_string())
     );
 
     agent.history.push(Message {
@@ -369,18 +371,18 @@ fn queued_steering_done_only_after_acknowledged_final() {
         .cloned()
         .collect::<Vec<_>>();
     assert!(unresolved.is_empty());
-    agent.mark_work_done("respond to queued steering");
+    agent.mark_work_done("respond to queued user update");
     assert!(
         agent
             .work_ledger
             .done
-            .contains(&"respond to queued steering".to_string())
+            .contains(&"respond to queued user update".to_string())
     );
     assert!(
         !agent
             .work_ledger
             .pending
-            .contains(&"respond to queued steering".to_string())
+            .contains(&"respond to queued user update".to_string())
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1194,6 +1196,71 @@ fn slash_fangs_emits_profile_update_for_tui_status() {
         saw_profile,
         "expected ApprovalProfileChanged after /fangs on"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn privacy_redacts_sensitive_tool_output_and_blocks_secret_paths() {
+    let root = temp_test_dir("privacy-policy");
+    let mut agent = test_agent(&root);
+    agent.privacy.enabled = true;
+
+    let content = "ssn=123-45-6789\ncard 4111 1111 1111 1111\naccount number: 123456789012\nAPI_KEY=abcdef123456";
+    let redacted = agent.privacy.apply_tool_output(
+        "read_file",
+        &json!({"path": "data.txt"}),
+        content.to_string(),
+    );
+    assert!(!redacted.text.contains("123-45-6789"));
+    assert!(!redacted.text.contains("4111 1111 1111 1111"));
+    assert!(!redacted.text.contains("123456789012"));
+    assert!(!redacted.text.contains("abcdef123456"));
+    assert!(
+        redacted.text.contains("[REDACTED_SSN]"),
+        "{}",
+        redacted.text
+    );
+    assert!(
+        redacted.text.contains("[REDACTED_CARD]"),
+        "{}",
+        redacted.text
+    );
+    assert!(
+        redacted.text.contains("[REDACTED_ACCOUNT]"),
+        "{}",
+        redacted.text
+    );
+    assert!(
+        redacted.text.contains("[REDACTED_SECRET]"),
+        "{}",
+        redacted.text
+    );
+    assert!(
+        redacted.text.contains("[privacy] Redacted"),
+        "{}",
+        redacted.text
+    );
+
+    let denial = agent
+        .privacy
+        .path_denial("read_file", &json!({"path": ".env"}))
+        .expect("secret path blocked");
+    assert!(denial.contains("blocked read_file"), "{denial}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn slash_privacy_toggles_runtime_policy() {
+    let root = temp_test_dir("privacy-slash");
+    let mut agent = test_agent(&root);
+
+    assert_eq!(handle_slash("/privacy on", &mut agent), Some(true));
+    assert!(agent.privacy.enabled);
+    assert_eq!(handle_slash("/privacy status", &mut agent), Some(true));
+    assert_eq!(handle_slash("/privacy off", &mut agent), Some(true));
+    assert!(!agent.privacy.enabled);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2935,6 +3002,98 @@ fn dedupe_cache_short_circuit_preserves_cached_error_semantics_regression() {
 }
 
 #[test]
+fn subagent_request_inherits_parent_capability_profile() {
+    let root = temp_test_dir("subagent-request-profile");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    agent.set_browser_recipe(BrowserRecipe::AgentBrowser);
+    agent.set_thinking_effort(ThinkingEffort::High);
+    agent.context_mode = ContextMode::Frugal;
+    agent.tool_profile = ToolProfile::Lean;
+    agent.set_budget_cap(BudgetCap::parse("25k tokens"));
+    agent.privacy.enabled = false;
+
+    let input = json!({
+        "task": "survey repo",
+        "allowed_tools": ["rg", "read_file"],
+        "max_iterations": 7,
+    });
+    let request = SubagentRequest::from_input(&agent, &input).expect("request");
+    assert_eq!(request.approval_profile, ApprovalProfile::Always);
+    assert_eq!(request.sandbox_profile, SandboxProfile::DangerFullAccess);
+    assert_eq!(request.browser_recipe, BrowserRecipe::AgentBrowser);
+    assert_eq!(request.thinking_effort, ThinkingEffort::High);
+    assert_eq!(request.context_mode, ContextMode::Frugal);
+    assert_eq!(request.tool_profile, ToolProfile::Lean);
+    assert_eq!(request.max_iterations, 7);
+    assert_eq!(
+        request.allowed_tools,
+        Some(vec!["rg".into(), "read_file".into()])
+    );
+    assert!(!request.privacy_enabled);
+    assert_eq!(request.to_tool_input()["task"], "survey repo");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn subagent_detached_request_paths_are_project_scoped() {
+    let root = temp_test_dir("subagent-request-path");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let request = SubagentRequest {
+        task: "noop".to_string(),
+        ..SubagentRequest::default()
+    };
+    let (request_path, report_path) =
+        write_subagent_request(&root, &request).expect("write request");
+    assert!(
+        request_path.starts_with(project_state_dir(&root)),
+        "{}",
+        request_path.display()
+    );
+    assert!(
+        report_path.starts_with(project_state_dir(&root)),
+        "{}",
+        report_path.display()
+    );
+    assert!(request_path.exists(), "{}", request_path.display());
+    let parsed: SubagentRequest =
+        serde_json::from_slice(&std::fs::read(&request_path).unwrap()).unwrap();
+    assert_eq!(parsed.task, "noop");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(subagent_requests_dir(&root));
+}
+
+#[test]
+fn subagent_worker_renders_report_with_quality_gate() {
+    let report = SubagentRunReport {
+        task: "research".to_string(),
+        max_iterations: 3,
+        iterations: 1,
+        calls: 0,
+        failed_calls: 0,
+        elapsed: std::time::Duration::from_millis(12),
+        halted_reason: None,
+        traces: Vec::new(),
+        final_text: "source inspected: docs\nverification run: none\nfiles touched: none\nuncertainty/open questions: none\nconfidence: medium\nexact recommended edits: none\nremaining risks: none"
+            .to_string(),
+    };
+    let rendered = render_subagent_report(&report);
+    assert!(rendered.contains("=== SUBAGENT RESULT ==="), "{rendered}");
+    assert!(rendered.contains("(no tool calls)"), "{rendered}");
+    assert!(!rendered.contains("quality gate"), "{rendered}");
+}
+
+#[test]
+fn shell_single_quote_handles_spaces_and_quotes() {
+    #[cfg(unix)]
+    assert_eq!(shell_single_quote("a b'c"), "'a b'\\''c'");
+}
+
+#[test]
 fn subagent_quality_gate_requires_structured_handoff_headings() {
     let good = "source inspected: src/main.rs\nverification run: cargo test\nfiles touched: src/main.rs\nuncertainty/open questions: none\nconfidence: high\nexact recommended edits: applied\nremaining risks: TUI manual check";
     assert!(subagent_quality_gate_missing(good).is_empty());
@@ -2961,6 +3120,7 @@ fn summarize_call_subagent_is_compact() {
         summary.starts_with("subagent: \"Investigate startup latency"),
         "{summary}"
     );
+    assert!(summary.contains("detached"), "{summary}");
     assert!(summary.contains("tools=read_file,rg,fd"), "{summary}");
     assert!(summary.contains("max_iter=20"), "{summary}");
     assert!(
@@ -3698,6 +3858,17 @@ fn jittered_backoff_respects_range_and_varies() {
             );
         }
     }
+}
+
+#[test]
+fn subagent_is_auto_approved_but_kept_off_provider_tool_list() {
+    let root = temp_test_dir("subagent-auto-approved");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let agent = test_agent(&root);
+    assert!(agent.allowed.contains("subagent"));
+    assert!(!agent.tools.iter().any(|t| t.name == "subagent"));
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

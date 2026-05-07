@@ -427,7 +427,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/subagent",
         args: "<task> [opts]",
-        help: "run disposable subagent",
+        help: "run detached subagent",
     },
     SlashCmd {
         name: "/hooks",
@@ -1567,7 +1567,8 @@ impl TuiState {
                 self.sub_batch = None;
             }
             AgentEvent::SteeringReceived { messages, preview } => {
-                self.status = format!("steering: {messages} message(s) injected");
+                let noun = if messages == 1 { "update" } else { "updates" };
+                self.status = format!("queued {messages} {noun} for next response");
                 self.queue(Line_::SteeringDelivered { messages, preview });
             }
         }
@@ -4528,12 +4529,6 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
             lines.push(Line::from(vec![
                 Span::styled(">> ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    "steering ",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-                Span::styled(
                     sanitized,
                     Style::default()
                         .fg(Color::Magenta)
@@ -4551,7 +4546,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!(
-                        "steering injected; final must address it: {messages} {noun} — {}",
+                        "queued for next response: {messages} {noun} — {}",
                         sanitize_display_text(preview)
                     ),
                     Style::default()
@@ -5951,9 +5946,9 @@ fn handle_key(
             if state.agent_busy && !text.starts_with('/') {
                 state.queue(Line_::Steering(text.clone()));
                 if steering_input.send(text).is_ok() {
-                    state.status = "steering queued for next safe boundary".to_string();
+                    state.status = "queued for next safe boundary".to_string();
                 } else {
-                    state.status = "steering queue unavailable".to_string();
+                    state.status = "queue unavailable".to_string();
                 }
                 state.input.clear();
                 state.cursor = 0;
@@ -6270,7 +6265,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                             let raw = trimmed.strip_prefix("/subagent").unwrap_or("").trim();
                             if raw.is_empty() {
                                 agent.sink.emit(AgentEvent::Slash(
-                                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly]".into(),
+                                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]".into(),
                                 ));
                             } else if let Err(e) = agent.run_subagent_cmd(raw.to_string()).await {
                                 agent
@@ -8160,7 +8155,7 @@ mod tests {
         );
         assert!(submit_rx.try_recv().is_err());
         assert!(state.input.is_empty());
-        assert_eq!(state.status, "steering queued for next safe boundary");
+        assert_eq!(state.status, "queued for next safe boundary");
         assert!(
             matches!(state.pending_insert.last(), Some(Line_::Steering(s)) if s == "please adjust the current fix")
         );
