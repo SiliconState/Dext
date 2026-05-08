@@ -443,7 +443,8 @@ impl LimitedTextCapture {
 #[derive(Debug, Default)]
 struct LimitedByteCapture {
     cap: usize,
-    kept: Vec<u8>,
+    head: Vec<u8>,
+    tail: Vec<u8>,
     observed_bytes: usize,
     truncated: bool,
 }
@@ -456,26 +457,85 @@ impl LimitedByteCapture {
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
-        self.observed_bytes += chunk.len();
-        if self.kept.len() < self.cap {
-            let remaining = self.cap - self.kept.len();
-            let take = remaining.min(chunk.len());
-            self.kept.extend_from_slice(&chunk[..take]);
+    fn tail_cap(&self) -> usize {
+        self.cap / 2
+    }
+
+    fn head_cap(&self) -> usize {
+        self.cap - self.tail_cap()
+    }
+
+    fn push_tail(&mut self, bytes: &[u8]) {
+        let cap = self.tail_cap();
+        if cap == 0 || bytes.is_empty() {
+            return;
         }
-        self.truncated = self.observed_bytes > self.kept.len();
+        if bytes.len() >= cap {
+            self.tail.clear();
+            self.tail.extend_from_slice(&bytes[bytes.len() - cap..]);
+            return;
+        }
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(cap);
+        if overflow > 0 {
+            self.tail.drain(0..overflow);
+        }
+        self.tail.extend_from_slice(bytes);
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.observed_bytes += chunk.len();
+        if !self.truncated && self.head.len() + chunk.len() <= self.cap {
+            self.head.extend_from_slice(chunk);
+            return;
+        }
+        if self.cap == 0 {
+            self.truncated = true;
+            return;
+        }
+        if !self.truncated {
+            self.truncated = true;
+            let head_cap = self.head_cap();
+            if self.head.len() > head_cap {
+                let overflow = self.head.split_off(head_cap);
+                self.push_tail(&overflow);
+            }
+        }
+
+        let head_cap = self.head_cap();
+        let mut rest = chunk;
+        if self.head.len() < head_cap {
+            let take = (head_cap - self.head.len()).min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+        }
+        self.push_tail(rest);
     }
 
     fn render(&self, label: &str) -> String {
-        let mut out = String::from_utf8_lossy(&self.kept).to_string();
+        let mut out = String::from_utf8_lossy(&self.head).to_string();
         if self.truncated {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
             out.push_str(&format!(
-                "\n…[{label} capped after {} bytes observed; kept first {}]\n",
-                self.observed_bytes, self.cap
+                "\n…[{label} capped after {} bytes observed; kept first {} and last {}]\n",
+                self.observed_bytes,
+                self.head.len(),
+                self.tail.len()
             ));
+            if !self.tail.is_empty() {
+                out.push_str(&String::from_utf8_lossy(&self.tail));
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
         }
         out
     }
@@ -5575,6 +5635,44 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "todo_read",
 ];
 
+fn read_project_todo_summary(root: &Path, max_items: usize) -> Option<String> {
+    let content = std::fs::read_to_string(root.join("WOLF.todo.json")).ok()?;
+    let todos = serde_json::from_str::<Value>(&content).ok()?;
+    let items = todos.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+
+    let (pending, in_progress, completed) = todo_status_counts(items);
+    let mut out = format!(
+        "todo_status: {pending} pending, {in_progress} in_progress, {completed} completed\n"
+    );
+    let mut shown = 0usize;
+    for status in ["in_progress", "pending"] {
+        for item in items
+            .iter()
+            .filter(|item| item["status"].as_str().unwrap_or("pending") == status)
+        {
+            if shown >= max_items {
+                break;
+            }
+            let text = item["text"].as_str().unwrap_or("?").trim();
+            if text.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("- {status}: {}\n", summarize_inline(text, 140)));
+            shown += 1;
+        }
+    }
+    if items.len() > shown {
+        out.push_str(&format!(
+            "- … {} more todo item(s) not shown\n",
+            items.len() - shown
+        ));
+    }
+    Some(out)
+}
+
 const PLAN_SYSTEM: &str = "\
 You are a planning agent. You have READ-ONLY tools: read_file, fd, rg, fzf, jq, \
 git_diff, git_log, todo_read. Explore the codebase and produce a concrete implementation plan.
@@ -6548,8 +6646,9 @@ fn builtin_family_context_window(model: &str) -> Option<u64> {
 }
 
 fn compact_threshold_chars_for_percent(model: &str, percent: u8) -> usize {
-    let window = usize::try_from(model_context_window(model)).unwrap_or(usize::MAX);
-    window
+    let window_tokens = usize::try_from(model_context_window(model)).unwrap_or(usize::MAX / 4);
+    window_tokens
+        .saturating_mul(4)
         .saturating_mul(percent.clamp(1, 100) as usize)
         .saturating_div(100)
         .max(HISTORY_CHAR_BUDGET_MIN)
@@ -7414,6 +7513,17 @@ impl Agent {
                 self.compact_threshold_chars(),
                 self.active_compact_threshold_chars()
             ));
+            if let Some(todo) = read_project_todo_summary(&self.sandbox_root, 3) {
+                env.push_str("\n## Project todos\n");
+                env.push_str(&cap_bytes_with_hint(
+                    todo,
+                    600,
+                    "project todo summary trimmed for frugal context.",
+                ));
+                if !env.ends_with('\n') {
+                    env.push('\n');
+                }
+            }
             let ledger = self.work_ledger_prompt();
             if !ledger.trim().is_empty() {
                 env.push_str("\n## Work ledger\n");
@@ -7488,6 +7598,17 @@ impl Agent {
             self.compact_threshold_chars(),
             self.active_compact_threshold_chars()
         ));
+        if let Some(todo) = read_project_todo_summary(&self.sandbox_root, 5) {
+            env.push_str("\n## Project todos\n");
+            env.push_str(&cap_bytes_with_hint(
+                todo,
+                900,
+                "project todo summary trimmed for prompt budget.",
+            ));
+            if !env.ends_with('\n') {
+                env.push('\n');
+            }
+        }
         let ledger = self.work_ledger_prompt();
         if !ledger.trim().is_empty() {
             env.push_str("\n## Work ledger\n");

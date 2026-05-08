@@ -174,6 +174,9 @@ fn bash_command_advisory(command: &str) -> Option<String> {
     if let Some(msg) = cargo_test_multi_filter_advisory(command) {
         return Some(msg);
     }
+    if let Some(msg) = slow_shell_search_advisory(command) {
+        return Some(msg);
+    }
     if bare_python_without_probe(command) {
         return Some(
             "bash advisory: this environment may not provide bare `python`; prefer `python3` or probe with `command -v python`.".to_string(),
@@ -206,6 +209,51 @@ fn cargo_test_multi_filter_advisory(command: &str) -> Option<String> {
                     "bash advisory: `cargo test` accepts one test filter before `--`; run separate tests or use one broader filter.".to_string(),
                 );
             }
+        }
+    }
+    None
+}
+
+fn slow_shell_search_advisory(command: &str) -> Option<String> {
+    let words = shell_words(command);
+    for (idx, word) in words.iter().enumerate() {
+        match word.as_str() {
+            "grep" => {
+                if command.contains("command -v grep") || command.contains("which grep") {
+                    continue;
+                }
+                let recursive = words
+                    .iter()
+                    .skip(idx + 1)
+                    .take_while(|arg| !matches!(arg.as_str(), "&&" | ";" | "|" | "&"))
+                    .any(|arg| {
+                        if matches!(
+                            arg.as_str(),
+                            "-r" | "-R" | "--recursive" | "--dereference-recursive"
+                        ) {
+                            return true;
+                        }
+                        arg.starts_with('-')
+                            && !arg.starts_with("--")
+                            && arg.chars().skip(1).any(|ch| ch == 'r' || ch == 'R')
+                    });
+                if recursive {
+                    return Some(
+                        "bash advisory: prefer the native rg tool over recursive grep; it is faster, structured, capped, and respects ignore files."
+                            .to_string(),
+                    );
+                }
+            }
+            "find" => {
+                if command.contains("command -v find") || command.contains("which find") {
+                    continue;
+                }
+                return Some(
+                    "bash advisory: prefer the native fd tool over shell find for repo file discovery; it is faster, capped, and easier to narrow."
+                        .to_string(),
+                );
+            }
+            _ => {}
         }
     }
     None
@@ -639,6 +687,25 @@ mod tests {
             tool_input_advisory("bash", &json!({"command": "python - <<'PY'\nprint(1)\nPY"}))
                 .expect("bare python should warn");
         assert!(python.contains("python3"), "{python}");
+
+        let recursive_grep = tool_input_advisory("bash", &json!({"command": "grep -R needle src"}))
+            .expect("recursive grep should warn");
+        assert!(
+            recursive_grep.contains("native rg tool"),
+            "{recursive_grep}"
+        );
+
+        let find = tool_input_advisory("bash", &json!({"command": "find . -name '*.rs'"}))
+            .expect("find should warn");
+        assert!(find.contains("native fd tool"), "{find}");
+
+        assert!(
+            tool_input_advisory(
+                "bash",
+                &json!({"command": "command -v grep >/dev/null && grep -R needle src"}),
+            )
+            .is_none()
+        );
 
         let rg = tool_input_advisory(
             "bash",

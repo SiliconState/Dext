@@ -28,7 +28,8 @@ of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
   canonicalizes to API slugs.
 - Tool stream capture floors are 6KB in standard mode; frugal intentionally uses
   lower prompt-facing caps. Explicit `read_file` offset+limit has a larger cap
-  and overlap cache; `read_symbol` supports symbol-first source reads.
+  and overlap cache; `read_symbol` supports symbol-first source reads. Process
+  stream caps prefer head+tail preservation over cap increases.
 - Compaction should split near the tail, preserve recent tool evidence, and use
   capped old tool results so summaries retain tool-derived facts. Standard mode
   auto-compacts at 90% of model context by end-turn and 80% after safe active
@@ -54,6 +55,8 @@ of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
 ## User preferences
 - Favor context engineering and memory quality over adding more tools.
 - Minimize tool duplication. No MCP for Wolf; prefer native/CLI integrations.
+- Do not add LLM-facing cargo tools; agent/runtime internals can use structured
+  cargo handling when useful, but keep the exposed tool list lean.
 - Prefer Wolf's built-in reqwest-backed `http` tool before shelling to curl/xh.
 - Use proper OAuth/web flows; do not copy Pi auth credentials manually.
 - Prefer live/thinking/scroll progress above the input box only.

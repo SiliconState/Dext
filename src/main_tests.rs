@@ -1938,7 +1938,52 @@ fn run_external_caps_streamed_stdout() {
 
     let out = run_external("bash", &args, None, &root).expect("external run should succeed");
     assert!(out.contains("stdout capped after"), "{out}");
-    assert!(out.contains("kept first 6000"), "{out}");
+    assert!(out.contains("kept first 3000 and last 3000"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn limited_byte_capture_preserves_head_and_tail() {
+    let mut capture = LimitedByteCapture::new(10);
+    capture.push(b"abcdefgh");
+    capture.push(b"ijklmnop");
+    let rendered = capture.render("stdout");
+
+    assert!(rendered.starts_with("abcde"), "{rendered}");
+    assert!(rendered.contains("kept first 5 and last 5"), "{rendered}");
+    assert!(rendered.contains("lmnop"), "{rendered}");
+}
+
+#[test]
+fn project_todo_summary_prioritizes_active_work_for_prompt() {
+    let root = temp_test_dir("todo-summary");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let todos = json!([
+        {"text": "done task", "status": "completed"},
+        {"text": "active task", "status": "in_progress"},
+        {"text": "next task", "status": "pending"}
+    ]);
+    std::fs::write(
+        root.join("WOLF.todo.json"),
+        serde_json::to_string_pretty(&todos).unwrap(),
+    )
+    .unwrap();
+
+    let summary = read_project_todo_summary(&root, 2).expect("todo summary");
+    assert!(
+        summary.contains("todo_status: 1 pending, 1 in_progress, 1 completed"),
+        "{summary}"
+    );
+    assert!(summary.contains("- in_progress: active task"), "{summary}");
+    assert!(summary.contains("- pending: next task"), "{summary}");
+    assert!(!summary.contains("done task"), "{summary}");
+
+    let mut agent = test_agent(&root);
+    agent.work_ledger = WorkLedger::default();
+    let (_stable, env) = agent.compose_system_parts();
+    assert!(env.contains("## Project todos"), "{env}");
+    assert!(env.contains("active task"), "{env}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2634,8 +2679,8 @@ fn auto_compact_depends_on_history_size_not_cumulative_output_usage() {
     let mut agent = test_agent(&root);
     agent.model = "demo-128k".to_string();
     agent.session_usage.output = 1_000_000;
-    assert_eq!(agent.compact_threshold_chars(), 115_200);
-    assert_eq!(agent.active_compact_threshold_chars(), 102_400);
+    assert_eq!(agent.compact_threshold_chars(), 460_800);
+    assert_eq!(agent.active_compact_threshold_chars(), 409_600);
     assert!(
         !agent.should_auto_compact(),
         "high cumulative output usage alone should not force compaction"
@@ -3250,6 +3295,11 @@ fn hooks_capture_is_capped() {
         "{}",
         out[0].0
     );
+    assert!(
+        out[0].0.contains("kept first 2000 and last 2000"),
+        "{}",
+        out[0].0
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3356,11 +3406,11 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
     assert_eq!(model_context_window("demo-128k"), 128_000);
     assert_eq!(
         history_char_budget_with_override("demo-128k", None, ContextMode::Standard),
-        115_200
+        460_800
     );
     assert_eq!(
         active_history_char_budget_with_override("demo-128k", None, ContextMode::Standard),
-        102_400
+        409_600
     );
     assert_eq!(
         history_char_budget_with_override("tiny-1k", None, ContextMode::Standard),
@@ -3372,11 +3422,11 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
     );
     assert_eq!(
         history_char_budget_with_override("huge-1m", None, ContextMode::Standard),
-        900_000
+        3_600_000
     );
     assert_eq!(
         active_history_char_budget_with_override("huge-1m", None, ContextMode::Standard),
-        800_000
+        3_200_000
     );
 
     unsafe {
