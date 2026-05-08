@@ -30,7 +30,9 @@ of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
   lower prompt-facing caps. Explicit `read_file` offset+limit has a larger cap
   and overlap cache; `read_symbol` supports symbol-first source reads.
 - Compaction should split near the tail, preserve recent tool evidence, and use
-  capped old tool results so summaries retain tool-derived facts.
+  capped old tool results so summaries retain tool-derived facts. Standard mode
+  auto-compacts at 90% of model context by end-turn and 80% after safe active
+  tool-result checkpoints; explicit `/compact N%`/env overrides still win.
 - Steering is queued-only: route active-turn user input directly to the steering
   channel (not behind the main command queue), inject only at safe boundaries, keep
   it visible in session/work-ledger state, and explicitly address it in the next/final answer.
@@ -59,25 +61,7 @@ of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
 - Keep repo source-first and reviewable; avoid runtime clutter.
 
 ## Current focus
-- Work Map/cache-status cleanup is complete in the dirty tree and required
-  verification passed: `cargo build --release`, `cargo test --release`,
-  `cargo test --release --test tui_smoke -- --nocapture`, and
-  `cargo install --path . --force`.
-- Usage status now splits actual input/cache/output and keeps the cache marker
-  visible as `↻0` after first usage if there were no cache hits; installed Wolf
-  at `/home/abaka/.cargo/bin/wolf` contains the cache-status strings.
-- Work Map includes derived waypoints/packets/focus/tracks, slash + CLI commands
-  including `wolf session track open`, and a command-inserting TUI composer drawer
-  for `/map` so navigation does not rewrite terminal scrollback.
-- TUI thinking is visible by default; Ctrl+V toggles hidden thinking mode. Completed
-  streamed thinking wraps within the internal vertical lane with a terminal auto-wrap
-  guard column, but live/thinking progress may use the full terminal width and break
-  at the outer border.
-- Local linker blocker was resolved with project-local Cargo config forcing system
-  `cc` and bfd instead of global `rust-lld` self-contained linking.
-- Final dirty files to review/commit: `WORKMAP.md`, `.gitignore`, `MEMORY.md`,
-  `WOLF.memory.md`, `src/main.rs`, `src/main_tests.rs`, `src/orchestrator.rs`,
-  `src/session.rs`, `src/tools.rs`, and `src/tui.rs`.
+- Compaction thresholds now use standard 90% end-turn / 80% active safe-checkpoint triggers with recent tool evidence preserved; verification/install passed after this update. Broader dirty tree still includes provider/auth, subagent/tool, and TUI changes across `.env.example`, `Cargo.toml`, `Cargo.lock`, `README.md`, `docs/USAGE.md`, `src/main.rs`, `src/main_tests.rs`, `src/orchestrator.rs`, `src/provider.rs`, `src/tools.rs`, and `src/tui.rs`.
 
 ## Open question
 - How much historical detail should remain prompt-injected versus only in

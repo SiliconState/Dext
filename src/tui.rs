@@ -5943,7 +5943,7 @@ fn handle_key(
             if text.trim().is_empty() {
                 return;
             }
-            if state.agent_busy && !text.starts_with('/') {
+            if state.agent_busy && state.pending_perm.is_none() {
                 state.queue(Line_::Steering(text.clone()));
                 if steering_input.send(text).is_ok() {
                     state.status = "queued for next safe boundary".to_string();
@@ -8128,37 +8128,38 @@ mod tests {
 
     #[test]
     fn busy_enter_sends_steering_directly_without_command_queue_delay() {
-        let mut state = TuiState::new(
-            "glm-5.1".to_string(),
-            ".".to_string(),
-            ApprovalProfile::Ask,
-            ThinkingEffort::Medium,
-        );
-        state.agent_busy = true;
-        state.input = "please adjust the current fix".to_string();
-        state.cursor = state.input.len();
+        for input in [
+            "please adjust the current fix",
+            "/model chatgpt/gpt-5.3-codex",
+            "/effort high",
+        ] {
+            let mut state = TuiState::new(
+                "glm-5.1".to_string(),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            state.agent_busy = true;
+            state.input = input.to_string();
+            state.cursor = state.input.len();
 
-        let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
-        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        handle_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &submit_tx,
-            &steering_tx,
-            &interrupt,
-        );
+            let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+            let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+                &submit_tx,
+                &steering_tx,
+                &interrupt,
+            );
 
-        assert_eq!(
-            steering_rx.try_recv().ok().as_deref(),
-            Some("please adjust the current fix")
-        );
-        assert!(submit_rx.try_recv().is_err());
-        assert!(state.input.is_empty());
-        assert_eq!(state.status, "queued for next safe boundary");
-        assert!(
-            matches!(state.pending_insert.last(), Some(Line_::Steering(s)) if s == "please adjust the current fix")
-        );
+            assert_eq!(steering_rx.try_recv().ok().as_deref(), Some(input));
+            assert!(submit_rx.try_recv().is_err());
+            assert!(state.input.is_empty());
+            assert_eq!(state.status, "queued for next safe boundary");
+            assert!(matches!(state.pending_insert.last(), Some(Line_::Steering(s)) if s == input));
+        }
     }
 
     #[test]

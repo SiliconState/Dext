@@ -285,8 +285,22 @@ fn non_tui_busy_input_routes_to_steering_channel_immediately() {
 
     let route =
         route_interactive_input_line("/effort high\n".to_string(), &busy, &input_tx, &steering_tx);
-    assert_eq!(route, InteractiveInputRoute::Submitted);
-    assert_eq!(input_rx.try_recv().ok().as_deref(), Some("/effort high"));
+    assert_eq!(route, InteractiveInputRoute::SteeringQueued);
+    assert_eq!(steering_rx.try_recv().ok().as_deref(), Some("/effort high"));
+    assert!(input_rx.try_recv().is_err());
+
+    let route = route_interactive_input_line(
+        "/model gpt-5.5\n".to_string(),
+        &busy,
+        &input_tx,
+        &steering_tx,
+    );
+    assert_eq!(route, InteractiveInputRoute::SteeringQueued);
+    assert_eq!(
+        steering_rx.try_recv().ok().as_deref(),
+        Some("/model gpt-5.5")
+    );
+    assert!(input_rx.try_recv().is_err());
 }
 
 #[test]
@@ -2618,7 +2632,10 @@ fn auto_compact_depends_on_history_size_not_cumulative_output_usage() {
     let root = temp_test_dir("compact-threshold");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
+    agent.model = "demo-128k".to_string();
     agent.session_usage.output = 1_000_000;
+    assert_eq!(agent.compact_threshold_chars(), 115_200);
+    assert_eq!(agent.active_compact_threshold_chars(), 102_400);
     assert!(
         !agent.should_auto_compact(),
         "high cumulative output usage alone should not force compaction"
@@ -2627,12 +2644,27 @@ fn auto_compact_depends_on_history_size_not_cumulative_output_usage() {
     agent.history.push(Message {
         role: "user".to_string(),
         content: vec![Block::Text {
-            text: "x".repeat(agent.compact_threshold_chars() + 10),
+            text: "x".repeat(agent.active_compact_threshold_chars() + 10),
+        }],
+    });
+    assert!(
+        agent.should_active_compact(),
+        "history beyond the active budget should trigger mid-run compaction"
+    );
+    assert!(
+        !agent.should_auto_compact(),
+        "history below the end-turn budget should not trigger end-turn compaction"
+    );
+
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "y".repeat(agent.compact_threshold_chars() - agent.history_chars() + 10),
         }],
     });
     assert!(
         agent.should_auto_compact(),
-        "history beyond the budget should trigger compaction"
+        "history beyond the end-turn budget should trigger compaction"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -2662,6 +2694,7 @@ fn manual_compact_threshold_percent_override_beats_model_default() {
     agent.set_compact_threshold_auto();
     assert_eq!(agent.compact_threshold_override(), None);
     assert_eq!(agent.compact_threshold_chars(), default_budget);
+    assert!(agent.active_compact_threshold_chars() < agent.compact_threshold_chars());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2678,12 +2711,71 @@ fn runtime_control_command_updates_effort_mid_run() {
     assert_eq!(agent.thinking_effort(), ThinkingEffort::High);
     assert!(
         out.iter().any(|msg| msg.contains("thinking effort -> high")
-            && msg.contains("model reasoning depth")
+            && msg.contains("applies immediately")
             && msg.contains("next model request")),
         "{out:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("runtime-control-model-provider");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let mut store = load_auth_store()?;
+        store.providers.insert(
+            "chatgpt".to_string(),
+            StoredCredential::ApiKey {
+                key: "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string(),
+            },
+        );
+        store.providers.insert(
+            "deepseek".to_string(),
+            StoredCredential::ApiKey {
+                key: "deepseek-key".to_string(),
+            },
+        );
+        save_auth_store(&store)?;
+
+        let mut agent = test_agent(&root);
+        agent.reload_provider(Some("glm"), false)?;
+        let mut out = Vec::new();
+
+        let handled =
+            apply_runtime_control_command(&mut agent, "/model deepseek/deepseek-reasoner", |msg| {
+                out.push(msg)
+            });
+        assert!(handled);
+        assert_eq!(agent.provider_id, "deepseek");
+        assert_eq!(agent.model, "deepseek-reasoner");
+        assert_eq!(agent.api_provider, ApiProvider::OpenAi);
+        assert!(
+            out.iter().any(
+                |msg| msg.contains("applies immediately") && msg.contains("next model request")
+            ),
+            "{out:?}"
+        );
+
+        let chatgpt_session_id = "test-session";
+        let (url, body) =
+            agent.build_streaming_request("sys", "env", &[], &[], chatgpt_session_id)?;
+        assert!(url.contains("api.deepseek.com"), "{url}");
+        let body_json: Value = serde_json::from_slice(&body)?;
+        assert_eq!(body_json["model"], "deepseek-reasoner");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 #[test]
@@ -2705,6 +2797,18 @@ fn runtime_control_command_updates_compact_threshold_by_percent() {
             .any(|msg| msg.contains("compact threshold set to 25% ->")),
         "{out:?}"
     );
+    assert_eq!(
+        agent.active_compact_threshold_chars(),
+        agent.compact_threshold_chars()
+    );
+
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "x".repeat(agent.active_compact_threshold_chars() + 1),
+        }],
+    });
+    assert!(agent.should_active_compact());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3027,7 +3131,7 @@ fn subagent_request_inherits_parent_capability_profile() {
     assert_eq!(request.thinking_effort, ThinkingEffort::High);
     assert_eq!(request.context_mode, ContextMode::Frugal);
     assert_eq!(request.tool_profile, ToolProfile::Lean);
-    assert_eq!(request.max_iterations, 7);
+    assert_eq!(request.max_iterations, Some(7));
     assert_eq!(
         request.allowed_tools,
         Some(vec!["rg".into(), "read_file".into()])
@@ -3071,7 +3175,7 @@ fn subagent_detached_request_paths_are_project_scoped() {
 fn subagent_worker_renders_report_with_quality_gate() {
     let report = SubagentRunReport {
         task: "research".to_string(),
-        max_iterations: 3,
+        max_iterations: Some(3),
         iterations: 1,
         calls: 0,
         failed_calls: 0,
@@ -3112,8 +3216,7 @@ fn summarize_call_subagent_is_compact() {
         "subagent",
         &json!({
             "task": "Investigate startup latency and map blocking calls in main and tui modules",
-            "allowed_tools": ["read_file", "rg", "fd"],
-            "max_iterations": 20
+            "allowed_tools": ["read_file", "rg", "fd"]
         }),
     );
     assert!(
@@ -3122,7 +3225,7 @@ fn summarize_call_subagent_is_compact() {
     );
     assert!(summary.contains("detached"), "{summary}");
     assert!(summary.contains("tools=read_file,rg,fd"), "{summary}");
-    assert!(summary.contains("max_iter=20"), "{summary}");
+    assert!(summary.contains("max_iter=unlimited"), "{summary}");
     assert!(
         summary.chars().count() <= TOOL_SUMMARY_CHAR_CAP + 50,
         "{summary}"
@@ -3195,6 +3298,10 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
 
     let (_stable, env) = agent.compose_system_parts();
     assert!(env.starts_with("## Environment\ncwd="), "{env}");
+    assert!(
+        env.contains("active_history_compact_threshold_chars="),
+        "{env}"
+    );
     assert!(!env.contains("session_event_refs"), "{env}");
     assert!(!env.contains("auth_source"), "{env}");
     assert!(
@@ -3249,15 +3356,27 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
     assert_eq!(model_context_window("demo-128k"), 128_000);
     assert_eq!(
         history_char_budget_with_override("demo-128k", None, ContextMode::Standard),
-        121_600
+        115_200
+    );
+    assert_eq!(
+        active_history_char_budget_with_override("demo-128k", None, ContextMode::Standard),
+        102_400
     );
     assert_eq!(
         history_char_budget_with_override("tiny-1k", None, ContextMode::Standard),
         HISTORY_CHAR_BUDGET_MIN
     );
     assert_eq!(
+        active_history_char_budget_with_override("tiny-1k", None, ContextMode::Standard),
+        HISTORY_CHAR_BUDGET_MIN
+    );
+    assert_eq!(
         history_char_budget_with_override("huge-1m", None, ContextMode::Standard),
-        950_000
+        900_000
+    );
+    assert_eq!(
+        active_history_char_budget_with_override("huge-1m", None, ContextMode::Standard),
+        800_000
     );
 
     unsafe {
@@ -3270,6 +3389,10 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
     }
     assert_eq!(
         history_char_budget_with_override("any-model", None, ContextMode::Standard),
+        77_777
+    );
+    assert_eq!(
+        active_history_char_budget_with_override("any-model", None, ContextMode::Standard),
         77_777
     );
 
@@ -4259,6 +4382,17 @@ fn api_provider_detects_openai_base_url() {
     assert_eq!(ApiProvider::from_env(), ApiProvider::OpenAi);
 
     unsafe {
+        std::env::set_var("WOLF_API_PROVIDER", "deepseek");
+        std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    }
+    assert_eq!(ApiProvider::from_env(), ApiProvider::OpenAi);
+
+    unsafe {
+        std::env::set_var("WOLF_API_PROVIDER", "codex");
+    }
+    assert_eq!(ApiProvider::from_env(), ApiProvider::ChatGpt);
+
+    unsafe {
         std::env::remove_var("WOLF_API_PROVIDER");
         std::env::remove_var("ANTHROPIC_BASE_URL");
     }
@@ -4553,8 +4687,31 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
             .iter()
             .map(|p| p.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["glm", "chatgpt"]);
-        assert_eq!(resolve_active_provider_id(&catalog), "glm");
+        assert_eq!(
+            ids,
+            vec!["glm", "chatgpt", "openai", "anthropic", "deepseek"]
+        );
+
+        let glm = find_provider_profile(&catalog, "glm").context("glm")?;
+        assert_eq!(glm.env_vars, vec!["ZAI_API_KEY"]);
+
+        let chatgpt = find_provider_profile(&catalog, "chatgpt").context("chatgpt")?;
+        assert_eq!(chatgpt.env_vars, vec!["CHATGPT_ACCESS_TOKEN"]);
+        assert!(chatgpt.oauth_flow.is_some());
+
+        let openai = find_provider_profile(&catalog, "openai").context("openai")?;
+        assert_eq!(openai.api_provider, ApiProvider::OpenAi);
+        assert_eq!(openai.env_vars, vec!["OPENAI_API_KEY"]);
+        assert!(openai.oauth_flow.is_none());
+
+        let anthropic = find_provider_profile(&catalog, "anthropic").context("anthropic")?;
+        assert_eq!(anthropic.api_provider, ApiProvider::Anthropic);
+        assert_eq!(anthropic.env_vars, vec!["ANTHROPIC_API_KEY"]);
+
+        let deepseek = find_provider_profile(&catalog, "deepseek").context("deepseek")?;
+        assert_eq!(deepseek.api_provider, ApiProvider::OpenAi);
+        assert_eq!(deepseek.env_vars, vec!["DEEPSEEK_API_KEY"]);
+        assert_eq!(deepseek.default_model, "deepseek-chat");
         Ok(())
     })();
 
@@ -4717,6 +4874,143 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
 
     unsafe {
         std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-core-set");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let ids = catalog
+            .providers
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["glm", "chatgpt", "openai", "anthropic", "deepseek"]
+        );
+        assert_eq!(resolve_active_provider_id(&catalog), "glm");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn auth_store_normalizes_canonical_provider_ids_on_load_and_logout() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("auth-canonical-normalize");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let path = auth_store_path();
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "providers": {
+    "codex": {"type":"api_key","key":"chatgpt-token"},
+    "zai": {"type":"api_key","key":"glm-token"},
+    "claude": {"type":"api_key","key":"anthropic-token"}
+  }
+}"#,
+        )?;
+
+        let store = load_auth_store()?;
+        assert!(store.providers.contains_key("chatgpt"), "{store:?}");
+        assert!(store.providers.contains_key("glm"), "{store:?}");
+        assert!(store.providers.contains_key("anthropic"), "{store:?}");
+        assert!(!store.providers.contains_key("codex"), "{store:?}");
+        assert!(!store.providers.contains_key("zai"), "{store:?}");
+        assert!(!store.providers.contains_key("claude"), "{store:?}");
+
+        let catalog = load_provider_catalog()?;
+        let chatgpt = find_provider_profile(&catalog, "chatgpt").context("chatgpt")?;
+        assert_eq!(provider_auth_status(&chatgpt, &store), "auth");
+
+        let logout = logout_provider(Some("codex"))?;
+        assert!(
+            logout.contains("removed stored credentials for provider 'chatgpt'"),
+            "{logout}"
+        );
+        let store = load_auth_store()?;
+        assert!(!store.providers.contains_key("chatgpt"));
+        assert!(store.providers.contains_key("glm"));
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn chatgpt_login_does_not_import_openai_platform_key() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("chatgpt-no-openai-platform-key");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("OPENAI_API_KEY", "sk-openai-platform-key");
+        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
+        std::env::remove_var("CHATGPT_ACCESS_TOKEN");
+        std::env::remove_var("WOLF_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let chatgpt_login = login_provider(Some("chatgpt"), None, false)?;
+        assert!(
+            chatgpt_login.awaiting_credentials,
+            "{}",
+            chatgpt_login.message
+        );
+        assert!(
+            !chatgpt_login.message.contains("imported credentials"),
+            "{}",
+            chatgpt_login.message
+        );
+
+        let openai_login = login_provider(Some("openai"), None, false)?;
+        assert!(
+            !openai_login.awaiting_credentials,
+            "{}",
+            openai_login.message
+        );
+
+        assert!(
+            openai_login.message.contains("imported credentials"),
+            "{}",
+            openai_login.message
+        );
+        let store = load_auth_store()?;
+        assert!(!store.providers.contains_key("chatgpt"));
+        assert!(store.providers.contains_key("openai"));
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
+        std::env::remove_var("CHATGPT_ACCESS_TOKEN");
+        std::env::remove_var("WOLF_API_KEY");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5799,6 +6093,119 @@ fn pair_close_drops_tool_result_whose_tool_use_is_missing_entirely() {
             }
         }
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn active_compaction_checkpoint_runs_when_history_crosses_active_threshold() {
+    let root = temp_test_dir("active-compact-checkpoint");
+    let mut agent = test_agent(&root);
+    agent.model = "demo-128k".to_string();
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "x".repeat(agent.active_compact_threshold_chars() + 1),
+        }],
+    });
+    assert!(
+        agent.history_chars() > agent.active_compact_threshold_chars(),
+        "active checkpoint should run before the next provider request"
+    );
+    assert!(
+        agent.history_chars() <= agent.compact_threshold_chars(),
+        "same history should remain below the 90% end-turn threshold"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn active_compaction_runs_after_tool_results_when_history_crosses_active_threshold() {
+    let root = temp_test_dir("active-compact-tool-results");
+    let mut agent = test_agent(&root);
+    agent.work_ledger.objective = "preserve active compaction evidence".to_string();
+    agent.compact_threshold_chars = Some(20_000);
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "start".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "ack".to_string(),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "old context ".repeat(1_800),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "noted".to_string(),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "more context ".repeat(1_800),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_active".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "src/main.rs", "offset": 1, "limit": 1}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_active", "line evidence", None)],
+        },
+    ];
+    assert!(agent.should_active_compact());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let compacted = agent
+        .compact_if_over_threshold(
+            agent.active_compact_threshold_chars(),
+            "after_active_compact_attempt",
+        )
+        .await;
+    assert!(compacted, "active compaction should shrink the history");
+
+    let mut saw_start = false;
+    let mut saw_end = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AgentEvent::CompactStart => saw_start = true,
+            AgentEvent::CompactEnd { .. } => saw_end = true,
+            _ => {}
+        }
+    }
+    assert!(saw_start && saw_end, "expected compact start/end events");
+    assert!(
+        agent
+            .history
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|b| matches!(b, Block::ToolUse { id, .. } if id == "call_active")),
+        "recent tool_use should remain paired after active compaction"
+    );
+    assert!(
+        agent.history.iter().flat_map(|m| m.content.iter()).any(
+            |b| matches!(b, Block::ToolResult { tool_use_id, .. } if tool_use_id == "call_active")
+        ),
+        "recent tool_result should remain paired after active compaction"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

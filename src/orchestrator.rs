@@ -331,7 +331,14 @@ impl ObjectiveTracker {
         if lowered.contains("analy") || lowered.contains("review") {
             checkpoints.push("analyze current behavior and constraints".to_string());
         }
-        if lowered.contains("fix") || lowered.contains("implement") || lowered.contains("do ") {
+        if lowered.contains("fix")
+            || lowered.contains("implement")
+            || lowered.contains("todo")
+            || lowered.contains("cleanup")
+            || lowered.contains("clean up")
+            || lowered.contains("go for it")
+            || lowered.contains("do ")
+        {
             checkpoints.push("implement requested changes".to_string());
         }
         if lowered.contains("test") || lowered.contains("verify") {
@@ -1072,6 +1079,17 @@ mod tests {
                 .any(|c| c.contains("implement requested changes")),
             "{:?}",
             tracker.checkpoints
+        );
+
+        let terse =
+            ObjectiveTracker::from_user_prompt("go for it, handle my todo and cleanup master");
+        assert!(
+            terse
+                .checkpoints
+                .iter()
+                .any(|c| c.contains("implement requested changes")),
+            "{:?}",
+            terse.checkpoints
         );
     }
 

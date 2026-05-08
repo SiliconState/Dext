@@ -28,9 +28,9 @@ impl serde::Serialize for ApiProvider {
 impl<'de> serde::Deserialize<'de> for ApiProvider {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        Ok(match s.as_str() {
-            "openai" | "openai-compatible" | "ollama" => Self::OpenAi,
-            "chatgpt" => Self::ChatGpt,
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "openai" | "openai-compatible" | "ollama" | "deepseek" => Self::OpenAi,
+            "chatgpt" | "openai-codex" | "codex" | "codex-openai" => Self::ChatGpt,
             _ => Self::Anthropic,
         })
     }
@@ -44,8 +44,9 @@ impl ApiProvider {
             .to_ascii_lowercase()
             .as_str()
         {
-            "openai" | "openai-compatible" | "ollama" => Self::OpenAi,
-            "chatgpt" => Self::ChatGpt,
+            "openai" | "openai-compatible" | "ollama" | "deepseek" => Self::OpenAi,
+            "chatgpt" | "openai-codex" | "codex" | "codex-openai" => Self::ChatGpt,
+            "anthropic" | "claude" | "glm" | "zai" => Self::Anthropic,
             _ => {
                 let base = std::env::var("ANTHROPIC_BASE_URL")
                     .unwrap_or_default()
@@ -194,14 +195,15 @@ pub(crate) fn auth_store_path() -> PathBuf {
 
 pub(crate) fn canonical_provider_id(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "zai" => "glm".to_string(),
+        "zai" | "bigmodel" | "bigmodel-cn" => "glm".to_string(),
         "openai-codex" | "codex-openai" | "codex" => "chatgpt".to_string(),
         "chatgpt-plus" | "chatgpt-pro" => "chatgpt".to_string(),
+        "claude" => "anthropic".to_string(),
         other => other.to_string(),
     }
 }
 
-const RETIRED_BUNDLED_PROVIDER_IDS: &[&str] = &["anthropic", "openai", "openrouter", "ollama"];
+const RETIRED_BUNDLED_PROVIDER_IDS: &[&str] = &["openrouter", "ollama"];
 
 pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
     vec![
@@ -216,7 +218,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "glm-5.0".to_string(),
                 "glm-5.1".to_string(),
             ],
-            env_vars: vec!["ZAI_API_KEY".to_string(), "ANTHROPIC_API_KEY".to_string()],
+            env_vars: vec!["ZAI_API_KEY".to_string()],
             requires_api_key: true,
             login_url: Some("https://open.bigmodel.cn/usercenter/apikeys".to_string()),
             oauth_flow: None,
@@ -248,10 +250,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "o3-mini".to_string(),
                 "o4-mini".to_string(),
             ],
-            env_vars: vec![
-                "OPENAI_API_KEY".to_string(),
-                "CHATGPT_ACCESS_TOKEN".to_string(),
-            ],
+            env_vars: vec!["CHATGPT_ACCESS_TOKEN".to_string()],
             requires_api_key: true,
             login_url: Some("https://chatgpt.com".to_string()),
             oauth_flow: Some(OAuthFlow {
@@ -275,6 +274,74 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 m.insert("gpt-4o-mini".to_string(), 128_000);
                 m
             },
+        },
+        ProviderProfile {
+            id: "openai".to_string(),
+            display_name: "OpenAI API".to_string(),
+            api_provider: ApiProvider::OpenAi,
+            base_url: "https://api.openai.com".to_string(),
+            default_model: "gpt-5".to_string(),
+            models: vec![
+                "gpt-5".to_string(),
+                "gpt-5-mini".to_string(),
+                "gpt-4.1".to_string(),
+                "gpt-4.1-mini".to_string(),
+                "gpt-4o".to_string(),
+                "gpt-4o-mini".to_string(),
+                "o3".to_string(),
+                "o3-mini".to_string(),
+                "o4-mini".to_string(),
+            ],
+            env_vars: vec!["OPENAI_API_KEY".to_string()],
+            requires_api_key: true,
+            login_url: Some("https://platform.openai.com/api-keys".to_string()),
+            oauth_flow: None,
+            notes: Some("Use an OpenAI Platform API key (not ChatGPT OAuth).".to_string()),
+            context_window: Some(400_000),
+            model_context_windows: {
+                let mut m = HashMap::new();
+                m.insert("gpt-4.1".to_string(), 1_000_000);
+                m.insert("gpt-4.1-mini".to_string(), 1_000_000);
+                m.insert("gpt-4o".to_string(), 128_000);
+                m.insert("gpt-4o-mini".to_string(), 128_000);
+                m
+            },
+        },
+        ProviderProfile {
+            id: "anthropic".to_string(),
+            display_name: "Anthropic".to_string(),
+            api_provider: ApiProvider::Anthropic,
+            base_url: "https://api.anthropic.com".to_string(),
+            default_model: "claude-sonnet-4-5".to_string(),
+            models: vec![
+                "claude-sonnet-4-5".to_string(),
+                "claude-opus-4-1".to_string(),
+                "claude-opus-4-0".to_string(),
+                "claude-haiku-4-5".to_string(),
+                "claude-3-5-haiku-latest".to_string(),
+            ],
+            env_vars: vec!["ANTHROPIC_API_KEY".to_string()],
+            requires_api_key: true,
+            login_url: Some("https://console.anthropic.com/settings/keys".to_string()),
+            oauth_flow: None,
+            notes: Some("Use an Anthropic Console API key.".to_string()),
+            context_window: Some(200_000),
+            model_context_windows: HashMap::new(),
+        },
+        ProviderProfile {
+            id: "deepseek".to_string(),
+            display_name: "DeepSeek".to_string(),
+            api_provider: ApiProvider::OpenAi,
+            base_url: "https://api.deepseek.com".to_string(),
+            default_model: "deepseek-chat".to_string(),
+            models: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+            env_vars: vec!["DEEPSEEK_API_KEY".to_string()],
+            requires_api_key: true,
+            login_url: Some("https://platform.deepseek.com/api_keys".to_string()),
+            oauth_flow: None,
+            notes: Some("Uses DeepSeek's OpenAI-compatible API.".to_string()),
+            context_window: Some(128_000),
+            model_context_windows: HashMap::new(),
         },
     ]
 }
@@ -511,6 +578,20 @@ pub(crate) fn save_provider_catalog(catalog: &ProviderCatalog) -> Result<()> {
     Ok(())
 }
 
+fn normalize_auth_store(mut store: AuthStore) -> AuthStore {
+    store.version = AUTH_STORE_VERSION;
+    let mut providers = HashMap::new();
+    for (provider, credential) in store.providers {
+        let canonical = canonical_provider_id(&provider);
+        if canonical.is_empty() {
+            continue;
+        }
+        providers.insert(canonical, credential);
+    }
+    store.providers = providers;
+    store
+}
+
 pub(crate) fn load_auth_store() -> Result<AuthStore> {
     let path = auth_store_path();
     if !path.exists() {
@@ -524,7 +605,7 @@ pub(crate) fn load_auth_store() -> Result<AuthStore> {
 
     if raw.get("providers").is_some() {
         let store: AuthStore = serde_json::from_value(raw).context("invalid auth store JSON")?;
-        return Ok(store);
+        return Ok(normalize_auth_store(store));
     }
 
     let mut store = AuthStore::default();
@@ -556,18 +637,12 @@ pub(crate) fn load_auth_store() -> Result<AuthStore> {
         }
     }
 
-    Ok(store)
+    Ok(normalize_auth_store(store))
 }
 
 pub(crate) fn save_auth_store(store: &AuthStore) -> Result<()> {
     let path = auth_store_path();
-    let mut normalized = store.clone();
-    normalized.version = AUTH_STORE_VERSION;
-    normalized.providers = normalized
-        .providers
-        .into_iter()
-        .map(|(k, v)| (canonical_provider_id(&k), v))
-        .collect();
+    let normalized = normalize_auth_store(store.clone());
     let bytes = serde_json::to_vec_pretty(&normalized)?;
     atomic_write_bytes(&path, &bytes)?;
     #[cfg(unix)]
@@ -678,18 +753,12 @@ pub(crate) fn resolve_active_provider_id(catalog: &ProviderCatalog) -> String {
     }
     if let Ok(v) = std::env::var("WOLF_API_PROVIDER") {
         let lower = v.trim().to_ascii_lowercase();
-        if lower == "anthropic" || lower == "zai" || lower == "glm" {
+        let canonical = canonical_provider_id(&lower);
+        if lower == "anthropic" && find_provider_profile(catalog, "anthropic").is_none() {
             return "glm".to_string();
         }
-        if lower == "chatgpt"
-            || lower == "openai-codex"
-            || lower == "codex"
-            || lower == "codex-openai"
-        {
-            return "chatgpt".to_string();
-        }
-        if find_provider_profile(catalog, &lower).is_some() {
-            return canonical_provider_id(&lower);
+        if find_provider_profile(catalog, &canonical).is_some() {
+            return canonical;
         }
     }
     canonical_provider_id(&catalog.active_provider)
@@ -1535,9 +1604,10 @@ pub(crate) fn parse_external_auth_credential(value: &Value) -> Option<StoredCred
 pub(crate) fn pi_auth_candidates(provider_id: &str) -> Vec<String> {
     let canonical = canonical_provider_id(provider_id);
     let mut candidates: Vec<String> = match canonical.as_str() {
-        "chatgpt" => vec!["openai-codex", "chatgpt", "openai"],
+        "chatgpt" => vec!["openai-codex", "codex", "chatgpt", "openai"],
         "openai" => vec!["openai"],
-        "glm" => vec!["zai", "anthropic"],
+        "glm" => vec!["zai", "glm", "bigmodel", "anthropic"],
+        "anthropic" => vec!["anthropic", "claude"],
         other => vec![other],
     }
     .into_iter()
@@ -1817,10 +1887,9 @@ pub(crate) fn prompt_input_line(prompt: &str) -> Result<String> {
 pub(crate) fn set_active_provider_in_catalog(provider_id: &str) -> Result<()> {
     let mut catalog = load_provider_catalog()?;
     let canonical = canonical_provider_id(provider_id);
-    if find_provider_profile(&catalog, &canonical).is_none() {
-        anyhow::bail!("unknown provider '{provider_id}'");
-    }
-    catalog.active_provider = canonical;
+    let profile = find_provider_profile(&catalog, &canonical)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider '{provider_id}'"))?;
+    catalog.active_provider = canonical_provider_id(&profile.id);
     save_provider_catalog(&catalog)
 }
 
@@ -1849,6 +1918,7 @@ pub(crate) fn set_provider_default_model_in_catalog(provider_id: &str, model: &s
     {
         profile.models.insert(0, normalized);
     }
+    catalog.active_provider = canonical;
 
     save_provider_catalog(&catalog)
 }
@@ -2639,39 +2709,38 @@ pub(crate) fn login_provider(
             save_auth_store(&store)?;
         }
 
-        if !explicit_web && let Some((secret, source)) = resolve_provider_api_key(&profile, &store)
-        {
-            if source.starts_with("auth:") {
+        if !explicit_web {
+            if let Some((secret, source)) = resolve_provider_api_key(&profile, &store) {
                 catalog.active_provider = profile.id.clone();
                 save_provider_catalog(&catalog)?;
-                return Ok(LoginResult {
-                    message: format!(
-                        "provider '{}' already authenticated via {} and set active",
-                        profile.id, source
-                    ),
-                    provider_id: profile.id.clone(),
-                    awaiting_credentials: false,
-                });
-            }
+                if source.starts_with("auth:") {
+                    return Ok(LoginResult {
+                        message: format!(
+                            "provider '{}' already authenticated via {} and set active",
+                            profile.id, source
+                        ),
+                        provider_id: profile.id.clone(),
+                        awaiting_credentials: false,
+                    });
+                }
 
-            if source.starts_with("env:") {
-                store.providers.insert(
-                    canonical_provider_id(&profile.id),
-                    StoredCredential::ApiKey { key: secret },
-                );
-                save_auth_store(&store)?;
-                catalog.active_provider = profile.id.clone();
-                save_provider_catalog(&catalog)?;
-                return Ok(LoginResult {
-                    message: format!(
-                        "imported credentials for provider '{}' from {} into {} and set it active",
-                        profile.id,
-                        source,
-                        auth_store_path().display()
-                    ),
-                    provider_id: profile.id.clone(),
-                    awaiting_credentials: false,
-                });
+                if source.starts_with("env:") {
+                    store.providers.insert(
+                        canonical_provider_id(&profile.id),
+                        StoredCredential::ApiKey { key: secret },
+                    );
+                    save_auth_store(&store)?;
+                    return Ok(LoginResult {
+                        message: format!(
+                            "imported credentials for provider '{}' from {} into {} and set it active",
+                            profile.id,
+                            source,
+                            auth_store_path().display()
+                        ),
+                        provider_id: profile.id.clone(),
+                        awaiting_credentials: false,
+                    });
+                }
             }
         }
 
@@ -2818,15 +2887,16 @@ pub(crate) fn logout_provider(selected: Option<&str>) -> Result<String> {
         Some(sel) => provider_id_from_selector(&catalog, sel)?,
         None => resolve_active_provider_id(&catalog),
     };
+    let canonical = canonical_provider_id(&provider_id);
 
     let mut store = load_auth_store()?;
-    let removed = store.providers.remove(&provider_id).is_some();
+    let removed = store.providers.remove(&canonical).is_some();
     save_auth_store(&store)?;
 
     Ok(if removed {
-        format!("removed stored credentials for provider '{provider_id}'")
+        format!("removed stored credentials for provider '{canonical}'")
     } else {
-        format!("no stored credentials for provider '{provider_id}'")
+        format!("no stored credentials for provider '{canonical}'")
     })
 }
 

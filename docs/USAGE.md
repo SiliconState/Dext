@@ -34,6 +34,9 @@ Store an API key:
 
 ```bash
 wolf auth login glm <api-key>
+wolf auth login openai <api-key>
+wolf auth login anthropic <api-key>
+wolf auth login deepseek <api-key>
 ```
 
 Switch providers/models:
@@ -144,6 +147,8 @@ Provider/model:
 ```bash
 WOLF_PROVIDER=glm
 WOLF_MODEL=glm-4.6
+# provider key env fallbacks: ZAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENAI_API_KEY,
+# ANTHROPIC_API_KEY, DEEPSEEK_API_KEY
 WOLF_MODEL_FORCE=1
 WOLF_BASE_URL=https://api.example.test
 WOLF_API_KEY=...
@@ -155,6 +160,7 @@ Provider-specific credential fallbacks:
 ZAI_API_KEY=...
 ANTHROPIC_API_KEY=...
 OPENAI_API_KEY=...
+DEEPSEEK_API_KEY=...
 CHATGPT_ACCESS_TOKEN=...
 OPENROUTER_API_KEY=...
 ```

@@ -30,6 +30,11 @@
 ## Recent Decisions
 
 <!-- pi-memory:decisions:start -->
+- **Compaction active and end-turn thresholds**
+  *Choice:* Standard mode auto-compacts at 90% of model context at end-turn and 80% after safe active tool-result checkpoints; explicit /compact percent and WOLF_MAX_HISTORY_CHARS overrides still win.
+  *Why:* Earlier compaction preserves evidence before active turns exceed provider context while keeping end-turn compaction near the tail and budget-conscious.
+  `2026-05-08` `active`
+
 - **Usage status shows prompt-cache visibility**
   *Choice:* Wolf usage displays split actual non-cached input, cached input reads/writes, and output; the TUI status line keeps the cached-input marker visible after first usage even when it is zero so cache status is not hidden.
   *Why:* ChatGPT/Codex and Anthropic report prompt-cache usage differently, and users need to see whether cache reads are happening without mistaking cached tokens for fresh input.
@@ -53,11 +58,6 @@
 - **Frugal context mode**
   *Choice:* Added --frugal, /context frugal, lean tool-profile schemas, smaller prompt/tool/history caps, and deterministic fact-card compaction for low-token operation.
   *Why:* Wolf should preserve capability while avoiding repeated prompt/schema/tool-result bloat; frugal mode makes large context emergency capacity rather than default payload.
-  `2026-04-27` `active`
-
-- **PTY-backed TUI verification**
-  *Choice:* Added a Unix integration smoke test (cargo test --release --test tui_smoke -- --nocapture) that launches the real wolf binary in an openpty pseudo-terminal, answers cursor-position queries, verifies banner/help/key handling, exits via Ctrl+D, and uses isolated WOLF_HOME/sandbox paths.
-  *Why:* Replaces the manual-only TUI caveat with a real terminal-path check while adding no runtime code or dependencies.
   `2026-04-27` `active`
 
 <!-- pi-memory:decisions:end -->

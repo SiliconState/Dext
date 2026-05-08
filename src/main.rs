@@ -195,6 +195,32 @@ fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
     }
 }
 
+async fn read_stream_next_chunk(
+    stream: &mut (
+             impl futures_util::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Unpin
+         ),
+    interrupt: &AtomicBool,
+    interrupted_msg: &str,
+) -> Result<Option<bytes::Bytes>> {
+    use futures_util::StreamExt;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+    loop {
+        if interrupt.load(Ordering::SeqCst) {
+            anyhow::bail!("{interrupted_msg}");
+        }
+        tokio::select! {
+            chunk = stream.next() => {
+                return match chunk {
+                    Some(Ok(chunk)) => Ok(Some(chunk)),
+                    Some(Err(e)) => Err(stream_chunk_err(e)),
+                    None => Ok(None),
+                };
+            }
+            _ = ticker.tick() => {}
+        }
+    }
+}
+
 fn maybe_preserve_partial_stream(blocks: &[Block], history: &mut Vec<Message>) -> bool {
     if blocks.is_empty()
         || !blocks
@@ -744,7 +770,7 @@ fn route_interactive_input_line(
     if trimmed.is_empty() {
         return InteractiveInputRoute::Dropped;
     }
-    if agent_busy.load(Ordering::SeqCst) && !trimmed.starts_with('/') {
+    if agent_busy.load(Ordering::SeqCst) {
         if steering_tx.send(trimmed).is_ok() {
             InteractiveInputRoute::SteeringQueued
         } else {
@@ -1148,7 +1174,7 @@ struct SubagentRequest {
     task: String,
     system: Option<String>,
     allowed_tools: Option<Vec<String>>,
-    max_iterations: u64,
+    max_iterations: Option<u64>,
     approval_profile: ApprovalProfile,
     sandbox_profile: SandboxProfile,
     browser_recipe: BrowserRecipe,
@@ -1165,7 +1191,7 @@ impl Default for SubagentRequest {
             task: String::new(),
             system: None,
             allowed_tools: None,
-            max_iterations: 20,
+            max_iterations: None,
             approval_profile: ApprovalProfile::default(),
             sandbox_profile: SandboxProfile::default(),
             browser_recipe: BrowserRecipe::default(),
@@ -1191,7 +1217,7 @@ impl SubagentRequest {
             task,
             system,
             allowed_tools,
-            max_iterations: input["max_iterations"].as_u64().unwrap_or(20),
+            max_iterations: input["max_iterations"].as_u64(),
             approval_profile: agent.approval_profile,
             sandbox_profile: agent.sandbox_profile,
             browser_recipe: agent.browser_recipe,
@@ -1206,8 +1232,10 @@ impl SubagentRequest {
     fn to_tool_input(&self) -> Value {
         let mut input = json!({
             "task": self.task,
-            "max_iterations": self.max_iterations,
         });
+        if let Some(max_iterations) = self.max_iterations {
+            input["max_iterations"] = json!(max_iterations);
+        }
         if let Some(system) = &self.system {
             input["system"] = json!(system);
         }
@@ -1224,6 +1252,7 @@ struct DetachedSubagentLaunch {
     report_path: PathBuf,
     stdout_path: PathBuf,
     command: String,
+    monitor_command: String,
 }
 
 #[cfg(unix)]
@@ -1264,6 +1293,16 @@ fn spawn_detached_subagent_process(
         request_path.display(),
         report_path.display()
     );
+    #[cfg(unix)]
+    let monitor_command = format!(
+        "tail -f {}",
+        shell_single_quote(&stdout_path.display().to_string())
+    );
+    #[cfg(windows)]
+    let monitor_command = format!(
+        "powershell -NoProfile -Command Get-Content -Wait {}",
+        stdout_path.display()
+    );
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut args = vec![
         "subagent-worker".to_string(),
@@ -1299,6 +1338,7 @@ fn spawn_detached_subagent_process(
                     report_path: report_path.to_path_buf(),
                     stdout_path,
                     command: task,
+                    monitor_command,
                 });
             }
         }
@@ -1334,6 +1374,7 @@ fn spawn_detached_subagent_process(
                 report_path: report_path.to_path_buf(),
                 stdout_path,
                 command: task,
+                monitor_command,
             });
         }
     }
@@ -1362,6 +1403,7 @@ fn spawn_detached_subagent_process(
             report_path: report_path.to_path_buf(),
             stdout_path,
             command: task,
+            monitor_command,
         });
     }
 
@@ -1408,6 +1450,7 @@ fn spawn_detached_subagent_process(
                     report_path: report_path.to_path_buf(),
                     stdout_path,
                     command: task,
+                    monitor_command,
                 });
             }
         }
@@ -1429,6 +1472,7 @@ fn spawn_detached_subagent_process(
         report_path: report_path.to_path_buf(),
         stdout_path,
         command: task,
+        monitor_command,
     })
 }
 
@@ -1443,7 +1487,7 @@ struct SubagentToolTrace {
 
 struct SubagentRunReport {
     task: String,
-    max_iterations: u32,
+    max_iterations: Option<u32>,
     iterations: u32,
     calls: usize,
     failed_calls: usize,
@@ -1509,6 +1553,12 @@ fn subagent_quality_gate_missing(final_text: &str) -> Vec<&'static str> {
         .collect()
 }
 
+fn subagent_iteration_limit_label(max_iterations: Option<u32>) -> String {
+    max_iterations
+        .map(|max| max.to_string())
+        .unwrap_or_else(|| "unlimited".to_string())
+}
+
 fn render_subagent_report(report: &SubagentRunReport) -> String {
     let mut summary = format!(
         "=== SUBAGENT RESULT ===\n\
@@ -1519,14 +1569,14 @@ fn render_subagent_report(report: &SubagentRunReport) -> String {
          === OUTPUT ===\n{}\n=== END ===",
         report.task,
         report.iterations,
-        report.max_iterations,
+        subagent_iteration_limit_label(report.max_iterations),
         report.calls,
         report.failed_calls,
         report.elapsed.as_secs_f64(),
         report
             .halted_reason
             .as_ref()
-            .map(|r| format!("HALTED: {r}"))
+            .map(|r| format!("HALTED: {r}\nParent should treat this as incomplete and verify/redo with higher --max-iter or narrower scope."))
             .unwrap_or_default(),
         report.final_text,
     );
@@ -3830,16 +3880,14 @@ async fn read_http_response_limited(
     resp: reqwest::Response,
     interrupt: Arc<AtomicBool>,
 ) -> std::result::Result<String, String> {
-    use futures_util::StreamExt;
-
     let mut stream = resp.bytes_stream();
     let mut capture = LimitedByteCapture::new(PROCESS_STREAM_CAPTURE_CAP);
-    while let Some(chunk) = stream.next().await {
-        if interrupt.load(Ordering::SeqCst) {
-            return Err("killed by interrupt (^C)".to_string());
+    loop {
+        match read_stream_next_chunk(&mut stream, &interrupt, "killed by interrupt (^C)").await {
+            Ok(Some(chunk)) => capture.push(&chunk),
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
         }
-        let chunk = chunk.map_err(|e| format!("HTTP body read failed: {e}"))?;
-        capture.push(&chunk);
     }
     Ok(capture.render("body"))
 }
@@ -5125,12 +5173,13 @@ async fn execute_builtin_call(
         let launch = spawn_detached_subagent_process(&root, &request_path, &report_path)
             .map_err(|e| format!("launch detached subagent: {e:#}"))?;
         return Ok(format!(
-            "detached subagent launched in {}\ncommand: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nUse `read_file` on the report path after it completes.",
+            "detached subagent launched in {}\ncommand: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nmonitor: {}\nUse the monitor command to watch live progress; inspect the report after completion.",
             launch.label,
             launch.command,
             request_path.display(),
             launch.report_path.display(),
-            launch.stdout_path.display()
+            launch.stdout_path.display(),
+            launch.monitor_command
         ));
     }
     if name == "bash" {
@@ -5358,7 +5407,7 @@ fn summarize_call(name: &str, input: &Value) -> String {
         }
         "subagent" => {
             let task = summarize_inline(input["task"].as_str().unwrap_or("?"), 84);
-            let max_iter = input["max_iterations"].as_u64().unwrap_or(20);
+            let max_iter = input["max_iterations"].as_u64();
             let tools = match input["allowed_tools"].as_array() {
                 Some(arr) => {
                     let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).take(4).collect();
@@ -5372,7 +5421,10 @@ fn summarize_call(name: &str, input: &Value) -> String {
                 }
                 None => "default".to_string(),
             };
-            format!("subagent: \"{task}\" · detached · tools={tools} · max_iter={max_iter}")
+            let iter_label = max_iter
+                .map(|max| max.to_string())
+                .unwrap_or_else(|| "unlimited".to_string());
+            format!("subagent: \"{task}\" · detached · tools={tools} · max_iter={iter_label}")
         }
         _ => {
             let compact = summarize_inline(&input.to_string(), TOOL_SUMMARY_CHAR_CAP);
@@ -5545,7 +5597,8 @@ Recent state\n\
 Keep each section concise. Capture the user's overall goal, key decisions and why, file paths, function names, identifiers, unresolved work, and anything the next assistant must remember to continue safely. No preamble, no meta-commentary, no filler.";
 
 const HISTORY_CHAR_BUDGET_MIN: usize = 24_000;
-const HISTORY_CHAR_BUDGET_DEFAULT_PERCENT: usize = 95;
+const HISTORY_CHAR_BUDGET_END_TURN_PERCENT: u8 = 90;
+const HISTORY_CHAR_BUDGET_ACTIVE_PERCENT: u8 = 80;
 const COMPACT_KEEP_MESSAGES: usize = 6;
 const COMPACT_USER_BOUNDARY_BACKTRACK: usize = COMPACT_KEEP_MESSAGES * 4;
 const COMPACT_PRESERVE_TOOL_MESSAGES: usize = 10;
@@ -5983,6 +6036,48 @@ fn parse_compact_slash(line: &str) -> Option<Result<CompactSlash, &'static str>>
     Some(Err("usage: /compact [status|auto|<percent>|<percent>%]"))
 }
 
+fn apply_runtime_model_command(agent: &mut Agent, arg: &str) -> Result<String> {
+    if arg.trim().is_empty() {
+        return Ok(format!(
+            "model: {} (provider: {})",
+            agent.model, agent.provider_id
+        ));
+    }
+    let selection = load_provider_catalog().and_then(|catalog| {
+        let store = load_auth_store()?;
+        resolve_provider_model_selection(&catalog, &store, &agent.provider_id, arg)
+    })?;
+    let provider_changed =
+        canonical_provider_id(&selection.provider_id) != canonical_provider_id(&agent.provider_id);
+    let target_provider = selection.provider_id.clone();
+    let target_model = selection.model.clone();
+    if provider_changed {
+        set_active_provider_in_catalog(&target_provider)?;
+        agent.reload_provider(Some(&target_provider), false)?;
+    }
+    agent.model = target_model.clone();
+    agent.pin_model_for_provider(&target_provider, &target_model);
+    agent.refresh_tools_for_context();
+    match set_provider_default_model_in_catalog(&target_provider, &target_model) {
+        Ok(()) if provider_changed => Ok(format!(
+            "model -> {} (provider -> {}; saved as default; applies immediately to the next model request)",
+            agent.model, agent.provider_id
+        )),
+        Ok(()) => Ok(format!(
+            "model -> {} (saved as default for provider {}; applies immediately to the next model request)",
+            agent.model, agent.provider_id
+        )),
+        Err(e) if provider_changed => Ok(format!(
+            "model -> {} (provider -> {}; applies immediately; session-only model change; failed to persist default: {e:#})",
+            agent.model, agent.provider_id
+        )),
+        Err(e) => Ok(format!(
+            "model -> {} (applies immediately; session-only; failed to persist default: {e:#})",
+            agent.model
+        )),
+    }
+}
+
 fn apply_runtime_control_command(
     agent: &mut Agent,
     text: &str,
@@ -5991,6 +6086,17 @@ fn apply_runtime_control_command(
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
         return false;
+    }
+
+    let mut parts = trimmed[1..].splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim();
+    if cmd == "model" {
+        match apply_runtime_model_command(agent, arg) {
+            Ok(msg) => emit(msg),
+            Err(e) => emit(format!("[err] {e:#}")),
+        }
+        return true;
     }
 
     let effort_arg = trimmed
@@ -6010,7 +6116,7 @@ fn apply_runtime_control_command(
         };
         match parsed {
             Some(effort) => emit(format!(
-                "thinking effort -> {} (model reasoning depth/tool persistence; applies to the next model request in this run)",
+                "thinking effort -> {} (applies immediately to the next model request in this run)",
                 effort.as_str()
             )),
             None => emit("usage: /effort [low|medium|high|xhigh|next|prev|status]".to_string()),
@@ -6026,13 +6132,14 @@ fn apply_runtime_control_command(
             ),
             Ok(CompactSlash::Status) => {
                 let current = agent.compact_threshold_chars();
+                let active = agent.active_compact_threshold_chars();
                 let base = history_char_budget_with_override(&agent.model, None, agent.context_mode);
                 match agent.compact_threshold_override_percent() {
                     Some(percent) => emit(format!(
-                        "compact threshold: {current} chars ({percent}% of model context window; auto baseline {base})"
+                        "compact threshold: {current} chars ({percent}% of model context window; active-run trigger {active}; auto baseline {base})"
                     )),
                     None => emit(format!(
-                        "compact threshold: {current} chars (auto: {} mode)",
+                        "compact threshold: {current} chars (auto: {} mode; active-run trigger {active})",
                         agent.context_mode.as_str()
                     )),
                 }
@@ -6448,10 +6555,11 @@ fn compact_threshold_chars_for_percent(model: &str, percent: u8) -> usize {
         .max(HISTORY_CHAR_BUDGET_MIN)
 }
 
-fn history_char_budget_with_override(
+fn history_char_budget_with_percent(
     model: &str,
     override_chars: Option<usize>,
     context_mode: ContextMode,
+    percent: u8,
 ) -> usize {
     if let Some(v) = override_chars.filter(|v| *v > 0) {
         return v;
@@ -6466,7 +6574,33 @@ fn history_char_budget_with_override(
         return 60_000;
     }
 
-    compact_threshold_chars_for_percent(model, HISTORY_CHAR_BUDGET_DEFAULT_PERCENT as u8)
+    compact_threshold_chars_for_percent(model, percent)
+}
+
+fn history_char_budget_with_override(
+    model: &str,
+    override_chars: Option<usize>,
+    context_mode: ContextMode,
+) -> usize {
+    history_char_budget_with_percent(
+        model,
+        override_chars,
+        context_mode,
+        HISTORY_CHAR_BUDGET_END_TURN_PERCENT,
+    )
+}
+
+fn active_history_char_budget_with_override(
+    model: &str,
+    override_chars: Option<usize>,
+    context_mode: ContextMode,
+) -> usize {
+    history_char_budget_with_percent(
+        model,
+        override_chars,
+        context_mode,
+        HISTORY_CHAR_BUDGET_ACTIVE_PERCENT,
+    )
 }
 
 fn compact_threshold_settings_path() -> PathBuf {
@@ -6963,6 +7097,14 @@ impl Agent {
         )
     }
 
+    fn active_compact_threshold_chars(&self) -> usize {
+        active_history_char_budget_with_override(
+            &self.model,
+            self.compact_threshold_chars,
+            self.context_mode,
+        )
+    }
+
     fn compact_threshold_override(&self) -> Option<usize> {
         self.compact_threshold_chars
     }
@@ -7004,15 +7146,17 @@ impl Agent {
     }
 
     async fn interrupt_aware_sleep(&self, secs: u64) {
-        let mut elapsed = 0u64;
-        while elapsed < secs {
-            let remaining = secs - elapsed;
-            let step = remaining.min(1);
-            tokio::time::sleep(std::time::Duration::from_secs(step)).await;
+        let sleep = tokio::time::sleep(std::time::Duration::from_secs(secs));
+        tokio::pin!(sleep);
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+        loop {
             if self.interrupt.load(Ordering::SeqCst) {
                 return;
             }
-            elapsed += step;
+            tokio::select! {
+                _ = &mut sleep => return,
+                _ = ticker.tick() => {}
+            }
         }
     }
 
@@ -7266,8 +7410,9 @@ impl Agent {
                 ));
             }
             env.push_str(&format!(
-                "history_compact_threshold_chars={}\n",
-                self.compact_threshold_chars()
+                "history_compact_threshold_chars={} active_history_compact_threshold_chars={}\n",
+                self.compact_threshold_chars(),
+                self.active_compact_threshold_chars()
             ));
             let ledger = self.work_ledger_prompt();
             if !ledger.trim().is_empty() {
@@ -7338,6 +7483,11 @@ impl Agent {
                 self.sandbox_profile.as_str()
             ));
         }
+        env.push_str(&format!(
+            "history_compact_threshold_chars={} active_history_compact_threshold_chars={}\n",
+            self.compact_threshold_chars(),
+            self.active_compact_threshold_chars()
+        ));
         let ledger = self.work_ledger_prompt();
         if !ledger.trim().is_empty() {
             env.push_str("\n## Work ledger\n");
@@ -7425,6 +7575,9 @@ impl Agent {
     }
 
     fn note_steering_messages(&mut self, messages: &[String]) -> String {
+        if messages.is_empty() {
+            return String::new();
+        }
         let combined = messages.join("\n\n");
         let preview = summarize_inline(&combined, 180);
         let entry = format!(
@@ -7465,19 +7618,46 @@ impl Agent {
         tool_count: usize,
         before_final: bool,
     ) -> bool {
+        let mut runtime_control_notes = Vec::new();
+        let mut pending_steering = Vec::new();
         let steering_messages = self.drain_steering();
-        if steering_messages.is_empty() {
+        let steering_count = steering_messages.len();
+        for message in steering_messages {
+            if apply_runtime_control_command(self, &message, |msg| runtime_control_notes.push(msg))
+            {
+                continue;
+            }
+            pending_steering.push(message);
+        }
+        if pending_steering.is_empty() && runtime_control_notes.is_empty() {
             return false;
         }
-        let combined = steering_messages.join("\n\n");
-        let preview = self.note_steering_messages(&steering_messages);
+        let preview = if pending_steering.is_empty() {
+            summarize_inline(&runtime_control_notes.join("; "), 180)
+        } else {
+            self.note_steering_messages(&pending_steering)
+        };
+        let control_note = if runtime_control_notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nRuntime control applied immediately:\n{}",
+                runtime_control_notes.join("\n")
+            )
+        };
+        let combined = pending_steering.join("\n\n");
+        let user_update = if combined.trim().is_empty() {
+            "(runtime control command only)".to_string()
+        } else {
+            combined
+        };
         let progress = format!(
             "[queued-user-update] The user sent this while you were working. This is active scope, not an aside. \
              You must explicitly address it in your next assistant response and say what changed, what you did about it, or why it is blocked. \
              If it adds/removes work, update any active todo list before continuing. Do not let the final answer omit this queued update.\n\n\
              Progress: completed {iterations} iterations, {tool_count} tool calls so far. \
              Phase: {}. Injection point: {}.\n\
-             User update:\n{combined}",
+             User update:\n{user_update}{control_note}",
             turn_state.phase().label(),
             if before_final {
                 "before final response"
@@ -7486,12 +7666,12 @@ impl Agent {
             }
         );
         self.sink.emit(AgentEvent::SteeringReceived {
-            messages: steering_messages.len(),
+            messages: steering_count,
             preview: preview.clone(),
         });
         self.append_latest_log(
             "steering_injected",
-            &format!("messages={} preview={preview}", steering_messages.len()),
+            &format!("messages={steering_count} preview={preview}"),
         );
         self.history.push(Message {
             role: "user".to_string(),
@@ -8601,8 +8781,36 @@ impl Agent {
         }
     }
 
+    #[cfg(test)]
     fn should_auto_compact(&self) -> bool {
         self.history_chars() > self.compact_threshold_chars()
+    }
+
+    #[cfg(test)]
+    fn should_active_compact(&self) -> bool {
+        self.history_chars() > self.active_compact_threshold_chars()
+    }
+
+    async fn compact_if_over_threshold(
+        &mut self,
+        threshold_chars: usize,
+        checkpoint_label: &str,
+    ) -> bool {
+        if self.history_chars() <= threshold_chars {
+            return false;
+        }
+        let before_len = self.history.len();
+        let before_chars = self.history_chars();
+        let compacted = match self.compact().await {
+            Ok(()) => self.history.len() != before_len || self.history_chars() < before_chars,
+            Err(_) => {
+                self.sink
+                    .emit(AgentEvent::Info("[continuing without compaction]".into()));
+                false
+            }
+        };
+        self.checkpoint_latest_session(checkpoint_label);
+        compacted
     }
 
     async fn compact(&mut self) -> Result<()> {
@@ -8707,7 +8915,7 @@ impl Agent {
     async fn run_subagent_cmd(&mut self, raw: String) -> Result<()> {
         let mut task_parts: Vec<String> = Vec::new();
         let mut tools_override: Option<Vec<String>> = None;
-        let mut max_iter: u64 = 20;
+        let mut max_iter: Option<u64> = None;
         let mut system_override: Option<String> = None;
         let mut readonly = false;
         let mut mode = SubagentMode::Detached;
@@ -8722,7 +8930,7 @@ impl Agent {
                 }
                 "--max-iter" => {
                     if let Some(n) = tokens.next() {
-                        max_iter = n.parse().unwrap_or(20);
+                        max_iter = n.parse().ok();
                     }
                 }
                 "--system" => {
@@ -8773,8 +8981,10 @@ impl Agent {
 
         let mut input = json!({
             "task": task,
-            "max_iterations": max_iter,
         });
+        if let Some(max_iter) = max_iter {
+            input["max_iterations"] = json!(max_iter);
+        }
         if let Some(tools) = &allowed_tools {
             input["allowed_tools"] = json!(tools);
         }
@@ -8787,26 +8997,31 @@ impl Agent {
             let (request_path, report_path) = write_subagent_request(&self.sandbox_root, &request)?;
             let launch =
                 spawn_detached_subagent_process(&self.sandbox_root, &request_path, &report_path)?;
+            let iter_label = max_iter
+                .map(|max| max.to_string())
+                .unwrap_or_else(|| "unlimited".to_string());
             let summary = format!(
-                "▶ subagent detached: \"{}\"{} · max_iter={}\nlauncher: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nParent remains usable; read the report path when complete.",
+                "▶ subagent detached: \"{}\"{} · max_iter={}\nlauncher: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nmonitor: {}\nParent remains usable; run the monitor command in another shell to watch live progress, then read the report when complete.",
                 task,
                 if readonly { " [readonly]" } else { "" },
-                max_iter,
+                iter_label,
                 launch.label,
                 request_path.display(),
                 launch.report_path.display(),
-                launch.stdout_path.display()
+                launch.stdout_path.display(),
+                launch.monitor_command
             );
             self.sink.emit(AgentEvent::Slash(summary.clone()));
             self.history.push(Message {
                 role: "user".to_string(),
                 content: vec![Block::Text {
                     text: format!(
-                        "[subagent detached]\nTask: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\n\nThe subagent is running outside the parent transcript. When it completes, inspect the report and decide whether to use, verify, revise, or discard it.",
+                        "[subagent detached]\nTask: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nmonitor: {}\n\nThe subagent is running outside the parent transcript. You can monitor live progress without interrupting parent work using the monitor command. When it completes, inspect the report and decide whether to use, verify, revise, or discard it.",
                         task,
                         request_path.display(),
                         launch.report_path.display(),
-                        launch.stdout_path.display()
+                        launch.stdout_path.display(),
+                        launch.monitor_command
                     ),
                 }],
             });
@@ -8814,8 +9029,11 @@ impl Agent {
         }
 
         self.sink.emit(AgentEvent::Slash(format!(
-            "▶ subagent inline: \"{task}\"{} · max_iter={max_iter}",
+            "▶ subagent inline: \"{task}\"{} · max_iter={}",
             if readonly { " [readonly]" } else { "" },
+            max_iter
+                .map(|max| max.to_string())
+                .unwrap_or_else(|| "unlimited".to_string())
         )));
 
         let report = self
@@ -8868,7 +9086,6 @@ impl Agent {
     }
 
     async fn chat_inner(&mut self, mut user_input: String) -> Result<()> {
-        let turn_started_at = std::time::Instant::now();
         let mut compacted_this_turn = false;
         let hook_env = [("WOLF_USER_INPUT", user_input.as_str())];
         for (out, _code) in self
@@ -8887,15 +9104,7 @@ impl Agent {
         });
         self.checkpoint_latest_session("after_user_message");
 
-        if self.should_auto_compact() {
-            if self.compact().await.is_err() {
-                self.sink
-                    .emit(AgentEvent::Info("[continuing without compaction]".into()));
-            } else {
-                compacted_this_turn = true;
-            }
-            self.checkpoint_latest_session("after_compact_attempt");
-        }
+        let turn_started_at = std::time::Instant::now();
 
         let objective = orchestrator::ObjectiveTracker::from_user_prompt(
             self.history
@@ -8916,20 +9125,6 @@ impl Agent {
             .emit(AgentEvent::Info(format!("[{}]", objective_line)));
         self.append_latest_log("objective", &objective_line);
 
-        let (sys_stable, sys_env) = self.compose_system_parts();
-        let sys_blocks = vec![
-            SystemBlock {
-                kind: "text",
-                text: &sys_stable,
-                cache_control: Some(CacheControl::EPHEMERAL),
-            },
-            SystemBlock {
-                kind: "text",
-                text: &sys_env,
-                cache_control: None,
-            },
-        ];
-        let wire_tools = self.wire_tools();
         let mut iterations: u32 = 0;
         let mut turn_usage = Usage::default();
         let mut denied_signatures: HashSet<String> = HashSet::new();
@@ -8960,6 +9155,16 @@ impl Agent {
                 .emit(AgentEvent::Info(format!("[browser] {hint}")));
         }
 
+        if self
+            .compact_if_over_threshold(
+                self.active_compact_threshold_chars(),
+                "after_active_compact_attempt",
+            )
+            .await
+        {
+            compacted_this_turn = true;
+        }
+
         loop {
             if let Some(msg) = self.budget_cap_denial() {
                 self.sink.emit(AgentEvent::Warn(msg.clone()));
@@ -8987,6 +9192,20 @@ impl Agent {
                     project_key(&self.sandbox_root)
                 )
             });
+            let (sys_stable, sys_env) = self.compose_system_parts();
+            let sys_blocks = vec![
+                SystemBlock {
+                    kind: "text",
+                    text: &sys_stable,
+                    cache_control: Some(CacheControl::EPHEMERAL),
+                },
+                SystemBlock {
+                    kind: "text",
+                    text: &sys_env,
+                    cache_control: None,
+                },
+            ];
+            let wire_tools = self.wire_tools();
             let (url, req_body) = self.build_streaming_request(
                 &sys_stable,
                 &sys_env,
@@ -9011,7 +9230,19 @@ impl Agent {
                         &self.api_key,
                         chatgpt_session_id.as_deref(),
                     )?;
-                    let res = req.send().await;
+                    let mut interrupt_ticker =
+                        tokio::time::interval(std::time::Duration::from_millis(25));
+                    let res = tokio::select! {
+                        _ = async {
+                            loop {
+                                if self.interrupt.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                interrupt_ticker.tick().await;
+                            }
+                        } => anyhow::bail!("interrupted by user before provider response"),
+                        res = req.send() => res,
+                    };
                     match res {
                         Ok(r) if r.status().is_success() => break r,
                         Ok(r) => {
@@ -9368,12 +9599,51 @@ impl Agent {
                     });
                 }
 
-                // Subagents are intentionally explicit-user only; the model may not spawn them as a tool.
+                // Subagents run detached and report through request/report/stdout files.
                 if plan.is_none() && name == "subagent" {
-                    plan = Some(Plan::Immediate {
-                        content: "subagent runs detached in a separate terminal/tmux/window when possible. It inherits the main runtime capabilities but reports back by artifact path; the parent stays in control. Use /subagent for explicit delegation.".to_string(),
-                        is_error: Some(true),
-                    });
+                    let task = input["task"].as_str().unwrap_or_default().trim();
+                    if task.is_empty() {
+                        plan = Some(Plan::Immediate {
+                            content: "subagent task is required".to_string(),
+                            is_error: Some(true),
+                        });
+                    } else {
+                        match SubagentRequest::from_input(self, &input)
+                            .and_then(|request| {
+                                write_subagent_request(&self.sandbox_root, &request)
+                                    .map_err(|e| format!("write subagent request: {e:#}"))
+                            })
+                            .and_then(|(request_path, report_path)| {
+                                spawn_detached_subagent_process(
+                                    &self.sandbox_root,
+                                    &request_path,
+                                    &report_path,
+                                )
+                                .map(|launch| (request_path, launch))
+                                .map_err(|e| format!("launch detached subagent: {e:#}"))
+                            }) {
+                            Ok((request_path, launch)) => {
+                                plan = Some(Plan::Immediate {
+                                    content: format!(
+                                        "detached subagent launched in {}\ncommand: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nmonitor: {}\nUse the monitor command to watch live progress; inspect the report after completion.",
+                                        launch.label,
+                                        launch.command,
+                                        request_path.display(),
+                                        launch.report_path.display(),
+                                        launch.stdout_path.display(),
+                                        launch.monitor_command
+                                    ),
+                                    is_error: None,
+                                });
+                            }
+                            Err(msg) => {
+                                plan = Some(Plan::Immediate {
+                                    content: msg,
+                                    is_error: Some(true),
+                                });
+                            }
+                        }
+                    }
                 }
 
                 if plan.is_none()
@@ -9928,6 +10198,16 @@ impl Agent {
                 anyhow::bail!("interrupted by user after tool round");
             }
 
+            if self
+                .compact_if_over_threshold(
+                    self.active_compact_threshold_chars(),
+                    "after_active_compact_attempt",
+                )
+                .await
+            {
+                compacted_this_turn = true;
+            }
+
             let tool_count_after_results = self
                 .history
                 .iter()
@@ -9970,6 +10250,15 @@ impl Agent {
             self.append_latest_log("objective_final_warning", &reminder);
             self.work_ledger.blocked.push(reminder);
         }
+        if self
+            .compact_if_over_threshold(
+                self.compact_threshold_chars(),
+                "after_end_turn_compact_attempt",
+            )
+            .await
+        {
+            compacted_this_turn = true;
+        }
         self.sink.emit(AgentEvent::TurnDiagnostics {
             provider: self.provider_id.clone(),
             api_family: api_family_label(self.api_provider).to_string(),
@@ -9990,7 +10279,6 @@ impl Agent {
         &mut self,
         resp: reqwest::Response,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        use futures_util::StreamExt;
         use std::collections::BTreeMap;
 
         let mut stream = resp.bytes_stream();
@@ -10000,11 +10288,9 @@ impl Agent {
         let mut stop_reason: Option<String> = None;
         let mut usage = Usage::default();
 
-        while let Some(chunk) = stream.next().await {
-            if self.interrupt.load(Ordering::SeqCst) {
-                anyhow::bail!("interrupted by user");
-            }
-            let chunk = chunk.map_err(stream_chunk_err)?;
+        while let Some(chunk) =
+            read_stream_next_chunk(&mut stream, &self.interrupt, "interrupted by user").await?
+        {
             buf.extend_from_slice(&chunk);
 
             loop {
@@ -10153,8 +10439,6 @@ impl Agent {
         &mut self,
         resp: reqwest::Response,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        use futures_util::StreamExt;
-
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut scan_cursor: usize = 0;
@@ -10164,11 +10448,9 @@ impl Agent {
         let mut usage = Usage::default();
         let mut finish_reason: Option<String> = None;
 
-        while let Some(chunk) = stream.next().await {
-            if self.interrupt.load(Ordering::SeqCst) {
-                anyhow::bail!("interrupted by user");
-            }
-            let chunk = chunk.map_err(stream_chunk_err)?;
+        while let Some(chunk) =
+            read_stream_next_chunk(&mut stream, &self.interrupt, "interrupted by user").await?
+        {
             buf.extend_from_slice(&chunk);
 
             loop {
@@ -10287,8 +10569,6 @@ impl Agent {
         &mut self,
         resp: reqwest::Response,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        use futures_util::StreamExt;
-
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut scan_cursor: usize = 0;
@@ -10303,11 +10583,9 @@ impl Agent {
             std::collections::BTreeMap::new();
         let mut tool_call_order: Vec<String> = Vec::new();
 
-        while let Some(chunk) = stream.next().await {
-            if self.interrupt.load(Ordering::SeqCst) {
-                anyhow::bail!("interrupted by user");
-            }
-            let chunk = chunk.map_err(stream_chunk_err)?;
+        while let Some(chunk) =
+            read_stream_next_chunk(&mut stream, &self.interrupt, "interrupted by user").await?
+        {
             buf.extend_from_slice(&chunk);
 
             loop {
@@ -10688,7 +10966,7 @@ impl Agent {
             .system
             .clone()
             .unwrap_or_else(|| DEFAULT_SUBAGENT_SYSTEM.to_string());
-        let max_iter = request.max_iterations as u32;
+        let max_iter = request.max_iterations.map(|max| max as u32);
         let whitelist = request.allowed_tools.clone();
 
         let tools: Vec<Tool> = tool_definitions()
@@ -10735,7 +11013,7 @@ impl Agent {
             git_context: self.git_context.clone(),
             silent: true,
             pretty: false,
-            max_iterations: Some(max_iter),
+            max_iterations: max_iter,
             session_usage: Usage::default(),
             interrupt: self.interrupt.clone(),
             hooks: self.hooks.clone(),
@@ -10775,7 +11053,10 @@ impl Agent {
         sub.refresh_tools_for_context();
 
         {
-            let chat_fut = Box::pin(sub.chat(task.clone()));
+            let delegated_prompt = format!(
+                "{task}\n\n[handoff requirement]\nFinish with these exact headings: source inspected, verification run, files touched, uncertainty/open questions, confidence, exact recommended edits, remaining risks. If the task is getting broad, prefer a partial handoff over endless tool use."
+            );
+            let chat_fut = Box::pin(sub.chat(delegated_prompt));
             tokio::pin!(chat_fut);
             let chat_result: Result<()> = loop {
                 tokio::select! {
@@ -12639,7 +12920,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "    --tools t1,t2           restrict tool whitelist");
             let _ = writeln!(
                 w,
-                "    --max-iter N            max tool-use cycles (default 20)"
+                "    --max-iter N            optional max tool-use cycles (default unlimited)"
             );
             let _ = writeln!(
                 w,
@@ -12913,83 +13194,15 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 }
             }
         }
-        "model" => {
-            if arg.is_empty() {
-                let _ = writeln!(
-                    w,
-                    "model: {} (provider: {})",
-                    agent.model, agent.provider_id
-                );
-            } else {
-                match load_provider_catalog().and_then(|catalog| {
-                    let store = load_auth_store()?;
-                    resolve_provider_model_selection(&catalog, &store, &agent.provider_id, arg)
-                }) {
-                    Ok(selection) => {
-                        let provider_changed = canonical_provider_id(&selection.provider_id)
-                            != canonical_provider_id(&agent.provider_id);
-                        let target_provider = selection.provider_id.clone();
-                        let target_model = selection.model.clone();
-                        let provider_ready = if provider_changed {
-                            match set_active_provider_in_catalog(&target_provider)
-                                .and_then(|_| agent.reload_provider(Some(&target_provider), false))
-                            {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    let _ = writeln!(w, "[err] {e:#}");
-                                    false
-                                }
-                            }
-                        } else {
-                            true
-                        };
-                        if provider_ready {
-                            agent.model = target_model.clone();
-                            agent.pin_model_for_provider(&target_provider, &target_model);
-                            match set_provider_default_model_in_catalog(
-                                &target_provider,
-                                &target_model,
-                            ) {
-                                Ok(()) => {
-                                    if provider_changed {
-                                        let _ = writeln!(
-                                            w,
-                                            "model -> {} (provider -> {}; saved as default)",
-                                            agent.model, agent.provider_id
-                                        );
-                                    } else {
-                                        let _ = writeln!(
-                                            w,
-                                            "model -> {} (saved as default for provider {})",
-                                            agent.model, agent.provider_id
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    if provider_changed {
-                                        let _ = writeln!(
-                                            w,
-                                            "model -> {} (provider -> {}; session-only model change; failed to persist default: {e:#})",
-                                            agent.model, agent.provider_id
-                                        );
-                                    } else {
-                                        let _ = writeln!(
-                                            w,
-                                            "model -> {} (session-only; failed to persist default: {e:#})",
-                                            agent.model
-                                        );
-                                    }
-                                }
-                            }
-                            ui_update = SlashUiUpdate::ModelProvider;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = writeln!(w, "[err] {e:#}");
-                    }
-                }
+        "model" => match apply_runtime_model_command(agent, arg) {
+            Ok(msg) => {
+                let _ = writeln!(w, "{msg}");
+                ui_update = SlashUiUpdate::ModelProvider;
             }
-        }
+            Err(e) => {
+                let _ = writeln!(w, "[err] {e:#}");
+            }
+        },
         "providers" => match (load_provider_catalog(), load_auth_store()) {
             (Ok(catalog), Ok(store)) => {
                 let active = resolve_active_provider_id(&catalog);
@@ -13009,8 +13222,11 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             } else {
                 match load_provider_catalog().and_then(|catalog| {
                     provider_id_from_selector(&catalog, arg).and_then(|target| {
-                        set_active_provider_in_catalog(&target)
-                            .and_then(|_| agent.reload_provider(Some(&target), false))
+                        set_active_provider_in_catalog(&target).and_then(|_| {
+                            agent.reload_provider(Some(&target), false)?;
+                            agent.refresh_tools_for_context();
+                            Ok(())
+                        })
                     })
                 }) {
                     Ok(()) => {
@@ -13079,6 +13295,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     let provider_id = login.provider_id.clone();
                     match agent.reload_provider(None, false) {
                         Ok(()) => {
+                            agent.refresh_tools_for_context();
                             if awaiting {
                                 agent.set_pending_login_provider(Some(provider_id));
                                 format!(
@@ -13119,6 +13336,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     agent.clear_pending_login();
                 }
                 let _ = agent.reload_provider(None, false);
+                agent.refresh_tools_for_context();
             }) {
                 Ok(msg) => {
                     let _ = writeln!(w, "{msg}");
@@ -13216,19 +13434,20 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
             "status" => {
                 let current = agent.compact_threshold_chars();
+                let active = agent.active_compact_threshold_chars();
                 let base =
                     history_char_budget_with_override(&agent.model, None, agent.context_mode);
                 match agent.compact_threshold_override_percent() {
                     Some(percent) => {
                         let _ = writeln!(
                             w,
-                            "compact threshold: {current} chars ({percent}% of model context window; auto baseline {base})"
+                            "compact threshold: {current} chars ({percent}% of model context window; active-run trigger {active}; auto baseline {base})"
                         );
                     }
                     None => {
                         let _ = writeln!(
                             w,
-                            "compact threshold: {current} chars (auto: {} mode)",
+                            "compact threshold: {current} chars (auto: {} mode; active-run trigger {active})",
                             agent.context_mode.as_str()
                         );
                     }
@@ -14924,17 +15143,18 @@ async fn main() -> Result<()> {
                 }
                 Ok(CompactSlash::Status) => {
                     let current = agent.compact_threshold_chars();
+                    let active = agent.active_compact_threshold_chars();
                     let base =
                         history_char_budget_with_override(&agent.model, None, agent.context_mode);
                     match agent.compact_threshold_override_percent() {
                         Some(percent) => {
                             println!(
-                                "compact threshold: {current} chars ({percent}% of model context window; auto baseline {base})"
+                                "compact threshold: {current} chars ({percent}% of model context window; active-run trigger {active}; auto baseline {base})"
                             );
                         }
                         None => {
                             println!(
-                                "compact threshold: {current} chars (auto: {} mode)",
+                                "compact threshold: {current} chars (auto: {} mode; active-run trigger {active})",
                                 agent.context_mode.as_str()
                             );
                         }

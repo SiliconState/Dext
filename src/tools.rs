@@ -227,7 +227,7 @@ pub(crate) fn tool_definitions() -> Vec<Tool> {
                     "task": {"type": "string", "description": "The full task description for the subagent. Must be self-contained."},
                     "system": {"type": "string", "description": "Optional system prompt override. Default is a terse worker prompt."},
                     "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional whitelist of tool names. Default: inherited full toolset except recursive subagent."},
-                    "max_iterations": {"type": "number", "description": "Maximum tool-use cycles. Default 20."}
+                    "max_iterations": {"type": "number", "description": "Optional maximum tool-use cycles. Omit for no subagent-specific iteration cap."}
                 },
                 "required": ["task"]
             }),
