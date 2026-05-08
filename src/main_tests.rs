@@ -3368,29 +3368,38 @@ fn subagent_request_inherits_parent_capability_profile() {
 }
 
 #[test]
-fn subagent_detached_request_paths_are_project_scoped() {
-    let root = temp_test_dir("subagent-request-path");
+fn subagent_detached_artifacts_are_project_scoped() {
+    let root = temp_test_dir("subagent-artifacts");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let request = SubagentRequest {
         task: "noop".to_string(),
         ..SubagentRequest::default()
     };
-    let (request_path, report_path) =
-        write_subagent_request(&root, &request).expect("write request");
+    let (input_path, output_path) =
+        write_subagent_input(&root, &request).expect("write subagent input");
     assert!(
-        request_path.starts_with(project_state_dir(&root)),
+        input_path.starts_with(project_state_dir(&root)),
         "{}",
-        request_path.display()
+        input_path.display()
     );
     assert!(
-        report_path.starts_with(project_state_dir(&root)),
+        output_path.starts_with(project_state_dir(&root)),
         "{}",
-        report_path.display()
+        output_path.display()
     );
-    assert!(request_path.exists(), "{}", request_path.display());
+    assert!(input_path.exists(), "{}", input_path.display());
+    assert!(output_path.exists(), "{}", output_path.display());
+    assert_eq!(
+        input_path.extension().and_then(|e| e.to_str()),
+        Some("json")
+    );
+    assert_eq!(output_path.extension().and_then(|e| e.to_str()), Some("md"));
     let parsed: SubagentRequest =
-        serde_json::from_slice(&std::fs::read(&request_path).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(&input_path).unwrap()).unwrap();
     assert_eq!(parsed.task, "noop");
+    let output = std::fs::read_to_string(&output_path).unwrap();
+    assert!(output.contains("# Wolf subagent output bundle"), "{output}");
+    assert!(output.contains("## Logs"), "{output}");
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(subagent_requests_dir(&root));
@@ -4248,11 +4257,12 @@ fn jittered_backoff_respects_range_and_varies() {
 }
 
 #[test]
-fn subagent_is_auto_approved_but_kept_off_provider_tool_list() {
+fn subagent_inherits_parent_approval_without_permission_category() {
     let root = temp_test_dir("subagent-auto-approved");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let agent = test_agent(&root);
     assert!(agent.allowed.contains("subagent"));
+    assert!(!needs_permission("subagent"));
     assert!(!agent.tools.iter().any(|t| t.name == "subagent"));
 
     let _ = std::fs::remove_dir_all(&root);

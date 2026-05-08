@@ -1314,8 +1314,7 @@ impl SubagentRequest {
 #[derive(Debug)]
 struct DetachedSubagentLaunch {
     label: String,
-    report_path: PathBuf,
-    stdout_path: PathBuf,
+    output_path: PathBuf,
     command: String,
     monitor_command: String,
 }
@@ -1332,212 +1331,77 @@ fn subagent_requests_dir(root: &Path) -> PathBuf {
     project_state_dir(root).join("subagents")
 }
 
-fn write_subagent_request(root: &Path, request: &SubagentRequest) -> Result<(PathBuf, PathBuf)> {
+fn next_subagent_artifact_stem() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let seq = next_subagent_run_id();
+    format!("subagent-{nanos}-{}-{seq}", std::process::id())
+}
+
+fn write_subagent_input(root: &Path, request: &SubagentRequest) -> Result<(PathBuf, PathBuf)> {
     let dir = subagent_requests_dir(root);
     std::fs::create_dir_all(&dir)?;
-    let run_id = next_subagent_run_id();
-    let request_path = dir.join(format!("subagent-{run_id}.request.json"));
-    let report_path = dir.join(format!("subagent-{run_id}.report.md"));
+    let stem = next_subagent_artifact_stem();
+    let input_path = dir.join(format!("{stem}.input.json"));
+    let output_path = dir.join(format!("{stem}.output.md"));
     let bytes = serde_json::to_vec_pretty(request)?;
-    if let Some(parent) = request_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    atomic_write_bytes(&request_path, &bytes)?;
-    Ok((request_path, report_path))
+    atomic_write_bytes(&input_path, &bytes)?;
+    let header = format!(
+        "# Wolf subagent output bundle\n\ninput: {}\ntask: {}\nstatus: launched\n\n## Logs\n",
+        input_path.display(),
+        request.task
+    );
+    atomic_write_bytes(&output_path, header.as_bytes())?;
+    Ok((input_path, output_path))
 }
 
 fn spawn_detached_subagent_process(
     root: &Path,
-    request_path: &Path,
-    report_path: &Path,
+    input_path: &Path,
+    output_path: &Path,
 ) -> Result<DetachedSubagentLaunch> {
     let exe = current_wolf_executable()?;
-    let stdout_path = report_path.with_extension("stdout.log");
-    let task = format!(
+    let command = format!(
         "{} subagent-worker {} {}",
         exe.display(),
-        request_path.display(),
-        report_path.display()
+        input_path.display(),
+        output_path.display()
     );
     #[cfg(unix)]
     let monitor_command = format!(
         "tail -f {}",
-        shell_single_quote(&stdout_path.display().to_string())
+        shell_single_quote(&output_path.display().to_string())
     );
     #[cfg(windows)]
     let monitor_command = format!(
         "powershell -NoProfile -Command Get-Content -Wait {}",
-        stdout_path.display()
+        output_path.display()
     );
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut args = vec![
+    let args = vec![
         "subagent-worker".to_string(),
-        request_path.display().to_string(),
-        report_path.display().to_string(),
+        input_path.display().to_string(),
+        output_path.display().to_string(),
     ];
-    let mut label;
 
-    #[cfg(unix)]
-    {
-        if binary_on_path("tmux") {
-            label = "tmux".to_string();
-            let quoted: Vec<String> = std::iter::once(exe.display().to_string())
-                .chain(args.iter().cloned())
-                .map(|s| shell_single_quote(&s))
-                .collect();
-            let command = format!(
-                "{}; printf '\\n[subagent complete — report: {}]\\n'; printf 'press Enter to close '; read _",
-                quoted.join(" "),
-                shell_single_quote(&report_path.display().to_string())
-            );
-            let status = Command::new("tmux")
-                .args(["new-window", "-n", "wolf-subagent", &command])
-                .current_dir(root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .context("launch tmux subagent window")?;
-            if status.success() {
-                return Ok(DetachedSubagentLaunch {
-                    label,
-                    report_path: report_path.to_path_buf(),
-                    stdout_path,
-                    command: task,
-                    monitor_command,
-                });
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if binary_on_path("osascript") {
-            label = "Terminal.app".to_string();
-            let quoted: Vec<String> = std::iter::once(exe.display().to_string())
-                .chain(args.iter().cloned())
-                .map(|s| shell_single_quote(&s))
-                .collect();
-            let command = format!(
-                "cd {}; {}; printf '\\n[subagent complete — report: {}]\\n'",
-                shell_single_quote(&root.display().to_string()),
-                quoted.join(" "),
-                shell_single_quote(&report_path.display().to_string())
-            );
-            let script = format!(
-                "tell application \"Terminal\" to do script {}",
-                serde_json::to_string(&command)?
-            );
-            Command::new("osascript")
-                .args(["-e", &script])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("launch Terminal.app subagent window")?;
-            return Ok(DetachedSubagentLaunch {
-                label,
-                report_path: report_path.to_path_buf(),
-                stdout_path,
-                command: task,
-                monitor_command,
-            });
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        label = "new console".to_string();
-        let exe_arg = exe.display().to_string();
-        let mut cmd_args = vec![
-            "/C".to_string(),
-            "start".to_string(),
-            "wolf-subagent".to_string(),
-            exe_arg,
-        ];
-        cmd_args.append(&mut args);
-        Command::new("cmd")
-            .args(cmd_args)
-            .current_dir(root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("launch Windows subagent console")?;
-        return Ok(DetachedSubagentLaunch {
-            label,
-            report_path: report_path.to_path_buf(),
-            stdout_path,
-            command: task,
-            monitor_command,
-        });
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        for terminal in ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"] {
-            if !binary_on_path(terminal) {
-                continue;
-            }
-            let launched = match terminal {
-                "gnome-terminal" => Command::new(terminal)
-                    .arg("--working-directory")
-                    .arg(root)
-                    .arg("--")
-                    .arg(&exe)
-                    .args(&args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn(),
-                "konsole" => Command::new(terminal)
-                    .arg("--workdir")
-                    .arg(root)
-                    .arg("-e")
-                    .arg(&exe)
-                    .args(&args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn(),
-                _ => Command::new(terminal)
-                    .arg("-e")
-                    .arg(&exe)
-                    .args(&args)
-                    .current_dir(root)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn(),
-            };
-            if launched.is_ok() {
-                return Ok(DetachedSubagentLaunch {
-                    label: terminal.to_string(),
-                    report_path: report_path.to_path_buf(),
-                    stdout_path,
-                    command: task,
-                    monitor_command,
-                });
-            }
-        }
-    }
-
-    label = "background process".to_string();
-    let stdout = std::fs::File::create(&stdout_path)?;
-    let stderr = stdout.try_clone()?;
+    let output = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path)?;
+    let stderr = output.try_clone()?;
     Command::new(exe)
         .args(args)
         .current_dir(root)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
+        .stdout(Stdio::from(output))
         .stderr(Stdio::from(stderr))
         .spawn()
         .context("launch background subagent process")?;
     Ok(DetachedSubagentLaunch {
-        label,
-        report_path: report_path.to_path_buf(),
-        stdout_path,
-        command: task,
+        label: "background process".to_string(),
+        output_path: output_path.to_path_buf(),
+        command,
         monitor_command,
     })
 }
@@ -1661,10 +1525,23 @@ fn render_subagent_report(report: &SubagentRunReport) -> String {
     summary
 }
 
-async fn run_subagent_worker(request_path: &Path, report_path: &Path) -> Result<()> {
+fn append_subagent_output(output_path: &Path, text: &str) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path)?;
+    file.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+async fn run_subagent_worker(input_path: &Path, output_path: &Path) -> Result<()> {
     let request: SubagentRequest = serde_json::from_slice(
-        &std::fs::read(request_path)
-            .with_context(|| format!("reading subagent request {}", request_path.display()))?,
+        &std::fs::read(input_path)
+            .with_context(|| format!("reading subagent input {}", input_path.display()))?,
+    )?;
+    append_subagent_output(
+        output_path,
+        &format!("[worker] started task: {}\n", request.task),
     )?;
     let root = std::env::current_dir()?;
     let mut agent = Agent::new_with_sandbox(Some(root), false)?;
@@ -1687,11 +1564,16 @@ async fn run_subagent_worker(request_path: &Path, report_path: &Path) -> Result<
         .await
         .map_err(anyhow::Error::msg)?;
     let rendered = render_subagent_report(&report);
-    if let Some(parent) = report_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    atomic_write_bytes(report_path, rendered.as_bytes())?;
-    println!("\n[subagent report written: {}]", report_path.display());
+    let bundle = format!(
+        "\n## Report\n\n{}\n\n## Status\ncomplete\n",
+        cap_bytes_with_hint(
+            rendered,
+            64_000,
+            "Subagent report truncated; rerun with a narrower task."
+        )
+    );
+    append_subagent_output(output_path, &bundle)?;
+    println!("\n[subagent output written: {}]", output_path.display());
     Ok(())
 }
 
@@ -6187,17 +6069,16 @@ async fn execute_builtin_call(
     if name == "subagent" {
         let request = serde_json::from_value::<SubagentRequest>(input.clone())
             .map_err(|e| format!("invalid subagent request: {e}"))?;
-        let (request_path, report_path) = write_subagent_request(&root, &request)
-            .map_err(|e| format!("write subagent request: {e:#}"))?;
-        let launch = spawn_detached_subagent_process(&root, &request_path, &report_path)
+        let (input_path, output_path) = write_subagent_input(&root, &request)
+            .map_err(|e| format!("write subagent input: {e:#}"))?;
+        let launch = spawn_detached_subagent_process(&root, &input_path, &output_path)
             .map_err(|e| format!("launch detached subagent: {e:#}"))?;
         return Ok(format!(
-            "detached subagent launched in {}\ncommand: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nmonitor: {}\nUse the monitor command to watch live progress; inspect the report after completion.",
+            "detached subagent launched in {}\ncommand: {}\ninput: {}\noutput: {}\nmonitor: {}\nUse the monitor command to watch live progress and inspect the single output bundle (report + logs) after completion.",
             launch.label,
             launch.command,
-            request_path.display(),
-            launch.report_path.display(),
-            launch.stdout_path.display(),
+            input_path.display(),
+            launch.output_path.display(),
             launch.monitor_command
         ));
     }
@@ -10099,21 +9980,20 @@ impl Agent {
 
         let request = SubagentRequest::from_input(self, &input).map_err(anyhow::Error::msg)?;
         if mode == SubagentMode::Detached {
-            let (request_path, report_path) = write_subagent_request(&self.sandbox_root, &request)?;
+            let (input_path, output_path) = write_subagent_input(&self.sandbox_root, &request)?;
             let launch =
-                spawn_detached_subagent_process(&self.sandbox_root, &request_path, &report_path)?;
+                spawn_detached_subagent_process(&self.sandbox_root, &input_path, &output_path)?;
             let iter_label = max_iter
                 .map(|max| max.to_string())
                 .unwrap_or_else(|| "unlimited".to_string());
             let summary = format!(
-                "▶ subagent detached: \"{}\"{} · max_iter={}\nlauncher: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nmonitor: {}\nParent remains usable; run the monitor command in another shell to watch live progress, then read the report when complete.",
+                "▶ subagent detached: \"{}\"{} · max_iter={}\nlauncher: {}\ninput: {}\noutput: {}\nmonitor: {}\nParent remains usable; monitor the single output bundle (report + logs), then inspect it when complete.",
                 task,
                 if readonly { " [readonly]" } else { "" },
                 iter_label,
                 launch.label,
-                request_path.display(),
-                launch.report_path.display(),
-                launch.stdout_path.display(),
+                input_path.display(),
+                launch.output_path.display(),
                 launch.monitor_command
             );
             self.sink.emit(AgentEvent::Slash(summary.clone()));
@@ -10121,11 +10001,10 @@ impl Agent {
                 role: "user".to_string(),
                 content: vec![Block::Text {
                     text: format!(
-                        "[subagent detached]\nTask: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nmonitor: {}\n\nThe subagent is running outside the parent transcript. You can monitor live progress without interrupting parent work using the monitor command. When it completes, inspect the report and decide whether to use, verify, revise, or discard it.",
+                        "[subagent detached]\nTask: {}\ninput: {}\noutput: {}\nmonitor: {}\n\nThe subagent is running outside the parent transcript. Monitor the single output bundle without interrupting parent work. When it completes, inspect the bundle and decide whether to use, verify, revise, or discard it.",
                         task,
-                        request_path.display(),
-                        launch.report_path.display(),
-                        launch.stdout_path.display(),
+                        input_path.display(),
+                        launch.output_path.display(),
                         launch.monitor_command
                     ),
                 }],
@@ -10704,49 +10583,17 @@ impl Agent {
                     });
                 }
 
-                // Subagents run detached and report through request/report/stdout files.
                 if plan.is_none() && name == "subagent" {
-                    let task = input["task"].as_str().unwrap_or_default().trim();
-                    if task.is_empty() {
-                        plan = Some(Plan::Immediate {
-                            content: "subagent task is required".to_string(),
-                            is_error: Some(true),
-                        });
-                    } else {
-                        match SubagentRequest::from_input(self, &input)
-                            .and_then(|request| {
-                                write_subagent_request(&self.sandbox_root, &request)
-                                    .map_err(|e| format!("write subagent request: {e:#}"))
-                            })
-                            .and_then(|(request_path, report_path)| {
-                                spawn_detached_subagent_process(
-                                    &self.sandbox_root,
-                                    &request_path,
-                                    &report_path,
-                                )
-                                .map(|launch| (request_path, launch))
-                                .map_err(|e| format!("launch detached subagent: {e:#}"))
-                            }) {
-                            Ok((request_path, launch)) => {
-                                plan = Some(Plan::Immediate {
-                                    content: format!(
-                                        "detached subagent launched in {}\ncommand: {}\nrequest: {}\nreport: {}\nstdout/stderr: {}\nmonitor: {}\nUse the monitor command to watch live progress; inspect the report after completion.",
-                                        launch.label,
-                                        launch.command,
-                                        request_path.display(),
-                                        launch.report_path.display(),
-                                        launch.stdout_path.display(),
-                                        launch.monitor_command
-                                    ),
-                                    is_error: None,
-                                });
-                            }
-                            Err(msg) => {
-                                plan = Some(Plan::Immediate {
-                                    content: msg,
-                                    is_error: Some(true),
-                                });
-                            }
+                    match SubagentRequest::from_input(self, &input) {
+                        Ok(request) => {
+                            input = serde_json::to_value(request).unwrap_or_else(|_| input.clone());
+                            input_str = input.to_string();
+                        }
+                        Err(msg) => {
+                            plan = Some(Plan::Immediate {
+                                content: msg,
+                                is_error: Some(true),
+                            });
                         }
                     }
                 }
@@ -10812,38 +10659,12 @@ impl Agent {
                 }
 
                 if plan.is_none() && name == "subagent" {
-                    match SubagentRequest::from_input(self, &input) {
-                        Ok(request) => {
-                            input = serde_json::to_value(request).unwrap_or_else(|_| input.clone());
-                            input_str = input.to_string();
-                            let detached_sig = format!("{name}\n{input_str}");
-                            if denied_signatures.contains(&detached_sig) {
-                                plan = Some(Plan::Immediate {
-                                    content: "permission denied by user — do not retry this tool call; ask the user instead".to_string(),
-                                    is_error: Some(true),
-                                });
-                            } else {
-                                match self.sink.request_permission(&name, &input) {
-                                    Choice::Once => {}
-                                    Choice::Always => {
-                                        self.allowed.insert(name.clone());
-                                    }
-                                    Choice::Deny => {
-                                        denied_signatures.insert(detached_sig);
-                                        plan = Some(Plan::Immediate {
-                                            content: "permission denied by user — do not retry this tool call; ask the user instead".to_string(),
-                                            is_error: Some(true),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        Err(msg) => {
-                            plan = Some(Plan::Immediate {
-                                content: msg,
-                                is_error: Some(true),
-                            });
-                        }
+                    // Subagent inherits the parent approval/session posture; no second prompt.
+                    if self.deny_tools.contains(&name) {
+                        plan = Some(Plan::Immediate {
+                            content: "subagent is denied by the active tool policy".to_string(),
+                            is_error: Some(true),
+                        });
                     }
                 }
 
@@ -14024,7 +13845,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /subagent <task> [opts]   run a detached subagent (tmux/window if available)"
+                "  /subagent <task> [opts]   run a detached subagent in background"
             );
             let _ = writeln!(w, "    --tools t1,t2           restrict tool whitelist");
             let _ = writeln!(
@@ -15954,11 +15775,16 @@ async fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().is_some_and(|a| a == "subagent-worker") {
         if argv.len() != 3 {
-            eprintln!("usage: wolf subagent-worker REQUEST_JSON REPORT_MD");
+            eprintln!("usage: wolf subagent-worker INPUT_JSON OUTPUT_MD");
             release_registered_locks();
             std::process::exit(2);
         }
-        let result = run_subagent_worker(Path::new(&argv[1]), Path::new(&argv[2])).await;
+        let input_path = Path::new(&argv[1]);
+        let output_path = Path::new(&argv[2]);
+        let result = run_subagent_worker(input_path, output_path).await;
+        if let Err(e) = &result {
+            let _ = append_subagent_output(output_path, &format!("\n## Status\nfailed\n\n{e:#}\n"));
+        }
         release_registered_locks();
         return result;
     }
@@ -15987,7 +15813,7 @@ async fn main() -> Result<()> {
         println!("       wolf session tracks");
         println!("       wolf session track open [latest|NAME|PATH] @wNN [name]");
         println!("       wolf session export [latest|NAME|PATH] [html|jsonl] [OUT]");
-        println!("       wolf subagent-worker REQUEST_JSON REPORT_MD");
+        println!("       wolf subagent-worker INPUT_JSON OUTPUT_MD");
         println!("       wolf session analyze|grep|failures|verify-log|decisions [session]");
         println!(
             "       wolf --no-session     run without project state lock, latest session, or log writes"
