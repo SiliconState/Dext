@@ -62,6 +62,7 @@ of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
 - Prefer live/thinking/scroll progress above the input box only.
 - Agent browser is allowed when useful for browser automation.
 - Keep repo source-first and reviewable; avoid runtime clutter.
+- For ambiguous cleanup asks, ask once max; if unresolved, default to reversible `git stash` and verify.
 
 ## Current focus
 - Compaction thresholds now use standard 90% end-turn / 80% active safe-checkpoint triggers with recent tool evidence preserved; verification/install passed after this update. Broader dirty tree still includes provider/auth, subagent/tool, and TUI changes across `.env.example`, `Cargo.toml`, `Cargo.lock`, `README.md`, `docs/USAGE.md`, `src/main.rs`, `src/main_tests.rs`, `src/orchestrator.rs`, `src/provider.rs`, `src/tools.rs`, and `src/tui.rs`.

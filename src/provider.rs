@@ -238,6 +238,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             models: vec![
                 "gpt-5.4".to_string(),
                 "gpt-5.4-mini".to_string(),
+                "gpt-5.5".to_string(),
                 "gpt-5.3-codex".to_string(),
                 "gpt-5.3-codex-spark".to_string(),
                 "gpt-5-codex".to_string(),
@@ -960,6 +961,7 @@ pub(crate) fn normalize_chatgpt_model_slug(model: &str) -> String {
         "gpt5codex" => "gpt-5-codex".to_string(),
         "gpt54" => "gpt-5.4".to_string(),
         "gpt54mini" => "gpt-5.4-mini".to_string(),
+        "gpt55" => "gpt-5.5".to_string(),
         "gpt53codex" => "gpt-5.3-codex".to_string(),
         "gpt53codexspark" => "gpt-5.3-codex-spark".to_string(),
         _ => canonical,
@@ -979,6 +981,7 @@ pub(crate) fn chatgpt_reasoning_effort(model: &str, effort: crate::ThinkingEffor
     if model.starts_with("gpt-5.2")
         || model.starts_with("gpt-5.3")
         || model.starts_with("gpt-5.4")
+        || model.starts_with("gpt-5.5")
         || model.starts_with("gpt-5-codex")
     {
         return match raw {
