@@ -39,7 +39,7 @@ of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
   it visible in session/work-ledger state, and explicitly address it in the next/final answer.
 - Session state is evidence-backed: headers persist prompt/runtime provenance,
   exposed/approval/auto-approved tools, cleaned work ledger, provider health,
-  verification records, and lightweight tool-result metadata.
+  verification records, workflow diagnostics, and lightweight tool-result metadata.
 - Bash/external process tools run subprocesses in their own Unix process group
   and clean up leftover children after exit/timeout/interrupt.
 - `/subagent` reports are model-visible to the parent and quality-gated; the

@@ -56,6 +56,11 @@ const FRUGAL_TEXT_TOOL_CAPTURE_CAP: usize = 6_000;
 const READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 16_000;
 const FRUGAL_READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 10_000;
 const PROCESS_STREAM_CAPTURE_CAP: usize = 6_000;
+const EDIT_MATCH_CONTEXT_LINES: usize = 2;
+const EDIT_MATCH_DISPLAY_LIMIT: usize = 8;
+const EDIT_MATCH_CONTEXT_CAP: usize = 6_000;
+const READ_SYMBOL_SUGGESTION_LIMIT: usize = 5;
+const CARGO_DIAGNOSTIC_SUMMARY_LIMIT: usize = 20;
 const HTTP_EXTRACT_INPUT_CAP: usize = 128_000;
 const HTTP_EXTRACT_OUTPUT_CAP: usize = 24_000;
 const HOOK_OUTPUT_CAPTURE_CAP: usize = 4_000;
@@ -1346,10 +1351,11 @@ fn spawn_detached_subagent_process(
     request_path: &Path,
     report_path: &Path,
 ) -> Result<DetachedSubagentLaunch> {
-    let exe = std::env::current_exe().context("resolve current wolf executable")?;
+    let exe = current_wolf_executable()?;
     let stdout_path = report_path.with_extension("stdout.log");
     let task = format!(
-        "wolf subagent worker {} {}",
+        "{} subagent-worker {} {}",
+        exe.display(),
         request_path.display(),
         report_path.display()
     );
@@ -3263,9 +3269,9 @@ fn checkpoint_debounce() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-fn binary_on_path(name: &str) -> bool {
+fn find_binary_on_path(name: &str) -> Option<PathBuf> {
     let Ok(path_var) = std::env::var("PATH") else {
-        return false;
+        return None;
     };
     for dir in path_var.split(if cfg!(windows) { ';' } else { ':' }) {
         let p = Path::new(dir).join(name);
@@ -3277,17 +3283,40 @@ fn binary_on_path(name: &str) -> bool {
                     .map(|m| m.permissions().mode() & 0o111 != 0)
                     .unwrap_or(false)
             {
-                return true;
+                return Some(p);
             }
         }
         #[cfg(windows)]
         {
             if p.is_file() {
-                return true;
+                return Some(p);
             }
         }
     }
-    false
+    None
+}
+
+fn binary_on_path(name: &str) -> bool {
+    find_binary_on_path(name).is_some()
+}
+
+fn current_wolf_executable() -> Result<PathBuf> {
+    current_wolf_executable_from(
+        std::env::current_exe().context("resolve current wolf executable")?,
+    )
+}
+
+fn current_wolf_executable_from(exe: PathBuf) -> Result<PathBuf> {
+    if exe.is_file() {
+        return Ok(exe);
+    }
+    if let Some(path_exe) = find_binary_on_path("wolf") {
+        return Ok(path_exe);
+    }
+    anyhow::bail!(
+        "resolved current executable {} is not a file, and `wolf` was not found on PATH",
+        exe.display()
+    )
 }
 
 fn fd_exclude_path_patterns(glob: &str) -> Vec<String> {
@@ -4280,6 +4309,672 @@ fn write_verification_artifact(
     Some(path)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WorkflowDiagnostic {
+    file: String,
+    line: Option<u64>,
+    character: Option<u64>,
+    severity: String,
+    code: Option<String>,
+    message: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WorkflowDiagnosticsReport {
+    source: String,
+    status: String,
+    diagnostics: Vec<WorkflowDiagnostic>,
+    raw_output: String,
+    duration: std::time::Duration,
+}
+
+fn lsp_severity_label(value: Option<u64>) -> &'static str {
+    match value {
+        Some(1) => "error",
+        Some(2) => "warning",
+        Some(3) => "info",
+        Some(4) => "hint",
+        _ => "unknown",
+    }
+}
+
+fn lsp_code_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn file_uri_to_display_path(uri: &str, root: &Path) -> String {
+    let Some(rest) = uri.strip_prefix("file://") else {
+        return uri.to_string();
+    };
+    let decoded = percent_decode_uri_path(rest);
+    let path = PathBuf::from(decoded);
+    path.strip_prefix(root)
+        .unwrap_or(path.as_path())
+        .display()
+        .to_string()
+}
+
+fn percent_decode_uri_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn collect_lsp_diagnostics(value: &Value, root: &Path, out: &mut Vec<WorkflowDiagnostic>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(method) = map.get("method").and_then(Value::as_str)
+                && method == "textDocument/publishDiagnostics"
+                && let Some(params) = map.get("params")
+            {
+                let uri = params["uri"].as_str().unwrap_or("");
+                let file = file_uri_to_display_path(uri, root);
+                if let Some(items) = params["diagnostics"].as_array() {
+                    for item in items {
+                        let range = &item["range"]["start"];
+                        let line = range["line"].as_u64().map(|v| v + 1);
+                        let character = range["character"].as_u64().map(|v| v + 1);
+                        let severity = lsp_severity_label(item["severity"].as_u64()).to_string();
+                        let code = lsp_code_to_string(&item["code"]);
+                        let message = item["message"]
+                            .as_str()
+                            .unwrap_or("")
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if !message.is_empty() {
+                            out.push(WorkflowDiagnostic {
+                                file: file.clone(),
+                                line,
+                                character,
+                                severity,
+                                code,
+                                message,
+                            });
+                        }
+                    }
+                }
+            }
+            for child in map.values() {
+                collect_lsp_diagnostics(child, root, out);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_lsp_diagnostics(child, root, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+fn parse_lsp_diagnostics_from_json_lines(output: &str, root: &Path) -> Vec<WorkflowDiagnostic> {
+    let mut out = Vec::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('{'))
+    {
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            collect_lsp_diagnostics(&value, root, &mut out);
+        }
+    }
+    out
+}
+
+fn render_workflow_diagnostics(report: &WorkflowDiagnosticsReport, cap: usize) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let (errors, warnings) = workflow_diagnostic_counts(&report.diagnostics);
+    let _ = writeln!(
+        out,
+        "diagnostics: {} via {} (errors={errors}, warnings={warnings}, total={}, {}ms)",
+        report.status,
+        report.source,
+        report.diagnostics.len(),
+        millis_u64(report.duration)
+    );
+    append_middle_truncated_diagnostics(&mut out, &report.diagnostics, 20);
+    if report.diagnostics.is_empty() && !report.raw_output.trim().is_empty() {
+        out.push_str("raw output:\n");
+        out.push_str(&cap_bytes_with_hint(
+            report.raw_output.clone(),
+            cap / 2,
+            "raw diagnostics output trimmed.",
+        ));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    cap_bytes_with_hint(out, cap, "diagnostics output trimmed.")
+}
+
+fn workflow_diagnostic_summary(report: &WorkflowDiagnosticsReport) -> String {
+    if let Some(first) = report.diagnostics.first() {
+        format!(
+            "{}{} {}",
+            first.file,
+            first
+                .line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default(),
+            summarize_inline(&first.message, 100)
+        )
+    } else if report.raw_output.trim().is_empty() {
+        "no diagnostics".to_string()
+    } else {
+        summarize_inline(report.raw_output.trim(), 120)
+    }
+}
+
+fn percent_encode_uri_path(raw: &str) -> String {
+    let mut out = String::new();
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' | b':' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn file_uri_from_path(path: &Path) -> String {
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let display = absolute.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        format!(
+            "file:///{}",
+            percent_encode_uri_path(display.trim_start_matches('/'))
+        )
+    } else {
+        format!("file://{}", percent_encode_uri_path(&display))
+    }
+}
+
+fn write_lsp_message<W: Write>(writer: &mut W, value: &Value) -> std::io::Result<()> {
+    let body = value.to_string();
+    write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
+    writer.flush()
+}
+
+fn read_lsp_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(raw) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = raw.trim().parse::<usize>().ok();
+        }
+    }
+    let Some(len) = content_length else {
+        return Ok(None);
+    };
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(Some(String::from_utf8_lossy(&body).to_string()))
+}
+
+fn rust_analyzer_unavailable_output(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("unknown binary 'rust-analyzer'")
+        || lower.contains("unknown binary `rust-analyzer`")
+        || lower.contains("unrecognized subcommand")
+        || lower.contains("failed to spawn rust-analyzer")
+}
+
+fn rust_analyzer_command() -> Option<Command> {
+    find_binary_on_path("rust-analyzer").map(Command::new)
+}
+
+fn collect_rust_files_for_diagnostics(dir: &Path, out: &mut Vec<PathBuf>, max_files: usize) {
+    if out.len() >= max_files {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    for path in entries {
+        if out.len() >= max_files {
+            return;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if matches!(name, "target" | ".git" | ".wolf" | ".pi") {
+            continue;
+        }
+        if path.is_dir() {
+            collect_rust_files_for_diagnostics(&path, out, max_files);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn rust_files_for_diagnostics(root: &Path, max_files: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_rust_files_for_diagnostics(&root.join("src"), &mut out, max_files);
+    if out.is_empty() {
+        collect_rust_files_for_diagnostics(root, &mut out, max_files);
+    }
+    out
+}
+
+fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsReport> {
+    if !root.join("Cargo.toml").exists() {
+        return None;
+    }
+
+    let started = std::time::Instant::now();
+    let mut cmd = rust_analyzer_command()?;
+    cmd.current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_std_process_group(&mut cmd);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return None,
+    };
+    let child_pid = child.id();
+
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    let mut stdin = child.stdin.take()?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        while let Ok(Some(body)) = read_lsp_message(&mut reader) {
+            if tx.send(body).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr_handle =
+        std::thread::spawn(move || collect_sync_limited(stderr, PROCESS_STREAM_CAPTURE_CAP));
+
+    let root_uri = file_uri_from_path(root);
+    let workspace_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "workspaceFolders": [{"uri": root_uri, "name": workspace_name}],
+            "capabilities": {}
+        }
+    });
+    if write_lsp_message(&mut stdin, &init).is_err()
+        || write_lsp_message(
+            &mut stdin,
+            &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+        )
+        .is_err()
+    {
+        terminate_std_child(&mut child);
+        return None;
+    }
+    for path in rust_files_for_diagnostics(root, 64) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let uri = file_uri_from_path(&path);
+            let _ = write_lsp_message(
+                &mut stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "textDocument/didOpen",
+                    "params": {
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "rust",
+                            "version": 1,
+                            "text": text
+                        }
+                    }
+                }),
+            );
+        }
+    }
+
+    let timeout = timeout_from_env("WOLF_LSP_DIAGNOSTICS_TIMEOUT_SECS", 20);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut diagnostics = Vec::new();
+    let mut capture = LimitedTextCapture::new(PROCESS_STREAM_CAPTURE_CAP);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(body) => {
+                let _ = capture.try_push_unit(&body);
+                let _ = capture.try_push_unit("\n");
+                if let Ok(value) = serde_json::from_str::<Value>(&body) {
+                    collect_lsp_diagnostics(&value, root, &mut diagnostics);
+                }
+                if !diagnostics.is_empty() && started.elapsed() > std::time::Duration::from_secs(2)
+                {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = write_lsp_message(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "shutdown"}),
+    );
+    let _ = write_lsp_message(&mut stdin, &json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    terminate_process_group_after_exit(child_pid);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stdout_handle.join();
+    let stderr = stderr_handle
+        .join()
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .render("rust-analyzer stderr");
+    let mut raw_output = capture.finish("raw LSP output trimmed.");
+    if !stderr.trim().is_empty() {
+        raw_output.push_str("--- stderr ---\n");
+        raw_output.push_str(&stderr);
+    }
+    if rust_analyzer_unavailable_output(&raw_output) {
+        return None;
+    }
+    let diagnostics = rank_dedupe_workflow_diagnostics(diagnostics);
+    let status = if diagnostics.iter().any(|d| d.severity == "error") {
+        "failed"
+    } else {
+        "passed"
+    };
+    Some(WorkflowDiagnosticsReport {
+        source: "rust-analyzer-lsp".to_string(),
+        status: status.to_string(),
+        diagnostics,
+        raw_output,
+        duration: started.elapsed(),
+    })
+}
+
+fn run_cargo_check_diagnostics(root: &Path) -> WorkflowDiagnosticsReport {
+    let started = std::time::Instant::now();
+    let mut cmd = Command::new("cargo");
+    cmd.args(["check", "--message-format=json", "--quiet"])
+        .current_dir(root);
+    let result = run_sync_command_limited(
+        cmd,
+        None,
+        PROCESS_STREAM_CAPTURE_CAP,
+        "cargo check diagnostics",
+        std::time::Duration::from_secs(120),
+    );
+    match result {
+        Ok((stdout, stderr, code)) => {
+            let raw = merge_process_output_with_status(
+                stdout.render("cargo check stdout"),
+                stderr.render("cargo check stderr"),
+                code,
+            );
+            WorkflowDiagnosticsReport {
+                source: "cargo check".to_string(),
+                status: if code == 0 { "passed" } else { "failed" }.to_string(),
+                diagnostics: parse_cargo_json_diagnostics(&raw, root),
+                raw_output: raw,
+                duration: started.elapsed(),
+            }
+        }
+        Err(err) => WorkflowDiagnosticsReport {
+            source: "cargo check".to_string(),
+            status: "failed".to_string(),
+            diagnostics: parse_cargo_json_diagnostics(&err, root),
+            raw_output: err,
+            duration: started.elapsed(),
+        },
+    }
+}
+
+fn workflow_diagnostic_location(diagnostic: &WorkflowDiagnostic) -> String {
+    match (diagnostic.line, diagnostic.character) {
+        (Some(line), Some(character)) => format!("{}:{line}:{character}", diagnostic.file),
+        (Some(line), None) => format!("{}:{line}", diagnostic.file),
+        _ => diagnostic.file.clone(),
+    }
+}
+
+fn workflow_diagnostic_rank(diagnostic: &WorkflowDiagnostic) -> usize {
+    match diagnostic.severity.as_str() {
+        "error" => 0,
+        "warning" => 1,
+        "info" => 2,
+        "hint" => 3,
+        _ => 4,
+    }
+}
+
+fn rank_dedupe_workflow_diagnostics(
+    diagnostics: Vec<WorkflowDiagnostic>,
+) -> Vec<WorkflowDiagnostic> {
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for (idx, diagnostic) in diagnostics.into_iter().enumerate() {
+        let key = (
+            diagnostic.file.clone(),
+            diagnostic.line,
+            diagnostic.character,
+            diagnostic.severity.clone(),
+            diagnostic.code.clone(),
+            diagnostic.message.clone(),
+        );
+        if seen.insert(key) {
+            items.push((idx, diagnostic));
+        }
+    }
+    items.sort_by(|(idx_a, a), (idx_b, b)| {
+        workflow_diagnostic_rank(a)
+            .cmp(&workflow_diagnostic_rank(b))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.character.cmp(&b.character))
+            .then_with(|| a.code.cmp(&b.code))
+            .then_with(|| idx_a.cmp(idx_b))
+    });
+    items
+        .into_iter()
+        .map(|(_, diagnostic)| diagnostic)
+        .collect()
+}
+
+fn workflow_diagnostic_counts(diagnostics: &[WorkflowDiagnostic]) -> (usize, usize) {
+    let errors = diagnostics.iter().filter(|d| d.severity == "error").count();
+    let warnings = diagnostics
+        .iter()
+        .filter(|d| d.severity == "warning")
+        .count();
+    (errors, warnings)
+}
+
+fn render_workflow_diagnostic_line(diagnostic: &WorkflowDiagnostic) -> String {
+    let code = diagnostic
+        .code
+        .as_ref()
+        .map(|code| format!(" [{code}]"))
+        .unwrap_or_default();
+    format!(
+        "- {}{}: {} — {}\n",
+        diagnostic.severity,
+        code,
+        workflow_diagnostic_location(diagnostic),
+        summarize_inline(&diagnostic.message, 180)
+    )
+}
+
+fn append_middle_truncated_diagnostics(
+    out: &mut String,
+    diagnostics: &[WorkflowDiagnostic],
+    limit: usize,
+) {
+    use std::fmt::Write as _;
+
+    if limit == 0 || diagnostics.is_empty() {
+        return;
+    }
+    if diagnostics.len() <= limit {
+        for diagnostic in diagnostics {
+            out.push_str(&render_workflow_diagnostic_line(diagnostic));
+        }
+        return;
+    }
+    let head = limit.div_ceil(2);
+    let tail = limit.saturating_sub(head);
+    for diagnostic in diagnostics.iter().take(head) {
+        out.push_str(&render_workflow_diagnostic_line(diagnostic));
+    }
+    let omitted = diagnostics.len().saturating_sub(head + tail);
+    let _ = writeln!(out, "- … {omitted} diagnostics omitted from middle");
+    if tail > 0 {
+        for diagnostic in diagnostics
+            .iter()
+            .skip(diagnostics.len().saturating_sub(tail))
+        {
+            out.push_str(&render_workflow_diagnostic_line(diagnostic));
+        }
+    }
+}
+
+fn parse_cargo_json_diagnostics(output: &str, root: &Path) -> Vec<WorkflowDiagnostic> {
+    let mut out = Vec::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('{'))
+    {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value["reason"].as_str() != Some("compiler-message") {
+            continue;
+        }
+        let msg = &value["message"];
+        let level = msg["level"].as_str().unwrap_or("unknown");
+        if !matches!(level, "error" | "warning") {
+            continue;
+        }
+        let code = msg["code"]["code"].as_str().map(String::from);
+        let message = msg["message"].as_str().unwrap_or("").trim().to_string();
+        let span = msg["spans"].as_array().and_then(|spans| {
+            spans
+                .iter()
+                .find(|span| span["is_primary"].as_bool().unwrap_or(false))
+                .or_else(|| spans.first())
+        });
+        let (file, line, character) = if let Some(span) = span {
+            let path = span["file_name"].as_str().unwrap_or("");
+            let display = if path.is_empty() {
+                "?".to_string()
+            } else {
+                let path = Path::new(path);
+                if path.is_absolute() {
+                    display_path_relative(path, root)
+                } else {
+                    path.display().to_string()
+                }
+            };
+            (
+                display,
+                span["line_start"].as_u64(),
+                span["column_start"].as_u64(),
+            )
+        } else {
+            ("?".to_string(), None, None)
+        };
+        if !message.is_empty() {
+            out.push(WorkflowDiagnostic {
+                file,
+                line,
+                character,
+                severity: level.to_string(),
+                code,
+                message,
+            });
+        }
+    }
+    rank_dedupe_workflow_diagnostics(out)
+}
+
+fn render_cargo_json_diagnostics_summary(output: &str, root: &Path) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let diagnostics = parse_cargo_json_diagnostics(output, root);
+    if diagnostics.is_empty() {
+        return None;
+    }
+    let (errors, warnings) = workflow_diagnostic_counts(&diagnostics);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "cargo diagnostics summary (--message-format=json, ranked/deduped): errors={errors}, warnings={warnings}, total={}",
+        diagnostics.len()
+    );
+    append_middle_truncated_diagnostics(&mut out, &diagnostics, CARGO_DIAGNOSTIC_SUMMARY_LIMIT);
+    Some(out)
+}
+
+fn prepend_cargo_json_diagnostics_summary(output: String, root: &Path) -> String {
+    match render_cargo_json_diagnostics_summary(&output, root) {
+        Some(summary) => format!("{summary}\n{output}"),
+        None => output,
+    }
+}
+
+fn run_workflow_diagnostics(root: &Path) -> WorkflowDiagnosticsReport {
+    run_rust_analyzer_diagnostics(root).unwrap_or_else(|| run_cargo_check_diagnostics(root))
+}
+
 fn is_ident_continue(ch: char) -> bool {
     ch == '_' || ch.is_alphanumeric()
 }
@@ -4433,6 +5128,267 @@ fn source_line_at<'a>(content: &'a str, starts: &[usize], idx: usize) -> Option<
     let line = &content[start..end];
     let line = line.strip_suffix('\n').unwrap_or(line);
     Some(line.strip_suffix('\r').unwrap_or(line))
+}
+
+fn display_path_relative(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn source_line_col_for_byte(content: &str, starts: &[usize], byte_idx: usize) -> (usize, usize) {
+    if starts.is_empty() {
+        return (1, 1);
+    }
+    let byte_idx = byte_idx.min(content.len());
+    let line_idx = starts
+        .partition_point(|start| *start <= byte_idx)
+        .saturating_sub(1)
+        .min(starts.len().saturating_sub(1));
+    let column = content[starts[line_idx]..byte_idx].chars().count() + 1;
+    (line_idx + 1, column)
+}
+
+fn render_old_string_match_locations(
+    path: &Path,
+    root: &Path,
+    content: &str,
+    old: &str,
+    count: usize,
+) -> String {
+    use std::fmt::Write as _;
+
+    let display = display_path_relative(path, root);
+    let starts = source_line_starts(content);
+    let mut capture = LimitedTextCapture::new(EDIT_MATCH_CONTEXT_CAP);
+    capture.try_push_unit(&format!(
+        "old_string appears {count} times in {} — must be unique\n",
+        path.display()
+    ));
+    if starts.is_empty() {
+        return capture.finish("Retry with a non-empty unique old_string.");
+    }
+
+    let mut shown = 0usize;
+    for (match_idx, (byte_idx, _)) in content
+        .match_indices(old)
+        .take(EDIT_MATCH_DISPLAY_LIMIT)
+        .enumerate()
+    {
+        let (line_no, column) = source_line_col_for_byte(content, &starts, byte_idx);
+        let line_idx = line_no.saturating_sub(1);
+        let start = line_idx.saturating_sub(EDIT_MATCH_CONTEXT_LINES);
+        let end = line_idx
+            .saturating_add(EDIT_MATCH_CONTEXT_LINES)
+            .min(starts.len().saturating_sub(1));
+        let mut block = String::new();
+        let _ = writeln!(
+            block,
+            "match {}: {display}:{line_no}:{column}",
+            match_idx + 1
+        );
+        for idx in start..=end {
+            if let Some(line) = source_line_at(content, &starts, idx) {
+                let marker = if idx == line_idx { '>' } else { ' ' };
+                let _ = writeln!(block, "{marker} {}\t{line}", idx + 1);
+            }
+        }
+        if !capture.try_push_unit(&block) {
+            break;
+        }
+        shown += 1;
+    }
+    if count > shown {
+        let _ = capture.try_push_unit(&format!("… {} more matches not shown\n", count - shown));
+    }
+    capture.finish(
+        "Use read_file around a listed location, then retry with a larger unique old_string.",
+    )
+}
+
+fn identifier_prefix(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("r#") {
+        let mut end = 0usize;
+        for (idx, ch) in rest.char_indices() {
+            if is_ident_continue(ch) {
+                end = idx + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        return (end > 0).then(|| &trimmed[..2 + end]);
+    }
+
+    let mut end = 0usize;
+    for (idx, ch) in trimmed.char_indices() {
+        if is_ident_continue(ch) {
+            end = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (end > 0).then(|| &trimmed[..end])
+}
+
+fn symbol_candidates_for_line(line: &str) -> Vec<(String, &'static str)> {
+    let trimmed = strip_decl_qualifiers(line);
+    let mut out = Vec::new();
+    if let Some(rest) = keyword_rest(trimmed, "const") {
+        if let Some(fn_rest) = keyword_rest(rest, "fn") {
+            if let Some(name) = identifier_prefix(fn_rest) {
+                out.push((name.to_string(), "fn"));
+            }
+            return out;
+        }
+        if let Some(name) = identifier_prefix(rest) {
+            out.push((name.to_string(), "const"));
+        }
+        return out;
+    }
+    if let Some(rest) = keyword_rest(trimmed, "static") {
+        if let Some(name) = identifier_prefix(rest) {
+            out.push((name.to_string(), "static"));
+        }
+        return out;
+    }
+    for (keyword, kind) in [
+        ("fn", "fn"),
+        ("struct", "struct"),
+        ("enum", "enum"),
+        ("trait", "trait"),
+        ("type", "type"),
+        ("mod", "mod"),
+        ("class", "class"),
+        ("def", "def"),
+        ("function", "function"),
+        ("interface", "interface"),
+    ] {
+        if let Some(rest) = keyword_rest(trimmed, keyword) {
+            if let Some(name) = identifier_prefix(rest) {
+                out.push((name.to_string(), kind));
+            }
+            return out;
+        }
+    }
+    out
+}
+
+#[derive(Debug)]
+struct SymbolSuggestion {
+    name: String,
+    kind: &'static str,
+    line: usize,
+    preview: String,
+    score: usize,
+}
+
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+fn is_subsequence(query: &str, candidate: &str) -> bool {
+    let mut chars = candidate.chars();
+    query.chars().all(|q| chars.by_ref().any(|c| c == q))
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count()
+}
+
+fn fuzzy_symbol_score(query: &str, candidate: &str) -> Option<usize> {
+    let query = query.trim().to_ascii_lowercase();
+    let candidate = candidate.trim().to_ascii_lowercase();
+    if query.is_empty() || candidate.is_empty() {
+        return None;
+    }
+    if query == candidate {
+        return Some(0);
+    }
+    if candidate.starts_with(&query) {
+        return Some(10 + candidate.len().saturating_sub(query.len()));
+    }
+    if candidate.contains(&query) {
+        return Some(30 + candidate.len().saturating_sub(query.len()));
+    }
+    let distance = levenshtein_distance(&query, &candidate);
+    let max_len = query.chars().count().max(candidate.chars().count());
+    if distance <= (max_len / 3).max(2) {
+        return Some(50 + distance * 4 + candidate.len().abs_diff(query.len()));
+    }
+    if is_subsequence(&query, &candidate) {
+        return Some(90 + candidate.len().saturating_sub(query.len()));
+    }
+    let prefix = common_prefix_len(&query, &candidate);
+    if prefix >= 3 || prefix * 2 >= query.chars().count().min(candidate.chars().count()) {
+        return Some(
+            120usize
+                .saturating_sub(prefix)
+                .saturating_add(candidate.len().abs_diff(query.len())),
+        );
+    }
+    None
+}
+
+fn render_symbol_not_found_suggestions(
+    path: &Path,
+    root: &Path,
+    content: &str,
+    starts: &[usize],
+    symbol: &str,
+) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let display = display_path_relative(path, root);
+    let mut suggestions = Vec::new();
+    for idx in 0..starts.len() {
+        let line = source_line_at(content, starts, idx)?;
+        for (name, kind) in symbol_candidates_for_line(line) {
+            if let Some(score) = fuzzy_symbol_score(symbol, &name) {
+                suggestions.push(SymbolSuggestion {
+                    name,
+                    kind,
+                    line: idx + 1,
+                    preview: summarize_inline(line.trim(), 100),
+                    score,
+                });
+            }
+        }
+    }
+    suggestions.sort_by(|a, b| {
+        a.score
+            .cmp(&b.score)
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let mut seen = HashSet::new();
+    suggestions.retain(|s| seen.insert((s.name.clone(), s.line)));
+    if suggestions.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("Did you mean:\n");
+    for suggestion in suggestions.into_iter().take(READ_SYMBOL_SUGGESTION_LIMIT) {
+        let _ = writeln!(
+            out,
+            "- {} @ {display}:{} ({}) — {}",
+            suggestion.name, suggestion.line, suggestion.kind, suggestion.preview
+        );
+    }
+    Some(out)
 }
 
 fn item_start_for_open_brace(content: &str, starts: &[usize], open_line: usize) -> Option<usize> {
@@ -4848,8 +5804,11 @@ fn execute_tool_with_cache(
                 let Some(window) = find_symbol_window(&content, &starts, symbol, context) else {
                     let hint = tool_policy::tool_input_advisory("read_symbol", &input)
                         .unwrap_or_else(|| format!("Search first with rg -n '{symbol}' {}, then retry read_symbol with an exact symbol or line.", path.display()));
+                    let suggestions =
+                        render_symbol_not_found_suggestions(&path, root, &content, &starts, symbol)
+                            .unwrap_or_default();
                     return Err(format!(
-                        "symbol '{symbol}' not found in {}\n{hint}",
+                        "symbol '{symbol}' not found in {}\n{suggestions}{hint}",
                         path.display()
                     ));
                 };
@@ -4890,9 +5849,8 @@ fn execute_tool_with_cache(
                 return Err(format!("old_string not found in {}", path.display()));
             }
             if count > 1 {
-                return Err(format!(
-                    "old_string appears {count} times in {} — must be unique",
-                    path.display()
+                return Err(render_old_string_match_locations(
+                    &path, root, &content, old, count,
                 ));
             }
             let updated = content.replacen(old, new, 1);
@@ -4925,7 +5883,8 @@ fn execute_tool_with_cache(
                     }
                     if count > 1 {
                         return Err(format!(
-                            "edit[{i}]: old_string appears {count} times — set replace_all or make it unique"
+                            "edit[{i}]: {}",
+                            render_old_string_match_locations(&path, root, &content, old, count)
                         ));
                     }
                     content = content.replacen(old, new, 1);
@@ -5103,7 +6062,7 @@ async fn execute_bash_async_with_timeout(
     }
     body.push_str("--- stderr ---\n");
     body.push_str(&stderr);
-    Ok(body)
+    Ok(prepend_cargo_json_diagnostics_summary(body, root))
 }
 
 async fn execute_external_async(
@@ -5879,7 +6838,18 @@ struct WorkLedger {
     steering: Vec<String>,
     files_changed: Vec<String>,
     verification: Vec<VerificationRecord>,
+    diagnostics: Vec<WorkflowDiagnosticRecord>,
     next_actions: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct WorkflowDiagnosticRecord {
+    source: String,
+    status: String,
+    summary: String,
+    errors: usize,
+    warnings: usize,
+    duration_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -6065,6 +7035,20 @@ fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
                     .as_ref()
                     .map(|a| format!(" artifact={a}"))
                     .unwrap_or_default()
+            ));
+        }
+    }
+    if !ledger.diagnostics.is_empty() {
+        out.push_str("diagnostics:\n");
+        for record in ledger.diagnostics.iter().rev().take(4).rev() {
+            out.push_str(&format!(
+                "- {}: {} errors={} warnings={} ({}ms) {}\n",
+                record.source,
+                record.status,
+                record.errors,
+                record.warnings,
+                record.duration_ms,
+                record.summary.trim()
             ));
         }
     }
@@ -13002,6 +13986,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
+                "  /diagnostics              run rust-analyzer diagnostics (fallback: cargo check)"
+            );
+            let _ = writeln!(
+                w,
                 "  /save <name>              write history + config to sessions dir as JSONL"
             );
             let _ = writeln!(
@@ -13640,6 +14628,39 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "tokens" => {
             let report = render_tokens_report(&agent.history);
             let _ = write!(w, "{report}");
+        }
+        "diagnostics" | "diag" => {
+            let report = run_workflow_diagnostics(&agent.sandbox_root);
+            let errors = report
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == "error")
+                .count();
+            let warnings = report
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == "warning")
+                .count();
+            agent
+                .work_ledger
+                .diagnostics
+                .push(WorkflowDiagnosticRecord {
+                    source: report.source.clone(),
+                    status: report.status.clone(),
+                    summary: workflow_diagnostic_summary(&report),
+                    errors,
+                    warnings,
+                    duration_ms: millis_u64(report.duration),
+                });
+            if agent.work_ledger.diagnostics.len() > 12 {
+                let excess = agent.work_ledger.diagnostics.len() - 12;
+                agent.work_ledger.diagnostics.drain(0..excess);
+            }
+            let _ = write!(
+                w,
+                "{}",
+                render_workflow_diagnostics(&report, SLASH_TEXT_CAP)
+            );
         }
         "save" => {
             if arg.is_empty() {

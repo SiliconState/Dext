@@ -32,6 +32,16 @@ fn temp_test_dir(label: &str) -> PathBuf {
     dir
 }
 
+fn prepend_env_path(path: &Path) -> String {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts = vec![path.to_path_buf()];
+    parts.extend(std::env::split_paths(&existing));
+    std::env::join_paths(parts)
+        .expect("join PATH")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn test_agent(root: &Path) -> Agent {
     Agent {
         client: Arc::new(OnceLock::new()),
@@ -1215,6 +1225,154 @@ fn slash_fangs_emits_profile_update_for_tui_status() {
 }
 
 #[test]
+fn lsp_diagnostics_parser_extracts_publish_diagnostics() {
+    let root = temp_test_dir("lsp-diagnostics-parser");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let uri = format!("file://{}/src/lib.rs", root.display());
+    let line = json!({
+        "method": "textDocument/publishDiagnostics",
+        "params": {
+            "uri": uri,
+            "diagnostics": [{
+                "range": {"start": {"line": 2, "character": 4}},
+                "severity": 1,
+                "code": "E0425",
+                "message": "cannot find value `x` in this scope\nextra detail"
+            }]
+        }
+    })
+    .to_string();
+
+    let diagnostics = parse_lsp_diagnostics_from_json_lines(&line, &root);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].file, "src/lib.rs");
+    assert_eq!(diagnostics[0].line, Some(3));
+    assert_eq!(diagnostics[0].character, Some(5));
+    assert_eq!(diagnostics[0].severity, "error");
+    assert_eq!(diagnostics[0].code.as_deref(), Some("E0425"));
+    assert_eq!(
+        diagnostics[0].message,
+        "cannot find value `x` in this scope"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cargo_json_diagnostics_parser_extracts_primary_span() {
+    let root = temp_test_dir("cargo-diagnostics-parser");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let line = json!({
+        "reason": "compiler-message",
+        "message": {
+            "level": "error",
+            "message": "mismatched types",
+            "code": {"code": "E0308"},
+            "spans": [{
+                "file_name": "src/main.rs",
+                "line_start": 10,
+                "column_start": 7,
+                "is_primary": true
+            }]
+        }
+    })
+    .to_string();
+
+    let diagnostics = parse_cargo_json_diagnostics(&line, &root);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].file, "src/main.rs");
+    assert_eq!(diagnostics[0].line, Some(10));
+    assert_eq!(diagnostics[0].character, Some(7));
+    assert_eq!(diagnostics[0].severity, "error");
+    assert_eq!(diagnostics[0].code.as_deref(), Some("E0308"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cargo_json_diagnostics_summary_ranks_and_dedupes() {
+    let root = temp_test_dir("cargo-diagnostics-summary");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let warning = json!({
+        "reason": "compiler-message",
+        "message": {
+            "level": "warning",
+            "message": "unused variable",
+            "code": {"code": "unused_variables"},
+            "spans": [{
+                "file_name": "src/lib.rs",
+                "line_start": 20,
+                "column_start": 9,
+                "is_primary": true
+            }]
+        }
+    })
+    .to_string();
+    let error = json!({
+        "reason": "compiler-message",
+        "message": {
+            "level": "error",
+            "message": "mismatched types",
+            "code": {"code": "E0308"},
+            "spans": [{
+                "file_name": "src/main.rs",
+                "line_start": 10,
+                "column_start": 7,
+                "is_primary": true
+            }]
+        }
+    })
+    .to_string();
+    let output = format!("{warning}\n{error}\n{error}\n");
+
+    let summary = render_cargo_json_diagnostics_summary(&output, &root).expect("summary");
+    assert!(summary.contains("errors=1"), "{summary}");
+    assert!(summary.contains("warnings=1"), "{summary}");
+    assert!(summary.contains("total=2"), "{summary}");
+    assert!(
+        summary.find("- error [E0308]").unwrap()
+            < summary.find("- warning [unused_variables]").unwrap(),
+        "{summary}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn workflow_diagnostics_render_and_ledger_are_prompt_visible() {
+    let report = WorkflowDiagnosticsReport {
+        source: "rust-analyzer".to_string(),
+        status: "failed".to_string(),
+        diagnostics: vec![WorkflowDiagnostic {
+            file: "src/lib.rs".to_string(),
+            line: Some(1),
+            character: Some(2),
+            severity: "error".to_string(),
+            code: Some("E0001".to_string()),
+            message: "bad thing".to_string(),
+        }],
+        raw_output: String::new(),
+        duration: std::time::Duration::from_millis(12),
+    };
+    let rendered = render_workflow_diagnostics(&report, 2_000);
+    assert!(rendered.contains("via rust-analyzer"), "{rendered}");
+    assert!(rendered.contains("src/lib.rs:1:2"), "{rendered}");
+
+    let mut ledger = WorkLedger::default();
+    ledger.diagnostics.push(WorkflowDiagnosticRecord {
+        source: report.source.clone(),
+        status: report.status.clone(),
+        summary: workflow_diagnostic_summary(&report),
+        errors: 1,
+        warnings: 0,
+        duration_ms: millis_u64(report.duration),
+    });
+    let prompt = render_work_ledger_prompt(&ledger);
+    assert!(prompt.contains("diagnostics:"), "{prompt}");
+    assert!(prompt.contains("errors=1"), "{prompt}");
+}
+
+#[test]
 fn privacy_redacts_sensitive_tool_output_and_blocks_secret_paths() {
     let root = temp_test_dir("privacy-policy");
     let mut agent = test_agent(&root);
@@ -1666,6 +1824,28 @@ fn read_symbol_line_mode_returns_enclosing_block_without_extra_allocations() {
     assert!(out.contains("7\t}"), "{out}");
     assert!(!out.contains("1\tfn before"), "{out}");
     assert!(!out.contains("9\tfn after"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_not_found_suggests_nearby_symbols() {
+    let root = temp_test_dir("read-symbol-suggestions");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("lib.rs"),
+        "fn load_provider_catalog() {}\nfn render_provider_picker() {}\nstruct ProviderState;\n",
+    )
+    .expect("write source");
+
+    let err = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "load_provider_catlog"}),
+        &root,
+    )
+    .expect_err("missing symbol should suggest neighbors");
+    assert!(err.contains("Did you mean:"), "{err}");
+    assert!(err.contains("load_provider_catalog @ lib.rs:1"), "{err}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3217,6 +3397,40 @@ fn subagent_detached_request_paths_are_project_scoped() {
 }
 
 #[test]
+fn current_wolf_executable_falls_back_to_path_when_current_exe_missing() {
+    let _guard = env_lock();
+    let root = temp_test_dir("wolf-exe-path-fallback");
+    let bin_dir = root.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let wolf_path = bin_dir.join("wolf");
+    std::fs::write(&wolf_path, "#!/bin/sh\nexit 0\n").expect("write fake wolf");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&wolf_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&wolf_path, perms).unwrap();
+    }
+    let old_path = std::env::var_os("PATH");
+    unsafe {
+        std::env::set_var("PATH", prepend_env_path(&bin_dir));
+    }
+
+    let missing_exe = root.join("missing-current-exe");
+    let found = current_wolf_executable_from(missing_exe).expect("PATH wolf fallback");
+    assert_eq!(found, wolf_path);
+
+    unsafe {
+        if let Some(old_path) = old_path {
+            std::env::set_var("PATH", old_path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn subagent_worker_renders_report_with_quality_gate() {
     let report = SubagentRunReport {
         task: "research".to_string(),
@@ -4218,6 +4432,43 @@ fn process_output_warns_on_suspicious_stderr_with_success_status() {
     assert!(out.contains("command not found"), "{out}");
 }
 
+#[tokio::test]
+async fn bash_prepends_cargo_json_diagnostics_summary() {
+    let root = temp_test_dir("bash-cargo-json-summary");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let line = json!({
+        "reason": "compiler-message",
+        "message": {
+            "level": "error",
+            "message": "mismatched types",
+            "code": {"code": "E0308"},
+            "spans": [{
+                "file_name": "src/main.rs",
+                "line_start": 10,
+                "column_start": 7,
+                "is_primary": true
+            }]
+        }
+    })
+    .to_string();
+    let escaped = serde_json::to_string(&line).unwrap();
+
+    let out = execute_bash_async_with_timeout(
+        &format!("printf '%s\\n' {escaped}"),
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("bash should succeed");
+
+    assert!(out.starts_with("cargo diagnostics summary"), "{out}");
+    assert!(out.contains("- error [E0308]: src/main.rs:10:7"), "{out}");
+    assert!(out.contains("exit: 0"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn git_diff_tool_builds_correct_args() {
     let root = temp_test_dir("git-diff-args");
@@ -4260,6 +4511,52 @@ fn edit_file_returns_diff_and_summary() {
     assert!(out.contains("-world"), "{out}");
     assert!(out.contains("+wolf"), "{out}");
     assert!(out.contains("edited "), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn edit_file_non_unique_error_returns_match_locations() {
+    let root = temp_test_dir("edit-file-non-unique");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let path = root.join("note.txt");
+    std::fs::write(&path, "alpha\nneedle\nbeta\nneedle\ngamma\n").unwrap();
+
+    let err = execute_tool(
+        "edit_file",
+        &json!({"path": "note.txt", "old_string": "needle", "new_string": "wolf"}),
+        &root,
+    )
+    .expect_err("edit_file should reject non-unique old_string");
+
+    assert!(err.contains("old_string appears 2 times"), "{err}");
+    assert!(err.contains("match 1: note.txt:2:1"), "{err}");
+    assert!(err.contains("match 2: note.txt:4:1"), "{err}");
+    assert!(err.contains("> 2\tneedle"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn multi_edit_non_unique_error_returns_match_locations() {
+    let root = temp_test_dir("multi-edit-non-unique");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let path = root.join("note.txt");
+    std::fs::write(&path, "alpha\nneedle\nbeta\nneedle\ngamma\n").unwrap();
+
+    let err = execute_tool(
+        "multi_edit",
+        &json!({
+            "path": "note.txt",
+            "edits": [{"old_string": "needle", "new_string": "wolf"}]
+        }),
+        &root,
+    )
+    .expect_err("multi_edit should reject non-unique old_string");
+
+    assert!(err.contains("edit[0]: old_string appears 2 times"), "{err}");
+    assert!(err.contains("match 1: note.txt:2:1"), "{err}");
+    assert!(err.contains("match 2: note.txt:4:1"), "{err}");
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
