@@ -10,6 +10,34 @@ pub(crate) struct Tool {
     pub(crate) input_schema: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeTool {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlashCommand {
+    pub(crate) name: &'static str,
+    pub(crate) usage: &'static str,
+    pub(crate) description: &'static str,
+}
+
+pub(crate) fn runtime_tool_definitions() -> Vec<RuntimeTool> {
+    vec![RuntimeTool {
+        name: "subagent-worker",
+        description: "Run a detached subagent worker from an input file into one output bundle.",
+    }]
+}
+
+pub(crate) fn slash_command_definitions() -> Vec<SlashCommand> {
+    vec![SlashCommand {
+        name: "subagent",
+        usage: "/subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]",
+        description: "Run a user-requested worker while keeping delegation out of provider-visible tools.",
+    }]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ToolProfile {
@@ -42,7 +70,7 @@ impl ToolProfile {
     }
 }
 
-pub(crate) fn tool_definitions() -> Vec<Tool> {
+pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
     vec![
         Tool {
             name: "read_file",
@@ -219,20 +247,6 @@ pub(crate) fn tool_definitions() -> Vec<Tool> {
             }),
         },
         Tool {
-            name: "subagent",
-            description: "Delegate a self-contained task to a detached worker. User-invoked /subagent opens tmux/new terminal when available (else background process) and writes a report path; parent stays in control. In model tool calls, subagent is explicit-user only and returns guidance to use /subagent.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "The full task description for the subagent. Must be self-contained."},
-                    "system": {"type": "string", "description": "Optional system prompt override. Default is a terse worker prompt."},
-                    "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional whitelist of tool names. Default: inherited full toolset except recursive subagent."},
-                    "max_iterations": {"type": "number", "description": "Optional maximum tool-use cycles. Omit for no subagent-specific iteration cap."}
-                },
-                "required": ["task"]
-            }),
-        },
-        Tool {
             name: "git_diff",
             description: "Show git diff for the repo. Returns staged, unstaged, or a specific commit range. Output is capped; prefer stat=true first for broad reviews, then target paths/hunks to avoid repeated capped diffs.",
             input_schema: json!({
@@ -372,7 +386,6 @@ fn lean_description(name: &str, fallback: &str) -> String {
         "http" => "HTTPie-style request; response capped.",
         "browser" => "Run agent-browser CLI.",
         "awk" => "Run awk with optional stdin.",
-        "subagent" => "Delegate self-contained task to fresh worker.",
         "git_diff" => "Show capped git diff or stat; prefer stat first.",
         "git_log" => "Show recent git log.",
         "git_commit" => "Stage files and create git commit.",

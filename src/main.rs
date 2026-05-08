@@ -29,8 +29,8 @@ use session::{
     wolf_state_dir,
 };
 use tools::{
-    Tool, ToolProfile, is_external_process_tool, needs_permission,
-    should_parallelize_builtin_tools, tool_definitions,
+    Tool, ToolProfile, is_external_process_tool, needs_permission, provider_tool_definitions,
+    runtime_tool_definitions, should_parallelize_builtin_tools, slash_command_definitions,
 };
 
 #[cfg(test)]
@@ -82,7 +82,25 @@ const TOOL_UI_CONTENT_CAP: usize = 8_000;
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
 pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "WOLF_ALLOW_BREAK_SYSTEM_PACKAGES";
 const AUTH_CIRCUIT_BREAKER_THRESHOLD: usize = 2;
-const TOOL_CATALOG_VERSION: u32 = 2;
+const TOOL_CATALOG_VERSION: u32 = 3;
+const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".wolf",
+    ".pi",
+    "target",
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    "dist",
+    "build",
+    "coverage",
+    ".venv",
+    "venv",
+    "__pycache__",
+];
 const MAX_STREAM_ATTEMPTS: u32 = 4;
 const DEFAULT_INPUT_USD_PER_MTOK: f64 = 1.0;
 const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 5.0;
@@ -1315,7 +1333,6 @@ impl SubagentRequest {
 struct DetachedSubagentLaunch {
     label: String,
     output_path: PathBuf,
-    command: String,
     monitor_command: String,
 }
 
@@ -1363,12 +1380,6 @@ fn spawn_detached_subagent_process(
     output_path: &Path,
 ) -> Result<DetachedSubagentLaunch> {
     let exe = current_wolf_executable()?;
-    let command = format!(
-        "{} subagent-worker {} {}",
-        exe.display(),
-        input_path.display(),
-        output_path.display()
-    );
     #[cfg(unix)]
     let monitor_command = format!(
         "tail -f {}",
@@ -1401,7 +1412,6 @@ fn spawn_detached_subagent_process(
     Ok(DetachedSubagentLaunch {
         label: "background process".to_string(),
         output_path: output_path.to_path_buf(),
-        command,
         monitor_command,
     })
 }
@@ -3201,6 +3211,44 @@ fn current_wolf_executable_from(exe: PathBuf) -> Result<PathBuf> {
     )
 }
 
+fn default_discovery_excludes_enabled(extra: &[String]) -> bool {
+    !extra.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--no-ignore" | "--no-ignore-vcs" | "--unrestricted" | "-u" | "-uu" | "-uuu"
+        )
+    })
+}
+
+fn add_default_fd_excludes(extra: &mut Vec<String>) {
+    if !default_discovery_excludes_enabled(extra) {
+        return;
+    }
+    for dir in DEFAULT_DISCOVERY_EXCLUDES {
+        extra.push("--exclude".to_string());
+        extra.push((*dir).to_string());
+    }
+}
+
+fn add_default_rg_excludes(args: &mut Vec<String>, extra: &[String]) {
+    if !default_discovery_excludes_enabled(extra) {
+        return;
+    }
+    for dir in DEFAULT_DISCOVERY_EXCLUDES {
+        args.push("--glob".to_string());
+        args.push(format!("!**/{dir}/**"));
+    }
+}
+
+fn add_default_grep_excludes(args: &mut Vec<String>, extra: &[String]) {
+    if !default_discovery_excludes_enabled(extra) {
+        return;
+    }
+    for dir in DEFAULT_DISCOVERY_EXCLUDES {
+        args.push(format!("--exclude-dir={dir}"));
+    }
+}
+
 fn fd_exclude_path_patterns(glob: &str) -> Vec<String> {
     let trimmed = glob.trim().trim_matches('/');
     if trimmed.is_empty() {
@@ -3224,7 +3272,14 @@ fn fd_exclude_path_patterns(glob: &str) -> Vec<String> {
 fn build_fd_find_fallback_args(search_root: &Path, pattern: &str, extra: &[String]) -> Vec<String> {
     let mut find_type = "f".to_string();
     let mut name_globs: Vec<String> = Vec::new();
-    let mut exclude_globs: Vec<String> = Vec::new();
+    let mut exclude_globs: Vec<String> = if default_discovery_excludes_enabled(extra) {
+        DEFAULT_DISCOVERY_EXCLUDES
+            .iter()
+            .flat_map(|dir| fd_exclude_path_patterns(dir))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut idx = 0usize;
     while idx < extra.len() {
         match extra[idx].as_str() {
@@ -3437,6 +3492,7 @@ fn prepare_external_tool(
             let extra = str_array(&input["extra_args"]);
             if binary_on_path("fd") {
                 let mut args: Vec<String> = extra;
+                add_default_fd_excludes(&mut args);
                 args.push(pattern.to_string());
                 args.push(search_root.to_string_lossy().to_string());
                 Ok(("fd".to_string(), args, None))
@@ -3452,12 +3508,14 @@ fn prepare_external_tool(
             let extra = str_array(&input["extra_args"]);
             if binary_on_path("rg") {
                 let mut args: Vec<String> = vec!["--line-number".into(), "--no-heading".into()];
+                add_default_rg_excludes(&mut args, &extra);
                 args.extend(translate_exclude_globs_for_rg(extra));
                 args.push(pattern.to_string());
                 args.push(search_root.to_string_lossy().to_string());
                 Ok(("rg".to_string(), args, None))
             } else {
                 let mut args: Vec<String> = vec!["-rn".into(), "-E".into(), "--color=never".into()];
+                add_default_grep_excludes(&mut args, &extra);
                 args.extend(translate_extra_args_for_grep(&extra));
                 args.push(pattern.to_string());
                 args.push(search_root.to_string_lossy().to_string());
@@ -3558,6 +3616,7 @@ fn prepare_external_tool_fallback(
                 canonical_within(root, user_path).unwrap_or_else(|_| root.to_path_buf());
             let extra = str_array(&input["extra_args"]);
             let mut args: Vec<String> = vec!["-rn".into(), "-E".into(), "--color=never".into()];
+            add_default_grep_excludes(&mut args, &extra);
             args.extend(translate_extra_args_for_grep(&extra));
             args.push(pattern.to_string());
             args.push(search_root.to_string_lossy().to_string());
@@ -6067,20 +6126,10 @@ async fn execute_builtin_call(
     read_cache: Option<Arc<Mutex<ReadFileCache>>>,
 ) -> std::result::Result<String, String> {
     if name == "subagent" {
-        let request = serde_json::from_value::<SubagentRequest>(input.clone())
-            .map_err(|e| format!("invalid subagent request: {e}"))?;
-        let (input_path, output_path) = write_subagent_input(&root, &request)
-            .map_err(|e| format!("write subagent input: {e:#}"))?;
-        let launch = spawn_detached_subagent_process(&root, &input_path, &output_path)
-            .map_err(|e| format!("launch detached subagent: {e:#}"))?;
-        return Ok(format!(
-            "detached subagent launched in {}\ncommand: {}\ninput: {}\noutput: {}\nmonitor: {}\nUse the monitor command to watch live progress and inspect the single output bundle (report + logs) after completion.",
-            launch.label,
-            launch.command,
-            input_path.display(),
-            launch.output_path.display(),
-            launch.monitor_command
-        ));
+        return Ok(
+            "subagent is not a provider-visible tool. Ask the user to run /subagent <task> if delegation is needed."
+                .to_string(),
+        );
     }
     if name == "bash" {
         let cmd = input["command"].as_str().unwrap_or("").to_string();
@@ -6304,27 +6353,6 @@ fn summarize_call(name: &str, input: &Value) -> String {
         "csvkit" => {
             let sub = input["subcommand"].as_str().unwrap_or("?");
             format!("csvkit:{sub} {}", summarize_args(&input["args"], 120))
-        }
-        "subagent" => {
-            let task = summarize_inline(input["task"].as_str().unwrap_or("?"), 84);
-            let max_iter = input["max_iterations"].as_u64();
-            let tools = match input["allowed_tools"].as_array() {
-                Some(arr) => {
-                    let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).take(4).collect();
-                    if names.is_empty() {
-                        "custom".to_string()
-                    } else if arr.len() > names.len() {
-                        format!("{} +{}", names.join(","), arr.len() - names.len())
-                    } else {
-                        names.join(",")
-                    }
-                }
-                None => "default".to_string(),
-            };
-            let iter_label = max_iter
-                .map(|max| max.to_string())
-                .unwrap_or_else(|| "unlimited".to_string());
-            format!("subagent: \"{task}\" · detached · tools={tools} · max_iter={iter_label}")
         }
         _ => {
             let compact = summarize_inline(&input.to_string(), TOOL_SUMMARY_CHAR_CAP);
@@ -7757,9 +7785,8 @@ impl Agent {
         } else {
             ToolContextProfile::Full
         };
-        let tools: Vec<Tool> = tool_definitions()
+        let tools: Vec<Tool> = provider_tool_definitions()
             .into_iter()
-            .filter(|t| t.name != "subagent")
             .filter(|t| browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser")
             .filter(|t| tool_name_allowed_in_profile(t.name, tool_context_profile))
             .collect();
@@ -7779,7 +7806,7 @@ impl Agent {
             system,
             history: Vec::new(),
             tools,
-            allowed: HashSet::from(["subagent".to_string()]),
+            allowed: HashSet::new(),
             deny_tools: HashSet::new(),
             hooks: Hooks::load(&sandbox_root),
             sandbox_root,
@@ -8656,7 +8683,7 @@ impl Agent {
             preview: preview.clone(),
         });
         self.append_latest_log(
-            "steering_injected",
+            "queued_update",
             &format!("messages={steering_count} preview={preview}"),
         );
         self.history.push(Message {
@@ -8718,9 +8745,8 @@ impl Agent {
 
     fn refresh_tools_for_context(&mut self) {
         let profile = self.tool_context_profile();
-        self.tools = tool_definitions()
+        self.tools = provider_tool_definitions()
             .into_iter()
-            .filter(|t| t.name != "subagent")
             .filter(|t| self.browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser")
             .filter(|t| tool_name_allowed_in_profile(t.name, profile))
             .collect();
@@ -9023,6 +9049,7 @@ impl Agent {
 
     fn session_header_with_origin(&self, track_origin: Option<TrackOrigin>) -> SessionHeader {
         let mut allowed: Vec<String> = self.allowed.iter().cloned().collect();
+        allowed.retain(|name| name != "subagent");
         allowed.sort();
         let mut exposed_tools: Vec<String> =
             self.tools.iter().map(|t| t.name.to_string()).collect();
@@ -10124,6 +10151,27 @@ impl Agent {
             "[phase:{}] validate one representative source item before scaling",
             turn_state.phase().label()
         )));
+        if objective.review_only {
+            self.sink.emit(AgentEvent::Info(
+                "[review-only] file mutations require an explicit apply/fix request".to_string(),
+            ));
+            if let Some((_, msg)) = turn_state.advance_phase(orchestrator::PhaseTrigger::ReviewOnly)
+            {
+                self.set_work_phase(turn_state.phase().label());
+                self.sink.emit(AgentEvent::Info(format!(
+                    "[phase:{}] {msg}",
+                    turn_state.phase().label()
+                )));
+            }
+        } else if objective.apply_fixes_allowed()
+            && let Some((_, msg)) = turn_state.advance_phase(orchestrator::PhaseTrigger::Fix)
+        {
+            self.set_work_phase(turn_state.phase().label());
+            self.sink.emit(AgentEvent::Info(format!(
+                "[phase:{}] {msg}",
+                turn_state.phase().label()
+            )));
+        }
 
         if self.provider_requires_api_key && self.api_key.trim().is_empty() {
             anyhow::bail!(
@@ -10558,9 +10606,9 @@ impl Agent {
             }
 
             let mut plans: Vec<PlannedCall> = Vec::new();
-            for (ordinal, (id, name, mut input)) in tool_calls.into_iter().enumerate() {
+            for (ordinal, (id, name, input)) in tool_calls.into_iter().enumerate() {
                 let event_call_id = normalize_tool_call_id(&id, 0, ordinal);
-                let mut input_str = input.to_string();
+                let input_str = input.to_string();
                 let summary = summarize_call(&name, &input);
                 let call_sig = format!("{name}\n{input_str}");
                 let hosts = tool_policy::hosts_for_tool_call(&name, &input);
@@ -10584,18 +10632,10 @@ impl Agent {
                 }
 
                 if plan.is_none() && name == "subagent" {
-                    match SubagentRequest::from_input(self, &input) {
-                        Ok(request) => {
-                            input = serde_json::to_value(request).unwrap_or_else(|_| input.clone());
-                            input_str = input.to_string();
-                        }
-                        Err(msg) => {
-                            plan = Some(Plan::Immediate {
-                                content: msg,
-                                is_error: Some(true),
-                            });
-                        }
-                    }
+                    plan = Some(Plan::Immediate {
+                        content: "subagent is not a provider-visible tool. Do not call it as a model tool; tell the user the /subagent command to run if delegation is needed.".to_string(),
+                        is_error: Some(true),
+                    });
                 }
 
                 if plan.is_none()
@@ -10658,20 +10698,8 @@ impl Agent {
                     });
                 }
 
-                if plan.is_none() && name == "subagent" {
-                    // Subagent inherits the parent approval/session posture; no second prompt.
-                    if self.deny_tools.contains(&name) {
-                        plan = Some(Plan::Immediate {
-                            content: "subagent is denied by the active tool policy".to_string(),
-                            is_error: Some(true),
-                        });
-                    }
-                }
-
                 if plan.is_none() {
-                    let approved = if name == "subagent" {
-                        true
-                    } else if self.deny_tools.contains(&name)
+                    let approved = if self.deny_tools.contains(&name)
                         || denied_signatures.contains(&call_sig)
                         || (needs_permission(&name)
                             && self.approval_profile == ApprovalProfile::Never)
@@ -10724,12 +10752,19 @@ impl Agent {
                     }
                 }
 
-                let plan = plan.expect("plan must be set");
+                let mut plan = plan.expect("plan must be set");
 
                 if matches!(plan, Plan::Builtin)
                     && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
                 {
-                    self.work_ledger_note_file_change(&input);
+                    if !objective.apply_fixes_allowed() {
+                        plan = Plan::Immediate {
+                            content: "review-only mode: file mutation is blocked until the user explicitly says to apply fixes or make changes.".to_string(),
+                            is_error: Some(true),
+                        };
+                    } else {
+                        self.work_ledger_note_file_change(&input);
+                    }
                 }
 
                 if matches!(plan, Plan::Builtin)
@@ -10746,7 +10781,11 @@ impl Agent {
                 if matches!(plan, Plan::Builtin)
                     && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
                     && let Some((_, msg)) =
-                        turn_state.advance_phase(orchestrator::PhaseTrigger::DeliverableWrite)
+                        turn_state.advance_phase(if objective.apply_fixes_allowed() {
+                            orchestrator::PhaseTrigger::Fix
+                        } else {
+                            orchestrator::PhaseTrigger::DeliverableWrite
+                        })
                 {
                     self.set_work_phase(turn_state.phase().label());
                     self.sink.emit(AgentEvent::Info(format!(
@@ -11895,9 +11934,8 @@ impl Agent {
         let max_iter = request.max_iterations.map(|max| max as u32);
         let whitelist = request.allowed_tools.clone();
 
-        let tools: Vec<Tool> = tool_definitions()
+        let tools: Vec<Tool> = provider_tool_definitions()
             .into_iter()
-            .filter(|t| t.name != "subagent")
             .filter(|t| {
                 request.browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser"
             })
@@ -13843,10 +13881,12 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 w,
                 "  /plan <task>              run a read-only planner, seed the plan into history"
             );
-            let _ = writeln!(
-                w,
-                "  /subagent <task> [opts]   run a detached subagent in background"
-            );
+            if let Some(cmd) = slash_command_definitions()
+                .into_iter()
+                .find(|cmd| cmd.name == "subagent")
+            {
+                let _ = writeln!(w, "  {:<27} {}", cmd.usage, cmd.description);
+            }
             let _ = writeln!(w, "    --tools t1,t2           restrict tool whitelist");
             let _ = writeln!(
                 w,
@@ -13963,10 +14003,15 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
         }
         "allowed" => {
-            if agent.allowed.is_empty() {
+            let mut v: Vec<String> = agent
+                .allowed
+                .iter()
+                .filter(|name| agent.tools.iter().any(|tool| tool.name == name.as_str()))
+                .cloned()
+                .collect();
+            if v.is_empty() {
                 let _ = writeln!(w, "(none)");
             } else {
-                let mut v: Vec<String> = agent.allowed.iter().cloned().collect();
                 v.sort();
                 let _ = writeln!(
                     w,
@@ -15813,7 +15858,12 @@ async fn main() -> Result<()> {
         println!("       wolf session tracks");
         println!("       wolf session track open [latest|NAME|PATH] @wNN [name]");
         println!("       wolf session export [latest|NAME|PATH] [html|jsonl] [OUT]");
-        println!("       wolf subagent-worker INPUT_JSON OUTPUT_MD");
+        for runtime_tool in runtime_tool_definitions() {
+            println!(
+                "       wolf {}  {}",
+                runtime_tool.name, runtime_tool.description
+            );
+        }
         println!("       wolf session analyze|grep|failures|verify-log|decisions [session]");
         println!(
             "       wolf --no-session     run without project state lock, latest session, or log writes"

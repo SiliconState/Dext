@@ -55,12 +55,11 @@ fn test_agent(root: &Path) -> Agent {
         thinking_effort: ThinkingEffort::Medium,
         system: "test-system".to_string(),
         history: Vec::new(),
-        tools: tool_definitions()
+        tools: provider_tool_definitions()
             .into_iter()
-            .filter(|t| t.name != "subagent")
             .filter(|t| t.name != "browser")
             .collect(),
-        allowed: HashSet::from(["subagent".to_string()]),
+        allowed: HashSet::new(),
         deny_tools: HashSet::new(),
         sandbox_root: root.to_path_buf(),
         git_context: None,
@@ -98,6 +97,14 @@ fn test_agent(root: &Path) -> Agent {
         track_origin: None,
         privacy: PrivacyPolicy::default(),
     }
+}
+
+fn drain_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    events
 }
 
 struct SessionReplayFixture {
@@ -229,6 +236,8 @@ fn injected_steering_is_ledger_visible_and_final_required() {
     let root = temp_test_dir("steering-ledger-visible");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
+    let (tx_events, mut rx_events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx: tx_events }));
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     agent.install_steering(rx, tx.clone());
     tx.send("fix the rg border overflow and tell me what happened".to_string())
@@ -254,8 +263,12 @@ fn injected_steering_is_ledger_visible_and_final_required() {
         "{injected}"
     );
     assert!(
-        injected.contains("Do not let the final answer omit this queued update"),
-        "{injected}"
+        drain_events(&mut rx_events).iter().any(|event| matches!(
+            event,
+            AgentEvent::SteeringReceived { messages, preview }
+                if *messages == 1 && preview.contains("rg border overflow")
+        )),
+        "expected compact queued-update event"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -664,6 +677,36 @@ fn session_replay_fixture_dedupe_cache_preserves_success_and_error_hits() -> Res
         replay.assistant_text().contains("deduped"),
         "{}",
         replay.assistant_text()
+    );
+    Ok(())
+}
+
+#[test]
+fn session_replay_fixture_ignores_irrelevant_subagent_and_handles_queued_update() -> Result<()> {
+    let replay = SessionReplayFixture::load("irrelevant_subagent_queued_update")?;
+    assert!(
+        !replay
+            .header
+            .exposed_tools
+            .contains(&"subagent".to_string())
+    );
+    assert_eq!(replay.tool_call_count("subagent"), 0);
+    assert_eq!(replay.tool_call_count("rg"), 1);
+    assert_eq!(replay.tool_call_count("read_file"), 1);
+    assert!(
+        replay.tool_names_after_marker("wealthtrak subagent is irrelevant")
+            == vec!["read_file".to_string()],
+        "expected Wolf-source work after queued update, got {:?}",
+        replay.tool_names_after_marker("wealthtrak subagent is irrelevant")
+    );
+    let assistant = replay.assistant_text();
+    assert!(
+        assistant.contains("ignored the detached wealthtrak subagent"),
+        "{assistant}"
+    );
+    assert!(
+        assistant.contains("provider-visible tools exclude subagent"),
+        "{assistant}"
     );
     Ok(())
 }
@@ -3369,8 +3412,14 @@ fn subagent_request_inherits_parent_capability_profile() {
 
 #[test]
 fn subagent_detached_artifacts_are_project_scoped() {
+    let _guard = env_lock();
     let root = temp_test_dir("subagent-artifacts");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let wolf_home = root.join("wolf-home");
+    unsafe {
+        std::env::set_var("WOLF_HOME", &wolf_home);
+        std::env::remove_var("WOLF_SESSIONS_DIR");
+    }
     let request = SubagentRequest {
         task: "noop".to_string(),
         ..SubagentRequest::default()
@@ -3403,6 +3452,9 @@ fn subagent_detached_artifacts_are_project_scoped() {
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(subagent_requests_dir(&root));
+    unsafe {
+        std::env::remove_var("WOLF_HOME");
+    }
 }
 
 #[test]
@@ -3479,25 +3531,13 @@ fn subagent_quality_gate_requires_structured_handoff_headings() {
 }
 
 #[test]
-fn summarize_call_subagent_is_compact() {
-    let summary = summarize_call(
-        "subagent",
-        &json!({
-            "task": "Investigate startup latency and map blocking calls in main and tui modules",
-            "allowed_tools": ["read_file", "rg", "fd"]
-        }),
-    );
-    assert!(
-        summary.starts_with("subagent: \"Investigate startup latency"),
-        "{summary}"
-    );
-    assert!(summary.contains("detached"), "{summary}");
-    assert!(summary.contains("tools=read_file,rg,fd"), "{summary}");
-    assert!(summary.contains("max_iter=unlimited"), "{summary}");
-    assert!(
-        summary.chars().count() <= TOOL_SUMMARY_CHAR_CAP + 50,
-        "{summary}"
-    );
+fn slash_subagent_command_usage_is_registered() {
+    let cmd = slash_command_definitions()
+        .into_iter()
+        .find(|cmd| cmd.name == "subagent")
+        .expect("subagent slash command");
+    assert!(cmd.usage.starts_with("/subagent <task>"));
+    assert!(cmd.description.contains("provider-visible tools"));
 }
 
 #[test]
@@ -4257,13 +4297,53 @@ fn jittered_backoff_respects_range_and_varies() {
 }
 
 #[test]
-fn subagent_inherits_parent_approval_without_permission_category() {
-    let root = temp_test_dir("subagent-auto-approved");
+fn provider_runtime_and_slash_registries_are_split() {
+    let provider_names: HashSet<&str> = provider_tool_definitions()
+        .iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(!provider_names.contains("subagent"));
+    assert!(provider_names.contains("read_file"));
+
+    let runtime_names: HashSet<&str> = runtime_tool_definitions()
+        .iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert!(runtime_names.contains("subagent-worker"));
+    assert!(!runtime_names.contains("read_file"));
+
+    let slash_names: HashSet<&str> = slash_command_definitions()
+        .iter()
+        .map(|cmd| cmd.name)
+        .collect();
+    assert!(slash_names.contains("subagent"));
+    assert!(!slash_names.contains("read_file"));
+    assert!(provider_names.is_disjoint(&runtime_names));
+}
+
+#[test]
+fn subagent_is_hidden_from_model_tool_state() {
+    let root = temp_test_dir("subagent-hidden");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let agent = test_agent(&root);
-    assert!(agent.allowed.contains("subagent"));
+    let mut agent = test_agent(&root);
+    agent.allowed.insert("subagent".to_string());
     assert!(!needs_permission("subagent"));
     assert!(!agent.tools.iter().any(|t| t.name == "subagent"));
+    let header = agent.session_header();
+    assert!(!header.allowed.contains(&"subagent".to_string()));
+    assert!(!header.exposed_tools.contains(&"subagent".to_string()));
+    assert!(!header.auto_approved_tools.contains(&"subagent".to_string()));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    assert_eq!(handle_slash("/allowed", &mut agent), Some(true));
+    let slash = drain_events(&mut rx)
+        .into_iter()
+        .find_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(slash.contains("(none)"), "{slash}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -4424,6 +4504,106 @@ async fn bash_tool_honors_input_timeout() {
     .await
     .expect_err("expected input timeout");
     assert!(err.contains("timed out after 1s running bash"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn model_side_subagent_tool_call_does_not_launch_worker() {
+    let root = temp_test_dir("model-subagent-blocked");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let out = execute_builtin_call(
+        "subagent".to_string(),
+        json!({"task": "do a thing"}),
+        root.clone(),
+        Arc::new(AtomicBool::new(false)),
+        None,
+    )
+    .await
+    .expect("model-side subagent guidance");
+    assert!(out.contains("not a provider-visible tool"), "{out}");
+    assert!(
+        !subagent_requests_dir(&root).exists(),
+        "model-side subagent tool call must not create artifacts"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fd_and_rg_discovery_ignore_heavy_dirs_by_default() {
+    let root = temp_test_dir("discovery-default-excludes");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let (fd_bin, fd_args, _) = prepare_external_tool(
+        "fd",
+        &json!({"pattern": "\\.rs$", "path": root.to_str().unwrap()}),
+        &root,
+    )
+    .expect("prepare fd");
+    if fd_bin == "fd" {
+        assert!(
+            fd_args.windows(2).any(|w| w == ["--exclude", "target"]),
+            "{fd_args:?}"
+        );
+        assert!(
+            fd_args
+                .windows(2)
+                .any(|w| w == ["--exclude", "node_modules"]),
+            "{fd_args:?}"
+        );
+    } else {
+        assert!(
+            fd_args.windows(2).any(|w| w == ["-path", "*/target/*"]),
+            "{fd_args:?}"
+        );
+        assert!(
+            fd_args
+                .windows(2)
+                .any(|w| w == ["-path", "*/node_modules/*"]),
+            "{fd_args:?}"
+        );
+    }
+
+    let (_rg_bin, rg_args, _) = prepare_external_tool(
+        "rg",
+        &json!({"pattern": "needle", "path": root.to_str().unwrap()}),
+        &root,
+    )
+    .expect("prepare rg");
+    if rg_args.iter().any(|arg| arg == "--glob") {
+        assert!(
+            rg_args.windows(2).any(|w| w == ["--glob", "!**/target/**"]),
+            "{rg_args:?}"
+        );
+        assert!(
+            rg_args
+                .windows(2)
+                .any(|w| w == ["--glob", "!**/node_modules/**"]),
+            "{rg_args:?}"
+        );
+    } else {
+        assert!(
+            rg_args.contains(&"--exclude-dir=target".to_string()),
+            "{rg_args:?}"
+        );
+        assert!(
+            rg_args.contains(&"--exclude-dir=node_modules".to_string()),
+            "{rg_args:?}"
+        );
+    }
+
+    let (_bin, unrestricted_args, _) = prepare_external_tool(
+        "fd",
+        &json!({"pattern": "\\.rs$", "path": root.to_str().unwrap(), "extra_args": ["--no-ignore"]}),
+        &root,
+    )
+    .expect("prepare unrestricted fd");
+    assert!(
+        !unrestricted_args
+            .windows(2)
+            .any(|w| w == ["--exclude", "target"] || w == ["-path", "*/target/*"]),
+        "{unrestricted_args:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -6243,7 +6423,7 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
 
 #[test]
 fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
-    let read_file = tool_definitions()
+    let read_file = provider_tool_definitions()
         .into_iter()
         .find(|tool| tool.name == "read_file")
         .expect("read_file tool");
@@ -6313,7 +6493,6 @@ fn every_schema_backed_tool_validates_happy_and_missing_paths() {
         ("http", json!({"args": ["GET", "https://x"]})),
         ("awk", json!({"args": ["{print}"]})),
         ("csvkit", json!({"subcommand": "csvcut", "args": ["-n"]})),
-        ("subagent", json!({"task": "do a thing"})),
         ("git_commit", json!({"message": "c"})),
         (
             "todo_write",

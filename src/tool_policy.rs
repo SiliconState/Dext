@@ -46,7 +46,6 @@ pub(crate) fn required_fields_for_tool(name: &str) -> &'static [&'static str] {
         "browser" => &["args"],
         "awk" => &["args"],
         "csvkit" => &["subcommand", "args"],
-        "subagent" => &["task"],
         "git_commit" => &["message"],
         "todo_write" => &["todos"],
         _ => &[],
@@ -121,14 +120,6 @@ pub(crate) fn tool_input_issue(name: &str, input: &Value) -> Option<String> {
             } else {
                 None
             }
-        }
-        "subagent" => {
-            if let Some(task) = input["task"].as_str()
-                && task.trim().is_empty()
-            {
-                return Some("task cannot be empty".to_string());
-            }
-            None
         }
         _ => None,
     }

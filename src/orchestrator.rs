@@ -26,8 +26,10 @@ pub(crate) enum PhaseTrigger {
     ScaleCollection,
     DeliverableWrite,
     FinalResponse,
-    PartialDeliveryFallback,
     Steering,
+    PartialDeliveryFallback,
+    ReviewOnly,
+    Fix,
 }
 
 pub(crate) fn phase_transition(
@@ -42,7 +44,9 @@ pub(crate) fn phase_transition(
         PhaseTrigger::DeliverableWrite
         | PhaseTrigger::FinalResponse
         | PhaseTrigger::PartialDeliveryFallback
-        | PhaseTrigger::Steering => WorkPhase::Synthesize,
+        | PhaseTrigger::Steering
+        | PhaseTrigger::ReviewOnly
+        | PhaseTrigger::Fix => WorkPhase::Synthesize,
     };
 
     if next == current {
@@ -57,6 +61,10 @@ pub(crate) fn phase_transition(
             "consolidate partial results and request user decision"
         }
         PhaseTrigger::Steering => "redirecting based on user input",
+        PhaseTrigger::ReviewOnly => {
+            "review-only task; require explicit user approval before applying fixes"
+        }
+        PhaseTrigger::Fix => "fix/apply requested; code changes are in scope",
     };
 
     Some((next, message))
@@ -288,6 +296,8 @@ impl TurnRuntimeState {
 pub(crate) struct ObjectiveTracker {
     pub(crate) summary: String,
     pub(crate) checkpoints: Vec<String>,
+    pub(crate) apply_fixes_requested: bool,
+    pub(crate) review_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +317,43 @@ struct ObjectiveEvidence {
     change_count: usize,
 }
 
+fn explicit_apply_fixes_requested(lowered: &str) -> bool {
+    [
+        "apply fix",
+        "apply fixes",
+        "fix it",
+        "fix them",
+        "fix this",
+        "fix the",
+        "implement",
+        "patch",
+        "merge",
+        "cleanup",
+        "clean up",
+        "go for it",
+        "handle my todo",
+        "do it",
+        "make changes",
+        "update the code",
+        "commit",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn explicit_review_only_requested(lowered: &str) -> bool {
+    [
+        "review",
+        "audit",
+        "inspect",
+        "analy",
+        "look for bugs",
+        "bug-review",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
 impl ObjectiveTracker {
     pub(crate) fn from_user_prompt(input: &str) -> Self {
         let compact = input
@@ -319,10 +366,14 @@ impl ObjectiveTracker {
             return Self {
                 summary: "(empty prompt)".to_string(),
                 checkpoints: Vec::new(),
+                apply_fixes_requested: false,
+                review_only: false,
             };
         }
 
         let lowered = compact.to_ascii_lowercase();
+        let apply_fixes_requested = explicit_apply_fixes_requested(&lowered);
+        let review_only = explicit_review_only_requested(&lowered) && !apply_fixes_requested;
         let mut checkpoints: Vec<String> = Vec::new();
 
         if lowered.contains("plan") {
@@ -331,14 +382,7 @@ impl ObjectiveTracker {
         if lowered.contains("analy") || lowered.contains("review") {
             checkpoints.push("analyze current behavior and constraints".to_string());
         }
-        if lowered.contains("fix")
-            || lowered.contains("implement")
-            || lowered.contains("todo")
-            || lowered.contains("cleanup")
-            || lowered.contains("clean up")
-            || lowered.contains("go for it")
-            || lowered.contains("do ")
-        {
+        if apply_fixes_requested {
             checkpoints.push("implement requested changes".to_string());
         }
         if lowered.contains("test") || lowered.contains("verify") {
@@ -365,7 +409,13 @@ impl ObjectiveTracker {
         Self {
             summary,
             checkpoints,
+            apply_fixes_requested,
+            review_only,
         }
+    }
+
+    pub(crate) fn apply_fixes_allowed(&self) -> bool {
+        self.apply_fixes_requested && !self.review_only
     }
 
     pub(crate) fn display_line(&self) -> String {
@@ -486,7 +536,6 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                         | "git_diff"
                         | "git_log"
                         | "csvkit"
-                        | "subagent"
                 )
             }) || contains_any(
                 &evidence.assistant_text,
@@ -1072,13 +1121,26 @@ mod tests {
             "{:?}",
             tracker.checkpoints
         );
+        assert!(tracker.apply_fixes_allowed());
+
+        let review_only = ObjectiveTracker::from_user_prompt("review wolf for bugs");
+        assert_eq!(
+            review_only.checkpoints,
+            vec!["analyze current behavior and constraints".to_string()]
+        );
+        assert!(review_only.review_only);
+        assert!(!review_only.apply_fixes_allowed());
+
+        let apply_after_review =
+            ObjectiveTracker::from_user_prompt("review the flow, then apply fixes");
+        assert!(apply_after_review.apply_fixes_allowed());
         assert!(
-            tracker
+            apply_after_review
                 .checkpoints
                 .iter()
                 .any(|c| c.contains("implement requested changes")),
             "{:?}",
-            tracker.checkpoints
+            apply_after_review.checkpoints
         );
 
         let terse =

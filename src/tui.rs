@@ -2008,7 +2008,6 @@ fn turn_tool_summary(counts: &HashMap<String, usize>) -> Option<(usize, String)>
         (&["todo_read", "todo_write"], "todo op", "todo ops"),
         (&["jq", "awk", "csvkit"], "data op", "data ops"),
         (&["http"], "request", "requests"),
-        (&["subagent"], "delegation", "delegations"),
     ];
 
     let mut accounted = 0usize;
@@ -2561,7 +2560,6 @@ fn merge_consecutive_tools(items: Vec<Line_>) -> Vec<Line_> {
             unreachable!()
         };
         let same_target = ln == &name
-            && name != "subagent"
             && tool_target_key(ln, ls).as_deref() == tool_target_key(&name, &summary).as_deref();
         let failed_bash_chain =
             name == "bash" && *lok == Some(false) && ok == Some(false) && ln == &name;
@@ -2632,11 +2630,7 @@ fn is_markdown_ordered_list(line: &str) -> bool {
         && line[digits + 1..].starts_with(' ')
 }
 
-fn looks_like_markdownish_tool_content(name: &str, content: &str) -> bool {
-    if name == "subagent" {
-        return true;
-    }
-
+fn looks_like_markdownish_tool_content(_name: &str, content: &str) -> bool {
     let mut markers = 0usize;
     let mut saw_heading = false;
     let mut saw_list = false;
@@ -6830,7 +6824,6 @@ mod tests {
             "awk",
             "csvkit",
             "http",
-            "subagent",
             "unknown_tool",
         ]
         .iter()
@@ -6859,7 +6852,7 @@ mod tests {
             })
             .expect("turn summary");
         assert!(
-            summary.starts_with("Turn used 19 tool calls ("),
+            summary.starts_with("Turn used 18 tool calls ("),
             "{summary}"
         );
         assert!(summary.contains("2 reads"), "{summary}");
@@ -6868,7 +6861,6 @@ mod tests {
         assert!(summary.contains("2 todo ops"), "{summary}");
         assert!(summary.contains("3 data ops"), "{summary}");
         assert!(summary.contains("1 request"), "{summary}");
-        assert!(summary.contains("1 delegation"), "{summary}");
         assert!(summary.contains("1 other call"), "{summary}");
         assert!(summary.ends_with(" · no errors"), "{summary}");
     }
@@ -7558,13 +7550,7 @@ mod tests {
 
     #[test]
     fn expanded_markdownish_tool_renders_markdown() {
-        let mut item = tool_line(
-            "#1.4",
-            "subagent",
-            "subagent: plan",
-            Some(true),
-            "# Plan\n- step",
-        );
+        let mut item = tool_line("#1.4", "rg", "rg: markdown", Some(true), "# Plan\n- step");
         if let Line_::Tool { expanded, .. } = &mut item {
             *expanded = true;
         }
