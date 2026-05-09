@@ -5179,6 +5179,10 @@ fn help_overlay_text() -> Text<'static> {
         ("Ctrl+D", "quit"),
         ("Ctrl+O", "toggle last tool output"),
         ("Ctrl+V", "toggle thinking visibility"),
+        (
+            "Tab / Shift+Tab",
+            "cycle reasoning depth (slash completion when typing /)",
+        ),
         ("Ctrl+E", "cycle reasoning depth"),
         ("PgUp / PgDn", "scroll transcript"),
         ("Up / Down", "history (single-line input only)"),
@@ -5916,14 +5920,14 @@ fn handle_key(
         }
         (KeyCode::Tab, _) if !state.agent_busy => {
             if !state.accept_slash_completion() {
-                state.status = "scroll: live".to_string();
+                let _ = agent_input.send(FromTui::CycleEffort(1));
             }
         }
         (KeyCode::BackTab, _) if !state.agent_busy => {
             if state.move_slash_completion_selection(-1) {
                 let _ = state.accept_slash_completion();
             } else {
-                state.status = "scroll: live".to_string();
+                let _ = agent_input.send(FromTui::CycleEffort(-1));
             }
         }
         (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) => {
@@ -6177,7 +6181,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         profile => profile.as_str(),
     };
     let banner = format!(
-        "🐺  Wolf v{}\nsandbox  {}\nmodel    {}\nmode     {}\nreason   {}\nkeys     Tab/Shift+Tab reasoning · Ctrl+C/Esc interrupt · Ctrl+D quit · ? help",
+        "🐺  Wolf v{}\nsandbox  {}\nmodel    {}\nmode     {}\nreason   {}\nkeys     Ctrl+C/Esc interrupt · Ctrl+D quit · ? help",
         env!("CARGO_PKG_VERSION"),
         clamp_chars(&state.sandbox, 96),
         clamp_chars(&state.model, 40),
@@ -8209,6 +8213,84 @@ mod tests {
         assert_eq!(state.cursor, state.input.len());
         assert_eq!(state.slash_acomp_sel, Some(0));
         assert_eq!(state.slash_acomp_scroll, 0);
+    }
+
+    #[test]
+    fn tab_cycles_effort_when_not_completing_slash_command() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "regular prompt".to_string();
+        state.cursor = state.input.len();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(FromTui::CycleEffort(1))));
+        assert_eq!(state.input, "regular prompt");
+    }
+
+    #[test]
+    fn backtab_cycles_effort_when_not_completing_slash_command() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "regular prompt".to_string();
+        state.cursor = state.input.len();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(FromTui::CycleEffort(-1))));
+        assert_eq!(state.input, "regular prompt");
+    }
+
+    #[test]
+    fn tab_falls_back_to_effort_when_slash_has_no_completion() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "/definitely-no-such-command".to_string();
+        state.cursor = state.input.len();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(FromTui::CycleEffort(1))));
+        assert_eq!(state.input, "/definitely-no-such-command");
     }
 
     #[test]

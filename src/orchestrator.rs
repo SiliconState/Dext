@@ -28,7 +28,6 @@ pub(crate) enum PhaseTrigger {
     FinalResponse,
     Steering,
     PartialDeliveryFallback,
-    ReviewOnly,
     Fix,
 }
 
@@ -45,7 +44,6 @@ pub(crate) fn phase_transition(
         | PhaseTrigger::FinalResponse
         | PhaseTrigger::PartialDeliveryFallback
         | PhaseTrigger::Steering
-        | PhaseTrigger::ReviewOnly
         | PhaseTrigger::Fix => WorkPhase::Synthesize,
     };
 
@@ -61,9 +59,6 @@ pub(crate) fn phase_transition(
             "consolidate partial results and request user decision"
         }
         PhaseTrigger::Steering => "redirecting based on user input",
-        PhaseTrigger::ReviewOnly => {
-            "review-only task; require explicit user approval before applying fixes"
-        }
         PhaseTrigger::Fix => "fix/apply requested; code changes are in scope",
     };
 
@@ -297,7 +292,6 @@ pub(crate) struct ObjectiveTracker {
     pub(crate) summary: String,
     pub(crate) checkpoints: Vec<String>,
     pub(crate) apply_fixes_requested: bool,
-    pub(crate) review_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,19 +335,6 @@ fn explicit_apply_fixes_requested(lowered: &str) -> bool {
     .any(|needle| lowered.contains(needle))
 }
 
-fn explicit_review_only_requested(lowered: &str) -> bool {
-    [
-        "review",
-        "audit",
-        "inspect",
-        "analy",
-        "look for bugs",
-        "bug-review",
-    ]
-    .iter()
-    .any(|needle| lowered.contains(needle))
-}
-
 impl ObjectiveTracker {
     pub(crate) fn from_user_prompt(input: &str) -> Self {
         let compact = input
@@ -367,13 +348,11 @@ impl ObjectiveTracker {
                 summary: "(empty prompt)".to_string(),
                 checkpoints: Vec::new(),
                 apply_fixes_requested: false,
-                review_only: false,
             };
         }
 
         let lowered = compact.to_ascii_lowercase();
         let apply_fixes_requested = explicit_apply_fixes_requested(&lowered);
-        let review_only = explicit_review_only_requested(&lowered) && !apply_fixes_requested;
         let mut checkpoints: Vec<String> = Vec::new();
 
         if lowered.contains("plan") {
@@ -410,12 +389,11 @@ impl ObjectiveTracker {
             summary,
             checkpoints,
             apply_fixes_requested,
-            review_only,
         }
     }
 
     pub(crate) fn apply_fixes_allowed(&self) -> bool {
-        self.apply_fixes_requested && !self.review_only
+        self.apply_fixes_requested
     }
 
     pub(crate) fn display_line(&self) -> String {
@@ -450,6 +428,7 @@ impl ObjectiveTracker {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn objective_runtime_reminder(
     objective: &ObjectiveTracker,
     history: &[crate::Message],
@@ -459,10 +438,14 @@ pub(crate) fn objective_runtime_reminder(
         return None;
     }
 
-    Some(format!(
+    Some(objective_runtime_reminder_from_coverage(&coverage))
+}
+
+pub(crate) fn objective_runtime_reminder_from_coverage(coverage: &ObjectiveCoverage) -> String {
+    format!(
         "runtime guidance: objective checkpoints still look unresolved: {}. Before ending this turn, address them or explicitly say why each remaining item is not applicable / blocked.",
         coverage.unresolved.join("; ")
-    ))
+    )
 }
 
 fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
@@ -1123,13 +1106,12 @@ mod tests {
         );
         assert!(tracker.apply_fixes_allowed());
 
-        let review_only = ObjectiveTracker::from_user_prompt("review wolf for bugs");
+        let review_task = ObjectiveTracker::from_user_prompt("review wolf for bugs");
         assert_eq!(
-            review_only.checkpoints,
+            review_task.checkpoints,
             vec!["analyze current behavior and constraints".to_string()]
         );
-        assert!(review_only.review_only);
-        assert!(!review_only.apply_fixes_allowed());
+        assert!(!review_task.apply_fixes_allowed());
 
         let apply_after_review =
             ObjectiveTracker::from_user_prompt("review the flow, then apply fixes");

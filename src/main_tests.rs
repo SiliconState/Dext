@@ -1382,6 +1382,57 @@ fn cargo_json_diagnostics_summary_ranks_and_dedupes() {
 }
 
 #[test]
+fn sync_work_ledger_keeps_only_unresolved_objective_checkpoints_pending() {
+    let root = temp_test_dir("ledger-objective-sync");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let objective = orchestrator::ObjectiveTracker::from_user_prompt("Implement it and test it");
+    agent.update_work_ledger_from_objective(&objective);
+    agent
+        .work_ledger
+        .done
+        .push("run verification checks".to_string());
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call-edit".to_string(),
+            name: "edit_file".to_string(),
+            input: json!({"path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
+        }],
+    });
+
+    let coverage = objective.assess_history(&agent.history);
+    agent.sync_work_ledger_with_objective_coverage(&coverage);
+
+    assert!(
+        agent
+            .work_ledger
+            .done
+            .contains(&"implement requested changes".to_string())
+    );
+    assert!(
+        agent
+            .work_ledger
+            .pending
+            .contains(&"run verification checks".to_string())
+    );
+    assert!(
+        !agent
+            .work_ledger
+            .done
+            .contains(&"run verification checks".to_string())
+    );
+    assert!(
+        !agent
+            .work_ledger
+            .pending
+            .contains(&"implement requested changes".to_string())
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn workflow_diagnostics_render_and_ledger_are_prompt_visible() {
     let report = WorkflowDiagnosticsReport {
         source: "rust-analyzer".to_string(),
@@ -4113,6 +4164,46 @@ fn final_objective_warning_lists_unresolved_checkpoints() {
     }];
     let warning = final_objective_warning(&objective, &history).expect("warning");
     assert!(warning.contains("run verification checks"), "{warning}");
+}
+
+#[test]
+fn final_objective_warning_is_suppressed_until_runtime_reminder_was_used() {
+    let root = temp_test_dir("final-warning-suppressed");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let objective = orchestrator::ObjectiveTracker::from_user_prompt("Implement it and test it");
+    agent.update_work_ledger_from_objective(&objective);
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "Implemented the change.".to_string(),
+        }],
+    });
+
+    let mut objective_warning_emitted = false;
+    let coverage = objective.assess_history(&agent.history);
+    agent.sync_work_ledger_with_objective_coverage(&coverage);
+    if !coverage.unresolved.is_empty() && objective_warning_emitted {
+        agent
+            .work_ledger
+            .blocked
+            .push(final_objective_warning_from_coverage(&coverage));
+    }
+    assert!(agent.work_ledger.blocked.is_empty());
+
+    objective_warning_emitted = true;
+    let coverage = objective.assess_history(&agent.history);
+    agent.sync_work_ledger_with_objective_coverage(&coverage);
+    if !coverage.unresolved.is_empty() && objective_warning_emitted {
+        agent
+            .work_ledger
+            .blocked
+            .push(final_objective_warning_from_coverage(&coverage));
+    }
+    assert_eq!(agent.work_ledger.blocked.len(), 1);
+    assert!(agent.work_ledger.blocked[0].contains("run verification checks"));
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

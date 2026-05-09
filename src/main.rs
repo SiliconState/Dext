@@ -8029,6 +8029,9 @@ impl Agent {
     fn update_work_ledger_from_objective(&mut self, objective: &orchestrator::ObjectiveTracker) {
         self.work_ledger.objective = objective.summary.clone();
         self.work_ledger.current_phase = "probe".to_string();
+        for checkpoint in &objective.checkpoints {
+            self.work_ledger.done.retain(|v| v != checkpoint);
+        }
         self.work_ledger.pending = objective.checkpoints.clone();
         self.work_ledger.in_progress.clear();
         self.work_ledger.blocked.clear();
@@ -8045,6 +8048,27 @@ impl Agent {
         }
         self.work_ledger.pending.retain(|v| v != item);
         self.work_ledger.in_progress.retain(|v| v != item);
+        self.work_ledger.next_actions.retain(|v| v != item);
+    }
+
+    fn sync_work_ledger_with_objective_coverage(
+        &mut self,
+        coverage: &orchestrator::ObjectiveCoverage,
+    ) {
+        for item in &coverage.unresolved {
+            self.work_ledger.done.retain(|v| v != item);
+        }
+        for item in &coverage.satisfied {
+            self.mark_work_done(item);
+        }
+        for item in &coverage.unresolved {
+            if !self.work_ledger.pending.iter().any(|v| v == item) {
+                self.work_ledger.pending.push(item.clone());
+            }
+            if !self.work_ledger.next_actions.iter().any(|v| v == item) {
+                self.work_ledger.next_actions.push(item.clone());
+            }
+        }
     }
 
     fn set_browser_recipe(&mut self, recipe: BrowserRecipe) {
@@ -10151,19 +10175,7 @@ impl Agent {
             "[phase:{}] validate one representative source item before scaling",
             turn_state.phase().label()
         )));
-        if objective.review_only {
-            self.sink.emit(AgentEvent::Info(
-                "[review-only] file mutations require an explicit apply/fix request".to_string(),
-            ));
-            if let Some((_, msg)) = turn_state.advance_phase(orchestrator::PhaseTrigger::ReviewOnly)
-            {
-                self.set_work_phase(turn_state.phase().label());
-                self.sink.emit(AgentEvent::Info(format!(
-                    "[phase:{}] {msg}",
-                    turn_state.phase().label()
-                )));
-            }
-        } else if objective.apply_fixes_allowed()
+        if objective.apply_fixes_allowed()
             && let Some((_, msg)) = turn_state.advance_phase(orchestrator::PhaseTrigger::Fix)
         {
             self.set_work_phase(turn_state.phase().label());
@@ -10493,10 +10505,11 @@ impl Agent {
                 ) {
                     continue;
                 }
-                if !objective_warning_emitted
-                    && let Some(reminder) =
-                        orchestrator::objective_runtime_reminder(&objective, &self.history)
-                {
+                let coverage = objective.assess_history(&self.history);
+                self.sync_work_ledger_with_objective_coverage(&coverage);
+                if !objective_warning_emitted && !coverage.unresolved.is_empty() {
+                    let reminder =
+                        orchestrator::objective_runtime_reminder_from_coverage(&coverage);
                     self.sink.emit(AgentEvent::Warn(reminder.clone()));
                     self.append_latest_log("objective_unresolved", &reminder);
                     self.history.push(Message {
@@ -10510,9 +10523,6 @@ impl Agent {
                     if let Some((_, msg)) =
                         turn_state.advance_phase(orchestrator::PhaseTrigger::FinalResponse)
                     {
-                        self.mark_work_done("deliver requested outcome with verifiable steps");
-                        self.mark_work_done("implement requested changes");
-                        self.mark_work_done("run verification checks");
                         self.set_work_phase(turn_state.phase().label());
                         self.sink.emit(AgentEvent::Info(format!(
                             "[phase:{}] {msg}",
@@ -10524,9 +10534,6 @@ impl Agent {
                 if let Some((_, msg)) =
                     turn_state.advance_phase(orchestrator::PhaseTrigger::FinalResponse)
                 {
-                    self.mark_work_done("deliver requested outcome with verifiable steps");
-                    self.mark_work_done("implement requested changes");
-                    self.mark_work_done("run verification checks");
                     self.set_work_phase(turn_state.phase().label());
                     self.sink.emit(AgentEvent::Info(format!(
                         "[phase:{}] {msg}",
@@ -10752,19 +10759,12 @@ impl Agent {
                     }
                 }
 
-                let mut plan = plan.expect("plan must be set");
+                let plan = plan.expect("plan must be set");
 
                 if matches!(plan, Plan::Builtin)
                     && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
                 {
-                    if !objective.apply_fixes_allowed() {
-                        plan = Plan::Immediate {
-                            content: "review-only mode: file mutation is blocked until the user explicitly says to apply fixes or make changes.".to_string(),
-                            is_error: Some(true),
-                        };
-                    } else {
-                        self.work_ledger_note_file_change(&input);
-                    }
+                    self.work_ledger_note_file_change(&input);
                 }
 
                 if matches!(plan, Plan::Builtin)
@@ -11210,7 +11210,10 @@ impl Agent {
                 );
             }
         }
-        if let Some(reminder) = final_objective_warning(&objective, &self.history) {
+        let coverage = objective.assess_history(&self.history);
+        self.sync_work_ledger_with_objective_coverage(&coverage);
+        if !coverage.unresolved.is_empty() && objective_warning_emitted {
+            let reminder = final_objective_warning_from_coverage(&coverage);
             self.sink.emit(AgentEvent::Warn(reminder.clone()));
             self.append_latest_log("objective_final_warning", &reminder);
             self.work_ledger.blocked.push(reminder);
@@ -15086,6 +15089,7 @@ fn steering_item_acknowledged(item: &str, history: &[Message]) -> bool {
     hits >= keywords.len().min(2)
 }
 
+#[cfg(test)]
 fn final_objective_warning(
     objective: &orchestrator::ObjectiveTracker,
     history: &[Message],
@@ -15094,11 +15098,15 @@ fn final_objective_warning(
     if coverage.unresolved.is_empty() {
         None
     } else {
-        Some(format!(
-            "final objective warning: unresolved checkpoint(s): {}. If these are complete, mention the evidence; otherwise say what is blocked or still pending.",
-            coverage.unresolved.join("; ")
-        ))
+        Some(final_objective_warning_from_coverage(&coverage))
     }
+}
+
+fn final_objective_warning_from_coverage(coverage: &orchestrator::ObjectiveCoverage) -> String {
+    format!(
+        "final objective warning: unresolved checkpoint(s): {}. If these are complete, mention the evidence; otherwise say what is blocked or still pending.",
+        coverage.unresolved.join("; ")
+    )
 }
 
 fn run_eval_shell_command(
