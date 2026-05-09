@@ -1022,8 +1022,7 @@ impl TuiState {
             let visible_rows = drawer
                 .waypoint_ids
                 .len()
-                .min(WORK_MAP_DRAWER_MAX_BODY_ROWS)
-                .max(1);
+                .clamp(1, WORK_MAP_DRAWER_MAX_BODY_ROWS);
             sync_work_map_scroll(drawer, visible_rows);
         }
     }
@@ -2912,8 +2911,7 @@ fn work_map_drawer_body_rows(state: &TuiState) -> usize {
             drawer
                 .waypoint_ids
                 .len()
-                .min(WORK_MAP_DRAWER_MAX_BODY_ROWS)
-                .max(1)
+                .clamp(1, WORK_MAP_DRAWER_MAX_BODY_ROWS)
         })
         .unwrap_or(0)
 }
@@ -5680,7 +5678,7 @@ fn handle_work_map_key(state: &mut TuiState, key: KeyEvent) -> bool {
     if !state.work_map_is_active() {
         return false;
     }
-    let handled = match key.code {
+    match key.code {
         KeyCode::Esc => {
             state.work_map = None;
             state.status = "work map drawer closed".to_string();
@@ -5753,8 +5751,7 @@ fn handle_work_map_key(state: &mut TuiState, key: KeyEvent) -> bool {
             true
         }
         _ => false,
-    };
-    handled
+    }
 }
 
 fn handle_key(

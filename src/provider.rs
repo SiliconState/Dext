@@ -2712,38 +2712,38 @@ pub(crate) fn login_provider(
             save_auth_store(&store)?;
         }
 
-        if !explicit_web {
-            if let Some((secret, source)) = resolve_provider_api_key(&profile, &store) {
-                catalog.active_provider = profile.id.clone();
-                save_provider_catalog(&catalog)?;
-                if source.starts_with("auth:") {
-                    return Ok(LoginResult {
-                        message: format!(
-                            "provider '{}' already authenticated via {} and set active",
-                            profile.id, source
-                        ),
-                        provider_id: profile.id.clone(),
-                        awaiting_credentials: false,
-                    });
-                }
+        if !explicit_web
+            && let Some((secret, source)) = resolve_provider_api_key(&profile, &store)
+        {
+            catalog.active_provider = profile.id.clone();
+            save_provider_catalog(&catalog)?;
+            if source.starts_with("auth:") {
+                return Ok(LoginResult {
+                    message: format!(
+                        "provider '{}' already authenticated via {} and set active",
+                        profile.id, source
+                    ),
+                    provider_id: profile.id.clone(),
+                    awaiting_credentials: false,
+                });
+            }
 
-                if source.starts_with("env:") {
-                    store.providers.insert(
-                        canonical_provider_id(&profile.id),
-                        StoredCredential::ApiKey { key: secret },
-                    );
-                    save_auth_store(&store)?;
-                    return Ok(LoginResult {
-                        message: format!(
-                            "imported credentials for provider '{}' from {} into {} and set it active",
-                            profile.id,
-                            source,
-                            auth_store_path().display()
-                        ),
-                        provider_id: profile.id.clone(),
-                        awaiting_credentials: false,
-                    });
-                }
+            if source.starts_with("env:") {
+                store.providers.insert(
+                    canonical_provider_id(&profile.id),
+                    StoredCredential::ApiKey { key: secret },
+                );
+                save_auth_store(&store)?;
+                return Ok(LoginResult {
+                    message: format!(
+                        "imported credentials for provider '{}' from {} into {} and set it active",
+                        profile.id,
+                        source,
+                        auth_store_path().display()
+                    ),
+                    provider_id: profile.id.clone(),
+                    awaiting_credentials: false,
+                });
             }
         }
 

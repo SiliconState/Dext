@@ -31,6 +31,16 @@ pub(crate) enum PhaseTrigger {
     Fix,
 }
 
+pub(crate) struct ExternalOutcomeInput<'a> {
+    pub(crate) tool_name: &'a str,
+    pub(crate) hosts: &'a [String],
+    pub(crate) cache_key: Option<&'a str>,
+    pub(crate) bash_similarity_key: Option<&'a str>,
+    pub(crate) command: Option<&'a str>,
+    pub(crate) content: &'a mut String,
+    pub(crate) is_error: Option<bool>,
+}
+
 pub(crate) fn phase_transition(
     current: WorkPhase,
     trigger: PhaseTrigger,
@@ -194,27 +204,21 @@ impl TurnRuntimeState {
 
     pub(crate) fn record_external_outcome(
         &mut self,
-        tool_name: &str,
-        hosts: &[String],
-        cache_key: Option<&str>,
-        bash_similarity_key: Option<&str>,
-        command: Option<&str>,
-        content: &mut String,
-        is_error: Option<bool>,
+        input: ExternalOutcomeInput<'_>,
     ) -> ExternalObservation {
         let mut observation = ExternalObservation::default();
-        let ok = !is_error.unwrap_or(false);
-        let auth_failure = crate::tool_policy::output_has_auth_failure_markers(content);
+        let ok = !input.is_error.unwrap_or(false);
+        let auth_failure = crate::tool_policy::output_has_auth_failure_markers(input.content);
 
-        if matches!(tool_name, "bash" | "http") {
+        if matches!(input.tool_name, "bash" | "http") {
             observation.round_external_failures = external_failure_increment(ok, auth_failure);
 
-            if !hosts.is_empty() {
+            if !input.hosts.is_empty() {
                 if auth_failure {
                     self.total_auth_failure_events =
                         self.total_auth_failure_events.saturating_add(1);
                     let mut newly_blocked: Vec<String> = Vec::new();
-                    for host in hosts {
+                    for host in input.hosts {
                         let entry = self.host_auth_failures.entry(host.clone()).or_insert(0);
                         *entry = entry.saturating_add(1);
                         if *entry >= crate::AUTH_CIRCUIT_BREAKER_THRESHOLD
@@ -225,7 +229,7 @@ impl TurnRuntimeState {
                     }
                     if !newly_blocked.is_empty() {
                         let blocked_list = newly_blocked.join(", ");
-                        content.push_str(&format!(
+                        input.content.push_str(&format!(
                             "\n\n[circuit-breaker] repeated auth failures for host(s): {blocked_list}. Stop retrying this source in this turn; pivot to another provider or ask the user for credentials."
                         ));
                         observation
@@ -235,28 +239,34 @@ impl TurnRuntimeState {
                             self.telemetry.circuit_breaker_trips.saturating_add(1);
                     }
                 } else if ok {
-                    for host in hosts {
+                    for host in input.hosts {
                         self.host_probe_passed.insert(host.clone());
                     }
                 }
             }
 
-            if let Some(cache_key) = cache_key {
+            if let Some(cache_key) = input.cache_key {
                 self.external_result_cache.insert(
                     cache_key.to_string(),
                     (
-                        crate::cap_bytes_with_hint(content.clone(), 6_000, "cache entry truncated"),
-                        is_error,
+                        crate::cap_bytes_with_hint(
+                            input.content.clone(),
+                            6_000,
+                            "cache entry truncated",
+                        ),
+                        input.is_error,
                     ),
                 );
             }
         }
 
-        if let Some(sim_key) = bash_similarity_key {
+        if let Some(sim_key) = input.bash_similarity_key {
             let productive = ok
                 && !auth_failure
-                && (content.trim().chars().count() >= 80
-                    || command.is_some_and(is_safe_repeated_validation_command));
+                && (input.content.trim().chars().count() >= 80
+                    || input
+                        .command
+                        .is_some_and(is_safe_repeated_validation_command));
             self.bash_attempt_history
                 .push((sim_key.to_string(), productive));
             if self.bash_attempt_history.len() > 64 {
@@ -309,7 +319,8 @@ struct ObjectiveEvidence {
     bash_commands: Vec<String>,
     touched_paths: Vec<String>,
     tool_result_text: String,
-    change_count: usize,
+    mutation_count: usize,
+    commit_count: usize,
 }
 
 fn explicit_apply_fixes_requested(lowered: &str) -> bool {
@@ -466,13 +477,13 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
                     evidence.tool_names.insert(name.clone());
                     match name.as_str() {
                         "edit_file" | "multi_edit" | "write_file" => {
-                            evidence.change_count += 1;
+                            evidence.mutation_count += 1;
                             if let Some(path) = input["path"].as_str() {
                                 evidence.touched_paths.push(path.to_string());
                             }
                         }
                         "git_commit" => {
-                            evidence.change_count += 1;
+                            evidence.commit_count += 1;
                         }
                         "bash" => {
                             if let Some(cmd) = input["command"].as_str() {
@@ -538,7 +549,7 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
             )
         }
         "implement requested changes" => {
-            evidence.change_count > 0
+            evidence.mutation_count > 0
                 || assistant_text_has_blocked_reason(&evidence.final_assistant_text_raw)
         }
         "run verification checks" => {
@@ -587,7 +598,8 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                 )
         }
         "deliver requested outcome with verifiable steps" => {
-            evidence.change_count > 0
+            evidence.mutation_count > 0
+                || evidence.commit_count > 0
                 || !evidence.bash_commands.is_empty()
                 || evidence.assistant_text_raw.trim().chars().count() >= 80
                 || contains_any(
@@ -1407,35 +1419,35 @@ mod tests {
         assert!(guard.contains("single-item probe"), "{guard}");
 
         let mut first = "short auth failure".to_string();
-        state.record_external_outcome(
-            "bash",
-            &hosts,
-            None,
-            Some("curl <url>"),
-            None,
-            &mut first,
-            Some(true),
-        );
+        state.record_external_outcome(ExternalOutcomeInput {
+            tool_name: "bash",
+            hosts: &hosts,
+            cache_key: None,
+            bash_similarity_key: Some("curl <url>"),
+            command: None,
+            content: &mut first,
+            is_error: Some(true),
+        });
         let mut second = "still short and failing".to_string();
-        state.record_external_outcome(
-            "bash",
-            &hosts,
-            None,
-            Some("curl <url>"),
-            None,
-            &mut second,
-            Some(true),
-        );
+        state.record_external_outcome(ExternalOutcomeInput {
+            tool_name: "bash",
+            hosts: &hosts,
+            cache_key: None,
+            bash_similarity_key: Some("curl <url>"),
+            command: None,
+            content: &mut second,
+            is_error: Some(true),
+        });
         let mut third = "yet another short failure".to_string();
-        state.record_external_outcome(
-            "bash",
-            &hosts,
-            None,
-            Some("curl <url>"),
-            None,
-            &mut third,
-            Some(true),
-        );
+        state.record_external_outcome(ExternalOutcomeInput {
+            tool_name: "bash",
+            hosts: &hosts,
+            cache_key: None,
+            bash_similarity_key: Some("curl <url>"),
+            command: None,
+            content: &mut third,
+            is_error: Some(true),
+        });
 
         let similarity = state
             .bash_similarity_guard(Some("curl <url>"), Some("curl https://api.example.com"))
@@ -1449,29 +1461,29 @@ mod tests {
         let hosts = vec!["api.example.com".to_string()];
 
         let mut first = "HTTP 401 unauthorized".to_string();
-        let first_obs = state.record_external_outcome(
-            "bash",
-            &hosts,
-            Some("cache-key"),
-            Some("curl one"),
-            None,
-            &mut first,
-            Some(true),
-        );
+        let first_obs = state.record_external_outcome(ExternalOutcomeInput {
+            tool_name: "bash",
+            hosts: &hosts,
+            cache_key: Some("cache-key"),
+            bash_similarity_key: Some("curl one"),
+            command: None,
+            content: &mut first,
+            is_error: Some(true),
+        });
         assert_eq!(first_obs.round_external_failures, 1);
         assert!(first_obs.followup_warnings.is_empty());
         assert!(!state.should_emit_partial_delivery_hint(1));
 
         let mut second = "HTTP 401 unauthorized".to_string();
-        let second_obs = state.record_external_outcome(
-            "bash",
-            &hosts,
-            Some("cache-key-2"),
-            Some("curl two"),
-            None,
-            &mut second,
-            Some(true),
-        );
+        let second_obs = state.record_external_outcome(ExternalOutcomeInput {
+            tool_name: "bash",
+            hosts: &hosts,
+            cache_key: Some("cache-key-2"),
+            bash_similarity_key: Some("curl two"),
+            command: None,
+            content: &mut second,
+            is_error: Some(true),
+        });
         assert!(second.contains("[circuit-breaker]"), "{second}");
         assert_eq!(second_obs.round_external_failures, 1);
         assert_eq!(second_obs.followup_warnings.len(), 1, "{:?}", second_obs);
@@ -1488,15 +1500,15 @@ mod tests {
         let mut validation_state = TurnRuntimeState::new();
         for _ in 0..4 {
             let mut output = "exit: 0".to_string();
-            validation_state.record_external_outcome(
-                "bash",
-                &[],
-                None,
-                Some("git diff --check"),
-                Some("git diff --check"),
-                &mut output,
-                Some(false),
-            );
+            validation_state.record_external_outcome(ExternalOutcomeInput {
+                tool_name: "bash",
+                hosts: &[],
+                cache_key: None,
+                bash_similarity_key: Some("git diff --check"),
+                command: Some("git diff --check"),
+                content: &mut output,
+                is_error: Some(false),
+            });
         }
         assert!(
             validation_state

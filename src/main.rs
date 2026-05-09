@@ -2267,7 +2267,7 @@ fn luhn_valid(digits: &str) -> bool {
         sum += n;
         double = !double;
     }
-    sum > 0 && sum % 10 == 0
+    sum > 0 && sum.is_multiple_of(10)
 }
 
 fn privacy_sensitive_path(path: &str) -> bool {
@@ -5743,7 +5743,7 @@ fn execute_tool_with_cache(
             } else {
                 let symbol = symbol.expect("selector count checked");
                 let Some(window) = find_symbol_window(&content, &starts, symbol, context) else {
-                    let hint = tool_policy::tool_input_advisory("read_symbol", &input)
+                    let hint = tool_policy::tool_input_advisory("read_symbol", input)
                         .unwrap_or_else(|| format!("Search first with rg -n '{symbol}' {}, then retry read_symbol with an exact symbol or line.", path.display()));
                     let suggestions =
                         render_symbol_not_found_suggestions(&path, root, &content, &starts, symbol)
@@ -11104,13 +11104,15 @@ impl Agent {
                     ));
                 }
                 let observation = turn_state.record_external_outcome(
-                    &name,
-                    &hosts,
-                    cache_key.as_deref(),
-                    bash_similarity_key.as_deref(),
-                    input["command"].as_str(),
-                    &mut content,
-                    is_error,
+                    orchestrator::ExternalOutcomeInput {
+                        tool_name: &name,
+                        hosts: &hosts,
+                        cache_key: cache_key.as_deref(),
+                        bash_similarity_key: bash_similarity_key.as_deref(),
+                        command: input["command"].as_str(),
+                        content: &mut content,
+                        is_error,
+                    },
                 );
                 emit_external_telemetry(self.sink.as_mut(), &turn_state);
                 round_external_failures =
