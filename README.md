@@ -1,15 +1,15 @@
-# Wolf
+# Dext
 
-Wolf is a single-binary Rust coding agent that runs from your terminal, keeps project-scoped session state, and gives the model a small set of native tools for filesystem, search, shell/data, HTTP, Git, and task tracking.
+Dext is a single-binary Rust coding agent that runs from your terminal, keeps project-scoped session state, and gives the model a small set of native tools for filesystem, search, shell/data, HTTP, Git, and task tracking.
 
-Wolf is source-first: prompts, runtime state, tool policies, provider wiring, and the TUI live in this repository with no external service required beyond whichever model provider you authenticate.
+Dext is source-first: prompts, runtime state, tool policies, provider wiring, and the TUI live in this repository with no external service required beyond whichever model provider you authenticate.
 
 ## Highlights
 
 - Interactive terminal agent with an inline ratatui TUI; no alternate-screen takeover.
 - One-shot mode for scripted tasks and JSON/stream-JSON output for automation.
 - Provider catalog with built-in GLM and ChatGPT/Codex profiles plus env/catalog overrides.
-- OAuth/API-key auth flows stored outside the repo under Wolf state directories.
+- OAuth/API-key auth flows stored outside the repo under Dext state directories.
 - Lean default tool schemas with optional full schemas and frugal context mode.
 - Project-scoped latest sessions, named session export/analyze/grep/failure/verification helpers.
 - Permission and sandbox profiles for read-only, workspace-write, and explicit danger modes.
@@ -20,16 +20,16 @@ Wolf is source-first: prompts, runtime state, tool policies, provider wiring, an
 Requires Rust stable with edition 2024 support.
 
 ```bash
-git clone https://github.com/SiliconState/Wolf.git
-cd Wolf
+git clone https://github.com/SiliconState/Dext.git
+cd Dext
 cargo install --path . --force
 ```
 
 Then run:
 
 ```bash
-wolf --help
-wolf
+dext --help
+dext
 ```
 
 For local development without installing:
@@ -43,37 +43,37 @@ cargo run -- --help
 Authenticate a provider:
 
 ```bash
-wolf auth providers
-wolf auth login chatgpt          # ChatGPT/Codex OAuth
-wolf auth login glm <api-key>    # ZAI GLM key
-wolf auth login openai <api-key> # OpenAI Platform key
-wolf auth login anthropic <api-key>
-wolf auth login deepseek <api-key>
+dext auth providers
+dext auth login chatgpt          # ChatGPT/Codex OAuth
+dext auth login glm <api-key>    # ZAI GLM key
+dext auth login openai <api-key> # OpenAI Platform key
+dext auth login anthropic <api-key>
+dext auth login deepseek <api-key>
 ```
 
 Start an interactive session:
 
 ```bash
-wolf
+dext
 ```
 
 Run a one-shot task:
 
 ```bash
-wolf "summarize this repository"
+dext "summarize this repository"
 ```
 
 Read a prompt from stdin:
 
 ```bash
-printf 'explain Cargo.toml\n' | wolf -p
+printf 'explain Cargo.toml\n' | dext -p
 ```
 
 Use low-token mode:
 
 ```bash
-wolf --frugal
-# or inside Wolf:
+dext --frugal
+# or inside Dext:
 /context frugal
 ```
 
@@ -82,12 +82,12 @@ wolf --frugal
 CLI:
 
 ```bash
-wolf --resume
-wolf --fork
-wolf sessions
-wolf session export latest html wolf-session.html
-wolf session analyze latest
-wolf --eval
+dext --resume
+dext --fork
+dext sessions
+dext session export latest html dext-session.html
+dext session analyze latest
+dext --eval
 ```
 
 Interactive slash commands:
@@ -111,32 +111,32 @@ Interactive slash commands:
 
 ## Configuration and state
 
-Wolf reads `.env` for local development if present, but `.env` is ignored and must never be committed. Prefer `wolf auth login ...` for credentials.
+Dext reads `.env` for local development if present, but `.env` is ignored and must never be committed. Prefer `dext auth login ...` for credentials.
 
 Useful environment variables:
 
 ```bash
-WOLF_PROVIDER=chatgpt
-WOLF_MODEL=gpt-5.3-codex
-WOLF_BASE_URL=https://example.test/v1
-WOLF_API_KEY=...
+DEXT_PROVIDER=chatgpt
+DEXT_MODEL=gpt-5.3-codex
+DEXT_BASE_URL=https://example.test/v1
+DEXT_API_KEY=...
 ZAI_API_KEY=...
 ANTHROPIC_API_KEY=...
 OPENAI_API_KEY=...
 DEEPSEEK_API_KEY=...
 CHATGPT_ACCESS_TOKEN=...
 OPENROUTER_API_KEY=...
-WOLF_HOME=~/.wolf
-WOLF_SESSIONS_DIR=~/.wolf/sessions
-WOLF_LOGS_DIR=~/.wolf/logs
-WOLF_APPROVAL=ask
-WOLF_SANDBOX_PROFILE=workspace-write
-WOLF_CONTEXT_MODE=standard
-WOLF_TOOL_PROFILE=lean
-WOLF_BUDGET_CAP=$5
+DEXT_HOME=~/.dext
+DEXT_SESSIONS_DIR=~/.dext/sessions
+DEXT_LOGS_DIR=~/.dext/logs
+DEXT_APPROVAL=ask
+DEXT_SANDBOX_PROFILE=workspace-write
+DEXT_CONTEXT_MODE=standard
+DEXT_TOOL_PROFILE=lean
+DEXT_BUDGET_CAP=$5
 ```
 
-Runtime state and credentials live outside version control. Project-local runtime directories such as `.wolf/`, `.pi/`, `target/`, `.env`, `WOLF.todo.json`, and `wolf-session-*` exports are ignored.
+Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `.pi/`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored.
 
 ## Development
 
@@ -161,7 +161,7 @@ Use the TUI smoke test after changing `src/tui.rs`.
 - `src/tui.rs` — inline terminal UI.
 - `tests/` — integration tests and replay fixtures.
 - `benches/` — criterion benchmarks.
-- `WOLF.md` / `WOLF.memory.md` — prompt-facing project guidance for Wolf working on itself.
+- `DEXT.md` / `DEXT.memory.md` — prompt-facing project guidance for Dext working on itself.
 - `MEMORY.md` — durable project memory synced through pi-memory.
 
 More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/USAGE.md`](docs/USAGE.md), [`SECURITY.md`](SECURITY.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md).

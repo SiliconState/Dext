@@ -1,7 +1,7 @@
 # Tooling and workflow improvement tasks
 
-Source: review of `wolf-session-1778099507.jsonl` plus user correction that
-pi-memory is an external shared memory tool, not part of Wolf.
+Source: review of `dext-session-1778099507.jsonl` plus user correction that
+pi-memory is an external shared memory tool, not part of Dext.
 
 ## Goals
 
@@ -9,18 +9,18 @@ pi-memory is an external shared memory tool, not part of Wolf.
 - Reduce assumptions about shell/tool availability.
 - Make symbol/source searches more reliable.
 - Keep cleanup/final-verification loops efficient without hiding real failures.
-- Clarify pi-memory as an external tool usable by Wolf or any agent.
+- Clarify pi-memory as an external tool usable by Dext or any agent.
 
 ## Tasks
 
 ### 1. Add a shell/tool availability guide to the system prompt
 
-Problem: the agent used `rg` inside `bash` because `rg` exists as a Wolf API tool,
+Problem: the agent used `rg` inside `bash` because `rg` exists as a Dext API tool,
 but `rg` was not available in the shell PATH.
 
 Action:
 - Add prompt guidance: API tools are not shell binaries.
-- Prefer native Wolf tools (`rg`, `fd`, `jq`, `http`) directly instead of assuming
+- Prefer native Dext tools (`rg`, `fd`, `jq`, `http`) directly instead of assuming
   matching commands exist in bash.
 - If a shell binary is required, probe once with `command -v <name>` before use.
 - For portable shell text search, use `grep`/`awk` when appropriate.
@@ -97,15 +97,15 @@ Problem: `pi-memory sync MEMORY.md` produced trailing Markdown spaces caught by
 `git diff --check`.
 
 Action:
-- Add a Wolf-side helper/wrapper pattern in docs or code for memory sync:
+- Add a Dext-side helper/wrapper pattern in docs or code for memory sync:
   run `pi-memory sync`, then strip trailing whitespace in tracked Markdown.
 - Prefer fixing pi-memory itself if editing that external project; otherwise keep
-  Wolf guidance explicit and non-invasive.
-- Clarify that pi-memory is external and Wolf should use official CLI/API flows,
+  Dext guidance explicit and non-invasive.
+- Clarify that pi-memory is external and Dext should use official CLI/API flows,
   not mutate its DB.
 
 Acceptance:
-- WOLF guidance says pi-memory is external.
+- DEXT guidance says pi-memory is external.
 - A documented command or helper strips trailing whitespace after sync.
 - `git diff --check` passes after memory sync.
 
@@ -133,13 +133,13 @@ Problem: verifying installed strings with repeated `strings | grep` probes ran
 into similarity guard friction.
 
 Action:
-- Add a canonical verification command or Wolf CLI subcommand for installed build
-  provenance, e.g. `wolf --version --verbose` showing source path/git hash/build
+- Add a canonical verification command or Dext CLI subcommand for installed build
+  provenance, e.g. `dext --version --verbose` showing source path/git hash/build
   time/features.
 - Prefer semantic installed checks over `strings` probes.
 
 Acceptance:
-- `wolf --version --verbose` or equivalent displays enough provenance to confirm
+- `dext --version --verbose` or equivalent displays enough provenance to confirm
   install freshness.
 - Tests cover version/provenance output if feasible.
 
@@ -152,7 +152,7 @@ Acceptance:
 
 ## Verification plan
 
-For Wolf source changes:
+For Dext source changes:
 
 ```bash
 cargo build --release

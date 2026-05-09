@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Wolf is pre-1.0. Security fixes are handled on `master` unless release branches are introduced later.
+Dext is pre-1.0. Security fixes are handled on `master` unless release branches are introduced later.
 
 ## Reporting a vulnerability
 
@@ -23,20 +23,20 @@ Please include:
 Never commit real credentials. The following must remain local/private:
 
 - `.env`
-- `.wolf/`
+- `.dext/`
 - `.pi/`
-- `~/.wolf/auth.json`
-- `~/.wolf/providers.json` if it contains private endpoints or tokens
-- `wolf-session-*.jsonl`
-- `wolf-session-*.html`
-- `WOLF.todo.json`
+- `~/.dext/auth.json`
+- `~/.dext/providers.json` if it contains private endpoints or tokens
+- `dext-session-*.jsonl`
+- `dext-session-*.html`
+- `DEXT.todo.json`
 - terminal/session logs and crash snapshots
 
 Use `.env.example` for documented variable names only. Do not put real values there.
 
 ## Session export warning
 
-Wolf sessions and exports can contain:
+Dext sessions and exports can contain:
 
 - User prompts.
 - Model responses.
@@ -67,5 +67,5 @@ Also scan untracked and ignored files before deciding what to preserve locally v
 - `--approval ask` is the conservative default for privileged tools.
 - `--approval never` prevents privileged tool execution.
 - `--sandbox read-only` is recommended for review-only tasks.
-- `--fangs-out` and `danger-full-access` are high-trust modes. Use only in controlled environments.
-- OAuth/API-key login should use Wolf's official CLI/slash flows. Do not copy credentials from unrelated tools or stores.
+- `--trust` and `danger-full-access` are high-trust modes. Use only in controlled environments.
+- OAuth/API-key login should use Dext's official CLI/slash flows. Do not copy credentials from unrelated tools or stores.

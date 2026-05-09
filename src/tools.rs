@@ -48,7 +48,7 @@ pub(crate) enum ToolProfile {
 
 impl ToolProfile {
     pub(crate) fn from_env() -> Self {
-        std::env::var("WOLF_TOOL_PROFILE")
+        std::env::var("DEXT_TOOL_PROFILE")
             .ok()
             .and_then(|v| Self::parse(&v))
             .unwrap_or_default()
@@ -154,7 +154,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout": {"type": "integer", "description": "Optional timeout in seconds for legitimate long-running commands. Defaults to WOLF_BASH_TIMEOUT_SECS or 60."}
+                    "timeout": {"type": "integer", "description": "Optional timeout in seconds for legitimate long-running commands. Defaults to DEXT_BASH_TIMEOUT_SECS or 60."}
                 },
                 "required": ["command"]
             }),
@@ -212,7 +212,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "http",
-            description: "HTTP request via Wolf's built-in client. Args are HTTPie-ish, e.g. ['GET','https://api.x','Auth:Bearer abc'] or ['POST','url','name=john']. Response output is capped. Add --extract-text (or --text) to strip HTML/script/style noise and pretty-print JSON for research pages.",
+            description: "HTTP request via Dext's built-in client. Args are HTTPie-ish, e.g. ['GET','https://api.x','Auth:Bearer abc'] or ['POST','url','name=john']. Response output is capped. Add --extract-text (or --text) to strip HTML/script/style noise and pretty-print JSON for research pages.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

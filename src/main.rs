@@ -22,11 +22,10 @@ use provider::{
     try_complete_oauth_from_callback,
 };
 use session::{
-    ProjectStateLock, atomic_write_bytes, latest_log_path, latest_session_path,
+    ProjectStateLock, atomic_write_bytes, dext_state_dir, latest_log_path, latest_session_path,
     list_session_records_for_root, named_session_path_for_root, named_sessions_dir_for_root,
     parse_session_header, project_key, project_state_dir, project_state_lock_path,
     release_registered_locks, render_limited_csv, restore_terminal_if_tui, unix_timestamp_secs,
-    wolf_state_dir,
 };
 use tools::{
     Tool, ToolProfile, is_external_process_tool, needs_permission, provider_tool_definitions,
@@ -80,14 +79,14 @@ const STREAM_EVENT_BUFFER_CAP: usize = 256_000;
 const TOOL_SUMMARY_CHAR_CAP: usize = 180;
 const TOOL_UI_CONTENT_CAP: usize = 8_000;
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
-pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "WOLF_ALLOW_BREAK_SYSTEM_PACKAGES";
+pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "DEXT_ALLOW_BREAK_SYSTEM_PACKAGES";
 const AUTH_CIRCUIT_BREAKER_THRESHOLD: usize = 2;
 const TOOL_CATALOG_VERSION: u32 = 3;
 const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     ".git",
     ".hg",
     ".svn",
-    ".wolf",
+    ".dext",
     ".pi",
     "target",
     "node_modules",
@@ -340,7 +339,7 @@ pub(crate) fn record_crash_event(event: &AgentEvent) {
 
 fn write_crash_snapshot(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> {
     let id = format!("crash-{}-{}", unix_timestamp_secs(), std::process::id());
-    let path = wolf_state_dir().join("crashes").join(format!("{id}.json"));
+    let path = dext_state_dir().join("crashes").join(format!("{id}.json"));
     let location = info
         .location()
         .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
@@ -730,7 +729,7 @@ impl ApprovalProfile {
             "auto-read" | "read" | "read-only" => Some(Self::AutoRead),
             "auto-write" | "trusted" | "on-failure" => Some(Self::AutoWrite),
             "never" | "deny" | "no-ask" => Some(Self::Never),
-            "always" | "auto" | "fangs-out" | "danger" => Some(Self::Always),
+            "always" | "auto" | "trust" | "danger" => Some(Self::Always),
             _ => None,
         }
     }
@@ -1015,14 +1014,14 @@ impl EventSink for ConsoleSink {
             AgentEvent::TextDelta(t) => {
                 if self.pretty {
                     if !self.printed_prefix {
-                        print!("wolf> …");
+                        print!("dext> …");
                         let _ = io::stdout().flush();
                         self.printed_prefix = true;
                     }
                     self.text_accum.push_str(&t);
                 } else {
                     if !self.printed_prefix {
-                        print!("wolf> ");
+                        print!("dext> ");
                         self.printed_prefix = true;
                     }
                     print!("{t}");
@@ -1366,7 +1365,7 @@ fn write_subagent_input(root: &Path, request: &SubagentRequest) -> Result<(PathB
     let bytes = serde_json::to_vec_pretty(request)?;
     atomic_write_bytes(&input_path, &bytes)?;
     let header = format!(
-        "# Wolf subagent output bundle\n\ninput: {}\ntask: {}\nstatus: launched\n\n## Logs\n",
+        "# Dext subagent output bundle\n\ninput: {}\ntask: {}\nstatus: launched\n\n## Logs\n",
         input_path.display(),
         request.task
     );
@@ -1379,7 +1378,7 @@ fn spawn_detached_subagent_process(
     input_path: &Path,
     output_path: &Path,
 ) -> Result<DetachedSubagentLaunch> {
-    let exe = current_wolf_executable()?;
+    let exe = current_dext_executable()?;
     #[cfg(unix)]
     let monitor_command = format!(
         "tail -f {}",
@@ -1889,7 +1888,7 @@ impl Default for PrivacyPolicy {
 impl PrivacyPolicy {
     fn from_env() -> Self {
         let mut policy = Self::default();
-        if let Ok(v) = std::env::var("WOLF_PRIVACY") {
+        if let Ok(v) = std::env::var("DEXT_PRIVACY") {
             policy.enabled = matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on" | "redact" | "strict"
@@ -2592,7 +2591,7 @@ impl BudgetCap {
     }
 
     fn from_env() -> Option<Self> {
-        std::env::var("WOLF_BUDGET_CAP")
+        std::env::var("DEXT_BUDGET_CAP")
             .ok()
             .and_then(|v| Self::parse(&v))
     }
@@ -2777,7 +2776,7 @@ fn output_suspicious_stderr_note(status: i32, stderr: &str) -> Option<String> {
     ];
     if suspicious.iter().any(|needle| lower.contains(needle)) {
         Some(
-            "[wolf note] command exited 0 but stderr contains failure-looking text; verify before trusting this result.\n".to_string(),
+            "[dext note] command exited 0 but stderr contains failure-looking text; verify before trusting this result.\n".to_string(),
         )
     } else {
         None
@@ -3000,7 +2999,7 @@ fn timeout_from_env(var: &str, fallback_secs: u64) -> std::time::Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .or_else(|| {
-            std::env::var("WOLF_EXTERNAL_TIMEOUT_SECS")
+            std::env::var("DEXT_EXTERNAL_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .filter(|secs| *secs > 0)
@@ -3010,11 +3009,11 @@ fn timeout_from_env(var: &str, fallback_secs: u64) -> std::time::Duration {
 }
 
 fn external_tool_timeout() -> std::time::Duration {
-    timeout_from_env("WOLF_EXTERNAL_TIMEOUT_SECS", EXTERNAL_TOOL_TIMEOUT_SECS)
+    timeout_from_env("DEXT_EXTERNAL_TIMEOUT_SECS", EXTERNAL_TOOL_TIMEOUT_SECS)
 }
 
 fn bash_tool_timeout() -> std::time::Duration {
-    timeout_from_env("WOLF_BASH_TIMEOUT_SECS", EXTERNAL_TOOL_TIMEOUT_SECS)
+    timeout_from_env("DEXT_BASH_TIMEOUT_SECS", EXTERNAL_TOOL_TIMEOUT_SECS)
 }
 
 fn timeout_from_tool_input(input: &Value, fallback: std::time::Duration) -> std::time::Duration {
@@ -3026,14 +3025,14 @@ fn timeout_from_tool_input(input: &Value, fallback: std::time::Duration) -> std:
 }
 
 fn hook_timeout() -> std::time::Duration {
-    timeout_from_env("WOLF_HOOK_TIMEOUT_SECS", EXTERNAL_TOOL_TIMEOUT_SECS)
+    timeout_from_env("DEXT_HOOK_TIMEOUT_SECS", EXTERNAL_TOOL_TIMEOUT_SECS)
 }
 
 const CHECKPOINT_DEBOUNCE_MS_DEFAULT: u64 = 500;
 const MAX_CONCURRENT_BUILTINS_DEFAULT: usize = 8;
 
 fn max_concurrent_builtins() -> usize {
-    std::env::var("WOLF_MAX_CONCURRENT_BUILTINS")
+    std::env::var("DEXT_MAX_CONCURRENT_BUILTINS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
@@ -3042,7 +3041,7 @@ fn max_concurrent_builtins() -> usize {
 
 fn unique_temp_dir(label: &str) -> PathBuf {
     let unique = format!(
-        "wolf-{label}-{}-{}",
+        "dext-{label}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3130,7 +3129,7 @@ fn edit_result_with_diff(
 }
 
 // "Full jitter" backoff: returns a wait in [base/2, base). Prevents thundering-herd when multiple
-// wolf processes see the same 429/503 at the same second and would otherwise retry in lockstep.
+// dext processes see the same 429/503 at the same second and would otherwise retry in lockstep.
 // Doesn't touch retry-after header waits — those come from the server and are respected exactly.
 fn jittered_backoff_secs(base: u64) -> u64 {
     let base = base.max(1);
@@ -3154,7 +3153,7 @@ fn jitter_next() -> u64 {
 }
 
 fn checkpoint_debounce() -> std::time::Duration {
-    let ms = std::env::var("WOLF_CHECKPOINT_DEBOUNCE_MS")
+    let ms = std::env::var("DEXT_CHECKPOINT_DEBOUNCE_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(CHECKPOINT_DEBOUNCE_MS_DEFAULT);
@@ -3192,21 +3191,21 @@ fn binary_on_path(name: &str) -> bool {
     find_binary_on_path(name).is_some()
 }
 
-fn current_wolf_executable() -> Result<PathBuf> {
-    current_wolf_executable_from(
-        std::env::current_exe().context("resolve current wolf executable")?,
+fn current_dext_executable() -> Result<PathBuf> {
+    current_dext_executable_from(
+        std::env::current_exe().context("resolve current dext executable")?,
     )
 }
 
-fn current_wolf_executable_from(exe: PathBuf) -> Result<PathBuf> {
+fn current_dext_executable_from(exe: PathBuf) -> Result<PathBuf> {
     if exe.is_file() {
         return Ok(exe);
     }
-    if let Some(path_exe) = find_binary_on_path("wolf") {
+    if let Some(path_exe) = find_binary_on_path("dext") {
         return Ok(path_exe);
     }
     anyhow::bail!(
-        "resolved current executable {} is not a file, and `wolf` was not found on PATH",
+        "resolved current executable {} is not a file, and `dext` was not found on PATH",
         exe.display()
     )
 }
@@ -4096,7 +4095,7 @@ async fn execute_http_tool_async(
     let mut req = http_tool_client()
         .request(request.method, request.url)
         .timeout(request.timeout)
-        .header(reqwest::header::USER_AGENT, "wolf/http");
+        .header(reqwest::header::USER_AGENT, "dext/http");
     for (name, value) in request.headers {
         req = req.header(name, value);
     }
@@ -4521,7 +4520,7 @@ fn collect_rust_files_for_diagnostics(dir: &Path, out: &mut Vec<PathBuf>, max_fi
             return;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if matches!(name, "target" | ".git" | ".wolf" | ".pi") {
+        if matches!(name, "target" | ".git" | ".dext" | ".pi") {
             continue;
         }
         if path.is_dir() {
@@ -4621,7 +4620,7 @@ fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsRepor
         }
     }
 
-    let timeout = timeout_from_env("WOLF_LSP_DIAGNOSTICS_TIMEOUT_SECS", 20);
+    let timeout = timeout_from_env("DEXT_LSP_DIAGNOSTICS_TIMEOUT_SECS", 20);
     let deadline = std::time::Instant::now() + timeout;
     let mut diagnostics = Vec::new();
     let mut capture = LimitedTextCapture::new(PROCESS_STREAM_CAPTURE_CAP);
@@ -5865,7 +5864,7 @@ fn execute_tool_with_cache(
             run_external("git", &commit_args, None, root)
         }
         "todo_read" => {
-            let todo_path = root.join("WOLF.todo.json");
+            let todo_path = root.join("DEXT.todo.json");
             if !todo_path.exists() {
                 return Ok("(no todos — use todo_write to create a task list)".to_string());
             }
@@ -5892,7 +5891,7 @@ fn execute_tool_with_cache(
                     Ok(json!({"text": text, "status": status}))
                 })
                 .collect::<std::result::Result<_, String>>()?;
-            let todo_path = root.join("WOLF.todo.json");
+            let todo_path = root.join("DEXT.todo.json");
             let before = read_todo_counts(&todo_path);
             let content = serde_json::to_string_pretty(&json!(validated))
                 .map_err(|e| format!("serialize todo: {e}"))?;
@@ -6407,7 +6406,7 @@ fn prompt_permission(name: &str, input: &Value, pretty: bool) -> Choice {
 }
 
 const DEFAULT_SYSTEM: &str = "\
-You are wolf, a terse coding assistant running as a CLI agent on the user's machine.
+You are dext, a terse coding assistant running as a CLI agent on the user's machine.
 
 Use only tools exposed in the current API tool list. Do not assume unavailable tools exist.
 
@@ -6420,9 +6419,9 @@ Runtime:
 Project state:
 - For nontrivial or ongoing project work, run todo_read first and use todo_write to track a concise plan/status.
 - Skip todo tools for trivial, single-turn, or mechanical benchmark tasks unless the user asks for planning/status.
-- Treat injected WOLF.md / WOLF.memory.md as project guidance; reread files only when exact current text matters.
-- Update WOLF.memory.md only for durable decisions, preferences, in-progress work, or open questions.
-- Keep WOLF.md concise and update it only for durable project guidance.
+- Treat injected DEXT.md / DEXT.memory.md as project guidance; reread files only when exact current text matters.
+- Update DEXT.memory.md only for durable decisions, preferences, in-progress work, or open questions.
+- Keep DEXT.md concise and update it only for durable project guidance.
 
 Discovery and reading:
 - Prefer fd for file discovery and rg for content search.
@@ -6443,7 +6442,7 @@ Git:
 
 Shell and external operations:
 - For bash pipelines, preserve failures with pipefail and avoid brittle silent-success checks.
-- API tools are not shell binaries; use Wolf rg/fd/jq/http tools directly, or probe shell commands with `command -v` before assuming they exist in bash.
+- API tools are not shell binaries; use Dext rg/fd/jq/http tools directly, or probe shell commands with `command -v` before assuming they exist in bash.
 - For complex quoting, prefer arrays, single-quoted args, or heredocs.
 - Inspect stderr even when exit code is 0.
 - Validate external/data sources with one representative probe before scaling.
@@ -6504,7 +6503,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 fn read_project_todo_summary(root: &Path, max_items: usize) -> Option<String> {
-    let content = std::fs::read_to_string(root.join("WOLF.todo.json")).ok()?;
+    let content = std::fs::read_to_string(root.join("DEXT.todo.json")).ok()?;
     let todos = serde_json::from_str::<Value>(&content).ok()?;
     let items = todos.as_array()?;
     if items.is_empty() {
@@ -6593,9 +6592,9 @@ struct Hooks {
 
 impl Hooks {
     fn load(root: &Path) -> Self {
-        let path = std::env::var("WOLF_HOOKS_FILE")
+        let path = std::env::var("DEXT_HOOKS_FILE")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| root.join("WOLF.hooks.json"));
+            .unwrap_or_else(|_| root.join("DEXT.hooks.json"));
         match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
                 eprintln!("[hooks] parse error in {}: {e}", path.display());
@@ -6673,7 +6672,7 @@ impl ContextMode {
     }
 
     fn from_env() -> Self {
-        std::env::var("WOLF_CONTEXT_MODE")
+        std::env::var("DEXT_CONTEXT_MODE")
             .ok()
             .and_then(|v| Self::parse(&v))
             .unwrap_or_default()
@@ -6802,7 +6801,7 @@ struct ProviderHealthState {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct SessionProvenance {
-    wolf_version: String,
+    dext_version: String,
     git: Option<String>,
     provider: String,
     api_provider: ApiProvider,
@@ -6811,8 +6810,8 @@ struct SessionProvenance {
     approval_profile: ApprovalProfile,
     sandbox_profile: SandboxProfile,
     system_prompt_hash: String,
-    wolf_md_hash: Option<String>,
-    wolf_memory_hash: Option<String>,
+    dext_md_hash: Option<String>,
+    dext_memory_hash: Option<String>,
     tool_catalog_version: u32,
     prompt_sources: Vec<String>,
 }
@@ -7435,8 +7434,8 @@ fn parse_model_context_hint_tokens(model: &str) -> Option<u64> {
 }
 
 pub(crate) fn model_context_window(model: &str) -> u64 {
-    if let Ok(raw) = std::env::var("WOLF_CONTEXT_WINDOW")
-        .or_else(|_| std::env::var("WOLF_CONTEXT_WINDOW_TOKENS"))
+    if let Ok(raw) = std::env::var("DEXT_CONTEXT_WINDOW")
+        .or_else(|_| std::env::var("DEXT_CONTEXT_WINDOW_TOKENS"))
         && let Ok(v) = raw.trim().parse::<u64>()
         && v > 0
     {
@@ -7448,7 +7447,7 @@ pub(crate) fn model_context_window(model: &str) -> u64 {
     }
 
     // Resolution order (first match wins):
-    //   1. WOLF_CONTEXT_WINDOW / WOLF_CONTEXT_WINDOW_TOKENS env var (handled above).
+    //   1. DEXT_CONTEXT_WINDOW / DEXT_CONTEXT_WINDOW_TOKENS env var (handled above).
     //   2. Model-name suffix hint ("-128k", "-1m", etc).
     //   3. Provider-catalog override: providers.json → profile.context_window
     //      OR profile.model_context_windows[model].
@@ -7556,7 +7555,7 @@ fn history_char_budget_with_percent(
     if let Some(v) = override_chars.filter(|v| *v > 0) {
         return v;
     }
-    if let Ok(raw) = std::env::var("WOLF_MAX_HISTORY_CHARS")
+    if let Ok(raw) = std::env::var("DEXT_MAX_HISTORY_CHARS")
         && let Ok(v) = raw.trim().parse::<usize>()
         && v > 0
     {
@@ -7596,7 +7595,7 @@ fn active_history_char_budget_with_override(
 }
 
 fn compact_threshold_settings_path() -> PathBuf {
-    wolf_state_dir().join("settings.json")
+    dext_state_dir().join("settings.json")
 }
 
 fn load_compact_threshold_percent_setting() -> Option<u8> {
@@ -7696,7 +7695,7 @@ struct Agent {
     budget_exhausted: bool,
     // Caps concurrent builtin tool execution. Model may request 20 read_files at once; without
     // a cap, the runtime spawns 20 tasks that all contend for disk/CPU and open-file limits.
-    // Default 8; override via WOLF_MAX_CONCURRENT_BUILTINS=N.
+    // Default 8; override via DEXT_MAX_CONCURRENT_BUILTINS=N.
     builtin_semaphore: Arc<tokio::sync::Semaphore>,
     sink: Box<dyn EventSink>,
     steering_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
@@ -7739,11 +7738,11 @@ impl Agent {
             let _ = set_provider_default_model_in_catalog(&provider_id, &model);
         }
 
-        let thinking_effort = std::env::var("WOLF_THINKING_EFFORT")
+        let thinking_effort = std::env::var("DEXT_THINKING_EFFORT")
             .ok()
             .and_then(|v| ThinkingEffort::parse(&v))
             .unwrap_or_default();
-        let system = std::env::var("WOLF_SYSTEM")
+        let system = std::env::var("DEXT_SYSTEM")
             .ok()
             .and_then(|v| {
                 // Support `@path/to/file` to load system prompt from disk
@@ -7755,7 +7754,7 @@ impl Agent {
             })
             .unwrap_or_else(|| DEFAULT_SYSTEM.to_string());
         let sandbox_root = std::fs::canonicalize(sandbox.unwrap_or_else(|| {
-            PathBuf::from(std::env::var("WOLF_SANDBOX").unwrap_or_else(|_| ".".to_string()))
+            PathBuf::from(std::env::var("DEXT_SANDBOX").unwrap_or_else(|_| ".".to_string()))
         }))
         .context("could not canonicalize sandbox root")?;
         let latest_session = latest_session_path(&sandbox_root);
@@ -7769,7 +7768,7 @@ impl Agent {
 
         let pretty = io::stdout().is_terminal();
         let git_context = git_summary(&sandbox_root);
-        let browser_recipe = std::env::var("WOLF_BROWSER_RECIPE")
+        let browser_recipe = std::env::var("DEXT_BROWSER_RECIPE")
             .ok()
             .and_then(|v| BrowserRecipe::parse(&v))
             .unwrap_or_default();
@@ -7987,7 +7986,7 @@ impl Agent {
         )))
     }
 
-    fn set_fangs_out(&mut self, on: bool) -> usize {
+    fn set_trust_mode(&mut self, on: bool) -> usize {
         let profile = if on {
             ApprovalProfile::Always
         } else {
@@ -8150,7 +8149,7 @@ impl Agent {
         }
     }
 
-    pub(crate) fn fangs_out_active(&self) -> bool {
+    pub(crate) fn trust_mode_active(&self) -> bool {
         self.approval_profile == ApprovalProfile::Always
     }
 
@@ -8358,10 +8357,10 @@ impl Agent {
         } else {
             PROJECT_CONTEXT_CAP
         };
-        let mut wolf_md_sections: Vec<(String, String)> = Vec::new();
+        let mut dext_md_sections: Vec<(String, String)> = Vec::new();
         let mut dir = self.sandbox_root.as_path();
         loop {
-            let candidate = dir.join("WOLF.md");
+            let candidate = dir.join("DEXT.md");
             if candidate.exists()
                 && let Ok(content) = std::fs::read_to_string(&candidate)
             {
@@ -8376,7 +8375,7 @@ impl Agent {
                     } else {
                         format!("/{display}")
                     };
-                    wolf_md_sections.push((label, trimmed.to_string()));
+                    dext_md_sections.push((label, trimmed.to_string()));
                 }
             }
             match dir.parent() {
@@ -8384,12 +8383,12 @@ impl Agent {
                 _ => break,
             }
         }
-        wolf_md_sections.reverse();
-        for (label, content) in &wolf_md_sections {
+        dext_md_sections.reverse();
+        for (label, content) in &dext_md_sections {
             if context_budget == 0 {
                 break;
             }
-            let section = format!("\n\n## Project context (WOLF.md from {label})\n{}", content);
+            let section = format!("\n\n## Project context (DEXT.md from {label})\n{}", content);
             if section.len() <= context_budget {
                 stable.push_str(&section);
                 context_budget -= section.len();
@@ -8397,10 +8396,10 @@ impl Agent {
                 let remaining = cap_bytes_with_hint(
                     content.clone(),
                     context_budget.saturating_sub(60),
-                    "WOLF.md truncated; keep only the most important project guidance here.",
+                    "DEXT.md truncated; keep only the most important project guidance here.",
                 );
                 stable.push_str(&format!(
-                    "\n\n## Project context (WOLF.md from {label})\n{remaining}"
+                    "\n\n## Project context (DEXT.md from {label})\n{remaining}"
                 ));
                 context_budget = 0;
                 break;
@@ -8410,7 +8409,7 @@ impl Agent {
         let mut memory_sections: Vec<(String, String)> = Vec::new();
         let mut dir = self.sandbox_root.as_path();
         loop {
-            let candidate = dir.join("WOLF.memory.md");
+            let candidate = dir.join("DEXT.memory.md");
             if candidate.exists()
                 && let Ok(content) = std::fs::read_to_string(&candidate)
             {
@@ -8439,7 +8438,7 @@ impl Agent {
                 break;
             }
             let section = format!(
-                "\n\n## Persistent memory (WOLF.memory.md from {label})\n{}",
+                "\n\n## Persistent memory (DEXT.memory.md from {label})\n{}",
                 content
             );
             if section.len() <= context_budget {
@@ -8449,10 +8448,10 @@ impl Agent {
                 let remaining = cap_bytes_with_hint(
                     content.clone(),
                     context_budget.saturating_sub(60),
-                    "WOLF.memory.md truncated; keep durable facts concise.",
+                    "DEXT.memory.md truncated; keep durable facts concise.",
                 );
                 stable.push_str(&format!(
-                    "\n\n## Persistent memory (WOLF.memory.md from {label})\n{remaining}"
+                    "\n\n## Persistent memory (DEXT.memory.md from {label})\n{remaining}"
                 ));
                 break;
             }
@@ -8641,7 +8640,7 @@ impl Agent {
         let mut ledger = self.work_ledger.clone();
         ledger.files_changed.retain(|path| {
             let p = Path::new(path);
-            !p.is_absolute() && !path.starts_with(".wolf/") && !path.starts_with(".pi/")
+            !p.is_absolute() && !path.starts_with(".dext/") && !path.starts_with(".pi/")
         });
         if ledger.pending.is_empty() && ledger.in_progress.is_empty() && !ledger.done.is_empty() {
             ledger.next_actions.clear();
@@ -8660,7 +8659,7 @@ impl Agent {
             return;
         };
         let p = Path::new(path);
-        if p.is_absolute() || path.starts_with(".wolf/") || path.starts_with(".pi/") {
+        if p.is_absolute() || path.starts_with(".dext/") || path.starts_with(".pi/") {
             return;
         }
         if !self.work_ledger.files_changed.iter().any(|p| p == path) {
@@ -9015,7 +9014,7 @@ impl Agent {
                     }
                     Block::ToolUse { id, name, input } => {
                         // Responses API requires item `id` to start with "fc_".
-                        // Wolf stores the server-provided call_id (starts with "call_") in
+                        // Dext stores the server-provided call_id (starts with "call_") in
                         // Block.id and uses it to pair tool results. `id` is optional —
                         // omit it so the backend auto-assigns a valid item id.
                         items.push(json!({
@@ -9189,18 +9188,18 @@ impl Agent {
 
     fn session_provenance(&self) -> SessionProvenance {
         let mut prompt_sources = Vec::new();
-        let wolf_md = self.sandbox_root.join("WOLF.md");
-        let wolf_memory = self.sandbox_root.join("WOLF.memory.md");
-        let wolf_md_hash = std::fs::read(&wolf_md).ok().map(|bytes| {
-            prompt_sources.push(wolf_md.display().to_string());
+        let dext_md = self.sandbox_root.join("DEXT.md");
+        let dext_memory = self.sandbox_root.join("DEXT.memory.md");
+        let dext_md_hash = std::fs::read(&dext_md).ok().map(|bytes| {
+            prompt_sources.push(dext_md.display().to_string());
             sha256_hex_bytes(&bytes)
         });
-        let wolf_memory_hash = std::fs::read(&wolf_memory).ok().map(|bytes| {
-            prompt_sources.push(wolf_memory.display().to_string());
+        let dext_memory_hash = std::fs::read(&dext_memory).ok().map(|bytes| {
+            prompt_sources.push(dext_memory.display().to_string());
             sha256_hex_bytes(&bytes)
         });
         SessionProvenance {
-            wolf_version: env!("CARGO_PKG_VERSION").to_string(),
+            dext_version: env!("CARGO_PKG_VERSION").to_string(),
             git: self.git_context.clone(),
             provider: self.provider_id.clone(),
             api_provider: self.api_provider,
@@ -9209,8 +9208,8 @@ impl Agent {
             approval_profile: self.approval_profile,
             sandbox_profile: self.sandbox_profile,
             system_prompt_hash: sha256_hex_str(&self.compose_system_parts().0),
-            wolf_md_hash,
-            wolf_memory_hash,
+            dext_md_hash,
+            dext_memory_hash,
             tool_catalog_version: TOOL_CATALOG_VERSION,
             prompt_sources,
         }
@@ -9389,7 +9388,7 @@ impl Agent {
         }
 
         let mut merged = String::from(
-            "[wolf workaround] provider rejected structured tool_result blocks; flattened results:\n",
+            "[dext workaround] provider rejected structured tool_result blocks; flattened results:\n",
         );
         for block in &last.content {
             if let Block::ToolResult {
@@ -10188,7 +10187,7 @@ impl Agent {
 
     async fn chat_inner(&mut self, mut user_input: String) -> Result<()> {
         let mut compacted_this_turn = false;
-        let hook_env = [("WOLF_USER_INPUT", user_input.as_str())];
+        let hook_env = [("DEXT_USER_INPUT", user_input.as_str())];
         for (out, _code) in self
             .hooks
             .fire("user_prompt", "", &hook_env, &self.sandbox_root)
@@ -10262,7 +10261,7 @@ impl Agent {
 
         if self.provider_requires_api_key && self.api_key.trim().is_empty() {
             anyhow::bail!(
-                "missing credentials for provider '{}'. run `/login {}` in REPL or `wolf auth login {}`.",
+                "missing credentials for provider '{}'. run `/login {}` in REPL or `dext auth login {}`.",
                 self.provider_id,
                 self.provider_id,
                 self.provider_id
@@ -10306,7 +10305,7 @@ impl Agent {
 
             let chatgpt_session_id = (self.api_provider == ApiProvider::ChatGpt).then(|| {
                 format!(
-                    "wolf-{}-{}",
+                    "dext-{}-{}",
                     self.provider_id,
                     project_key(&self.sandbox_root)
                 )
@@ -10330,7 +10329,7 @@ impl Agent {
                 &sys_env,
                 &sys_blocks,
                 &wire_tools,
-                chatgpt_session_id.as_deref().unwrap_or("wolf"),
+                chatgpt_session_id.as_deref().unwrap_or("dext"),
             )?;
             let mut stream_attempt: u32 = 0;
             let (blocks, _stop_reason, mut usage) = 'stream_retry: loop {
@@ -10846,8 +10845,8 @@ impl Agent {
                         });
                     } else {
                         let pre_env = [
-                            ("WOLF_TOOL_NAME", name.as_str()),
-                            ("WOLF_TOOL_INPUT", input_str.as_str()),
+                            ("DEXT_TOOL_NAME", name.as_str()),
+                            ("DEXT_TOOL_INPUT", input_str.as_str()),
                         ];
                         let mut blocked: Option<String> = None;
                         for (out, code) in
@@ -11075,9 +11074,9 @@ impl Agent {
                 };
 
                 let post_env = [
-                    ("WOLF_TOOL_NAME", name.as_str()),
-                    ("WOLF_TOOL_INPUT", input_str.as_str()),
-                    ("WOLF_TOOL_RESULT", content.as_str()),
+                    ("DEXT_TOOL_NAME", name.as_str()),
+                    ("DEXT_TOOL_INPUT", input_str.as_str()),
+                    ("DEXT_TOOL_RESULT", content.as_str()),
                 ];
                 for (out, _code) in
                     self.hooks
@@ -11103,8 +11102,8 @@ impl Agent {
                         privacy_redaction.counts.summary()
                     ));
                 }
-                let observation = turn_state.record_external_outcome(
-                    orchestrator::ExternalOutcomeInput {
+                let observation =
+                    turn_state.record_external_outcome(orchestrator::ExternalOutcomeInput {
                         tool_name: &name,
                         hosts: &hosts,
                         cache_key: cache_key.as_deref(),
@@ -11112,8 +11111,7 @@ impl Agent {
                         command: input["command"].as_str(),
                         content: &mut content,
                         is_error,
-                    },
-                );
+                    });
                 emit_external_telemetry(self.sink.as_mut(), &turn_state);
                 round_external_failures =
                     round_external_failures.saturating_add(observation.round_external_failures);
@@ -12254,7 +12252,7 @@ impl SessionExportFormat {
 }
 
 fn default_session_export_filename(format: SessionExportFormat) -> String {
-    format!("wolf-session-{}.{}", unix_timestamp_secs(), format.ext())
+    format!("dext-session-{}.{}", unix_timestamp_secs(), format.ext())
 }
 
 fn default_session_export_path(format: SessionExportFormat) -> PathBuf {
@@ -12550,7 +12548,7 @@ fn render_session_html(header: &SessionHeader, history: &[Message], title: &str)
     }
     let _ = write!(
         out,
-        "<div class=\"footer\">Exported by Wolf at unix {}</div></body></html>",
+        "<div class=\"footer\">Exported by Dext at unix {}</div></body></html>",
         unix_timestamp_secs()
     );
     out
@@ -13129,7 +13127,7 @@ fn render_work_map_packet(map: &WorkMap, selection: &WorkMapSelection) -> String
     use std::fmt::Write as _;
     let waypoints = selected_waypoints(map, selection);
     let mut out = String::new();
-    let _ = writeln!(out, "[wolf packet {}]", work_map_selection_label(waypoints));
+    let _ = writeln!(out, "[dext packet {}]", work_map_selection_label(waypoints));
     let _ = writeln!(out, "source: {}", map.source);
     let ranges = waypoints
         .iter()
@@ -13256,7 +13254,7 @@ fn render_work_map_focus(map: &WorkMap, selection: &WorkMapSelection, mode: &Foc
     let selected = selected_waypoints(map, selection);
     let _ = writeln!(
         out,
-        "[wolf focus {} mode={}]",
+        "[dext focus {} mode={}]",
         work_map_selection_label(selected),
         mode.label()
     );
@@ -13458,7 +13456,7 @@ fn create_track_from_work_map_with_header(
             role: "user".to_string(),
             content: vec![Block::Text {
                 text: format!(
-                    "Start a Wolf track from {}. Use this focus packet as the starting context.\n\n{}",
+                    "Start a Dext track from {}. Use this focus packet as the starting context.\n\n{}",
                     work_map_selection_label(selected),
                     packet
                 ),
@@ -13522,7 +13520,7 @@ fn render_session_analysis(
     );
     if !header.provenance.system_prompt_hash.is_empty() {
         let _ = writeln!(out, "provenance:");
-        let _ = writeln!(out, "- wolf_version: {}", header.provenance.wolf_version);
+        let _ = writeln!(out, "- dext_version: {}", header.provenance.dext_version);
         let _ = writeln!(
             out,
             "- api_provider: {}",
@@ -13636,7 +13634,7 @@ fn export_session_file(source: &Path, format: SessionExportFormat, target: &Path
             let title = source
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .unwrap_or("wolf session");
+                .unwrap_or("dext session");
             let html = render_session_html(&header, &history, title);
             atomic_write_bytes(target, html.as_bytes())?;
         }
@@ -13675,7 +13673,7 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
         }
         "sessions-grep" => {
             let Some(needle) = argv.get(1) else {
-                eprintln!("usage: wolf sessions-grep <text>");
+                eprintln!("usage: dext sessions-grep <text>");
                 return Ok(Some(2));
             };
             let source = latest_session_path(&root);
@@ -13721,7 +13719,7 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                     };
                     if args.len() > idx + 1 {
                         eprintln!(
-                            "usage: wolf session export [latest|NAME|PATH] [html|jsonl] [OUT]"
+                            "usage: dext session export [latest|NAME|PATH] [html|jsonl] [OUT]"
                         );
                         return Ok(Some(2));
                     }
@@ -13747,7 +13745,7 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                 }
                 "grep" => {
                     let Some(needle) = argv.get(2) else {
-                        eprintln!("usage: wolf session grep <text> [latest|NAME|PATH]");
+                        eprintln!("usage: dext session grep <text> [latest|NAME|PATH]");
                         return Ok(Some(2));
                     };
                     let selector = argv.get(3).map(|s| s.as_str()).unwrap_or("latest");
@@ -13849,14 +13847,14 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                     }
                     _ => {
                         eprintln!(
-                            "usage: wolf session track [list]|open [latest|NAME|PATH] @wNN [name] [--exact]"
+                            "usage: dext session track [list]|open [latest|NAME|PATH] @wNN [name] [--exact]"
                         );
                         Ok(Some(2))
                     }
                 },
                 _ => {
                     eprintln!(
-                        "usage: wolf session [list|map [session]|packet [session] @wNN|focus [session] @wNN [--exact]|tracks|track open [session] @wNN [name]|export [latest|NAME|PATH] [html|jsonl] [OUT]|analyze [latest|NAME|PATH]|grep <text> [session]|failures [session]|verify-log [session]|decisions [session]]"
+                        "usage: dext session [list|map [session]|packet [session] @wNN|focus [session] @wNN [--exact]|tracks|track open [session] @wNN [name]|export [latest|NAME|PATH] [html|jsonl] [OUT]|analyze [latest|NAME|PATH]|grep <text> [session]|failures [session]|verify-log [session]|decisions [session]]"
                     );
                     Ok(Some(2))
                 }
@@ -13884,7 +13882,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "help" | "?" => {
             let _ = writeln!(w, "commands:");
             let _ = writeln!(w, "  /help                     show this");
-            let _ = writeln!(w, "  /quit, /exit              exit wolf");
+            let _ = writeln!(w, "  /quit, /exit              exit dext");
             let _ = writeln!(w, "  /reset                    clear conversation history");
             let _ = writeln!(w, "  /tools                    list available tools");
             let _ = writeln!(
@@ -13901,10 +13899,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(w, "  /revoke <tool>            remove auto-approval");
             let _ = writeln!(w, "  /allowed                  list auto-approved tools");
-            let _ = writeln!(
-                w,
-                "  /fangs [on|off|status]    dangerous: auto-approve all gated tools"
-            );
+            let _ = writeln!(w, "  /trust [on|off|status]   auto-approve all gated tools");
             let _ = writeln!(
                 w,
                 "  /privacy [on|off|status]  redact sensitive tool output before model context"
@@ -14047,10 +14042,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 w,
                 "  /hooks [reload]           show hook config or reload from disk"
             );
-            let _ = writeln!(w, "  /version                  show wolf version");
+            let _ = writeln!(w, "  /version                  show dext version");
         }
         "version" => {
-            let _ = writeln!(w, "wolf {}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(w, "dext {}", env!("CARGO_PKG_VERSION"));
         }
         "quit" | "exit" => {
             return Some(false);
@@ -14162,14 +14157,14 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 );
             }
         }
-        "fangs" => match arg {
+        "trust" => match arg {
             "" | "status" => {
-                let mode = if agent.fangs_out_active() {
+                let mode = if agent.trust_mode_active() {
                     "ON"
                 } else {
                     "off"
                 };
-                let _ = writeln!(w, "fangs-out: {mode}");
+                let _ = writeln!(w, "trust: {mode}");
                 let _ = writeln!(w, "approval profile: {}", agent.approval_profile().as_str());
                 let _ = writeln!(
                     w,
@@ -14177,23 +14172,20 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 );
             }
             "on" => {
-                let changed = agent.set_fangs_out(true);
+                let changed = agent.set_trust_mode(true);
                 ui_update = SlashUiUpdate::ApprovalProfile;
-                let _ = writeln!(
-                    w,
-                    "⚠ fangs-out ON: {changed} gated tools now auto-approving"
-                );
+                let _ = writeln!(w, "trust ON: {changed} gated tools now auto-approving");
             }
             "off" => {
-                let changed = agent.set_fangs_out(false);
+                let changed = agent.set_trust_mode(false);
                 ui_update = SlashUiUpdate::ApprovalProfile;
                 let _ = writeln!(
                     w,
-                    "fangs-out off: {changed} gated tools returned to per-call prompts"
+                    "trust off: {changed} gated tools returned to per-call prompts"
                 );
             }
             _ => {
-                let _ = writeln!(w, "usage: /fangs [on|off|status]");
+                let _ = writeln!(w, "usage: /trust [on|off|status]");
             }
         },
         "privacy" => match arg {
@@ -14763,7 +14755,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     agent.history.push(Message {
                         role: "user".to_string(),
                         content: vec![Block::Text {
-                            text: format!("[wolf focus packet loaded]\n{text}"),
+                            text: format!("[dext focus packet loaded]\n{text}"),
                         }],
                     });
                     emit_work_map_event(
@@ -15545,7 +15537,7 @@ fn default_eval_cases() -> &'static [EvalCase] {
         },
         EvalCase {
             name: "edit_in_place",
-            task: "Edit notes.md in place: replace 'world' with 'wolf'. Do not create a new file.",
+            task: "Edit notes.md in place: replace 'world' with 'dext'. Do not create a new file.",
             setup: |p| {
                 std::fs::write(p.join("notes.md"), "hello world\n")?;
                 Ok(())
@@ -15554,7 +15546,7 @@ fn default_eval_cases() -> &'static [EvalCase] {
             assertions: &[
                 Assertion::ToolCalledAny(&["edit_file", "multi_edit"]),
                 Assertion::ToolNotCalled("write_file"),
-                Assertion::FileEquals("notes.md", "hello wolf\n"),
+                Assertion::FileEquals("notes.md", "hello dext\n"),
             ],
         },
         EvalCase {
@@ -15709,7 +15701,7 @@ pub(crate) struct CliOptions {
     pub(crate) resume_latest: bool,
     pub(crate) no_session: bool,
     pub(crate) no_tui: bool,
-    pub(crate) fangs_out: bool,
+    pub(crate) trust_mode: bool,
     pub(crate) output: OutputMode,
     pub(crate) cd: Option<PathBuf>,
     pub(crate) fork: bool,
@@ -15728,7 +15720,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut resume_latest = false;
     let mut no_session = false;
     let mut no_tui = false;
-    let mut fangs_out = false;
+    let mut trust_mode = false;
     let mut output = OutputMode::Text;
     let mut cd: Option<PathBuf> = None;
     let mut fork = false;
@@ -15747,7 +15739,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--resume" => resume_latest = true,
             "--no-session" => no_session = true,
             "--no-tui" => no_tui = true,
-            "--fangs-out" | "--mask-off" | "--risk-on" => fangs_out = true,
+            "--trust" => trust_mode = true,
             "--fork" => fork = true,
             "--frugal" => {
                 context_mode = Some(ContextMode::Frugal);
@@ -15974,7 +15966,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         resume_latest,
         no_session,
         no_tui,
-        fangs_out,
+        trust_mode,
         output,
         cd,
         fork,
@@ -16040,7 +16032,7 @@ async fn main() -> Result<()> {
             std::process::exit(0);
         }
         if let Some(path) = write_crash_snapshot(info) {
-            eprintln!("[wolf crash snapshot: {}]", path.display());
+            eprintln!("[dext crash snapshot: {}]", path.display());
         }
         default_panic(info);
     }));
@@ -16048,7 +16040,7 @@ async fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().is_some_and(|a| a == "subagent-worker") {
         if argv.len() != 3 {
-            eprintln!("usage: wolf subagent-worker INPUT_JSON OUTPUT_MD");
+            eprintln!("usage: dext subagent-worker INPUT_JSON OUTPUT_MD");
             release_registered_locks();
             std::process::exit(2);
         }
@@ -16062,7 +16054,7 @@ async fn main() -> Result<()> {
         return result;
     }
     if argv.iter().any(|a| a == "-V" || a == "--version") {
-        println!("wolf {}", env!("CARGO_PKG_VERSION"));
+        println!("dext {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if let Some(code) = handle_auth_cli(&argv)? {
@@ -16074,51 +16066,51 @@ async fn main() -> Result<()> {
         std::process::exit(code);
     }
     if argv.iter().any(|a| a == "-h" || a == "--help") {
-        println!("usage: wolf [TASK...]        run one-shot with TASK (joined with spaces)");
-        println!("       wolf -p               read task from stdin, run one-shot");
+        println!("usage: dext [TASK...]        run one-shot with TASK (joined with spaces)");
+        println!("       dext -p               read task from stdin, run one-shot");
         println!(
-            "       wolf --resume         resume the project-scoped auto-saved latest session"
+            "       dext --resume         resume the project-scoped auto-saved latest session"
         );
-        println!("       wolf sessions         list project latest + named sessions");
-        println!("       wolf session map [latest|NAME|PATH]");
-        println!("       wolf session packet [latest|NAME|PATH] @wNN");
-        println!("       wolf session focus [latest|NAME|PATH] @wNN [--exact]");
-        println!("       wolf session tracks");
-        println!("       wolf session track open [latest|NAME|PATH] @wNN [name]");
-        println!("       wolf session export [latest|NAME|PATH] [html|jsonl] [OUT]");
+        println!("       dext sessions         list project latest + named sessions");
+        println!("       dext session map [latest|NAME|PATH]");
+        println!("       dext session packet [latest|NAME|PATH] @wNN");
+        println!("       dext session focus [latest|NAME|PATH] @wNN [--exact]");
+        println!("       dext session tracks");
+        println!("       dext session track open [latest|NAME|PATH] @wNN [name]");
+        println!("       dext session export [latest|NAME|PATH] [html|jsonl] [OUT]");
         for runtime_tool in runtime_tool_definitions() {
             println!(
-                "       wolf {}  {}",
+                "       dext {}  {}",
                 runtime_tool.name, runtime_tool.description
             );
         }
-        println!("       wolf session analyze|grep|failures|verify-log|decisions [session]");
+        println!("       dext session analyze|grep|failures|verify-log|decisions [session]");
         println!(
-            "       wolf --no-session     run without project state lock, latest session, or log writes"
+            "       dext --no-session     run without project state lock, latest session, or log writes"
         );
-        println!("       wolf --fork           resume latest into an isolated, unsaved branch");
-        println!("       wolf --cd DIR         use DIR as sandbox/cwd");
-        println!("       wolf --output json|stream-json  emit machine-readable output");
+        println!("       dext --fork           resume latest into an isolated, unsaved branch");
+        println!("       dext --cd DIR         use DIR as sandbox/cwd");
+        println!("       dext --output json|stream-json  emit machine-readable output");
         println!(
-            "       wolf --budget CAP     stop before more model calls once CAP is reached ($ or tokens)"
+            "       dext --budget CAP     stop before more model calls once CAP is reached ($ or tokens)"
         );
-        println!("       wolf --approval ask|auto-read|auto-write|never|always");
-        println!("       wolf --sandbox read-only|workspace-write|danger-full-access");
-        println!("       wolf --browser agent-browser    add optional browser automation recipe");
-        println!("       wolf --effort low|medium|high|xhigh  set provider reasoning effort");
+        println!("       dext --approval ask|auto-read|auto-write|never|always");
+        println!("       dext --sandbox read-only|workspace-write|danger-full-access");
+        println!("       dext --browser agent-browser    add optional browser automation recipe");
+        println!("       dext --effort low|medium|high|xhigh  set provider reasoning effort");
         println!(
-            "       wolf --frugal        minimize prompt/tool/history context for lower token cost"
+            "       dext --frugal        minimize prompt/tool/history context for lower token cost"
         );
-        println!("       wolf --context-mode standard|frugal");
+        println!("       dext --context-mode standard|frugal");
         println!(
-            "       wolf --tool-profile lean|full  choose provider tool schema verbosity (default lean)"
+            "       dext --tool-profile lean|full  choose provider tool schema verbosity (default lean)"
         );
-        println!("       wolf --eval [NAME]    run eval harness (optionally a single case)");
-        println!("       wolf --fangs-out      dangerous mode: auto-approve gated tools");
-        println!("       wolf auth ...         provider/model/auth management commands");
-        println!("       wolf                  interactive REPL (or reads stdin if piped)");
+        println!("       dext --eval [NAME]    run eval harness (optionally a single case)");
+        println!("       dext --trust          auto-approve gated tools");
+        println!("       dext auth ...         provider/model/auth management commands");
+        println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   WOLF_PROVIDER, WOLF_PROFILE, WOLF_MODEL, WOLF_MODEL_<PROVIDER>, WOLF_MODEL_FORCE=1, WOLF_BASE_URL, WOLF_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENROUTER_API_KEY, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, WOLF_SYSTEM, WOLF_SANDBOX, WOLF_EXTERNAL_TIMEOUT_SECS, WOLF_BASH_TIMEOUT_SECS, WOLF_HOOK_TIMEOUT_SECS, WOLF_SESSIONS_DIR, WOLF_LOGS_DIR, WOLF_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), WOLF_FANGS_OUT=1, WOLF_NO_TUI=1, WOLF_THINKING_EFFORT=low|medium|high|xhigh, WOLF_CONTEXT_MODE=standard|frugal, WOLF_TOOL_PROFILE=lean|full, WOLF_BUDGET_CAP, WOLF_APPROVAL, WOLF_SANDBOX_PROFILE, WOLF_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENROUTER_API_KEY, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }
@@ -16129,7 +16121,7 @@ async fn main() -> Result<()> {
         std::process::exit(if ok { 0 } else { 1 });
     }
     let opts = parse_cli_options(argv.clone())?;
-    let fangs_out = opts.fangs_out || env_flag("WOLF_FANGS_OUT");
+    let trust_mode = opts.trust_mode || env_flag("DEXT_TRUST");
 
     let one_shot_task: Option<String> = if !opts.positional.is_empty() {
         Some(opts.positional.join(" "))
@@ -16147,13 +16139,13 @@ async fn main() -> Result<()> {
     };
 
     let mut agent = Agent::new_with_sandbox(opts.cd.clone(), !opts.no_session && !opts.fork)?;
-    if let Some(profile) = std::env::var("WOLF_APPROVAL")
+    if let Some(profile) = std::env::var("DEXT_APPROVAL")
         .ok()
         .and_then(|v| ApprovalProfile::parse(&v))
     {
         agent.set_approval_profile(profile);
     }
-    if let Some(profile) = std::env::var("WOLF_SANDBOX_PROFILE")
+    if let Some(profile) = std::env::var("DEXT_SANDBOX_PROFILE")
         .ok()
         .and_then(|v| SandboxProfile::parse(&v))
     {
@@ -16242,10 +16234,10 @@ async fn main() -> Result<()> {
             }
         }
     }
-    if fangs_out {
-        let changed = agent.set_fangs_out(true);
+    if trust_mode {
+        let changed = agent.set_trust_mode(true);
         if !opts.output.is_json() {
-            eprintln!("[danger] fangs-out enabled — {changed} gated tools now auto-approving");
+            eprintln!("[trust] enabled — {changed} gated tools now auto-approving");
         }
     }
     if !opts.output.is_json() {
@@ -16270,7 +16262,7 @@ async fn main() -> Result<()> {
 
     let use_tui = !opts.no_tui
         && !opts.output.is_json()
-        && std::env::var("WOLF_NO_TUI").is_err()
+        && std::env::var("DEXT_NO_TUI").is_err()
         && io::stdout().is_terminal();
 
     if use_tui && !opts.print {
@@ -16349,7 +16341,7 @@ async fn main() -> Result<()> {
 
     let mut stdout = io::stdout();
 
-    println!("wolf — chat loop with tools. /help for commands, empty line or Ctrl+D to exit.");
+    println!("dext — chat loop with tools. /help for commands, empty line or Ctrl+D to exit.");
     println!("sandbox: {}", agent.sandbox_root.display());
     println!("{}", agent.provider_status_line());
 

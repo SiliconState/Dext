@@ -593,7 +593,7 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                         "memory.md",
                         "pending",
                         "follow-up",
-                        "wolf.md",
+                        "dext.md",
                     ],
                 )
         }
@@ -646,7 +646,7 @@ fn commands_contain(commands: &[String], needles: &[&str]) -> bool {
 
 fn is_decision_log_path(path: &str) -> bool {
     path.ends_with("MEMORY.md")
-        || path.ends_with("WOLF.md")
+        || path.ends_with("DEXT.md")
         || path.ends_with(".pi/pending.jsonl")
         || path.ends_with("autoresearch.ideas.md")
 }
@@ -1134,7 +1134,7 @@ mod tests {
         );
         assert!(tracker.apply_fixes_allowed());
 
-        let review_task = ObjectiveTracker::from_user_prompt("review wolf for bugs");
+        let review_task = ObjectiveTracker::from_user_prompt("review dext for bugs");
         assert_eq!(
             review_task.checkpoints,
             vec!["analyze current behavior and constraints".to_string()]

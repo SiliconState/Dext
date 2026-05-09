@@ -15,18 +15,18 @@ const TUI_ROWS: u16 = 40;
 
 #[test]
 fn tui_smoke_launches_real_binary_in_pty() {
-    let temp = TempDir::new("wolf-tui-smoke").expect("temp dir");
+    let temp = TempDir::new("dext-tui-smoke").expect("temp dir");
     let sandbox = temp.path().join("sandbox");
-    let wolf_home = temp.path().join("wolf-home");
+    let dext_home = temp.path().join("dext-home");
     let home = temp.path().join("home");
     fs::create_dir_all(&sandbox).expect("sandbox");
-    fs::create_dir_all(&wolf_home).expect("wolf home");
+    fs::create_dir_all(&dext_home).expect("dext home");
     fs::create_dir_all(&home).expect("home");
 
     let mut pty = Pty::open(TUI_COLS, TUI_ROWS).expect("open pty");
-    let mut child = spawn_wolf(&pty, &sandbox, &wolf_home, &home).expect("spawn wolf in pty");
+    let mut child = spawn_dext(&pty, &sandbox, &dext_home, &home).expect("spawn dext in pty");
 
-    assert_visible(&mut pty, &mut child, "Wolf v", Duration::from_secs(5));
+    assert_visible(&mut pty, &mut child, "Dext v", Duration::from_secs(5));
     assert_visible(&mut pty, &mut child, "sandbox", Duration::from_secs(2));
     assert_visible(&mut pty, &mut child, "model", Duration::from_secs(2));
     assert_visible(&mut pty, &mut child, "Ctrl+D quit", Duration::from_secs(2));
@@ -43,26 +43,26 @@ fn tui_smoke_launches_real_binary_in_pty() {
 
     pty.write_all_retry(&[0x04]).expect("send Ctrl+D");
     let status = wait_for_exit(&mut child, Duration::from_secs(5), || pty.visible_text())
-        .expect("wait for wolf exit");
+        .expect("wait for dext exit");
     pty.read_available().expect("final pty drain");
     let visible = pty.visible_text();
 
     assert!(
         status.success(),
-        "wolf exited with {status}; visible tail:\n{}",
+        "dext exited with {status}; visible tail:\n{}",
         tail(&visible, 3000)
     );
     assert_no_crash_text(&visible);
 }
 
-fn spawn_wolf(pty: &Pty, sandbox: &Path, wolf_home: &Path, home: &Path) -> io::Result<Child> {
+fn spawn_dext(pty: &Pty, sandbox: &Path, dext_home: &Path, home: &Path) -> io::Result<Child> {
     let slave = pty.slave_fd();
     let stdin = unsafe { File::from_raw_fd(dup_fd(slave)?) };
     let stdout = unsafe { File::from_raw_fd(dup_fd(slave)?) };
     let stderr = unsafe { File::from_raw_fd(dup_fd(slave)?) };
     let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wolf"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dext"));
     cmd.args(["--no-session", "--cd"])
         .arg(sandbox)
         .current_dir(sandbox)
@@ -72,8 +72,8 @@ fn spawn_wolf(pty: &Pty, sandbox: &Path, wolf_home: &Path, home: &Path) -> io::R
         .env("COLORTERM", "truecolor")
         .env("LANG", "C.UTF-8")
         .env("HOME", home)
-        .env("WOLF_HOME", wolf_home)
-        .env("WOLF_APPROVAL", "never")
+        .env("DEXT_HOME", dext_home)
+        .env("DEXT_APPROVAL", "never")
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -121,7 +121,7 @@ fn wait_for_exit(
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "wolf did not exit within {timeout:?}; visible tail:\n{}",
+                "dext did not exit within {timeout:?}; visible tail:\n{}",
                 tail(&visible, 3000)
             );
         }
@@ -133,7 +133,7 @@ fn assert_no_crash_text(visible: &str) {
     for needle in [
         "panicked at",
         "thread 'main' panicked",
-        "[wolf crash snapshot",
+        "[dext crash snapshot",
         "[error]",
     ] {
         assert!(

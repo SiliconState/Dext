@@ -1,8 +1,8 @@
-# WOLF persistent memory
+# DEXT persistent memory
 
 Prompt-facing cache only. Durable project memory lives in `MEMORY.md`, synced
-through the external pi-memory tool with `--project wolf`. pi-memory is not part
-of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
+through the external pi-memory tool with `--project dext`. pi-memory is not part
+of Dext; Dext or any agent can use it. Keep this file compact and curated.
 
 ## Workflow
 - Query `MEMORY.md` / pi-memory for durable history before major decisions.
@@ -19,7 +19,7 @@ of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
 - Standard prompts should also stay budget-conscious: compact system sections,
   capped runtime ledger/provider health, and minimal prompt-facing memory.
 - `MEMORY.md` + pi-memory are the long-form source of truth;
-  `WOLF.memory.md` is only the compact cache.
+  `DEXT.memory.md` is only the compact cache.
 - Eval supports outcome-oriented assertions on files and command output.
 - `codex` canonicalizes to `chatgpt`; ChatGPT/Codex share one OAuth-backed
   provider path. Model selection pins the selected model for the current
@@ -54,10 +54,10 @@ of Wolf; Wolf or any agent can use it. Keep this file compact and curated.
 
 ## User preferences
 - Favor context engineering and memory quality over adding more tools.
-- Minimize tool duplication. No MCP for Wolf; prefer native/CLI integrations.
+- Minimize tool duplication. No MCP for Dext; prefer native/CLI integrations.
 - Do not add LLM-facing cargo tools; agent/runtime internals can use structured
   cargo handling when useful, but keep the exposed tool list lean.
-- Prefer Wolf's built-in reqwest-backed `http` tool before shelling to curl/xh.
+- Prefer Dext's built-in reqwest-backed `http` tool before shelling to curl/xh.
 - Use proper OAuth/web flows; do not copy Pi auth credentials manually.
 - Prefer live/thinking/scroll progress above the input box only.
 - Agent browser is allowed when useful for browser automation.

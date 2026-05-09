@@ -323,6 +323,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "dext"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "criterion",
+ "crossterm",
+ "dotenvy",
+ "futures-util",
+ "getrandom 0.3.4",
+ "libc",
+ "ratatui",
+ "ratatui-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tui-markdown",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2342,30 +2366,6 @@ name = "wit-bindgen"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
-
-[[package]]
-name = "wolf"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "criterion",
- "crossterm",
- "dotenvy",
- "futures-util",
- "getrandom 0.3.4",
- "libc",
- "ratatui",
- "ratatui-core",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tui-markdown",
- "unicode-width 0.2.0",
-]
 
 [[package]]
 name = "writeable"

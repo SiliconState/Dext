@@ -1,12 +1,12 @@
 # Contributing
 
-Wolf is a compact Rust terminal agent. Keep changes source-first, reviewable, and low-bloat.
+Dext is a compact Rust terminal agent. Keep changes source-first, reviewable, and low-bloat.
 
 ## Development setup
 
 ```bash
-git clone https://github.com/SiliconState/Wolf.git
-cd Wolf
+git clone https://github.com/SiliconState/Dext.git
+cd Dext
 cargo build
 ```
 
@@ -30,7 +30,7 @@ cargo install --path . --force
 - Add comments only for non-obvious invariants, security reasoning, or platform footguns.
 - No backwards-compatibility shims for unreleased internal behavior.
 - Keep terminal/TUI behavior text-first and sparse.
-- Use Wolf's built-in HTTP implementation rather than shelling to curl for core behavior.
+- Use Dext's built-in HTTP implementation rather than shelling to curl for core behavior.
 
 ## Verification
 
@@ -54,7 +54,7 @@ After code changes intended for interactive use:
 cargo install --path . --force
 ```
 
-On Windows, if install fails with `Access is denied`, close running `wolf.exe` processes and retry.
+On Windows, if install fails with `Access is denied`, close running `dext.exe` processes and retry.
 
 ## Security hygiene
 
@@ -70,11 +70,11 @@ git grep -n -I -i -E 'api[_-]?key|secret|token|oauth|authorization|bearer|passwo
 Do not commit:
 
 - `.env`
-- `.wolf/`
+- `.dext/`
 - `.pi/`
 - `target/`
-- `wolf-session-*`
-- `WOLF.todo.json`
+- `dext-session-*`
+- `DEXT.todo.json`
 - one-off scratch files
 
 ## Pull request expectations

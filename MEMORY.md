@@ -1,10 +1,10 @@
-# Memory — wolf
+# Memory — dext
 
 > Durable knowledge base for this project, synced through the shared external `pi-memory` system (SQLite in your user `.pi/memory` directory).
 >
 > **Refresh live sections:**
 > ```bash
-> pi-memory sync MEMORY.md --project wolf --limit 6
+> pi-memory sync MEMORY.md --project dext --limit 6
 > ```
 
 ---
@@ -31,12 +31,12 @@
 
 <!-- pi-memory:decisions:start -->
 - **Compaction active and end-turn thresholds**
-  *Choice:* Standard mode auto-compacts at 90% of model context at end-turn and 80% after safe active tool-result checkpoints; explicit /compact percent and WOLF_MAX_HISTORY_CHARS overrides still win.
+  *Choice:* Standard mode auto-compacts at 90% of model context at end-turn and 80% after safe active tool-result checkpoints; explicit /compact percent and DEXT_MAX_HISTORY_CHARS overrides still win.
   *Why:* Earlier compaction preserves evidence before active turns exceed provider context while keeping end-turn compaction near the tail and budget-conscious.
   `2026-05-08` `active`
 
 - **Usage status shows prompt-cache visibility**
-  *Choice:* Wolf usage displays split actual non-cached input, cached input reads/writes, and output; the TUI status line keeps the cached-input marker visible after first usage even when it is zero so cache status is not hidden.
+  *Choice:* Dext usage displays split actual non-cached input, cached input reads/writes, and output; the TUI status line keeps the cached-input marker visible after first usage even when it is zero so cache status is not hidden.
   *Why:* ChatGPT/Codex and Anthropic report prompt-cache usage differently, and users need to see whether cache reads are happening without mistaking cached tokens for fresh input.
   `2026-05-06` `active`
 
@@ -51,13 +51,13 @@
   `2026-05-05` `active`
 
 - **Session map/teleport architecture separates JSONL evidence from Pi memory**
-  *Choice:* Keep Wolf JSONL/session headers as source of truth for exact navigation and build derived SessionMap/teleport packets from local evidence; use pi-memory/MEMORY.md for curated durable decisions, cross-session semantic recall, and optional tags/links, not for direct transcript storage or mutation.
-  *Why:* Pi is shared external memory and already canonical for durable Wolf knowledge, but exact session replay, offsets, verification artifacts, and forks must remain local, deterministic, and source-first.
+  *Choice:* Keep Dext JSONL/session headers as source of truth for exact navigation and build derived SessionMap/teleport packets from local evidence; use pi-memory/MEMORY.md for curated durable decisions, cross-session semantic recall, and optional tags/links, not for direct transcript storage or mutation.
+  *Why:* Pi is shared external memory and already canonical for durable Dext knowledge, but exact session replay, offsets, verification artifacts, and forks must remain local, deterministic, and source-first.
   `2026-05-05` `active`
 
 - **Frugal context mode**
   *Choice:* Added --frugal, /context frugal, lean tool-profile schemas, smaller prompt/tool/history caps, and deterministic fact-card compaction for low-token operation.
-  *Why:* Wolf should preserve capability while avoiding repeated prompt/schema/tool-result bloat; frugal mode makes large context emergency capacity rather than default payload.
+  *Why:* Dext should preserve capability while avoiding repeated prompt/schema/tool-result bloat; frugal mode makes large context emergency capacity rather than default payload.
   `2026-04-27` `active`
 
 <!-- pi-memory:decisions:end -->
@@ -66,7 +66,7 @@
 
 ## Findings & Lessons
 
-Query live: `pi-memory query --project wolf` or `pi-memory search <keyword>`
+Query live: `pi-memory query --project dext` or `pi-memory search <keyword>`
 
 ## Memory Curation Notes
 
@@ -75,7 +75,7 @@ Query live: `pi-memory query --project wolf` or `pi-memory search <keyword>`
 - Avoid logging ephemeral workflow chatter as decisions (for example: spawned subagents, "Done", "Synced", or similar progress narration).
 - Avoid logging garbage entities from session ingest; keep only stable project-specific entities that would matter in a future session.
 - Use Pi session ingest mainly for session linkage and recovery context; add manual memory entries for durable architectural knowledge.
-- For this repo, always use `--project wolf` with pi-memory, or export `PI_MEMORY_PROJECT=wolf` before logging/syncing memory.
+- For this repo, always use `--project dext` with pi-memory, or export `PI_MEMORY_PROJECT=dext` before logging/syncing memory.
 
 ---
 
@@ -83,21 +83,21 @@ Query live: `pi-memory query --project wolf` or `pi-memory search <keyword>`
 
 ```bash
 # Log
-pi-memory log decision "Title" --choice "..." --rationale "..." --project wolf
-pi-memory log finding  "Fact"  --category "..." --confidence verified --project wolf
-pi-memory log lesson   "What broke" --why "..." --fix "..." --project wolf
-pi-memory log entity   "Name" --type service --description "..." --project wolf
+pi-memory log decision "Title" --choice "..." --rationale "..." --project dext
+pi-memory log finding  "Fact"  --category "..." --confidence verified --project dext
+pi-memory log lesson   "What broke" --why "..." --fix "..." --project dext
+pi-memory log entity   "Name" --type service --description "..." --project dext
 
 # Read
-pi-memory state wolf
-pi-memory query   --project wolf --type decision --limit 12
-pi-memory query   --project wolf --type finding  --limit 12
-pi-memory search  <keyword> --project wolf --limit 20
+pi-memory state dext
+pi-memory query   --project dext --type decision --limit 12
+pi-memory query   --project dext --type finding  --limit 12
+pi-memory search  <keyword> --project dext --limit 20
 pi-memory recent  --n 20
-pi-memory export  --project wolf --format md
+pi-memory export  --project dext --format md
 
 # Sync this file
-pi-memory sync MEMORY.md --project wolf --limit 6
+pi-memory sync MEMORY.md --project dext --limit 6
 
 # List all projects
 pi-memory projects

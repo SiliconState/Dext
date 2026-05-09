@@ -43,6 +43,7 @@ const WORK_MAP_DRAWER_MAX_ROWS: usize = 10;
 const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 8;
 const WORK_MAP_DRAWER_MIN_EDITOR_ROWS: usize = 1;
 const THINKING_BG: Color = Color::Indexed(235);
+const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 fn is_subagent_call_id(call_id: &str) -> bool {
@@ -242,12 +243,12 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/quit",
         args: "",
-        help: "exit wolf",
+        help: "exit dext",
     },
     SlashCmd {
         name: "/exit",
         args: "",
-        help: "exit wolf",
+        help: "exit dext",
     },
     SlashCmd {
         name: "/reset",
@@ -285,9 +286,9 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "list auto-approved tools",
     },
     SlashCmd {
-        name: "/fangs",
+        name: "/trust",
         args: "[on|off|status]",
-        help: "danger: auto-approve all",
+        help: "auto-approve all gated tools",
     },
     SlashCmd {
         name: "/approval",
@@ -441,7 +442,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     },
 ];
 
-static FANGS_ARGS: &[&str] = &["on", "off", "status"];
+static TRUST_ARGS: &[&str] = &["on", "off", "status"];
 static EFFORT_ARGS: &[&str] = &["low", "medium", "high", "xhigh"];
 static WORK_MAP_SESSION_ARGS: &[&str] = &["current", "latest"];
 static TRACK_ARGS: &[&str] = &["open", "list"];
@@ -636,7 +637,7 @@ fn slash_completions(input: &str) -> Vec<SlashCompletion> {
         }
 
         let sub_args = match cmd_part {
-            "fangs" => Some(FANGS_ARGS),
+            "trust" => Some(TRUST_ARGS),
             "effort" => Some(EFFORT_ARGS),
             "map" | "packet" | "focus" => Some(WORK_MAP_SESSION_ARGS),
             "track" => Some(TRACK_ARGS),
@@ -1918,16 +1919,7 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
     ));
 
     match state.approval_profile {
-        ApprovalProfile::Always => {
-            spans.insert(
-                1,
-                Span::styled(
-                    "fangs●  ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-            );
-        }
-        ApprovalProfile::Ask => {}
+        ApprovalProfile::Ask | ApprovalProfile::Always => {}
         profile => {
             spans.insert(1, Span::styled("  ", Style::default().fg(Color::DarkGray)));
             spans.insert(
@@ -2984,9 +2976,9 @@ fn abstract_input_for_display(input: &str) -> Option<String> {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct WolfMarkdownStyleSheet;
+struct DextMarkdownStyleSheet;
 
-impl MarkdownStyleSheet for WolfMarkdownStyleSheet {
+impl MarkdownStyleSheet for DextMarkdownStyleSheet {
     fn heading(&self, level: u8) -> MdStyle {
         match level {
             1 => MdStyle::default()
@@ -3667,7 +3659,7 @@ fn fence_delimiter(line: &str) -> Option<char> {
 
 fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'static> {
     let sanitized = sanitize_display_text(body);
-    let options = MarkdownOptions::new(WolfMarkdownStyleSheet);
+    let options = MarkdownOptions::new(DextMarkdownStyleSheet);
     if !has_table_marker(&sanitized) {
         return hide_plain_text_code_fence_lines(
             text_to_static(from_str_with_options(&sanitized, &options)).style(base_style),
@@ -4085,7 +4077,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
         Line_::Assistant { text, dim_prefix } => {
             push_swim_markdown_card(
                 &mut lines,
-                "wolf",
+                "dext",
                 if *dim_prefix {
                     Color::DarkGray
                 } else {
@@ -4583,7 +4575,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
 
 fn work_map_line_style(raw: &str, is_selected: bool) -> Style {
     let trimmed = raw.trim_start();
-    let mut style = if trimmed.starts_with("Work map") || trimmed.starts_with("[wolf") {
+    let mut style = if trimmed.starts_with("Work map") || trimmed.starts_with("[dext") {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
@@ -4998,6 +4990,14 @@ fn set_last_tool_expanded(items: &mut [Line_], name: &str, expanded: bool) -> bo
     } else {
         false
     }
+}
+
+fn input_border_style(state: &TuiState) -> Style {
+    let color = match state.approval_profile {
+        ApprovalProfile::Always => TRUST_INPUT_BORDER,
+        _ => Color::DarkGray,
+    };
+    Style::default().fg(color)
 }
 
 fn input_hint_text(state: &TuiState) -> &'static str {
@@ -5530,7 +5530,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let input = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(input_border_style(state)),
     );
     render_widget_safe(frame, input, input_area);
 
@@ -6173,12 +6173,12 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
 
     let mut state = TuiState::new(model, sandbox, approval_profile, thinking_effort);
     let mode_label = match state.approval_profile {
-        ApprovalProfile::Always => "FANGS-OUT (danger)",
+        ApprovalProfile::Always => "trust",
         ApprovalProfile::Ask => "guarded",
         profile => profile.as_str(),
     };
     let banner = format!(
-        "🐺  Wolf v{}\nsandbox  {}\nmodel    {}\nmode     {}\nreason   {}\nkeys     Ctrl+C/Esc interrupt · Ctrl+D quit · ? help",
+        "🐺  Dext v{}\nsandbox  {}\nmodel    {}\nmode     {}\nreason   {}\nkeys     Ctrl+C/Esc interrupt · Ctrl+D quit · ? help",
         env!("CARGO_PKG_VERSION"),
         clamp_chars(&state.sandbox, 96),
         clamp_chars(&state.model, 40),
@@ -6188,7 +6188,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     state.queue(Line_::Banner(banner));
     if state.approval_profile == ApprovalProfile::Always {
         state.queue(Line_::Warn(
-            "⚠ fangs-out is active: privileged tools skip confirmation prompts".to_string(),
+            "trust mode is active: privileged tools skip confirmation prompts".to_string(),
         ));
     }
     if let Some(task) = initial_task {
@@ -6519,7 +6519,7 @@ mod tests {
     fn permission_prompt_renders_two_border_lines() {
         let text = permission_prompt_text(
             "bash",
-            "echo $WOLF_MODEL",
+            "echo $DEXT_MODEL",
             crate::tool_policy::CommandRisk::Read,
             80,
         );
@@ -6528,7 +6528,7 @@ mod tests {
         assert!(lines.iter().all(|line| line.starts_with("▌ ")));
         assert!(lines[0].contains("ask bash"));
         assert!(lines[0].contains("risk=read"));
-        assert!(lines[0].contains("echo $WOLF_MODEL"));
+        assert!(lines[0].contains("echo $DEXT_MODEL"));
         assert!(lines[1].contains("[y] once"));
         assert!(lines[1].contains("[a] always"));
         assert!(lines[1].contains("[n] deny"));
@@ -6570,7 +6570,7 @@ mod tests {
         );
         state.pending_perm = Some(PendingPermission {
             tool: "bash".to_string(),
-            audit_label: "echo $WOLF_MODEL".to_string(),
+            audit_label: "echo $DEXT_MODEL".to_string(),
             tier: PermissionTier::Read,
             responder: std::sync::mpsc::sync_channel(0).0,
         });
@@ -6589,7 +6589,7 @@ mod tests {
         state.agent_busy = true;
         state.pending_perm = Some(PendingPermission {
             tool: "bash".to_string(),
-            audit_label: "echo $WOLF_MODEL".to_string(),
+            audit_label: "echo $DEXT_MODEL".to_string(),
             tier: PermissionTier::Read,
             responder: std::sync::mpsc::sync_channel(0).0,
         });
@@ -6603,7 +6603,7 @@ mod tests {
     }
 
     #[test]
-    fn status_spans_keep_fangs_near_left_edge() {
+    fn status_spans_do_not_render_trust_indicator() {
         let state = TuiState::new(
             "test-model".to_string(),
             ".".to_string(),
@@ -6615,11 +6615,13 @@ mod tests {
             .map(|span| span.content)
             .collect::<String>();
 
-        assert!(rendered.starts_with("● fangs●  ."), "{rendered}");
+        assert!(rendered.starts_with("● ."), "{rendered}");
+        assert!(!rendered.contains("trust●"), "{rendered}");
+        assert_eq!(input_border_style(&state).fg, Some(TRUST_INPUT_BORDER));
     }
 
     #[test]
-    fn approval_profile_changed_updates_fangs_status() {
+    fn approval_profile_changed_updates_trust_input_border() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             ".".to_string(),
@@ -6630,7 +6632,8 @@ mod tests {
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(!rendered.contains("fangs●"), "{rendered}");
+        assert!(!rendered.contains("trust●"), "{rendered}");
+        assert_eq!(input_border_style(&state).fg, Some(Color::DarkGray));
 
         state.apply_event(AgentEvent::ApprovalProfileChanged {
             profile: ApprovalProfile::Always,
@@ -6639,7 +6642,8 @@ mod tests {
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(rendered.contains("fangs●"), "{rendered}");
+        assert!(!rendered.contains("trust●"), "{rendered}");
+        assert_eq!(input_border_style(&state).fg, Some(TRUST_INPUT_BORDER));
 
         state.apply_event(AgentEvent::ApprovalProfileChanged {
             profile: ApprovalProfile::Ask,
@@ -6648,7 +6652,8 @@ mod tests {
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(!rendered.contains("fangs●"), "{rendered}");
+        assert!(!rendered.contains("trust●"), "{rendered}");
+        assert_eq!(input_border_style(&state).fg, Some(Color::DarkGray));
     }
 
     #[test]
@@ -6961,7 +6966,7 @@ mod tests {
         );
         state.apply_event(AgentEvent::WorkMap {
             kind: WorkMapEventKind::Packet,
-            text: "[wolf packet @w01]\nsource: current".to_string(),
+            text: "[dext packet @w01]\nsource: current".to_string(),
             waypoint_ids: vec!["@w01".to_string()],
             selector: None,
         });
@@ -7222,7 +7227,7 @@ mod tests {
             ]
         ));
         let text = line_to_text(state.pending_insert.last().unwrap(), 80);
-        let style = span_style_for(&text, "wolf").expect("wolf label");
+        let style = span_style_for(&text, "dext").expect("dext label");
         assert_eq!(style.fg, Some(Color::DarkGray));
     }
 
@@ -7811,7 +7816,7 @@ mod tests {
     fn context_meter_uses_chatgpt_catalog_window() {
         let _guard = env_lock();
         let root = std::env::temp_dir().join(format!(
-            "wolf-tui-ctx-window-{}-{}",
+            "dext-tui-ctx-window-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -7820,9 +7825,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("create temp dir");
         unsafe {
-            std::env::set_var("WOLF_HOME", &root);
-            std::env::remove_var("WOLF_CONTEXT_WINDOW");
-            std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+            std::env::set_var("DEXT_HOME", &root);
+            std::env::remove_var("DEXT_CONTEXT_WINDOW");
+            std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
         }
 
         let mut state = TuiState::new(
@@ -7839,9 +7844,9 @@ mod tests {
             .collect::<String>();
 
         unsafe {
-            std::env::remove_var("WOLF_HOME");
-            std::env::remove_var("WOLF_CONTEXT_WINDOW");
-            std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+            std::env::remove_var("DEXT_HOME");
+            std::env::remove_var("DEXT_CONTEXT_WINDOW");
+            std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
         }
         let _ = std::fs::remove_dir_all(&root);
 
@@ -7900,7 +7905,7 @@ mod tests {
     fn model_arg_completions_lists_authenticated_provider_models() {
         let _guard = env_lock();
         let root = std::env::temp_dir().join(format!(
-            "wolf-tui-model-completions-{}-{}",
+            "dext-tui-model-completions-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -7909,7 +7914,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("create temp dir");
         unsafe {
-            std::env::set_var("WOLF_HOME", &root);
+            std::env::set_var("DEXT_HOME", &root);
         }
 
         let result = (|| -> Result<()> {
@@ -7943,7 +7948,7 @@ mod tests {
         })();
 
         unsafe {
-            std::env::remove_var("WOLF_HOME");
+            std::env::remove_var("DEXT_HOME");
         }
         let _ = std::fs::remove_dir_all(&root);
         result.expect("model completions should load auth-backed providers");
@@ -8349,7 +8354,7 @@ mod tests {
 
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
-            "/home/abaka/Documents/Projects/wolf".to_string(),
+            "/home/abaka/Documents/Projects/dext".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
@@ -8390,7 +8395,7 @@ mod tests {
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        state.queue(Line_::Banner("🐺  Wolf vtest".to_string()));
+        state.queue(Line_::Banner("🐺  Dext vtest".to_string()));
         flush_pending_insert(&mut terminal, &mut state).expect("flush banner");
 
         let mut first = vec![tool_line(
@@ -8433,7 +8438,7 @@ mod tests {
 
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
-            "/home/abaka/Documents/Projects/wolf".to_string(),
+            "/home/abaka/Documents/Projects/dext".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
@@ -8542,10 +8547,10 @@ mod tests {
 
     #[test]
     fn parse_md_table_supports_escaped_pipes() {
-        let input = "| Name | Note |\n| --- | --- |\n| wolf | uses \\| safely |";
+        let input = "| Name | Note |\n| --- | --- |\n| dext | uses \\| safely |";
         let lines: Vec<&str> = input.lines().collect();
         let table = parse_table_lines(&lines).expect("should parse");
-        assert_eq!(table.rows[1], vec!["wolf", "uses | safely"]);
+        assert_eq!(table.rows[1], vec!["dext", "uses | safely"]);
     }
 
     #[test]
@@ -8588,7 +8593,7 @@ mod tests {
         let table = ParsedTable {
             rows: vec![
                 vec!["Key".into(), "Value".into()],
-                vec!["name".into(), "wolf".into()],
+                vec!["name".into(), "dext".into()],
             ],
             header_rows: 1,
             alignments: vec![TableColumnAlignment::Left, TableColumnAlignment::Left],

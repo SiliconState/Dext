@@ -12,18 +12,18 @@ use crate::{
     byte_prefix_at_char_boundary, byte_suffix_at_char_boundary, cap_bytes_with_hint,
 };
 
-pub(crate) fn wolf_state_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("WOLF_HOME") {
+pub(crate) fn dext_state_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("DEXT_HOME") {
         return PathBuf::from(p);
     }
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".wolf")
+    PathBuf::from(home).join(".dext")
 }
 
 pub(crate) fn named_sessions_dir_for_root(root: &Path) -> PathBuf {
-    if let Ok(p) = std::env::var("WOLF_SESSIONS_DIR") {
+    if let Ok(p) = std::env::var("DEXT_SESSIONS_DIR") {
         return PathBuf::from(p);
     }
     project_state_dir(root).join("sessions")
@@ -105,18 +105,18 @@ pub(crate) fn project_key(root: &Path) -> String {
 }
 
 pub(crate) fn project_state_dir(root: &Path) -> PathBuf {
-    wolf_state_dir().join("projects").join(project_key(root))
+    dext_state_dir().join("projects").join(project_key(root))
 }
 
 pub(crate) fn latest_sessions_dir(root: &Path) -> PathBuf {
-    if let Ok(p) = std::env::var("WOLF_SESSIONS_DIR") {
+    if let Ok(p) = std::env::var("DEXT_SESSIONS_DIR") {
         return PathBuf::from(p);
     }
     project_state_dir(root).join("sessions")
 }
 
 pub(crate) fn logs_dir(root: &Path) -> PathBuf {
-    if let Ok(p) = std::env::var("WOLF_LOGS_DIR") {
+    if let Ok(p) = std::env::var("DEXT_LOGS_DIR") {
         return PathBuf::from(p);
     }
     project_state_dir(root).join("logs")
@@ -234,7 +234,7 @@ pub(crate) fn cap_latest_log_buffer(content: String) -> String {
 }
 
 fn log_archive_count() -> u32 {
-    std::env::var("WOLF_LOG_ARCHIVES")
+    std::env::var("DEXT_LOG_ARCHIVES")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .map(|n| n.min(LATEST_LOG_ARCHIVE_MAX))
@@ -533,7 +533,7 @@ impl ProjectStateLock {
                         continue;
                     }
                     anyhow::bail!(
-                        "another wolf process already owns project state for {} (pid {}, lock {}). Close that process or remove the stale lock if it is no longer running.",
+                        "another dext process already owns project state for {} (pid {}, lock {}). Close that process or remove the stale lock if it is no longer running.",
                         existing.sandbox_root,
                         existing.pid,
                         path.display(),

@@ -20,7 +20,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn temp_test_dir(label: &str) -> PathBuf {
     let unique = format!(
-        "wolf-{label}-{}-{}",
+        "dext-{label}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -524,7 +524,7 @@ fn work_map_derives_waypoints_and_packets() {
         .expect("failure waypoint");
     let selection = parse_work_map_selection(&failure.id, &map).expect("select waypoint");
     let packet = render_work_map_packet(&map, &selection);
-    assert!(packet.contains("[wolf packet"), "{packet}");
+    assert!(packet.contains("[dext packet"), "{packet}");
     assert!(packet.contains("Failures/blockers"), "{packet}");
     assert!(
         packet.contains("Focus changes model context only"),
@@ -570,7 +570,7 @@ fn track_origin_serializes_in_session_header() -> Result<()> {
     let _guard = env_lock();
     let sessions_dir = root.join("sessions");
     std::fs::create_dir_all(&sessions_dir)?;
-    unsafe { std::env::set_var("WOLF_SESSIONS_DIR", &sessions_dir) };
+    unsafe { std::env::set_var("DEXT_SESSIONS_DIR", &sessions_dir) };
     let result = (|| -> Result<()> {
         let agent = test_agent(&root);
         let map = build_test_work_map();
@@ -589,7 +589,7 @@ fn track_origin_serializes_in_session_header() -> Result<()> {
         assert_eq!(history.len(), 2);
         Ok(())
     })();
-    unsafe { std::env::remove_var("WOLF_SESSIONS_DIR") };
+    unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
     result
 }
 
@@ -696,7 +696,7 @@ fn session_replay_fixture_ignores_irrelevant_subagent_and_handles_queued_update(
     assert!(
         replay.tool_names_after_marker("wealthtrak subagent is irrelevant")
             == vec!["read_file".to_string()],
-        "expected Wolf-source work after queued update, got {:?}",
+        "expected Dext-source work after queued update, got {:?}",
         replay.tool_names_after_marker("wealthtrak subagent is irrelevant")
     );
     let assistant = replay.assistant_text();
@@ -722,7 +722,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
     std::fs::create_dir_all(&other)?;
 
     // Safe: test holds a global lock around env mutation.
-    unsafe { std::env::set_var("WOLF_SESSIONS_DIR", &sessions_dir) };
+    unsafe { std::env::set_var("DEXT_SESSIONS_DIR", &sessions_dir) };
     let result = (|| -> Result<()> {
         let sandbox = std::fs::canonicalize(&sandbox)?;
 
@@ -756,7 +756,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
             status: "passed".to_string(),
             exit_code: Some(0),
             duration_ms: 123,
-            artifact: Some(".wolf/artifacts/verify.json".to_string()),
+            artifact: Some(".dext/artifacts/verify.json".to_string()),
             validates: vec!["session roundtrip".to_string()],
         });
         saved.provider_health.providers.insert(
@@ -891,7 +891,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         Ok(())
     })();
     // Safe: test holds a global lock around env mutation.
-    unsafe { std::env::remove_var("WOLF_SESSIONS_DIR") };
+    unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
     let _ = std::fs::remove_dir_all(&root);
     result
 }
@@ -948,14 +948,14 @@ fn session_html_export_renders_and_escapes_transcript() -> Result<()> {
 fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("session-listing-latest");
-    let wolf_home = root.join("wolf-home");
+    let dext_home = root.join("dext-home");
     let project = root.join("project");
-    std::fs::create_dir_all(&wolf_home)?;
+    std::fs::create_dir_all(&dext_home)?;
     std::fs::create_dir_all(&project)?;
 
     unsafe {
-        std::env::set_var("WOLF_HOME", &wolf_home);
-        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::set_var("DEXT_HOME", &dext_home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
     }
     let result = (|| -> Result<()> {
         let project = std::fs::canonicalize(&project)?;
@@ -983,8 +983,8 @@ fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<(
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
-        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -994,16 +994,16 @@ fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<(
 fn named_sessions_are_project_scoped_by_default() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("project-scoped-named-sessions");
-    let wolf_home = root.join("wolf-home");
+    let dext_home = root.join("dext-home");
     let alpha = root.join("alpha");
     let beta = root.join("beta");
-    std::fs::create_dir_all(&wolf_home)?;
+    std::fs::create_dir_all(&dext_home)?;
     std::fs::create_dir_all(&alpha)?;
     std::fs::create_dir_all(&beta)?;
 
     unsafe {
-        std::env::set_var("WOLF_HOME", &wolf_home);
-        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::set_var("DEXT_HOME", &dext_home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
     }
     let result = (|| -> Result<()> {
         let alpha = std::fs::canonicalize(&alpha)?;
@@ -1035,8 +1035,8 @@ fn named_sessions_are_project_scoped_by_default() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
-        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -1100,7 +1100,7 @@ fn session_jsonl_reads_tool_metadata_duration() -> Result<()> {
 fn latest_state_defaults_are_project_scoped() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("project-scoped-state");
-    let wolf_home = root.join("wolf-home");
+    let dext_home = root.join("dext-home");
     let alpha = root.join("alpha");
     let beta = root.join("beta");
     std::fs::create_dir_all(&alpha)?;
@@ -1108,9 +1108,9 @@ fn latest_state_defaults_are_project_scoped() -> Result<()> {
 
     // Safe: test holds a global lock around env mutation.
     unsafe {
-        std::env::set_var("WOLF_HOME", &wolf_home);
-        std::env::remove_var("WOLF_SESSIONS_DIR");
-        std::env::remove_var("WOLF_LOGS_DIR");
+        std::env::set_var("DEXT_HOME", &dext_home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
     }
     let result = (|| -> Result<()> {
         let alpha = std::fs::canonicalize(&alpha)?;
@@ -1122,16 +1122,16 @@ fn latest_state_defaults_are_project_scoped() -> Result<()> {
 
         assert_ne!(alpha_session, beta_session);
         assert_ne!(alpha_log, beta_log);
-        assert!(alpha_session.starts_with(wolf_home.join("projects")));
-        assert!(alpha_log.starts_with(wolf_home.join("projects")));
+        assert!(alpha_session.starts_with(dext_home.join("projects")));
+        assert!(alpha_log.starts_with(dext_home.join("projects")));
         Ok(())
     })();
 
     // Safe: test holds a global lock around env mutation.
     unsafe {
-        std::env::remove_var("WOLF_HOME");
-        std::env::remove_var("WOLF_SESSIONS_DIR");
-        std::env::remove_var("WOLF_LOGS_DIR");
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -1146,7 +1146,7 @@ fn project_state_lock_blocks_second_owner_until_release() -> Result<()> {
     let err = ProjectStateLock::acquire(&root).expect_err("second owner should fail");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("another wolf process already owns project state"),
+        msg.contains("another dext process already owns project state"),
         "{msg}"
     );
     drop(first);
@@ -1197,7 +1197,7 @@ fn set_sandbox_root_rejects_locked_project() -> Result<()> {
         .expect_err("locked target project should fail");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("another wolf process already owns project state"),
+        msg.contains("another dext process already owns project state"),
         "{msg}"
     );
     assert_eq!(agent.sandbox_root, before);
@@ -1226,32 +1226,32 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
 }
 
 #[test]
-fn fangs_out_toggle_controls_gated_allowlist() {
-    let root = temp_test_dir("fangs-toggle");
+fn trust_mode_toggle_controls_gated_allowlist() {
+    let root = temp_test_dir("trust-toggle");
     let mut agent = test_agent(&root);
-    assert!(!agent.fangs_out_active());
+    assert!(!agent.trust_mode_active());
 
-    let enabled = agent.set_fangs_out(true);
+    let enabled = agent.set_trust_mode(true);
     assert!(enabled > 0, "expected gated tools to be added");
-    assert!(agent.fangs_out_active());
+    assert!(agent.trust_mode_active());
     assert_eq!(agent.approval_profile(), ApprovalProfile::Always);
 
-    let disabled = agent.set_fangs_out(false);
+    let disabled = agent.set_trust_mode(false);
     assert!(disabled > 0, "expected gated tools to be removed");
-    assert!(!agent.fangs_out_active());
+    assert!(!agent.trust_mode_active());
     assert_eq!(agent.approval_profile(), ApprovalProfile::Ask);
 
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn slash_fangs_emits_profile_update_for_tui_status() {
-    let root = temp_test_dir("fangs-slash-status");
+fn slash_trust_emits_profile_update_for_tui_status() {
+    let root = temp_test_dir("trust-slash-status");
     let mut agent = test_agent(&root);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent.set_sink(Box::new(ChannelSink { tx }));
 
-    assert_eq!(handle_slash("/fangs on", &mut agent), Some(true));
+    assert_eq!(handle_slash("/trust on", &mut agent), Some(true));
     let mut saw_profile = false;
     while let Ok(event) = rx.try_recv() {
         if let AgentEvent::ApprovalProfileChanged { profile } = event {
@@ -1261,7 +1261,7 @@ fn slash_fangs_emits_profile_update_for_tui_status() {
     }
     assert!(
         saw_profile,
-        "expected ApprovalProfileChanged after /fangs on"
+        "expected ApprovalProfileChanged after /trust on"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -2280,7 +2280,7 @@ fn project_todo_summary_prioritizes_active_work_for_prompt() {
         {"text": "next task", "status": "pending"}
     ]);
     std::fs::write(
-        root.join("WOLF.todo.json"),
+        root.join("DEXT.todo.json"),
         serde_json::to_string_pretty(&todos).unwrap(),
     )
     .unwrap();
@@ -2587,13 +2587,13 @@ fn jq_tool_builds_inline_json_mode_argv() {
 
     let (bin, args, stdin) = prepare_external_tool(
         "jq",
-        &json!({"filter": ".name", "json": "{\"name\":\"wolf\"}"}),
+        &json!({"filter": ".name", "json": "{\"name\":\"dext\"}"}),
         &root,
     )
     .expect("prepare jq inline mode");
     assert_eq!(bin, "jq");
     assert_eq!(args, vec![".name"]);
-    assert_eq!(stdin.as_deref(), Some("{\"name\":\"wolf\"}"));
+    assert_eq!(stdin.as_deref(), Some("{\"name\":\"dext\"}"));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2762,7 +2762,7 @@ fn fd_find_fallback_translates_type_and_consumes_value() {
     let (bin, args, _) = prepare_external_tool_fallback(
         "fd",
         &json!({
-            "pattern": "^WOLF(\\.memory)?\\.md$",
+            "pattern": "^DEXT(\\.memory)?\\.md$",
             "path": root.to_str().unwrap(),
             "extra_args": ["-H", "--type", "f"]
         }),
@@ -2778,7 +2778,7 @@ fn fd_find_fallback_translates_type_and_consumes_value() {
             "-regextype",
             "posix-extended",
             "-regex",
-            ".*^WOLF(\\.memory)?\\.md$.*"
+            ".*^DEXT(\\.memory)?\\.md$.*"
         ]
     );
     assert!(
@@ -3084,7 +3084,7 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("runtime-control-model-provider");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -3132,7 +3132,7 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -3186,7 +3186,7 @@ fn compaction_evidence_includes_ledger_verification_provider_health_and_tool_ref
         status: "passed".to_string(),
         exit_code: Some(0),
         duration_ms: 42,
-        artifact: Some(".wolf/artifacts/verify.json".to_string()),
+        artifact: Some(".dext/artifacts/verify.json".to_string()),
         validates: vec!["session discovery".to_string()],
     });
     let mut health = ProviderHealthLedger::default();
@@ -3337,7 +3337,7 @@ fn session_analysis_surfaces_provenance_and_verification() {
         model: "gpt-5.4".to_string(),
         system: "sys".to_string(),
         provenance: SessionProvenance {
-            wolf_version: "test-version".to_string(),
+            dext_version: "test-version".to_string(),
             provider: "chatgpt".to_string(),
             api_provider: ApiProvider::ChatGpt,
             model: "gpt-5.4".to_string(),
@@ -3507,10 +3507,10 @@ fn subagent_detached_artifacts_are_project_scoped() {
     let _guard = env_lock();
     let root = temp_test_dir("subagent-artifacts");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let wolf_home = root.join("wolf-home");
+    let dext_home = root.join("dext-home");
     unsafe {
-        std::env::set_var("WOLF_HOME", &wolf_home);
-        std::env::remove_var("WOLF_SESSIONS_DIR");
+        std::env::set_var("DEXT_HOME", &dext_home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
     }
     let request = SubagentRequest {
         task: "noop".to_string(),
@@ -3539,30 +3539,30 @@ fn subagent_detached_artifacts_are_project_scoped() {
         serde_json::from_slice(&std::fs::read(&input_path).unwrap()).unwrap();
     assert_eq!(parsed.task, "noop");
     let output = std::fs::read_to_string(&output_path).unwrap();
-    assert!(output.contains("# Wolf subagent output bundle"), "{output}");
+    assert!(output.contains("# Dext subagent output bundle"), "{output}");
     assert!(output.contains("## Logs"), "{output}");
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(subagent_requests_dir(&root));
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
 }
 
 #[test]
-fn current_wolf_executable_falls_back_to_path_when_current_exe_missing() {
+fn current_dext_executable_falls_back_to_path_when_current_exe_missing() {
     let _guard = env_lock();
-    let root = temp_test_dir("wolf-exe-path-fallback");
+    let root = temp_test_dir("dext-exe-path-fallback");
     let bin_dir = root.join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create bin dir");
-    let wolf_path = bin_dir.join("wolf");
-    std::fs::write(&wolf_path, "#!/bin/sh\nexit 0\n").expect("write fake wolf");
+    let dext_path = bin_dir.join("dext");
+    std::fs::write(&dext_path, "#!/bin/sh\nexit 0\n").expect("write fake dext");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&wolf_path).unwrap().permissions();
+        let mut perms = std::fs::metadata(&dext_path).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&wolf_path, perms).unwrap();
+        std::fs::set_permissions(&dext_path, perms).unwrap();
     }
     let old_path = std::env::var_os("PATH");
     unsafe {
@@ -3570,8 +3570,8 @@ fn current_wolf_executable_falls_back_to_path_when_current_exe_missing() {
     }
 
     let missing_exe = root.join("missing-current-exe");
-    let found = current_wolf_executable_from(missing_exe).expect("PATH wolf fallback");
-    assert_eq!(found, wolf_path);
+    let found = current_dext_executable_from(missing_exe).expect("PATH dext fallback");
+    assert_eq!(found, dext_path);
 
     unsafe {
         if let Some(old_path) = old_path {
@@ -3660,18 +3660,18 @@ fn hooks_capture_is_capped() {
 }
 
 #[test]
-fn compose_system_parts_caps_wolf_md() {
-    let root = temp_test_dir("wolf-md-cap");
+fn compose_system_parts_caps_dext_md() {
+    let root = temp_test_dir("dext-md-cap");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     std::fs::write(
-        root.join("WOLF.md"),
+        root.join("DEXT.md"),
         "x".repeat(PROJECT_CONTEXT_CAP + 5_000),
     )
-    .expect("write WOLF.md");
+    .expect("write DEXT.md");
 
     let agent = test_agent(&root);
     let (stable, _env) = agent.compose_system_parts();
-    assert!(stable.contains("WOLF.md truncated"), "{stable}");
+    assert!(stable.contains("DEXT.md truncated"), "{stable}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3729,19 +3729,19 @@ fn default_tool_profile_is_lean_for_prompt_budget() {
 }
 
 #[test]
-fn compose_system_parts_includes_wolf_memory_md() {
-    let root = temp_test_dir("wolf-memory-md");
+fn compose_system_parts_includes_dext_memory_md() {
+    let root = temp_test_dir("dext-memory-md");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     std::fs::write(
-        root.join("WOLF.memory.md"),
+        root.join("DEXT.memory.md"),
         "## Decisions\n- keep tool evidence concise",
     )
-    .expect("write WOLF.memory.md");
+    .expect("write DEXT.memory.md");
 
     let agent = test_agent(&root);
     let (stable, _env) = agent.compose_system_parts();
     assert!(
-        stable.contains("Persistent memory (WOLF.memory.md"),
+        stable.contains("Persistent memory (DEXT.memory.md"),
         "{stable}"
     );
     assert!(stable.contains("keep tool evidence concise"), "{stable}");
@@ -3753,9 +3753,9 @@ fn compose_system_parts_includes_wolf_memory_md() {
 fn context_window_and_history_budget_are_model_aware_and_overridable() {
     let _guard = env_lock();
     unsafe {
-        std::env::remove_var("WOLF_CONTEXT_WINDOW");
-        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
-        std::env::remove_var("WOLF_MAX_HISTORY_CHARS");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+        std::env::remove_var("DEXT_MAX_HISTORY_CHARS");
     }
 
     assert_eq!(model_context_window("demo-128k"), 128_000);
@@ -3785,12 +3785,12 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
     );
 
     unsafe {
-        std::env::set_var("WOLF_CONTEXT_WINDOW_TOKENS", "64000");
+        std::env::set_var("DEXT_CONTEXT_WINDOW_TOKENS", "64000");
     }
     assert_eq!(model_context_window("demo-128k"), 64_000);
 
     unsafe {
-        std::env::set_var("WOLF_MAX_HISTORY_CHARS", "77777");
+        std::env::set_var("DEXT_MAX_HISTORY_CHARS", "77777");
     }
     assert_eq!(
         history_char_budget_with_override("any-model", None, ContextMode::Standard),
@@ -3802,9 +3802,9 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
     );
 
     unsafe {
-        std::env::remove_var("WOLF_CONTEXT_WINDOW");
-        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
-        std::env::remove_var("WOLF_MAX_HISTORY_CHARS");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+        std::env::remove_var("DEXT_MAX_HISTORY_CHARS");
     }
 }
 
@@ -3817,9 +3817,9 @@ fn context_window_reads_from_provider_catalog() -> Result<()> {
     let root = temp_test_dir("ctx-window-catalog");
     let root = std::fs::canonicalize(&root)?;
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
-        std::env::remove_var("WOLF_CONTEXT_WINDOW");
-        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
     }
 
     let result = (|| -> Result<()> {
@@ -3859,11 +3859,11 @@ fn context_window_reads_from_provider_catalog() -> Result<()> {
         save_provider_catalog(&catalog)?;
         // Env var beats the catalog.
         unsafe {
-            std::env::set_var("WOLF_CONTEXT_WINDOW_TOKENS", "42000");
+            std::env::set_var("DEXT_CONTEXT_WINDOW_TOKENS", "42000");
         }
         assert_eq!(model_context_window("custom-default"), 42_000);
         unsafe {
-            std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+            std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
         }
         // Model unknown to any provider falls through to heuristic + default.
         assert_eq!(model_context_window("unknown-model"), 200_000);
@@ -3871,7 +3871,7 @@ fn context_window_reads_from_provider_catalog() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -3904,9 +3904,9 @@ fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> 
     let root = temp_test_dir("ctx-window-builtin-chatgpt");
     let root = std::fs::canonicalize(&root)?;
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
-        std::env::remove_var("WOLF_CONTEXT_WINDOW");
-        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
     }
 
     let result = {
@@ -3915,9 +3915,9 @@ fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> 
     };
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
-        std::env::remove_var("WOLF_CONTEXT_WINDOW");
-        std::env::remove_var("WOLF_CONTEXT_WINDOW_TOKENS");
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -3990,7 +3990,7 @@ fn log_rotation_archives_when_enabled() -> Result<()> {
     let root = temp_test_dir("log-rotation");
     let path = root.join("latest.log");
     // Safe: test holds a global lock around env mutation.
-    unsafe { std::env::set_var("WOLF_LOG_ARCHIVES", "3") };
+    unsafe { std::env::set_var("DEXT_LOG_ARCHIVES", "3") };
     let result = (|| -> Result<()> {
         let big = "y".repeat(LATEST_LOG_CAP);
         std::fs::write(&path, &big)?;
@@ -4003,7 +4003,7 @@ fn log_rotation_archives_when_enabled() -> Result<()> {
         Ok(())
     })();
     // Safe: test holds a global lock around env mutation.
-    unsafe { std::env::remove_var("WOLF_LOG_ARCHIVES") };
+    unsafe { std::env::remove_var("DEXT_LOG_ARCHIVES") };
     let _ = std::fs::remove_dir_all(&root);
     result
 }
@@ -4014,7 +4014,7 @@ fn log_rotation_defaults_to_truncation_only() -> Result<()> {
     let root = temp_test_dir("log-no-rotation");
     let path = root.join("latest.log");
     // Safe: test holds a global lock around env mutation.
-    unsafe { std::env::remove_var("WOLF_LOG_ARCHIVES") };
+    unsafe { std::env::remove_var("DEXT_LOG_ARCHIVES") };
     std::fs::create_dir_all(&root)?;
     let big = "y".repeat(LATEST_LOG_CAP);
     std::fs::write(&path, &big)?;
@@ -4035,8 +4035,8 @@ fn checkpoint_latest_session_writes_session_and_log() {
 
     // Safe: test holds a global lock around env mutation.
     unsafe {
-        std::env::set_var("WOLF_SESSIONS_DIR", &sessions);
-        std::env::set_var("WOLF_LOGS_DIR", &logs);
+        std::env::set_var("DEXT_SESSIONS_DIR", &sessions);
+        std::env::set_var("DEXT_LOGS_DIR", &logs);
     }
 
     let result = (|| -> Result<()> {
@@ -4074,8 +4074,8 @@ fn checkpoint_latest_session_writes_session_and_log() {
 
     // Safe: test holds a global lock around env mutation.
     unsafe {
-        std::env::remove_var("WOLF_SESSIONS_DIR");
-        std::env::remove_var("WOLF_LOGS_DIR");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     result.expect("checkpoint latest session");
@@ -4086,17 +4086,17 @@ fn max_concurrent_builtins_reads_env_and_defaults() {
     let _guard = env_lock();
     // Safe: test holds a global lock around env mutation.
     unsafe {
-        std::env::remove_var("WOLF_MAX_CONCURRENT_BUILTINS");
+        std::env::remove_var("DEXT_MAX_CONCURRENT_BUILTINS");
     }
     assert_eq!(max_concurrent_builtins(), 8);
     // Safe: guarded by env_lock.
     unsafe {
-        std::env::set_var("WOLF_MAX_CONCURRENT_BUILTINS", "3");
+        std::env::set_var("DEXT_MAX_CONCURRENT_BUILTINS", "3");
     }
     assert_eq!(max_concurrent_builtins(), 3);
     // Safe: guarded by env_lock.
     unsafe {
-        std::env::set_var("WOLF_MAX_CONCURRENT_BUILTINS", "0");
+        std::env::set_var("DEXT_MAX_CONCURRENT_BUILTINS", "0");
     }
     assert_eq!(
         max_concurrent_builtins(),
@@ -4105,7 +4105,7 @@ fn max_concurrent_builtins_reads_env_and_defaults() {
     );
     // Safe: guarded by env_lock.
     unsafe {
-        std::env::set_var("WOLF_MAX_CONCURRENT_BUILTINS", "garbage");
+        std::env::set_var("DEXT_MAX_CONCURRENT_BUILTINS", "garbage");
     }
     assert_eq!(
         max_concurrent_builtins(),
@@ -4114,7 +4114,7 @@ fn max_concurrent_builtins_reads_env_and_defaults() {
     );
     // Safe: guarded by env_lock.
     unsafe {
-        std::env::remove_var("WOLF_MAX_CONCURRENT_BUILTINS");
+        std::env::remove_var("DEXT_MAX_CONCURRENT_BUILTINS");
     }
 }
 
@@ -4167,8 +4167,8 @@ fn no_session_agent_skips_checkpoints_and_state_lock() -> Result<()> {
     let sessions = root.join("sessions");
     let logs = root.join("logs");
     unsafe {
-        std::env::set_var("WOLF_SESSIONS_DIR", &sessions);
-        std::env::set_var("WOLF_LOGS_DIR", &logs);
+        std::env::set_var("DEXT_SESSIONS_DIR", &sessions);
+        std::env::set_var("DEXT_LOGS_DIR", &logs);
     }
 
     let result = {
@@ -4187,8 +4187,8 @@ fn no_session_agent_skips_checkpoints_and_state_lock() -> Result<()> {
     };
 
     unsafe {
-        std::env::remove_var("WOLF_SESSIONS_DIR");
-        std::env::remove_var("WOLF_LOGS_DIR");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -4489,9 +4489,9 @@ fn checkpoint_debounce_skips_rapid_non_critical_writes() {
 
     // Safe: test holds a global lock around env mutation.
     unsafe {
-        std::env::set_var("WOLF_SESSIONS_DIR", &sessions);
-        std::env::set_var("WOLF_LOGS_DIR", &logs);
-        std::env::set_var("WOLF_CHECKPOINT_DEBOUNCE_MS", "10000");
+        std::env::set_var("DEXT_SESSIONS_DIR", &sessions);
+        std::env::set_var("DEXT_LOGS_DIR", &logs);
+        std::env::set_var("DEXT_CHECKPOINT_DEBOUNCE_MS", "10000");
     }
 
     let result = (|| -> Result<()> {
@@ -4533,9 +4533,9 @@ fn checkpoint_debounce_skips_rapid_non_critical_writes() {
 
     // Safe: test holds a global lock around env mutation.
     unsafe {
-        std::env::remove_var("WOLF_SESSIONS_DIR");
-        std::env::remove_var("WOLF_LOGS_DIR");
-        std::env::remove_var("WOLF_CHECKPOINT_DEBOUNCE_MS");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+        std::env::remove_var("DEXT_CHECKPOINT_DEBOUNCE_MS");
     }
     let _ = std::fs::remove_dir_all(&root);
     result.expect("checkpoint debounce");
@@ -4547,7 +4547,7 @@ fn suppressed_checkpoints_do_not_clobber_parent_session() {
     let root = temp_test_dir("subagent-no-clobber");
     let sessions = root.join("sessions");
     // Safe: test holds a global lock around env mutation.
-    unsafe { std::env::set_var("WOLF_SESSIONS_DIR", &sessions) };
+    unsafe { std::env::set_var("DEXT_SESSIONS_DIR", &sessions) };
 
     let result = (|| -> Result<()> {
         let root_canon = std::fs::canonicalize(&root)?;
@@ -4588,7 +4588,7 @@ fn suppressed_checkpoints_do_not_clobber_parent_session() {
     })();
 
     // Safe: test holds a global lock around env mutation.
-    unsafe { std::env::remove_var("WOLF_SESSIONS_DIR") };
+    unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
     let _ = std::fs::remove_dir_all(&root);
     result.expect("subagent checkpoint suppression");
 }
@@ -4824,14 +4824,14 @@ fn edit_file_returns_diff_and_summary() {
 
     let out = execute_tool(
         "edit_file",
-        &json!({"path": "note.txt", "old_string": "world", "new_string": "wolf"}),
+        &json!({"path": "note.txt", "old_string": "world", "new_string": "dext"}),
         &root,
     )
     .expect("edit_file should succeed");
 
     assert!(out.contains("@@"), "{out}");
     assert!(out.contains("-world"), "{out}");
-    assert!(out.contains("+wolf"), "{out}");
+    assert!(out.contains("+dext"), "{out}");
     assert!(out.contains("edited "), "{out}");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -4845,7 +4845,7 @@ fn edit_file_non_unique_error_returns_match_locations() {
 
     let err = execute_tool(
         "edit_file",
-        &json!({"path": "note.txt", "old_string": "needle", "new_string": "wolf"}),
+        &json!({"path": "note.txt", "old_string": "needle", "new_string": "dext"}),
         &root,
     )
     .expect_err("edit_file should reject non-unique old_string");
@@ -4869,7 +4869,7 @@ fn multi_edit_non_unique_error_returns_match_locations() {
         "multi_edit",
         &json!({
             "path": "note.txt",
-            "edits": [{"old_string": "needle", "new_string": "wolf"}]
+            "edits": [{"old_string": "needle", "new_string": "dext"}]
         }),
         &root,
     )
@@ -5026,7 +5026,7 @@ fn todo_write_rejects_invalid_status() {
 fn api_provider_detects_openai_base_url() {
     let _guard = env_lock();
     unsafe {
-        std::env::set_var("WOLF_API_PROVIDER", "");
+        std::env::set_var("DEXT_API_PROVIDER", "");
     }
 
     unsafe {
@@ -5045,24 +5045,24 @@ fn api_provider_detects_openai_base_url() {
     assert_eq!(ApiProvider::from_env(), ApiProvider::Anthropic);
 
     unsafe {
-        std::env::set_var("WOLF_API_PROVIDER", "openai");
+        std::env::set_var("DEXT_API_PROVIDER", "openai");
         std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
     }
     assert_eq!(ApiProvider::from_env(), ApiProvider::OpenAi);
 
     unsafe {
-        std::env::set_var("WOLF_API_PROVIDER", "deepseek");
+        std::env::set_var("DEXT_API_PROVIDER", "deepseek");
         std::env::set_var("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
     }
     assert_eq!(ApiProvider::from_env(), ApiProvider::OpenAi);
 
     unsafe {
-        std::env::set_var("WOLF_API_PROVIDER", "codex");
+        std::env::set_var("DEXT_API_PROVIDER", "codex");
     }
     assert_eq!(ApiProvider::from_env(), ApiProvider::ChatGpt);
 
     unsafe {
-        std::env::remove_var("WOLF_API_PROVIDER");
+        std::env::remove_var("DEXT_API_PROVIDER");
         std::env::remove_var("ANTHROPIC_BASE_URL");
     }
 }
@@ -5097,12 +5097,12 @@ fn runtime_provider_reroutes_away_from_stale_cross_provider_default_model() -> R
     let _guard = env_lock();
     let root = temp_test_dir("provider-stale-default-reroute");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
-        std::env::remove_var("WOLF_PROVIDER");
-        std::env::remove_var("WOLF_MODEL");
-        std::env::remove_var("WOLF_MODEL_CHATGPT");
-        std::env::remove_var("WOLF_MODEL_GLM");
-        std::env::remove_var("WOLF_MODEL_FORCE");
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_PROVIDER");
+        std::env::remove_var("DEXT_MODEL");
+        std::env::remove_var("DEXT_MODEL_CHATGPT");
+        std::env::remove_var("DEXT_MODEL_GLM");
+        std::env::remove_var("DEXT_MODEL_FORCE");
     }
 
     let result = (|| -> Result<()> {
@@ -5142,7 +5142,7 @@ fn runtime_provider_reroutes_away_from_stale_cross_provider_default_model() -> R
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5153,9 +5153,9 @@ fn runtime_provider_allows_missing_key_when_requested() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-missing-key");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
-        std::env::set_var("WOLF_PROVIDER", "glm");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("DEXT_PROVIDER", "glm");
+        std::env::remove_var("DEXT_API_KEY");
         std::env::remove_var("ZAI_API_KEY");
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
@@ -5170,8 +5170,8 @@ fn runtime_provider_allows_missing_key_when_requested() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
-        std::env::remove_var("WOLF_PROVIDER");
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_PROVIDER");
         std::env::remove_var("ZAI_API_KEY");
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
@@ -5184,11 +5184,11 @@ fn global_model_override_respects_provider_compatibility() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-model-compat");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
-        std::env::set_var("WOLF_PROVIDER", "chatgpt");
-        std::env::set_var("WOLF_MODEL", "glm-5.1");
-        std::env::remove_var("WOLF_MODEL_CHATGPT");
-        std::env::remove_var("WOLF_MODEL_FORCE");
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("DEXT_PROVIDER", "chatgpt");
+        std::env::set_var("DEXT_MODEL", "glm-5.1");
+        std::env::remove_var("DEXT_MODEL_CHATGPT");
+        std::env::remove_var("DEXT_MODEL_FORCE");
     }
 
     let result = (|| -> Result<()> {
@@ -5197,14 +5197,14 @@ fn global_model_override_respects_provider_compatibility() -> Result<()> {
         assert_eq!(resolved.model, "gpt-5.4");
 
         unsafe {
-            std::env::set_var("WOLF_MODEL_CHATGPT", "gpt-4o");
+            std::env::set_var("DEXT_MODEL_CHATGPT", "gpt-4o");
         }
         let resolved_with_provider_override = resolve_runtime_provider(None, false)?;
         assert_eq!(resolved_with_provider_override.model, "gpt-4o");
 
         unsafe {
-            std::env::remove_var("WOLF_MODEL_CHATGPT");
-            std::env::set_var("WOLF_MODEL_FORCE", "1");
+            std::env::remove_var("DEXT_MODEL_CHATGPT");
+            std::env::set_var("DEXT_MODEL_FORCE", "1");
         }
         let resolved_forced = resolve_runtime_provider(None, false)?;
         assert_eq!(resolved_forced.model, "glm-5.1");
@@ -5212,11 +5212,11 @@ fn global_model_override_respects_provider_compatibility() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
-        std::env::remove_var("WOLF_PROVIDER");
-        std::env::remove_var("WOLF_MODEL");
-        std::env::remove_var("WOLF_MODEL_CHATGPT");
-        std::env::remove_var("WOLF_MODEL_FORCE");
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_PROVIDER");
+        std::env::remove_var("DEXT_MODEL");
+        std::env::remove_var("DEXT_MODEL_CHATGPT");
+        std::env::remove_var("DEXT_MODEL_FORCE");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5227,7 +5227,7 @@ fn provider_default_model_persists_and_is_listed() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-default-model");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5240,7 +5240,7 @@ fn provider_default_model_persists_and_is_listed() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5251,7 +5251,7 @@ fn chatgpt_default_model_is_normalized_when_saved() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-chatgpt-model-normalize");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5264,7 +5264,7 @@ fn chatgpt_default_model_is_normalized_when_saved() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5275,7 +5275,7 @@ fn stale_chatgpt_catalog_entry_is_upgraded_on_load() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-chatgpt-catalog-upgrade");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5319,7 +5319,7 @@ fn stale_chatgpt_catalog_entry_is_upgraded_on_load() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5330,7 +5330,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-prune-legacy-builtin");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5385,7 +5385,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5396,7 +5396,7 @@ fn auth_store_reads_legacy_provider_map() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("auth-legacy-map");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5427,7 +5427,7 @@ fn auth_store_reads_legacy_provider_map() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5438,9 +5438,9 @@ fn login_imports_env_key_and_reuses_stored_key() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-import-env");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("ZAI_API_KEY", "env-glm-key");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
     }
 
     let result = (|| -> Result<()> {
@@ -5466,7 +5466,7 @@ fn login_imports_env_key_and_reuses_stored_key() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
         std::env::remove_var("ZAI_API_KEY");
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -5478,7 +5478,7 @@ fn provider_selector_accepts_index_and_id() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-selector");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5491,7 +5491,7 @@ fn provider_selector_accepts_index_and_id() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5502,7 +5502,7 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
     let _guard = env_lock();
     let root = temp_test_dir("provider-model-selection-auth");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5542,7 +5542,7 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5553,7 +5553,7 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-core-set");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5572,7 +5572,7 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5583,7 +5583,7 @@ fn auth_store_normalizes_canonical_provider_ids_on_load_and_logout() -> Result<(
     let _guard = env_lock();
     let root = temp_test_dir("auth-canonical-normalize");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5625,7 +5625,7 @@ fn auth_store_normalizes_canonical_provider_ids_on_load_and_logout() -> Result<(
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5636,11 +5636,11 @@ fn chatgpt_login_does_not_import_openai_platform_key() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("chatgpt-no-openai-platform-key");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("OPENAI_API_KEY", "sk-openai-platform-key");
-        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
         std::env::remove_var("CHATGPT_ACCESS_TOKEN");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
     }
 
     let result = (|| -> Result<()> {
@@ -5675,11 +5675,11 @@ fn chatgpt_login_does_not_import_openai_platform_key() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
         std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
+        std::env::remove_var("DEXT_SKIP_BROWSER_OPEN");
         std::env::remove_var("CHATGPT_ACCESS_TOKEN");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5690,7 +5690,7 @@ fn list_models_for_available_providers_shows_authenticated_sections() -> Result<
     let _guard = env_lock();
     let root = temp_test_dir("models-all-authenticated");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5722,7 +5722,7 @@ fn list_models_for_available_providers_shows_authenticated_sections() -> Result<
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5733,7 +5733,7 @@ fn auth_store_parses_oauth_access_shape() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("auth-oauth-shape");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -5755,7 +5755,7 @@ fn auth_store_parses_oauth_access_shape() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5766,10 +5766,10 @@ fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-pi-auth");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("HOME", &root);
         std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
     }
 
     let result = (|| -> Result<()> {
@@ -5804,7 +5804,7 @@ fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
         std::env::remove_var("HOME");
         std::env::remove_var("OPENAI_API_KEY");
     }
@@ -5817,11 +5817,11 @@ fn login_chatgpt_default_mode_ignores_pi_auth_import() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-default-mode");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("HOME", &root);
-        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
         std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
     }
 
     let result = (|| -> Result<()> {
@@ -5849,9 +5849,9 @@ fn login_chatgpt_default_mode_ignores_pi_auth_import() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
         std::env::remove_var("HOME");
-        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
+        std::env::remove_var("DEXT_SKIP_BROWSER_OPEN");
         std::env::remove_var("OPENAI_API_KEY");
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -5863,11 +5863,11 @@ fn login_web_mode_skips_pi_auth_import() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-web-mode");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("HOME", &root);
-        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
         std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
     }
 
     let result = (|| -> Result<()> {
@@ -5901,9 +5901,9 @@ fn login_web_mode_skips_pi_auth_import() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
         std::env::remove_var("HOME");
-        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
+        std::env::remove_var("DEXT_SKIP_BROWSER_OPEN");
         std::env::remove_var("OPENAI_API_KEY");
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -5911,23 +5911,23 @@ fn login_web_mode_skips_pi_auth_import() -> Result<()> {
 }
 
 #[test]
-fn chatgpt_oauth_authorize_url_uses_wolf_originator_by_default() -> Result<()> {
+fn chatgpt_oauth_authorize_url_uses_dext_originator_by_default() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-originator-default");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("HOME", &root);
-        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
-        std::env::remove_var("WOLF_OAUTH_ORIGINATOR");
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
+        std::env::remove_var("DEXT_OAUTH_ORIGINATOR");
         std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
     }
 
     let result = (|| -> Result<()> {
         let login = login_provider(Some("chatgpt"), Some("web"), false)?;
         assert!(login.awaiting_credentials);
         assert!(
-            login.message.contains("originator=wolf"),
+            login.message.contains("originator=dext"),
             "{}",
             login.message
         );
@@ -5940,12 +5940,12 @@ fn chatgpt_oauth_authorize_url_uses_wolf_originator_by_default() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
         std::env::remove_var("HOME");
-        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
-        std::env::remove_var("WOLF_OAUTH_ORIGINATOR");
+        std::env::remove_var("DEXT_SKIP_BROWSER_OPEN");
+        std::env::remove_var("DEXT_OAUTH_ORIGINATOR");
         std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("WOLF_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -5972,7 +5972,7 @@ fn login_chatgpt_authorization_code_uses_oauth_completion_path() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-authorization-code");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = {
@@ -5993,7 +5993,7 @@ fn login_chatgpt_authorization_code_uses_oauth_completion_path() -> Result<()> {
     };
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -6007,7 +6007,7 @@ fn oauth_exchange_failure_stays_retryable() {
     );
     assert!(message.contains("OAuth token exchange failed"), "{message}");
     assert!(
-        message.contains("paste the callback URL or authorization code into wolf to retry"),
+        message.contains("paste the callback URL or authorization code into dext to retry"),
         "{message}"
     );
 }
@@ -6017,7 +6017,7 @@ fn chatgpt_oauth_defaults_match_pi_flow() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("chatgpt-oauth-defaults");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -6034,7 +6034,7 @@ fn chatgpt_oauth_defaults_match_pi_flow() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -6045,9 +6045,9 @@ fn chatgpt_oauth_callback_host_env_override_is_respected() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("chatgpt-oauth-callback-host-override");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
-        std::env::set_var("WOLF_SKIP_BROWSER_OPEN", "1");
-        std::env::set_var("WOLF_OAUTH_CALLBACK_HOST", "256.0.0.1");
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
+        std::env::set_var("DEXT_OAUTH_CALLBACK_HOST", "256.0.0.1");
     }
 
     let result = (|| -> Result<()> {
@@ -6062,9 +6062,9 @@ fn chatgpt_oauth_callback_host_env_override_is_respected() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
-        std::env::remove_var("WOLF_SKIP_BROWSER_OPEN");
-        std::env::remove_var("WOLF_OAUTH_CALLBACK_HOST");
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SKIP_BROWSER_OPEN");
+        std::env::remove_var("DEXT_OAUTH_CALLBACK_HOST");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -6075,7 +6075,7 @@ fn login_chatgpt_accepts_access_token_json_and_rejects_api_key() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-access-token");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -6109,7 +6109,7 @@ fn login_chatgpt_accepts_access_token_json_and_rejects_api_key() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -6120,7 +6120,7 @@ fn slash_logout_ignores_extra_words_after_provider() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("slash-logout-chatgpt-web");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -6158,7 +6158,7 @@ fn slash_logout_ignores_extra_words_after_provider() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -6169,7 +6169,7 @@ fn handle_slash_model_switches_provider_when_model_belongs_elsewhere() -> Result
     let _guard = env_lock();
     let root = temp_test_dir("slash-model-cross-provider");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
+        std::env::set_var("DEXT_HOME", &root);
     }
 
     let result = (|| -> Result<()> {
@@ -6223,7 +6223,7 @@ fn handle_slash_model_switches_provider_when_model_belongs_elsewhere() -> Result
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
+        std::env::remove_var("DEXT_HOME");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -6234,10 +6234,10 @@ fn slash_model_pins_runtime_model_against_global_override() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("slash-model-runtime-pin");
     unsafe {
-        std::env::set_var("WOLF_HOME", &root);
-        std::env::set_var("WOLF_PROVIDER", "chatgpt");
-        std::env::set_var("WOLF_MODEL", "glm-5.1");
-        std::env::set_var("WOLF_MODEL_FORCE", "1");
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("DEXT_PROVIDER", "chatgpt");
+        std::env::set_var("DEXT_MODEL", "glm-5.1");
+        std::env::set_var("DEXT_MODEL_FORCE", "1");
     }
 
     let result = (|| -> Result<()> {
@@ -6264,10 +6264,10 @@ fn slash_model_pins_runtime_model_against_global_override() -> Result<()> {
     })();
 
     unsafe {
-        std::env::remove_var("WOLF_HOME");
-        std::env::remove_var("WOLF_PROVIDER");
-        std::env::remove_var("WOLF_MODEL");
-        std::env::remove_var("WOLF_MODEL_FORCE");
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_PROVIDER");
+        std::env::remove_var("DEXT_MODEL");
+        std::env::remove_var("DEXT_MODEL_FORCE");
     }
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -6383,7 +6383,7 @@ fn action_contract_note_requires_mutation_tool_use() {
 }
 
 #[test]
-fn anthropic_request_strips_wolf_only_tool_result_metadata() -> Result<()> {
+fn anthropic_request_strips_dext_only_tool_result_metadata() -> Result<()> {
     let root = temp_test_dir("anthropic-strip-tool-metadata");
     let root = std::fs::canonicalize(&root)?;
     let mut agent = test_agent(&root);
@@ -6432,7 +6432,7 @@ fn anthropic_request_strips_wolf_only_tool_result_metadata() -> Result<()> {
 #[test]
 fn chatgpt_input_serializes_function_call_without_id_field() {
     // Regression: Codex rejects `input[].id` that doesn't start with `fc_`.
-    // Wolf stores the server's call_id on Block::ToolUse.id and must not echo it
+    // Dext stores the server's call_id on Block::ToolUse.id and must not echo it
     // as `id` on replay — only `call_id` (optional `id` gets auto-assigned).
     let root = temp_test_dir("chatgpt-input-no-id");
     let root = std::fs::canonicalize(&root).unwrap();

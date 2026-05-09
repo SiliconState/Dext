@@ -15,7 +15,7 @@ fn unique_tmp(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    p.push(format!("wolf-bench-{tag}-{nanos}-{}", std::process::id()));
+    p.push(format!("dext-bench-{tag}-{nanos}-{}", std::process::id()));
     p
 }
 

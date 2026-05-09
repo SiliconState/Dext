@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-use crate::session::{atomic_write_bytes, unix_timestamp_secs, wolf_state_dir};
+use crate::session::{atomic_write_bytes, dext_state_dir, unix_timestamp_secs};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ApiProvider {
@@ -39,7 +39,7 @@ impl<'de> serde::Deserialize<'de> for ApiProvider {
 impl ApiProvider {
     #[cfg(test)]
     pub(crate) fn from_env() -> Self {
-        match std::env::var("WOLF_API_PROVIDER")
+        match std::env::var("DEXT_API_PROVIDER")
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str()
@@ -110,7 +110,7 @@ pub(crate) struct ProviderProfile {
     #[serde(default)]
     pub(crate) notes: Option<String>,
     /// Default request context window (in tokens) for this provider's models.
-    /// Editable in ~/.wolf/providers.json. Env override: WOLF_CONTEXT_WINDOW[_TOKENS].
+    /// Editable in ~/.dext/providers.json. Env override: DEXT_CONTEXT_WINDOW[_TOKENS].
     #[serde(default)]
     pub(crate) context_window: Option<u64>,
     /// Optional per-model override of context_window. Map key = model id.
@@ -186,11 +186,11 @@ pub(crate) struct ResolvedProviderConfig {
 }
 
 pub(crate) fn provider_catalog_path() -> PathBuf {
-    wolf_state_dir().join("providers.json")
+    dext_state_dir().join("providers.json")
 }
 
 pub(crate) fn auth_store_path() -> PathBuf {
-    wolf_state_dir().join("auth.json")
+    dext_state_dir().join("auth.json")
 }
 
 pub(crate) fn canonical_provider_id(raw: &str) -> String {
@@ -740,19 +740,19 @@ impl StoredCredential {
 }
 
 pub(crate) fn resolve_active_provider_id(catalog: &ProviderCatalog) -> String {
-    if let Ok(v) = std::env::var("WOLF_PROVIDER") {
+    if let Ok(v) = std::env::var("DEXT_PROVIDER") {
         let c = canonical_provider_id(&v);
         if !c.is_empty() {
             return c;
         }
     }
-    if let Ok(v) = std::env::var("WOLF_PROFILE") {
+    if let Ok(v) = std::env::var("DEXT_PROFILE") {
         let c = canonical_provider_id(&v);
         if !c.is_empty() {
             return c;
         }
     }
-    if let Ok(v) = std::env::var("WOLF_API_PROVIDER") {
+    if let Ok(v) = std::env::var("DEXT_API_PROVIDER") {
         let lower = v.trim().to_ascii_lowercase();
         let canonical = canonical_provider_id(&lower);
         if lower == "anthropic" && find_provider_profile(catalog, "anthropic").is_none() {
@@ -781,10 +781,10 @@ pub(crate) fn resolve_provider_api_key(
     profile: &ProviderProfile,
     store: &AuthStore,
 ) -> Option<(String, String)> {
-    if let Ok(v) = std::env::var("WOLF_API_KEY") {
+    if let Ok(v) = std::env::var("DEXT_API_KEY") {
         let t = v.trim().to_string();
         if !t.is_empty() {
-            return Some((t, "env:WOLF_API_KEY".to_string()));
+            return Some((t, "env:DEXT_API_KEY".to_string()));
         }
     }
 
@@ -852,7 +852,7 @@ pub(crate) fn normalize_provider_model_value(profile: &ProviderProfile, model: &
 
 pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
     let provider_env = format!(
-        "WOLF_MODEL_{}",
+        "DEXT_MODEL_{}",
         canonical_provider_id(&profile.id)
             .replace('-', "_")
             .to_ascii_uppercase()
@@ -864,10 +864,10 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
         }
     }
 
-    if let Ok(v) = std::env::var("WOLF_MODEL") {
+    if let Ok(v) = std::env::var("DEXT_MODEL") {
         let t = normalize_provider_model_value(profile, &v);
         if !t.is_empty() {
-            let force = std::env::var("WOLF_MODEL_FORCE").ok().is_some_and(|raw| {
+            let force = std::env::var("DEXT_MODEL_FORCE").ok().is_some_and(|raw| {
                 let low = raw.trim().to_ascii_lowercase();
                 !(low.is_empty() || low == "0" || low == "false" || low == "off" || low == "no")
             });
@@ -881,7 +881,7 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
 }
 
 pub(crate) fn resolve_provider_base_url(profile: &ProviderProfile) -> String {
-    if let Ok(v) = std::env::var("WOLF_BASE_URL") {
+    if let Ok(v) = std::env::var("DEXT_BASE_URL") {
         let t = v.trim().trim_end_matches('/').to_string();
         if !t.is_empty() {
             return t;
@@ -970,7 +970,7 @@ pub(crate) fn normalize_chatgpt_model_slug(model: &str) -> String {
 
 pub(crate) fn chatgpt_client_user_agent() -> String {
     format!(
-        "wolf ({}; {})",
+        "dext ({}; {})",
         std::env::consts::OS,
         std::env::consts::ARCH
     )
@@ -1261,7 +1261,7 @@ pub(crate) fn resolve_runtime_provider(
                 profile.env_vars.join(" or ")
             };
             anyhow::bail!(
-                "missing credentials for provider '{}'. Run `wolf auth login {}` or set {}.",
+                "missing credentials for provider '{}'. Run `dext auth login {}` or set {}.",
                 profile.id,
                 profile.id,
                 env_hint
@@ -1749,7 +1749,7 @@ pub(crate) fn running_in_wsl() -> bool {
 }
 
 pub(crate) fn open_url_in_browser(url: &str) -> Result<String> {
-    if std::env::var("WOLF_SKIP_BROWSER_OPEN")
+    if std::env::var("DEXT_SKIP_BROWSER_OPEN")
         .ok()
         .is_some_and(|raw| {
             let low = raw.trim().to_ascii_lowercase();
@@ -1761,7 +1761,7 @@ pub(crate) fn open_url_in_browser(url: &str) -> Result<String> {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     if running_in_wsl()
-        && std::env::var("WOLF_DISABLE_WSL_BROWSER_OPEN")
+        && std::env::var("DEXT_DISABLE_WSL_BROWSER_OPEN")
             .ok()
             .is_some_and(|raw| {
                 let low = raw.trim().to_ascii_lowercase();
@@ -2022,7 +2022,7 @@ fn spawn_oauth_code_listener(
 }
 
 fn oauth_callback_host(oauth: &OAuthFlow) -> String {
-    if let Ok(raw) = std::env::var("WOLF_OAUTH_CALLBACK_HOST") {
+    if let Ok(raw) = std::env::var("DEXT_OAUTH_CALLBACK_HOST") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -2047,11 +2047,11 @@ fn oauth_callback_port(redirect_uri: &str) -> Result<u16> {
 }
 
 pub(crate) fn oauth_originator() -> String {
-    std::env::var("WOLF_OAUTH_ORIGINATOR")
+    std::env::var("DEXT_OAUTH_ORIGINATOR")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "wolf".to_string())
+        .unwrap_or_else(|| "dext".to_string())
 }
 
 fn build_oauth_authorize_url(
@@ -2092,7 +2092,7 @@ fn oauth_exchange_failure_result(
 ) -> LoginResult {
     LoginResult {
         message: format!(
-            "OAuth token exchange failed: {error:#}\n\n{manual_hint}\nYou can paste the callback URL or authorization code into wolf to retry without restarting /login."
+            "OAuth token exchange failed: {error:#}\n\n{manual_hint}\nYou can paste the callback URL or authorization code into dext to retry without restarting /login."
         ),
         provider_id: profile_id.to_string(),
         awaiting_credentials: true,
@@ -2138,7 +2138,7 @@ fn run_oauth_login(
     let manual_hint = format!(
         "If the browser callback doesn't auto-complete, paste the callback URL \
 (http://localhost:{callback_port}/auth/callback?code=...) or just the authorization code \
-(starts with `ac_`) directly into wolf. /login cancel aborts."
+(starts with `ac_`) directly into dext. /login cancel aborts."
     );
     let listener_suffix = listener_warning
         .as_ref()
@@ -2249,12 +2249,12 @@ struct PendingOAuthState {
 
 #[cfg(test)]
 pub(crate) fn pending_oauth_path() -> PathBuf {
-    wolf_state_dir().join("pending_oauth.json")
+    dext_state_dir().join("pending_oauth.json")
 }
 
 #[cfg(not(test))]
 fn pending_oauth_path() -> PathBuf {
-    wolf_state_dir().join("pending_oauth.json")
+    dext_state_dir().join("pending_oauth.json")
 }
 
 #[cfg(test)]
@@ -2712,8 +2712,7 @@ pub(crate) fn login_provider(
             save_auth_store(&store)?;
         }
 
-        if !explicit_web
-            && let Some((secret, source)) = resolve_provider_api_key(&profile, &store)
+        if !explicit_web && let Some((secret, source)) = resolve_provider_api_key(&profile, &store)
         {
             catalog.active_provider = profile.id.clone();
             save_provider_catalog(&catalog)?;
@@ -2764,7 +2763,7 @@ pub(crate) fn login_provider(
                 });
             }
             anyhow::bail!(
-                "no reusable Pi credential found for provider '{}'. Run `wolf auth login {} web` or paste a token/key directly.",
+                "no reusable Pi credential found for provider '{}'. Run `dext auth login {} web` or paste a token/key directly.",
                 profile.id,
                 profile.id
             );
@@ -2805,10 +2804,10 @@ pub(crate) fn login_provider(
             save_provider_catalog(&catalog)?;
 
             let mut msg = if profile.api_provider == ApiProvider::ChatGpt {
-                "opened ChatGPT in your browser. sign in if needed, then paste the access token or full session JSON directly into wolf.".to_string()
+                "opened ChatGPT in your browser. sign in if needed, then paste the access token or full session JSON directly into dext.".to_string()
             } else {
                 format!(
-                    "opened login page for provider '{}'. paste the credential directly into wolf when ready.",
+                    "opened login page for provider '{}'. paste the credential directly into dext when ready.",
                     profile.id
                 )
             };
@@ -2985,15 +2984,15 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
 
     match sub {
         "help" | "-h" | "--help" => {
-            println!("wolf auth commands:");
-            println!("  wolf auth status");
-            println!("  wolf auth providers            list configured providers and auth status");
-            println!("  wolf auth provider [id|index]  show/set active provider");
-            println!("  wolf auth models [provider|index] list known models for provider");
+            println!("dext auth commands:");
+            println!("  dext auth status");
+            println!("  dext auth providers            list configured providers and auth status");
+            println!("  dext auth provider [id|index]  show/set active provider");
+            println!("  dext auth models [provider|index] list known models for provider");
             println!(
-                "  wolf auth login [provider|index] [token|web|import]   web login + store credential"
+                "  dext auth login [provider|index] [token|web|import]   web login + store credential"
             );
-            println!("  wolf auth logout [provider|index] remove stored credential");
+            println!("  dext auth logout [provider|index] remove stored credential");
             Ok(Some(0))
         }
         "status" | "providers" | "list" => {
@@ -3055,12 +3054,12 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
                     println!("{}", login.message);
                     if login.awaiting_credentials {
                         println!(
-                            "then run: wolf auth login {} <code|callback-url|token|json>",
+                            "then run: dext auth login {} <code|callback-url|token|json>",
                             login.provider_id
                         );
                     }
                 } else {
-                    println!("usage: wolf auth login <provider|index> [token|web|import]");
+                    println!("usage: dext auth login <provider|index> [token|web|import]");
                 }
                 return Ok(Some(0));
             }
@@ -3076,7 +3075,7 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             println!("{}", login.message);
             if login.awaiting_credentials {
                 println!(
-                    "then run: wolf auth login {} <code|callback-url|token|json>",
+                    "then run: dext auth login {} <code|callback-url|token|json>",
                     login.provider_id
                 );
             }
@@ -3089,7 +3088,7 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             Ok(Some(0))
         }
         other => {
-            eprintln!("unknown auth command: {other}. try `wolf auth help`");
+            eprintln!("unknown auth command: {other}. try `dext auth help`");
             Ok(Some(2))
         }
     }

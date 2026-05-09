@@ -175,7 +175,7 @@ fn bash_command_advisory(command: &str) -> Option<String> {
     }
     if let Some(tool) = api_tool_used_as_shell_filter(command) {
         return Some(format!(
-            "bash advisory: `{tool}` is available as a Wolf API tool but may not be installed as a shell binary. Use the native {tool} tool, use grep/awk, or probe with `command -v {tool}`."
+            "bash advisory: `{tool}` is available as a Dext API tool but may not be installed as a shell binary. Use the native {tool} tool, use grep/awk, or probe with `command -v {tool}`."
         ));
     }
     None
@@ -578,7 +578,7 @@ pub(crate) fn apply_bash_guardrails(command: &str) -> std::result::Result<String
         let allow_unsafe = matches!(allow.as_str(), "1" | "true" | "yes");
         if !allow_unsafe {
             return Err(
-                "blocked unsafe flag '--break-system-packages'. Use a virtualenv instead (python3 -m venv .venv && . .venv/bin/activate). Set WOLF_ALLOW_BREAK_SYSTEM_PACKAGES=1 to override."
+                "blocked unsafe flag '--break-system-packages'. Use a virtualenv instead (python3 -m venv .venv && . .venv/bin/activate). Set DEXT_ALLOW_BREAK_SYSTEM_PACKAGES=1 to override."
                     .to_string(),
             );
         }
@@ -703,7 +703,7 @@ mod tests {
             &json!({"command": "git show HEAD:file | rg needle"}),
         )
         .expect("shell rg should warn");
-        assert!(rg.contains("Wolf API tool"), "{rg}");
+        assert!(rg.contains("Dext API tool"), "{rg}");
 
         assert!(
             tool_input_advisory(

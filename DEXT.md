@@ -1,6 +1,6 @@
-# Wolf project context
+# Dext project context
 
-Wolf is a single-binary Rust coding agent. This file is auto-injected into the
+Dext is a single-binary Rust coding agent. This file is auto-injected into the
 system prompt from the sandbox root, so keep it short and high-signal.
 
 ## Architecture
@@ -12,10 +12,10 @@ system prompt from the sandbox root, so keep it short and high-signal.
   provider tool schemas.
 - `src/provider.rs` — provider catalog/auth, request shaping, and normalization.
 - `src/tui.rs` — ratatui inline TUI using the regular terminal buffer.
-- `benches/wolf_bench.rs` — criterion perf harness.
+- `benches/dext_bench.rs` — criterion perf harness.
 
 ## Self-modification
-When changing Wolf itself:
+When changing Dext itself:
 1. Locate code first with rg/read_symbol/read_file; do not guess.
 2. Keep edits surgical and focused. Prefer existing files over new files.
 3. Verify before declaring done:
@@ -23,22 +23,22 @@ When changing Wolf itself:
    - `cargo test --release`
    - If `src/tui.rs` changed: `cargo test --release --test tui_smoke -- --nocapture`
 4. Reinstall the interactive binary after code changes: `cargo install --path . --force`.
-   Never skip this; `target/release/wolf` is not what `wolf` on PATH invokes.
+   Never skip this; `target/release/dext` is not what `dext` on PATH invokes.
 5. On Windows, failed install with “Access is denied” usually means another
-   `wolf.exe` is running. Ask the user to close it; do not kill processes.
+   `dext.exe` is running. Ask the user to close it; do not kill processes.
 
 ## Project style
 - No explanatory comments for obvious behavior; names should carry intent.
 - Add comments only for non-obvious why/invariants/platform footguns.
 - No backwards-compat shims for unreleased code.
-- Keep runtime clutter (`.wolf/`, `.pi/`, scratch logs, one-off docs,
+- Keep runtime clutter (`.dext/`, `.pi/`, scratch logs, one-off docs,
   screenshots) ignored or deleted, not committed.
 
 ## Context and memory
-- `WOLF.memory.md` is a compact prompt-facing cache; durable long-form project
-  memory lives in `MEMORY.md` / pi-memory (`--project wolf`).
+- `DEXT.memory.md` is a compact prompt-facing cache; durable long-form project
+  memory lives in `MEMORY.md` / pi-memory (`--project dext`).
 - Log durable decisions/findings to pi-memory, sync `MEMORY.md`, then keep only
-  the distilled prompt-worthy cache in `WOLF.memory.md`.
+  the distilled prompt-worthy cache in `DEXT.memory.md`.
 - Prefer context engineering and memory quality over adding tools. Minimize tool
   duplication and prompt-injected historical detail.
 
@@ -52,4 +52,4 @@ When changing Wolf itself:
 ## Platform notes
 - Windows Git Bash: TUI detection uses stdout terminal status; stdin is read
   only with `-p`.
-- Windows file locks can block build/install while `wolf.exe` is running.
+- Windows file locks can block build/install while `dext.exe` is running.

@@ -4,13 +4,13 @@
 /nul
 
 # Runtime/project state
-/.wolf/
+/.dext/
 /.pi/
-/wolf-session-*.jsonl
-/wolf-session-*.html
+/dext-session-*.jsonl
+/dext-session-*.html
 /semi_stderr.log
 /steering.txt
-/WOLF.todo.json
+/DEXT.todo.json
 
 # Scratch files, docs, screenshots, and local session copies
 /htmk
@@ -22,6 +22,6 @@
 /docs/improve*.md
 /docs/Improve*.md
 /docs/tui-markdown-migration.md
-/docs/wolf-review-and-improvements.md
+/docs/dext-review-and-improvements.md
 Screenshot*.jpg
 Screenshot*.png

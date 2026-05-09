@@ -1,8 +1,8 @@
-# Wolf Work Map plan
+# Dext Work Map plan
 
 ## Goal
 
-Build lightweight session navigation around coding work evidence instead of a message tree. Wolf should help the user find, package, and continue from meaningful work moments without exposing tree/leaf concepts or rewriting session storage.
+Build lightweight session navigation around coding work evidence instead of a message tree. Dext should help the user find, package, and continue from meaningful work moments without exposing tree/leaf concepts or rewriting session storage.
 
 ## Product model
 
@@ -16,11 +16,11 @@ JSONL session files remain the source of truth. The map is rebuildable derived s
 
 ## Implementation status
 
-Implemented in the current Wolf tree:
+Implemented in the current Dext tree:
 
 - Sparse deterministic waypoint derivation from session JSONL/current history and work ledger evidence.
 - Map, packet, focus, track, and tracks rendering.
-- CLI commands: `wolf session map|packet|focus|tracks|track open`.
+- CLI commands: `dext session map|packet|focus|tracks|track open`.
 - Slash commands: `/map`, `/packet`, `/focus`, `/track open`, `/tracks`, plus `/sessions` aliases.
 - Text-first TUI composer drawer that inserts editable `/focus`, `/packet`, or `/track open` commands.
 - Additive track sessions with `track_origin` header metadata.
@@ -37,7 +37,7 @@ Implemented in the current Wolf tree:
 **Commands:**
 
 ```text
-wolf session map [latest|NAME|PATH]
+dext session map [latest|NAME|PATH]
 /map [latest|NAME|PATH]
 /sessions map [latest|NAME|PATH]
 ```
@@ -60,8 +60,8 @@ wolf session map [latest|NAME|PATH]
 **Commands:**
 
 ```text
-wolf session packet @w07 [latest|NAME|PATH]
-wolf session packet @w03..@w08 [latest|NAME|PATH]
+dext session packet @w07 [latest|NAME|PATH]
+dext session packet @w03..@w08 [latest|NAME|PATH]
 /packet @w07 [latest|NAME|PATH]
 /packet @w03..@w08 [latest|NAME|PATH]
 /sessions packet @w07 [latest|NAME|PATH]
@@ -89,7 +89,7 @@ wolf session packet @w03..@w08 [latest|NAME|PATH]
 ```text
 /focus @w07 [--exact]
 /focus @w07 --carry failures,decisions,files
-wolf session focus @w07 [latest|NAME|PATH] [--exact]
+dext session focus @w07 [latest|NAME|PATH] [--exact]
 ```
 
 **Default:** carry-forward. Use the selected waypoint plus later relevant lessons, especially failures, decisions, touched files, and verification. Exact replay is opt-in.
@@ -114,15 +114,15 @@ The drawer borrows height from the input panel, is capped to preserve transcript
 
 ### Phase 5 — Tracks
 
-**Makes sense after packets/focus exist.** A track can be a normal named Wolf session seeded with a focus packet and origin metadata. Avoid in-file branching or worktree coupling for the first implementation.
+**Makes sense after packets/focus exist.** A track can be a normal named Dext session seeded with a focus packet and origin metadata. Avoid in-file branching or worktree coupling for the first implementation.
 
 **Commands:**
 
 ```text
 /track open @w07 [name]
 /tracks
-wolf session track open @w07 [name] [latest|NAME|PATH]
-wolf session tracks
+dext session track open @w07 [name] [latest|NAME|PATH]
+dext session tracks
 ```
 
 **Track metadata:**
@@ -174,7 +174,7 @@ A track is resumed like any named session.
 
 ### CLI and slash commands
 
-1. Extend `wolf session` with `map`, `packet`, `focus`, `tracks`, and `track open`.
+1. Extend `dext session` with `map`, `packet`, `focus`, `tracks`, and `track open`.
 2. Add top-level slash aliases: `/map`, `/packet`, `/focus`, `/track`, `/tracks`.
 3. Extend `/sessions` with `map`, `packet`, `focus`, and `tracks`.
 4. Keep CLI commands read-only except `track open`, which writes a named session.
@@ -191,7 +191,7 @@ A track is resumed like any named session.
 
 1. Add unit tests for waypoint extraction, packet rendering, focus safety text, and track-origin serialization.
 2. Run focused tests first.
-3. Run required Wolf checks before declaring done:
+3. Run required Dext checks before declaring done:
    - `cargo build --release`
    - `cargo test --release`
    - if TUI changed: `cargo test --release --test tui_smoke -- --nocapture`

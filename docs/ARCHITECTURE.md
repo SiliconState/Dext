@@ -1,6 +1,6 @@
 # Architecture
 
-Wolf is a Rust terminal agent packaged as one binary. Most behavior is still intentionally local and inspectable: provider requests are built in process, tools are native functions/short-lived child processes, and session state is written as JSONL/log files under Wolf state paths.
+Dext is a Rust terminal agent packaged as one binary. Most behavior is still intentionally local and inspectable: provider requests are built in process, tools are native functions/short-lived child processes, and session state is written as JSONL/log files under Dext state paths.
 
 ## Runtime flow
 
@@ -46,7 +46,7 @@ Wolf is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Turn telemetry.
 
 - `src/session.rs`
-  - `WOLF_HOME`, session, log, and project-state paths.
+  - `DEXT_HOME`, session, log, and project-state paths.
   - Project-scoped locks and stale-lock cleanup.
   - Atomic state writes.
   - Terminal restore helpers used by crash/panic paths.
@@ -57,7 +57,7 @@ Wolf is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 ## Tool model
 
-Wolf exposes a deliberately small native tool set:
+Dext exposes a deliberately small native tool set:
 
 - Filesystem: `read_file`, `read_symbol`, `write_file`, `edit_file`, `multi_edit`.
 - Search: `fd`, `rg`, `fzf`.
@@ -71,19 +71,19 @@ Lean schemas are the default to reduce prompt cost. Full schemas are available w
 
 ## Sessions and state
 
-Wolf distinguishes project files from runtime state:
+Dext distinguishes project files from runtime state:
 
 - Project files live in the Git repository.
-- State defaults to `~/.wolf` or `WOLF_HOME`.
+- State defaults to `~/.dext` or `DEXT_HOME`.
 - Project latest sessions/logs are scoped by a stable project key.
-- Named sessions can be stored under `WOLF_SESSIONS_DIR`.
-- Session exports (`wolf-session-*.jsonl`, `wolf-session-*.html`) are ignored by Git.
+- Named sessions can be stored under `DEXT_SESSIONS_DIR`.
+- Session exports (`dext-session-*.jsonl`, `dext-session-*.html`) are ignored by Git.
 
 Session JSONL files include header provenance, exposed tools, approval/sandbox context, provider health, ledger entries, and message history. They may contain sensitive prompts or tool output; do not publish them blindly.
 
 ## Safety model
 
-Wolf has three safety layers:
+Dext has three safety layers:
 
 1. Tool validation rejects malformed calls before execution.
 2. Permission profiles decide which privileged tools require approval.
@@ -94,7 +94,7 @@ Profiles:
 - Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`.
 - Sandbox: `read-only`, `workspace-write`, `danger-full-access`.
 
-`--fangs-out` is intentionally explicit danger mode and auto-approves gated tools.
+`--trust` enables trust mode and auto-approves gated tools.
 
 ## Context modes
 
@@ -105,7 +105,7 @@ Compaction preserves recent tool evidence and summarizes older conversation when
 
 ## Verification surface
 
-Expected checks before releasing Wolf changes:
+Expected checks before releasing Dext changes:
 
 ```bash
 cargo fmt
