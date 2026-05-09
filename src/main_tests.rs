@@ -1433,6 +1433,47 @@ fn sync_work_ledger_keeps_only_unresolved_objective_checkpoints_pending() {
 }
 
 #[test]
+fn action_contract_violation_notes_loop_and_fallback_after_repeated_no_mutation() {
+    let root = temp_test_dir("action-contract-noop-notes");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.provider_id = "chatgpt".to_string();
+    agent.model = "gpt-5.3-codex".to_string();
+    let mut fallback_emitted = false;
+
+    let notes = agent.action_contract_violation_runtime_notes(1, &mut fallback_emitted);
+    assert!(!fallback_emitted);
+    assert_eq!(agent.model, "gpt-5.3-codex");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("action contract active")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.contains("mutating tool_use")),
+        "{notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|note| note.contains("git_commit")),
+        "{notes:?}"
+    );
+
+    let notes = agent.action_contract_violation_runtime_notes(2, &mut fallback_emitted);
+    assert!(fallback_emitted);
+    assert_eq!(agent.model, "gpt-5.5");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("switched model to gpt-5.5")),
+        "{notes:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn workflow_diagnostics_render_and_ledger_are_prompt_visible() {
     let report = WorkflowDiagnosticsReport {
         source: "rust-analyzer".to_string(),
@@ -6243,6 +6284,105 @@ fn normalize_chatgpt_model_slug_accepts_compact_aliases() {
 }
 
 #[test]
+fn implementation_model_mitigation_lowers_codex_53_xhigh() {
+    let root = temp_test_dir("codex-53-implementation-effort-mitigation");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.provider_id = "chatgpt".to_string();
+    agent.model = "gpt-5.3-codex".to_string();
+    agent.thinking_effort = ThinkingEffort::XHigh;
+
+    let note = agent
+        .apply_implementation_phase_model_mitigation()
+        .expect("mitigation note");
+    assert_eq!(agent.thinking_effort(), ThinkingEffort::Medium);
+    assert!(note.contains("gpt-5.3-codex"), "{note}");
+
+    agent.thinking_effort = ThinkingEffort::XHigh;
+    agent.model = "gpt-5.5".to_string();
+    assert!(
+        agent
+            .apply_implementation_phase_model_mitigation()
+            .is_none()
+    );
+    assert_eq!(agent.thinking_effort(), ThinkingEffort::XHigh);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn implementation_model_fallback_switches_codex_53_to_55() {
+    let root = temp_test_dir("codex-53-implementation-fallback");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.provider_id = "chatgpt".to_string();
+    agent.model = "gpt-5.3-codex".to_string();
+
+    let mut fallback_emitted = false;
+    let notes = agent.action_contract_violation_runtime_notes(2, &mut fallback_emitted);
+    assert!(fallback_emitted);
+    assert_eq!(agent.model, "gpt-5.5");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("switched model to gpt-5.5")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.contains("mutating tool_use")),
+        "{notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|note| note.contains("git_commit")),
+        "{notes:?}"
+    );
+    assert_eq!(
+        agent
+            .session_model_pins
+            .get(&canonical_provider_id("chatgpt"))
+            .map(String::as_str),
+        Some("gpt-5.5")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pseudo_tool_syntax_detection_marks_plain_text_invalid() {
+    assert!(text_contains_pseudo_tool_syntax(
+        "I will run this now:\nto=functions.edit_file {\"path\":\"src/main.rs\"}"
+    ));
+    assert!(blocks_contain_pseudo_tool_syntax(&[Block::Text {
+        text: "tool call: functions.write_file".to_string(),
+    }]));
+    assert!(!text_contains_pseudo_tool_syntax(
+        "I will use the edit_file tool if needed."
+    ));
+}
+
+#[test]
+fn action_contract_note_requires_mutation_tool_use() {
+    let note = action_contract_runtime_note(2);
+    assert!(note.contains("edit_file|multi_edit|write_file"), "{note}");
+    assert!(!note.contains("git_commit"), "{note}");
+    assert!(
+        note.contains("Text-only blocked statements do not clear"),
+        "{note}"
+    );
+    assert!(assistant_text_has_implementation_commitment(
+        "I will implement this next."
+    ));
+    assert!(assistant_text_has_implementation_commitment(
+        "Applying patch now."
+    ));
+    assert!(!assistant_text_has_implementation_commitment(
+        "I found the root cause."
+    ));
+}
+
+#[test]
 fn anthropic_request_strips_wolf_only_tool_result_metadata() -> Result<()> {
     let root = temp_test_dir("anthropic-strip-tool-metadata");
     let root = std::fs::canonicalize(&root)?;
@@ -6414,7 +6554,7 @@ fn chatgpt_summary_request_body_matches_current_responses_api_expectations() {
 
 #[test]
 fn chatgpt_request_body_maps_xhigh_to_actual_reasoning_effort_and_summary() {
-    // Regression: Codex silently refuses to emit function_call items unless the
+    // Regression: ChatGPT/Codex models silently refuse to emit function_call items unless the
     // request body contains tool_choice, parallel_tool_calls, include (reasoning
     // encrypted_content), text.verbosity, and reasoning.effort.
     let root = temp_test_dir("chatgpt-body-fields");

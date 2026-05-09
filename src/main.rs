@@ -8026,6 +8026,72 @@ impl Agent {
         self.budget_exhausted = false;
     }
 
+    fn note_runtime_model_change(&mut self, model: &str) {
+        self.model = model.to_string();
+        let provider_id = self.provider_id.clone();
+        self.pin_model_for_provider(&provider_id, model);
+        self.refresh_tools_for_context();
+    }
+
+    fn apply_implementation_phase_model_mitigation(&mut self) -> Option<String> {
+        if self.api_provider != ApiProvider::ChatGpt
+            || !self.model.starts_with("gpt-5.3-codex")
+            || self.thinking_effort != ThinkingEffort::XHigh
+        {
+            return None;
+        }
+        self.thinking_effort = ThinkingEffort::Medium;
+        Some("runtime model mitigation: gpt-5.3-codex implementation phase uses medium effort to favor concrete tool calls over analysis narration; keep xhigh for review/debug phases.".to_string())
+    }
+
+    fn maybe_fallback_implementation_model(&mut self) -> Option<String> {
+        if self.api_provider != ApiProvider::ChatGpt || !self.model.starts_with("gpt-5.3-codex") {
+            return None;
+        }
+        self.note_runtime_model_change("gpt-5.5");
+        Some("runtime model fallback: action contract is still unresolved after repeated no-mutation turns; switched model to gpt-5.5 for the next request.".to_string())
+    }
+
+    fn action_contract_violation_runtime_notes(
+        &mut self,
+        no_mutation_turns: u32,
+        fallback_emitted: &mut bool,
+    ) -> Vec<String> {
+        let mut notes = Vec::new();
+        if no_mutation_turns >= 2
+            && !*fallback_emitted
+            && let Some(note) = self.maybe_fallback_implementation_model()
+        {
+            *fallback_emitted = true;
+            notes.push(note);
+        }
+        notes.push(action_contract_runtime_note(no_mutation_turns));
+        notes
+    }
+
+    fn push_runtime_notes(
+        &mut self,
+        notes: Vec<String>,
+        log_event: &str,
+        checkpoint_label: &str,
+    ) -> bool {
+        if notes.is_empty() {
+            return false;
+        }
+        for note in notes {
+            self.sink.emit(AgentEvent::Warn(note.clone()));
+            self.append_latest_log(log_event, &note);
+            self.history.push(Message {
+                role: "user".to_string(),
+                content: vec![Block::Text {
+                    text: format!("[runtime-note] {note}"),
+                }],
+            });
+        }
+        self.checkpoint_latest_session(checkpoint_label);
+        true
+    }
+
     fn update_work_ledger_from_objective(&mut self, objective: &orchestrator::ObjectiveTracker) {
         self.work_ledger.objective = objective.summary.clone();
         self.work_ledger.current_phase = "probe".to_string();
@@ -10167,6 +10233,9 @@ impl Agent {
         let read_cache = self.read_cache.clone();
         let mut objective_warning_emitted = false;
         let mut steering_final_followup_emitted = false;
+        let mut action_contract_must_mutate = false;
+        let mut action_contract_no_mutation_turns: u32 = 0;
+        let mut implementation_fallback_emitted = false;
         let mut last_retry_reason: Option<String> = None;
         let mut workaround_fired_this_turn = false;
 
@@ -10183,6 +10252,12 @@ impl Agent {
                 "[phase:{}] {msg}",
                 turn_state.phase().label()
             )));
+        }
+        if objective.apply_fixes_allowed()
+            && let Some(note) = self.apply_implementation_phase_model_mitigation()
+        {
+            self.sink.emit(AgentEvent::Warn(note.clone()));
+            self.append_latest_log("model_mitigation", &note);
         }
 
         if self.provider_requires_api_key && self.api_key.trim().is_empty() {
@@ -10461,6 +10536,14 @@ impl Agent {
                 self.append_latest_log("budget_cap_reached", &msg);
             }
 
+            let assistant_response_text = assistant_blocks_text(&blocks);
+            let response_has_pseudo_tool = blocks_contain_pseudo_tool_syntax(&blocks);
+            if objective.apply_fixes_allowed()
+                && assistant_text_has_implementation_commitment(&assistant_response_text)
+            {
+                action_contract_must_mutate = true;
+            }
+
             if maybe_preserve_partial_stream(&blocks, &mut self.history) {
                 self.checkpoint_latest_session("after_assistant_message");
             } else {
@@ -10489,6 +10572,36 @@ impl Agent {
                 .collect();
 
             if tool_calls.is_empty() {
+                let coverage = objective.assess_history(&self.history);
+                self.sync_work_ledger_with_objective_coverage(&coverage);
+                if response_has_pseudo_tool {
+                    let note = pseudo_tool_runtime_note();
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("pseudo_tool_text", &note);
+                    self.history.push(Message {
+                        role: "user".to_string(),
+                        content: vec![Block::Text {
+                            text: format!("[runtime-note] {note}"),
+                        }],
+                    });
+                    self.checkpoint_latest_session("after_pseudo_tool_warning");
+                    continue;
+                }
+                if action_contract_must_mutate {
+                    action_contract_no_mutation_turns =
+                        action_contract_no_mutation_turns.saturating_add(1);
+                    let notes = self.action_contract_violation_runtime_notes(
+                        action_contract_no_mutation_turns,
+                        &mut implementation_fallback_emitted,
+                    );
+                    if self.push_runtime_notes(
+                        notes,
+                        "action_contract_violation",
+                        "after_action_contract_warning",
+                    ) {
+                        continue;
+                    }
+                }
                 if self.inject_queued_steering(
                     &mut turn_state,
                     iterations,
@@ -10922,6 +11035,7 @@ impl Agent {
             let mut batch_labels: Vec<String> = Vec::new();
             let mut results = Vec::new();
             let mut round_external_failures: usize = 0;
+            let mut mutation_succeeded = false;
             for (idx, p) in plans.into_iter().enumerate() {
                 let PlannedCall {
                     tool_use_id,
@@ -10976,6 +11090,10 @@ impl Agent {
                 }
 
                 let ok = !is_error.unwrap_or(false);
+                if ok && ran_builtin && ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
+                {
+                    mutation_succeeded = true;
+                }
                 let privacy_redaction = self.privacy.apply_tool_output(&name, &input, content);
                 let redacted_count = privacy_redaction.counts.total();
                 content = privacy_redaction.text;
@@ -11134,6 +11252,25 @@ impl Agent {
                 content: results,
             });
             self.checkpoint_latest_session("after_tool_results");
+
+            if mutation_succeeded {
+                action_contract_must_mutate = false;
+                action_contract_no_mutation_turns = 0;
+            } else if action_contract_must_mutate {
+                action_contract_no_mutation_turns =
+                    action_contract_no_mutation_turns.saturating_add(1);
+                let notes = self.action_contract_violation_runtime_notes(
+                    action_contract_no_mutation_turns,
+                    &mut implementation_fallback_emitted,
+                );
+                if self.push_runtime_notes(
+                    notes,
+                    "action_contract_violation",
+                    "after_action_contract_warning",
+                ) {
+                    continue;
+                }
+            }
 
             if turn_state.should_emit_partial_delivery_hint(round_external_failures) {
                 let hint = orchestrator::partial_delivery_hint().to_string();
@@ -15100,6 +15237,87 @@ fn final_objective_warning(
     } else {
         Some(final_objective_warning_from_coverage(&coverage))
     }
+}
+
+const ACTION_CONTRACT_MUTATING_TOOL_NAMES: &[&str] = &["edit_file", "multi_edit", "write_file"];
+
+fn block_text(block: &Block) -> Option<&str> {
+    match block {
+        Block::Text { text } | Block::PartialStream { text } => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+fn assistant_blocks_text(blocks: &[Block]) -> String {
+    blocks
+        .iter()
+        .filter_map(block_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assistant_text_has_implementation_commitment(text: &str) -> bool {
+    let lower = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    !lower.is_empty()
+        && [
+            "i'll implement",
+            "i will implement",
+            "i’ll implement",
+            "i'll apply",
+            "i will apply",
+            "i’ll apply",
+            "applying patch",
+            "apply the patch",
+            "applying the patch",
+            "making changes now",
+            "make the patch now",
+            "make changes now",
+            "i'll patch",
+            "i will patch",
+            "i’ll patch",
+            "patching now",
+            "editing now",
+            "i'll edit",
+            "i will edit",
+            "i’ll edit",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn text_contains_pseudo_tool_syntax(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        lower.starts_with("to=functions")
+            || lower.starts_with("to = functions")
+            || lower.starts_with("<|tool")
+            || lower.starts_with("tool_use:")
+            || lower.starts_with("tool call:") && lower.contains("functions.")
+            || (lower.contains("to=functions.") || lower.contains("to = functions."))
+    })
+}
+
+fn blocks_contain_pseudo_tool_syntax(blocks: &[Block]) -> bool {
+    blocks
+        .iter()
+        .filter_map(block_text)
+        .any(text_contains_pseudo_tool_syntax)
+}
+
+fn action_contract_runtime_note(no_mutation_turns: u32) -> String {
+    format!(
+        "runtime guidance: action contract active because the assistant committed to implement/apply changes. This is invalid progress after {no_mutation_turns} assistant response(s) without a successful file mutation. Keep looping; next assistant message must use a real mutating tool_use ({}). Text-only blocked statements do not clear this contract.",
+        ACTION_CONTRACT_MUTATING_TOOL_NAMES.join("|")
+    )
+}
+
+fn pseudo_tool_runtime_note() -> String {
+    "runtime guidance: pseudo-tool syntax emitted as plain text is invalid progress. Use an actual provider tool_use block, or state a concise blocked reason if no tool can run.".to_string()
 }
 
 fn final_objective_warning_from_coverage(coverage: &orchestrator::ObjectiveCoverage) -> String {

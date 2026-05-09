@@ -304,6 +304,7 @@ pub(crate) struct ObjectiveCoverage {
 struct ObjectiveEvidence {
     assistant_text_raw: String,
     assistant_text: String,
+    final_assistant_text_raw: String,
     tool_names: HashSet<String>,
     bash_commands: Vec<String>,
     touched_paths: Vec<String>,
@@ -452,26 +453,26 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
     let mut evidence = ObjectiveEvidence::default();
 
     for msg in history {
+        let mut assistant_text_for_message = String::new();
         for block in &msg.content {
             match block {
                 crate::Block::Text { text } if msg.role == "assistant" => {
                     evidence.assistant_text_raw.push_str(text);
                     evidence.assistant_text_raw.push('\n');
+                    assistant_text_for_message.push_str(text);
+                    assistant_text_for_message.push('\n');
                 }
                 crate::Block::ToolUse { name, input, .. } => {
                     evidence.tool_names.insert(name.clone());
                     match name.as_str() {
-                        "edit_file" | "multi_edit" => {
+                        "edit_file" | "multi_edit" | "write_file" => {
                             evidence.change_count += 1;
                             if let Some(path) = input["path"].as_str() {
                                 evidence.touched_paths.push(path.to_string());
                             }
                         }
-                        "write_file" => {
+                        "git_commit" => {
                             evidence.change_count += 1;
-                            if let Some(path) = input["path"].as_str() {
-                                evidence.touched_paths.push(path.to_string());
-                            }
                         }
                         "bash" => {
                             if let Some(cmd) = input["command"].as_str() {
@@ -487,6 +488,9 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
                 }
                 _ => {}
             }
+        }
+        if msg.role == "assistant" {
+            evidence.final_assistant_text_raw = assistant_text_for_message;
         }
     }
 
@@ -535,17 +539,7 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
         }
         "implement requested changes" => {
             evidence.change_count > 0
-                || contains_any(
-                    &evidence.assistant_text,
-                    &[
-                        "implemented",
-                        "updated",
-                        "changed",
-                        "fixed",
-                        "patched",
-                        "added",
-                    ],
-                )
+                || assistant_text_has_blocked_reason(&evidence.final_assistant_text_raw)
         }
         "run verification checks" => {
             commands_contain(
@@ -603,6 +597,28 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
         }
         _ => false,
     }
+}
+
+fn assistant_text_has_blocked_reason(text: &str) -> bool {
+    let normalized = normalize_token(text);
+    !normalized.is_empty()
+        && contains_any(
+            &normalized,
+            &[
+                "blocked",
+                "cannot",
+                "can't",
+                "unable",
+                "not allowed",
+                "permission denied",
+                "need credentials",
+                "missing credentials",
+                "requires clarification",
+                "need clarification",
+                "no changes needed",
+                "not applicable",
+            ],
+        )
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -1193,7 +1209,7 @@ mod tests {
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::Text {
-                    text: "Implemented the fix, verified it with cargo test, and documented the follow-up notes.".to_string(),
+                    text: "Changed code, verified it with cargo test, and documented the follow-up notes.".to_string(),
                 }],
             },
         ];
@@ -1202,6 +1218,42 @@ mod tests {
         assert!(coverage.unresolved.is_empty(), "{:?}", coverage);
         assert_eq!(coverage.satisfied.len(), tracker.checkpoints.len());
         assert!(objective_runtime_reminder(&tracker, &history).is_none());
+    }
+
+    #[test]
+    fn implementation_checkpoint_requires_mutation_or_blocked_reason() {
+        let tracker = ObjectiveTracker::from_user_prompt("Implement the requested fix");
+        let text_only_history = vec![crate::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::Block::Text {
+                text: "Implemented the requested change.".to_string(),
+            }],
+        }];
+        let coverage = tracker.assess_history(&text_only_history);
+        assert!(
+            coverage
+                .unresolved
+                .iter()
+                .any(|item| item == "implement requested changes"),
+            "{:?}",
+            coverage
+        );
+
+        let blocked_history = vec![crate::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::Block::Text {
+                text: "Blocked: I need clarification before changing code.".to_string(),
+            }],
+        }];
+        let coverage = tracker.assess_history(&blocked_history);
+        assert!(
+            coverage
+                .satisfied
+                .iter()
+                .any(|item| item == "implement requested changes"),
+            "{:?}",
+            coverage
+        );
     }
 
     #[test]
