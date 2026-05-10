@@ -61,10 +61,14 @@ curated.
 - Prefer Dext's built-in reqwest-backed `http` tool before shelling to curl/xh.
 - Use proper OAuth/web flows; do not copy Pi auth credentials manually.
 - Prefer live/thinking/scroll progress above the input box only.
-- Agent browser is allowed when useful for browser automation.
+- Agent browser is allowed when useful for browser automation or web surfing.
 - Keep repo source-first and reviewable; avoid runtime clutter.
 - Prefer simple, flowing one-word names where possible; avoid compound or
-  overqualified names when a clear single word works.
+  overqualified names when a clear single word works. Never use `name.name.ext`;
+  prefer `hooks.json` over `DEXT.hooks.json`.
+- Packs should be user-scoped and buildable/scaffoldable by Dext on demand for
+  any project; keep packs separate from Dext core and avoid provider-visible
+  tool bloat.
 - For ambiguous cleanup asks, ask once max; if unresolved, default to reversible `git stash` and verify.
 
 ## Current focus

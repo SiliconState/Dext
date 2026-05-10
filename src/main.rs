@@ -6594,7 +6594,7 @@ impl Hooks {
     fn load(root: &Path) -> Self {
         let path = std::env::var("DEXT_HOOKS_FILE")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| root.join("DEXT.hooks.json"));
+            .unwrap_or_else(|_| root.join("hooks.json"));
         match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
                 eprintln!("[hooks] parse error in {}: {e}", path.display());

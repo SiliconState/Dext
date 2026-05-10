@@ -3655,6 +3655,23 @@ fn slash_subagent_command_usage_is_registered() {
 }
 
 #[test]
+fn hooks_loads_project_hooks_json_by_default() {
+    let root = temp_test_dir("hooks-json-default");
+    std::fs::write(
+        root.join("hooks.json"),
+        r#"{"user_prompt":[{"command":"printf pack"}]}"#,
+    )
+    .expect("write hooks.json");
+
+    let hooks = Hooks::load(&root);
+    let out = hooks.fire("user_prompt", "", &[], &root);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].0.contains("pack"), "{}", out[0].0);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn hooks_capture_is_capped() {
     let root = temp_test_dir("hook-cap");
     let hooks = Hooks {
