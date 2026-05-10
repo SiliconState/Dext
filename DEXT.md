@@ -35,10 +35,10 @@ When changing Dext itself:
   screenshots) ignored or deleted, not committed.
 
 ## Context and memory
-- `DEXT.memory.md` is a compact prompt-facing cache; durable long-form project
+- `recall.md` is a compact prompt-facing recall cache; durable long-form
   memory lives in `MEMORY.md` / pi-memory (`--project dext`).
 - Log durable decisions/findings to pi-memory, sync `MEMORY.md`, then keep only
-  the distilled prompt-worthy cache in `DEXT.memory.md`.
+  the distilled prompt-worthy cache in `recall.md`.
 - Prefer context engineering and memory quality over adding tools. Minimize tool
   duplication and prompt-injected historical detail.
 

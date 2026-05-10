@@ -6419,8 +6419,8 @@ Runtime:
 Project state:
 - For nontrivial or ongoing project work, run todo_read first and use todo_write to track a concise plan/status.
 - Skip todo tools for trivial, single-turn, or mechanical benchmark tasks unless the user asks for planning/status.
-- Treat injected DEXT.md / DEXT.memory.md as project guidance; reread files only when exact current text matters.
-- Update DEXT.memory.md only for durable decisions, preferences, in-progress work, or open questions.
+- Treat injected DEXT.md / recall.md as project guidance; reread files only when exact current text matters.
+- Update recall.md only for durable decisions, preferences, in-progress work, or open questions.
 - Keep DEXT.md concise and update it only for durable project guidance.
 
 Discovery and reading:
@@ -6811,7 +6811,8 @@ struct SessionProvenance {
     sandbox_profile: SandboxProfile,
     system_prompt_hash: String,
     dext_md_hash: Option<String>,
-    dext_memory_hash: Option<String>,
+    #[serde(default, alias = "dext_memory_hash")]
+    recall_hash: Option<String>,
     tool_catalog_version: u32,
     prompt_sources: Vec<String>,
 }
@@ -8406,10 +8407,10 @@ impl Agent {
             }
         }
 
-        let mut memory_sections: Vec<(String, String)> = Vec::new();
+        let mut recall_sections: Vec<(String, String)> = Vec::new();
         let mut dir = self.sandbox_root.as_path();
         loop {
-            let candidate = dir.join("DEXT.memory.md");
+            let candidate = dir.join("recall.md");
             if candidate.exists()
                 && let Ok(content) = std::fs::read_to_string(&candidate)
             {
@@ -8424,7 +8425,7 @@ impl Agent {
                     } else {
                         format!("/{display}")
                     };
-                    memory_sections.push((label, trimmed.to_string()));
+                    recall_sections.push((label, trimmed.to_string()));
                 }
             }
             match dir.parent() {
@@ -8432,15 +8433,12 @@ impl Agent {
                 _ => break,
             }
         }
-        memory_sections.reverse();
-        for (label, content) in &memory_sections {
+        recall_sections.reverse();
+        for (label, content) in &recall_sections {
             if context_budget == 0 {
                 break;
             }
-            let section = format!(
-                "\n\n## Persistent memory (DEXT.memory.md from {label})\n{}",
-                content
-            );
+            let section = format!("\n\n## Recall (recall.md from {label})\n{}", content);
             if section.len() <= context_budget {
                 stable.push_str(&section);
                 context_budget -= section.len();
@@ -8448,10 +8446,10 @@ impl Agent {
                 let remaining = cap_bytes_with_hint(
                     content.clone(),
                     context_budget.saturating_sub(60),
-                    "DEXT.memory.md truncated; keep durable facts concise.",
+                    "recall.md truncated; keep durable facts concise.",
                 );
                 stable.push_str(&format!(
-                    "\n\n## Persistent memory (DEXT.memory.md from {label})\n{remaining}"
+                    "\n\n## Recall (recall.md from {label})\n{remaining}"
                 ));
                 break;
             }
@@ -9189,13 +9187,13 @@ impl Agent {
     fn session_provenance(&self) -> SessionProvenance {
         let mut prompt_sources = Vec::new();
         let dext_md = self.sandbox_root.join("DEXT.md");
-        let dext_memory = self.sandbox_root.join("DEXT.memory.md");
+        let recall_md = self.sandbox_root.join("recall.md");
         let dext_md_hash = std::fs::read(&dext_md).ok().map(|bytes| {
             prompt_sources.push(dext_md.display().to_string());
             sha256_hex_bytes(&bytes)
         });
-        let dext_memory_hash = std::fs::read(&dext_memory).ok().map(|bytes| {
-            prompt_sources.push(dext_memory.display().to_string());
+        let recall_hash = std::fs::read(&recall_md).ok().map(|bytes| {
+            prompt_sources.push(recall_md.display().to_string());
             sha256_hex_bytes(&bytes)
         });
         SessionProvenance {
@@ -9209,7 +9207,7 @@ impl Agent {
             sandbox_profile: self.sandbox_profile,
             system_prompt_hash: sha256_hex_str(&self.compose_system_parts().0),
             dext_md_hash,
-            dext_memory_hash,
+            recall_hash,
             tool_catalog_version: TOOL_CATALOG_VERSION,
             prompt_sources,
         }

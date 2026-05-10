@@ -591,6 +591,7 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                         "logged",
                         "recorded",
                         "memory.md",
+                        "recall.md",
                         "pending",
                         "follow-up",
                         "dext.md",
@@ -646,6 +647,7 @@ fn commands_contain(commands: &[String], needles: &[&str]) -> bool {
 
 fn is_decision_log_path(path: &str) -> bool {
     path.ends_with("MEMORY.md")
+        || path.ends_with("recall.md")
         || path.ends_with("DEXT.md")
         || path.ends_with(".pi/pending.jsonl")
         || path.ends_with("autoresearch.ideas.md")

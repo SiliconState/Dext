@@ -3331,6 +3331,28 @@ fn transcript_summary_is_capped() {
 }
 
 #[test]
+fn provenance_aliases_legacy_dext_memory_hash_to_recall_hash() {
+    let original = SessionProvenance {
+        recall_hash: Some("abc123".to_string()),
+        ..Default::default()
+    };
+    let serialized = serde_json::to_string(&original).expect("serialize provenance");
+    assert!(serialized.contains("recall_hash"), "{serialized}");
+    assert!(!serialized.contains("dext_memory_hash"), "{serialized}");
+
+    let mut legacy = serde_json::to_value(&original).expect("serialize legacy provenance");
+    let legacy_object = legacy.as_object_mut().expect("provenance object");
+    let hash = legacy_object
+        .remove("recall_hash")
+        .expect("recall hash field");
+    legacy_object.insert("dext_memory_hash".to_string(), hash);
+
+    let parsed: SessionProvenance =
+        serde_json::from_value(legacy).expect("parse legacy provenance");
+    assert_eq!(parsed.recall_hash.as_deref(), Some("abc123"));
+}
+
+#[test]
 fn session_analysis_surfaces_provenance_and_verification() {
     let header = SessionHeader {
         version: SESSION_FORMAT_VERSION,
@@ -3729,21 +3751,18 @@ fn default_tool_profile_is_lean_for_prompt_budget() {
 }
 
 #[test]
-fn compose_system_parts_includes_dext_memory_md() {
-    let root = temp_test_dir("dext-memory-md");
+fn compose_system_parts_includes_recall_md() {
+    let root = temp_test_dir("recall-md");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     std::fs::write(
-        root.join("DEXT.memory.md"),
+        root.join("recall.md"),
         "## Decisions\n- keep tool evidence concise",
     )
-    .expect("write DEXT.memory.md");
+    .expect("write recall.md");
 
     let agent = test_agent(&root);
     let (stable, _env) = agent.compose_system_parts();
-    assert!(
-        stable.contains("Persistent memory (DEXT.memory.md"),
-        "{stable}"
-    );
+    assert!(stable.contains("Recall (recall.md"), "{stable}");
     assert!(stable.contains("keep tool evidence concise"), "{stable}");
 
     let _ = std::fs::remove_dir_all(&root);

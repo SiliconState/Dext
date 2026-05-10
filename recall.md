@@ -1,8 +1,9 @@
-# DEXT persistent memory
+# Dext recall
 
-Prompt-facing cache only. Durable project memory lives in `MEMORY.md`, synced
-through the external pi-memory tool with `--project dext`. pi-memory is not part
-of Dext; Dext or any agent can use it. Keep this file compact and curated.
+Compact prompt-facing recall only. Durable project memory lives in `MEMORY.md`,
+synced through the external pi-memory tool with `--project dext`. pi-memory is
+not part of Dext; Dext or any agent can use it. Keep this file compact and
+curated.
 
 ## Workflow
 - Query `MEMORY.md` / pi-memory for durable history before major decisions.
@@ -18,8 +19,8 @@ of Dext; Dext or any agent can use it. Keep this file compact and curated.
   default effort.
 - Standard prompts should also stay budget-conscious: compact system sections,
   capped runtime ledger/provider health, and minimal prompt-facing memory.
-- `MEMORY.md` + pi-memory are the long-form source of truth;
-  `DEXT.memory.md` is only the compact cache.
+- `MEMORY.md` + pi-memory are the long-form source of truth; `recall.md` is
+  only the compact prompt-facing cache.
 - Eval supports outcome-oriented assertions on files and command output.
 - `codex` canonicalizes to `chatgpt`; ChatGPT/Codex share one OAuth-backed
   provider path. Model selection pins the selected model for the current
@@ -62,6 +63,8 @@ of Dext; Dext or any agent can use it. Keep this file compact and curated.
 - Prefer live/thinking/scroll progress above the input box only.
 - Agent browser is allowed when useful for browser automation.
 - Keep repo source-first and reviewable; avoid runtime clutter.
+- Prefer simple, flowing one-word names where possible; avoid compound or
+  overqualified names when a clear single word works.
 - For ambiguous cleanup asks, ask once max; if unresolved, default to reversible `git stash` and verify.
 
 ## Current focus
