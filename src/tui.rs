@@ -43,6 +43,7 @@ const WORK_MAP_DRAWER_MAX_ROWS: usize = 10;
 const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 8;
 const WORK_MAP_DRAWER_MIN_EDITOR_ROWS: usize = 1;
 const THINKING_BG: Color = Color::Indexed(235);
+const STEERING_BG: Color = Color::Indexed(237);
 const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -881,7 +882,14 @@ impl TuiState {
         if matches!(line, Line_::Thinking(_)) && self.last_line_is_tool() {
             self.pending_insert.push(Line_::Blank);
         }
+        if matches!(line, Line_::Steering(_)) && !self.pending_insert.ends_with(&[Line_::Blank]) {
+            self.pending_insert.push(Line_::Blank);
+        }
+        let is_steering = matches!(line, Line_::Steering(_));
         self.pending_insert.push(line);
+        if is_steering {
+            self.pending_insert.push(Line_::Blank);
+        }
     }
 
     fn last_line_is_completed_thinking(&self) -> bool {
@@ -2364,8 +2372,9 @@ fn mark_retry_cycles(items: &mut [Line_]) {
                 continue;
             }
             if let Some(ref failed_cmd) = failed_cmd_summary {
-                let is_edit_to_failed_file = matches!(name.as_str(), "edit_file" | "multi_edit")
-                    && files_in_error.iter().any(|f| summary.contains(f));
+                let is_edit_to_failed_file =
+                    matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
+                        && files_in_error.iter().any(|f| summary.contains(f));
                 let is_same_command = *name == "bash"
                     && summary.contains(failed_cmd.split_once(": ").map(|(_, c)| c).unwrap_or(""));
                 if is_edit_to_failed_file || is_same_command {
@@ -2389,7 +2398,7 @@ fn grouped_tool_summary(
     group_chunks: &[ToolChunk],
 ) -> String {
     let is_read = matches!(name, "read_file" | "rg" | "fd");
-    let is_edit = matches!(name, "edit_file" | "multi_edit");
+    let is_edit = matches!(name, "write_file" | "edit_file" | "multi_edit");
 
     let paths: Vec<String> = group_chunks
         .iter()
@@ -4153,7 +4162,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 let content_lines = content.lines().count();
                 let result_tag = match name.as_str() {
                     "read_file" | "rg" | "fd" => format!(" ({} lines)", content_lines),
-                    "edit_file" | "multi_edit" => {
+                    "write_file" | "edit_file" | "multi_edit" => {
                         let (added, removed) = count_diff_stats(content);
                         let hunks = content.lines().filter(|l| l.starts_with("@@")).count();
                         let mut tag = String::new();
@@ -4214,8 +4223,9 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 width,
             );
 
-            let is_edit = matches!(name.as_str(), "edit_file" | "multi_edit");
-            if is_edit
+            let is_mutating_diff =
+                matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit");
+            if is_mutating_diff
                 && !grouped
                 && let Some(path) = extract_path_from_summary(summary)
             {
@@ -4224,7 +4234,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                     Span::styled(short_path(&path), Style::default().fg(Color::DarkGray)),
                 ]));
             }
-            if is_edit && matches!(ok, Some(true)) && !content.is_empty() && !grouped {
+            if is_mutating_diff && matches!(ok, Some(true)) && !content.is_empty() && !grouped {
                 let funcs = extract_hunk_function_names(content);
                 for func in funcs.iter().take(2) {
                     lines.push(Line::from(vec![
@@ -4239,7 +4249,6 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 }
             }
 
-            let is_edit = matches!(name.as_str(), "edit_file" | "multi_edit");
             if grouped {
                 let repeated_note = if repeated_read_dim {
                     " · repeated read dimmed"
@@ -4267,7 +4276,10 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                     "  Ctrl+O collapse",
                     Style::default().fg(Color::DarkGray),
                 )));
-            } else if is_edit && matches!(ok, Some(true) | Some(false)) && !content.is_empty() {
+            } else if is_mutating_diff
+                && matches!(ok, Some(true) | Some(false))
+                && !content.is_empty()
+            {
                 let remaining = push_diff_preview(&mut lines, content, 8, width);
                 if remaining > 0 {
                     lines.push(Line::from(vec![Span::styled(
@@ -4510,15 +4522,19 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
         }
         Line_::Steering(s) => {
             let sanitized = sanitize_display_text(s);
-            lines.push(Line::from(vec![
-                Span::styled(">> ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    sanitized,
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]));
+            let body_style = Style::default()
+                .fg(Color::LightMagenta)
+                .bg(STEERING_BG)
+                .add_modifier(Modifier::ITALIC);
+            let border_style = Style::default().fg(Color::Indexed(177)).bg(STEERING_BG);
+            push_prefixed_wrapped_line(
+                &mut lines,
+                ">> ",
+                border_style,
+                &sanitized,
+                body_style,
+                width,
+            );
         }
         Line_::SteeringDelivered { messages, preview } => {
             let noun = if *messages == 1 {
@@ -4737,7 +4753,7 @@ fn render_tool_content_body(
     } else {
         strip_content_line_numbers(content)
     };
-    if matches!(name, "edit_file" | "multi_edit") {
+    if matches!(name, "write_file" | "edit_file" | "multi_edit") {
         let remaining = push_diff_preview(lines, &stripped, max_diff_lines, width);
         let _ = remaining;
     } else if looks_like_markdownish_tool_content(name, &stripped) {
@@ -4884,6 +4900,7 @@ fn insert_transcript_item<B: Backend>(
     let (text, height) = cached_transcript_render(state, item, width);
     let tint_bg = match item {
         Line_::Thinking(_) => Some(THINKING_BG),
+        Line_::Steering(_) => Some(STEERING_BG),
         _ => next_transcript_tint(item, tool_tint_parity),
     };
     terminal.insert_before(height, |buf| {
@@ -7178,6 +7195,26 @@ mod tests {
     }
 
     #[test]
+    fn steering_history_has_distinct_highlight_and_lane() {
+        let text = line_to_text(
+            &Line_::Steering("wolf = dext my bad. old names.".to_string()),
+            80,
+        );
+        let lines = flatten_lines(&text);
+        let body_style = span_style_for(&text, "wolf = dext").expect("steering body");
+        let prefix_style = span_style_for(&text, ">>").expect("steering prefix");
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some(">> wolf = dext my bad. old names.")
+        );
+        assert_eq!(body_style.bg, Some(STEERING_BG));
+        assert_eq!(prefix_style.bg, Some(STEERING_BG));
+        assert_ne!(body_style.bg, Some(THINKING_BG));
+        assert_eq!(body_style.fg, Some(Color::LightMagenta));
+    }
+
+    #[test]
     fn thinking_body_wraps_on_word_boundaries_with_stable_lane_prefix() {
         let text = line_to_text(
             &Line_::Thinking("I need to keep working on fixing Clippy. It seems like I should read the SessionHeader struct and check its default nested provenance. I might be able to patch it directly, but I should inspect the imports too.".to_string()),
@@ -7523,6 +7560,24 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("-old")));
         assert!(lines.iter().any(|line| line.contains("+new")));
         assert!(!lines.iter().any(|line| line.contains("+++ b/src/tui.rs")));
+    }
+
+    #[test]
+    fn write_tool_renders_path_chip_and_colored_diff_preview() {
+        let item = tool_line(
+            "#1.3w",
+            "write_file",
+            "write_file: src/new.rs (32 bytes)",
+            Some(true),
+            "@@ -0,0 +1,2 @@\n+fn main() {}\n+// done\n",
+        );
+        let text = line_to_text(&item, 120);
+        let lines = flatten_lines(&text);
+
+        assert!(lines.iter().any(|line| line.contains("↳ new.rs")));
+        assert!(lines.iter().any(|line| line.contains("+fn main() {}")));
+        let added_style = span_style_for(&text, "+fn main() {}").expect("added line span");
+        assert_eq!(added_style.fg, Some(Color::Green));
     }
 
     #[test]
@@ -8150,7 +8205,10 @@ mod tests {
             assert!(submit_rx.try_recv().is_err());
             assert!(state.input.is_empty());
             assert_eq!(state.status, "queued for next safe boundary");
-            assert!(matches!(state.pending_insert.last(), Some(Line_::Steering(s)) if s == input));
+            assert!(matches!(
+                state.pending_insert.as_slice(),
+                [Line_::Blank, Line_::Steering(s), Line_::Blank] if s == input
+            ));
         }
     }
 

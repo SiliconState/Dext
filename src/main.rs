@@ -3122,6 +3122,26 @@ fn edit_result_with_diff(
     } else {
         format!("applied {count} edits to {}", path.display())
     };
+    result_with_diff(summary, path, root, before, after)
+}
+
+fn write_file_result_with_diff(
+    path: &Path,
+    root: &Path,
+    before: Option<&str>,
+    after: &str,
+) -> String {
+    let summary = format!("wrote {} bytes to {}", after.len(), path.display());
+    result_with_diff(summary, path, root, before.unwrap_or(""), after)
+}
+
+fn result_with_diff(
+    summary: String,
+    path: &Path,
+    root: &Path,
+    before: &str,
+    after: &str,
+) -> String {
     match git_unified_diff(before, after, path, root) {
         Some(diff) if !diff.is_empty() => format!("{diff}{summary}"),
         _ => summary,
@@ -5766,16 +5786,22 @@ fn execute_tool_with_cache(
             let path_str = input["path"].as_str().ok_or("missing path")?;
             let content = input["content"].as_str().ok_or("missing content")?;
             let path = canonical_within(root, path_str)?;
+            let before = match std::fs::read_to_string(&path) {
+                Ok(existing) => Some(existing),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("failed to read existing file for preview: {e}")),
+            };
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
                 std::fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
             }
             std::fs::write(&path, content).map_err(|e| format!("{e}"))?;
-            Ok(format!(
-                "wrote {} bytes to {}",
-                content.len(),
-                path.display()
+            Ok(write_file_result_with_diff(
+                &path,
+                root,
+                before.as_deref(),
+                content,
             ))
         }
         "edit_file" => {
@@ -11090,6 +11116,7 @@ impl Agent {
                 if ok && ran_builtin && ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
                 {
                     mutation_succeeded = true;
+                    turn_state.mark_mutation_succeeded();
                 }
                 let privacy_redaction = self.privacy.apply_tool_output(&name, &input, content);
                 let redacted_count = privacy_redaction.counts.total();

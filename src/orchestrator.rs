@@ -99,7 +99,8 @@ pub(crate) struct TurnRuntimeState {
     host_auth_failures: HashMap<String, usize>,
     host_probe_passed: HashSet<String>,
     external_result_cache: HashMap<String, (String, Option<bool>)>,
-    bash_attempt_history: Vec<(String, bool)>,
+    bash_attempt_history: Vec<(String, bool, u64)>,
+    mutation_epoch: u64,
     telemetry: ExternalTelemetry,
 }
 
@@ -114,6 +115,7 @@ impl Default for TurnRuntimeState {
             host_probe_passed: HashSet::new(),
             external_result_cache: HashMap::new(),
             bash_attempt_history: Vec::new(),
+            mutation_epoch: 0,
             telemetry: ExternalTelemetry::default(),
         }
     }
@@ -152,6 +154,10 @@ impl TurnRuntimeState {
         hit
     }
 
+    pub(crate) fn mark_mutation_succeeded(&mut self) {
+        self.mutation_epoch = self.mutation_epoch.saturating_add(1);
+    }
+
     pub(crate) fn bash_similarity_guard(
         &mut self,
         bash_similarity_key: Option<&str>,
@@ -164,7 +170,9 @@ impl TurnRuntimeState {
         let similar_unproductive = self
             .bash_attempt_history
             .iter()
-            .filter(|(seen_key, productive)| !*productive && commands_similar(sim_key, seen_key))
+            .filter(|(seen_key, productive, epoch)| {
+                !*productive && *epoch == self.mutation_epoch && commands_similar(sim_key, seen_key)
+            })
             .count();
         if similar_unproductive >= 3 {
             self.telemetry.similarity_blocks = self.telemetry.similarity_blocks.saturating_add(1);
@@ -268,7 +276,7 @@ impl TurnRuntimeState {
                         .command
                         .is_some_and(is_safe_repeated_validation_command));
             self.bash_attempt_history
-                .push((sim_key.to_string(), productive));
+                .push((sim_key.to_string(), productive, self.mutation_epoch));
             if self.bash_attempt_history.len() > 64 {
                 self.bash_attempt_history.remove(0);
             }
@@ -831,17 +839,35 @@ pub(crate) fn is_safe_repeated_validation_command(command: &str) -> bool {
     matches!(
         normalized,
         "git status --short" | "git diff --check" | "cargo fmt --check"
-    ) || normalized.starts_with("cargo test ")
-        || normalized == "cargo test"
+    ) || [
+        "cargo test",
+        "cargo nextest",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "cargo install",
+    ]
+    .iter()
+    .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
+}
+
+fn primary_bash_similarity_line(command: &str) -> &str {
+    command
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with("set "))
+        .or_else(|| {
+            command
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+        })
+        .or_else(|| command.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or(command)
 }
 
 pub(crate) fn normalize_bash_similarity_key(command: &str) -> String {
-    let primary = command
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .or_else(|| command.lines().map(str::trim).find(|line| !line.is_empty()))
-        .unwrap_or(command);
+    let primary = primary_bash_similarity_line(command);
 
     let tokens: Vec<String> = primary
         .split_whitespace()
@@ -1512,11 +1538,45 @@ mod tests {
                 is_error: Some(false),
             });
         }
+
         assert!(
             validation_state
                 .bash_similarity_guard(Some("git diff --check"), Some("git diff --check"))
                 .is_none(),
             "safe validation reruns should not trigger similarity guard"
+        );
+
+        let mut stale_failure_state = TurnRuntimeState::new();
+        for _ in 0..3 {
+            let mut output = "exit: 101\nlinker failed".to_string();
+            stale_failure_state.record_external_outcome(ExternalOutcomeInput {
+                tool_name: "bash",
+                hosts: &[],
+                cache_key: None,
+                bash_similarity_key: Some("set -euo pipefail cargo test --release"),
+                command: Some("./verify-release.sh"),
+                content: &mut output,
+                is_error: Some(true),
+            });
+        }
+        assert!(
+            stale_failure_state
+                .bash_similarity_guard(
+                    Some("set -euo pipefail cargo test --release"),
+                    Some("./verify-release.sh")
+                )
+                .is_some(),
+            "repeated stale failures are blocked before edits"
+        );
+        stale_failure_state.mark_mutation_succeeded();
+        assert!(
+            stale_failure_state
+                .bash_similarity_guard(
+                    Some("set -euo pipefail cargo test --release"),
+                    Some("./verify-release.sh")
+                )
+                .is_none(),
+            "file mutations should reset stale failed cargo-test similarity history"
         );
 
         let cached = state
@@ -1687,6 +1747,15 @@ mod tests {
         let b = normalize_bash_similarity_key(
             "# retry with mirror\ncurl -s https://api.two.example.com/v1/items | jq '.items[] | .id'",
         );
+        let cargo =
+            normalize_bash_similarity_key("set -euo pipefail\ncargo test --release --quiet");
+        assert_eq!(cargo, "cargo test --release --quiet");
+        assert!(is_safe_repeated_validation_command(
+            "set -euo pipefail\ncargo build --release"
+        ));
+        assert!(is_safe_repeated_validation_command(
+            "set -euo pipefail\ncargo install --path . --force"
+        ));
         assert!(
             commands_similar(&a, &b),
             "expected near-duplicate bash fallback commands to be similar"

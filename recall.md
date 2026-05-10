@@ -52,6 +52,7 @@ curated.
 - Usage displays should split actual non-cached input from cache reads/writes;
   TUI status keeps the cached marker visible after first usage even when zero.
   Context pressure may still include cache because providers count it in request context.
+- User may say Wolf/wolf when referring to Dext; treat it as the old Dext name.
 
 ## User preferences
 - Favor context engineering and memory quality over adding more tools.
@@ -68,7 +69,8 @@ curated.
   prefer `hooks.json` over `DEXT.hooks.json`.
 - Packs should be user-scoped and buildable/scaffoldable by Dext on demand for
   any project; keep packs separate from Dext core and avoid provider-visible
-  tool bloat.
+  tool bloat. Pack hook templates should use `phooks.json` so they do not
+  collide with a project's active `hooks.json`.
 - For ambiguous cleanup asks, ask once max; if unresolved, default to reversible `git stash` and verify.
 
 ## Current focus

@@ -4852,6 +4852,29 @@ fn git_log_tool_builds_correct_args() {
 }
 
 #[test]
+fn write_file_returns_diff_preview_and_summary() {
+    let root = temp_test_dir("write-file-diff");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    let out = execute_tool(
+        "write_file",
+        &json!({"path": "note.txt", "content": "hello\nworld\n"}),
+        &root,
+    )
+    .expect("write_file should succeed");
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).unwrap(),
+        "hello\nworld\n"
+    );
+    assert!(out.contains("@@"), "{out}");
+    assert!(out.contains("+hello"), "{out}");
+    assert!(out.contains("+world"), "{out}");
+    assert!(out.contains("wrote 12 bytes to"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn edit_file_returns_diff_and_summary() {
     let root = temp_test_dir("edit-file-diff");
     let root = std::fs::canonicalize(&root).unwrap();
