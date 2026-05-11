@@ -1333,6 +1333,7 @@ impl SubagentRequest {
 struct DetachedSubagentLaunch {
     label: String,
     output_path: PathBuf,
+    steer_path: PathBuf,
     monitor_command: String,
 }
 
@@ -1357,21 +1358,23 @@ fn next_subagent_artifact_stem() -> String {
     format!("subagent-{nanos}-{}-{seq}", std::process::id())
 }
 
-fn write_subagent_input(root: &Path, request: &SubagentRequest) -> Result<(PathBuf, PathBuf)> {
+fn write_subagent_input(root: &Path, request: &SubagentRequest) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let dir = subagent_requests_dir(root);
     std::fs::create_dir_all(&dir)?;
     let stem = next_subagent_artifact_stem();
     let input_path = dir.join(format!("{stem}.input.json"));
     let output_path = dir.join(format!("{stem}.output.md"));
+    let steer_path = dir.join(format!("{stem}.steer"));
     let bytes = serde_json::to_vec_pretty(request)?;
     atomic_write_bytes(&input_path, &bytes)?;
+    atomic_write_bytes(&steer_path, b"\n")?;
     let header = format!(
         "# Dext subagent output bundle\n\ninput: {}\ntask: {}\nstatus: launched\n\n## Logs\n",
         input_path.display(),
         request.task
     );
     atomic_write_bytes(&output_path, header.as_bytes())?;
-    Ok((input_path, output_path))
+    Ok((input_path, output_path, steer_path))
 }
 
 #[cfg(unix)]
@@ -1537,6 +1540,7 @@ fn spawn_detached_subagent_process(
     root: &Path,
     input_path: &Path,
     output_path: &Path,
+    steer_path: &Path,
 ) -> Result<DetachedSubagentLaunch> {
     let exe = current_dext_executable()?;
     #[cfg(unix)]
@@ -1562,6 +1566,7 @@ fn spawn_detached_subagent_process(
     Ok(DetachedSubagentLaunch {
         label,
         output_path: output_path.to_path_buf(),
+        steer_path: steer_path.to_path_buf(),
         monitor_command,
     })
 }
@@ -1703,6 +1708,42 @@ async fn run_subagent_worker(input_path: &Path, output_path: &Path) -> Result<()
         output_path,
         &format!("[worker] started task: {}\n", request.task),
     )?;
+
+    // Set up file-based steering: derive .steer path from output path.
+    let steer_path = output_path.with_extension("steer");
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    {
+        let _guard = tokio::spawn(async move {
+            let mut offset: u64 = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let mut file = match std::fs::File::open(&steer_path) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                use std::io::{Read, Seek, SeekFrom};
+                if file.seek(SeekFrom::Start(offset)).is_err() {
+                    continue;
+                }
+                let mut buf = String::new();
+                if file.read_to_string(&mut buf).is_err() {
+                    continue;
+                }
+                if buf.is_empty() {
+                    continue;
+                }
+                offset += buf.len() as u64;
+                for line in buf.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    let _ = steer_tx.send(trimmed.to_string());
+                }
+            }
+        });
+    }
+
     let root = std::env::current_dir()?;
     let mut agent = Agent::new_with_sandbox(Some(root), false)?;
     agent.prewarm_connection();
@@ -1719,6 +1760,7 @@ async fn run_subagent_worker(input_path: &Path, output_path: &Path) -> Result<()
     if !request.privacy_enabled {
         agent.privacy.enabled = false;
     }
+    agent.install_steering(steer_rx, Agent::noop_steering_tx());
     agent.refresh_tools_for_context();
     let report = agent
         .run_subagent(&request.to_tool_input())
@@ -7848,6 +7890,7 @@ struct Agent {
     provider_health: ProviderHealthLedger,
     track_origin: Option<TrackOrigin>,
     privacy: PrivacyPolicy,
+    detached_subagent_steer_path: Option<PathBuf>,
 }
 
 impl Agent {
@@ -7986,6 +8029,7 @@ impl Agent {
             provider_health: ProviderHealthLedger::default(),
             track_origin: None,
             privacy: PrivacyPolicy::from_env(),
+            detached_subagent_steer_path: None,
         })
     }
 
@@ -10211,6 +10255,44 @@ impl Agent {
         Ok(())
     }
 
+    async fn steer_detached_subagent(&mut self, message: String) -> Result<()> {
+        let steer_path = match self.detached_subagent_steer_path.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                self.sink.emit(AgentEvent::Slash(
+                    "No active detached subagent to steer.".into(),
+                ));
+                return Ok(());
+            }
+        };
+        if !steer_path.exists() {
+            self.sink.emit(AgentEvent::Slash(format!(
+                "Steer file not found: {}. Subagent may have exited.",
+                steer_path.display()
+            )));
+            return Ok(());
+        }
+        let line = format!("{message}\n");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&steer_path)?;
+        file.write_all(line.as_bytes())?;
+        drop(file);
+        self.sink.emit(AgentEvent::Slash(format!(
+            "▶ steer: \"{message}\"\n  → {}",
+            steer_path.display()
+        )));
+        self.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: format!(
+                    "[subagent steered] Sent: \"{message}\"\nThe subagent will pick this up within a few seconds."
+                ),
+            }],
+        });
+        Ok(())
+    }
+
     async fn run_subagent_cmd(&mut self, raw: String) -> Result<()> {
         let mut task_parts: Vec<String> = Vec::new();
         let mut tools_override: Option<Vec<String>> = None;
@@ -10293,14 +10375,14 @@ impl Agent {
 
         let request = SubagentRequest::from_input(self, &input).map_err(anyhow::Error::msg)?;
         if mode == SubagentMode::Detached {
-            let (input_path, output_path) = write_subagent_input(&self.sandbox_root, &request)?;
+            let (input_path, output_path, steer_path) = write_subagent_input(&self.sandbox_root, &request)?;
             let launch =
-                spawn_detached_subagent_process(&self.sandbox_root, &input_path, &output_path)?;
+                spawn_detached_subagent_process(&self.sandbox_root, &input_path, &output_path, &steer_path)?;
             let iter_label = max_iter
                 .map(|max| max.to_string())
                 .unwrap_or_else(|| "unlimited".to_string());
             let summary = format!(
-                "▶ subagent detached: \"{}\"{} · max_iter={}\nlauncher: {}\ninput: {}\noutput: {}\nmonitor: {}\nParent remains usable; monitor the single output bundle (report + logs), then inspect it when complete.",
+                "▶ subagent detached: \"{}\"{} · max_iter={}\nlauncher: {}\ninput: {}\noutput: {}\nmonitor: {}\nsteer: /subagent steer <message>\nParent remains usable; use /subagent steer to send corrections while it works.",
                 task,
                 if readonly { " [readonly]" } else { "" },
                 iter_label,
@@ -10314,14 +10396,16 @@ impl Agent {
                 role: "user".to_string(),
                 content: vec![Block::Text {
                     text: format!(
-                        "[subagent detached]\nTask: {}\ninput: {}\noutput: {}\nmonitor: {}\n\nThe subagent is running outside the parent transcript. Monitor the single output bundle without interrupting parent work. When it completes, inspect the bundle and decide whether to use, verify, revise, or discard it.",
+                        "[subagent detached]\nTask: {}\ninput: {}\noutput: {}\nmonitor: {}\nsteer: {}\n\nThe subagent is running outside the parent transcript. Monitor the single output bundle without interrupting parent work. Use /subagent steer <message> to send corrections while it works. When it completes, inspect the bundle and decide whether to use, verify, revise, or discard it.",
                         task,
                         input_path.display(),
                         launch.output_path.display(),
-                        launch.monitor_command
+                        launch.monitor_command,
+                        launch.steer_path.display()
                     ),
                 }],
             });
+            self.detached_subagent_steer_path = Some(launch.steer_path.clone());
             return Ok(());
         }
 
@@ -12377,13 +12461,14 @@ impl Agent {
             budget_exhausted: false,
             builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
             sink: Box::new(ChannelSink { tx: ev_tx }),
-            steering_rx: None,
-            steering_tx: Agent::noop_steering_tx(),
+            steering_rx: self.steering_rx.take(),
+            steering_tx: self.steering_tx.clone(),
             read_cache: self.read_cache.clone(),
             work_ledger: self.work_ledger.clone(),
             provider_health: self.provider_health.clone(),
             track_origin: self.track_origin.clone(),
             privacy: self.privacy.clone(),
+            detached_subagent_steer_path: None,
         };
 
         if !request.privacy_enabled {
@@ -16800,8 +16885,19 @@ async fn main() -> Result<()> {
             let raw = input.strip_prefix("/subagent").unwrap_or("").trim();
             if raw.is_empty() {
                 println!(
-                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]"
+                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]\n       /subagent steer <message>"
                 );
+            } else if raw.starts_with("steer ") || raw == "steer" {
+                let msg = raw.strip_prefix("steer").unwrap_or("").trim();
+                if msg.is_empty() {
+                    println!("usage: /subagent steer <message>");
+                } else {
+                    agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Err(e) = agent.steer_detached_subagent(msg.to_string()).await {
+                        eprintln!("[steer error] {e:#}");
+                    }
+                    agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
             } else {
                 agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Err(e) = agent.run_subagent_cmd(raw.to_string()).await {

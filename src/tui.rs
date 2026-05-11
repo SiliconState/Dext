@@ -940,7 +940,7 @@ impl TuiState {
         }
         ds.file_offset += buf.len() as u64;
         let new_lines: Vec<&str> = buf.lines().collect();
-        const MAX_TAIL: usize = 3;
+        const MAX_TAIL: usize = 8;
         for line in new_lines {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1848,11 +1848,14 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
     }
     if let Some(ds) = &state.detached_subagent {
         if !ds.completed {
-            let last = ds.tail.last().map(|s| s.as_str()).unwrap_or("launched");
-            let label = if ds.task.is_empty() {
-                last.to_string()
+            let last_tool = ds.tail.iter().rev().find(|l| l.starts_with("▶"));
+            let last_line = ds.tail.last().map(|s| s.as_str()).unwrap_or("launched");
+            let label = if let Some(tool) = last_tool {
+                format!("⟨sub⟩ {}", tool.trim_start_matches("▶ ").trim())
+            } else if ds.task.is_empty() {
+                last_line.to_string()
             } else {
-                let task_head = ds.task.chars().take(40).collect::<String>();
+                let task_head = ds.task.chars().take(30).collect::<String>();
                 format!("⟨sub⟩ {task_head}")
             };
             return Some(live_detail_line(label, Color::Cyan, max_cells));
@@ -6387,8 +6390,15 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                             let raw = trimmed.strip_prefix("/subagent").unwrap_or("").trim();
                             if raw.is_empty() {
                                 agent.sink.emit(AgentEvent::Slash(
-                                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]".into(),
+                                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]\n       /subagent steer <message>".into(),
                                 ));
+                            } else if raw.starts_with("steer ") || raw == "steer" {
+                                let msg = raw.strip_prefix("steer").unwrap_or("").trim();
+                                if msg.is_empty() {
+                                    agent.sink.emit(AgentEvent::Slash("usage: /subagent steer <message>".into()));
+                                } else if let Err(e) = agent.steer_detached_subagent(msg.to_string()).await {
+                                    agent.sink.emit(AgentEvent::Error(format!("[steer error] {e:#}")));
+                                }
                             } else if let Err(e) = agent.run_subagent_cmd(raw.to_string()).await {
                                 agent
                                     .sink

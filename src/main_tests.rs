@@ -97,6 +97,7 @@ fn test_agent(root: &Path) -> Agent {
         provider_health: ProviderHealthLedger::default(),
         track_origin: None,
         privacy: PrivacyPolicy::default(),
+        detached_subagent_steer_path: None,
     }
 }
 
@@ -3539,7 +3540,7 @@ fn subagent_detached_artifacts_are_project_scoped() {
         task: "noop".to_string(),
         ..SubagentRequest::default()
     };
-    let (input_path, output_path) =
+    let (input_path, output_path, steer_path) =
         write_subagent_input(&root, &request).expect("write subagent input");
     assert!(
         input_path.starts_with(project_state_dir(&root)),
@@ -3553,11 +3554,13 @@ fn subagent_detached_artifacts_are_project_scoped() {
     );
     assert!(input_path.exists(), "{}", input_path.display());
     assert!(output_path.exists(), "{}", output_path.display());
+    assert!(steer_path.exists(), "{}", steer_path.display());
     assert_eq!(
-        input_path.extension().and_then(|e| e.to_str()),
+        input_path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()),
         Some("json")
     );
-    assert_eq!(output_path.extension().and_then(|e| e.to_str()), Some("md"));
+    assert_eq!(output_path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()), Some("md"));
+    assert_eq!(steer_path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()), Some("steer"));
     let parsed: SubagentRequest =
         serde_json::from_slice(&std::fs::read(&input_path).unwrap()).unwrap();
     assert_eq!(parsed.task, "noop");
