@@ -16,9 +16,9 @@ use ratatui_core::style::{Color as MdColor, Modifier as MdModifier, Style as MdS
 use ratatui_core::text::Text as MdText;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write as IoWrite};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -334,7 +334,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     },
     SlashCmd {
         name: "/browser",
-        args: "[off|agent-browser]",
+        args: "[off|agent-browser|agentbrowser]",
         help: "optional browser recipe",
     },
     SlashCmd {
@@ -1217,7 +1217,11 @@ impl TuiState {
                 self.turn_tool_counts.clear();
                 self.turn_error_count = 0;
                 self.turn_start_at = Some(Instant::now());
-                if self.detached_subagent.as_ref().is_some_and(|ds| ds.completed) {
+                if self
+                    .detached_subagent
+                    .as_ref()
+                    .is_some_and(|ds| ds.completed)
+                {
                     self.detached_subagent = None;
                 }
             }
@@ -6395,9 +6399,15 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                             } else if raw.starts_with("steer ") || raw == "steer" {
                                 let msg = raw.strip_prefix("steer").unwrap_or("").trim();
                                 if msg.is_empty() {
-                                    agent.sink.emit(AgentEvent::Slash("usage: /subagent steer <message>".into()));
-                                } else if let Err(e) = agent.steer_detached_subagent(msg.to_string()).await {
-                                    agent.sink.emit(AgentEvent::Error(format!("[steer error] {e:#}")));
+                                    agent.sink.emit(AgentEvent::Slash(
+                                        "usage: /subagent steer <message>".into(),
+                                    ));
+                                } else if let Err(e) =
+                                    agent.steer_detached_subagent(msg.to_string()).await
+                                {
+                                    agent
+                                        .sink
+                                        .emit(AgentEvent::Error(format!("[steer error] {e:#}")));
                                 }
                             } else if let Err(e) = agent.run_subagent_cmd(raw.to_string()).await {
                                 agent

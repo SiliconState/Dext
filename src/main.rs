@@ -2,6 +2,7 @@ mod orchestrator;
 mod packs;
 mod provider;
 mod session;
+mod shelves;
 mod tool_policy;
 mod tools;
 mod tui;
@@ -790,9 +791,8 @@ impl BrowserRecipe {
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "0" | "false" | "off" | "none" | "disabled" => Some(Self::Disabled),
-            "1" | "true" | "on" | "agent-browser" | "agent_browser" | "browser" => {
-                Some(Self::AgentBrowser)
-            }
+            "1" | "true" | "on" | "agent-browser" | "agent_browser" | "browser"
+            | "agentbrowser" => Some(Self::AgentBrowser),
             _ => None,
         }
     }
@@ -1358,7 +1358,10 @@ fn next_subagent_artifact_stem() -> String {
     format!("subagent-{nanos}-{}-{seq}", std::process::id())
 }
 
-fn write_subagent_input(root: &Path, request: &SubagentRequest) -> Result<(PathBuf, PathBuf, PathBuf)> {
+fn write_subagent_input(
+    root: &Path,
+    request: &SubagentRequest,
+) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let dir = subagent_requests_dir(root);
     std::fs::create_dir_all(&dir)?;
     let stem = next_subagent_artifact_stem();
@@ -1378,14 +1381,14 @@ fn write_subagent_input(root: &Path, request: &SubagentRequest) -> Result<(PathB
 }
 
 #[cfg(unix)]
-fn subagent_worker_shell_command(
+fn subagent_runtime_shell_command(
     root: &Path,
     exe: &Path,
     input_path: &Path,
     output_path: &Path,
 ) -> String {
     format!(
-        "cd {} && {} subagent-worker {} {}; status=$?; printf '\\n[subagent exited with status %s]\\n' \"$status\"; printf 'Press Enter to close...'; read _",
+        "cd {} && {} subagent-runtime {} {}; status=$?; printf '\\n[subagent exited with status %s]\\n' \"$status\"; printf 'Press Enter to close...'; read _",
         shell_single_quote(&root.display().to_string()),
         shell_single_quote(&exe.display().to_string()),
         shell_single_quote(&input_path.display().to_string()),
@@ -1399,9 +1402,9 @@ fn windows_cmd_quote(raw: &str) -> String {
 }
 
 #[cfg(windows)]
-fn subagent_worker_cmd_command(exe: &Path, input_path: &Path, output_path: &Path) -> String {
+fn subagent_runtime_cmd_command(exe: &Path, input_path: &Path, output_path: &Path) -> String {
     format!(
-        "{} subagent-worker {} {}",
+        "{} subagent-runtime {} {}",
         windows_cmd_quote(&exe.display().to_string()),
         windows_cmd_quote(&input_path.display().to_string()),
         windows_cmd_quote(&output_path.display().to_string())
@@ -1420,7 +1423,7 @@ fn spawn_background_subagent_process(
         .open(output_path)?;
     let stderr = output.try_clone()?;
     Command::new(exe)
-        .arg("subagent-worker")
+        .arg("subagent-runtime")
         .arg(input_path)
         .arg(output_path)
         .current_dir(root)
@@ -1439,7 +1442,7 @@ fn spawn_visible_subagent_terminal(
     input_path: &Path,
     output_path: &Path,
 ) -> Option<String> {
-    let command = subagent_worker_shell_command(root, exe, input_path, output_path)
+    let command = subagent_runtime_shell_command(root, exe, input_path, output_path)
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
     let script = format!("tell application \"Terminal\" to do script \"{command}\"");
@@ -1464,7 +1467,7 @@ fn spawn_visible_subagent_terminal(
     if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return None;
     }
-    let command = subagent_worker_shell_command(root, exe, input_path, output_path);
+    let command = subagent_runtime_shell_command(root, exe, input_path, output_path);
     let candidates: Vec<(&str, Vec<String>)> = vec![
         (
             "x-terminal-emulator",
@@ -1489,10 +1492,7 @@ fn spawn_visible_subagent_terminal(
             "xterm",
             vec!["-e".into(), "sh".into(), "-lc".into(), command.clone()],
         ),
-        (
-            "kitty",
-            vec!["sh".into(), "-lc".into(), command.clone()],
-        ),
+        ("kitty", vec!["sh".into(), "-lc".into(), command.clone()]),
         (
             "alacritty",
             vec!["-e".into(), "sh".into(), "-lc".into(), command],
@@ -1524,7 +1524,7 @@ fn spawn_visible_subagent_terminal(
     input_path: &Path,
     output_path: &Path,
 ) -> Option<String> {
-    let command = subagent_worker_cmd_command(exe, input_path, output_path);
+    let command = subagent_runtime_cmd_command(exe, input_path, output_path);
     Command::new("cmd")
         .args(["/C", "start", "Dext subagent", "cmd", "/K", &command])
         .current_dir(root)
@@ -1554,14 +1554,13 @@ fn spawn_detached_subagent_process(
         output_path.display()
     );
 
-    let label = if let Some(label) =
-        spawn_visible_subagent_terminal(root, &exe, input_path, output_path)
-    {
-        label
-    } else {
-        spawn_background_subagent_process(root, &exe, input_path, output_path)?;
-        "background process (no terminal opener found)".to_string()
-    };
+    let label =
+        if let Some(label) = spawn_visible_subagent_terminal(root, &exe, input_path, output_path) {
+            label
+        } else {
+            spawn_background_subagent_process(root, &exe, input_path, output_path)?;
+            "background process (no terminal opener found)".to_string()
+        };
 
     Ok(DetachedSubagentLaunch {
         label,
@@ -1699,14 +1698,14 @@ fn append_subagent_output(output_path: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_subagent_worker(input_path: &Path, output_path: &Path) -> Result<()> {
+async fn run_subagent_runtime(input_path: &Path, output_path: &Path) -> Result<()> {
     let request: SubagentRequest = serde_json::from_slice(
         &std::fs::read(input_path)
             .with_context(|| format!("reading subagent input {}", input_path.display()))?,
     )?;
     append_subagent_output(
         output_path,
-        &format!("[worker] started task: {}\n", request.task),
+        &format!("[subagent-runtime] started task: {}\n", request.task),
     )?;
 
     // Set up file-based steering: derive .steer path from output path.
@@ -6636,20 +6635,47 @@ fn prompt_permission(name: &str, input: &Value, pretty: bool) -> Choice {
 const DEFAULT_SYSTEM: &str = "You are dext, a terse coding assistant running as a CLI agent on the user's machine.
 
 Use only tools exposed in the current API tool list. Do not assume unavailable tools exist.
-Runtime: privileged ops are auto-approved; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested. Avoid mutating external state stores directly.
-Project state: use todo_read/todo_write for nontrivial work. Treat DEXT.md/recall.md as guidance; update recall.md only for durable decisions.
-Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Avoid broad reads; paginate. Use read-only tools in parallel.
-Editing: always read before editing. Use edit_file for small changes, multi_edit for batches, write_file for new files. Checkpoint before large edits.
-Git: inspect status/diff before editing tracked files. Use git_commit (not raw git). Use git_log only when history is needed.
-Shell: preserve pipefail in bash. Dext rg/fd/jq/http are direct tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Validate external sources before scaling. On auth failures, ask for credentials.
-Browser: if browser_recipe=agent-browser, invoke agent-browser only when useful; start with agent-browser skills get core.
-Subagents: do not call subagent directly; suggest /subagent if delegation is requested. Review subagent output before acting.
-Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
-Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
-Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.";
+Runtime: privileged ops are auto-approved; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested.
+Project context files such as DEXT.md and recall.md are injected separately when present.
+Be source-first, concise, and verify realistic changes before declaring done.";
+
+fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
+    let mut sections = Vec::new();
+    let mut dir = root;
+    loop {
+        let candidate = dir.join(filename);
+        if candidate.exists()
+            && let Ok(content) = std::fs::read_to_string(&candidate)
+        {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let display = dir.strip_prefix(root).unwrap_or(dir).display();
+                let label = if display.to_string().is_empty() {
+                    ".".to_string()
+                } else {
+                    format!("/{display}")
+                };
+                sections.push((label, candidate, trimmed.to_string()));
+            }
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent,
+            _ => break,
+        }
+    }
+    sections.reverse();
+    sections
+}
+
+#[derive(Debug, Clone)]
+struct SystemParts {
+    stable: String,
+    env: String,
+    prompt_sources: Vec<PathBuf>,
+}
 
 const DEFAULT_SUBAGENT_SYSTEM: &str = "\
-You are a focused worker agent spawned to complete one specific task delegated by a \
+You are a focused Dext subagent runtime spawned to complete one specific task delegated by a \
 parent agent. You share the same sandbox and toolkit, but you do NOT see the parent's \
 conversation — only the task you were given.
 
@@ -7015,6 +7041,9 @@ struct SessionHeader {
     version: u32,
     model: String,
     system: String,
+    // Full prompt actually sent/shown; `system` remains the restore-safe base prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    composed_system: Option<String>,
     /// Legacy name: tools approved persistently for this session/profile.
     #[serde(default)]
     allowed: Vec<String>,
@@ -7064,6 +7093,7 @@ impl Default for SessionHeader {
             version: SESSION_FORMAT_VERSION,
             model: String::new(),
             system: DEFAULT_SYSTEM.to_string(),
+            composed_system: None,
             allowed: Vec::new(),
             exposed_tools: Vec::new(),
             approval_required_tools: Vec::new(),
@@ -8584,44 +8614,20 @@ impl Agent {
         session::append_latest_log(&self.sandbox_root, event, &detail);
     }
 
-    fn compose_system_parts(&self) -> (String, String) {
+    fn compose_system_details(&self) -> SystemParts {
         let mut stable = self.system.clone();
         let mut context_budget = if self.context_mode.is_frugal() {
             FRUGAL_PROJECT_CONTEXT_CAP
         } else {
             PROJECT_CONTEXT_CAP
         };
-        let mut dext_md_sections: Vec<(String, String)> = Vec::new();
-        let mut dir = self.sandbox_root.as_path();
-        loop {
-            let candidate = dir.join("DEXT.md");
-            if candidate.exists()
-                && let Ok(content) = std::fs::read_to_string(&candidate)
-            {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    let display = dir
-                        .strip_prefix(&self.sandbox_root)
-                        .unwrap_or(dir)
-                        .display();
-                    let label = if display.to_string().is_empty() {
-                        ".".to_string()
-                    } else {
-                        format!("/{display}")
-                    };
-                    dext_md_sections.push((label, trimmed.to_string()));
-                }
-            }
-            match dir.parent() {
-                Some(parent) if parent != dir => dir = parent,
-                _ => break,
-            }
-        }
-        dext_md_sections.reverse();
-        for (label, content) in &dext_md_sections {
+        let mut prompt_sources = Vec::new();
+        let dext_md_sections = prompt_context_files(&self.sandbox_root, "DEXT.md");
+        for (label, path, content) in &dext_md_sections {
             if context_budget == 0 {
                 break;
             }
+            prompt_sources.push(path.clone());
             let section = format!("\n\n## Project context (DEXT.md from {label})\n{}", content);
             if section.len() <= context_budget {
                 stable.push_str(&section);
@@ -8640,37 +8646,12 @@ impl Agent {
             }
         }
 
-        let mut recall_sections: Vec<(String, String)> = Vec::new();
-        let mut dir = self.sandbox_root.as_path();
-        loop {
-            let candidate = dir.join("recall.md");
-            if candidate.exists()
-                && let Ok(content) = std::fs::read_to_string(&candidate)
-            {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    let display = dir
-                        .strip_prefix(&self.sandbox_root)
-                        .unwrap_or(dir)
-                        .display();
-                    let label = if display.to_string().is_empty() {
-                        ".".to_string()
-                    } else {
-                        format!("/{display}")
-                    };
-                    recall_sections.push((label, trimmed.to_string()));
-                }
-            }
-            match dir.parent() {
-                Some(parent) if parent != dir => dir = parent,
-                _ => break,
-            }
-        }
-        recall_sections.reverse();
-        for (label, content) in &recall_sections {
+        let recall_sections = prompt_context_files(&self.sandbox_root, "recall.md");
+        for (label, path, content) in &recall_sections {
             if context_budget == 0 {
                 break;
             }
+            prompt_sources.push(path.clone());
             let section = format!("\n\n## Recall (recall.md from {label})\n{}", content);
             if section.len() <= context_budget {
                 stable.push_str(&section);
@@ -8776,7 +8757,11 @@ impl Agent {
             }
             env.push_str(&self.privacy.prompt_status_line());
             env.push('\n');
-            return (stable, env);
+            return SystemParts {
+                stable,
+                env,
+                prompt_sources,
+            };
         }
 
         let mut env = String::from("## Environment\n");
@@ -8866,7 +8851,16 @@ impl Agent {
         }
         env.push_str(&self.privacy.prompt_status_line());
         env.push('\n');
-        (stable, env)
+        SystemParts {
+            stable,
+            env,
+            prompt_sources,
+        }
+    }
+
+    fn compose_system_parts(&self) -> (String, String) {
+        let parts = self.compose_system_details();
+        (parts.stable, parts.env)
     }
 
     fn work_ledger_prompt(&self) -> String {
@@ -9378,6 +9372,9 @@ impl Agent {
     }
 
     fn session_header_with_origin(&self, track_origin: Option<TrackOrigin>) -> SessionHeader {
+        let system_details = self.compose_system_details();
+        let composed_system = format!("{}\n\n{}", system_details.stable, system_details.env);
+        let provenance = self.session_provenance_from(&system_details, &composed_system);
         let mut allowed: Vec<String> = self.allowed.iter().cloned().collect();
         allowed.retain(|name| name != "subagent");
         allowed.sort();
@@ -9404,6 +9401,7 @@ impl Agent {
             version: SESSION_FORMAT_VERSION,
             model: self.model.clone(),
             system: self.system.clone(),
+            composed_system: Some(composed_system),
             allowed,
             exposed_tools,
             approval_required_tools,
@@ -9419,7 +9417,7 @@ impl Agent {
             browser_recipe: self.browser_recipe,
             context_mode: self.context_mode,
             tool_profile: self.tool_profile,
-            provenance: self.session_provenance(),
+            provenance,
             work_ledger: self.cleaned_work_ledger(),
             provider_health: self.provider_health.clone(),
             track_origin,
@@ -9427,18 +9425,45 @@ impl Agent {
         }
     }
 
-    fn session_provenance(&self) -> SessionProvenance {
+    fn composed_system_prompt(&self) -> String {
+        let (sys_stable, sys_env) = self.compose_system_parts();
+        format!("{sys_stable}\n\n{sys_env}")
+    }
+
+    fn session_provenance_from(
+        &self,
+        details: &SystemParts,
+        system_prompt: &str,
+    ) -> SessionProvenance {
         let mut prompt_sources = Vec::new();
-        let dext_md = self.sandbox_root.join("DEXT.md");
-        let recall_md = self.sandbox_root.join("recall.md");
-        let dext_md_hash = std::fs::read(&dext_md).ok().map(|bytes| {
-            prompt_sources.push(dext_md.display().to_string());
+        let dext_md_root = self.sandbox_root.join("DEXT.md");
+        let recall_root = self.sandbox_root.join("recall.md");
+        let dext_md_hash = std::fs::read(&dext_md_root).ok().map(|bytes| {
+            if !details
+                .prompt_sources
+                .iter()
+                .any(|path| path == &dext_md_root)
+            {
+                prompt_sources.push(dext_md_root.display().to_string());
+            }
             sha256_hex_bytes(&bytes)
         });
-        let recall_hash = std::fs::read(&recall_md).ok().map(|bytes| {
-            prompt_sources.push(recall_md.display().to_string());
+        let recall_hash = std::fs::read(&recall_root).ok().map(|bytes| {
+            if !details
+                .prompt_sources
+                .iter()
+                .any(|path| path == &recall_root)
+            {
+                prompt_sources.push(recall_root.display().to_string());
+            }
             sha256_hex_bytes(&bytes)
         });
+        prompt_sources.extend(
+            details
+                .prompt_sources
+                .iter()
+                .map(|path| path.display().to_string()),
+        );
         SessionProvenance {
             dext_version: env!("CARGO_PKG_VERSION").to_string(),
             git: self.git_context.clone(),
@@ -9448,7 +9473,7 @@ impl Agent {
             thinking_effort: self.thinking_effort,
             approval_profile: self.approval_profile,
             sandbox_profile: self.sandbox_profile,
-            system_prompt_hash: sha256_hex_str(&self.compose_system_parts().0),
+            system_prompt_hash: sha256_hex_str(system_prompt),
             dext_md_hash,
             recall_hash,
             tool_catalog_version: TOOL_CATALOG_VERSION,
@@ -9476,7 +9501,8 @@ impl Agent {
     }
 
     pub(crate) fn export_session_html_to_path(&self, path: &Path) -> Result<()> {
-        let html = render_session_html(&self.session_header(), &self.history, "current session");
+        let header = self.session_header();
+        let html = render_session_html(&header, &self.history, "current session");
         atomic_write_bytes(path, html.as_bytes())?;
         Ok(())
     }
@@ -10273,9 +10299,7 @@ impl Agent {
             return Ok(());
         }
         let line = format!("{message}\n");
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&steer_path)?;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&steer_path)?;
         file.write_all(line.as_bytes())?;
         drop(file);
         self.sink.emit(AgentEvent::Slash(format!(
@@ -10375,9 +10399,14 @@ impl Agent {
 
         let request = SubagentRequest::from_input(self, &input).map_err(anyhow::Error::msg)?;
         if mode == SubagentMode::Detached {
-            let (input_path, output_path, steer_path) = write_subagent_input(&self.sandbox_root, &request)?;
-            let launch =
-                spawn_detached_subagent_process(&self.sandbox_root, &input_path, &output_path, &steer_path)?;
+            let (input_path, output_path, steer_path) =
+                write_subagent_input(&self.sandbox_root, &request)?;
+            let launch = spawn_detached_subagent_process(
+                &self.sandbox_root,
+                &input_path,
+                &output_path,
+                &steer_path,
+            )?;
             let iter_label = max_iter
                 .map(|max| max.to_string())
                 .unwrap_or_else(|| "unlimited".to_string());
@@ -12850,7 +12879,7 @@ fn render_session_html(header: &SessionHeader, history: &[Message], title: &str)
     let _ = write!(
         out,
         "<details class=\"meta\"><summary>system prompt</summary><pre>{}</pre></details>",
-        html_escape(&header.system)
+        html_escape(header.composed_system.as_deref().unwrap_or(&header.system))
     );
 
     for (idx, message) in history.iter().enumerate() {
@@ -14280,7 +14309,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /browser [off|agent-browser] optional browser automation recipe"
+                "  /browser [off|agent-browser|agentbrowser] optional browser automation recipe"
             );
             let _ = writeln!(
                 w,
@@ -14474,13 +14503,14 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         }
         "system" => {
             if arg.is_empty() {
+                let composed = agent.composed_system_prompt();
                 let _ = writeln!(
                     w,
                     "{}",
                     cap_bytes_with_hint(
-                        agent.system.clone(),
+                        composed,
                         SLASH_TEXT_CAP,
-                        "system prompt display truncated; use /system <text> to replace it.",
+                        "system prompt display truncated; use /system <text> to replace the base prompt.",
                     )
                 );
             } else {
@@ -14647,7 +14677,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     let _ = writeln!(w, "{hint}");
                 }
             } else {
-                let _ = writeln!(w, "usage: /browser [off|agent-browser]");
+                let _ = writeln!(w, "usage: /browser [off|agent-browser|agentbrowser]");
             }
         }
         "sandbox" => {
@@ -16202,11 +16232,13 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             }
             "--browser" | "--browser-recipe" => {
                 i += 1;
-                let value = argv
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--browser requires off|agent-browser"))?;
+                let value = argv.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--browser requires off|agent-browser|agentbrowser")
+                })?;
                 browser_recipe = Some(BrowserRecipe::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!("invalid --browser '{value}' (expected off|agent-browser)")
+                    anyhow::anyhow!(
+                        "invalid --browser '{value}' (expected off|agent-browser|agentbrowser)"
+                    )
                 })?);
             }
             "--agent-browser" => browser_recipe = Some(BrowserRecipe::AgentBrowser),
@@ -16328,7 +16360,9 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .or_else(|| arg.strip_prefix("--browser-recipe="))
                     .unwrap_or_default();
                 browser_recipe = Some(BrowserRecipe::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!("invalid browser recipe '{value}' (expected off|agent-browser)")
+                    anyhow::anyhow!(
+                        "invalid browser recipe '{value}' (expected off|agent-browser|agentbrowser)"
+                    )
                 })?);
             }
             _ if arg.starts_with('@') => {
@@ -16421,15 +16455,15 @@ async fn main() -> Result<()> {
     }));
 
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.first().is_some_and(|a| a == "subagent-worker") {
+    if argv.first().is_some_and(|a| a == "subagent-runtime") {
         if argv.len() != 3 {
-            eprintln!("usage: dext subagent-worker INPUT_JSON OUTPUT_MD");
+            eprintln!("usage: dext subagent-runtime INPUT_JSON OUTPUT_MD");
             release_registered_locks();
             std::process::exit(2);
         }
         let input_path = Path::new(&argv[1]);
         let output_path = Path::new(&argv[2]);
-        let result = run_subagent_worker(input_path, output_path).await;
+        let result = run_subagent_runtime(input_path, output_path).await;
         if let Err(e) = &result {
             let _ = append_subagent_output(output_path, &format!("\n## Status\nfailed\n\n{e:#}\n"));
         }
@@ -16441,7 +16475,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if argv.first().is_some_and(|a| a == "pack" || a == "packs") {
-        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
         let sub = argv.get(1).map(String::as_str).unwrap_or("list");
         match sub {
             "" | "list" | "ls" => {
@@ -16531,7 +16568,7 @@ async fn main() -> Result<()> {
         println!("       dext auth ...         provider/model/auth management commands");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENROUTER_API_KEY, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENROUTER_API_KEY, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }

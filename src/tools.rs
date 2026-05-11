@@ -25,8 +25,8 @@ pub(crate) struct SlashCommand {
 
 pub(crate) fn runtime_tool_definitions() -> Vec<RuntimeTool> {
     vec![RuntimeTool {
-        name: "subagent-worker",
-        description: "Run a detached subagent worker from an input file into one output bundle.",
+        name: "subagent-runtime",
+        description: "Run a detached subagent runtime from an input file into one output bundle.",
     }]
 }
 
@@ -35,7 +35,12 @@ pub(crate) fn slash_command_definitions() -> Vec<SlashCommand> {
         SlashCommand {
             name: "subagent",
             usage: "/subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]",
-            description: "Run a user-requested worker while keeping delegation out of provider-visible tools.",
+            description: "Run a user-requested subagent while keeping delegation out of provider-visible tools.",
+        },
+        SlashCommand {
+            name: "browser",
+            usage: "/browser [off|agent-browser|status]",
+            description: "Enable/status optional agent-browser automation for heavy web/HTML work.",
         },
         SlashCommand {
             name: "pack",

@@ -118,7 +118,7 @@ Interactive slash commands:
 
 ## Packs
 
-Packs are source-first workflow bundles with a `PACK.md`. Dext discovers packs from `.dext/packs`, `packs`, `DEXT_PACKS_DIR`, `~/.dext/packs`, and bundled repository packs.
+Packs are source-first workflow bundles with a `PACK.md`. Dext discovers packs from `DEXT_PACK_<NAME>_DIR`, project `.dext/shelves/<shelf>/packs`, `.dext/packs`, `packs`, `DEXT_SHELVES_DIR`, `DEXT_PACKS_DIR`, user `~/.dext/shelves/<shelf>/packs`, `~/.dext/packs`, and bundled repository packs. Shelf packs take precedence over same-named legacy project/user pack directories within the same scope.
 
 Invoke a pack conversationally:
 
@@ -141,7 +141,7 @@ dext pack run autoresearch "improve this benchmark"
 dext --pack autoresearch "improve this benchmark"
 ```
 
-If a pack has `phooks.json`, Dext activates those hook templates for that invocation and passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to hook processes.
+If a pack has `phooks.json`, Dext activates those hook templates for that invocation and passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to hook processes. Shelf packs use the same invocation path and remain regular source directories.
 
 ## Configuration and state
 

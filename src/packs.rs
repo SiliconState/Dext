@@ -16,6 +16,7 @@ pub(crate) struct PackInfo {
     pub(crate) pack_md_path: PathBuf,
     pub(crate) phooks_path: Option<PathBuf>,
     pub(crate) source: String,
+    pub(crate) shelf: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +99,7 @@ fn parse_front_matter(text: &str) -> PackFrontMatter {
     front
 }
 
-fn load_pack_from_dir(dir: &Path, source: &str) -> Result<Option<PackInfo>> {
+fn load_pack_from_dir(dir: &Path, source: &str, shelf: Option<&str>) -> Result<Option<PackInfo>> {
     let pack_md_path = dir.join("PACK.md");
     if !pack_md_path.is_file() {
         return Ok(None);
@@ -123,63 +124,140 @@ fn load_pack_from_dir(dir: &Path, source: &str) -> Result<Option<PackInfo>> {
         pack_md_path,
         phooks_path: phooks.is_file().then_some(phooks),
         source: source.to_string(),
+        shelf: shelf.map(str::to_string),
     }))
 }
 
-fn push_root(roots: &mut Vec<(PathBuf, String)>, path: PathBuf, label: impl Into<String>) {
-    if path.is_dir() {
-        roots.push((path, label.into()));
+fn push_pack_root(
+    dirs: &mut Vec<(PathBuf, String, Option<String>)>,
+    pack_root: PathBuf,
+    label: impl Into<String>,
+) {
+    if !pack_root.is_dir() {
+        return;
+    }
+    let label = label.into();
+    push_direct(dirs, pack_root.clone(), label.clone(), None);
+    let Ok(entries) = std::fs::read_dir(&pack_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let path = entry.path();
+        if path.join("PACK.md").is_file() {
+            push_direct(dirs, path, label.clone(), None);
+        }
     }
 }
 
-fn push_direct(dirs: &mut Vec<(PathBuf, String)>, path: PathBuf, label: impl Into<String>) {
+fn push_direct(
+    dirs: &mut Vec<(PathBuf, String, Option<String>)>,
+    path: PathBuf,
+    label: impl Into<String>,
+    shelf: Option<String>,
+) {
     // load_pack_from_dir already checks PACK.md existence
-    dirs.push((path, label.into()));
+    dirs.push((path, label.into(), shelf));
 }
 
-fn candidate_pack_dirs(root: &Path) -> Vec<(PathBuf, String)> {
+fn push_shelf(dirs: &mut Vec<(PathBuf, String, Option<String>)>, shelf_path: PathBuf, label: &str) {
+    let shelf_name = shelf_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("shelf")
+        .to_string();
+    let packs_root = shelf_path.join("packs");
+    let Ok(packs) = std::fs::read_dir(&packs_root) else {
+        return;
+    };
+    for pack in packs.flatten() {
+        let is_dir = pack.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        let path = pack.path();
+        if path.join("PACK.md").is_file() {
+            push_direct(
+                dirs,
+                path,
+                format!("{label}/{shelf_name}"),
+                Some(shelf_name.clone()),
+            );
+        }
+    }
+}
+
+fn push_shelf_root(
+    dirs: &mut Vec<(PathBuf, String, Option<String>)>,
+    shelf_root: PathBuf,
+    label: impl Into<String>,
+) {
+    if !shelf_root.is_dir() {
+        return;
+    }
+    let label = label.into();
+    push_shelf(dirs, shelf_root.clone(), &label);
+    let Ok(shelves) = std::fs::read_dir(&shelf_root) else {
+        return;
+    };
+    for shelf in shelves.flatten() {
+        let is_dir = shelf.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_dir {
+            push_shelf(dirs, shelf.path(), &label);
+        }
+    }
+}
+
+fn candidate_pack_dirs(root: &Path) -> Vec<(PathBuf, String, Option<String>)> {
     let mut direct = Vec::new();
     for (key, value) in std::env::vars() {
         if key.starts_with("DEXT_PACK_") && key.ends_with("_DIR") && !value.trim().is_empty() {
-            push_direct(&mut direct, PathBuf::from(value), format!("env:{key}"));
+            push_direct(
+                &mut direct,
+                PathBuf::from(value),
+                format!("env:{key}"),
+                None,
+            );
         }
     }
 
-    let mut roots = Vec::new();
-    push_root(&mut roots, root.join(".dext/packs"), "project:.dext/packs");
-    push_root(&mut roots, root.join("packs"), "project:packs");
-    if let Some(paths) = std::env::var_os("DEXT_PACKS_DIR") {
+    push_shelf_root(
+        &mut direct,
+        root.join(".dext/shelves"),
+        "project:.dext/shelves",
+    );
+    push_pack_root(&mut direct, root.join(".dext/packs"), "project:.dext/packs");
+    push_pack_root(&mut direct, root.join("packs"), "project:packs");
+
+    if let Some(paths) = std::env::var_os("DEXT_SHELVES_DIR") {
         for path in std::env::split_paths(&paths) {
-            push_root(&mut roots, path, "env:DEXT_PACKS_DIR");
+            push_shelf_root(&mut direct, path, "env:DEXT_SHELVES_DIR");
         }
     }
-    push_root(
-        &mut roots,
+
+    if let Some(paths) = std::env::var_os("DEXT_PACKS_DIR") {
+        for path in std::env::split_paths(&paths) {
+            push_pack_root(&mut direct, path, "env:DEXT_PACKS_DIR");
+        }
+    }
+    push_shelf_root(
+        &mut direct,
+        dext_state_dir().join("shelves"),
+        "user:~/.dext/shelves",
+    );
+    push_pack_root(
+        &mut direct,
         dext_state_dir().join("packs"),
         "user:~/.dext/packs",
     );
     let bundled_packs = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
     if root.join("packs") != bundled_packs {
-        push_root(&mut roots, bundled_packs, "bundled:packs");
+        push_pack_root(&mut direct, bundled_packs, "bundled:packs");
     }
 
-    for (pack_root, label) in roots {
-        push_direct(&mut direct, pack_root.clone(), label.clone());
-        let Ok(entries) = std::fs::read_dir(&pack_root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            // Use cached file_type from dir entry to avoid extra stat
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            if !is_dir {
-                continue;
-            }
-            let path = entry.path();
-            if path.join("PACK.md").is_file() {
-                direct.push((path, label.clone()));
-            }
-        }
-    }
     direct
 }
 
@@ -187,7 +265,7 @@ pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
     let mut packs = Vec::new();
     let mut seen_names = HashSet::new();
     let mut seen_paths = HashSet::new();
-    for (dir, source) in candidate_pack_dirs(root) {
+    for (dir, source, shelf) in candidate_pack_dirs(root) {
         // Use path directly first; only canonicalize on collision
         let path_key = if seen_paths.contains(&dir) {
             std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())
@@ -197,7 +275,7 @@ pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
         if !seen_paths.insert(path_key) {
             continue;
         }
-        let Ok(Some(pack)) = load_pack_from_dir(&dir, &source) else {
+        let Ok(Some(pack)) = load_pack_from_dir(&dir, &source, shelf.as_deref()) else {
             continue;
         };
         let key = normalize_key(&pack.name);
@@ -239,7 +317,7 @@ pub(crate) fn find_pack(root: &Path, selector: &str) -> Result<PackInfo> {
 pub(crate) fn render_pack_listing(root: &Path) -> String {
     let packs = discover_packs(root);
     if packs.is_empty() {
-        return "packs: none found\nsearch paths: .dext/packs, packs, DEXT_PACKS_DIR, ~/.dext/packs, bundled packs".to_string();
+        return "packs: none found\nsearch paths: .dext/shelves/*/packs, .dext/packs, packs, DEXT_SHELVES_DIR, DEXT_PACKS_DIR, ~/.dext/shelves/*/packs, ~/.dext/packs, bundled packs".to_string();
     }
     let mut out = String::from("packs:\n");
     for pack in packs.iter().take(PACK_LIST_LIMIT) {
@@ -248,10 +326,13 @@ pub(crate) fn render_pack_listing(root: &Path) -> String {
         } else {
             pack.description.clone()
         };
+        let shelf = pack.shelf.as_deref().unwrap_or("(none)");
         out.push_str(&format!(
-            "  {} — {}\n    path: {}\n",
+            "  {} — {}\n    shelf: {}\n    source: {}\n    path: {}\n",
             pack.name,
             desc,
+            shelf,
+            pack.source,
             pack.path.display()
         ));
     }
@@ -275,13 +356,14 @@ pub(crate) fn render_pack_inspect(root: &Path, selector: &str) -> Result<String>
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(none)".to_string());
     Ok(format!(
-        "pack: {}\ndescription: {}\nsource: {}\npath: {}\nworkflow: {}\nhooks: {}\nenv: {}={}",
+        "pack: {}\ndescription: {}\nshelf: {}\nsource: {}\npath: {}\nworkflow: {}\nhooks: {}\nenv: {}={}",
         pack.name,
         if pack.description.is_empty() {
             "(none)"
         } else {
             &pack.description
         },
+        pack.shelf.as_deref().unwrap_or("(none)"),
         pack.source,
         pack.path.display(),
         pack.pack_md_path.display(),
@@ -312,13 +394,14 @@ pub(crate) fn pack_prompt(pack: &PackInfo, task: &str) -> Result<String> {
         task.to_string()
     };
     Ok(format!(
-        "[dext pack invocation]\nPack: {name}\nDescription: {description}\nPack path: {path}\nWorkflow: {workflow_path}\n{hook_line}\nPack env: {env_name}={path}\n\nFollow the PACK.md workflow below. Treat this as an explicit user request to invoke the pack; do not just describe how to run it. Use normal Dext tools and pack-local helper scripts through bash when the workflow says to.\n\n--- PACK.md ---\n{workflow}\n--- END PACK.md ---\n\nUser task for this pack:\n{task}",
+        "[dext pack invocation]\nPack: {name}\nDescription: {description}\nShelf: {shelf}\nPack path: {path}\nWorkflow: {workflow_path}\n{hook_line}\nPack env: {env_name}={path}\n\nFollow the PACK.md workflow below. Treat this as an explicit user request to invoke the pack; do not just describe how to run it. Use normal Dext tools and pack-local helper scripts through bash when the workflow says to.\n\n--- PACK.md ---\n{workflow}\n--- END PACK.md ---\n\nUser task for this pack:\n{task}",
         name = pack.name,
         description = if pack.description.is_empty() {
             "(none)"
         } else {
             &pack.description
         },
+        shelf = pack.shelf.as_deref().unwrap_or("(none)"),
         path = pack.path.display(),
         workflow_path = pack.pack_md_path.display(),
         env_name = pack.env_var_name(),
@@ -403,7 +486,10 @@ pub(crate) fn pack_summary_for_prompt(root: &Path) -> Option<String> {
         &packs
             .iter()
             .take(10)
-            .map(|pack| pack.name.as_str())
+            .map(|pack| match pack.shelf.as_deref() {
+                Some(shelf) => format!("{}[{shelf}]", pack.name),
+                None => pack.name.clone(),
+            })
             .collect::<Vec<_>>()
             .join(", "),
     );

@@ -823,6 +823,16 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         );
 
         let saved_header: SessionHeader = serde_json::from_str(&saved_header_line)?;
+        assert_eq!(saved_header.system, "saved-system");
+        assert!(
+            saved_header
+                .composed_system
+                .as_deref()
+                .unwrap_or_default()
+                .contains("saved-system"),
+            "{:?}",
+            saved_header.composed_system
+        );
         assert!(
             saved_header
                 .exposed_tools
@@ -885,6 +895,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
             Some(10)
         );
         assert_eq!(header.version, SESSION_FORMAT_VERSION);
+        assert!(header.composed_system.is_some());
         assert_eq!(header.provenance.thinking_effort, ThinkingEffort::XHigh);
         assert_eq!(header.provenance.tool_catalog_version, TOOL_CATALOG_VERSION);
         assert!(!header.provenance.system_prompt_hash.is_empty());
@@ -929,6 +940,8 @@ fn session_html_export_renders_and_escapes_transcript() -> Result<()> {
         },
     ];
 
+    std::fs::write(root.join("DEXT.md"), "## Local\n- html export context")?;
+
     let out = root.join("session.html");
     agent.export_session_html_to_path(&out)?;
     let html = std::fs::read_to_string(&out)?;
@@ -941,6 +954,9 @@ fn session_html_export_renders_and_escapes_transcript() -> Result<()> {
     assert!(html.contains("tool_use bash"), "{html}");
     assert!(html.contains("tool_result"), "{html}");
     assert!(html.contains("line &lt;ok&gt; &amp; done"), "{html}");
+    assert!(html.contains("system prompt"), "{html}");
+    assert!(html.contains("Project context (DEXT.md"), "{html}");
+    assert!(html.contains("html export context"), "{html}");
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -3556,11 +3572,23 @@ fn subagent_detached_artifacts_are_project_scoped() {
     assert!(output_path.exists(), "{}", output_path.display());
     assert!(steer_path.exists(), "{}", steer_path.display());
     assert_eq!(
-        input_path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()),
+        input_path
+            .extension()
+            .and_then(|e: &std::ffi::OsStr| e.to_str()),
         Some("json")
     );
-    assert_eq!(output_path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()), Some("md"));
-    assert_eq!(steer_path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()), Some("steer"));
+    assert_eq!(
+        output_path
+            .extension()
+            .and_then(|e: &std::ffi::OsStr| e.to_str()),
+        Some("md")
+    );
+    assert_eq!(
+        steer_path
+            .extension()
+            .and_then(|e: &std::ffi::OsStr| e.to_str()),
+        Some("steer")
+    );
     let parsed: SubagentRequest =
         serde_json::from_slice(&std::fs::read(&input_path).unwrap()).unwrap();
     assert_eq!(parsed.task, "noop");
@@ -3610,7 +3638,7 @@ fn current_dext_executable_falls_back_to_path_when_current_exe_missing() {
 }
 
 #[test]
-fn subagent_worker_renders_report_with_quality_gate() {
+fn subagent_runtime_renders_report_with_quality_gate() {
     let report = SubagentRunReport {
         task: "research".to_string(),
         max_iterations: Some(3),
@@ -3769,6 +3797,31 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
 #[test]
 fn default_tool_profile_is_lean_for_prompt_budget() {
     assert_eq!(ToolProfile::default(), ToolProfile::Lean);
+}
+
+#[test]
+fn slash_system_displays_composed_prompt_with_project_context() {
+    let root = temp_test_dir("slash-system-composed");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(root.join("DEXT.md"), "## Local\n- slash system context")
+        .expect("write DEXT.md");
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(handle_slash("/system", &mut agent), Some(true));
+    let slash = drain_events(&mut rx)
+        .into_iter()
+        .find_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(slash.contains("test-system"), "{slash}");
+    assert!(slash.contains("Project context (DEXT.md"), "{slash}");
+    assert!(slash.contains("slash system context"), "{slash}");
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -4481,14 +4534,21 @@ fn provider_runtime_and_slash_registries_are_split() {
         .iter()
         .map(|tool| tool.name)
         .collect();
-    assert!(runtime_names.contains("subagent-worker"));
+    assert!(runtime_names.contains("subagent-runtime"));
     assert!(!runtime_names.contains("read_file"));
+
+    assert_eq!(
+        BrowserRecipe::parse("agentbrowser"),
+        Some(BrowserRecipe::AgentBrowser)
+    );
 
     let slash_names: HashSet<&str> = slash_command_definitions()
         .iter()
         .map(|cmd| cmd.name)
         .collect();
     assert!(slash_names.contains("subagent"));
+    assert!(slash_names.contains("browser"));
+    assert!(slash_names.contains("pack"));
     assert!(!slash_names.contains("read_file"));
     assert!(provider_names.is_disjoint(&runtime_names));
 }
@@ -4680,7 +4740,7 @@ async fn bash_tool_honors_input_timeout() {
 }
 
 #[tokio::test]
-async fn model_side_subagent_tool_call_does_not_launch_worker() {
+async fn model_side_subagent_tool_call_does_not_launch_runtime() {
     let root = temp_test_dir("model-subagent-blocked");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let out = execute_builtin_call(
@@ -7117,6 +7177,7 @@ fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
     )?;
     unsafe {
         std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
 
@@ -7140,6 +7201,76 @@ fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn packs_discover_shelf_pack_and_apply_precedence() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("shelf-pack-discovery");
+    let shelf_pack = root.join(".dext/shelves/community/packs/demo");
+    let legacy_pack = root.join("packs/demo");
+    let env_pack = root.join("external-shelf/packs/envpack");
+    std::fs::create_dir_all(&shelf_pack)?;
+    std::fs::create_dir_all(&legacy_pack)?;
+    std::fs::create_dir_all(&env_pack)?;
+    std::fs::write(
+        shelf_pack.join("PACK.md"),
+        "---\nname: demo\ndescription: Shelf workflow\n---\n# Shelf demo\n",
+    )?;
+    std::fs::write(
+        legacy_pack.join("PACK.md"),
+        "---\nname: demo\ndescription: Legacy workflow\n---\n# Legacy demo\n",
+    )?;
+    std::fs::write(
+        env_pack.join("PACK.md"),
+        "---\nname: envpack\ndescription: Env shelf workflow\n---\n# Env demo\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::set_var("DEXT_SHELVES_DIR", root.join("external-shelf"));
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let pack = packs::find_pack(&root, "demo")?;
+    assert_eq!(pack.description, "Shelf workflow");
+    assert_eq!(pack.shelf.as_deref(), Some("community"));
+    assert!(pack.source.contains("project:.dext/shelves/community"));
+
+    let env = packs::find_pack(&root, "envpack")?;
+    assert_eq!(env.shelf.as_deref(), Some("external-shelf"));
+    assert!(env.source.contains("env:DEXT_SHELVES_DIR/external-shelf"));
+
+    let project_names = packs::discover_packs(&root)
+        .into_iter()
+        .map(|pack| pack.name)
+        .collect::<Vec<_>>();
+    let demo_count = project_names.iter().filter(|name| *name == "demo").count();
+    assert_eq!(demo_count, 1, "{project_names:?}");
+
+    let listing = packs::render_pack_listing(&root);
+    assert!(listing.contains("demo — Shelf workflow"), "{listing}");
+    assert!(listing.contains("shelf: community"), "{listing}");
+    assert!(
+        listing.contains("source: project:.dext/shelves/community"),
+        "{listing}"
+    );
+
+    let inspect = packs::render_pack_inspect(&root, "demo")?;
+    assert!(inspect.contains("shelf: community"), "{inspect}");
+
+    let prompt = packs::pack_prompt(&pack, "ship it")?;
+    assert!(prompt.contains("Shelf: community"), "{prompt}");
+
+    let summary = packs::pack_summary_for_prompt(&root).unwrap_or_default();
+    assert!(summary.contains("demo[community]"), "{summary}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -7157,6 +7288,7 @@ fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
     )?;
     unsafe {
         std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
 
@@ -7180,6 +7312,7 @@ fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -7194,6 +7327,7 @@ fn conversational_pack_inference_requires_invocation_intent() -> Result<()> {
     std::fs::write(pack_dir.join("PACK.md"), "---\nname: demo\n---\n# Demo\n")?;
     unsafe {
         std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
 
@@ -7206,6 +7340,7 @@ fn conversational_pack_inference_requires_invocation_intent() -> Result<()> {
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     Ok(())

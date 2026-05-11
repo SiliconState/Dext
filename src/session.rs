@@ -691,6 +691,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .as_str()
             .unwrap_or(DEFAULT_SYSTEM)
             .to_string(),
+        composed_system: meta["composed_system"].as_str().map(String::from),
         allowed: meta["allowed"]
             .as_array()
             .map(|arr| {

@@ -106,13 +106,16 @@ dext --no-session "quick answer only"
 
 ## Packs
 
-Dext packs are regular source directories containing `PACK.md` plus optional helper scripts and `phooks.json`. Discovery checks:
+Dext packs are regular source directories containing `PACK.md` plus optional helper scripts and `phooks.json`. Discovery checks, in precedence order:
 
 1. `DEXT_PACK_<NAME>_DIR` environment variables
-2. project `.dext/packs` and `packs`
-3. `DEXT_PACKS_DIR` entries
-4. user `~/.dext/packs`
-5. bundled packs in the Dext repository
+2. project `.dext/shelves/<shelf>/packs`, `.dext/packs`, and `packs`
+3. `DEXT_SHELVES_DIR` entries (`<shelf>/packs/<pack>` or a direct shelf root containing `packs/<pack>`)
+4. `DEXT_PACKS_DIR` entries
+5. user `~/.dext/shelves/<shelf>/packs` and `~/.dext/packs`
+6. bundled packs in the Dext repository
+
+Shelf packs are just source-first packs grouped under a shelf. If a shelf and legacy pack define the same pack name in a scope, the shelf pack wins.
 
 Use:
 
@@ -206,6 +209,7 @@ DEXT_SESSIONS_DIR=~/.dext/sessions
 DEXT_LOGS_DIR=~/.dext/logs
 DEXT_LOG_ARCHIVES=4
 DEXT_PACKS_DIR=~/.dext/packs:/path/to/project-packs
+DEXT_SHELVES_DIR=~/.dext/shelves:/path/to/shared-shelves
 ```
 
 Runtime controls:
