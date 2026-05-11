@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub(crate) struct ShelfId(String);
 
 impl ShelfId {
@@ -27,7 +27,17 @@ impl TryFrom<&str> for ShelfId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for ShelfId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub(crate) struct PackId(String);
 
 impl PackId {
@@ -45,6 +55,16 @@ impl TryFrom<&str> for PackId {
 
     fn try_from(value: &str) -> Result<Self> {
         Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for PackId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -408,6 +428,13 @@ impl StaticShelf {
     pub(crate) fn new(manifest: ShelfManifest) -> Self {
         Self { manifest }
     }
+
+    pub(crate) fn from_json_file(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let mut manifest: ShelfManifest = serde_json::from_str(&text)?;
+        manifest.origin.path.get_or_insert_with(|| path.to_path_buf());
+        Ok(Self { manifest })
+    }
 }
 
 impl Shelf for StaticShelf {
@@ -596,5 +623,48 @@ mod tests {
             pack_path(root, &shelf, &pack),
             PathBuf::from("/repo/.dext/shelves/community/packs/autoresearch")
         );
+    }
+
+    #[test]
+    fn static_shelf_loads_manifest_from_json_file() {
+        let root = std::env::temp_dir().join(format!(
+            "dext-shelf-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("shelf.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{
+  "id": "community",
+  "name": "Community",
+  "description": "shared packs",
+  "origin": {"scope": "project"},
+  "mode": "always",
+  "packs": [{
+    "id": "research",
+    "name": "Research",
+    "version": "0.1.0",
+    "description": "research helpers",
+    "abilities": [{"ability": "context", "name": "notes", "description": "curated notes", "budget": 1024}]
+  }]
+}"#,
+        )
+        .unwrap();
+
+        let shelf = StaticShelf::from_json_file(&manifest_path).unwrap();
+        let manifest = shelf.manifest();
+        assert_eq!(manifest.id, ShelfId::new("community").unwrap());
+        assert_eq!(manifest.packs[0].id, PackId::new("research").unwrap());
+        assert_eq!(manifest.origin.path.as_deref(), Some(manifest_path.as_path()));
+        match &manifest.packs[0].abilities[0] {
+            Ability::Context(context) => assert_eq!(context.budget, 1024),
+            other => panic!("expected context ability, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
