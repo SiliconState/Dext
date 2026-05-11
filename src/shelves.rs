@@ -432,7 +432,10 @@ impl StaticShelf {
     pub(crate) fn from_json_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let mut manifest: ShelfManifest = serde_json::from_str(&text)?;
-        manifest.origin.path.get_or_insert_with(|| path.to_path_buf());
+        manifest
+            .origin
+            .path
+            .get_or_insert_with(|| path.to_path_buf());
         Ok(Self { manifest })
     }
 }
@@ -660,7 +663,10 @@ mod tests {
         let manifest = shelf.manifest();
         assert_eq!(manifest.id, ShelfId::new("community").unwrap());
         assert_eq!(manifest.packs[0].id, PackId::new("research").unwrap());
-        assert_eq!(manifest.origin.path.as_deref(), Some(manifest_path.as_path()));
+        assert_eq!(
+            manifest.origin.path.as_deref(),
+            Some(manifest_path.as_path())
+        );
         match &manifest.packs[0].abilities[0] {
             Ability::Context(context) => assert_eq!(context.budget, 1024),
             other => panic!("expected context ability, got {other:?}"),

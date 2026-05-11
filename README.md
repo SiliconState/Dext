@@ -120,6 +120,8 @@ Interactive slash commands:
 
 Packs are source-first workflow bundles with a `PACK.md`. Dext discovers packs from `DEXT_PACK_<NAME>_DIR`, project `.dext/shelves/<shelf>/packs`, `.dext/packs`, `packs`, `DEXT_SHELVES_DIR`, `DEXT_PACKS_DIR`, user `~/.dext/shelves/<shelf>/packs`, `~/.dext/packs`, and bundled repository packs. Shelf packs take precedence over same-named legacy project/user pack directories within the same scope.
 
+The stable extension contract is intentionally provider-neutral: a pack is files plus instructions that any LLM/provider can read, with optional shell helpers and `phooks.json` steering. Scaffold a pack as `packs/<name>/PACK.md`, keep helper scripts inside that directory, and validate it with `dext pack inspect <name>` plus a real `dext pack run <name> ...` on a disposable task. Shared shelves live at `<shelf>/packs/<pack>` and can be distributed through project, user, or `DEXT_SHELVES_DIR` paths without adding provider-visible tools. Richer shelf manifests are internal groundwork for typed abilities; today the portable path is source-first packs.
+
 Invoke a pack conversationally:
 
 ```text

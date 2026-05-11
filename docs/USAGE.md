@@ -115,7 +115,7 @@ Dext packs are regular source directories containing `PACK.md` plus optional hel
 5. user `~/.dext/shelves/<shelf>/packs` and `~/.dext/packs`
 6. bundled packs in the Dext repository
 
-Shelf packs are just source-first packs grouped under a shelf. If a shelf and legacy pack define the same pack name in a scope, the shelf pack wins.
+Shelf packs are just source-first packs grouped under a shelf. If a shelf and legacy pack define the same pack name in a scope, the shelf pack wins. This is the current stable extension contract: scaffold `packs/<name>/PACK.md` or `<shelf>/packs/<name>/PACK.md`, keep scripts/data beside it, validate with `dext pack inspect <name>`, then run it on a disposable task before sharing. Because packs are plain files and normal commands, they work across users, LLMs, and providers without expanding the provider-visible tool list. Optional shelf manifests are internal typed-ability groundwork; portable packs should not depend on provider-specific behavior.
 
 Use:
 
