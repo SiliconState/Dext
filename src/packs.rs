@@ -159,11 +159,10 @@ fn candidate_pack_dirs(root: &Path) -> Vec<(PathBuf, String)> {
         dext_state_dir().join("packs"),
         "user:~/.dext/packs",
     );
-    push_root(
-        &mut roots,
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("packs"),
-        "bundled:packs",
-    );
+    let bundled_packs = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
+    if root.join("packs") != bundled_packs {
+        push_root(&mut roots, bundled_packs, "bundled:packs");
+    }
 
     for (pack_root, label) in roots {
         push_direct(&mut direct, pack_root.clone(), label.clone());
