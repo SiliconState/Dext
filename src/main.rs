@@ -1374,6 +1374,165 @@ fn write_subagent_input(root: &Path, request: &SubagentRequest) -> Result<(PathB
     Ok((input_path, output_path))
 }
 
+#[cfg(unix)]
+fn subagent_worker_shell_command(
+    root: &Path,
+    exe: &Path,
+    input_path: &Path,
+    output_path: &Path,
+) -> String {
+    format!(
+        "cd {} && {} subagent-worker {} {}; status=$?; printf '\\n[subagent exited with status %s]\\n' \"$status\"; printf 'Press Enter to close...'; read _",
+        shell_single_quote(&root.display().to_string()),
+        shell_single_quote(&exe.display().to_string()),
+        shell_single_quote(&input_path.display().to_string()),
+        shell_single_quote(&output_path.display().to_string())
+    )
+}
+
+#[cfg(windows)]
+fn windows_cmd_quote(raw: &str) -> String {
+    format!("\"{}\"", raw.replace('"', "\\\""))
+}
+
+#[cfg(windows)]
+fn subagent_worker_cmd_command(exe: &Path, input_path: &Path, output_path: &Path) -> String {
+    format!(
+        "{} subagent-worker {} {}",
+        windows_cmd_quote(&exe.display().to_string()),
+        windows_cmd_quote(&input_path.display().to_string()),
+        windows_cmd_quote(&output_path.display().to_string())
+    )
+}
+
+fn spawn_background_subagent_process(
+    root: &Path,
+    exe: &Path,
+    input_path: &Path,
+    output_path: &Path,
+) -> Result<()> {
+    let output = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path)?;
+    let stderr = output.try_clone()?;
+    Command::new(exe)
+        .arg("subagent-worker")
+        .arg(input_path)
+        .arg(output_path)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .context("launch background subagent process")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_visible_subagent_terminal(
+    root: &Path,
+    exe: &Path,
+    input_path: &Path,
+    output_path: &Path,
+) -> Option<String> {
+    let command = subagent_worker_shell_command(root, exe, input_path, output_path)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let script = format!("tell application \"Terminal\" to do script \"{command}\"");
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    Some("terminal window".to_string())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn spawn_visible_subagent_terminal(
+    root: &Path,
+    exe: &Path,
+    input_path: &Path,
+    output_path: &Path,
+) -> Option<String> {
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return None;
+    }
+    let command = subagent_worker_shell_command(root, exe, input_path, output_path);
+    let candidates: Vec<(&str, Vec<String>)> = vec![
+        (
+            "x-terminal-emulator",
+            vec!["-e".into(), "sh".into(), "-lc".into(), command.clone()],
+        ),
+        (
+            "gnome-terminal",
+            vec!["--".into(), "sh".into(), "-lc".into(), command.clone()],
+        ),
+        (
+            "konsole",
+            vec!["-e".into(), "sh".into(), "-lc".into(), command.clone()],
+        ),
+        (
+            "xfce4-terminal",
+            vec![
+                "--command".into(),
+                format!("sh -lc {}", shell_single_quote(&command)),
+            ],
+        ),
+        (
+            "xterm",
+            vec!["-e".into(), "sh".into(), "-lc".into(), command.clone()],
+        ),
+        (
+            "kitty",
+            vec!["sh".into(), "-lc".into(), command.clone()],
+        ),
+        (
+            "alacritty",
+            vec!["-e".into(), "sh".into(), "-lc".into(), command],
+        ),
+    ];
+    for (terminal, args) in candidates {
+        if find_binary_on_path(terminal).is_none() {
+            continue;
+        }
+        if Command::new(terminal)
+            .args(args)
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+        {
+            return Some(format!("terminal window ({terminal})"));
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn spawn_visible_subagent_terminal(
+    root: &Path,
+    exe: &Path,
+    input_path: &Path,
+    output_path: &Path,
+) -> Option<String> {
+    let command = subagent_worker_cmd_command(exe, input_path, output_path);
+    Command::new("cmd")
+        .args(["/C", "start", "Dext subagent", "cmd", "/K", &command])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    Some("terminal window".to_string())
+}
+
 fn spawn_detached_subagent_process(
     root: &Path,
     input_path: &Path,
@@ -1390,27 +1549,18 @@ fn spawn_detached_subagent_process(
         "powershell -NoProfile -Command Get-Content -Wait {}",
         output_path.display()
     );
-    let args = vec![
-        "subagent-worker".to_string(),
-        input_path.display().to_string(),
-        output_path.display().to_string(),
-    ];
 
-    let output = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output_path)?;
-    let stderr = output.try_clone()?;
-    Command::new(exe)
-        .args(args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("launch background subagent process")?;
+    let label = if let Some(label) =
+        spawn_visible_subagent_terminal(root, &exe, input_path, output_path)
+    {
+        label
+    } else {
+        spawn_background_subagent_process(root, &exe, input_path, output_path)?;
+        "background process (no terminal opener found)".to_string()
+    };
+
     Ok(DetachedSubagentLaunch {
-        label: "background process".to_string(),
+        label,
         output_path: output_path.to_path_buf(),
         monitor_command,
     })
@@ -10559,6 +10709,12 @@ impl Agent {
                             "stream_error",
                             &format!("kind={} {body}", plan.label()),
                         );
+                        if plan.retry {
+                            return Err(e.context(format!(
+                                "{} stream error after {stream_attempt} attempts; provider/upstream kept returning retryable SSE errors",
+                                plan.label()
+                            )));
+                        }
                         return Err(e);
                     }
                 }

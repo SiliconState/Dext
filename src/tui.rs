@@ -16,6 +16,7 @@ use ratatui_core::style::{Color as MdColor, Modifier as MdModifier, Style as MdS
 use ratatui_core::text::Text as MdText;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write as IoWrite};
 use std::sync::Arc;
@@ -53,6 +54,31 @@ fn is_subagent_call_id(call_id: &str) -> bool {
 
 fn is_subagent_batch_id(batch_id: &str) -> bool {
     batch_id.starts_with("sub.")
+}
+
+fn parse_detached_subagent_launch(s: &str) -> Option<DetachedSubagent> {
+    if !s.contains("▶ subagent detached:") {
+        return None;
+    }
+    let output_path = s
+        .lines()
+        .find(|l| l.starts_with("output:"))
+        .map(|l| l.trim_start_matches("output:").trim())?;
+    let task = s
+        .lines()
+        .find(|l| l.starts_with("▶ subagent detached:"))
+        .and_then(|l| {
+            let between = l.split('"').nth(1)?;
+            Some(between.to_string())
+        })
+        .unwrap_or_default();
+    Some(DetachedSubagent {
+        task,
+        output_path: PathBuf::from(output_path),
+        file_offset: 0,
+        tail: Vec::new(),
+        completed: false,
+    })
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -706,6 +732,14 @@ struct TranscriptLayoutState {
     live_indicator_text: Option<Text<'static>>,
 }
 
+struct DetachedSubagent {
+    task: String,
+    output_path: PathBuf,
+    file_offset: u64,
+    tail: Vec<String>,
+    completed: bool,
+}
+
 struct TuiState {
     pending_insert: Vec<Line_>,
     transcript: Vec<Line_>,
@@ -778,6 +812,7 @@ struct TuiState {
     turn_start_at: Option<Instant>,
     todo_progress: Option<TodoProgress>,
     work_map: Option<WorkMapDrawer>,
+    detached_subagent: Option<DetachedSubagent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -865,6 +900,7 @@ impl TuiState {
             turn_start_at: None,
             todo_progress: None,
             work_map: None,
+            detached_subagent: None,
         }
     }
 
@@ -878,6 +914,46 @@ impl TuiState {
         }
         self.git_branch = git_summary(std::path::Path::new(&self.sandbox));
         self.git_branch_refreshed = Some(Instant::now());
+    }
+
+    fn poll_detached_subagent(&mut self) {
+        let ds = match self.detached_subagent.as_mut() {
+            Some(ds) if !ds.completed => ds,
+            _ => return,
+        };
+        let mut file = match std::fs::File::open(&ds.output_path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        if let Ok(meta) = file.metadata() {
+            if meta.len() <= ds.file_offset {
+                return;
+            }
+        }
+        if file.seek(SeekFrom::Start(ds.file_offset)).is_err() {
+            return;
+        }
+        let mut buf = String::new();
+        if file.read_to_string(&mut buf).is_err() {
+            return;
+        }
+        ds.file_offset += buf.len() as u64;
+        let new_lines: Vec<&str> = buf.lines().collect();
+        const MAX_TAIL: usize = 3;
+        for line in new_lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            ds.tail.push(trimmed.to_string());
+        }
+        while ds.tail.len() > MAX_TAIL {
+            ds.tail.remove(0);
+        }
+        if buf.contains("## Status\ncomplete") {
+            ds.completed = true;
+        }
     }
 
     fn queue(&mut self, line: Line_) {
@@ -1141,6 +1217,9 @@ impl TuiState {
                 self.turn_tool_counts.clear();
                 self.turn_error_count = 0;
                 self.turn_start_at = Some(Instant::now());
+                if self.detached_subagent.as_ref().is_some_and(|ds| ds.completed) {
+                    self.detached_subagent = None;
+                }
             }
             AgentEvent::HistoryContextUpdated { chars, tokens } => {
                 self.history_chars = chars as u64;
@@ -1455,6 +1534,9 @@ impl TuiState {
                 self.sub_batch = None;
                 self.agent_busy = false;
                 self.status = "ready".into();
+                if let Some(ds) = parse_detached_subagent_launch(&s) {
+                    self.detached_subagent = Some(ds);
+                }
                 self.queue(Line_::Info(s));
             }
             AgentEvent::WorkMap {
@@ -1659,6 +1741,11 @@ fn derived_busy_status(state: &TuiState) -> String {
     if let Some(retry) = &state.retry_status {
         return retry.clone();
     }
+    if let Some(ds) = &state.detached_subagent {
+        if !ds.completed {
+            return "subagent running".to_string();
+        }
+    }
     let running_tools: Vec<&LiveTool> = state
         .live_tools
         .iter()
@@ -1757,6 +1844,24 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
                 Span::styled("  ▸ ", Style::default().fg(Color::Blue)),
                 Span::styled(clamp_chars(tail, max_cells), Style::default()),
             ]));
+        }
+    }
+    if let Some(ds) = &state.detached_subagent {
+        if !ds.completed {
+            let last = ds.tail.last().map(|s| s.as_str()).unwrap_or("launched");
+            let label = if ds.task.is_empty() {
+                last.to_string()
+            } else {
+                let task_head = ds.task.chars().take(40).collect::<String>();
+                format!("⟨sub⟩ {task_head}")
+            };
+            return Some(live_detail_line(label, Color::Cyan, max_cells));
+        } else {
+            return Some(live_detail_line(
+                "⟨sub⟩ complete".to_string(),
+                Color::Green,
+                max_cells,
+            ));
         }
     }
     let running_tools: Vec<&LiveTool> = state
@@ -6395,6 +6500,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
             }
             _ = tokio::time::sleep(timeout) => {
                 last_tick = Instant::now();
+                state.poll_detached_subagent();
             }
         }
     }

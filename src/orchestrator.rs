@@ -1009,6 +1009,7 @@ pub(crate) fn classify_stream_error(body: &str) -> RetryPlan {
     // Transient markers — retry with backoff.
     let transient_phrases = [
         "internal network failure",
+        "network error",
         "please contact customer service",
         "overloaded",
         "service_unavailable",
@@ -1653,6 +1654,12 @@ mod tests {
         let plan = classify_stream_error(zai);
         assert_eq!(plan.kind, FailureKind::Transient);
         assert!(plan.retry, "ZAI 1234 must retry");
+
+        // ZAI/GLM generic network failure — another observed shape from glm-5.1.
+        let zai_network = r#"{"error":{"code":"1234","message":"Network error, error id: x, please try again later"},"request_id":"x"}"#;
+        let plan = classify_stream_error(zai_network);
+        assert_eq!(plan.kind, FailureKind::Transient);
+        assert!(plan.retry, "ZAI network errors must retry");
 
         // Anthropic overloaded
         let overloaded =
