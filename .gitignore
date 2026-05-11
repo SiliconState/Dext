@@ -2,6 +2,8 @@
 /.env
 /.cargo/config.toml
 /nul
+__pycache__/
+*.py[cod]
 
 # Runtime/project state
 /.dext/
