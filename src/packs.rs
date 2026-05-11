@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::session::dext_state_dir;
+use crate::session::{canonicalize_or_clone, dext_state_dir};
 use crate::{byte_prefix_at_char_boundary, cap_bytes_with_hint};
 
 const PACK_PROMPT_CAP: usize = 32_000;
@@ -141,7 +141,9 @@ fn push_pack_root(
     let Ok(entries) = std::fs::read_dir(&pack_root) else {
         return;
     };
-    for entry in entries.flatten() {
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         if !is_dir {
             continue;
@@ -173,7 +175,9 @@ fn push_shelf(dirs: &mut Vec<(PathBuf, String, Option<String>)>, shelf_path: Pat
     let Ok(packs) = std::fs::read_dir(&packs_root) else {
         return;
     };
-    for pack in packs.flatten() {
+    let mut packs = packs.flatten().collect::<Vec<_>>();
+    packs.sort_by_key(|entry| entry.path());
+    for pack in packs {
         let is_dir = pack.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         if !is_dir {
             continue;
@@ -203,7 +207,9 @@ fn push_shelf_root(
     let Ok(shelves) = std::fs::read_dir(&shelf_root) else {
         return;
     };
-    for shelf in shelves.flatten() {
+    let mut shelves = shelves.flatten().collect::<Vec<_>>();
+    shelves.sort_by_key(|entry| entry.path());
+    for shelf in shelves {
         let is_dir = shelf.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         if is_dir {
             push_shelf(dirs, shelf.path(), &label);
@@ -266,12 +272,7 @@ pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
     let mut seen_names = HashSet::new();
     let mut seen_paths = HashSet::new();
     for (dir, source, shelf) in candidate_pack_dirs(root) {
-        // Use path directly first; only canonicalize on collision
-        let path_key = if seen_paths.contains(&dir) {
-            std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())
-        } else {
-            dir.clone()
-        };
+        let path_key = canonicalize_or_clone(&dir);
         if !seen_paths.insert(path_key) {
             continue;
         }

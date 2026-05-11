@@ -7259,6 +7259,54 @@ fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
 }
 
 #[test]
+fn packs_discovery_is_deterministic_and_dedupes_symlinked_roots() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-deterministic-discovery");
+    let pack_root = root.join("shared-packs");
+    let alpha = pack_root.join("alpha");
+    let beta = pack_root.join("beta");
+    std::fs::create_dir_all(&alpha)?;
+    std::fs::create_dir_all(&beta)?;
+    std::fs::write(
+        alpha.join("PACK.md"),
+        "---\nname: alpha\ndescription: Alpha workflow\n---\n# Alpha\n",
+    )?;
+    std::fs::write(
+        beta.join("PACK.md"),
+        "---\nname: beta\ndescription: Beta workflow\n---\n# Beta\n",
+    )?;
+    let alias = root.join("alias-packs");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&pack_root, &alias)?;
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&pack_root, &alias)?;
+    unsafe {
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var(
+            "DEXT_PACKS_DIR",
+            std::env::join_paths([&alias, &pack_root])?,
+        );
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let packs = packs::discover_packs(&root);
+    let names = packs
+        .iter()
+        .filter(|pack| pack.source == "env:DEXT_PACKS_DIR")
+        .map(|pack| pack.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["alpha", "beta"], "{names:?}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn packs_discover_shelf_pack_and_apply_precedence() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("shelf-pack-discovery");
