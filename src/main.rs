@@ -2463,14 +2463,22 @@ impl Usage {
     fn parse(v: &Value) -> Self {
         let cache_create = v["cache_creation_input_tokens"].as_u64().unwrap_or(0);
         let cache_read = v["cache_read_input_tokens"].as_u64().unwrap_or(0);
-        let input = v["input_tokens"]
+        // Anthropic-style input_tokens; fall back to prompt_tokens for
+        // Anthropic-compatible proxies (GLM/z.ai) that use OpenAI field names.
+        let raw_input = v["input_tokens"]
             .as_u64()
-            .unwrap_or(0)
+            .or_else(|| v["prompt_tokens"].as_u64())
+            .unwrap_or(0);
+        let input = raw_input
             .saturating_sub(cache_create)
             .saturating_sub(cache_read);
+        let output = v["output_tokens"]
+            .as_u64()
+            .or_else(|| v["completion_tokens"].as_u64())
+            .unwrap_or(0);
         Self {
             input,
-            output: v["output_tokens"].as_u64().unwrap_or(0),
+            output,
             cache_create,
             cache_read,
         }
@@ -11607,8 +11615,22 @@ impl Agent {
                         if let Some(sr) = data["delta"]["stop_reason"].as_str() {
                             stop_reason = Some(sr.to_string());
                         }
-                        if let Some(o) = data["usage"]["output_tokens"].as_u64() {
-                            usage.output = o;
+                        if let Some(u) = data.get("usage") {
+                            // Some Anthropic-compatible proxies (GLM/z.ai)
+                            // include full usage in message_delta rather than
+                            // just output_tokens.
+                            if let Some(o) = u["output_tokens"].as_u64() {
+                                usage.output = o;
+                            }
+                            if let Some(i) = u["input_tokens"].as_u64() {
+                                usage.input = i
+                                    .saturating_sub(usage.cache_create)
+                                    .saturating_sub(usage.cache_read);
+                            } else if let Some(i) = u["prompt_tokens"].as_u64() {
+                                usage.input = i
+                                    .saturating_sub(usage.cache_create)
+                                    .saturating_sub(usage.cache_read);
+                            }
                         }
                     }
                     "message_stop" => {}

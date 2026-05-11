@@ -113,8 +113,8 @@ fn load_pack_from_dir(dir: &Path, source: &str) -> Result<Option<PackInfo>> {
             .to_string()
     });
     let description = front.description.unwrap_or_default();
-    let path = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let pack_md_path = std::fs::canonicalize(&pack_md_path).unwrap_or(pack_md_path);
+    let path = dir.to_path_buf();
+    let pack_md_path = pack_md_path;
     let phooks = path.join("phooks.json");
     Ok(Some(PackInfo {
         name,
@@ -133,9 +133,8 @@ fn push_root(roots: &mut Vec<(PathBuf, String)>, path: PathBuf, label: impl Into
 }
 
 fn push_direct(dirs: &mut Vec<(PathBuf, String)>, path: PathBuf, label: impl Into<String>) {
-    if path.join("PACK.md").is_file() {
-        dirs.push((path, label.into()));
-    }
+    // load_pack_from_dir already checks PACK.md existence
+    dirs.push((path, label.into()));
 }
 
 fn candidate_pack_dirs(root: &Path) -> Vec<(PathBuf, String)> {
@@ -170,8 +169,13 @@ fn candidate_pack_dirs(root: &Path) -> Vec<(PathBuf, String)> {
             continue;
         };
         for entry in entries.flatten() {
+            // Use cached file_type from dir entry to avoid extra stat
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() && path.join("PACK.md").is_file() {
+            if path.join("PACK.md").is_file() {
                 direct.push((path, label.clone()));
             }
         }
@@ -184,7 +188,12 @@ pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
     let mut seen_names = HashSet::new();
     let mut seen_paths = HashSet::new();
     for (dir, source) in candidate_pack_dirs(root) {
-        let path_key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        // Use path directly first; only canonicalize on collision
+        let path_key = if seen_paths.contains(&dir) {
+            std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())
+        } else {
+            dir.clone()
+        };
         if !seen_paths.insert(path_key) {
             continue;
         }
