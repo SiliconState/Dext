@@ -432,6 +432,11 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "run detached subagent",
     },
     SlashCmd {
+        name: "/pack",
+        args: "[list|inspect|run]",
+        help: "discover/invoke packs",
+    },
+    SlashCmd {
         name: "/hooks",
         args: "[reload]",
         help: "show/reload hooks",
@@ -6283,6 +6288,32 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                                 agent
                                     .sink
                                     .emit(AgentEvent::Error(format!("[subagent error] {e:#}")));
+                            }
+                        } else if trimmed == "/pack"
+                            || trimmed.starts_with("/pack ")
+                            || trimmed == "/packs"
+                            || trimmed.starts_with("/packs ")
+                        {
+                            let raw = trimmed
+                                .trim_start_matches("/packs")
+                                .trim_start_matches("/pack")
+                                .trim();
+                            let mut parts = raw.splitn(3, char::is_whitespace);
+                            let sub = parts.next().unwrap_or("");
+                            if matches!(sub, "run" | "use" | "start") {
+                                let selector = parts.next().unwrap_or("").trim();
+                                let task = parts.next().unwrap_or("").trim();
+                                if selector.is_empty() || task.is_empty() {
+                                    agent.sink.emit(AgentEvent::Slash(
+                                        "usage: /pack run <name> <task>".into(),
+                                    ));
+                                } else if let Err(e) = agent.run_pack(selector, task).await {
+                                    agent
+                                        .sink
+                                        .emit(AgentEvent::Error(format!("[pack error] {e:#}")));
+                                }
+                            } else if !run_slash(&text, &mut agent) {
+                                break;
                             }
                         } else if !run_slash(&text, &mut agent) {
                             break;

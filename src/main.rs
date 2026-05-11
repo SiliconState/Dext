@@ -1,4 +1,5 @@
 mod orchestrator;
+mod packs;
 mod provider;
 mod session;
 mod tool_policy;
@@ -6621,7 +6622,11 @@ impl Hooks {
         let path = std::env::var("DEXT_HOOKS_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| root.join("hooks.json"));
-        match std::fs::read_to_string(&path) {
+        Self::load_file(&path)
+    }
+
+    fn load_file(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
                 eprintln!("[hooks] parse error in {}: {e}", path.display());
                 Hooks::default()
@@ -6635,6 +6640,7 @@ impl Hooks {
         phase: &str,
         tool: &str,
         env: &[(&str, &str)],
+        extra_env: &[(String, String)],
         root: &Path,
     ) -> Vec<(String, i32)> {
         let hooks: &[Hook] = match phase {
@@ -6654,6 +6660,9 @@ impl Hooks {
             let mut cmd = Command::new("bash");
             cmd.arg("-c").arg(&h.command).current_dir(root);
             for (k, v) in env {
+                cmd.env(k, v);
+            }
+            for (k, v) in extra_env {
                 cmd.env(k, v);
             }
             match run_sync_command_limited(
@@ -7699,6 +7708,7 @@ struct Agent {
     session_usage: Usage,
     interrupt: Arc<AtomicBool>,
     hooks: Hooks,
+    pack_hook_env: Vec<(String, String)>,
     state_lock: Option<Arc<ProjectStateLock>>,
     session_enabled: bool,
     latest_session_path: PathBuf,
@@ -7835,6 +7845,7 @@ impl Agent {
             allowed: HashSet::new(),
             deny_tools: HashSet::new(),
             hooks: Hooks::load(&sandbox_root),
+            pack_hook_env: Vec::new(),
             sandbox_root,
             git_context,
             silent: false,
@@ -8273,6 +8284,7 @@ impl Agent {
     }
 
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
+        self.pack_hook_env.clear();
         let next_lock_path = project_state_lock_path(&root);
         let same_project = self
             .state_lock
@@ -8293,6 +8305,36 @@ impl Agent {
             self.state_lock = Some(lock);
         }
         Ok(())
+    }
+
+    fn activate_pack_hooks(&mut self, pack: &packs::PackInfo) {
+        let path = pack.path.display().to_string();
+        let env_name = pack.env_var_name();
+        self.pack_hook_env
+            .retain(|(key, _)| key != &env_name && key != "DEXT_PACK_DIR");
+        self.pack_hook_env
+            .push(("DEXT_PACK_DIR".to_string(), path.clone()));
+        self.pack_hook_env.push((env_name, path));
+        if let Some(phooks) = &pack.phooks_path {
+            self.hooks = Hooks::load_file(phooks);
+        }
+    }
+
+    async fn run_pack(&mut self, selector: &str, task: &str) -> Result<()> {
+        let pack = packs::find_pack(&self.sandbox_root, selector)?;
+        self.activate_pack_hooks(&pack);
+        self.sink.emit(AgentEvent::Slash(format!(
+            "▶ pack: {} · {}\nworkflow: {}",
+            pack.name,
+            if task.trim().is_empty() {
+                "run"
+            } else {
+                task.trim()
+            },
+            pack.pack_md_path.display()
+        )));
+        let prompt = packs::pack_prompt(&pack, task)?;
+        self.chat(prompt).await
     }
 
     fn browser_recipe_hint(&self) -> Option<String> {
@@ -8562,6 +8604,11 @@ impl Agent {
                     self.browser_recipe.as_str()
                 ));
             }
+            if let Some(pack_summary) = packs::pack_summary_for_prompt(&self.sandbox_root) {
+                env.push_str("\n## Dext packs\n");
+                env.push_str(&pack_summary);
+                env.push('\n');
+            }
             env.push_str(&self.privacy.prompt_status_line());
             env.push('\n');
             return (stable, env);
@@ -8646,6 +8693,11 @@ impl Agent {
                 "browser_recipe={}\n",
                 self.browser_recipe.as_str()
             ));
+        }
+        if let Some(pack_summary) = packs::pack_summary_for_prompt(&self.sandbox_root) {
+            env.push_str("\n## Dext packs\n");
+            env.push_str(&pack_summary);
+            env.push('\n');
         }
         env.push_str(&self.privacy.prompt_status_line());
         env.push('\n');
@@ -10211,11 +10263,22 @@ impl Agent {
 
     async fn chat_inner(&mut self, mut user_input: String) -> Result<()> {
         let mut compacted_this_turn = false;
+        if let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input) {
+            self.activate_pack_hooks(&invocation.pack);
+            self.sink.emit(AgentEvent::Info(format!(
+                "[pack:{}] inferred conversational invocation",
+                invocation.pack.name
+            )));
+            user_input = packs::pack_prompt(&invocation.pack, &invocation.task)?;
+        }
         let hook_env = [("DEXT_USER_INPUT", user_input.as_str())];
-        for (out, _code) in self
-            .hooks
-            .fire("user_prompt", "", &hook_env, &self.sandbox_root)
-        {
+        for (out, _code) in self.hooks.fire(
+            "user_prompt",
+            "",
+            &hook_env,
+            &self.pack_hook_env,
+            &self.sandbox_root,
+        ) {
             let t = out.trim();
             if !t.is_empty() {
                 user_input.push_str(&format!("\n\n[hook:user_prompt]\n{t}"));
@@ -10873,10 +10936,13 @@ impl Agent {
                             ("DEXT_TOOL_INPUT", input_str.as_str()),
                         ];
                         let mut blocked: Option<String> = None;
-                        for (out, code) in
-                            self.hooks
-                                .fire("pre_tool", &name, &pre_env, &self.sandbox_root)
-                        {
+                        for (out, code) in self.hooks.fire(
+                            "pre_tool",
+                            &name,
+                            &pre_env,
+                            &self.pack_hook_env,
+                            &self.sandbox_root,
+                        ) {
                             if code != 0 {
                                 blocked = Some(format!(
                                     "pre_tool hook blocked (exit {code}):\n{}",
@@ -11102,10 +11168,13 @@ impl Agent {
                     ("DEXT_TOOL_INPUT", input_str.as_str()),
                     ("DEXT_TOOL_RESULT", content.as_str()),
                 ];
-                for (out, _code) in
-                    self.hooks
-                        .fire("post_tool", &name, &post_env, &self.sandbox_root)
-                {
+                for (out, _code) in self.hooks.fire(
+                    "post_tool",
+                    &name,
+                    &post_env,
+                    &self.pack_hook_env,
+                    &self.sandbox_root,
+                ) {
                     let t = out.trim();
                     if !t.is_empty() {
                         content.push_str(&format!("\n\n[hook:post_tool]\n{t}"));
@@ -12146,6 +12215,7 @@ impl Agent {
             session_usage: Usage::default(),
             interrupt: self.interrupt.clone(),
             hooks: self.hooks.clone(),
+            pack_hook_env: self.pack_hook_env.clone(),
             state_lock: self.state_lock.clone(),
             session_enabled: self.session_enabled,
             latest_session_path: self.latest_session_path.clone(),
@@ -13904,6 +13974,47 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
     let w = &mut out;
 
     match cmd {
+        "pack" | "packs" => {
+            let mut parts = arg.splitn(3, char::is_whitespace);
+            let sub = parts.next().unwrap_or("").trim();
+            match sub {
+                "" | "list" | "ls" => {
+                    let _ = write!(w, "{}", packs::render_pack_listing(&agent.sandbox_root));
+                }
+                "inspect" | "info" | "show" => {
+                    let selector = parts.next().unwrap_or("").trim();
+                    if selector.is_empty() {
+                        let _ = writeln!(w, "usage: /pack inspect <name>");
+                    } else {
+                        match packs::render_pack_inspect(&agent.sandbox_root, selector) {
+                            Ok(text) => {
+                                let _ = write!(w, "{text}");
+                            }
+                            Err(e) => {
+                                let _ = writeln!(w, "{e:#}");
+                            }
+                        }
+                    }
+                }
+                "run" | "use" | "start" => {
+                    let selector = parts.next().unwrap_or("").trim();
+                    let task = parts.next().unwrap_or("").trim();
+                    if selector.is_empty() {
+                        let _ = writeln!(w, "usage: /pack run <name> <task>");
+                    } else if task.is_empty() {
+                        let _ = writeln!(w, "usage: /pack run {selector} <task>");
+                    } else {
+                        let _ = writeln!(
+                            w,
+                            "pack run is async; use /pack run from the interactive loop, or `dext pack run {selector} {task}`"
+                        );
+                    }
+                }
+                _ => {
+                    let _ = writeln!(w, "usage: /pack [list|inspect <name>|run <name> <task>]");
+                }
+            }
+        }
         "help" | "?" => {
             let _ = writeln!(w, "commands:");
             let _ = writeln!(w, "  /help                     show this");
@@ -13944,6 +14055,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(
                 w,
                 "  /browser [off|agent-browser] optional browser automation recipe"
+            );
+            let _ = writeln!(
+                w,
+                "  /pack [list|inspect|run]  discover or invoke Dext packs"
             );
             let _ = writeln!(
                 w,
@@ -15737,6 +15852,7 @@ pub(crate) struct CliOptions {
     pub(crate) thinking_effort: Option<ThinkingEffort>,
     pub(crate) context_mode: Option<ContextMode>,
     pub(crate) tool_profile: Option<ToolProfile>,
+    pub(crate) pack: Option<String>,
 }
 
 pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
@@ -15756,6 +15872,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut thinking_effort: Option<ThinkingEffort> = None;
     let mut context_mode: Option<ContextMode> = None;
     let mut tool_profile: Option<ToolProfile> = None;
+    let mut pack: Option<String> = None;
     let mut i = 0usize;
     while i < argv.len() {
         let arg = &argv[i];
@@ -15790,6 +15907,13 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                 tool_profile = Some(ToolProfile::parse(value).ok_or_else(|| {
                     anyhow::anyhow!("invalid --tool-profile '{value}' (expected full|lean)")
                 })?);
+            }
+            "--pack" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--pack requires a pack name"))?;
+                pack = Some(value.clone());
             }
             "--budget" => {
                 i += 1;
@@ -15913,6 +16037,13 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     anyhow::anyhow!("invalid context mode '{value}' (expected standard|frugal)")
                 })?);
             }
+            _ if arg.starts_with("--pack=") => {
+                let value = arg.trim_start_matches("--pack=");
+                if value.trim().is_empty() {
+                    anyhow::bail!("--pack requires a pack name");
+                }
+                pack = Some(value.to_string());
+            }
             _ if arg.starts_with("--tool-profile=") => {
                 let value = arg.trim_start_matches("--tool-profile=");
                 tool_profile = Some(ToolProfile::parse(value).ok_or_else(|| {
@@ -16002,6 +16133,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         thinking_effort,
         context_mode,
         tool_profile,
+        pack,
     })
 }
 
@@ -16062,7 +16194,7 @@ async fn main() -> Result<()> {
         default_panic(info);
     }));
 
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().is_some_and(|a| a == "subagent-worker") {
         if argv.len() != 3 {
             eprintln!("usage: dext subagent-worker INPUT_JSON OUTPUT_MD");
@@ -16082,6 +16214,42 @@ async fn main() -> Result<()> {
         println!("dext {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if argv.first().is_some_and(|a| a == "pack" || a == "packs") {
+        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let sub = argv.get(1).map(String::as_str).unwrap_or("list");
+        match sub {
+            "" | "list" | "ls" => {
+                println!("{}", packs::render_pack_listing(&root));
+                return Ok(());
+            }
+            "inspect" | "info" | "show" => {
+                let Some(selector) = argv.get(2) else {
+                    eprintln!("usage: dext pack inspect <name>");
+                    release_registered_locks();
+                    std::process::exit(2);
+                };
+                println!("{}", packs::render_pack_inspect(&root, selector)?);
+                return Ok(());
+            }
+            "run" | "use" | "start" => {
+                if argv.len() < 4 {
+                    eprintln!("usage: dext pack run <name> <task>");
+                    release_registered_locks();
+                    std::process::exit(2);
+                }
+                let mut forwarded = argv[3..].to_vec();
+                forwarded.insert(0, "--pack".to_string());
+                forwarded.insert(1, argv[2].clone());
+                argv = forwarded;
+            }
+            _ => {
+                eprintln!("usage: dext pack [list|inspect <name>|run <name> <task>]");
+                release_registered_locks();
+                std::process::exit(2);
+            }
+        }
+    }
+
     if let Some(code) = handle_auth_cli(&argv)? {
         release_registered_locks();
         std::process::exit(code);
@@ -16109,6 +16277,8 @@ async fn main() -> Result<()> {
                 runtime_tool.name, runtime_tool.description
             );
         }
+        println!("       dext pack list|inspect|run ...  discover or invoke Dext packs");
+        println!("       dext --pack NAME TASK  invoke a pack in one-shot mode");
         println!("       dext session analyze|grep|failures|verify-log|decisions [session]");
         println!(
             "       dext --no-session     run without project state lock, latest session, or log writes"
@@ -16135,7 +16305,7 @@ async fn main() -> Result<()> {
         println!("       dext auth ...         provider/model/auth management commands");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENROUTER_API_KEY, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENROUTER_API_KEY, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }
@@ -16283,6 +16453,34 @@ async fn main() -> Result<()> {
         if agent.browser_recipe() != BrowserRecipe::Disabled {
             eprintln!("[browser] recipe {}", agent.browser_recipe().as_str());
         }
+    }
+
+    if let Some(pack_name) = opts.pack.clone() {
+        let task = one_shot_task.clone().unwrap_or_default();
+        if task.trim().is_empty() {
+            eprintln!("usage: dext --pack <name> <task>");
+            release_registered_locks();
+            std::process::exit(2);
+        }
+        let result = agent.run_pack(&pack_name, &task).await;
+        autosave_latest(&mut agent);
+        return match result {
+            Ok(()) => {
+                if !opts.output.is_json() {
+                    println!();
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if opts.output.is_json() {
+                    agent.sink.emit(AgentEvent::Error(format!("{e:#}")));
+                } else {
+                    eprintln!("[error] {e:#}");
+                }
+                release_registered_locks();
+                std::process::exit(1);
+            }
+        };
     }
 
     let use_tui = !opts.no_tui
@@ -16471,6 +16669,33 @@ async fn main() -> Result<()> {
             }
             autosave_latest(&mut agent);
             continue;
+        }
+        if input == "/pack"
+            || input.starts_with("/pack ")
+            || input == "/packs"
+            || input.starts_with("/packs ")
+        {
+            let raw = input
+                .trim_start_matches("/packs")
+                .trim_start_matches("/pack")
+                .trim();
+            let mut parts = raw.splitn(3, char::is_whitespace);
+            let sub = parts.next().unwrap_or("");
+            if matches!(sub, "run" | "use" | "start") {
+                let selector = parts.next().unwrap_or("").trim();
+                let task = parts.next().unwrap_or("").trim();
+                if selector.is_empty() || task.is_empty() {
+                    println!("usage: /pack run <name> <task>");
+                } else {
+                    agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Err(e) = agent.run_pack(selector, task).await {
+                        eprintln!("[pack error] {e:#}");
+                    }
+                    agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                autosave_latest(&mut agent);
+                continue;
+            }
         }
 
         if let Some(keep_going) = handle_slash(&input, &mut agent) {

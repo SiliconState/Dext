@@ -69,6 +69,7 @@ fn test_agent(root: &Path) -> Agent {
         session_usage: Usage::default(),
         interrupt: Arc::new(AtomicBool::new(false)),
         hooks: Hooks::default(),
+        pack_hook_env: Vec::new(),
         state_lock: None,
         session_enabled: true,
         latest_session_path: latest_session_path(root),
@@ -3664,7 +3665,7 @@ fn hooks_loads_project_hooks_json_by_default() {
     .expect("write hooks.json");
 
     let hooks = Hooks::load(&root);
-    let out = hooks.fire("user_prompt", "", &[], &root);
+    let out = hooks.fire("user_prompt", "", &[], &[], &root);
     assert_eq!(out.len(), 1);
     assert!(out[0].0.contains("pack"), "{}", out[0].0);
 
@@ -3682,7 +3683,7 @@ fn hooks_capture_is_capped() {
         ..Default::default()
     };
 
-    let out = hooks.fire("pre_tool", "read_file", &[], &root);
+    let out = hooks.fire("pre_tool", "read_file", &[], &[], &root);
     assert_eq!(out.len(), 1);
     assert!(
         out[0].0.contains("hook stdout capped after"),
@@ -7099,4 +7100,127 @@ async fn compact_uses_deterministic_evidence_fallback_when_summary_request_error
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-discovery");
+    let pack_dir = root.join(".dext/packs/demo");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(
+        pack_dir.join("PACK.md"),
+        "---\nname: demo\ndescription: Demo workflow\n---\n# Demo pack\n\nDo the demo workflow.\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let pack = packs::find_pack(&root, "demo")?;
+    assert_eq!(pack.name, "demo");
+    assert_eq!(pack.description, "Demo workflow");
+    assert_eq!(pack.env_var_name(), "DEXT_PACK_DEMO_DIR");
+    assert!(pack.pack_md_path.ends_with("PACK.md"));
+
+    let listing = packs::render_pack_listing(&root);
+    assert!(listing.contains("demo — Demo workflow"), "{listing}");
+    assert!(listing.contains("/pack run <name> <task>"), "{listing}");
+
+    let prompt = packs::pack_prompt(&pack, "ship it")?;
+    assert!(prompt.contains("[dext pack invocation]"), "{prompt}");
+    assert!(prompt.contains("Do the demo workflow."), "{prompt}");
+    assert!(
+        prompt.contains("User task for this pack:\nship it"),
+        "{prompt}"
+    );
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("slash-pack");
+    let pack_dir = root.join("packs/demo");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(
+        pack_dir.join("PACK.md"),
+        "---\nname: demo\ndescription: Slash demo\n---\n# Demo\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(handle_slash("/pack list", &mut agent), Some(true));
+    assert_eq!(handle_slash("/pack inspect demo", &mut agent), Some(true));
+    let slash_text = drain_events(&mut rx)
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    assert!(slash_text.contains("demo — Slash demo"), "{slash_text}");
+    assert!(slash_text.contains("pack: demo"), "{slash_text}");
+    assert!(slash_text.contains("workflow:"), "{slash_text}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn conversational_pack_inference_requires_invocation_intent() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-inference");
+    let pack_dir = root.join("packs/demo");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(pack_dir.join("PACK.md"), "---\nname: demo\n---\n# Demo\n")?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let invocation = packs::infer_pack_invocation(&root, "run demo on faster tests")
+        .expect("expected pack invocation");
+    assert_eq!(invocation.pack.name, "demo");
+    assert_eq!(invocation.task, "run demo on faster tests");
+    assert!(packs::infer_pack_invocation(&root, "how do I run demo?").is_none());
+    assert!(packs::infer_pack_invocation(&root, "explain demo").is_none());
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn parse_cli_options_accepts_pack_flag() -> Result<()> {
+    let opts = parse_cli_options(vec![
+        "--pack".to_string(),
+        "demo".to_string(),
+        "do".to_string(),
+        "thing".to_string(),
+    ])?;
+    assert_eq!(opts.pack.as_deref(), Some("demo"));
+    assert_eq!(opts.positional, vec!["do".to_string(), "thing".to_string()]);
+
+    let opts = parse_cli_options(vec!["--pack=demo".to_string(), "do thing".to_string()])?;
+    assert_eq!(opts.pack.as_deref(), Some("demo"));
+    assert_eq!(opts.positional, vec!["do thing".to_string()]);
+    Ok(())
 }

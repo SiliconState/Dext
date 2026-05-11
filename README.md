@@ -87,6 +87,9 @@ dext --fork
 dext sessions
 dext session export latest html dext-session.html
 dext session analyze latest
+dext pack list
+dext pack inspect autoresearch
+dext pack run autoresearch "optimize the benchmark in this repo"
 dext --eval
 ```
 
@@ -104,10 +107,41 @@ Interactive slash commands:
 /context standard|frugal
 /tool-profile lean|full
 /compact status
+/pack list
+/pack inspect autoresearch
+/pack run autoresearch optimize the benchmark in this repo
 /save name
 /export html path
 /sessions analyze|grep|failures|verify-log|decisions
 ```
+
+
+## Packs
+
+Packs are source-first workflow bundles with a `PACK.md`. Dext discovers packs from `.dext/packs`, `packs`, `DEXT_PACKS_DIR`, `~/.dext/packs`, and bundled repository packs.
+
+Invoke a pack conversationally:
+
+```text
+run autoresearch on improving this project benchmark
+```
+
+Or invoke it explicitly:
+
+```text
+/pack run autoresearch improve this benchmark
+```
+
+CLI equivalents:
+
+```bash
+dext pack list
+dext pack inspect autoresearch
+dext pack run autoresearch "improve this benchmark"
+dext --pack autoresearch "improve this benchmark"
+```
+
+If a pack has `phooks.json`, Dext activates those hook templates for that invocation and passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to hook processes.
 
 ## Configuration and state
 

@@ -81,6 +81,8 @@ Useful slash commands:
 /save name                    save a named session
 /export html session.html     export transcript
 /sessions analyze             inspect latest session
+/pack list                    list discovered packs
+/pack run autoresearch <task> invoke a pack in-session
 /quit                         exit
 ```
 
@@ -91,6 +93,8 @@ dext "inspect this repo and list missing tests"
 printf 'summarize stdin\n' | dext -p
 dext --output json "return a short answer"
 dext --output stream-json "run a small diagnostic"
+dext pack run autoresearch "improve this benchmark"
+dext --pack autoresearch "improve this benchmark"
 ```
 
 Use `--no-session` for disposable runs that should not write project session/log state:
@@ -98,6 +102,35 @@ Use `--no-session` for disposable runs that should not write project session/log
 ```bash
 dext --no-session "quick answer only"
 ```
+
+
+## Packs
+
+Dext packs are regular source directories containing `PACK.md` plus optional helper scripts and `phooks.json`. Discovery checks:
+
+1. `DEXT_PACK_<NAME>_DIR` environment variables
+2. project `.dext/packs` and `packs`
+3. `DEXT_PACKS_DIR` entries
+4. user `~/.dext/packs`
+5. bundled packs in the Dext repository
+
+Use:
+
+```bash
+dext pack list
+dext pack inspect autoresearch
+dext pack run autoresearch "improve this benchmark"
+```
+
+Inside a session:
+
+```text
+/pack list
+/pack inspect autoresearch
+/pack run autoresearch improve this benchmark
+```
+
+Conversational invocation also works when the message clearly asks to run/use a known pack, for example: `run autoresearch on reducing test runtime`.
 
 ## Context and cost controls
 
@@ -172,6 +205,7 @@ DEXT_HOME=~/.dext
 DEXT_SESSIONS_DIR=~/.dext/sessions
 DEXT_LOGS_DIR=~/.dext/logs
 DEXT_LOG_ARCHIVES=4
+DEXT_PACKS_DIR=~/.dext/packs:/path/to/project-packs
 ```
 
 Runtime controls:

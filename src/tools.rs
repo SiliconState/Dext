@@ -31,13 +31,19 @@ pub(crate) fn runtime_tool_definitions() -> Vec<RuntimeTool> {
 }
 
 pub(crate) fn slash_command_definitions() -> Vec<SlashCommand> {
-    vec![SlashCommand {
-        name: "subagent",
-        usage: "/subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]",
-        description: "Run a user-requested worker while keeping delegation out of provider-visible tools.",
-    }]
+    vec![
+        SlashCommand {
+            name: "subagent",
+            usage: "/subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]",
+            description: "Run a user-requested worker while keeping delegation out of provider-visible tools.",
+        },
+        SlashCommand {
+            name: "pack",
+            usage: "/pack [list|inspect <name>|run <name> <task>]",
+            description: "Discover and invoke source-first Dext packs without provider-visible tools.",
+        },
+    ]
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ToolProfile {
