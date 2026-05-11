@@ -1555,6 +1555,7 @@ async fn run_subagent_worker(input_path: &Path, output_path: &Path) -> Result<()
     )?;
     let root = std::env::current_dir()?;
     let mut agent = Agent::new_with_sandbox(Some(root), false)?;
+    agent.prewarm_connection();
     agent.silent = false;
     agent.pretty = io::stdout().is_terminal();
     agent.sink = Box::new(ConsoleSink::new(agent.pretty, false));
@@ -8212,6 +8213,21 @@ impl Agent {
     fn cycle_thinking_effort(&mut self, step: i8) -> ThinkingEffort {
         self.thinking_effort = self.thinking_effort.cycle(step);
         self.thinking_effort
+    }
+
+    /// Pre-warm the TCP+TLS connection to the provider API by sending a
+    /// lightweight request. The actual API call will reuse the warm connection.
+    fn prewarm_connection(&self) {
+        let client = self.client.get_or_init(reqwest::Client::new).clone();
+        let url = provider_request_url(&self.base_url, self.api_provider);
+        // Fire-and-forget HEAD request to warm TLS
+        let _ = tokio::spawn(async move {
+            let _ = client
+                .head(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+        });
     }
 
     fn http_client(&self) -> &reqwest::Client {
@@ -16303,6 +16319,7 @@ async fn main() -> Result<()> {
     };
 
     let mut agent = Agent::new_with_sandbox(opts.cd.clone(), !opts.no_session && !opts.fork)?;
+    agent.prewarm_connection();
     if let Some(profile) = std::env::var("DEXT_APPROVAL")
         .ok()
         .and_then(|v| ApprovalProfile::parse(&v))
