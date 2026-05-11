@@ -68,6 +68,7 @@ fn test_agent(root: &Path) -> Agent {
         max_iterations: Some(1),
         session_usage: Usage::default(),
         interrupt: Arc::new(AtomicBool::new(false)),
+        shelf_registry: shelves::ShelfRegistry::discover(root),
         hooks: Hooks::default(),
         pack_hook_env: Vec::new(),
         state_lock: None,
@@ -3795,6 +3796,55 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
 }
 
 #[test]
+fn compose_system_parts_includes_typed_shelf_registry_summary() {
+    let _guard = env_lock();
+    let root = temp_test_dir("typed-shelf-system-summary");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let shelf_dir = root.join(".dext/shelves/community");
+    std::fs::create_dir_all(&shelf_dir).expect("create shelf dir");
+    std::fs::write(
+        shelf_dir.join("shelf.json"),
+        r#"{
+  "id": "community",
+  "name": "Community",
+  "description": "shared typed abilities",
+  "mode": "always",
+  "packs": [{
+    "id": "research",
+    "name": "Research",
+    "version": "0.1.0",
+    "description": "research helpers",
+    "abilities": [{"ability": "context", "name": "notes", "description": "curated notes", "budget": 1024}]
+  }]
+}"#,
+    )
+    .expect("write shelf manifest");
+    unsafe {
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let agent = test_agent(&root);
+    let (_stable, env) = agent.compose_system_parts();
+    assert!(env.contains("## Dext shelves"), "{env}");
+    assert!(
+        env.contains("Typed shelf registry: 1 shelf(s), 1 resolved ability metadata entry."),
+        "{env}"
+    );
+    assert!(
+        env.contains("context:notes (community/research, curated notes, budget 1024)"),
+        "{env}"
+    );
+    assert!(env.contains("not extra provider-visible tools"), "{env}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn default_tool_profile_is_lean_for_prompt_budget() {
     assert_eq!(ToolProfile::default(), ToolProfile::Lean);
 }
@@ -4549,6 +4599,7 @@ fn provider_runtime_and_slash_registries_are_split() {
     assert!(slash_names.contains("subagent"));
     assert!(slash_names.contains("browser"));
     assert!(slash_names.contains("pack"));
+    assert!(slash_names.contains("shelves"));
     assert!(!slash_names.contains("read_file"));
     assert!(provider_names.is_disjoint(&runtime_names));
 }
@@ -7268,12 +7319,70 @@ fn packs_discover_shelf_pack_and_apply_precedence() -> Result<()> {
     let summary = packs::pack_summary_for_prompt(&root).unwrap_or_default();
     assert!(summary.contains("demo[community]"), "{summary}");
 
+    let registry = shelves::ShelfRegistry::discover(&root);
+    assert!(registry.is_empty());
+
     unsafe {
         std::env::remove_var("DEXT_HOME");
         std::env::remove_var("DEXT_SHELVES_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[test]
+fn slash_shelves_lists_typed_manifest_registry() {
+    let _guard = env_lock();
+    let root = temp_test_dir("slash-shelves");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let shelf_dir = root.join(".dext/shelves/community");
+    std::fs::create_dir_all(&shelf_dir).expect("create shelf dir");
+    std::fs::write(
+        shelf_dir.join("shelf.json"),
+        r#"{
+  "id": "community",
+  "name": "Community",
+  "description": "shared typed abilities",
+  "packs": [{
+    "id": "research",
+    "name": "Research",
+    "version": "0.1.0",
+    "description": "research helpers",
+    "abilities": [{"ability": "command", "name": "scan", "usage": "scan <target>", "description": "scan target"}]
+  }]
+}"#,
+    )
+    .expect("write shelf manifest");
+    unsafe {
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(handle_slash("/shelves", &mut agent), Some(true));
+    let slash = drain_events(&mut rx)
+        .into_iter()
+        .find_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(slash.contains("shelves:"), "{slash}");
+    assert!(
+        slash.contains("Community — shared typed abilities"),
+        "{slash}"
+    );
+    assert!(slash.contains("command:scan — scan target"), "{slash}");
+    assert!(slash.contains("scope: project"), "{slash}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

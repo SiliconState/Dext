@@ -47,6 +47,11 @@ pub(crate) fn slash_command_definitions() -> Vec<SlashCommand> {
             usage: "/pack [list|inspect <name>|run <name> <task>]",
             description: "Discover and invoke source-first Dext packs without provider-visible tools.",
         },
+        SlashCommand {
+            name: "shelves",
+            usage: "/shelves",
+            description: "List typed shelf manifests and provider-neutral ability metadata.",
+        },
     ]
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

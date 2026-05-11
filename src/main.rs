@@ -6635,9 +6635,17 @@ fn prompt_permission(name: &str, input: &Value, pretty: bool) -> Choice {
 const DEFAULT_SYSTEM: &str = "You are dext, a terse coding assistant running as a CLI agent on the user's machine.
 
 Use only tools exposed in the current API tool list. Do not assume unavailable tools exist.
-Runtime: privileged ops are auto-approved; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested.
-Project context files such as DEXT.md and recall.md are injected separately when present.
-Be source-first, concise, and verify realistic changes before declaring done.";
+Runtime: privileged ops are auto-approved; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested. Avoid mutating external state stores directly.
+Project state: use todo_read/todo_write for nontrivial work. Treat DEXT.md/recall.md as guidance; update recall.md only for durable decisions.
+Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Avoid broad reads; paginate. Use read-only tools in parallel.
+Editing: always read before editing. Use edit_file for small changes, multi_edit for batches, write_file for new files. Checkpoint before large edits.
+Git: inspect status/diff before editing tracked files. Use git_commit (not raw git). Use git_log only when history is needed.
+Shell: preserve pipefail in bash. Dext rg/fd/jq/http are direct tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Validate external sources before scaling. On auth failures, ask for credentials.
+Browser: if browser_recipe=agent-browser, invoke agent-browser only when useful; start with agent-browser skills get core.
+Subagents: do not call subagent directly; suggest /subagent if delegation is requested. Review subagent output before acting.
+Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
+Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
+Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.";
 
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     let mut sections = Vec::new();
@@ -7885,6 +7893,7 @@ struct Agent {
     max_iterations: Option<u32>,
     session_usage: Usage,
     interrupt: Arc<AtomicBool>,
+    shelf_registry: shelves::ShelfRegistry,
     hooks: Hooks,
     pack_hook_env: Vec<(String, String)>,
     state_lock: Option<Arc<ProjectStateLock>>,
@@ -8023,6 +8032,7 @@ impl Agent {
             tools,
             allowed: HashSet::new(),
             deny_tools: HashSet::new(),
+            shelf_registry: shelves::ShelfRegistry::discover(&sandbox_root),
             hooks: Hooks::load(&sandbox_root),
             pack_hook_env: Vec::new(),
             sandbox_root,
@@ -8492,6 +8502,7 @@ impl Agent {
         };
 
         self.sandbox_root = root;
+        self.shelf_registry = shelves::ShelfRegistry::discover(&self.sandbox_root);
         self.hooks = Hooks::load(&self.sandbox_root);
         self.git_context = git_summary(&self.sandbox_root);
         self.refresh_state_paths();
@@ -8755,6 +8766,12 @@ impl Agent {
                 env.push_str(&pack_summary);
                 env.push('\n');
             }
+            if let Some(shelf_summary) = shelves::registry_summary_for_prompt(&self.shelf_registry)
+            {
+                env.push_str("\n## Dext shelves\n");
+                env.push_str(&shelf_summary);
+                env.push('\n');
+            }
             env.push_str(&self.privacy.prompt_status_line());
             env.push('\n');
             return SystemParts {
@@ -8847,6 +8864,11 @@ impl Agent {
         if let Some(pack_summary) = packs::pack_summary_for_prompt(&self.sandbox_root) {
             env.push_str("\n## Dext packs\n");
             env.push_str(&pack_summary);
+            env.push('\n');
+        }
+        if let Some(shelf_summary) = shelves::registry_summary_for_prompt(&self.shelf_registry) {
+            env.push_str("\n## Dext shelves\n");
+            env.push_str(&shelf_summary);
             env.push('\n');
         }
         env.push_str(&self.privacy.prompt_status_line());
@@ -12468,6 +12490,7 @@ impl Agent {
             max_iterations: max_iter,
             session_usage: Usage::default(),
             interrupt: self.interrupt.clone(),
+            shelf_registry: shelves::ShelfRegistry::discover(&self.sandbox_root),
             hooks: self.hooks.clone(),
             pack_hook_env: self.pack_hook_env.clone(),
             state_lock: self.state_lock.clone(),
@@ -14270,6 +14293,13 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 }
             }
         }
+        "shelf" | "shelves" => {
+            let _ = write!(
+                w,
+                "{}",
+                shelves::render_registry_listing(&agent.shelf_registry)
+            );
+        }
         "help" | "?" => {
             let _ = writeln!(w, "commands:");
             let _ = writeln!(w, "  /help                     show this");
@@ -14314,6 +14344,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(
                 w,
                 "  /pack [list|inspect|run]  discover or invoke Dext packs"
+            );
+            let _ = writeln!(
+                w,
+                "  /shelves                  list typed shelf manifests and ability metadata"
             );
             let _ = writeln!(
                 w,
@@ -16512,6 +16546,17 @@ async fn main() -> Result<()> {
             }
         }
     }
+    if argv.first().is_some_and(|a| a == "shelf" || a == "shelves") {
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        println!(
+            "{}",
+            shelves::render_registry_listing(&shelves::ShelfRegistry::discover(&root))
+        );
+        return Ok(());
+    }
 
     if let Some(code) = handle_auth_cli(&argv)? {
         release_registered_locks();
@@ -16541,6 +16586,9 @@ async fn main() -> Result<()> {
             );
         }
         println!("       dext pack list|inspect|run ...  discover or invoke Dext packs");
+        println!(
+            "       dext shelves                      list typed shelf manifests and ability metadata"
+        );
         println!("       dext --pack NAME TASK  invoke a pack in one-shot mode");
         println!("       dext session analyze|grep|failures|verify-log|decisions [session]");
         println!(

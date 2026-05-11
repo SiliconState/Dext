@@ -3,33 +3,6 @@
 Dext is a single-binary Rust coding agent. This file is auto-injected into the
 system prompt from the sandbox root, so keep it short and high-signal.
 
-## Agent workflow
-- Project state: use todo_read/todo_write for nontrivial work; update recall.md
-  only for durable prompt-worthy decisions.
-- Discovery: prefer fd for files, rg for content. Use rg first for symbols, then
-  read_symbol/focused read_file. Avoid broad reads; paginate. Use read-only tools
-  in parallel.
-- Editing: always read before editing. Use edit_file for small changes,
-  multi_edit for batches, write_file for new files. Checkpoint before large edits.
-- Git: inspect status/diff before editing tracked files. Use git_commit, not raw
-  git. Use git_log only when history is needed.
-- Shell: preserve pipefail in bash. Dext rg/fd/jq/http are direct tools, not
-  shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit
-  0. Validate external sources before scaling. On auth failures, ask for
-  credentials.
-- Browser: if browser_recipe=agent-browser, invoke agent-browser when useful;
-  start with `agent-browser skills get core --full`.
-- Subagents: do not call subagent directly; suggest /subagent if delegation is
-  requested. Review subagent output before acting.
-- Verification: narrowest checks first, realistic timeouts. Prefer
-  stdlib/existing test runners. Compare structured output semantically. Rerun
-  suites only if code changed.
-- Context: keep tool output small. Preserve exact paths/commands/decisions.
-  Avoid rereading just-written files; prefer compile/test checks. Summarize large
-  logs and share partial results early.
-- Communication: be terse. Report what changed, verification results, and gaps.
-  No narrative unless checkpointing.
-
 ## Architecture
 - `src/main.rs` — agent loop, provider HTTP, permissions/sandboxing, slash
   commands, CLI entry, eval, and remaining orchestration.

@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -128,6 +128,12 @@ impl ShelfOrigin {
     }
 }
 
+impl Default for ShelfOrigin {
+    fn default() -> Self {
+        Self::core()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ShelfMode {
@@ -136,12 +142,20 @@ pub(crate) enum ShelfMode {
     Always,
 }
 
+impl Default for ShelfMode {
+    fn default() -> Self {
+        Self::OnDemand
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ShelfManifest {
     pub(crate) id: ShelfId,
     pub(crate) name: String,
     pub(crate) description: String,
+    #[serde(default)]
     pub(crate) origin: ShelfOrigin,
+    #[serde(default)]
     pub(crate) mode: ShelfMode,
     #[serde(default)]
     pub(crate) packs: Vec<PackManifest>,
@@ -346,8 +360,24 @@ impl ShelfRegistry {
         }
     }
 
+    pub(crate) fn discover(root: &Path) -> Self {
+        let mut registry = Self::new();
+        for candidate in shelf_manifest_candidates(root) {
+            let Ok(mut shelf) = StaticShelf::from_json_file(&candidate.path) else {
+                continue;
+            };
+            shelf.manifest.origin = candidate.origin;
+            registry.register(shelf);
+        }
+        registry
+    }
+
     pub(crate) fn register(&mut self, shelf: impl Shelf + 'static) {
         self.shelves.push(Box::new(shelf));
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.shelves.is_empty()
     }
 
     pub(crate) fn manifests(&self) -> Vec<&ShelfManifest> {
@@ -430,8 +460,10 @@ impl StaticShelf {
     }
 
     pub(crate) fn from_json_file(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        let mut manifest: ShelfManifest = serde_json::from_str(&text)?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading shelf manifest {}", path.display()))?;
+        let mut manifest: ShelfManifest = serde_json::from_str(&text)
+            .with_context(|| format!("parsing shelf manifest {}", path.display()))?;
         manifest
             .origin
             .path
@@ -444,6 +476,289 @@ impl Shelf for StaticShelf {
     fn manifest(&self) -> &ShelfManifest {
         &self.manifest
     }
+}
+
+struct ShelfManifestCandidate {
+    path: PathBuf,
+    origin: ShelfOrigin,
+}
+
+fn shelf_manifest_candidates(root: &Path) -> Vec<ShelfManifestCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    let bundled_shelves = Path::new(env!("CARGO_MANIFEST_DIR")).join("shelves");
+    push_shelf_manifest_root(
+        &mut candidates,
+        &mut seen,
+        bundled_shelves,
+        ShelfScope::Core,
+    );
+    push_shelf_manifest_root(
+        &mut candidates,
+        &mut seen,
+        crate::session::dext_state_dir().join("shelves"),
+        ShelfScope::User,
+    );
+    push_shelf_manifest_root(
+        &mut candidates,
+        &mut seen,
+        root.join(".dext/shelves"),
+        ShelfScope::Project,
+    );
+    if let Some(paths) = std::env::var_os("DEXT_SHELVES_DIR") {
+        for path in std::env::split_paths(&paths) {
+            push_shelf_manifest_root(&mut candidates, &mut seen, path, ShelfScope::Run);
+        }
+    }
+
+    candidates
+}
+
+fn push_shelf_manifest_root(
+    candidates: &mut Vec<ShelfManifestCandidate>,
+    seen: &mut HashSet<PathBuf>,
+    shelf_root: PathBuf,
+    scope: ShelfScope,
+) {
+    if !shelf_root.is_dir() {
+        return;
+    }
+    push_shelf_manifest_dir(candidates, seen, &shelf_root, scope);
+    let Ok(shelves) = std::fs::read_dir(&shelf_root) else {
+        return;
+    };
+    let mut shelves = shelves.flatten().collect::<Vec<_>>();
+    shelves.sort_by_key(|entry| entry.path());
+    for shelf in shelves {
+        let is_dir = shelf.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_dir {
+            push_shelf_manifest_dir(candidates, seen, &shelf.path(), scope);
+        }
+    }
+}
+
+fn push_shelf_manifest_dir(
+    candidates: &mut Vec<ShelfManifestCandidate>,
+    seen: &mut HashSet<PathBuf>,
+    shelf_dir: &Path,
+    scope: ShelfScope,
+) {
+    let path = shelf_dir.join("shelf.json");
+    if !path.is_file() {
+        return;
+    }
+    let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    if !seen.insert(key) {
+        return;
+    }
+    candidates.push(ShelfManifestCandidate {
+        origin: ShelfOrigin {
+            scope,
+            path: Some(path.clone()),
+        },
+        path,
+    });
+}
+
+pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
+    if registry.is_empty() {
+        return "shelves: none found\nsearch paths: .dext/shelves/*/shelf.json, DEXT_SHELVES_DIR, ~/.dext/shelves/*/shelf.json, bundled shelves".to_string();
+    }
+
+    let mut out = String::from("shelves:\n");
+    for manifest in registry.manifests() {
+        let path = manifest
+            .origin
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string());
+        let ability_count: usize = manifest.packs.iter().map(|pack| pack.abilities.len()).sum();
+        out.push_str(&format!(
+            "  {} — {}\n    id: {}\n    scope: {}\n    path: {}\n    packs: {} · abilities: {}\n",
+            manifest.name,
+            empty_label(&manifest.description),
+            manifest.id.as_str(),
+            scope_label(manifest.origin.scope),
+            path,
+            manifest.packs.len(),
+            ability_count
+        ));
+    }
+
+    let resolved = registry.resolve();
+    if !resolved.is_empty() {
+        out.push_str("resolved abilities:\n");
+        for ability in resolved.iter().take(50) {
+            out.push_str(&format_resolved_ability(ability, "  "));
+            out.push('\n');
+        }
+        if resolved.len() > 50 {
+            out.push_str(&format!(
+                "  … [{} more abilities omitted]\n",
+                resolved.len() - 50
+            ));
+        }
+    }
+    out.push_str("commands: /shelves · dext shelves");
+    out
+}
+
+pub(crate) fn registry_summary_for_prompt(registry: &ShelfRegistry) -> Option<String> {
+    if registry.is_empty() {
+        return None;
+    }
+    let manifests = registry.manifests();
+    let resolved = registry.resolve();
+    let mut out = format!(
+        "Typed shelf registry: {} shelf(s), {} resolved ability metadata entr{}.",
+        manifests.len(),
+        resolved.len(),
+        if resolved.len() == 1 { "y" } else { "ies" }
+    );
+    if !resolved.is_empty() {
+        out.push_str(" Available: ");
+        out.push_str(
+            &resolved
+                .iter()
+                .take(10)
+                .map(compact_resolved_ability)
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+        if resolved.len() > 10 {
+            out.push_str(&format!("; … +{}", resolved.len() - 10));
+        }
+        out.push('.');
+    }
+    out.push_str(" These are provider-neutral registry records, not extra provider-visible tools; use normal Dext tools or pack-local helpers to act on them.");
+    Some(out)
+}
+
+fn compact_resolved_ability(resolved: &ResolvedAbility) -> String {
+    let (kind, name) = resolved.ability.key();
+    format!(
+        "{kind}:{name} ({}/{}, {})",
+        resolved.shelf.as_str(),
+        resolved.pack.as_str(),
+        ability_short_description(&resolved.ability)
+    )
+}
+
+fn format_resolved_ability(resolved: &ResolvedAbility, indent: &str) -> String {
+    let (kind, name) = resolved.ability.key();
+    format!(
+        "{indent}{kind}:{name} — {}\n{indent}  shelf: {} · pack: {} · scope: {}",
+        ability_long_description(&resolved.ability),
+        resolved.shelf.as_str(),
+        resolved.pack.as_str(),
+        scope_label(resolved.origin.scope)
+    )
+}
+
+fn ability_short_description(ability: &Ability) -> String {
+    match ability {
+        Ability::Tool(tool) => empty_label(&tool.description).to_string(),
+        Ability::Command(command) => empty_label(&command.description).to_string(),
+        Ability::Hook(hook) => format!("signals {}", signal_list(&hook.signals)),
+        Ability::Context(context) => format!(
+            "{}, budget {}",
+            empty_label(&context.description),
+            context.budget
+        ),
+    }
+}
+
+fn ability_long_description(ability: &Ability) -> String {
+    match ability {
+        Ability::Tool(tool) => format!(
+            "{} · exposure: {} · grants: {}",
+            empty_label(&tool.description),
+            exposure_label(tool.exposure),
+            grant_list(&tool.grants)
+        ),
+        Ability::Command(command) => format!(
+            "{} · usage: {}",
+            empty_label(&command.description),
+            empty_label(&command.usage)
+        ),
+        Ability::Hook(hook) => format!("signals {}", signal_list(&hook.signals)),
+        Ability::Context(context) => format!(
+            "{} · budget: {}",
+            empty_label(&context.description),
+            context.budget
+        ),
+    }
+}
+
+fn empty_label(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "(none)"
+    } else {
+        value.trim()
+    }
+}
+
+fn scope_label(scope: ShelfScope) -> &'static str {
+    match scope {
+        ShelfScope::Core => "core",
+        ShelfScope::User => "user",
+        ShelfScope::Project => "project",
+        ShelfScope::Run => "run",
+    }
+}
+
+fn exposure_label(exposure: Exposure) -> &'static str {
+    match exposure {
+        Exposure::Hidden => "hidden",
+        Exposure::OnDemand => "on_demand",
+        Exposure::Visible => "visible",
+    }
+}
+
+fn grant_label(grant: Grant) -> &'static str {
+    match grant {
+        Grant::Read => "read",
+        Grant::Write => "write",
+        Grant::Network => "network",
+        Grant::Process => "process",
+        Grant::Secret => "secret",
+        Grant::Browser => "browser",
+    }
+}
+
+fn signal_label(signal: SignalKind) -> &'static str {
+    match signal {
+        SignalKind::Load => "load",
+        SignalKind::Prompt => "prompt",
+        SignalKind::Tool => "tool",
+        SignalKind::Turn => "turn",
+        SignalKind::Compact => "compact",
+        SignalKind::Shutdown => "shutdown",
+    }
+}
+
+fn grant_list(grants: &[Grant]) -> String {
+    if grants.is_empty() {
+        return "none".to_string();
+    }
+    grants
+        .iter()
+        .map(|grant| grant_label(*grant))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn signal_list(signals: &[SignalKind]) -> String {
+    if signals.is_empty() {
+        return "none".to_string();
+    }
+    signals
+        .iter()
+        .map(|signal| signal_label(*signal))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(crate) fn shelf_path(root: &Path, id: &ShelfId) -> PathBuf {
@@ -670,6 +985,84 @@ mod tests {
         match &manifest.packs[0].abilities[0] {
             Ability::Context(context) => assert_eq!(context.budget, 1024),
             other => panic!("expected context ability, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn registry_discovers_manifests_and_resolves_precedence() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "dext-shelf-registry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project_shelf = root.join(".dext/shelves/project");
+        let env_shelf = root.join("env-shelves/community");
+        std::fs::create_dir_all(&project_shelf).unwrap();
+        std::fs::create_dir_all(&env_shelf).unwrap();
+        std::fs::write(
+            project_shelf.join("shelf.json"),
+            r#"{
+  "id": "project",
+  "name": "Project",
+  "description": "project abilities",
+  "packs": [{
+    "id": "search",
+    "name": "Search",
+    "version": "0.1.0",
+    "description": "search helpers",
+    "abilities": [{"ability": "tool", "name": "search", "description": "project search", "schema": {"type": "object"}, "grants": ["read"], "exposure": "on_demand"}]
+  }]
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            env_shelf.join("shelf.json"),
+            r#"{
+  "id": "community",
+  "name": "Community",
+  "description": "env abilities",
+  "packs": [{
+    "id": "search",
+    "name": "Search",
+    "version": "0.1.0",
+    "description": "search helpers",
+    "abilities": [{"ability": "tool", "name": "search", "description": "run search", "schema": {"type": "object"}, "grants": ["network"], "exposure": "visible"}]
+  }]
+}"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("DEXT_SHELVES_DIR", root.join("env-shelves"));
+            std::env::set_var("DEXT_HOME", root.join("home"));
+        }
+
+        let registry = ShelfRegistry::discover(&root);
+        assert_eq!(registry.manifests().len(), 2);
+        let resolved = registry.resolve();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].shelf, ShelfId::new("community").unwrap());
+        assert_eq!(resolved[0].origin.scope, ShelfScope::Run);
+        match &resolved[0].ability {
+            Ability::Tool(tool) => assert_eq!(tool.description, "run search"),
+            other => panic!("expected tool, got {other:?}"),
+        }
+        let listing = render_registry_listing(&registry);
+        assert!(listing.contains("scope: run"), "{listing}");
+        assert!(listing.contains("tool:search — run search"), "{listing}");
+        let summary = registry_summary_for_prompt(&registry).unwrap();
+        assert!(
+            summary.contains("tool:search (community/search, run search)"),
+            "{summary}"
+        );
+
+        unsafe {
+            std::env::remove_var("DEXT_HOME");
+            std::env::remove_var("DEXT_SHELVES_DIR");
         }
         let _ = std::fs::remove_dir_all(root);
     }
