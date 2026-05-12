@@ -1775,18 +1775,33 @@ fn phase_status_text(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
     let rest = trimmed.strip_prefix("[phase:")?;
     let (phase, msg) = rest.split_once(']')?;
+    let phase = phase.trim();
     let msg = msg.trim();
-    let friendly =
-        if phase.contains("synthesize") || msg.contains("final") || msg.contains("deliver") {
-            "Summarizing…"
-        } else if phase.contains("tool") || msg.contains("tool") || msg.contains("scal") {
-            "Running tools…"
-        } else if phase.contains("fix") || msg.contains("fix") {
-            "Applying changes…"
-        } else {
-            "Thinking…"
-        };
-    Some(friendly.to_string())
+    let phase_label = match phase {
+        "discover" => "Discovery",
+        "tool" | "tools" => "Tools",
+        "fix" => "Applying changes",
+        "synthesize" => "Final response",
+        other if !other.is_empty() => other,
+        _ => "Progress",
+    };
+    if msg.is_empty() {
+        Some(phase_label.to_string())
+    } else {
+        Some(format!("{phase_label}: {msg}"))
+    }
+}
+
+fn objective_status_text(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let body = trimmed
+        .strip_prefix("[objective:")?
+        .strip_suffix(']')?
+        .trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!("Objective: {body}"))
 }
 
 fn todo_text_from_line(line: &str) -> String {
@@ -2084,17 +2099,14 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
     let mut spans = vec![Span::styled(marker, Style::default().fg(marker_color))];
 
     spans.push(Span::styled(
-        clamp_chars(&home_tilde(&state.sandbox), 34),
+        home_tilde(&state.sandbox),
         Style::default().fg(Color::Green),
     ));
 
     if let Some(branch) = &state.git_branch {
+        spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
-            " │ branch: ",
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            branch.clone(),
+            format!("({})", clamp_chars(branch, 28)),
             Style::default().fg(Color::Magenta),
         ));
     }
@@ -5300,12 +5312,14 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                     )]));
                 }
             } else if trimmed.starts_with("[objective:") {
-                lines.push(Line::from(vec![Span::styled(
-                    "agent objective noted".to_string(),
-                    Style::default()
-                        .fg(Color::Indexed(242))
-                        .add_modifier(Modifier::ITALIC),
-                )]));
+                if let Some(label) = objective_status_text(trimmed) {
+                    lines.push(Line::from(vec![Span::styled(
+                        label,
+                        Style::default()
+                            .fg(Color::Indexed(242))
+                            .add_modifier(Modifier::ITALIC),
+                    )]));
+                }
             } else if trimmed.starts_with("* provider '") && trimmed.contains(" models:") {
                 let body = trimmed.trim_start_matches("* ");
                 lines.push(Line::from(vec![
@@ -6579,10 +6593,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let input = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(
-                " Message ",
-                Style::default().fg(Color::DarkGray),
-            ))
             .title_bottom(
                 Line::from(Span::styled(
                     input_hint_text(state),
@@ -7792,6 +7802,60 @@ mod tests {
         assert!(rendered.starts_with("● ."), "{rendered}");
         assert!(!rendered.contains("trust●"), "{rendered}");
         assert_eq!(input_border_style(&state).fg, Some(TRUST_INPUT_BORDER));
+    }
+
+    #[test]
+    fn status_spans_render_branch_between_sandbox_and_model() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.provider_label = "chatgpt".to_string();
+        state.api_family = "chatgpt-responses".to_string();
+        state.git_branch = Some("status-branch (dirty)".to_string());
+
+        let rendered = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+
+        let sandbox_idx = rendered.find('.').expect("sandbox marker");
+        let branch_idx = rendered.find("(status-branch (dirty))").expect("branch");
+        let model_idx = rendered.find("chatgpt/test-model").expect("model");
+        assert!(sandbox_idx < branch_idx, "{rendered}");
+        assert!(branch_idx < model_idx, "{rendered}");
+        assert!(!rendered.contains("branch:"), "{rendered}");
+    }
+
+    #[test]
+    fn status_bar_keeps_full_requested_sandbox_and_branch_visible() {
+        let mut state = TuiState::new(
+            "gpt-5.5".to_string(),
+            "/home/abaka/Documents/Projects/Learn/Finance".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.provider_label = "chatgpt".to_string();
+        state.api_family = "chatgpt-responses".to_string();
+        state.git_branch = Some("main".to_string());
+
+        let lines = draw_to_lines(100, 20, &mut state);
+        let line = lines
+            .iter()
+            .find(|line| line.contains("~/Documents/Projects/Learn/Finance"))
+            .unwrap_or_else(|| panic!("sandbox not visible: {lines:?}"));
+        assert!(
+            line.contains("~/Documents/Projects/Learn/Finance"),
+            "{line}"
+        );
+        assert!(!line.contains("~/Documents/Projects/Le…"), "{line}");
+        assert!(line.contains("(main)"), "{line}");
+        assert!(
+            line.find("(main)").unwrap() < line.find("chatgpt/gpt-5.5").unwrap(),
+            "{line}"
+        );
     }
 
     #[test]
@@ -10041,9 +10105,25 @@ mod tests {
             80,
         );
         let joined = flatten_lines(&text).join("\n");
-        assert!(joined.contains("Summarizing…"), "{joined}");
+        assert!(
+            joined.contains("Final response: preparing final response"),
+            "{joined}"
+        );
         assert!(!joined.contains("phase:"), "{joined}");
-        assert!(!joined.contains("synthesize"), "{joined}");
+    }
+
+    #[test]
+    fn objective_info_renders_actual_objective() {
+        let text = line_to_text(
+            &Line_::Info("[objective: fix status bar | checkpoints: branch visible]".to_string()),
+            100,
+        );
+        let joined = flatten_lines(&text).join("\n");
+        assert!(
+            joined.contains("Objective: fix status bar | checkpoints: branch visible"),
+            "{joined}"
+        );
+        assert!(!joined.contains("agent objective noted"), "{joined}");
     }
 
     #[test]
