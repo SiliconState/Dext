@@ -49,6 +49,7 @@ dext auth login glm <api-key>    # ZAI GLM key
 dext auth login openai <api-key> # OpenAI Platform key
 dext auth login anthropic <api-key>
 dext auth login deepseek <api-key>
+dext auth provider local        # local llama.cpp/Qwen on 127.0.0.1:8080, no key
 ```
 
 Start an interactive session:
@@ -72,9 +73,12 @@ printf 'explain Cargo.toml\n' | dext -p
 Use low-token mode:
 
 ```bash
-dext --frugal
+dext --frugal --effort off
+# even smaller local mode:
+dext --context-mode tiny --effort off
 # or inside Dext:
-/context frugal
+/context tiny
+/effort off
 ```
 
 ## Common commands
@@ -101,10 +105,10 @@ Interactive slash commands:
 /provider chatgpt
 /models all
 /login chatgpt
-/model gpt-5.3-codex
+/model local/qwen-local
 /approval ask|auto-read|auto-write|never|always
 /sandbox-profile read-only|workspace-write|danger-full-access
-/context standard|frugal
+/context standard|frugal|tiny
 /tool-profile lean|full
 /compact status
 /pack list
@@ -152,6 +156,11 @@ Dext reads `.env` for local development if present, but `.env` is ignored and mu
 Useful environment variables:
 
 ```bash
+DEXT_PROVIDER=local
+DEXT_MODEL=qwen-local
+DEXT_BASE_URL=http://127.0.0.1:8080
+DEXT_THINKING_EFFORT=off
+# or cloud:
 DEXT_PROVIDER=chatgpt
 DEXT_MODEL=gpt-5.3-codex
 DEXT_BASE_URL=https://example.test/v1
@@ -161,7 +170,6 @@ ANTHROPIC_API_KEY=...
 OPENAI_API_KEY=...
 DEEPSEEK_API_KEY=...
 CHATGPT_ACCESS_TOKEN=...
-OPENROUTER_API_KEY=...
 DEXT_HOME=~/.dext
 DEXT_SESSIONS_DIR=~/.dext/sessions
 DEXT_LOGS_DIR=~/.dext/logs

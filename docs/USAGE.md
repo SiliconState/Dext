@@ -42,7 +42,7 @@ dext auth login deepseek <api-key>
 Switch providers/models:
 
 ```bash
-dext auth provider chatgpt
+dext auth provider local
 dext auth models all
 ```
 
@@ -54,10 +54,33 @@ Inside the interactive session, the matching slash commands are:
 /models all
 /login chatgpt
 /logout chatgpt
-/model gpt-5.3-codex
+/model local/qwen-local
 ```
 
 Credentials are stored in Dext state, not in the repository. Do not commit `.env`, `.dext/`, exported sessions, or auth stores.
+
+## Local Qwen / llama.cpp
+
+Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Start your server first, then select it:
+
+```bash
+dext auth provider local
+# or inside Dext:
+/model local/qwen-local
+/effort off
+```
+
+For the installed Qwen model, a known-good server command is:
+
+```bash
+cd /home/abaka/Documents/Projects/Overload/MoE/llama.cpp
+./build/bin/llama-server \
+  -m /home/abaka/Documents/Projects/Overload/MoE/models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
+  -ngl 11 -c 4096 -np 1 --cache-ram 0 --no-warmup -t 12 \
+  --reasoning off --flash-attn on --host 127.0.0.1 --port 8080
+```
+
+Use `--context-mode tiny --effort off` or `/context tiny` plus `/effort off` for the lowest local token/compute pressure.
 
 ## Interactive workflow
 
@@ -75,7 +98,7 @@ Useful slash commands:
 /tools                        list exposed/approval/auto-approved tools
 /approval ask                 ask before privileged tools
 /sandbox-profile read-only    prevent write operations
-/context frugal               lower token usage
+/context tiny                 skinny local/token mode
 /compact status               inspect compaction threshold/history size
 /tokens                       approximate token-heavy messages
 /save name                    save a named session
@@ -151,13 +174,14 @@ Conversational invocation also works when the message clearly asks to run/use a 
 
 ```bash
 dext --frugal
+dext --context-mode tiny
 dext --context-mode frugal
 dext --tool-profile lean
 dext --budget '$2'
 dext --budget 200000t
 ```
 
-Frugal mode uses lean schemas, smaller caps, and more aggressive context reduction. Standard mode still defaults to lean schemas to avoid prompt bloat.
+Frugal mode uses lean schemas, smaller caps, and more aggressive context reduction. Tiny mode keeps frugal's lean tools, uses a condensed prompt only for tiny, and caps history around 80% of the local model window (bounded 8k–32k chars). Standard mode and frugal mode keep the regular main-agent prompt.
 
 ## Permission and sandbox controls
 
@@ -193,6 +217,11 @@ Session exports can include prompts, tool output, credentials accidentally paste
 Provider/model:
 
 ```bash
+DEXT_PROVIDER=local
+DEXT_MODEL=qwen-local
+DEXT_BASE_URL=http://127.0.0.1:8080
+DEXT_THINKING_EFFORT=off
+# cloud examples:
 DEXT_PROVIDER=glm
 DEXT_MODEL=glm-4.6
 # provider key env fallbacks: ZAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENAI_API_KEY,
@@ -210,7 +239,6 @@ ANTHROPIC_API_KEY=...
 OPENAI_API_KEY=...
 DEEPSEEK_API_KEY=...
 CHATGPT_ACCESS_TOKEN=...
-OPENROUTER_API_KEY=...
 ```
 
 State and logs:
@@ -232,7 +260,7 @@ DEXT_APPROVAL=ask
 DEXT_SANDBOX_PROFILE=workspace-write
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOL_PROFILE=lean
-DEXT_THINKING_EFFORT=high
+DEXT_THINKING_EFFORT=off
 DEXT_BUDGET_CAP='$5'
 DEXT_EXTERNAL_TIMEOUT_SECS=60
 DEXT_BASH_TIMEOUT_SECS=60

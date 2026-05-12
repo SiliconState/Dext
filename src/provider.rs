@@ -29,7 +29,8 @@ impl<'de> serde::Deserialize<'de> for ApiProvider {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         Ok(match s.trim().to_ascii_lowercase().as_str() {
-            "openai" | "openai-compatible" | "ollama" | "deepseek" => Self::OpenAi,
+            "openai" | "openai-compatible" | "ollama" | "llama" | "llama.cpp" | "local"
+            | "deepseek" => Self::OpenAi,
             "chatgpt" | "openai-codex" | "codex" | "codex-openai" => Self::ChatGpt,
             _ => Self::Anthropic,
         })
@@ -44,7 +45,8 @@ impl ApiProvider {
             .to_ascii_lowercase()
             .as_str()
         {
-            "openai" | "openai-compatible" | "ollama" | "deepseek" => Self::OpenAi,
+            "openai" | "openai-compatible" | "ollama" | "llama" | "llama.cpp" | "local"
+            | "deepseek" => Self::OpenAi,
             "chatgpt" | "openai-codex" | "codex" | "codex-openai" => Self::ChatGpt,
             "anthropic" | "claude" | "glm" | "zai" => Self::Anthropic,
             _ => {
@@ -53,6 +55,8 @@ impl ApiProvider {
                     .to_ascii_lowercase();
                 if base.contains("openai")
                     || base.contains("ollama")
+                    || base.contains("llama")
+                    || base.contains("127.0.0.1")
                     || base.contains("localhost:11434")
                 {
                     Self::OpenAi
@@ -199,6 +203,7 @@ pub(crate) fn canonical_provider_id(raw: &str) -> String {
         "openai-codex" | "codex-openai" | "codex" => "chatgpt".to_string(),
         "chatgpt-plus" | "chatgpt-pro" => "chatgpt".to_string(),
         "claude" => "anthropic".to_string(),
+        "llama" | "llama.cpp" | "llamacpp" | "qwen" => "local".to_string(),
         other => other.to_string(),
     }
 }
@@ -344,6 +349,24 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             context_window: Some(128_000),
             model_context_windows: HashMap::new(),
         },
+        ProviderProfile {
+            id: "local".to_string(),
+            display_name: "Local llama.cpp".to_string(),
+            api_provider: ApiProvider::OpenAi,
+            base_url: "http://127.0.0.1:8080".to_string(),
+            default_model: "qwen-local".to_string(),
+            models: vec![
+                "qwen-local".to_string(),
+                "Qwen3.6-35B-A3B-Q4_K_M.gguf".to_string(),
+            ],
+            env_vars: Vec::new(),
+            requires_api_key: false,
+            login_url: None,
+            oauth_flow: None,
+            notes: Some("Local OpenAI-compatible llama.cpp server. Start llama-server on 127.0.0.1:8080 first; no cloud credentials are used.".to_string()),
+            context_window: Some(4_096),
+            model_context_windows: HashMap::new(),
+        },
     ]
 }
 
@@ -353,12 +376,17 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
         return None;
     }
 
+    let fallback_model = if profile.id == "local" {
+        "qwen-local"
+    } else {
+        "glm-4.6"
+    };
     profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
     if profile.display_name.trim().is_empty() {
         profile.display_name = profile.id.clone();
     }
     if profile.default_model.trim().is_empty() {
-        profile.default_model = "glm-4.6".to_string();
+        profile.default_model = fallback_model.to_string();
     }
     if profile.api_provider == ApiProvider::ChatGpt {
         profile.default_model = normalize_chatgpt_model_slug(&profile.default_model);
@@ -875,6 +903,18 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
             if force || compatible {
                 return t;
             }
+            if !force
+                && !compatible
+                && profile.api_provider == ApiProvider::OpenAi
+                && !profile.requires_api_key
+            {
+                let looks_local = canonical_provider_id(&profile.id) == "local"
+                    || profile.base_url.contains("127.0.0.1")
+                    || profile.base_url.contains("localhost");
+                if looks_local {
+                    return t;
+                }
+            }
         }
     }
     normalize_provider_model_value(profile, &profile.default_model)
@@ -976,7 +1016,13 @@ pub(crate) fn chatgpt_client_user_agent() -> String {
     )
 }
 
-pub(crate) fn chatgpt_reasoning_effort(model: &str, effort: crate::ThinkingEffort) -> &'static str {
+pub(crate) fn chatgpt_reasoning_effort(
+    model: &str,
+    effort: crate::ThinkingEffort,
+) -> Option<&'static str> {
+    if effort == crate::ThinkingEffort::Off {
+        return None;
+    }
     let raw = effort.as_str();
     if model.starts_with("gpt-5.2")
         || model.starts_with("gpt-5.3")
@@ -984,28 +1030,28 @@ pub(crate) fn chatgpt_reasoning_effort(model: &str, effort: crate::ThinkingEffor
         || model.starts_with("gpt-5.5")
         || model.starts_with("gpt-5-codex")
     {
-        return match raw {
+        return Some(match raw {
             "minimal" => "low",
             "low" => "low",
             "medium" => "medium",
             "high" => "high",
             "xhigh" => "xhigh",
             _ => "medium",
-        };
+        });
     }
     if model == "gpt-5.1-codex-mini" {
-        return match raw {
+        return Some(match raw {
             "high" | "xhigh" => "high",
             _ => "medium",
-        };
+        });
     }
     if model.starts_with("gpt-5.1") {
-        return match raw {
+        return Some(match raw {
             "xhigh" => "high",
             other => other,
-        };
+        });
     }
-    raw
+    Some(raw)
 }
 
 pub(crate) fn build_chatgpt_request(
@@ -1029,8 +1075,15 @@ pub(crate) fn build_chatgpt_request(
         "prompt_cache_key": session_id,
         "tool_choice": "auto",
         "parallel_tool_calls": true,
-        "reasoning": { "effort": effort, "summary": "auto" },
     });
+    if let Some(effort) = effort {
+        body.as_object_mut()
+            .expect("chatgpt request body is always an object")
+            .insert(
+                "reasoning".to_string(),
+                json!({ "effort": effort, "summary": "auto" }),
+            );
+    }
     if !tools.is_empty() {
         body.as_object_mut()
             .expect("chatgpt request body is always an object")
@@ -2920,6 +2973,15 @@ fn render_provider_models(profile: &ProviderProfile) -> String {
                 .join("\n")
         )
     };
+    if !profile.requires_api_key {
+        out.push_str(
+            "\nnote: no credentials required; the local/server endpoint must already be running.",
+        );
+    }
+    if let Some(notes) = &profile.notes {
+        out.push_str("\n");
+        out.push_str(notes);
+    }
     if profile.api_provider == ApiProvider::ChatGpt {
         out.push_str(
             "\nnote: this is a local curated list, not your full account entitlement list.\nset any model slug directly with /model <slug>.",

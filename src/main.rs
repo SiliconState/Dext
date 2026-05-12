@@ -132,6 +132,7 @@ fn millis_u64(duration: std::time::Duration) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ThinkingEffort {
+    Off,
     Low,
     #[default]
     Medium,
@@ -142,6 +143,7 @@ pub(crate) enum ThinkingEffort {
 impl ThinkingEffort {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Off => "off",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -151,6 +153,9 @@ impl ThinkingEffort {
 
     fn guidance(self) -> &'static str {
         match self {
+            Self::Off => {
+                "Disable provider-side reasoning controls where supported; answer directly."
+            }
             Self::Low => "Keep reasoning concise and deliver a direct answer quickly.",
             Self::Medium => "Use balanced reasoning depth and concise explanations.",
             Self::High => "Reason carefully through edge cases before answering.",
@@ -162,6 +167,7 @@ impl ThinkingEffort {
 
     fn parse(v: &str) -> Option<Self> {
         match v.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disable" | "disabled" | "0" => Some(Self::Off),
             "low" | "l" => Some(Self::Low),
             "medium" | "med" | "m" | "default" => Some(Self::Medium),
             "high" | "h" => Some(Self::High),
@@ -171,8 +177,8 @@ impl ThinkingEffort {
     }
 
     fn cycle(self, step: i8) -> Self {
-        let levels = [Self::Low, Self::Medium, Self::High, Self::XHigh];
-        let idx = levels.iter().position(|v| *v == self).unwrap_or(1) as i32;
+        let levels = [Self::Off, Self::Low, Self::Medium, Self::High, Self::XHigh];
+        let idx = levels.iter().position(|v| *v == self).unwrap_or(2) as i32;
         let len = levels.len() as i32;
         let next = (idx + i32::from(step)).rem_euclid(len) as usize;
         levels[next]
@@ -1835,6 +1841,9 @@ async fn run_subagent_runtime(input_path: &Path, output_path: &Path) -> Result<(
     agent.set_browser_recipe(request.browser_recipe);
     agent.set_thinking_effort(request.thinking_effort);
     agent.context_mode = request.context_mode;
+    if request.context_mode.is_tiny() && request.system.as_deref().unwrap_or("").trim().is_empty() {
+        agent.system = TINY_SYSTEM.to_string();
+    }
     agent.tool_profile = request.tool_profile;
     agent.set_budget_cap(request.budget_cap);
     if !request.privacy_enabled {
@@ -2602,20 +2611,22 @@ pub(crate) struct WireTool {
 }
 
 fn openai_reasoning_effort(effort: ThinkingEffort) -> Option<&'static str> {
-    Some(match effort {
-        ThinkingEffort::Low => "low",
-        ThinkingEffort::Medium => "medium",
-        ThinkingEffort::High | ThinkingEffort::XHigh => "high",
-    })
+    match effort {
+        ThinkingEffort::Off => None,
+        ThinkingEffort::Low => Some("low"),
+        ThinkingEffort::Medium => Some("medium"),
+        ThinkingEffort::High | ThinkingEffort::XHigh => Some("high"),
+    }
 }
 
 fn anthropic_thinking_budget_tokens(effort: ThinkingEffort) -> Option<u32> {
-    Some(match effort {
-        ThinkingEffort::Low => 1_024,
-        ThinkingEffort::Medium => 2_048,
-        ThinkingEffort::High => 4_096,
-        ThinkingEffort::XHigh => 8_192,
-    })
+    match effort {
+        ThinkingEffort::Off => None,
+        ThinkingEffort::Low => Some(1_024),
+        ThinkingEffort::Medium => Some(2_048),
+        ThinkingEffort::High => Some(4_096),
+        ThinkingEffort::XHigh => Some(8_192),
+    }
 }
 
 #[derive(Serialize)]
@@ -6838,6 +6849,8 @@ Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing
 Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
 Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.";
 
+const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Inspect before edits. Prefer rg/fd then focused reads. Keep tool output small. Use todo for nontrivial work. Make surgical changes. Verify narrowly. Final: changed, tests, gaps.";
+
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     let mut sections = Vec::new();
     let mut dir = root;
@@ -6964,6 +6977,9 @@ Keep each section concise. Capture the user's overall goal, key decisions and wh
 const HISTORY_CHAR_BUDGET_MIN: usize = 24_000;
 const HISTORY_CHAR_BUDGET_END_TURN_PERCENT: u8 = 90;
 const HISTORY_CHAR_BUDGET_ACTIVE_PERCENT: u8 = 80;
+const FRUGAL_HISTORY_CHAR_BUDGET_PERCENT: u8 = 80;
+const FRUGAL_HISTORY_CHAR_BUDGET_MIN: usize = 8_000;
+const FRUGAL_HISTORY_CHAR_BUDGET_MAX: usize = 32_000;
 const COMPACT_KEEP_MESSAGES: usize = 6;
 const COMPACT_USER_BOUNDARY_BACKTRACK: usize = COMPACT_KEEP_MESSAGES * 4;
 const COMPACT_PRESERVE_TOOL_MESSAGES: usize = 10;
@@ -7068,6 +7084,7 @@ pub(crate) enum ContextMode {
     #[default]
     Standard,
     Frugal,
+    Tiny,
 }
 
 impl ContextMode {
@@ -7075,6 +7092,7 @@ impl ContextMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "standard" | "default" | "full" | "normal" | "off" => Some(Self::Standard),
             "frugal" | "lean" | "slim" | "minimal" | "min" => Some(Self::Frugal),
+            "tiny" | "skinny" | "micro" | "lite" => Some(Self::Tiny),
             _ => None,
         }
     }
@@ -7090,11 +7108,16 @@ impl ContextMode {
         match self {
             Self::Standard => "standard",
             Self::Frugal => "frugal",
+            Self::Tiny => "tiny",
         }
     }
 
     fn is_frugal(self) -> bool {
-        self == Self::Frugal
+        matches!(self, Self::Frugal | Self::Tiny)
+    }
+
+    fn is_tiny(self) -> bool {
+        self == Self::Tiny
     }
 }
 
@@ -7522,7 +7545,7 @@ fn apply_runtime_control_command(
                 "thinking effort -> {} (applies immediately to the next model request in this run)",
                 effort.as_str()
             )),
-            None => emit("usage: /effort [low|medium|high|xhigh|next|prev|status]".to_string()),
+            None => emit("usage: /effort [off|low|medium|high|xhigh|next|prev|status]".to_string()),
         }
         return true;
     }
@@ -7974,6 +7997,18 @@ fn history_char_budget_with_percent(
     {
         return v;
     }
+    if context_mode.is_tiny() {
+        let window_chars = usize::try_from(model_context_window(model))
+            .unwrap_or(usize::MAX / 4)
+            .saturating_mul(4);
+        return window_chars
+            .saturating_mul(FRUGAL_HISTORY_CHAR_BUDGET_PERCENT as usize)
+            .saturating_div(100)
+            .clamp(
+                FRUGAL_HISTORY_CHAR_BUDGET_MIN,
+                FRUGAL_HISTORY_CHAR_BUDGET_MAX,
+            );
+    }
     if context_mode.is_frugal() {
         return 60_000;
     }
@@ -8158,6 +8193,7 @@ impl Agent {
             .ok()
             .and_then(|v| ThinkingEffort::parse(&v))
             .unwrap_or_default();
+        let context_mode = ContextMode::from_env();
         let system = std::env::var("DEXT_SYSTEM")
             .ok()
             .and_then(|v| {
@@ -8168,7 +8204,13 @@ impl Agent {
                     Some(v)
                 }
             })
-            .unwrap_or_else(|| DEFAULT_SYSTEM.to_string());
+            .unwrap_or_else(|| {
+                if context_mode.is_tiny() {
+                    TINY_SYSTEM.to_string()
+                } else {
+                    DEFAULT_SYSTEM.to_string()
+                }
+            });
         let sandbox_root = std::fs::canonicalize(sandbox.unwrap_or_else(|| {
             PathBuf::from(std::env::var("DEXT_SANDBOX").unwrap_or_else(|_| ".".to_string()))
         }))
@@ -8188,7 +8230,6 @@ impl Agent {
             .ok()
             .and_then(|v| BrowserRecipe::parse(&v))
             .unwrap_or_default();
-        let context_mode = ContextMode::from_env();
         let tool_profile = if context_mode.is_frugal() {
             ToolProfile::Lean
         } else {
@@ -8818,7 +8859,9 @@ impl Agent {
 
     fn compose_system_details(&self) -> SystemParts {
         let mut stable = self.system.clone();
-        let mut context_budget = if self.context_mode.is_frugal() {
+        let mut context_budget = if self.context_mode.is_tiny() {
+            1_500
+        } else if self.context_mode.is_frugal() {
             FRUGAL_PROJECT_CONTEXT_CAP
         } else {
             PROJECT_CONTEXT_CAP
@@ -8872,6 +8915,60 @@ impl Agent {
         }
 
         let mut env = String::from("## Environment\n");
+        if self.context_mode.is_tiny() {
+            if let Some(git) = &self.git_context {
+                env.push_str(&format!(
+                    "cwd={} os={} git={} provider={} model={} effort={} context={} schemas={} approval={} sandbox={}\n",
+                    self.sandbox_root.display(),
+                    std::env::consts::OS,
+                    git,
+                    self.provider_id,
+                    self.model,
+                    self.thinking_effort.as_str(),
+                    self.context_mode.as_str(),
+                    self.wire_tool_profile().as_str(),
+                    self.approval_profile.as_str(),
+                    self.sandbox_profile.as_str()
+                ));
+            } else {
+                env.push_str(&format!(
+                    "cwd={} os={} provider={} model={} effort={} context={} schemas={} approval={} sandbox={}\n",
+                    self.sandbox_root.display(),
+                    std::env::consts::OS,
+                    self.provider_id,
+                    self.model,
+                    self.thinking_effort.as_str(),
+                    self.context_mode.as_str(),
+                    self.wire_tool_profile().as_str(),
+                    self.approval_profile.as_str(),
+                    self.sandbox_profile.as_str()
+                ));
+            }
+            env.push_str(&format!(
+                "compact={} active={}\n",
+                self.compact_threshold_chars(),
+                self.active_compact_threshold_chars()
+            ));
+            let ledger = self.work_ledger_prompt();
+            if !ledger.trim().is_empty() {
+                env.push_str("\n## Work ledger\n");
+                env.push_str(&cap_bytes_with_hint(
+                    ledger,
+                    600,
+                    "work ledger trimmed for tiny context.",
+                ));
+                if !env.ends_with('\n') {
+                    env.push('\n');
+                }
+            }
+            env.push_str(&self.privacy.prompt_status_line());
+            env.push('\n');
+            return SystemParts {
+                stable,
+                env,
+                prompt_sources,
+            };
+        }
         if self.context_mode.is_frugal() {
             if let Some(git) = &self.git_context {
                 env.push_str(&format!(
@@ -12666,10 +12763,13 @@ impl Agent {
         let started_at = std::time::Instant::now();
         let request = SubagentRequest::from_input(self, input)?;
         let task = request.task.clone();
-        let system = request
-            .system
-            .clone()
-            .unwrap_or_else(|| DEFAULT_SUBAGENT_SYSTEM.to_string());
+        let system = request.system.clone().unwrap_or_else(|| {
+            if request.context_mode.is_tiny() {
+                TINY_SYSTEM.to_string()
+            } else {
+                DEFAULT_SUBAGENT_SYSTEM.to_string()
+            }
+        });
         let max_iter = request.max_iterations.map(|max| max as u32);
         let whitelist = request.allowed_tools.clone();
 
@@ -14612,11 +14712,11 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /effort [level]           set model reasoning depth/tool persistence: low|medium|high|xhigh"
+                "  /effort [level]           set model reasoning depth/tool persistence: off|low|medium|high|xhigh"
             );
             let _ = writeln!(
                 w,
-                "  /context [standard|frugal] context/cap mode; frugal minimizes token spend"
+                "  /context [standard|frugal|tiny] context/cap mode; tiny is skinny local mode"
             );
             let _ = writeln!(
                 w,
@@ -15137,8 +15237,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         Some(agent.thinking_effort())
                     }
                     None => {
-                        let _ =
-                            writeln!(w, "usage: /effort [low|medium|high|xhigh|next|prev|status]");
+                        let _ = writeln!(
+                            w,
+                            "usage: /effort [off|low|medium|high|xhigh|next|prev|status]"
+                        );
                         None
                     }
                 },
@@ -15172,7 +15274,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     agent.tool_context_profile().as_str()
                 );
             } else {
-                let _ = writeln!(w, "usage: /context [standard|frugal|status]");
+                let _ = writeln!(w, "usage: /context [standard|frugal|tiny|status]");
             }
         }
         "tool-profile" | "tools-profile" => {
@@ -16411,11 +16513,13 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             }
             "--context-mode" => {
                 i += 1;
-                let value = argv
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--context-mode requires standard|frugal"))?;
+                let value = argv.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--context-mode requires standard|frugal|tiny")
+                })?;
                 context_mode = Some(ContextMode::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!("invalid --context-mode '{value}' (expected standard|frugal)")
+                    anyhow::anyhow!(
+                        "invalid --context-mode '{value}' (expected standard|frugal|tiny)"
+                    )
                 })?);
             }
             "--tool-profile" => {
@@ -16507,12 +16611,12 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--agent-browser" => browser_recipe = Some(BrowserRecipe::AgentBrowser),
             "--effort" | "--thinking-effort" => {
                 i += 1;
-                let value = argv
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--effort requires low|medium|high|xhigh"))?;
+                let value = argv.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--effort requires off|low|medium|high|xhigh")
+                })?;
                 thinking_effort = Some(ThinkingEffort::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid thinking effort '{value}' (expected low|medium|high|xhigh)"
+                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh)"
                     )
                 })?);
             }
@@ -16548,14 +16652,16 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .unwrap_or_default();
                 thinking_effort = Some(ThinkingEffort::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid thinking effort '{value}' (expected low|medium|high|xhigh)"
+                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh)"
                     )
                 })?);
             }
             _ if arg.starts_with("--context-mode=") => {
                 let value = arg.trim_start_matches("--context-mode=");
                 context_mode = Some(ContextMode::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!("invalid context mode '{value}' (expected standard|frugal)")
+                    anyhow::anyhow!(
+                        "invalid context mode '{value}' (expected standard|frugal|tiny)"
+                    )
                 })?);
             }
             _ if arg.starts_with("--pack=") => {
@@ -16832,11 +16938,12 @@ async fn main() -> Result<()> {
         println!("       dext --approval ask|auto-read|auto-write|never|always");
         println!("       dext --sandbox read-only|workspace-write|danger-full-access");
         println!("       dext --browser agent-browser    add optional browser automation recipe");
-        println!("       dext --effort low|medium|high|xhigh  set provider reasoning effort");
+        println!("       dext --effort off|low|medium|high|xhigh  set provider reasoning effort");
         println!(
             "       dext --frugal        minimize prompt/tool/history context for lower token cost"
         );
-        println!("       dext --context-mode standard|frugal");
+        println!("       dext --context-mode tiny      skinny local mode with condensed prompt");
+        println!("       dext --context-mode standard|frugal|tiny");
         println!(
             "       dext --tool-profile lean|full  choose provider tool schema verbosity (default lean)"
         );
@@ -16845,7 +16952,7 @@ async fn main() -> Result<()> {
         println!("       dext auth ...         provider/model/auth management commands");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENROUTER_API_KEY, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }

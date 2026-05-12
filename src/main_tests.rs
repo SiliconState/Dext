@@ -1797,12 +1797,15 @@ fn browser_recipe_toggles_browser_tool() {
 
 #[test]
 fn thinking_effort_parse_and_cycle() {
+    assert_eq!(ThinkingEffort::parse("off"), Some(ThinkingEffort::Off));
+    assert_eq!(ThinkingEffort::parse("none"), Some(ThinkingEffort::Off));
     assert_eq!(ThinkingEffort::parse("low"), Some(ThinkingEffort::Low));
     assert_eq!(ThinkingEffort::parse("MED"), Some(ThinkingEffort::Medium));
     assert_eq!(ThinkingEffort::parse("x-high"), Some(ThinkingEffort::XHigh));
     assert_eq!(ThinkingEffort::parse("unknown"), None);
-    assert_eq!(ThinkingEffort::Low.cycle(-1), ThinkingEffort::XHigh);
-    assert_eq!(ThinkingEffort::XHigh.cycle(1), ThinkingEffort::Low);
+    assert_eq!(ThinkingEffort::Off.cycle(-1), ThinkingEffort::XHigh);
+    assert_eq!(ThinkingEffort::Low.cycle(-1), ThinkingEffort::Off);
+    assert_eq!(ThinkingEffort::XHigh.cycle(1), ThinkingEffort::Off);
 }
 
 #[test]
@@ -3298,6 +3301,7 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
         assert!(url.contains("api.deepseek.com"), "{url}");
         let body_json: Value = serde_json::from_slice(&body)?;
         assert_eq!(body_json["model"], "deepseek-reasoner");
+        assert_eq!(body_json["max_tokens"], 4096);
         Ok(())
     })();
 
@@ -3341,6 +3345,38 @@ fn runtime_control_command_updates_compact_threshold_by_percent() {
     assert!(agent.should_active_compact());
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
+    let root = temp_test_dir("reasoning-effort-off");
+    let root = std::fs::canonicalize(root)?;
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "http://127.0.0.1:8080".to_string();
+    agent.model = "qwen-local".to_string();
+    agent.thinking_effort = ThinkingEffort::Off;
+
+    let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body_json: Value = serde_json::from_slice(&body)?;
+    assert!(body_json.get("reasoning_effort").is_none(), "{body_json}");
+    assert_eq!(body_json["max_tokens"], 4096);
+
+    let chatgpt = build_chatgpt_request(
+        "gpt-5.4",
+        ThinkingEffort::Off,
+        "sys",
+        "sess-1",
+        vec![json!({"type":"message","role":"user","content":[]} )],
+        Vec::new(),
+    );
+    assert!(chatgpt.get("reasoning").is_none(), "{chatgpt}");
+
+    assert!(openai_reasoning_effort(ThinkingEffort::Off).is_none());
+    assert!(anthropic_thinking_budget_tokens(ThinkingEffort::Off).is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 #[test]
@@ -3900,6 +3936,27 @@ fn compose_system_parts_caps_dext_md() {
 }
 
 #[test]
+fn tiny_mode_uses_condensed_prompt_and_slim_env() {
+    let root = temp_test_dir("tiny-system-prompt");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(root.join("DEXT.md"), "project guidance".repeat(500)).expect("write DEXT.md");
+    let mut agent = test_agent(&root);
+    agent.context_mode = ContextMode::Tiny;
+    agent.system = TINY_SYSTEM.to_string();
+    agent.work_ledger.objective = "keep it tiny".to_string();
+
+    let (stable, env) = agent.compose_system_parts();
+    assert!(stable.starts_with(TINY_SYSTEM), "{stable}");
+    assert!(stable.len() < 2_200, "{}", stable.len());
+    assert!(env.contains("context=tiny"), "{env}");
+    assert!(env.contains("compact="), "{env}");
+    assert!(!env.contains("## Project todos"), "{env}");
+    assert!(env.len() < 1_200, "{}", env.len());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
     let root = temp_test_dir("compact-env-ledger");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -4044,6 +4101,17 @@ fn compose_system_parts_includes_recall_md() {
 }
 
 #[test]
+fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
+    assert_eq!(ContextMode::parse("tiny"), Some(ContextMode::Tiny));
+    assert_eq!(ContextMode::parse("skinny"), Some(ContextMode::Tiny));
+    assert_eq!(ContextMode::parse("frugal"), Some(ContextMode::Frugal));
+    assert_eq!(ContextMode::Tiny.as_str(), "tiny");
+    assert!(ContextMode::Tiny.is_frugal());
+    assert!(ContextMode::Tiny.is_tiny());
+    assert!(!ContextMode::Frugal.is_tiny());
+}
+
+#[test]
 fn context_window_and_history_budget_are_model_aware_and_overridable() {
     let _guard = env_lock();
     unsafe {
@@ -4076,6 +4144,31 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
     assert_eq!(
         active_history_char_budget_with_override("huge-1m", None, ContextMode::Standard),
         3_200_000
+    );
+
+    assert_eq!(
+        history_char_budget_with_override("demo-128k", None, ContextMode::Frugal),
+        60_000
+    );
+    assert_eq!(
+        active_history_char_budget_with_override("demo-128k", None, ContextMode::Frugal),
+        60_000
+    );
+    assert_eq!(
+        history_char_budget_with_override("qwen-local", None, ContextMode::Tiny),
+        13_107
+    );
+    assert_eq!(
+        active_history_char_budget_with_override("qwen-local", None, ContextMode::Tiny),
+        13_107
+    );
+    assert_eq!(
+        history_char_budget_with_override("tiny-1k", None, ContextMode::Tiny),
+        8_000
+    );
+    assert_eq!(
+        active_history_char_budget_with_override("tiny-1k", None, ContextMode::Tiny),
+        8_000
     );
 
     unsafe {
@@ -4429,7 +4522,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--sandbox-profile=read-only".to_string(),
         "--browser=agent-browser".to_string(),
         "--frugal".to_string(),
-        "--context-mode=frugal".to_string(),
+        "--context-mode=tiny".to_string(),
         "--tool-profile=lean".to_string(),
         format!("@{}", task_file.display()),
         "tail".to_string(),
@@ -4443,7 +4536,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
     assert_eq!(opts.approval_profile, Some(ApprovalProfile::AutoRead));
     assert_eq!(opts.sandbox_profile, Some(SandboxProfile::ReadOnly));
     assert_eq!(opts.browser_recipe, Some(BrowserRecipe::AgentBrowser));
-    assert_eq!(opts.context_mode, Some(ContextMode::Frugal));
+    assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
     assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
     assert_eq!(
         opts.positional,
@@ -5685,7 +5778,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["glm", "chatgpt", "openai", "anthropic", "deepseek"]
+            vec!["glm", "chatgpt", "openai", "anthropic", "deepseek", "local"]
         );
 
         let glm = find_provider_profile(&catalog, "glm").context("glm")?;
@@ -5708,6 +5801,11 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         assert_eq!(deepseek.api_provider, ApiProvider::OpenAi);
         assert_eq!(deepseek.env_vars, vec!["DEEPSEEK_API_KEY"]);
         assert_eq!(deepseek.default_model, "deepseek-chat");
+
+        let local = find_provider_profile(&catalog, "local").context("local")?;
+        assert_eq!(local.api_provider, ApiProvider::OpenAi);
+        assert!(!local.requires_api_key);
+        assert_eq!(local.default_model, "qwen-local");
         Ok(())
     })();
 
@@ -5861,6 +5959,15 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
         assert_eq!(glm.provider_id, "glm");
         assert_eq!(glm.model, "glm-5.1");
 
+        let local = resolve_provider_model_selection(&catalog, &store, "glm", "local/qwen-local")?;
+        assert_eq!(local.provider_id, "local");
+        assert_eq!(local.model, "qwen-local");
+
+        let qwen_alias =
+            resolve_provider_model_selection(&catalog, &store, "glm", "qwen/qwen-local")?;
+        assert_eq!(qwen_alias.provider_id, "local");
+        assert_eq!(qwen_alias.model, "qwen-local");
+
         let explicit =
             resolve_provider_model_selection(&catalog, &store, "glm", "chatgpt/gpt-5-4")?;
         assert_eq!(explicit.provider_id, "chatgpt");
@@ -5892,8 +5999,17 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["glm", "chatgpt", "openai", "anthropic", "deepseek"]
+            vec!["glm", "chatgpt", "openai", "anthropic", "deepseek", "local"]
         );
+        let local = catalog
+            .providers
+            .iter()
+            .find(|p| p.id == "local")
+            .expect("local provider");
+        assert_eq!(local.api_provider, ApiProvider::OpenAi);
+        assert!(!local.requires_api_key);
+        assert_eq!(local.default_model, "qwen-local");
+        assert_eq!(local.context_window, Some(4_096));
         assert_eq!(resolve_active_provider_id(&catalog), "glm");
         Ok(())
     })();
