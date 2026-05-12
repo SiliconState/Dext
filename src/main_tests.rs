@@ -278,6 +278,145 @@ fn injected_steering_is_ledger_visible_and_final_required() {
 }
 
 #[test]
+fn channel_sink_emits_local_auth_only_via_explicit_method() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut sink = ChannelSink { tx };
+
+    sink.emit(AgentEvent::Info("visible".to_string()));
+    assert!(matches!(rx.try_recv(), Ok(AgentEvent::Info(_))));
+    assert!(rx.try_recv().is_err());
+
+    sink.local_auth_prompt("bash", SUDO_AUTH_GUIDANCE);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AgentEvent::LocalAuthPrompt { tool, message })
+            if tool == "bash" && message == SUDO_AUTH_GUIDANCE
+    ));
+}
+
+#[test]
+fn local_auth_prompt_is_not_recorded_in_crash_or_latest_logs() {
+    let root = temp_test_dir("local-auth-no-logs");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut agent = test_agent(&root);
+    let log_path = agent.latest_log_path.clone();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    if let Ok(mut state) = crash_runtime_state().lock() {
+        state.last_event_ids.clear();
+    }
+    agent.sink.local_auth_prompt("bash", SUDO_AUTH_GUIDANCE);
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AgentEvent::LocalAuthPrompt { tool, message })
+            if tool == "bash" && message == SUDO_AUTH_GUIDANCE
+    ));
+    let crash_labels = crash_runtime_state()
+        .lock()
+        .map(|state| state.last_event_ids.clone())
+        .unwrap_or_default();
+    assert!(
+        crash_labels
+            .iter()
+            .all(|label| !label.contains("local_auth")),
+        "{crash_labels:?}"
+    );
+    assert!(!log_path.exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn potential_login_secret_is_not_serialized_to_provider_request() {
+    let root = temp_test_dir("local-login-secret-provider");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_steering(steer_rx, steer_tx.clone());
+    let secret = "/login chatgpt sk-secret-token-that-should-stay-local";
+
+    assert!(text_is_potential_local_secret(secret));
+    steer_tx.send(secret.to_string()).expect("queue steering");
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    assert!(!agent.inject_queued_steering(&mut turn_state, 1, 0, false));
+    assert!(agent.history.is_empty());
+    assert!(drain_events(&mut rx).iter().any(|event| matches!(
+        event,
+        AgentEvent::Warn(msg) if msg.contains("withheld")
+    )));
+
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "safe steering note".to_string(),
+        }],
+    });
+    let (_url, body) = agent
+        .build_streaming_request("sys", "env", &[], &[], "sess-local")
+        .expect("build request");
+    let body_text = String::from_utf8(body).expect("utf8 request");
+    assert!(!body_text.contains("sk-secret-token-that-should-stay-local"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn sudo_askpass_script_uses_local_tty_and_never_echoes_chat_guidance() {
+    let script = sudo_askpass_script_content_with_paths("/tmp/zenity'bad", "/tmp/kdialog");
+    assert!(script.contains("/dev/tty"), "{script}");
+    assert!(
+        script.contains("Dext local sudo prompt requires a TTY"),
+        "{script}"
+    );
+    assert!(!script.contains("chat/steering"), "{script}");
+    assert!(script.contains("'\\''"), "{script}");
+}
+
+#[test]
+fn busy_console_input_withholds_potential_local_secret_from_steering() {
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+    let busy = AtomicBool::new(true);
+
+    let route = route_interactive_input_line(
+        "token=abcdefghijklmnopqrstuvwxyz\n".to_string(),
+        &busy,
+        &input_tx,
+        &steering_tx,
+    );
+
+    assert_eq!(route, InteractiveInputRoute::Dropped);
+    assert!(steering_rx.try_recv().is_err());
+    assert!(input_rx.try_recv().is_err());
+
+    let route = route_interactive_input_line(
+        "{\"accessToken\":\"secret-token-that-should-go-to-login\"}\n".to_string(),
+        &busy,
+        &input_tx,
+        &steering_tx,
+    );
+    assert_eq!(route, InteractiveInputRoute::Dropped);
+    assert!(steering_rx.try_recv().is_err());
+    assert!(input_rx.try_recv().is_err());
+
+    let route = route_interactive_input_line(
+        "/login chatgpt sk-secret-token-that-should-stay-local\n".to_string(),
+        &busy,
+        &input_tx,
+        &steering_tx,
+    );
+    assert_eq!(route, InteractiveInputRoute::Dropped);
+    assert!(steering_rx.try_recv().is_err());
+    assert!(input_rx.try_recv().is_err());
+}
+
+#[test]
 fn steering_received_event_serializes_preview() {
     let ev = AgentEvent::SteeringReceived {
         messages: 1,
@@ -624,6 +763,17 @@ fn session_replay_fixture_feasibility_gate_requires_probe_before_scale() -> Resu
     let replay = SessionReplayFixture::load("feasibility_gate")?;
     let gate_hits = replay.tool_results_containing("source feasibility gate");
     assert_eq!(gate_hits.len(), 1, "{:?}", gate_hits);
+    let gate_text = &gate_hits[0].0;
+    assert!(
+        gate_text.contains("Bulk external collection is blocked"),
+        "{}",
+        gate_text
+    );
+    assert!(
+        gate_text.contains("retry the original bulk request"),
+        "{}",
+        gate_text
+    );
 
     let probe_inputs = replay.tool_inputs_after_marker("source feasibility gate", "bash");
     assert!(
@@ -2459,6 +2609,7 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
         }),
         root.clone(),
         Arc::new(AtomicBool::new(false)),
+        None,
         None,
     )
     .await
@@ -4783,6 +4934,7 @@ async fn bash_tool_honors_input_timeout() {
         root.clone(),
         Arc::new(AtomicBool::new(false)),
         None,
+        None,
     )
     .await
     .expect_err("expected input timeout");
@@ -4799,6 +4951,7 @@ async fn model_side_subagent_tool_call_does_not_launch_runtime() {
         json!({"task": "do a thing"}),
         root.clone(),
         Arc::new(AtomicBool::new(false)),
+        None,
         None,
     )
     .await

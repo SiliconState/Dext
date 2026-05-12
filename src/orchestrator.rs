@@ -204,7 +204,7 @@ impl TurnRuntimeState {
             None
         } else {
             Some(format!(
-                "source feasibility gate: host(s) {} have not passed a single-item probe yet. First query one representative item and confirm required fields before bulk collection.",
+                "source feasibility gate: host(s) {} have not passed a single-item probe yet. Bulk external collection is blocked until each host succeeds once on a representative single item (for example, limit=1 or one item URL). Run that smaller probe, confirm the expected fields/schema, then retry the original bulk request.",
                 unprobed.join(", ")
             ))
         }
@@ -1445,8 +1445,30 @@ mod tests {
         let guard = state
             .feasibility_guard(&hosts, true)
             .expect("bulk call should require probe first");
-        assert!(guard.contains("single-item probe"), "{guard}");
+        assert!(
+            guard.contains("Bulk external collection is blocked"),
+            "{guard}"
+        );
+        assert!(guard.contains("single item"), "{guard}");
+        assert!(guard.contains("limit=1"), "{guard}");
+        assert!(guard.contains("retry the original bulk request"), "{guard}");
 
+        let mut probe = "{\"id\":1,\"title\":\"ok\"}".to_string();
+        state.record_external_outcome(ExternalOutcomeInput {
+            tool_name: "bash",
+            hosts: &hosts,
+            cache_key: None,
+            bash_similarity_key: None,
+            command: Some("curl https://api.example.com/items/1"),
+            content: &mut probe,
+            is_error: Some(false),
+        });
+        assert!(
+            state.feasibility_guard(&hosts, true).is_none(),
+            "bulk should be allowed after a successful single-item probe"
+        );
+
+        let mut state = TurnRuntimeState::new();
         let mut first = "short auth failure".to_string();
         state.record_external_outcome(ExternalOutcomeInput {
             tool_name: "bash",

@@ -140,6 +140,73 @@ pub(crate) fn tool_input_advisory(name: &str, input: &Value) -> Option<String> {
     }
 }
 
+pub(crate) fn command_requests_sudo_password(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if !lower.contains("sudo") {
+        return false;
+    }
+    let words = shell_words(command);
+    let mut idx = 0usize;
+    let mut command_position = true;
+    while idx < words.len() {
+        let word = &words[idx];
+        if shell_command_separator(word) {
+            command_position = true;
+            idx += 1;
+            continue;
+        }
+        if !command_position {
+            idx += 1;
+            continue;
+        }
+        if shell_assignment_word(word) || shell_command_prefix_word(word) {
+            idx += 1;
+            continue;
+        }
+        if word == "sudo" {
+            let has_noninteractive = words[idx..]
+                .iter()
+                .take_while(|arg| !shell_command_separator(arg))
+                .any(|arg| {
+                    arg == "-n"
+                        || arg == "--non-interactive"
+                        || arg.strip_prefix('-').is_some_and(|flags| {
+                            !flags.starts_with('-') && flags.chars().any(|ch| ch == 'n')
+                        })
+                });
+            if !has_noninteractive {
+                return true;
+            }
+        }
+        command_position = false;
+        idx += 1;
+    }
+    false
+}
+
+fn shell_command_separator(word: &str) -> bool {
+    matches!(word, "&&" | ";" | "|" | "&")
+}
+
+fn shell_command_prefix_word(word: &str) -> bool {
+    matches!(
+        word,
+        "command" | "env" | "time" | "if" | "then" | "do" | "while" | "until"
+    )
+}
+
+fn shell_assignment_word(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn read_symbol_advisory(symbol: &str) -> Option<String> {
     let trimmed = symbol.trim();
     let token = trimmed
@@ -177,6 +244,12 @@ fn bash_command_advisory(command: &str) -> Option<String> {
         return Some(format!(
             "bash advisory: `{tool}` is available as a Dext API tool but may not be installed as a shell binary. Use the native {tool} tool, use grep/awk, or probe with `command -v {tool}`."
         ));
+    }
+    if command_requests_sudo_password(command) {
+        return Some(
+            "bash advisory: sudo auth is local only. Dext will open a local password prompt if sudo needs authentication; never type sudo passwords into chat or steering input."
+                .to_string(),
+        );
     }
     None
 }
@@ -735,6 +808,21 @@ mod tests {
             classify_command_risk("bash", &json!({"command": "sudo rm -rf /tmp/demo"})),
             CommandRisk::Danger
         );
+        assert!(command_requests_sudo_password("sudo apt update"));
+        assert!(command_requests_sudo_password("sudo -v"));
+        assert!(command_requests_sudo_password("echo ok && sudo apt update"));
+        assert!(command_requests_sudo_password(
+            "sudo -n true; sudo apt update"
+        ));
+        assert!(command_requests_sudo_password(
+            "echo sudo && sudo apt update"
+        ));
+        assert!(!command_requests_sudo_password("grep sudo README.md"));
+        assert!(!command_requests_sudo_password("sudo -n true"));
+        assert!(!command_requests_sudo_password("sudo -nv"));
+        assert!(!command_requests_sudo_password(
+            "sudo --non-interactive true"
+        ));
         assert_eq!(
             classify_command_risk("read_file", &json!({"path": "/outside"})),
             CommandRisk::Read

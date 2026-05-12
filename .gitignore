@@ -26,5 +26,6 @@ __pycache__/
 /docs/Improve*.md
 /docs/tui-markdown-migration.md
 /docs/dext-review-and-improvements.md
+/docs/*.jsonl
 Screenshot*.jpg
 Screenshot*.png

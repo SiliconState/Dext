@@ -80,6 +80,8 @@ const PROJECT_STATE_LOCK_STALE_SECS: u64 = 86_400;
 const STREAM_EVENT_BUFFER_CAP: usize = 256_000;
 const TOOL_SUMMARY_CHAR_CAP: usize = 180;
 const TOOL_UI_CONTENT_CAP: usize = 8_000;
+const SUDO_ASKPASS_ENV: &str = "DEXT_SUDO_ASKPASS";
+const SUDO_AUTH_GUIDANCE: &str = "sudo auth is local only. If this command needs sudo, use the local prompt Dext opens; never type sudo passwords into chat/steering input.";
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
 pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "DEXT_ALLOW_BREAK_SYSTEM_PACKAGES";
 const AUTH_CIRCUIT_BREAKER_THRESHOLD: usize = 2;
@@ -854,6 +856,9 @@ fn route_interactive_input_line(
         return InteractiveInputRoute::Dropped;
     }
     if agent_busy.load(Ordering::SeqCst) {
+        if text_is_potential_local_secret(&trimmed) {
+            return InteractiveInputRoute::Dropped;
+        }
         if steering_tx.send(trimmed).is_ok() {
             InteractiveInputRoute::SteeringQueued
         } else {
@@ -864,6 +869,50 @@ fn route_interactive_input_line(
     } else {
         InteractiveInputRoute::Dropped
     }
+}
+
+pub(crate) fn text_is_potential_local_secret(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains("accessToken") || trimmed.contains("access_token") {
+        return true;
+    }
+    if slash_login_contains_secret(trimmed) {
+        return true;
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with('{') {
+        return false;
+    }
+    let words = trimmed.split_whitespace().count();
+    if words > 3 || (trimmed.contains(' ') && !trimmed.contains('=')) {
+        return false;
+    }
+    words <= 2 && trimmed.chars().count() >= 8
+}
+
+fn slash_login_contains_secret(trimmed: &str) -> bool {
+    let mut parts = trimmed.split_whitespace();
+    let Some(cmd) = parts.next() else {
+        return false;
+    };
+    if cmd != "/login" {
+        return false;
+    }
+    let args: Vec<&str> = parts.collect();
+    if args.len() < 2 {
+        return false;
+    }
+    let secret = args[1..].join(" ");
+    let lowered = secret.trim().to_ascii_lowercase();
+    if matches!(
+        lowered.as_str(),
+        "web" | "import" | "--import" | "reuse" | "--reuse" | "cancel"
+    ) {
+        return false;
+    }
+    looks_like_login_secret_input(&secret)
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -904,6 +953,10 @@ enum AgentEvent {
         ok: bool,
         preview: String,
         content: String,
+    },
+    LocalAuthPrompt {
+        tool: String,
+        message: String,
     },
     ToolBatchStart {
         batch_id: String,
@@ -981,6 +1034,7 @@ enum AgentEvent {
 trait EventSink: Send + Sync {
     fn emit(&mut self, event: AgentEvent);
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice;
+    fn local_auth_prompt(&mut self, tool: &str, message: &str);
 }
 
 struct ConsoleSink {
@@ -1059,6 +1113,7 @@ impl EventSink for ConsoleSink {
             }
             AgentEvent::ToolCallStart { .. } => {}
             AgentEvent::ToolCallResult { .. } => {}
+            AgentEvent::LocalAuthPrompt { .. } => {}
             AgentEvent::ToolBatchStart { .. } => {}
             AgentEvent::ToolBatchEnd { .. } => {}
             AgentEvent::UsageUpdate { .. } => {}
@@ -1106,6 +1161,10 @@ impl EventSink for ConsoleSink {
 
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice {
         prompt_permission(name, input, self.pretty)
+    }
+
+    fn local_auth_prompt(&mut self, _tool: &str, message: &str) {
+        eprintln!("{message}");
     }
 }
 
@@ -1183,6 +1242,19 @@ impl EventSink for JsonSink {
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice {
         self.inner.request_permission(name, input)
     }
+
+    fn local_auth_prompt(&mut self, tool: &str, message: &str) {
+        if self.mode == OutputMode::StreamJson {
+            if let Ok(value) = serde_json::to_value(AgentEvent::LocalAuthPrompt {
+                tool: tool.to_string(),
+                message: message.to_string(),
+            }) {
+                Self::emit_json_line(&value);
+            }
+        } else {
+            self.inner.local_auth_prompt(tool, message);
+        }
+    }
 }
 
 struct ChannelSink {
@@ -1196,6 +1268,13 @@ impl EventSink for ChannelSink {
     }
     fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
         Choice::Deny
+    }
+
+    fn local_auth_prompt(&mut self, tool: &str, message: &str) {
+        let _ = self.tx.send(AgentEvent::LocalAuthPrompt {
+            tool: tool.to_string(),
+            message: message.to_string(),
+        });
     }
 }
 
@@ -1231,6 +1310,8 @@ impl EventSink for NullSink {
     fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
         Choice::Deny
     }
+
+    fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6144,22 +6225,126 @@ fn execute_tool_with_cache(
     }
 }
 
+#[derive(Clone, Debug)]
+struct LocalSudoAuth {
+    askpass: PathBuf,
+}
+
+async fn prepare_local_sudo_auth(
+    root: &Path,
+) -> std::result::Result<Option<LocalSudoAuth>, String> {
+    if std::env::var_os(SUDO_ASKPASS_ENV).is_some() {
+        return Ok(None);
+    }
+    if find_binary_on_path("sudo").is_none() {
+        return Ok(None);
+    }
+    let mut probe = tokio::process::Command::new("sudo");
+    probe
+        .arg("-n")
+        .arg("-v")
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    configure_tokio_process_group(&mut probe);
+    let cached = match tokio::time::timeout(std::time::Duration::from_secs(2), probe.status()).await
+    {
+        Ok(Ok(status)) => status.success(),
+        _ => false,
+    };
+    if cached {
+        return Ok(None);
+    }
+    let askpass = write_sudo_askpass_script(root)?;
+    Ok(Some(LocalSudoAuth { askpass }))
+}
+
+#[cfg(unix)]
+fn write_sudo_askpass_script(root: &Path) -> std::result::Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = project_state_dir(root).join("sudo");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("prepare local sudo prompt dir: {e}"))?;
+    let path = dir.join("askpass.sh");
+    let content = sudo_askpass_script_content();
+    atomic_write_bytes(&path, content.as_bytes())
+        .map_err(|e| format!("write sudo askpass script: {e}"))?;
+    let mut perms = std::fs::metadata(&path)
+        .map_err(|e| format!("metadata sudo askpass script: {e}"))?
+        .permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&path, perms)
+        .map_err(|e| format!("chmod sudo askpass script: {e}"))?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn sudo_askpass_script_content_with_paths(zenity: &str, kdialog: &str) -> String {
+    format!(
+        "#!/bin/sh\nset -eu\nPROMPT=${{1:-'sudo password:'}}\nif command -v zenity >/dev/null 2>&1; then\n  exec {} --password --title='Dext local sudo prompt' --text=\"$PROMPT\"\nfi\nif command -v kdialog >/dev/null 2>&1; then\n  exec {} --password \"$PROMPT\"\nfi\nif [ -r /dev/tty ] && [ -w /dev/tty ]; then\n  printf 'Dext needs your sudo password locally for: %s\\n' \"$PROMPT\" >/dev/tty\n  printf 'Password: ' >/dev/tty\n  stty -echo </dev/tty\n  IFS= read -r password </dev/tty\n  stty echo </dev/tty\n  printf '\\n' >/dev/tty\n  printf '%s\\n' \"$password\"\n  exit 0\nfi\nprintf '%s\\n' 'Dext local sudo prompt requires a TTY, zenity, or kdialog.' >&2\nexit 1\n",
+        shell_single_quote(zenity),
+        shell_single_quote(kdialog),
+    )
+}
+
+#[cfg(unix)]
+fn sudo_askpass_script_content() -> String {
+    let zenity = find_binary_on_path("zenity")
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "zenity".to_string());
+    let kdialog = find_binary_on_path("kdialog")
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "kdialog".to_string());
+    sudo_askpass_script_content_with_paths(&zenity, &kdialog)
+}
+
+#[cfg(not(unix))]
+fn write_sudo_askpass_script(_root: &Path) -> std::result::Result<PathBuf, String> {
+    Err("local sudo prompts are only supported on Unix".to_string())
+}
+
 async fn execute_bash_async_with_timeout(
     cmd: &str,
     root: &Path,
     interrupt: Arc<AtomicBool>,
     timeout: std::time::Duration,
 ) -> std::result::Result<String, String> {
+    execute_bash_async_prepared(cmd, root, interrupt, timeout, None).await
+}
+
+async fn execute_bash_async_prepared(
+    cmd: &str,
+    root: &Path,
+    interrupt: Arc<AtomicBool>,
+    timeout: std::time::Duration,
+    local_sudo_auth: Option<LocalSudoAuth>,
+) -> std::result::Result<String, String> {
     use tokio::process::Command as TokioCommand;
 
+    let bash_cmd = if local_sudo_auth.is_some() {
+        format!("sudo() {{ command sudo -A \"$@\"; }}\n{cmd}")
+    } else {
+        cmd.to_string()
+    };
     let mut command = TokioCommand::new("bash");
     command
         .arg("-c")
-        .arg(cmd)
+        .arg(&bash_cmd)
         .current_dir(root)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if let Some(auth) = local_sudo_auth.as_ref() {
+        command
+            .env("SUDO_ASKPASS", &auth.askpass)
+            .env(
+                "SUDO_PROMPT",
+                "[dext local sudo] password for %u to run %p: ",
+            )
+            .env(SUDO_ASKPASS_ENV, &auth.askpass);
+    }
     configure_tokio_process_group(&mut command);
     let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
     let child_pid = child.id();
@@ -6350,6 +6535,7 @@ async fn execute_builtin_call(
     root: PathBuf,
     interrupt: Arc<AtomicBool>,
     read_cache: Option<Arc<Mutex<ReadFileCache>>>,
+    local_sudo_auth: Option<LocalSudoAuth>,
 ) -> std::result::Result<String, String> {
     if name == "subagent" {
         return Ok(
@@ -6361,7 +6547,12 @@ async fn execute_builtin_call(
         let cmd = input["command"].as_str().unwrap_or("").to_string();
         let guarded = tool_policy::apply_bash_guardrails(&cmd)?;
         let timeout = timeout_from_tool_input(&input, bash_tool_timeout());
-        execute_bash_async_with_timeout(&guarded, &root, interrupt, timeout).await
+        match local_sudo_auth {
+            Some(auth) => {
+                execute_bash_async_prepared(&guarded, &root, interrupt, timeout, Some(auth)).await
+            }
+            None => execute_bash_async_with_timeout(&guarded, &root, interrupt, timeout).await,
+        }
     } else if name == "http" {
         execute_http_tool_async(&input, interrupt, external_tool_timeout()).await
     } else if is_external_process_tool(&name) {
@@ -8986,6 +9177,12 @@ impl Agent {
             {
                 continue;
             }
+            if text_is_potential_local_secret(&message) {
+                self.sink.emit(AgentEvent::Warn(
+                    "queued input withheld: use the local auth prompt or run /login again when the agent is idle".to_string(),
+                ));
+                continue;
+            }
             pending_steering.push(message);
         }
         if pending_steering.is_empty() && runtime_control_notes.is_empty() {
@@ -11068,6 +11265,7 @@ impl Agent {
                 summary: String,
                 hosts: Vec<String>,
                 bulk_network: bool,
+                local_sudo_auth_needed: bool,
                 cache_key: Option<String>,
                 bash_similarity_key: Option<String>,
                 plan: Plan,
@@ -11091,6 +11289,7 @@ impl Agent {
                 };
 
                 let mut plan: Option<Plan> = None;
+                let mut local_sudo_auth_needed = false;
 
                 if let Err(msg) = tool_policy::validate_tool_input(&name, &input) {
                     plan = Some(Plan::Immediate {
@@ -11218,7 +11417,13 @@ impl Agent {
                                 content: msg,
                                 is_error: Some(true),
                             },
-                            None => Plan::Builtin,
+                            None => {
+                                local_sudo_auth_needed = name == "bash"
+                                    && tool_policy::command_requests_sudo_password(
+                                        input["command"].as_str().unwrap_or(""),
+                                    );
+                                Plan::Builtin
+                            }
                         });
                     }
                 }
@@ -11267,6 +11472,7 @@ impl Agent {
                     summary,
                     hosts,
                     bulk_network,
+                    local_sudo_auth_needed,
                     cache_key,
                     bash_similarity_key,
                     plan,
@@ -11348,7 +11554,8 @@ impl Agent {
                                 Ok(p) => p,
                                 Err(e) => return Err(format!("builtin semaphore closed: {e}")),
                             };
-                            execute_builtin_call(n, inp, root, interrupt, Some(read_cache)).await
+                            execute_builtin_call(n, inp, root, interrupt, Some(read_cache), None)
+                                .await
                         });
                         (*idx, handle)
                     })
@@ -11367,6 +11574,7 @@ impl Agent {
                     let n = plans[idx].name.clone();
                     let inp = plans[idx].input.clone();
                     let summary = plans[idx].summary.clone();
+                    let local_sudo_auth_needed = plans[idx].local_sudo_auth_needed;
                     self.sink.emit(AgentEvent::ToolCallStart {
                         call_id: plans[idx].event_call_id.clone(),
                         name: n.clone(),
@@ -11374,9 +11582,29 @@ impl Agent {
                     });
                     self.append_latest_log("tool_start", &summary);
                     builtin_started_at.insert(idx, std::time::Instant::now());
-                    let interrupt = self.interrupt.clone();
-                    let r = execute_builtin_call(n, inp, root, interrupt, Some(read_cache.clone()))
-                        .await;
+                    let local_sudo_auth = if local_sudo_auth_needed {
+                        match prepare_local_sudo_auth(&root).await {
+                            Ok(auth) => auth,
+                            Err(e) => {
+                                builtin_outputs.insert(idx, Err(e));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if local_sudo_auth.is_some() {
+                        self.sink.local_auth_prompt("bash", SUDO_AUTH_GUIDANCE);
+                    }
+                    let r = execute_builtin_call(
+                        n,
+                        inp,
+                        root,
+                        self.interrupt.clone(),
+                        Some(read_cache.clone()),
+                        local_sudo_auth,
+                    )
+                    .await;
                     builtin_outputs.insert(idx, r);
                 }
             }
@@ -11397,6 +11625,7 @@ impl Agent {
                     summary,
                     hosts,
                     bulk_network: _bulk_network,
+                    local_sudo_auth_needed: _local_sudo_auth_needed,
                     cache_key,
                     bash_similarity_key,
                     plan,
@@ -16863,10 +17092,16 @@ async fn main() -> Result<()> {
                 match stdin.lock().read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        if route_interactive_input_line(line, &busy, &input_tx, &steering_tx)
-                            == InteractiveInputRoute::SteeringQueued
-                        {
-                            eprintln!("[queued for next response]");
+                        match route_interactive_input_line(line, &busy, &input_tx, &steering_tx) {
+                            InteractiveInputRoute::SteeringQueued => {
+                                eprintln!("[queued for next response]");
+                            }
+                            InteractiveInputRoute::Dropped if busy.load(Ordering::SeqCst) => {
+                                eprintln!(
+                                    "[input withheld: use the local auth prompt for sudo/auth secrets]"
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -16898,6 +17133,11 @@ async fn main() -> Result<()> {
 
         if agent_busy_flag.load(std::sync::atomic::Ordering::SeqCst) {
             if apply_runtime_control_command(&mut agent, &input, |msg| println!("{msg}")) {
+                autosave_latest(&mut agent);
+                continue;
+            }
+            if text_is_potential_local_secret(&input) {
+                eprintln!("[input withheld: use the local auth prompt for sudo/auth secrets]");
                 autosave_latest(&mut agent);
                 continue;
             }

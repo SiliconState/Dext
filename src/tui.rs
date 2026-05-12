@@ -170,6 +170,10 @@ enum Line_ {
         approved: bool,
         always: bool,
     },
+    LocalAuth {
+        tool: String,
+        message: String,
+    },
     Info(String),
     Warn(String),
     Error(String),
@@ -229,6 +233,13 @@ impl EventSink for TuiSink {
             return Choice::Deny;
         }
         resp_rx.recv().unwrap_or(Choice::Deny)
+    }
+
+    fn local_auth_prompt(&mut self, tool: &str, message: &str) {
+        let _ = self.tx.send(ToTui::Event(AgentEvent::LocalAuthPrompt {
+            tool: tool.to_string(),
+            message: message.to_string(),
+        }));
     }
 }
 
@@ -1431,6 +1442,10 @@ impl TuiState {
                     self.live_tools.retain(|t| !t.is_subagent);
                 }
                 self.status = "thinking".into();
+            }
+            AgentEvent::LocalAuthPrompt { tool, message } => {
+                self.status = "local sudo prompt".into();
+                self.queue(Line_::LocalAuth { tool, message });
             }
             AgentEvent::ToolBatchStart {
                 batch_id,
@@ -4532,6 +4547,16 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 Span::styled(command.clone(), Style::default().fg(Color::DarkGray)),
             ]));
         }
+        Line_::LocalAuth { tool, message } => {
+            push_prefixed_wrapped_line(
+                &mut lines,
+                "🔐 ",
+                Style::default().fg(Color::Yellow),
+                &format!("local auth for {tool}: {message}"),
+                Style::default().fg(Color::Yellow),
+                width,
+            );
+        }
         Line_::Info(s) => {
             let trimmed = s.trim_start();
             if let Some(rest) = trimmed.strip_prefix("[sub]") {
@@ -5142,7 +5167,7 @@ fn input_hint_text(state: &TuiState) -> &'static str {
     } else if state.input_display_override.is_some() {
         "  large paste collapsed visually  ·  Enter sends full input  ·  any edit reveals full text"
     } else if state.agent_busy {
-        "  /commands accepted  ·  Ctrl+C/Esc interrupt  ·  Ctrl+O expand/collapse  ·  PgUp/PgDn scroll  ·  Ctrl+D quit"
+        "  agent busy: chat input becomes steering; local auth secrets are withheld — use sudo/auth prompts only"
     } else {
         "  Enter submit  ·  Shift+Enter newline  ·  Ctrl+O expand/collapse  ·  PgUp/PgDn scroll"
     }
@@ -5308,6 +5333,10 @@ fn help_overlay_text() -> Text<'static> {
         ("Paste", "multi-line paste is inserted without auto-submit"),
         ("Esc", "clear input / close this help"),
         ("Ctrl+C", "interrupt agent (twice = quit)"),
+        (
+            "Auth secrets",
+            "never type sudo passwords here; use local auth prompts",
+        ),
         ("Ctrl+D", "quit"),
         ("Ctrl+O", "toggle last tool output"),
         ("Ctrl+V", "toggle thinking visibility"),
@@ -5772,6 +5801,13 @@ fn handle_paste(state: &mut TuiState, pasted: String) {
     if pasted.is_empty() {
         return;
     }
+    if state.agent_busy && crate::text_is_potential_local_secret(&pasted) {
+        state.queue(Line_::Warn(
+            "paste withheld: do not enter sudo passwords or local auth secrets in chat; use the local auth prompt".to_string(),
+        ));
+        state.status = "local secret paste withheld".to_string();
+        return;
+    }
     state.input.insert_str(state.cursor, &pasted);
     state.cursor += pasted.len();
     state.input_display_override = abstract_input_for_display(&state.input);
@@ -6036,11 +6072,19 @@ fn handle_key(
             } else if state.show_help {
                 state.show_help = false;
             } else if state.agent_busy {
-                if interrupt.swap(true, Ordering::SeqCst) {
-                    state.quit = true;
-                    let _ = agent_input.send(FromTui::Quit);
+                if state.input.trim().is_empty() {
+                    if interrupt.swap(true, Ordering::SeqCst) {
+                        state.quit = true;
+                        let _ = agent_input.send(FromTui::Quit);
+                    } else {
+                        state.status = "interrupting… Esc again quits".to_string();
+                    }
                 } else {
-                    state.status = "interrupting… Esc again quits".to_string();
+                    state.input.clear();
+                    state.cursor = 0;
+                    state.clear_slash_completion_selection();
+                    state.input_display_override = None;
+                    state.status = "input cleared; Esc again interrupts".to_string();
                 }
             } else if !state.input.is_empty() {
                 state.input.clear();
@@ -6073,6 +6117,17 @@ fn handle_key(
                 return;
             }
             if state.agent_busy && state.pending_perm.is_none() {
+                if crate::text_is_potential_local_secret(&text) {
+                    state.queue(Line_::Warn(
+                        "input withheld: do not enter sudo passwords or local auth secrets in chat; use the local auth prompt".to_string(),
+                    ));
+                    state.input.clear();
+                    state.cursor = 0;
+                    state.clear_slash_completion_selection();
+                    state.input_display_override = None;
+                    state.status = "local secret withheld from provider".to_string();
+                    return;
+                }
                 state.queue(Line_::Steering(text.clone()));
                 if steering_input.send(text).is_ok() {
                     state.status = "queued for next safe boundary".to_string();
@@ -6750,6 +6805,19 @@ mod tests {
         });
 
         assert_eq!(input_hint_text(&state), "  press y / a / n to respond");
+    }
+
+    #[test]
+    fn busy_input_hint_warns_about_local_auth_secrets() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+
+        assert!(input_hint_text(&state).contains("local auth secrets are withheld"));
     }
 
     #[test]
@@ -8367,6 +8435,58 @@ mod tests {
                 [Line_::Blank, Line_::Steering(s), Line_::Blank] if s == input
             ));
         }
+    }
+
+    #[test]
+    fn busy_input_withholds_potential_local_secret_from_steering() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.input = "/login chatgpt sk-secret-token-that-should-stay-local".to_string();
+        state.cursor = state.input.len();
+
+        let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &submit_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(steering_rx.try_recv().is_err());
+        assert!(submit_rx.try_recv().is_err());
+        assert!(state.input.is_empty());
+        assert_eq!(state.status, "local secret withheld from provider");
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Warn(s)] if s.contains("input withheld")
+        ));
+    }
+
+    #[test]
+    fn busy_paste_withholds_potential_local_secret() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        handle_paste(&mut state, "token=abcdefghijklmnopqrstuvwxyz".to_string());
+
+        assert!(state.input.is_empty());
+        assert_eq!(state.status, "local secret paste withheld");
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Warn(s)] if s.contains("paste withheld")
+        ));
     }
 
     #[test]
