@@ -2104,22 +2104,14 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
     ));
 
     if let Some(branch) = &state.git_branch {
-        spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
-            format!("({})", clamp_chars(branch, 28)),
+            format!("Branch({})", clamp_chars(branch, 28)),
             Style::default().fg(Color::Magenta),
         ));
     }
 
-    let model_label = if state.provider_label.is_empty() {
-        state.model.clone()
-    } else {
-        format!(
-            "{}/{}",
-            status_provider_label(&state.provider_label, &state.api_family),
-            state.model
-        )
-    };
+    let model_label = status_model_label(&state.model);
     spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
     spans.push(Span::styled(model_label, Style::default().fg(Color::Cyan)));
     spans.push(Span::raw(" "));
@@ -2144,7 +2136,7 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
 
     if let Some((_, _, pct, color)) = context_usage(state) {
         spans.push(Span::styled(
-            " │ ctx ",
+            " │ Ctx ",
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::styled("[", Style::default().fg(Color::DarkGray)));
@@ -2246,17 +2238,13 @@ fn status_detail_spans(state: &TuiState) -> Vec<Span<'_>> {
     spans
 }
 
-fn status_provider_label(provider: &str, api_family: &str) -> String {
-    match (provider, api_family) {
-        (provider, "") => provider.to_string(),
-        ("chatgpt", "chatgpt-responses" | "chatgpt") => "chatgpt".to_string(),
-        ("openai", "openai-chat-completions" | "openai") => "openai".to_string(),
-        ("anthropic", "anthropic-messages" | "anthropic") => "anthropic".to_string(),
-        (provider, "chatgpt-responses") => format!("{provider}:chatgpt"),
-        (provider, "openai-chat-completions") => format!("{provider}:openai"),
-        (provider, "anthropic-messages") => format!("{provider}:anthropic"),
-        (provider, api_family) if provider == api_family => provider.to_string(),
-        (provider, api_family) => format!("{provider}:{api_family}"),
+fn status_model_label(model: &str) -> String {
+    if let Some(rest) = model.strip_prefix("gpt-") {
+        format!("GPT-{rest}")
+    } else if let Some(rest) = model.strip_prefix("glm-") {
+        format!("GLM-{rest}")
+    } else {
+        model.to_string()
     }
 }
 
@@ -6070,10 +6058,10 @@ fn help_overlay_text() -> Text<'static> {
     ];
     let legend_rows: &[(&str, &str)] = &[
         ("↑N ↻ N ↓N", "actual input / cached input / output tokens"),
-        ("ctx [████░░░░░░]", "last request context window usage"),
+        ("Ctx [████░░░░░░]", "last request context window usage"),
         ("Ctrl+T", "show exact token counters"),
         ("● / ⠋", "ready / busy spinner"),
-        ("(branch)", "git branch in sandbox"),
+        ("Branch(name)", "git branch in sandbox"),
     ];
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -7821,9 +7809,15 @@ mod tests {
             .map(|span| span.content)
             .collect::<String>();
 
+        assert!(
+            rendered.contains(". | Branch(status-branch (dirty)) │ test-model"),
+            "{rendered}"
+        );
         let sandbox_idx = rendered.find('.').expect("sandbox marker");
-        let branch_idx = rendered.find("(status-branch (dirty))").expect("branch");
-        let model_idx = rendered.find("chatgpt/test-model").expect("model");
+        let branch_idx = rendered
+            .find("Branch(status-branch (dirty))")
+            .expect("branch");
+        let model_idx = rendered.find("test-model").expect("model");
         assert!(sandbox_idx < branch_idx, "{rendered}");
         assert!(branch_idx < model_idx, "{rendered}");
         assert!(!rendered.contains("branch:"), "{rendered}");
@@ -7841,19 +7835,17 @@ mod tests {
         state.api_family = "chatgpt-responses".to_string();
         state.git_branch = Some("main".to_string());
 
+        let sandbox = "Documents/Projects/Learn/Finance";
         let lines = draw_to_lines(100, 20, &mut state);
         let line = lines
             .iter()
-            .find(|line| line.contains("~/Documents/Projects/Learn/Finance"))
+            .find(|line| line.contains(sandbox))
             .unwrap_or_else(|| panic!("sandbox not visible: {lines:?}"));
-        assert!(
-            line.contains("~/Documents/Projects/Learn/Finance"),
-            "{line}"
-        );
+        assert!(line.contains(sandbox), "{line}");
         assert!(!line.contains("~/Documents/Projects/Le…"), "{line}");
-        assert!(line.contains("(main)"), "{line}");
+        assert!(line.contains("Branch(main)"), "{line}");
         assert!(
-            line.find("(main)").unwrap() < line.find("chatgpt/gpt-5.5").unwrap(),
+            line.find("Branch(main)").unwrap() < line.find("GPT-5.5").unwrap(),
             "{line}"
         );
     }
@@ -9122,7 +9114,7 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
 
-        assert!(rendered.contains("ctx ["), "{rendered}");
+        assert!(rendered.contains("Ctx ["), "{rendered}");
         assert!(rendered.contains("59%"), "{rendered}");
         let details = status_detail_spans(&state)
             .into_iter()
@@ -9256,23 +9248,11 @@ mod tests {
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(rendered.contains(" │ chatgpt/gpt-4o "), "{rendered}");
+        assert!(rendered.contains(" │ GPT-4o "), "{rendered}");
+        assert!(!rendered.contains("chatgpt/"), "{rendered}");
         assert!(!rendered.contains("chatgpt:chatgpt"), "{rendered}");
         assert!(!rendered.contains("chatgpt-responses"), "{rendered}");
-        assert!(rendered.contains("gpt-4o"), "{rendered}");
-    }
-
-    #[test]
-    fn status_provider_label_keeps_distinct_provider_and_api_family() {
-        assert_eq!(
-            status_provider_label("openrouter", "openai-chat-completions"),
-            "openrouter:openai"
-        );
-        assert_eq!(
-            status_provider_label("glm", "anthropic-messages"),
-            "glm:anthropic"
-        );
-        assert_eq!(status_provider_label("custom", "custom"), "custom");
+        assert!(rendered.contains("GPT-4o"), "{rendered}");
     }
 
     #[test]
@@ -10139,7 +10119,7 @@ mod tests {
         let joined = lines.join("\n");
         assert!(!joined.contains("+12 chars"), "{joined}");
         assert!(joined.contains("Type a request…"), "{joined}");
-        assert!(joined.contains("ctx ["), "{joined}");
+        assert!(joined.contains("Ctx ["), "{joined}");
         assert!(
             compute_layout(Rect::new(0, 0, 120, 24), &state)
                 .input_area
