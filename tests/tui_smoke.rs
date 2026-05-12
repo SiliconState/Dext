@@ -12,9 +12,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TUI_COLS: u16 = 120;
 const TUI_ROWS: u16 = 40;
+const TUI_NARROW_COLS: u16 = 80;
+const TUI_NARROW_ROWS: u16 = 24;
+const TUI_WIDE_COLS: u16 = 180;
+const TUI_WIDE_ROWS: u16 = 40;
 
 #[test]
 fn tui_smoke_launches_real_binary_in_pty() {
+    run_tui_smoke(TUI_COLS, TUI_ROWS, true);
+}
+
+#[test]
+fn tui_smoke_launches_narrow_and_wide_terminals() {
+    run_tui_smoke(TUI_NARROW_COLS, TUI_NARROW_ROWS, false);
+    run_tui_smoke(TUI_WIDE_COLS, TUI_WIDE_ROWS, false);
+}
+
+fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
     let temp = TempDir::new("dext-tui-smoke").expect("temp dir");
     let sandbox = temp.path().join("sandbox");
     let dext_home = temp.path().join("dext-home");
@@ -23,7 +37,7 @@ fn tui_smoke_launches_real_binary_in_pty() {
     fs::create_dir_all(&dext_home).expect("dext home");
     fs::create_dir_all(&home).expect("home");
 
-    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).expect("open pty");
+    let mut pty = Pty::open(cols, rows).expect("open pty");
     let mut child = spawn_dext(&pty, &sandbox, &dext_home, &home).expect("spawn dext in pty");
 
     assert_visible(&mut pty, &mut child, "Dext v", Duration::from_secs(5));
@@ -31,15 +45,17 @@ fn tui_smoke_launches_real_binary_in_pty() {
     assert_visible(&mut pty, &mut child, "model", Duration::from_secs(2));
     assert_visible(&mut pty, &mut child, "Ctrl+D quit", Duration::from_secs(2));
 
-    pty.write_all_retry(b"?").expect("send help key");
-    assert_visible(&mut pty, &mut child, "keymap", Duration::from_secs(3));
-    assert_visible(&mut pty, &mut child, "Ctrl+O", Duration::from_secs(2));
-    assert_visible(
-        &mut pty,
-        &mut child,
-        "insertnewline",
-        Duration::from_secs(2),
-    );
+    if exercise_help {
+        pty.write_all_retry(b"?").expect("send help key");
+        assert_visible(&mut pty, &mut child, "keymap", Duration::from_secs(3));
+        assert_visible(&mut pty, &mut child, "Ctrl+O", Duration::from_secs(2));
+        assert_visible(
+            &mut pty,
+            &mut child,
+            "insertnewline",
+            Duration::from_secs(2),
+        );
+    }
 
     pty.write_all_retry(&[0x04]).expect("send Ctrl+D");
     let status = wait_for_exit(&mut child, Duration::from_secs(5), || pty.visible_text())
@@ -53,6 +69,11 @@ fn tui_smoke_launches_real_binary_in_pty() {
         tail(&visible, 3000)
     );
     assert_no_crash_text(&visible);
+    assert!(
+        !visible.contains("+12 chars"),
+        "stale truncation/debug artifact visible at {cols}x{rows}:\n{}",
+        tail(&visible, 3000)
+    );
 }
 
 fn spawn_dext(pty: &Pty, sandbox: &Path, dext_home: &Path, home: &Path) -> io::Result<Child> {

@@ -15,6 +15,7 @@ use ratatui_core::layout::Alignment as MdAlignment;
 use ratatui_core::style::{Color as MdColor, Modifier as MdModifier, Style as MdStyle};
 use ratatui_core::text::Text as MdText;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write as IoWrite};
@@ -40,6 +41,8 @@ const COLLAPSED_PREVIEW_LINES: usize = 4;
 const TOOL_DENSITY_SEPARATOR_EVERY: usize = 10;
 const RG_LINE_TRUNCATE_CELLS: usize = 220;
 const TRANSCRIPT_WRAP_GUARD_COLS: u16 = 1;
+const INPUT_MAX_PANEL_ROWS: u16 = 12;
+const CONTEXT_BAR_CELLS: usize = 10;
 const WORK_MAP_DRAWER_MAX_ROWS: usize = 10;
 const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 8;
 const WORK_MAP_DRAWER_MIN_EDITOR_ROWS: usize = 1;
@@ -759,6 +762,7 @@ struct TuiState {
     transcript_hover_expandable: Option<usize>,
     transcript_area: Rect,
     input_area: Rect,
+    inspector_area: Rect,
     live_indicator_height: u16,
     live_indicator_visible: bool,
     live_indicator_text: Option<Text<'static>>,
@@ -796,6 +800,8 @@ struct TuiState {
     thinking_effort: ThinkingEffort,
     last_expandable: Option<ExpandableBlock>,
     show_help: bool,
+    show_status_details: bool,
+    show_inspector: bool,
     slash_acomp_sel: Option<usize>,
     slash_acomp_scroll: usize,
     git_branch: Option<String>,
@@ -824,6 +830,7 @@ struct TuiState {
     todo_progress: Option<TodoProgress>,
     work_map: Option<WorkMapDrawer>,
     detached_subagent: Option<DetachedSubagent>,
+    debug_events: VecDeque<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -849,6 +856,7 @@ impl TuiState {
             transcript_hover_expandable: None,
             transcript_area: Rect::default(),
             input_area: Rect::default(),
+            inspector_area: Rect::default(),
             live_indicator_height: 0,
             live_indicator_visible: false,
             live_indicator_text: None,
@@ -884,6 +892,8 @@ impl TuiState {
             thinking_effort,
             last_expandable: None,
             show_help: false,
+            show_status_details: false,
+            show_inspector: false,
             slash_acomp_sel: None,
             slash_acomp_scroll: 0,
             git_branch: None,
@@ -912,6 +922,7 @@ impl TuiState {
             todo_progress: None,
             work_map: None,
             detached_subagent: None,
+            debug_events: VecDeque::new(),
         }
     }
 
@@ -964,6 +975,14 @@ impl TuiState {
         }
         if buf.contains("## Status\ncomplete") {
             ds.completed = true;
+        }
+    }
+
+    fn push_debug_event(&mut self, event: impl Into<String>) {
+        const MAX_DEBUG_EVENTS: usize = 80;
+        self.debug_events.push_back(event.into());
+        while self.debug_events.len() > MAX_DEBUG_EVENTS {
+            self.debug_events.pop_front();
         }
     }
 
@@ -1170,6 +1189,7 @@ impl TuiState {
     fn managed_region_contains(&self, column: u16, row: u16) -> bool {
         let transcript = self.transcript_area;
         let input = self.input_area;
+        let inspector = self.inspector_area;
         let transcript_contains = transcript.width > 0
             && transcript.height > 0
             && column >= transcript.x
@@ -1182,7 +1202,13 @@ impl TuiState {
             && column < input.x.saturating_add(input.width)
             && row >= input.y
             && row < input.y.saturating_add(input.height);
-        transcript_contains || input_contains
+        let inspector_contains = inspector.width > 0
+            && inspector.height > 0
+            && column >= inspector.x
+            && column < inspector.x.saturating_add(inspector.width)
+            && row >= inspector.y
+            && row < inspector.y.saturating_add(inspector.height);
+        transcript_contains || input_contains || inspector_contains
     }
 
     fn set_transcript_layout(&mut self, layout: TranscriptLayoutState) {
@@ -1217,6 +1243,7 @@ impl TuiState {
     fn apply_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::TurnStart => {
+                self.push_debug_event("turn start");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
                 self.agent_busy = true;
@@ -1242,6 +1269,7 @@ impl TuiState {
                     tokens.unwrap_or_else(|| ((self.history_chars.saturating_add(3)) / 4).max(1));
             }
             AgentEvent::TextDelta(t) => {
+                self.push_debug_event(format!("text delta · {} chars", t.chars().count()));
                 self.retry_status = None;
                 if self.stream_started_at.is_none() {
                     self.stream_started_at = Some(Instant::now());
@@ -1255,6 +1283,10 @@ impl TuiState {
                 self.streaming_text.push_str(&t);
             }
             AgentEvent::TextBlockComplete(full) => {
+                self.push_debug_event(format!(
+                    "assistant block complete · {} chars",
+                    full.chars().count()
+                ));
                 if !full.is_empty() {
                     let dim_prefix = self.assistant_prefix_seen;
                     self.assistant_prefix_seen = true;
@@ -1268,6 +1300,7 @@ impl TuiState {
                 self.stream_chars = 0;
             }
             AgentEvent::ThinkingDelta(t) => {
+                self.push_debug_event(format!("thinking delta · {} chars", t.chars().count()));
                 self.retry_status = None;
                 self.streaming_thinking.push_str(&t);
                 if self.streaming_text.is_empty() && self.stream_started_at.is_none() {
@@ -1275,13 +1308,17 @@ impl TuiState {
                 }
             }
             AgentEvent::ThinkingBlockComplete(full) => {
+                self.push_debug_event(format!(
+                    "thinking block complete · {} words",
+                    full.split_whitespace().count()
+                ));
                 if !full.is_empty() {
                     let word_count = full.split_whitespace().count();
                     if self.verbose {
                         self.queue(Line_::Thinking(full));
                     }
                     self.status = if self.verbose {
-                        format!("thinking done ({} words)", word_count)
+                        format!("thinking visible ({} words)", word_count)
                     } else {
                         format!("thinking hidden ({} words)", word_count)
                     };
@@ -1293,6 +1330,7 @@ impl TuiState {
                 name,
                 summary,
             } => {
+                self.push_debug_event(format!("tool preview · {name} · {call_id}"));
                 let is_subagent = is_subagent_call_id(&call_id);
                 let call_tag = self.tool_tag_for(&call_id);
                 if let Some(existing) = self.live_tools.iter_mut().find(|t| t.call_id == call_id) {
@@ -1318,6 +1356,7 @@ impl TuiState {
                 name,
                 summary,
             } => {
+                self.push_debug_event(format!("tool start · {name} · {call_id}"));
                 let is_subagent = is_subagent_call_id(&call_id);
                 if !is_subagent && self.sub_batch.as_ref().is_some_and(|b| b.done) {
                     self.sub_batch = None;
@@ -1370,6 +1409,11 @@ impl TuiState {
                 preview,
                 content,
             } => {
+                self.push_debug_event(format!(
+                    "tool result · {name} · {} · {} lines",
+                    if ok { "ok" } else { "error" },
+                    content.lines().count()
+                ));
                 let is_subagent = is_subagent_call_id(&call_id);
                 let call_tag = self.tool_tag_for(&call_id);
                 let idx = self
@@ -1444,6 +1488,7 @@ impl TuiState {
                 self.status = "thinking".into();
             }
             AgentEvent::LocalAuthPrompt { tool, message } => {
+                self.push_debug_event(format!("local auth prompt · {tool}"));
                 self.status = "local sudo prompt".into();
                 self.queue(Line_::LocalAuth { tool, message });
             }
@@ -1452,6 +1497,10 @@ impl TuiState {
                 call_ids,
                 labels,
             } => {
+                self.push_debug_event(format!(
+                    "tool batch start · {batch_id} · {} calls",
+                    call_ids.len()
+                ));
                 if is_subagent_batch_id(&batch_id) {
                     let mut entries: Vec<String> = Vec::new();
                     for (i, call_id) in call_ids.into_iter().enumerate() {
@@ -1472,6 +1521,10 @@ impl TuiState {
                 labels,
                 failed,
             } => {
+                self.push_debug_event(format!(
+                    "tool batch end · {batch_id} · {} calls · {failed} failed",
+                    call_ids.len()
+                ));
                 if is_subagent_batch_id(&batch_id) {
                     let mut entries: Vec<String> = Vec::new();
                     for (i, call_id) in call_ids.into_iter().enumerate() {
@@ -1506,6 +1559,9 @@ impl TuiState {
                 wait_secs,
                 reason,
             } => {
+                self.push_debug_event(format!(
+                    "http retry · attempt {attempt}/4 · wait {wait_secs}s · {reason}"
+                ));
                 self.retry_status = Some(format!("retry backoff {attempt}/4"));
                 self.status = format!("retry backoff {attempt}/4");
                 if attempt == 1 {
@@ -1526,6 +1582,9 @@ impl TuiState {
                 workaround_fired,
                 ..
             } => {
+                self.push_debug_event(format!(
+                    "turn diagnostics · {provider}/{model} · {api_family} · auth {auth_source}"
+                ));
                 self.provider_label = provider;
                 self.api_family = api_family;
                 self.auth_source = auth_source;
@@ -1534,15 +1593,30 @@ impl TuiState {
                 self.workaround_fired = workaround_fired;
             }
             AgentEvent::ThinkingEffortChanged { effort } => {
+                self.push_debug_event(format!("thinking effort changed · {}", effort.as_str()));
                 self.thinking_effort = effort;
             }
             AgentEvent::ApprovalProfileChanged { profile } => {
+                self.push_debug_event(format!("approval profile changed · {}", profile.as_str()));
                 self.approval_profile = profile;
             }
-            AgentEvent::Info(s) => self.queue(Line_::Info(s)),
-            AgentEvent::Warn(s) => self.queue(Line_::Warn(s)),
-            AgentEvent::Error(s) => self.queue(Line_::Error(s)),
+            AgentEvent::Info(s) => {
+                self.push_debug_event(format!("info · {}", sanitize_display_text(&s)));
+                if let Some(status) = phase_status_text(&s) {
+                    self.status = status;
+                }
+                self.queue(Line_::Info(s));
+            }
+            AgentEvent::Warn(s) => {
+                self.push_debug_event(format!("warn · {}", sanitize_display_text(&s)));
+                self.queue(Line_::Warn(s));
+            }
+            AgentEvent::Error(s) => {
+                self.push_debug_event(format!("error · {}", sanitize_display_text(&s)));
+                self.queue(Line_::Error(s));
+            }
             AgentEvent::Slash(s) => {
+                self.push_debug_event(format!("slash/system · {}", sanitize_display_text(&s)));
                 self.compacting = false;
                 self.compacting_resume_busy = false;
                 self.streaming_text.clear();
@@ -1552,7 +1626,7 @@ impl TuiState {
                 self.live_tools.clear();
                 self.sub_batch = None;
                 self.agent_busy = false;
-                self.status = "ready".into();
+                self.status = phase_status_text(&s).unwrap_or_else(|| "ready".into());
                 if let Some(ds) = parse_detached_subagent_launch(&s) {
                     self.detached_subagent = Some(ds);
                 }
@@ -1564,6 +1638,10 @@ impl TuiState {
                 waypoint_ids,
                 selector,
             } => {
+                self.push_debug_event(format!(
+                    "work map · {kind:?} · {} waypoints",
+                    waypoint_ids.len()
+                ));
                 self.compacting = false;
                 self.compacting_resume_busy = false;
                 self.streaming_text.clear();
@@ -1597,6 +1675,7 @@ impl TuiState {
                 }
             }
             AgentEvent::TurnEnd { .. } => {
+                self.push_debug_event("turn end");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
                 if let Some((tool_total, tool_summary)) = turn_tool_summary(&self.turn_tool_counts)
@@ -1615,10 +1694,8 @@ impl TuiState {
                         " · no errors".to_string()
                     };
                     self.queue(Line_::Info(format!(
-                        "Turn used {} tool call{} ({}) · {elapsed}{error_note}",
+                        "{} tools · {elapsed}{error_note} · {tool_summary}",
                         tool_total,
-                        if tool_total == 1 { "" } else { "s" },
-                        tool_summary,
                     )));
                 }
                 self.agent_busy = false;
@@ -1632,6 +1709,7 @@ impl TuiState {
                 self.sub_batch = None;
             }
             AgentEvent::CompactStart => {
+                self.push_debug_event("compact start");
                 self.compacting_resume_busy = self.agent_busy;
                 self.compacting = true;
                 self.agent_busy = true;
@@ -1639,6 +1717,7 @@ impl TuiState {
             }
 
             AgentEvent::CompactEnd { before, after } => {
+                self.push_debug_event(format!("compact end · {before} → {after}"));
                 let resume_busy = self.compacting_resume_busy;
                 self.compacting = false;
                 self.compacting_resume_busy = false;
@@ -1656,6 +1735,7 @@ impl TuiState {
                 };
             }
             AgentEvent::CompactFailed { message } => {
+                self.push_debug_event(format!("compact failed · {message}"));
                 let resume_busy = self.compacting_resume_busy;
                 self.compacting = false;
                 self.compacting_resume_busy = false;
@@ -1668,6 +1748,7 @@ impl TuiState {
                 };
             }
             AgentEvent::Interrupted => {
+                self.push_debug_event("interrupted");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
                 self.queue(Line_::Warn("interrupted".into()));
@@ -1681,12 +1762,31 @@ impl TuiState {
                 self.sub_batch = None;
             }
             AgentEvent::SteeringReceived { messages, preview } => {
+                self.push_debug_event(format!("steering received · {messages} updates"));
                 let noun = if messages == 1 { "update" } else { "updates" };
                 self.status = format!("queued {messages} {noun} for next response");
                 self.queue(Line_::SteeringDelivered { messages, preview });
             }
         }
     }
+}
+
+fn phase_status_text(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("[phase:")?;
+    let (phase, msg) = rest.split_once(']')?;
+    let msg = msg.trim();
+    let friendly =
+        if phase.contains("synthesize") || msg.contains("final") || msg.contains("deliver") {
+            "Summarizing…"
+        } else if phase.contains("tool") || msg.contains("tool") || msg.contains("scal") {
+            "Running tools…"
+        } else if phase.contains("fix") || msg.contains("fix") {
+            "Applying changes…"
+        } else {
+            "Thinking…"
+        };
+    Some(friendly.to_string())
 }
 
 fn todo_text_from_line(line: &str) -> String {
@@ -1831,7 +1931,7 @@ fn live_thinking_detail_line(detail: String, max_cells: usize) -> Line<'static> 
     let style = Style::default().fg(Color::Gray).bg(THINKING_BG);
     Line::from(vec![
         Span::styled(
-            "  ↳ ",
+            "│ ",
             Style::default().fg(Color::Indexed(244)).bg(THINKING_BG),
         ),
         Span::styled(clamp_chars(&detail, max_cells), style),
@@ -1922,6 +2022,7 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
             .unwrap_or(&state.streaming_thinking)
             .trim();
         if !tail.is_empty() {
+            let max_cells = width.saturating_sub(2) as usize;
             return Some(live_thinking_detail_line(tail.to_string(), max_cells));
         }
     }
@@ -1929,11 +2030,48 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
 }
 
 fn display_busy_status(status: String) -> String {
-    if status == "thinking" {
-        "Thinking".to_string()
-    } else {
-        status
+    match status.as_str() {
+        "thinking" => "Thinking".to_string(),
+        "responding" => "Responding".to_string(),
+        s if s.starts_with("running ") => format!("Running {}", s.trim_start_matches("running ")),
+        s if s.starts_with("retry ") => "Waiting to retry".to_string(),
+        s if s.starts_with("compacting") => "Summarizing".to_string(),
+        _ => status,
     }
+}
+
+fn context_usage(state: &TuiState) -> Option<(u64, u64, u64, Color)> {
+    let window = model_context_window(&state.model);
+    if window == 0 {
+        return None;
+    }
+    let ctx_used = if state.last_turn_context_tokens > 0 {
+        state.last_turn_context_tokens
+    } else if state.history_chars > 0 {
+        (state.history_chars / 4).max(1)
+    } else {
+        0
+    };
+    let pct = ((ctx_used as f64 / window as f64) * 100.0)
+        .clamp(0.0, 100.0)
+        .round() as u64;
+    let color = if pct >= 90 {
+        Color::Red
+    } else if pct >= 70 {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    Some((ctx_used, window, pct, color))
+}
+
+fn context_bar(pct: u64, cells: usize) -> String {
+    let filled = (((pct.min(100) as usize) * cells + 50) / 100).min(cells);
+    format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(cells.saturating_sub(filled))
+    )
 }
 
 fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
@@ -1945,78 +2083,111 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
     };
     let mut spans = vec![Span::styled(marker, Style::default().fg(marker_color))];
 
-    let cwd = home_tilde(&state.sandbox);
     spans.push(Span::styled(
-        clamp_chars(&cwd, 40),
+        clamp_chars(&home_tilde(&state.sandbox), 34),
         Style::default().fg(Color::Green),
     ));
 
     if let Some(branch) = &state.git_branch {
-        spans.push(Span::raw(" "));
         spans.push(Span::styled(
-            format!("({branch})"),
+            " │ branch: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            branch.clone(),
             Style::default().fg(Color::Magenta),
         ));
     }
 
-    if !state.provider_label.is_empty() {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            status_provider_label(&state.provider_label, &state.api_family),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    let usage = &state.usage;
-    let actual_in = usage.actual_input_tokens();
-    let cached_in = usage.cached_input_tokens();
-    if actual_in + cached_in + usage.output > 0 {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("↑{}", format_count(actual_in)),
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("↻ {}", format_count(cached_in)),
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("↓{}", format_count(usage.output)),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-
-    let window = model_context_window(&state.model);
-    let ctx_used = if state.last_turn_context_tokens > 0 {
-        state.last_turn_context_tokens
-    } else if state.history_chars > 0 {
-        (state.history_chars / 4).max(1)
+    let model_label = if state.provider_label.is_empty() {
+        state.model.clone()
     } else {
-        0
+        format!(
+            "{}/{}",
+            status_provider_label(&state.provider_label, &state.api_family),
+            state.model
+        )
     };
-    if window > 0 {
-        let pct = ((ctx_used as f64 / window as f64) * 100.0)
-            .clamp(0.0, 100.0)
-            .round() as u64;
-        let bar_color = if pct >= 90 {
-            Color::Red
-        } else if pct >= 70 {
-            Color::Yellow
-        } else {
-            Color::Cyan
-        };
-        spans.push(Span::raw("  "));
+    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(model_label, Style::default().fg(Color::Cyan)));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        state.thinking_effort.as_str().to_string(),
+        Style::default().fg(Color::Magenta),
+    ));
+
+    match state.approval_profile {
+        ApprovalProfile::Ask | ApprovalProfile::Always => {}
+        profile => {
+            spans.push(Span::styled(
+                " │ approval: ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                profile.as_str().to_string(),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+
+    if let Some((_, _, pct, color)) = context_usage(state) {
         spans.push(Span::styled(
-            format!("{}/{}", format_count(ctx_used), format_count(window)),
-            Style::default().fg(bar_color),
+            " │ ctx ",
+            Style::default().fg(Color::DarkGray),
         ));
-        spans.push(Span::styled(" ctx", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::raw(" "));
+        spans.push(Span::styled("[", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
-            format!("{pct}%"),
-            Style::default().fg(bar_color),
+            context_bar(pct, CONTEXT_BAR_CELLS),
+            Style::default().fg(color),
+        ));
+        spans.push(Span::styled("] ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(format!("{pct}%"), Style::default().fg(color)));
+    }
+
+    if state.show_status_details {
+        spans.push(Span::styled(
+            " │ details",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if state.show_inspector {
+        spans.push(Span::styled(
+            " │ inspector",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    spans
+}
+
+fn status_detail_spans(state: &TuiState) -> Vec<Span<'_>> {
+    let usage = &state.usage;
+    let mut spans = vec![Span::styled(
+        "Tokens: ",
+        Style::default().fg(Color::DarkGray),
+    )];
+    spans.push(Span::styled(
+        format!(
+            "in {} · cached {} · out {}",
+            format_count(usage.actual_input_tokens()),
+            format_count(usage.cached_input_tokens()),
+            format_count(usage.output),
+        ),
+        Style::default().fg(Color::Gray),
+    ));
+
+    if let Some((ctx_used, window, pct, color)) = context_usage(state) {
+        spans.push(Span::styled(
+            " · ctx ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!(
+                "{}/{} ({pct}%)",
+                format_count(ctx_used),
+                format_count(window)
+            ),
+            Style::default().fg(color),
         ));
     }
 
@@ -2027,8 +2198,10 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
         + ext.partial_delivery_hints
         + ext.http_retries;
     if ext_total > 0 {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("ext", Style::default().fg(Color::LightBlue)));
+        spans.push(Span::styled(
+            " · ext",
+            Style::default().fg(Color::LightBlue),
+        ));
         let counters = [
             (ext.dedupe_hits, "d", Color::Cyan),
             (ext.circuit_breaker_trips, "cb", Color::Yellow),
@@ -2047,29 +2220,15 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
         }
     }
 
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        state.model.clone(),
-        Style::default().fg(Color::Cyan),
-    ));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        format!("reasoning:{}", state.thinking_effort.as_str()),
-        Style::default().fg(Color::Magenta),
-    ));
-
-    match state.approval_profile {
-        ApprovalProfile::Ask | ApprovalProfile::Always => {}
-        profile => {
-            spans.insert(1, Span::styled("  ", Style::default().fg(Color::DarkGray)));
-            spans.insert(
-                2,
-                Span::styled(
-                    format!("approval:{}  ", profile.as_str()),
-                    Style::default().fg(Color::Yellow),
-                ),
-            );
-        }
+    if !state.auth_source.is_empty() {
+        spans.push(Span::styled(
+            " · auth ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            state.auth_source.clone(),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
 
     spans
@@ -2866,7 +3025,38 @@ fn push_diff_preview(
     preview_lines.len().saturating_sub(take)
 }
 
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&b) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+        if let Some(ch) = text[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 fn sanitize_display_text(text: &str) -> String {
+    let text = strip_ansi_escapes(text);
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -2923,53 +3113,20 @@ fn clamp_chars_plain(s: &str, max_cells: usize) -> String {
     out
 }
 
-fn clamp_chars_with_hint(s: &str, max_cells: usize) -> String {
+fn clamp_chars_with_indicator(s: &str, max_cells: usize) -> String {
     if max_cells == 0 {
         return String::new();
     }
 
-    let total_cells = text_width(s);
-    if total_cells <= max_cells {
+    if text_width(s) <= max_cells {
         return s.to_string();
     }
+    clamp_chars_plain(s, max_cells)
+}
 
-    let omitted_chars = s.chars().count();
-    if max_cells == 1 {
-        return "…".to_string();
-    }
-
-    let hint = format!("… +{omitted_chars} chars");
-    if text_width(&hint) >= max_cells {
-        let mut out = String::new();
-        let mut cells = 0usize;
-        for ch in hint.chars() {
-            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if cells + w > max_cells {
-                break;
-            }
-            out.push(ch);
-            cells += w;
-        }
-        return out;
-    }
-
-    let suffix_width = text_width(&hint);
-    let prefix_limit = max_cells.saturating_sub(suffix_width);
-    let mut out = String::new();
-    let mut cells = 0usize;
-    let mut kept_chars = 0usize;
-    for ch in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cells + w > prefix_limit {
-            break;
-        }
-        out.push(ch);
-        cells += w;
-        kept_chars += 1;
-    }
-    let omitted_chars = s.chars().count().saturating_sub(kept_chars);
-    out.push_str(&format!("… +{omitted_chars} chars"));
-    out
+#[cfg(test)]
+fn clamp_chars_with_hint(s: &str, max_cells: usize) -> String {
+    clamp_chars_with_indicator(s, max_cells)
 }
 
 fn wrap_input_visual(
@@ -3017,22 +3174,29 @@ fn wrap_input_visual(
     (lines, cursor_row, cursor_col)
 }
 
-fn input_panel_height(state: &TuiState, area_height: u16, area_width: u16) -> u16 {
-    let available = area_height.saturating_sub(2).max(1);
-    let base_min = if state.pending_perm.is_some() || state.agent_busy {
-        5
+fn input_editor_text(state: &TuiState) -> Cow<'_, str> {
+    if let Some(preview) = &state.input_display_override {
+        Cow::Borrowed(preview.as_str())
+    } else if state.input.is_empty() {
+        Cow::Borrowed("Type a request…")
     } else {
-        7
-    };
-    let min_panel = base_min.min(available);
+        Cow::Borrowed(state.input.as_str())
+    }
+}
+
+fn input_panel_height(state: &TuiState, area_height: u16, area_width: u16) -> u16 {
+    let available = area_height.saturating_sub(1).max(1);
+    let min_panel = 3.min(available);
     let ratio_cap = ((area_height as f32) * 0.5).round() as u16;
-    let max_panel = ratio_cap.max(min_panel).min(available);
+    let max_panel = INPUT_MAX_PANEL_ROWS
+        .min(ratio_cap.max(min_panel))
+        .min(available);
 
     let cols = area_width.saturating_sub(2).max(1) as usize;
-    let (wrapped, _, _) = wrap_input_visual(&state.input, state.cursor, cols);
+    let (wrapped, _, _) = wrap_input_visual(&input_editor_text(state), state.cursor, cols);
     let text_rows = wrapped.len().max(1) as u16;
     let drawer_rows = work_map_drawer_height(state, area_width) as u16;
-    let desired = text_rows.saturating_add(3).saturating_add(drawer_rows);
+    let desired = text_rows.saturating_add(2).saturating_add(drawer_rows);
     desired.clamp(min_panel, max_panel)
 }
 
@@ -3262,21 +3426,77 @@ fn rendered_line_text(line: &Line<'_>) -> String {
         .collect::<String>()
 }
 
+fn strip_markdown_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with("**") || rest.starts_with("__") {
+            i += 2;
+            continue;
+        }
+        if rest.starts_with('`') {
+            i += 1;
+            continue;
+        }
+        if let Some(ch) = rest.chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn clean_markdown_text(mut text: Text<'static>) -> Text<'static> {
+    for line in &mut text.lines {
+        for span in &mut line.spans {
+            let cleaned = strip_markdown_markers(span.content.as_ref());
+            span.content = cleaned.into();
+        }
+        let rendered = rendered_line_text(line);
+        let trimmed = rendered.trim_start();
+        let mut split_idx = 0usize;
+        let mut heading_marks = 0usize;
+        for (idx, ch) in trimmed.char_indices() {
+            if ch == '#' {
+                heading_marks += 1;
+                split_idx = idx + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if (1..=6).contains(&heading_marks) && trimmed[split_idx..].starts_with(' ') {
+            let cleaned = trimmed[split_idx..].trim_start().to_string();
+            line.spans = vec![Span::styled(
+                cleaned,
+                line.style
+                    .patch(Style::default().add_modifier(Modifier::BOLD)),
+            )];
+        }
+    }
+    text
+}
+
 fn is_plain_text_code_fence_opener(line: &Line<'_>) -> bool {
     let text = rendered_line_text(line);
     let trimmed = text.trim();
-    let Some(info) = trimmed.strip_prefix("```") else {
+    if trimmed == "```" || trimmed == "~~~" {
+        return true;
+    }
+    let Some(rest) = trimmed
+        .strip_prefix("```")
+        .or_else(|| trimmed.strip_prefix("~~~"))
+    else {
         return false;
     };
-    let lang = info.split_whitespace().next().unwrap_or("");
-    matches!(
-        lang.to_ascii_lowercase().as_str(),
-        "text" | "txt" | "plain" | "plaintext"
-    )
+    !rest.trim().is_empty()
 }
 
 fn is_code_fence_closer(line: &Line<'_>) -> bool {
-    rendered_line_text(line).trim() == "```"
+    let trimmed = rendered_line_text(line).trim().to_string();
+    trimmed == "```" || trimmed == "~~~"
 }
 
 fn hide_plain_text_code_fence_lines(mut text: Text<'static>) -> Text<'static> {
@@ -3540,6 +3760,483 @@ fn parse_table_lines(lines: &[&str]) -> Option<ParsedTable> {
         })
 }
 
+fn clean_status_cell(cell: &str) -> String {
+    let trimmed = strip_markdown_markers(cell).trim().to_string();
+    let without_yes = trimmed
+        .strip_prefix("✅")
+        .or_else(|| trimmed.strip_prefix('✓'))
+        .map(str::trim_start)
+        .unwrap_or(trimmed.as_str());
+    if without_yes.eq_ignore_ascii_case("yes") {
+        "PASS".to_string()
+    } else if without_yes.eq_ignore_ascii_case("no") {
+        "FAIL".to_string()
+    } else {
+        without_yes.to_string()
+    }
+}
+
+fn normalize_table_status_cells(table: &mut ParsedTable) {
+    let Some(header) = table.rows.first() else {
+        return;
+    };
+    let status_cols = header
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, cell)| {
+            let lower = cell.trim().to_ascii_lowercase();
+            matches!(lower.as_str(), "result" | "status" | "pass" | "ok").then_some(idx)
+        })
+        .collect::<Vec<_>>();
+    for row in table.rows.iter_mut().skip(table.header_rows) {
+        for idx in &status_cols {
+            if let Some(cell) = row.get_mut(*idx) {
+                *cell = clean_status_cell(cell);
+            }
+        }
+    }
+}
+
+fn semantic_clean_cell(cell: &str) -> String {
+    clean_status_cell(&sanitize_display_text(cell))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn semantic_lower(cell: &str) -> String {
+    semantic_clean_cell(cell).to_ascii_lowercase()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticTableKind {
+    Checks,
+    Performance,
+    Constraint,
+    NextStep,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticTableItem {
+    kind: SemanticTableKind,
+    label: String,
+    value: String,
+    passed: Option<bool>,
+}
+
+fn semantic_kind_from_text(text: &str) -> Option<SemanticTableKind> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("next")
+        || lower.contains("recommend")
+        || lower.contains("action")
+        || lower.contains("step")
+    {
+        Some(SemanticTableKind::NextStep)
+    } else if lower.contains("check")
+        || lower.contains("validation")
+        || lower.contains("verified")
+        || lower.contains("test")
+    {
+        Some(SemanticTableKind::Checks)
+    } else if lower.contains("constraint")
+        || lower.contains("bottleneck")
+        || lower.contains("limit")
+        || lower.contains("cap")
+        || lower.contains("physical ram")
+        || lower.contains("system ram")
+        || lower.contains("wsl")
+        || lower.contains("memory allocation")
+    {
+        Some(SemanticTableKind::Constraint)
+    } else if lower.contains("performance")
+        || lower.contains("speed")
+        || lower.contains("throughput")
+        || lower.contains("tok/s")
+        || lower.contains("wpm")
+        || lower.contains("vram")
+        || lower.contains("generation")
+        || lower.contains("latency")
+    {
+        Some(SemanticTableKind::Performance)
+    } else {
+        None
+    }
+}
+
+fn semantic_status_value(cell: &str) -> Option<bool> {
+    let lower = semantic_lower(cell);
+    if matches!(lower.as_str(), "pass" | "ok" | "yes" | "true" | "✓" | "✅") {
+        Some(true)
+    } else if matches!(lower.as_str(), "fail" | "no" | "false" | "✗" | "x" | "❌") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn semantic_status_is_explicit(cell: &str) -> bool {
+    let raw = strip_markdown_markers(&sanitize_display_text(cell)).to_ascii_lowercase();
+    raw.contains('✓')
+        || raw.contains('✅')
+        || raw.contains('✗')
+        || raw.contains('❌')
+        || matches!(
+            raw.trim(),
+            "pass" | "fail" | "ok" | "yes" | "no" | "true" | "false"
+        )
+}
+
+fn semantic_metric_value(cell: &str) -> bool {
+    let lower = semantic_lower(cell);
+    lower.chars().any(|c| c.is_ascii_digit())
+        && (lower.contains("tok/s")
+            || lower.contains("wpm")
+            || lower.contains("gb")
+            || lower.contains("gib")
+            || lower.contains("mb")
+            || lower.contains('%')
+            || lower.contains('/')
+            || lower.contains('~')
+            || lower.contains('–')
+            || lower.contains('-'))
+}
+
+fn semantic_find_col(headers: &[String], needles: &[&str]) -> Option<usize> {
+    headers.iter().position(|header| {
+        needles
+            .iter()
+            .any(|needle| header == needle || header.contains(needle))
+    })
+}
+
+fn semantic_row_extra(row: &[String], excluded: &[usize]) -> String {
+    row.iter()
+        .enumerate()
+        .filter(|(idx, _)| !excluded.contains(idx))
+        .map(|(_, cell)| semantic_clean_cell(cell))
+        .filter(|cell| !cell.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn semantic_row_value(row: &[String], preferred: Option<usize>, excluded: &[usize]) -> String {
+    preferred
+        .and_then(|idx| row.get(idx))
+        .map(|cell| semantic_clean_cell(cell))
+        .filter(|cell| !cell.is_empty())
+        .unwrap_or_else(|| semantic_row_extra(row, excluded))
+}
+
+fn semantic_table_item(
+    row: &[String],
+    headers: &[String],
+    category_col: Option<usize>,
+    label_col: usize,
+    value_col: Option<usize>,
+    status_col: Option<usize>,
+    next_col: Option<usize>,
+) -> Option<SemanticTableItem> {
+    let whole_row = row
+        .iter()
+        .map(|cell| semantic_clean_cell(cell))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let category_kind = category_col
+        .and_then(|idx| row.get(idx))
+        .and_then(|cell| semantic_kind_from_text(cell));
+    let label = row
+        .get(label_col)
+        .map(|cell| semantic_clean_cell(cell))
+        .unwrap_or_default();
+    let label_kind =
+        semantic_kind_from_text(&label).or_else(|| semantic_kind_from_text(&whole_row));
+    let status = status_col
+        .and_then(|idx| row.get(idx))
+        .and_then(|cell| semantic_status_value(cell));
+    let label_header = headers.get(label_col).map(String::as_str).unwrap_or("");
+    let status_header = status_col
+        .and_then(|idx| headers.get(idx))
+        .map(String::as_str);
+    let status_is_explicit = status_col
+        .and_then(|idx| row.get(idx))
+        .is_some_and(|cell| semantic_status_is_explicit(cell));
+
+    let kind = category_kind.or(label_kind).or_else(|| {
+        if next_col.is_some() {
+            Some(SemanticTableKind::NextStep)
+        } else if status.is_some()
+            && (status_is_explicit
+                || label_header.contains("check")
+                || status_header
+                    .is_some_and(|header| matches!(header, "result" | "status" | "pass" | "ok")))
+        {
+            Some(SemanticTableKind::Checks)
+        } else if value_col
+            .and_then(|idx| row.get(idx))
+            .is_some_and(|cell| semantic_metric_value(cell))
+        {
+            Some(SemanticTableKind::Performance)
+        } else {
+            None
+        }
+    })?;
+
+    let excluded = [
+        Some(label_col),
+        category_col,
+        status_col,
+        next_col,
+        value_col,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let value = match kind {
+        SemanticTableKind::Checks => status_col
+            .and_then(|idx| row.get(idx))
+            .map(|cell| semantic_clean_cell(cell))
+            .unwrap_or_default(),
+        SemanticTableKind::NextStep => semantic_row_value(row, next_col.or(value_col), &excluded),
+        SemanticTableKind::Performance | SemanticTableKind::Constraint => {
+            semantic_row_value(row, value_col, &excluded)
+        }
+    };
+
+    if label.is_empty() && value.is_empty() {
+        return None;
+    }
+
+    Some(SemanticTableItem {
+        kind,
+        label,
+        value,
+        passed: status,
+    })
+}
+
+fn semantic_section_title(kind: SemanticTableKind) -> &'static str {
+    match kind {
+        SemanticTableKind::Checks => "Checks",
+        SemanticTableKind::Performance => "Performance",
+        SemanticTableKind::Constraint => "Constraint",
+        SemanticTableKind::NextStep => "Next step",
+    }
+}
+
+fn push_semantic_pair_line(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    value: &str,
+    label_width: usize,
+    width: u16,
+    base_style: Style,
+) {
+    let label = if label.is_empty() { "item" } else { label };
+    let value = value.trim();
+    let prefix_style = Style::default().fg(Color::DarkGray);
+    let label_style = base_style.patch(Style::default().fg(Color::Gray));
+    let value_style = base_style;
+    let available = width.saturating_sub(2).max(1) as usize;
+    let label_cells = text_width(label);
+    let pad = label_width.saturating_sub(label_cells).saturating_add(2);
+    if !value.is_empty() && label_cells + pad + text_width(value) <= available {
+        lines.push(Line::from(vec![
+            Span::styled("  ".to_string(), prefix_style),
+            Span::styled(label.to_string(), label_style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(value.to_string(), value_style),
+        ]));
+    } else if value.is_empty() {
+        push_prefixed_wrapped_line(lines, "  ", prefix_style, label, label_style, width);
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  ".to_string(), prefix_style),
+            Span::styled(label.to_string(), label_style),
+        ]));
+        push_prefixed_wrapped_line(lines, "    ", prefix_style, value, value_style, width);
+    }
+}
+
+fn push_semantic_check_line(
+    lines: &mut Vec<Line<'static>>,
+    item: &SemanticTableItem,
+    width: u16,
+    base_style: Style,
+) {
+    let (marker, color) = match item.passed {
+        Some(true) => ("✓ ", Color::Green),
+        Some(false) => ("✗ ", Color::Red),
+        None => ("• ", Color::DarkGray),
+    };
+    let label = if item.label.is_empty() {
+        item.value.as_str()
+    } else {
+        item.label.as_str()
+    };
+    let detail = if !item.value.is_empty() && !matches!(item.value.as_str(), "PASS" | "FAIL") {
+        format!("{label} — {}", item.value)
+    } else {
+        label.to_string()
+    };
+    push_prefixed_wrapped_line(
+        lines,
+        marker,
+        Style::default().fg(color),
+        &detail,
+        base_style,
+        width,
+    );
+}
+
+fn render_semantic_table_lines(
+    table: &ParsedTable,
+    base_style: Style,
+    max_total_width: usize,
+) -> Option<Vec<Line<'static>>> {
+    if table.header_rows == 0 || table.rows.len() <= table.header_rows {
+        return None;
+    }
+    let header = table.rows.first()?;
+    let headers = header
+        .iter()
+        .map(|cell| semantic_lower(cell))
+        .collect::<Vec<_>>();
+    let category_col = semantic_find_col(&headers, &["section", "category", "type", "area"]);
+    let status_col = semantic_find_col(&headers, &["result", "status", "pass", "ok"]);
+    let next_col = semantic_find_col(&headers, &["next", "recommend", "action", "step"]);
+    let value_col = semantic_find_col(
+        &headers,
+        &[
+            "value",
+            "metric",
+            "speed",
+            "rate",
+            "observed",
+            "expected",
+            "throughput",
+            "usage",
+        ],
+    )
+    .or(status_col);
+    let label_col = semantic_find_col(
+        &headers,
+        &[
+            "check",
+            "item",
+            "name",
+            "metric",
+            "constraint",
+            "setting",
+            "field",
+            "parameter",
+        ],
+    )
+    .filter(|idx| Some(*idx) != status_col)
+    .unwrap_or_else(|| {
+        (0..headers.len())
+            .find(|idx| {
+                Some(*idx) != category_col
+                    && Some(*idx) != status_col
+                    && Some(*idx) != value_col
+                    && Some(*idx) != next_col
+            })
+            .unwrap_or(0)
+    });
+
+    let mut items = Vec::new();
+    for row in table.rows.iter().skip(table.header_rows) {
+        let item = semantic_table_item(
+            row,
+            &headers,
+            category_col,
+            label_col,
+            value_col,
+            status_col,
+            next_col,
+        )?;
+        items.push(item);
+    }
+    if items.is_empty() {
+        return None;
+    }
+
+    let kinds = [
+        SemanticTableKind::Checks,
+        SemanticTableKind::Performance,
+        SemanticTableKind::Constraint,
+        SemanticTableKind::NextStep,
+    ];
+    let width = (max_total_width as u16).max(1);
+    let mut lines = Vec::new();
+    let mut wrote_section = false;
+    for kind in kinds {
+        let section_items = items
+            .iter()
+            .filter(|item| item.kind == kind)
+            .collect::<Vec<_>>();
+        if section_items.is_empty() {
+            continue;
+        }
+        if wrote_section {
+            lines.push(Line::from(""));
+        }
+        wrote_section = true;
+        lines.push(Line::from(Span::styled(
+            semantic_section_title(kind),
+            base_style.patch(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )));
+        let label_width = section_items
+            .iter()
+            .map(|item| text_width(&item.label))
+            .max()
+            .unwrap_or(0)
+            .clamp(14, (max_total_width / 2).clamp(14, 34));
+        for item in section_items {
+            match kind {
+                SemanticTableKind::Checks => {
+                    push_semantic_check_line(&mut lines, item, width, base_style)
+                }
+                SemanticTableKind::NextStep => {
+                    let text = if item.value.is_empty() {
+                        item.label.clone()
+                    } else if item.label.is_empty()
+                        || semantic_kind_from_text(&item.label) == Some(SemanticTableKind::NextStep)
+                    {
+                        item.value.clone()
+                    } else {
+                        format!("{}: {}", item.label, item.value)
+                    };
+                    push_prefixed_wrapped_line(
+                        &mut lines,
+                        "  ",
+                        Style::default().fg(Color::DarkGray),
+                        &text,
+                        base_style,
+                        width,
+                    );
+                }
+                SemanticTableKind::Performance | SemanticTableKind::Constraint => {
+                    push_semantic_pair_line(
+                        &mut lines,
+                        &item.label,
+                        &item.value,
+                        label_width,
+                        width,
+                        base_style,
+                    );
+                }
+            }
+        }
+    }
+
+    (!lines.is_empty()).then_some(lines)
+}
+
 fn table_area_width(widths: &[usize], spacing: usize) -> usize {
     if widths.is_empty() {
         return 0;
@@ -3744,11 +4441,13 @@ fn render_table_lines(
 }
 
 fn truncate_cell(cell: &str, max_width: usize) -> String {
+    let sanitized = strip_ansi_escapes(cell);
+    let cell = clean_status_cell(&sanitized);
     if max_width == 0 {
         return String::new();
     }
 
-    if unicode_width::UnicodeWidthStr::width(cell) <= max_width {
+    if text_width(&cell) <= max_width {
         return cell.to_string();
     }
     if max_width == 1 {
@@ -3770,7 +4469,11 @@ fn truncate_cell(cell: &str, max_width: usize) -> String {
 }
 
 fn text_width(s: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(s)
+    unicode_width::UnicodeWidthStr::width(strip_markdown_markers(&strip_ansi_escapes(s)).as_str())
+}
+
+fn transcript_content_rect(area: Rect) -> Rect {
+    area
 }
 
 fn transcript_render_width(width: u16) -> u16 {
@@ -3802,9 +4505,9 @@ fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'s
     let sanitized = sanitize_display_text(body);
     let options = MarkdownOptions::new(DextMarkdownStyleSheet);
     if !has_table_marker(&sanitized) {
-        return hide_plain_text_code_fence_lines(
+        return clean_markdown_text(hide_plain_text_code_fence_lines(
             text_to_static(from_str_with_options(&sanitized, &options)).style(base_style),
-        );
+        ));
     }
 
     let raw_lines: Vec<&str> = sanitized.lines().collect();
@@ -3832,7 +4535,8 @@ fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'s
         let parsed = parse_markdown_table_block(&raw_lines, i)
             .or_else(|| parse_ascii_table_block(&raw_lines, i));
 
-        if let Some((table, consumed)) = parsed {
+        if let Some((mut table, consumed)) = parsed {
+            normalize_table_status_cells(&mut table);
             if markdown_start < i {
                 blocks.push(EitherBlock::Markdown(&raw_lines[markdown_start..i]));
             }
@@ -3858,16 +4562,22 @@ fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'s
                 result_lines.extend(rendered.style(base_style).lines);
             }
             EitherBlock::Table(table) => {
-                result_lines.extend(render_table_lines(
-                    &table,
-                    base_style,
-                    max_total_width as usize,
-                ));
+                if let Some(lines) =
+                    render_semantic_table_lines(&table, base_style, max_total_width as usize)
+                {
+                    result_lines.extend(lines);
+                } else {
+                    result_lines.extend(render_table_lines(
+                        &table,
+                        base_style,
+                        max_total_width as usize,
+                    ));
+                }
             }
         }
     }
 
-    hide_plain_text_code_fence_lines(Text::from(result_lines))
+    clean_markdown_text(hide_plain_text_code_fence_lines(Text::from(result_lines)))
 }
 
 enum EitherBlock<'a> {
@@ -3882,7 +4592,7 @@ fn push_prefixed_text(
     prefix_style: Style,
     target_width: u16,
 ) {
-    let prefix_w = unicode_width::UnicodeWidthStr::width(prefix);
+    let prefix_w = text_width(prefix);
     let available_content_width = (target_width as usize).saturating_sub(prefix_w);
     if text.lines.is_empty() {
         lines.push(Line::from(vec![Span::styled(
@@ -3899,13 +4609,13 @@ fn push_prefixed_text(
             if remaining == 0 {
                 break;
             }
-            let content = span.content.into_owned();
-            let width = unicode_width::UnicodeWidthStr::width(content.as_str());
+            let content = strip_markdown_markers(&span.content.into_owned());
+            let width = text_width(&content);
             if width <= remaining {
                 remaining = remaining.saturating_sub(width);
                 spans.push(Span::styled(content, span.style));
             } else {
-                let clipped = clamp_chars_with_hint(&content, remaining);
+                let clipped = clamp_chars_with_indicator(&content, remaining);
                 if !clipped.is_empty() {
                     spans.push(Span::styled(clipped, span.style));
                 }
@@ -3929,7 +4639,7 @@ fn push_prefixed_wrapped_line(
     target_width: u16,
 ) {
     let content_width = (target_width as usize)
-        .saturating_sub(unicode_width::UnicodeWidthStr::width(prefix))
+        .saturating_sub(text_width(prefix))
         .max(1);
     let wrapped = wrap_plain_visual(body, content_width)
         .into_iter()
@@ -3962,6 +4672,8 @@ fn push_prefixed_wrapped_spans(
 }
 
 fn split_display_cells(s: &str, max_cells: usize) -> (String, String) {
+    let sanitized = strip_ansi_escapes(s);
+    let s = sanitized.as_str();
     if max_cells == 0 || s.is_empty() {
         return (String::new(), s.to_string());
     }
@@ -4003,7 +4715,7 @@ fn clip_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<
             break;
         }
         let style = span.style;
-        let content = span.content.into_owned();
+        let content = strip_markdown_markers(&span.content.into_owned());
         let width = text_width(&content);
         if width <= remaining {
             remaining = remaining.saturating_sub(width);
@@ -4061,7 +4773,7 @@ fn push_wrapped_spans_with_prefix(
                 break;
             };
             let style = span.style;
-            let content = span.content.into_owned();
+            let content = strip_markdown_markers(&span.content.into_owned());
             let width = text_width(&content);
             if width <= available {
                 available = available.saturating_sub(width);
@@ -4155,7 +4867,8 @@ fn push_thinking_body_lines(
     let prefix_width = text_width(prefix);
     let body_width = max_width.saturating_sub(prefix_width).max(1);
     for raw in sanitize_display_text(body).lines().take(20) {
-        for row in wrap_plain_words_visual(raw, body_width) {
+        let cleaned = strip_markdown_markers(raw);
+        for row in wrap_plain_words_visual(&cleaned, body_width) {
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), border_style),
                 Span::styled(row, thinking_style),
@@ -4280,7 +4993,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 Span::styled(name.clone(), name_style),
             ];
 
-            let summary_body = tool_summary_body(name, summary);
+            let summary_body = clean_status_cell(tool_summary_body(name, summary));
             let mut body_spans = Vec::new();
             if !summary_body.is_empty() {
                 body_spans.push(Span::raw(": "));
@@ -4578,22 +5291,17 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                     ]));
                 }
             } else if trimmed.starts_with("[phase:") {
-                let phase_label = trimmed
-                    .strip_prefix("[phase:")
-                    .and_then(|r| r.strip_suffix(']'))
-                    .unwrap_or(trimmed);
-                lines.push(Line::from(vec![Span::styled(
-                    format!("▫ {phase_label}"),
-                    Style::default()
-                        .fg(Color::Indexed(242))
-                        .add_modifier(Modifier::ITALIC),
-                )]));
+                if let Some(label) = phase_status_text(trimmed) {
+                    lines.push(Line::from(vec![Span::styled(
+                        label,
+                        Style::default()
+                            .fg(Color::Indexed(242))
+                            .add_modifier(Modifier::ITALIC),
+                    )]));
+                }
             } else if trimmed.starts_with("[objective:") {
                 lines.push(Line::from(vec![Span::styled(
-                    trimmed
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .to_string(),
+                    "agent objective noted".to_string(),
                     Style::default()
                         .fg(Color::Indexed(242))
                         .add_modifier(Modifier::ITALIC),
@@ -4934,12 +5642,7 @@ fn text_visual_height(text: &Text, width: u16) -> u16 {
         let cells: usize = line
             .spans
             .iter()
-            .map(|s| {
-                s.content
-                    .chars()
-                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
-                    .sum::<usize>()
-            })
+            .map(|s| text_width(s.content.as_ref()))
             .sum();
         let rows = if cells == 0 { 1 } else { cells.div_ceil(w) };
         h = h.saturating_add(rows as u16);
@@ -5039,7 +5742,8 @@ fn insert_transcript_item<B: Backend>(
     width: u16,
     tool_tint_parity: &mut bool,
 ) -> io::Result<()> {
-    let (text, height) = cached_transcript_render(state, item, width);
+    let content_width = transcript_render_width(width);
+    let (text, height) = cached_transcript_render(state, item, content_width);
     let tint_bg = match item {
         Line_::Thinking(_) => Some(THINKING_BG),
         Line_::Steering(_) => Some(STEERING_BG),
@@ -5161,15 +5865,15 @@ fn input_border_style(state: &TuiState) -> Style {
 
 fn input_hint_text(state: &TuiState) -> &'static str {
     if state.pending_perm.is_some() {
-        "  press y / a / n to respond"
+        "y once · a always · n deny"
     } else if state.work_map_is_active() {
-        "  Work Map drawer  ·  Enter focuses selection  ·  p packet  ·  t track  ·  Esc close"
+        "Enter focus · p packet · t track · Esc close"
     } else if state.input_display_override.is_some() {
-        "  large paste collapsed visually  ·  Enter sends full input  ·  any edit reveals full text"
+        "paste preview · Enter sends full input · edit reveals"
     } else if state.agent_busy {
-        "  agent busy: chat input becomes steering; local auth secrets are withheld — use sudo/auth prompts only"
+        "steering mode · local auth secrets withheld"
     } else {
-        "  Enter submit  ·  Shift+Enter newline  ·  Ctrl+O expand/collapse  ·  PgUp/PgDn scroll"
+        "Enter send · Shift+Enter newline · Ctrl+O expand · Ctrl+I inspect"
     }
 }
 
@@ -5177,16 +5881,14 @@ fn transcript_live_indicator_text(state: &TuiState, width: u16) -> Option<Text<'
     if width == 0 || !state.agent_busy || state.pending_perm.is_some() {
         return None;
     }
+    let status = display_busy_status(derived_busy_status(state));
     let mut top = vec![
         Span::styled(
             SPINNER_FRAMES[(state.frame_count % SPINNER_FRAMES.len() as u64) as usize].to_string(),
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),
-        Span::styled(
-            display_busy_status(derived_busy_status(state)),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(status, Style::default().fg(Color::DarkGray)),
     ];
     if let Some(elapsed) = live_indicator_elapsed(state) {
         top.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
@@ -5229,7 +5931,8 @@ fn collect_wrapped_lines(text: &Text<'static>, width: u16) -> Vec<Line<'static>>
 }
 
 fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcript_area: Rect) {
-    let content_width = transcript_render_width(transcript_area.width);
+    let content_area = transcript_content_rect(transcript_area);
+    let content_width = transcript_render_width(content_area.width);
     let live_text = transcript_live_indicator_text(state, content_width);
     let live_lines = live_text
         .as_ref()
@@ -5243,7 +5946,7 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
 
     if transcript_area.width == 0 || transcript_area.height == 0 || live_indicator_lines == 0 {
         state.set_transcript_layout(TranscriptLayoutState {
-            transcript_area,
+            transcript_area: content_area,
             input_area: state.input_area,
             total_lines: 0,
             visible_lines: viewport_height,
@@ -5261,11 +5964,11 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
 
     let live_height = live_indicator_lines.min(transcript_area.height as usize) as u16;
     let live_area = Rect::new(
-        transcript_area.x,
-        transcript_area
+        content_area.x,
+        content_area
             .y
             .saturating_add(transcript_area.height.saturating_sub(live_height)),
-        transcript_area.width,
+        content_area.width,
         live_height,
     );
     let text = Text::from(live_lines.clone());
@@ -5277,7 +5980,7 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
 
     let live_start = transcript_area.height.saturating_sub(live_height) as usize;
     state.set_transcript_layout(TranscriptLayoutState {
-        transcript_area,
+        transcript_area: content_area,
         input_area: state.input_area,
         total_lines: live_indicator_lines,
         visible_lines: viewport_height,
@@ -5339,7 +6042,9 @@ fn help_overlay_text() -> Text<'static> {
         ),
         ("Ctrl+D", "quit"),
         ("Ctrl+O", "toggle last tool output"),
-        ("Ctrl+V", "toggle thinking visibility"),
+        ("Ctrl+V", "toggle thinking detail"),
+        ("Ctrl+T", "toggle token/status details"),
+        ("Ctrl+I", "toggle inspector/debug pane"),
         (
             "Tab / Shift+Tab",
             "cycle reasoning depth (slash completion when typing /)",
@@ -5351,7 +6056,8 @@ fn help_overlay_text() -> Text<'static> {
     ];
     let legend_rows: &[(&str, &str)] = &[
         ("↑N ↻ N ↓N", "actual input / cached input / output tokens"),
-        ("% [████░░░░░░]", "last request context window usage"),
+        ("ctx [████░░░░░░]", "last request context window usage"),
+        ("Ctrl+T", "show exact token counters"),
         ("● / ⠋", "ready / busy spinner"),
         ("(branch)", "git branch in sandbox"),
     ];
@@ -5448,23 +6154,50 @@ struct TuiLayout {
     transcript_area: ratatui::layout::Rect,
     input_area: ratatui::layout::Rect,
     status_area: ratatui::layout::Rect,
+    inspector_area: ratatui::layout::Rect,
+}
+
+fn inspector_width(area_width: u16) -> u16 {
+    if area_width < 120 {
+        0
+    } else {
+        (area_width / 3).clamp(34, 56)
+    }
 }
 
 fn compute_layout(area: ratatui::layout::Rect, state: &TuiState) -> TuiLayout {
+    let status_height = if state.show_status_details { 2 } else { 1 }.min(area.height);
     let input_height = input_panel_height(state, area.height, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
             Constraint::Length(input_height),
-            Constraint::Length(area.height.min(1)),
+            Constraint::Length(status_height),
         ])
         .split(area);
 
+    let main_area = chunks[0];
+    let inspector_width = if state.show_inspector {
+        inspector_width(area.width).min(main_area.width.saturating_sub(40))
+    } else {
+        0
+    };
+    let (transcript_rect, inspector_rect) = if inspector_width > 0 {
+        let horizontal = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(inspector_width)])
+            .split(main_area);
+        (horizontal[0], horizontal[1])
+    } else {
+        (main_area, empty_rect(main_area))
+    };
+
     TuiLayout {
-        transcript_area: clip_rect(chunks[0], area).unwrap_or_else(|| empty_rect(area)),
+        transcript_area: clip_rect(transcript_rect, area).unwrap_or_else(|| empty_rect(area)),
         input_area: clip_rect(chunks[1], area).unwrap_or_else(|| empty_rect(area)),
         status_area: clip_rect(chunks[2], area).unwrap_or_else(|| empty_rect(area)),
+        inspector_area: clip_rect(inspector_rect, area).unwrap_or_else(|| empty_rect(area)),
     }
 }
 
@@ -5488,7 +6221,7 @@ fn slash_popup_layout(
     let name_width = completions
         .iter()
         .take(visible_count)
-        .map(|c| unicode_width::UnicodeWidthStr::width(c.text.as_str()))
+        .map(|c| text_width(c.text.as_str()))
         .max()
         .unwrap_or(0);
 
@@ -5630,6 +6363,148 @@ fn work_map_drawer_lines(state: &mut TuiState, width: u16, height: usize) -> Vec
     lines
 }
 
+fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
+    let inner = width.saturating_sub(2).max(1) as usize;
+    let mut lines = Vec::new();
+    let status = display_busy_status(derived_busy_status(state));
+    lines.push(Line::from(vec![
+        Span::styled("Status ", Style::default().fg(Color::DarkGray)),
+        Span::styled(status, Style::default().fg(Color::Yellow)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Model  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            clamp_chars(&state.model, inner.saturating_sub(7)),
+            Style::default().fg(Color::Cyan),
+        ),
+    ]));
+    if let Some((ctx_used, window, pct, color)) = context_usage(state) {
+        lines.push(Line::from(vec![
+            Span::styled("Context ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "{} / {} ({pct}%)",
+                    format_count(ctx_used),
+                    format_count(window)
+                ),
+                Style::default().fg(color),
+            ),
+        ]));
+    }
+    if let Some((total, summary)) = turn_tool_summary(&state.turn_tool_counts) {
+        lines.push(Line::from(vec![
+            Span::styled("Tools  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                clamp_chars(&format!("{total}: {summary}"), inner.saturating_sub(7)),
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+    }
+    if state.turn_error_count > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Errors ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                state.turn_error_count.to_string(),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+    }
+    if !state.streaming_thinking.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Thinking",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let tail = state
+            .streaming_thinking
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for row in wrap_plain_words_visual(&tail, inner.saturating_sub(2).max(1))
+            .into_iter()
+            .take(4)
+        {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    row,
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Debug events",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let reserved = lines.len().saturating_add(2);
+    let event_take = (height as usize).saturating_sub(reserved).max(1);
+    for event in state
+        .debug_events
+        .iter()
+        .rev()
+        .take(event_take)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let event = sanitize_display_text(event);
+        for (idx, row) in wrap_plain_words_visual(&event, inner.saturating_sub(2).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if idx == 0 { "• " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(row, Style::default().fg(Color::DarkGray)),
+            ]));
+            if lines.len() >= height.saturating_sub(1) as usize {
+                break;
+            }
+        }
+        if lines.len() >= height.saturating_sub(1) as usize {
+            break;
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "Ctrl+I hide",
+        Style::default().fg(Color::DarkGray),
+    )));
+    Text::from(lines)
+}
+
+fn render_inspector(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text = inspector_lines(state, area.width, area.height);
+    let widget = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::LEFT)
+            .title(Span::styled(
+                " inspector ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    render_widget_safe(frame, Clear, area);
+    render_widget_safe(frame, widget, area);
+}
+
 fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let area = frame.area();
     render_widget_safe(frame, Clear, area);
@@ -5638,25 +6513,40 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let transcript_area = layout.transcript_area;
     let input_area = layout.input_area;
     let status_area = layout.status_area;
+    let inspector_area = layout.inspector_area;
     state.input_area = input_area;
+    state.inspector_area = inspector_area;
 
     render_transcript(frame, state, transcript_area);
+    if state.show_inspector {
+        render_inspector(frame, state, inspector_area);
+    }
 
-    let status = Paragraph::new(Line::from(status_spans(state)));
+    let status = if state.show_status_details {
+        Paragraph::new(Text::from(vec![
+            Line::from(status_spans(state)),
+            Line::from(status_detail_spans(state)),
+        ]))
+    } else {
+        Paragraph::new(Line::from(status_spans(state)))
+    };
     render_widget_safe(frame, status, status_area);
 
-    let prompt_style = if state.agent_busy && state.pending_perm.is_none() {
+    let prompt_style = if state.input.is_empty() && state.input_display_override.is_none() {
+        Style::default().fg(Color::DarkGray)
+    } else if state.agent_busy && state.pending_perm.is_none() {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default()
     };
 
     let wrap_cols = input_area.width.saturating_sub(2).max(1) as usize;
+    let editor_text = input_editor_text(state);
     let (wrapped, cursor_row, cursor_col) =
-        wrap_input_visual(&state.input, state.cursor, wrap_cols);
+        wrap_input_visual(editor_text.as_ref(), state.cursor, wrap_cols);
     let inner_rows = input_area.height.saturating_sub(2).max(1) as usize;
     let drawer_height = work_map_drawer_height(state, input_area.width).min(inner_rows);
-    let hint_rows = 1usize;
+    let hint_rows = 0usize;
     let mut text_rows_visible = inner_rows
         .saturating_sub(drawer_height)
         .saturating_sub(hint_rows)
@@ -5685,14 +6575,21 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     if drawer_rows > 0 {
         lines.extend(work_map_drawer_lines(state, wrap_cols as u16, drawer_rows));
     }
-    lines.push(Line::from(Span::styled(
-        input_hint_text(state),
-        Style::default().fg(Color::DarkGray),
-    )));
 
     let input = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
+            .title(Span::styled(
+                " Message ",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .title_bottom(
+                Line::from(Span::styled(
+                    input_hint_text(state),
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .right_aligned(),
+            )
             .border_style(input_border_style(state)),
     );
     render_widget_safe(frame, input, input_area);
@@ -5734,6 +6631,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     if !state.show_help
         && state.pending_perm.is_none()
         && !state.work_map_is_active()
+        && !state.show_inspector
         && (!state.agent_busy || state.input.starts_with('/'))
     {
         let completions = slash_completions(&state.input);
@@ -5765,7 +6663,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
                 let padding = layout
                     .name_width
                     .saturating_add(1)
-                    .saturating_sub(unicode_width::UnicodeWidthStr::width(comp.text.as_str()));
+                    .saturating_sub(text_width(comp.text.as_str()));
                 let padded = format!("{}{}", comp.text, " ".repeat(padding));
                 let mut spans = vec![
                     Span::styled(padded, cmd_style),
@@ -6057,6 +6955,22 @@ fn handle_key(
                 }
             }
         }
+        (KeyCode::Char('t'), m) if is_ctrl(m) => {
+            state.show_status_details = !state.show_status_details;
+            state.status = if state.show_status_details {
+                "status details visible".to_string()
+            } else {
+                "status details hidden".to_string()
+            };
+        }
+        (KeyCode::Char('i'), m) if is_ctrl(m) => {
+            state.show_inspector = !state.show_inspector;
+            state.status = if state.show_inspector {
+                "inspector visible".to_string()
+            } else {
+                "inspector hidden".to_string()
+            };
+        }
         (KeyCode::Char('v'), m) if is_ctrl(m) => {
             state.verbose = !state.verbose;
             state.status = if state.verbose {
@@ -6071,6 +6985,9 @@ fn handle_key(
                 state.status = "work map drawer closed".to_string();
             } else if state.show_help {
                 state.show_help = false;
+            } else if state.show_inspector {
+                state.show_inspector = false;
+                state.status = "inspector hidden".to_string();
             } else if state.agent_busy {
                 if state.input.trim().is_empty() {
                     if interrupt.swap(true, Ordering::SeqCst) {
@@ -6664,6 +7581,7 @@ pub(crate) fn steering_delivered_text_for_test(
 mod tests {
     use super::*;
     use crate::provider::StoredCredential;
+    use std::sync::atomic::AtomicBool;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_env_lock().lock().expect("env lock")
@@ -6704,6 +7622,20 @@ mod tests {
                 line.spans
                     .iter()
                     .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn draw_to_lines(width: u16, height: u16, state: &mut TuiState) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, state)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect()
@@ -6804,7 +7736,7 @@ mod tests {
             responder: std::sync::mpsc::sync_channel(0).0,
         });
 
-        assert_eq!(input_hint_text(&state), "  press y / a / n to respond");
+        assert_eq!(input_hint_text(&state), "y once · a always · n deny");
     }
 
     #[test]
@@ -6817,7 +7749,7 @@ mod tests {
         );
         state.agent_busy = true;
 
-        assert!(input_hint_text(&state).contains("local auth secrets are withheld"));
+        assert!(input_hint_text(&state).contains("local auth secrets withheld"));
     }
 
     #[test]
@@ -6925,7 +7857,7 @@ mod tests {
         let text = transcript_live_indicator_text(&state, 80).expect("live indicator");
         let lines = flatten_lines(&text);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("responding"));
+        assert!(lines[0].contains("Responding"));
         assert!(lines[0].contains("12s"));
         assert!(lines[1].contains("final streamed line"));
     }
@@ -6993,7 +7925,7 @@ mod tests {
         let text = transcript_live_indicator_text(&state, 80).expect("live indicator");
         let lines = flatten_lines(&text);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("running bash"));
+        assert!(lines[0].contains("Running bash"));
         assert!(lines[0].contains("5s"));
         assert!(lines[1].contains("cargo test --release"));
     }
@@ -7095,22 +8027,20 @@ mod tests {
             .iter()
             .rev()
             .find_map(|line| match line {
-                Line_::Info(msg) if msg.starts_with("Turn used ") => Some(msg.as_str()),
+                Line_::Info(msg) if msg.starts_with("18 tools · ") => Some(msg.as_str()),
                 _ => None,
             })
             .expect("turn summary");
-        assert!(
-            summary.starts_with("Turn used 18 tool calls ("),
-            "{summary}"
-        );
-        assert!(summary.contains("2 reads"), "{summary}");
+        assert!(summary.starts_with("18 tools · "), "{summary}");
+        assert!(summary.contains("1 search"), "{summary}");
+        assert!(summary.contains("1 find"), "{summary}");
         assert!(summary.contains("1 write"), "{summary}");
         assert!(summary.contains("3 git ops"), "{summary}");
         assert!(summary.contains("2 todo ops"), "{summary}");
         assert!(summary.contains("3 data ops"), "{summary}");
         assert!(summary.contains("1 request"), "{summary}");
         assert!(summary.contains("1 other call"), "{summary}");
-        assert!(summary.ends_with(" · no errors"), "{summary}");
+        assert!(summary.contains(" · no errors"), "{summary}");
     }
 
     #[test]
@@ -7682,8 +8612,6 @@ mod tests {
 
     #[test]
     fn collapse_marks_transcript_for_rebuild() {
-        use std::sync::atomic::AtomicBool;
-
         let mut state = TuiState::new(
             "test-model".to_string(),
             ".".to_string(),
@@ -8046,13 +8974,13 @@ mod tests {
             cache_create: 0,
             cache_read: 268_000,
         };
-        let line = status_spans(&state)
+        let line = status_detail_spans(&state)
             .into_iter()
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(line.contains("↑47.0k"), "{line}");
-        assert!(line.contains("↻ 268.0k"), "{line}");
-        assert!(line.contains("↓5.3k"), "{line}");
+        assert!(line.contains("in 47.0k"), "{line}");
+        assert!(line.contains("cached 268.0k"), "{line}");
+        assert!(line.contains("out 5.3k"), "{line}");
 
         state.usage = Usage {
             input: 47_000,
@@ -8060,13 +8988,13 @@ mod tests {
             cache_create: 0,
             cache_read: 0,
         };
-        let line = status_spans(&state)
+        let line = status_detail_spans(&state)
             .into_iter()
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(line.contains("↑47.0k"), "{line}");
-        assert!(line.contains("↻ 0"), "{line}");
-        assert!(line.contains("↓5.3k"), "{line}");
+        assert!(line.contains("in 47.0k"), "{line}");
+        assert!(line.contains("cached 0"), "{line}");
+        assert!(line.contains("out 5.3k"), "{line}");
     }
 
     #[test]
@@ -8130,11 +9058,17 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
 
-        assert!(rendered.contains("160.0k/272.0k"), "{rendered}");
+        assert!(rendered.contains("ctx ["), "{rendered}");
+        assert!(rendered.contains("59%"), "{rendered}");
+        let details = status_detail_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+        assert!(details.contains("160.0k/272.0k"), "{details}");
     }
 
     #[test]
-    fn status_spans_render_external_telemetry_counters() {
+    fn status_detail_spans_render_external_telemetry_counters() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             ".".to_string(),
@@ -8148,7 +9082,7 @@ mod tests {
             partial_delivery_hints: 1,
             http_retries: 4,
         };
-        let rendered = status_spans(&state)
+        let rendered = status_detail_spans(&state)
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
@@ -8156,7 +9090,7 @@ mod tests {
     }
 
     #[test]
-    fn status_spans_render_only_nonzero_external_telemetry_counters() {
+    fn status_detail_spans_render_only_nonzero_external_telemetry_counters() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             ".".to_string(),
@@ -8170,7 +9104,7 @@ mod tests {
             partial_delivery_hints: 0,
             http_retries: 0,
         };
-        let rendered = status_spans(&state)
+        let rendered = status_detail_spans(&state)
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
@@ -8258,7 +9192,7 @@ mod tests {
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(rendered.contains("  chatgpt  "), "{rendered}");
+        assert!(rendered.contains(" │ chatgpt/gpt-4o "), "{rendered}");
         assert!(!rendered.contains("chatgpt:chatgpt"), "{rendered}");
         assert!(!rendered.contains("chatgpt-responses"), "{rendered}");
         assert!(rendered.contains("gpt-4o"), "{rendered}");
@@ -8963,15 +9897,24 @@ mod tests {
     }
 
     #[test]
-    fn markdown_text_renders_table_with_surrounding_prose() {
+    fn markdown_text_renders_generic_status_table_with_surrounding_prose() {
         let input =
             "## Results\n\n| Tool | Status |\n| --- | ------ |\n| rg | ok |\n| fd | ok |\n\nDone.";
         let text = markdown_text(input, Style::default(), 120);
         let flat = flatten_lines(&text);
         let joined = flat.join("\n");
-        assert!(joined.contains("┌"), "should have table borders");
-        assert!(joined.contains("Tool"), "should have header");
-        assert!(joined.contains("rg"), "should have data");
+        assert!(
+            joined.contains("Checks"),
+            "should rewrite status table semantically: {joined}"
+        );
+        assert!(
+            joined.contains("✓ rg"),
+            "should have semantic check row: {joined}"
+        );
+        assert!(
+            joined.contains("✓ fd"),
+            "should have semantic check row: {joined}"
+        );
         assert!(joined.contains("Done"), "should have trailing text");
     }
 
@@ -8983,7 +9926,7 @@ mod tests {
         let joined = flat.join("\n");
         assert!(joined.contains("line one"));
         assert!(joined.contains("line two"));
-        assert!(joined.contains("┌"));
+        assert!(joined.contains("Checks"));
         assert!(!joined.contains('\r'));
     }
 
@@ -8996,8 +9939,14 @@ mod tests {
             !flat.iter().any(|line| line.starts_with('┌')),
             "fenced code should stay code, not table"
         );
-        assert!(flat.iter().any(|line| line.trim() == "```md"), "{flat:?}");
-        assert!(flat.iter().any(|line| line.trim() == "```"), "{flat:?}");
+        assert!(
+            flat.iter().any(|line| line.trim().contains("A | B")),
+            "{flat:?}"
+        );
+        assert!(
+            flat.iter().any(|line| line.trim().contains("1 | 2")),
+            "{flat:?}"
+        );
     }
 
     #[test]
@@ -9039,9 +9988,202 @@ mod tests {
     }
 
     #[test]
-    fn clamp_chars_reports_omitted_character_count() {
+    fn status_cells_use_single_terminal_safe_token() {
+        let input = "| Check | Result |\n| --- | --- |\n| Server | ✅ Yes |\n| Cache | ✓ No |";
+        let text = markdown_text(input, Style::default(), 120);
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains("Checks"), "{joined}");
+        assert!(joined.contains("✓ Server"), "{joined}");
+        assert!(joined.contains("✗ Cache"), "{joined}");
+        assert!(!joined.contains("✅"), "{joined}");
+        assert!(!joined.contains("Yes"), "{joined}");
+    }
+
+    #[test]
+    fn overloaded_table_rewrites_to_semantic_sections() {
+        let input = "| Area | Item | Result | Value | Recommendation |\n| --- | --- | --- | --- | --- |\n| Check | Model installed | ✅ Yes | | |\n| Performance | Best observed generation | | 10.87 tok/s | |\n| Constraint | WSL currently exposes | | ~15 GiB | |\n| Next step | Increase WSL memory | | | edit ~/.wslconfig and restart WSL |";
+        let text = markdown_text(input, Style::default(), 120);
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains("Checks"), "{joined}");
+        assert!(joined.contains("Performance"), "{joined}");
+        assert!(joined.contains("Constraint"), "{joined}");
+        assert!(joined.contains("Next step"), "{joined}");
+        assert!(joined.contains("✓ Model installed"), "{joined}");
+        assert!(joined.contains("Best observed generation"), "{joined}");
+        assert!(joined.contains("10.87 tok/s"), "{joined}");
+        assert!(joined.contains("~15 GiB"), "{joined}");
+        assert!(joined.contains("edit ~/.wslconfig"), "{joined}");
+        assert!(
+            !joined.contains('┌'),
+            "semantic rewrite should not render as bordered table: {joined}"
+        );
+    }
+
+    #[test]
+    fn markdown_text_removes_common_raw_markers() {
+        let input =
+            "## Bottom Line\n\n**10.87 tok/s** and `inline` code\n\n```rust\nfn main() {}\n```";
+        let text = markdown_text(input, Style::default(), 120);
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains("Bottom Line"), "{joined}");
+        assert!(joined.contains("10.87 tok/s"), "{joined}");
+        assert!(joined.contains("inline"), "{joined}");
+        assert!(joined.contains("fn main()"), "{joined}");
+        assert!(!joined.contains("##"), "{joined}");
+        assert!(!joined.contains("**"), "{joined}");
+        assert!(!joined.contains("```"), "{joined}");
+    }
+
+    #[test]
+    fn phase_info_renders_friendly_status_without_internal_label() {
+        let text = line_to_text(
+            &Line_::Info("[phase:synthesize] preparing final response".to_string()),
+            80,
+        );
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains("Summarizing…"), "{joined}");
+        assert!(!joined.contains("phase:"), "{joined}");
+        assert!(!joined.contains("synthesize"), "{joined}");
+    }
+
+    #[test]
+    fn draw_empty_composer_is_compact_and_clears_debug_artifacts() {
+        let mut state = TuiState::new(
+            "gpt-5.4".to_string(),
+            "/home/abaka/Documents/Projects/Dext".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.last_turn_context_tokens = 80_000;
+        let lines = draw_to_lines(120, 24, &mut state);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("+12 chars"), "{joined}");
+        assert!(joined.contains("Type a request…"), "{joined}");
+        assert!(joined.contains("ctx ["), "{joined}");
+        assert!(
+            compute_layout(Rect::new(0, 0, 120, 24), &state)
+                .input_area
+                .height
+                <= 3
+        );
+    }
+
+    #[test]
+    fn transcript_width_uses_available_terminal_space() {
+        assert_eq!(transcript_render_width(80), 79);
+        assert_eq!(transcript_render_width(160), 159);
+        let rect = transcript_content_rect(Rect::new(0, 0, 160, 20));
+        assert_eq!(rect.width, 160);
+        assert_eq!(rect.x, 0);
+    }
+
+    #[test]
+    fn wide_layout_only_splits_when_inspector_is_visible() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let wide = Rect::new(0, 0, 180, 32);
+        let normal = compute_layout(wide, &state);
+        assert_eq!(normal.inspector_area.width, 0);
+        assert_eq!(normal.transcript_area.width, 180);
+
+        state.show_inspector = true;
+        let inspected = compute_layout(wide, &state);
+        assert!(inspected.inspector_area.width >= 34, "{inspected:?}");
+        assert_eq!(
+            inspected.transcript_area.width + inspected.inspector_area.width,
+            180
+        );
+    }
+
+    #[test]
+    fn ansi_and_wide_text_width_are_display_safe() {
+        assert_eq!(text_width("\u{1b}[31mPASS\u{1b}[0m"), 4);
+        assert_eq!(text_width("界"), 2);
+        assert_eq!(text_width("✓"), 1);
+    }
+
+    #[test]
+    fn truncate_cell_drops_duplicate_boolean_marker() {
+        assert_eq!(truncate_cell("✅ Yes", 10), "PASS");
+        assert_eq!(truncate_cell("✓ No", 10), "FAIL");
+    }
+
+    #[test]
+    fn empty_input_panel_defaults_to_three_rows() {
+        let state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        assert_eq!(input_panel_height(&state, 24, 80), 3);
+    }
+
+    #[test]
+    fn status_details_are_expanded_by_ctrl_t() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &tx,
+            &steering_tx,
+            &interrupt,
+        );
+        assert!(state.show_status_details);
+        assert_eq!(
+            compute_layout(Rect::new(0, 0, 80, 20), &state)
+                .status_area
+                .height,
+            2
+        );
+    }
+
+    #[test]
+    fn inspector_is_toggled_by_ctrl_i_and_renders_debug_events() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::Info(
+            "[phase:synthesize] preparing final response".to_string(),
+        ));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL),
+            &tx,
+            &steering_tx,
+            &interrupt,
+        );
+        assert!(state.show_inspector);
+        let lines = draw_to_lines(160, 28, &mut state);
+        let joined = lines.join("\n");
+        assert!(joined.contains("inspector"), "{joined}");
+        assert!(joined.contains("Debug events"), "{joined}");
+        assert!(joined.contains("phase:synthesize"), "{joined}");
+    }
+
+    #[test]
+    fn clamp_chars_with_indicator_omits_debug_count() {
         let clipped = clamp_chars_with_hint("abcdefghijklmnopqrstuvwxyz", 20);
-        assert!(clipped.ends_with("+17 chars"), "{clipped}");
+        assert_eq!(clipped, "abcdefghijklmnopqrs…");
+        assert!(!clipped.contains("chars"), "{clipped}");
         assert!(unicode_width::UnicodeWidthStr::width(clipped.as_str()) <= 20);
     }
 
