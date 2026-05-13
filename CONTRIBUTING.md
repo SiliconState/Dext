@@ -71,7 +71,6 @@ Do not commit:
 
 - `.env`
 - `.dext/`
-- `.pi/`
 - `target/`
 - `dext-session-*`
 - `DEXT.todo.json`

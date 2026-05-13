@@ -6205,9 +6205,9 @@ fn auth_store_parses_oauth_access_shape() -> Result<()> {
 }
 
 #[test]
-fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
+fn login_chatgpt_import_mode_uses_external_auth() -> Result<()> {
     let _guard = env_lock();
-    let root = temp_test_dir("login-chatgpt-pi-auth");
+    let root = temp_test_dir("login-chatgpt-external-auth");
     unsafe {
         std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("HOME", &root);
@@ -6216,11 +6216,11 @@ fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
     }
 
     let result = (|| -> Result<()> {
-        let pi_auth = PathBuf::from(&root).join(".pi/agent/auth.json");
-        std::fs::create_dir_all(pi_auth.parent().unwrap_or(Path::new(".")))?;
+        let ext_auth = PathBuf::from(&root).join(".dext/external-auth.json");
+        std::fs::create_dir_all(ext_auth.parent().unwrap_or(Path::new(".")))?;
         std::fs::write(
-            &pi_auth,
-            r#"{"openai-codex":{"type":"oauth","access":"pi-codex-token","refresh":"rr","expires":4102444800}}"#,
+            &ext_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"ext-codex-token","refresh":"rr","expires":4102444800}}"#,
         )?;
 
         let login = login_provider(Some("chatgpt"), Some("import"), false)?;
@@ -6231,7 +6231,7 @@ fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
             login.message
         );
         assert!(
-            login.message.contains("pi-auth:openai-codex"),
+            login.message.contains("external-auth:openai-codex"),
             "{}",
             login.message
         );
@@ -6242,7 +6242,7 @@ fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
             .get("chatgpt")
             .context("missing chatgpt credential")?;
         let secret = entry.resolve_secret().context("missing secret")?;
-        assert_eq!(secret, "pi-codex-token");
+        assert_eq!(secret, "ext-codex-token");
         Ok(())
     })();
 
@@ -6256,7 +6256,7 @@ fn login_chatgpt_import_mode_uses_pi_auth() -> Result<()> {
 }
 
 #[test]
-fn login_chatgpt_default_mode_ignores_pi_auth_import() -> Result<()> {
+fn login_chatgpt_default_mode_ignores_external_auth_import() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-default-mode");
     unsafe {
@@ -6268,11 +6268,11 @@ fn login_chatgpt_default_mode_ignores_pi_auth_import() -> Result<()> {
     }
 
     let result = (|| -> Result<()> {
-        let pi_auth = PathBuf::from(&root).join(".pi/agent/auth.json");
-        std::fs::create_dir_all(pi_auth.parent().unwrap_or(Path::new(".")))?;
+        let ext_auth = PathBuf::from(&root).join(".dext/external-auth.json");
+        std::fs::create_dir_all(ext_auth.parent().unwrap_or(Path::new(".")))?;
         std::fs::write(
-            &pi_auth,
-            r#"{"openai-codex":{"type":"oauth","access":"pi-codex-token","refresh":"rr","expires":4102444800}}"#,
+            &ext_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"ext-codex-token","refresh":"rr","expires":4102444800}}"#,
         )?;
 
         let login = login_provider(Some("chatgpt"), None, false)?;
@@ -6302,7 +6302,7 @@ fn login_chatgpt_default_mode_ignores_pi_auth_import() -> Result<()> {
 }
 
 #[test]
-fn login_web_mode_skips_pi_auth_import() -> Result<()> {
+fn login_web_mode_skips_external_auth_import() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-web-mode");
     unsafe {
@@ -6314,11 +6314,11 @@ fn login_web_mode_skips_pi_auth_import() -> Result<()> {
     }
 
     let result = (|| -> Result<()> {
-        let pi_auth = PathBuf::from(&root).join(".pi/agent/auth.json");
-        std::fs::create_dir_all(pi_auth.parent().unwrap_or(Path::new(".")))?;
+        let ext_auth = PathBuf::from(&root).join(".dext/external-auth.json");
+        std::fs::create_dir_all(ext_auth.parent().unwrap_or(Path::new(".")))?;
         std::fs::write(
-            &pi_auth,
-            r#"{"openai-codex":{"type":"oauth","access":"pi-codex-token","refresh":"rr","expires":4102444800}}"#,
+            &ext_auth,
+            r#"{"openai-codex":{"type":"oauth","access":"ext-codex-token","refresh":"rr","expires":4102444800}}"#,
         )?;
 
         let login = login_provider(Some("chatgpt"), Some("web"), false)?;

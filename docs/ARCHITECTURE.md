@@ -55,6 +55,20 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Inline ratatui UI in the regular terminal buffer.
   - Transcript rendering, input box, status/live areas, permission prompts, and slash completions.
 
+- `src/packs.rs`
+  - Pack discovery, loading, and invocation.
+  - Front matter parsing, precedence ordering, and pack listing/inspection rendering.
+
+- `src/shelves.rs`
+  - Shelf registry with typed manifests (`shelf.json`).
+  - `ShelfManifest`, `PackManifest`, `Ability`, `Signal` types.
+  - Scope-precedence resolution and ability metadata injection.
+
+- `src/tool_policy.rs`
+  - Tool input validation and command risk classification.
+  - URL/host extraction and external-attempt guard helpers.
+  - Bash guardrails (pipefail injection, unsafe pip flag blocking).
+
 ## Tool model
 
 Dext exposes a deliberately small native tool set:

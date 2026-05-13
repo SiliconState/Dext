@@ -657,7 +657,6 @@ fn is_decision_log_path(path: &str) -> bool {
     path.ends_with("MEMORY.md")
         || path.ends_with("recall.md")
         || path.ends_with("DEXT.md")
-        || path.ends_with(".pi/pending.jsonl")
         || path.ends_with("autoresearch.ideas.md")
 }
 

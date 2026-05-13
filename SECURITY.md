@@ -24,7 +24,6 @@ Never commit real credentials. The following must remain local/private:
 
 - `.env`
 - `.dext/`
-- `.pi/`
 - `~/.dext/auth.json`
 - `~/.dext/providers.json` if it contains private endpoints or tokens
 - `dext-session-*.jsonl`

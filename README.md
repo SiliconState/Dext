@@ -122,6 +122,8 @@ Interactive slash commands:
 
 ## Packs
 
+See [`docs/PACKS.md`](docs/PACKS.md) for the full packs and shelves reference, including structure, discovery, building, and distributing packs.
+
 Packs are source-first workflow bundles with a `PACK.md`. Dext discovers packs from `DEXT_PACK_<NAME>_DIR`, project `.dext/shelves/<shelf>/packs`, `.dext/packs`, `packs`, `DEXT_SHELVES_DIR`, `DEXT_PACKS_DIR`, user `~/.dext/shelves/<shelf>/packs`, `~/.dext/packs`, and bundled repository packs. Shelf packs take precedence over same-named legacy project/user pack directories within the same scope. Typed shelf manifests named `shelf.json` are loaded from the same shelf roots into the runtime `ShelfRegistry` and exposed in prompt context plus `/shelves` / `dext shelves` as provider-neutral ability metadata.
 
 The stable extension contract is intentionally provider-neutral: a pack is files plus instructions that any LLM/provider can read, with optional shell helpers and `phooks.json` steering. Scaffold a pack as `packs/<name>/PACK.md`, keep helper scripts inside that directory, and validate it with `dext pack inspect <name>` plus a real `dext pack run <name> ...` on a disposable task. Shared shelves live at `<shelf>/packs/<pack>` and can be distributed through project, user, or `DEXT_SHELVES_DIR` paths without adding provider-visible tools. `shelf.json` manifests add typed ability metadata for internal registry resolution; the runtime lists and prompt-injects those records without expanding the provider-visible tool list.
@@ -180,7 +182,7 @@ DEXT_TOOL_PROFILE=lean
 DEXT_BUDGET_CAP=$5
 ```
 
-Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `.pi/`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored.
+Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored.
 
 ## Development
 
@@ -203,9 +205,12 @@ Use the TUI smoke test after changing `src/tui.rs`.
 - `src/tool_policy.rs` — validation and command/external-source guardrails.
 - `src/orchestrator.rs` — turn telemetry, dedupe, circuit-breaker, and workflow guards.
 - `src/tui.rs` — inline terminal UI.
+- `src/packs.rs` — pack discovery, loading, and invocation.
+- `src/shelves.rs` — shelf registry with typed manifests and abilities.
 - `tests/` — integration tests and replay fixtures.
 - `benches/` — criterion benchmarks.
 - `DEXT.md` / `recall.md` — prompt-facing project guidance and recall for Dext working on itself.
 - `MEMORY.md` — durable project memory.
+- `docs/PACKS.md` — packs and shelves reference.
 
 More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/USAGE.md`](docs/USAGE.md), [`SECURITY.md`](SECURITY.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md).

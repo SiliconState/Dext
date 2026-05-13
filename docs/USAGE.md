@@ -39,6 +39,14 @@ dext auth login anthropic <api-key>
 dext auth login deepseek <api-key>
 ```
 
+Import credentials from an external auth file (`~/.dext/external-auth.json` or `DEXT_EXTERNAL_AUTH_FILE`):
+
+```bash
+dext auth login chatgpt import
+```
+
+The external auth file is a JSON object mapping provider identifiers to credential objects. Dext tries candidate keys for each provider and imports the first match.
+
 Switch providers/models:
 
 ```bash
@@ -128,6 +136,8 @@ dext --no-session "quick answer only"
 
 
 ## Packs
+
+See [`docs/PACKS.md`](PACKS.md) for the full packs and shelves reference.
 
 Dext packs are regular source directories containing `PACK.md` plus optional helper scripts and `phooks.json`. Discovery checks, in precedence order:
 
@@ -250,6 +260,7 @@ DEXT_LOGS_DIR=~/.dext/logs
 DEXT_LOG_ARCHIVES=4
 DEXT_PACKS_DIR=~/.dext/packs:/path/to/project-packs
 DEXT_SHELVES_DIR=~/.dext/shelves:/path/to/shared-shelves
+DEXT_EXTERNAL_AUTH_FILE=~/.dext/external-auth.json
 ```
 
 Runtime controls:

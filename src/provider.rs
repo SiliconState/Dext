@@ -1577,17 +1577,18 @@ pub(crate) fn provider_id_from_selector(
     Ok(canonical)
 }
 
-pub(crate) fn pi_auth_path() -> PathBuf {
-    if let Ok(path) = std::env::var("PI_AUTH_FILE") {
+pub(crate) fn external_auth_path() -> PathBuf {
+    if let Ok(path) = std::env::var("DEXT_EXTERNAL_AUTH_FILE")
+        .or_else(|_| std::env::var("PI_AUTH_FILE"))
+    {
         return PathBuf::from(path);
     }
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
-        .join(".pi")
-        .join("agent")
-        .join("auth.json")
+        .join(".dext")
+        .join("external-auth.json")
 }
 
 pub(crate) fn parse_expiry_epoch_seconds(v: &Value) -> Option<u64> {
@@ -1657,7 +1658,7 @@ pub(crate) fn parse_external_auth_credential(value: &Value) -> Option<StoredCred
     })
 }
 
-pub(crate) fn pi_auth_candidates(provider_id: &str) -> Vec<String> {
+pub(crate) fn external_auth_candidates(provider_id: &str) -> Vec<String> {
     let canonical = canonical_provider_id(provider_id);
     let mut candidates: Vec<String> = match canonical.as_str() {
         "chatgpt" => vec!["openai-codex", "codex", "chatgpt", "openai"],
@@ -1676,16 +1677,16 @@ pub(crate) fn pi_auth_candidates(provider_id: &str) -> Vec<String> {
     candidates
 }
 
-pub(crate) fn import_provider_credential_from_pi_auth(
+pub(crate) fn import_provider_credential_from_external(
     profile: &ProviderProfile,
     store: &mut AuthStore,
 ) -> Option<String> {
-    let path = pi_auth_path();
+    let path = external_auth_path();
     let text = std::fs::read_to_string(&path).ok()?;
     let raw: Value = serde_json::from_str(&text).ok()?;
     let object = raw.as_object()?;
 
-    for candidate in pi_auth_candidates(&profile.id) {
+    for candidate in external_auth_candidates(&profile.id) {
         let Some(value) = object.get(&candidate) else {
             continue;
         };
@@ -1695,7 +1696,7 @@ pub(crate) fn import_provider_credential_from_pi_auth(
         store
             .providers
             .insert(canonical_provider_id(&profile.id), credential);
-        return Some(format!("pi-auth:{candidate}"));
+        return Some(format!("external-auth:{candidate}"));
     }
 
     None
@@ -2800,7 +2801,7 @@ pub(crate) fn login_provider(
         }
 
         if explicit_import {
-            if let Some(source) = import_provider_credential_from_pi_auth(&profile, &mut store) {
+            if let Some(source) = import_provider_credential_from_external(&profile, &mut store) {
                 save_auth_store(&store)?;
                 catalog.active_provider = profile.id.clone();
                 save_provider_catalog(&catalog)?;
@@ -2816,7 +2817,7 @@ pub(crate) fn login_provider(
                 });
             }
             anyhow::bail!(
-                "no reusable Pi credential found for provider '{}'. Run `dext auth login {} web` or paste a token/key directly.",
+                "no reusable external credential found for provider '{}'. Run `dext auth login {} web` or paste a token/key directly.",
                 profile.id,
                 profile.id
             );

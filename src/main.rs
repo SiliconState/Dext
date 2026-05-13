@@ -9185,7 +9185,7 @@ impl Agent {
         let mut ledger = self.work_ledger.clone();
         ledger.files_changed.retain(|path| {
             let p = Path::new(path);
-            !p.is_absolute() && !path.starts_with(".dext/") && !path.starts_with(".pi/")
+            !p.is_absolute() && !path.starts_with(".dext/")
         });
         if ledger.pending.is_empty() && ledger.in_progress.is_empty() && !ledger.done.is_empty() {
             ledger.next_actions.clear();
@@ -9204,7 +9204,7 @@ impl Agent {
             return;
         };
         let p = Path::new(path);
-        if p.is_absolute() || path.starts_with(".dext/") || path.starts_with(".pi/") {
+        if p.is_absolute() || path.starts_with(".dext/") {
             return;
         }
         if !self.work_ledger.files_changed.iter().any(|p| p == path) {
