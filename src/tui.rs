@@ -9055,8 +9055,8 @@ mod tests {
 
     #[test]
     fn ctx_meter_sums_anthropic_cache_create_read_and_output() {
-        // Native usage totals include output tokens; Pi's context-token helper
-        // uses input + output + cacheRead + cacheWrite.
+        // Native usage totals include output tokens; context pressure includes
+        // input, output, cache reads, and cache writes.
         let mut state = TuiState::new(
             "claude-opus-4-6".to_string(),
             ".".to_string(),

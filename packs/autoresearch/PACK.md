@@ -10,7 +10,7 @@ Run an autonomous research loop: understand the system, make one experimental ch
 This pack is inspired by:
 
 - `karpathy/autoresearch`: small real LLM training setup, fixed 5-minute budget, one editable file, `val_bpb` lower-is-better, simple baseline loop.
-- `davebcn87/pi-autoresearch`: generic loop infrastructure, structured `METRIC name=value` output, JSONL state, session docs, checks, ASI, hooks, compaction-resilient summaries, and finalization into reviewable branches.
+- A prior generic autoresearch extension: structured `METRIC name=value` output, JSONL state, session docs, checks, ASI, hooks, compaction-resilient summaries, and finalization into reviewable branches.
 
 Dext adaptation: no new provider-visible tools. Use the pack helper through the normal `bash` tool and keep durable state in project files.
 
@@ -186,5 +186,5 @@ The pack works without hooks. Hooks are only light steering/status helpers.
 ## What this pack intentionally improves
 
 - Compared with Karpathy's barebones loop: structured JSONL state, resumable Markdown runbook, parsed metrics, optional checks, full run logs, ASI, and deterministic status summaries.
-- Compared with Pi's extension: no Dext core patch, no new provider-visible tools, no global Node package, and simple stdlib Python that can be copied into any project.
+- Compared with external extension approaches: no Dext core patch, no new provider-visible tools, no global package, and simple stdlib Python that can be copied into any project.
 - Compared with generic coding loops: explicit keep/discard semantics, preserved experiment memory, and a bias toward measurable improvement rather than speculative refactors.

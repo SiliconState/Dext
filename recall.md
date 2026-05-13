@@ -58,7 +58,7 @@ Keep this file compact and curated.
 - Do not add LLM-facing cargo tools; agent/runtime internals can use structured
   cargo handling when useful, but keep the exposed tool list lean.
 - Prefer Dext's built-in reqwest-backed `http` tool before shelling to curl/xh.
-- Use proper OAuth/web flows; do not copy Pi auth credentials manually.
+- Use proper OAuth/web flows; do not copy credentials from unrelated tools manually.
 - Prefer live/thinking/scroll progress above the input box only.
 - Agent browser is allowed when useful for browser automation or web surfing.
 - Keep repo source-first and reviewable; avoid runtime clutter.

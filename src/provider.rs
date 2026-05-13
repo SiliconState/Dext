@@ -1578,17 +1578,13 @@ pub(crate) fn provider_id_from_selector(
 }
 
 pub(crate) fn external_auth_path() -> PathBuf {
-    if let Ok(path) = std::env::var("DEXT_EXTERNAL_AUTH_FILE")
-        .or_else(|_| std::env::var("PI_AUTH_FILE"))
-    {
+    if let Ok(path) = std::env::var("DEXT_EXTERNAL_AUTH_FILE") {
         return PathBuf::from(path);
     }
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".dext")
-        .join("external-auth.json")
+    PathBuf::from(home).join(".dext").join("external-auth.json")
 }
 
 pub(crate) fn parse_expiry_epoch_seconds(v: &Value) -> Option<u64> {

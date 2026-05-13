@@ -91,7 +91,6 @@ const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     ".hg",
     ".svn",
     ".dext",
-    ".pi",
     "target",
     "node_modules",
     ".next",
@@ -4833,7 +4832,7 @@ fn collect_rust_files_for_diagnostics(dir: &Path, out: &mut Vec<PathBuf>, max_fi
             return;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if matches!(name, "target" | ".git" | ".dext" | ".pi") {
+        if matches!(name, "target" | ".git" | ".dext") {
             continue;
         }
         if path.is_dir() {

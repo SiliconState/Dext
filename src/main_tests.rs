@@ -6375,7 +6375,7 @@ fn chatgpt_oauth_authorize_url_uses_dext_originator_by_default() -> Result<()> {
             login.message
         );
         assert!(
-            !login.message.contains("originator=pi"),
+            !login.message.contains("originator=codex"),
             "{}",
             login.message
         );
