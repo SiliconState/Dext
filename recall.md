@@ -1,13 +1,11 @@
 # Dext recall
 
-Compact prompt-facing recall only. Durable project memory lives in `MEMORY.md`,
-synced through the external pi-memory tool with `--project dext`. pi-memory is
-not part of Dext; Dext or any agent can use it. Keep this file compact and
-curated.
+Compact prompt-facing recall only. Durable project memory lives in `MEMORY.md`.
+Keep this file compact and curated.
 
 ## Workflow
-- Query `MEMORY.md` / pi-memory for durable history before major decisions.
-- Log material decisions/findings to pi-memory, sync `MEMORY.md`, then distill
+- Query `MEMORY.md` for durable history before major decisions.
+- Log material decisions/findings to `MEMORY.md`, then distill
   only prompt-worthy facts here.
 - Avoid storing changelog detail here; completed implementation history belongs
   in commits, session logs, or `MEMORY.md`.
@@ -19,7 +17,7 @@ curated.
   default effort.
 - Standard prompts should also stay budget-conscious: compact system sections,
   capped runtime ledger/provider health, and minimal prompt-facing memory.
-- `MEMORY.md` + pi-memory are the long-form source of truth; `recall.md` is
+- `MEMORY.md` is the long-form source of truth; `recall.md` is
   only the compact prompt-facing cache.
 - Eval supports outcome-oriented assertions on files and command output.
 - `codex` canonicalizes to `chatgpt`; ChatGPT/Codex share one OAuth-backed
@@ -78,4 +76,4 @@ curated.
 
 ## Open question
 - How much historical detail should remain prompt-injected versus only in
-  pi-memory / `MEMORY.md`?
+  `MEMORY.md`?

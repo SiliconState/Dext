@@ -206,6 +206,6 @@ Use the TUI smoke test after changing `src/tui.rs`.
 - `tests/` — integration tests and replay fixtures.
 - `benches/` — criterion benchmarks.
 - `DEXT.md` / `recall.md` — prompt-facing project guidance and recall for Dext working on itself.
-- `MEMORY.md` — durable project memory synced through pi-memory.
+- `MEMORY.md` — durable project memory.
 
 More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/USAGE.md`](docs/USAGE.md), [`SECURITY.md`](SECURITY.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md).

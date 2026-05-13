@@ -8,7 +8,6 @@ __pycache__/
 
 # Runtime/project state
 /.dext/
-/.pi/
 /dext-session-*.jsonl
 /dext-session-*.html
 /semi_stderr.log
@@ -18,7 +17,6 @@ __pycache__/
 # Scratch files, docs, screenshots, and local session copies
 /htmk
 /sprompt.md
-/docs/pi-session-discovery-recommendations.md
 /docs/BugUI*.jpg
 /docs/Toolsfeatureupdater*.txt
 /docs/gptconvo.md

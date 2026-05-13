@@ -31,13 +31,13 @@ When changing Dext itself:
 - No explanatory comments for obvious behavior; names should carry intent.
 - Add comments only for non-obvious why/invariants/platform footguns.
 - No backwards-compat shims for unreleased code.
-- Keep runtime clutter (`.dext/`, `.pi/`, scratch logs, one-off docs,
+- Keep runtime clutter (`.dext/`, scratch logs, one-off docs,
   screenshots) ignored or deleted, not committed.
 
 ## Context and memory
 - `recall.md` is a compact prompt-facing recall cache; durable long-form
-  memory lives in `MEMORY.md` / pi-memory (`--project dext`).
-- Log durable decisions/findings to pi-memory, sync `MEMORY.md`, then keep only
+  memory lives in `MEMORY.md`.
+- Log durable decisions/findings to `MEMORY.md`, then keep only
   the distilled prompt-worthy cache in `recall.md`.
 - Prefer context engineering and memory quality over adding tools. Minimize tool
   duplication and prompt-injected historical detail.
