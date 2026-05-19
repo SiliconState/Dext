@@ -4241,7 +4241,7 @@ fn table_area_width(widths: &[usize], spacing: usize) -> usize {
     if widths.is_empty() {
         return 0;
     }
-    widths.iter().sum::<usize>() + widths.len().saturating_sub(1) * spacing + 2
+    widths.iter().sum::<usize>() + widths.len().saturating_sub(1) * spacing
 }
 
 fn shrink_table_widths(widths: &mut [usize], spacing: usize, max_total: usize) {
@@ -4364,7 +4364,6 @@ fn table_visual_height(table: &ParsedTable, max_total_width: usize) -> u16 {
     let body_rows = table.rows.len().saturating_sub(header_rows);
     header_rows
         .saturating_add(body_rows)
-        .saturating_add(2)
         .min(u16::MAX as usize) as u16
 }
 
@@ -4420,7 +4419,7 @@ fn render_table_lines(
         .style(base_style)
         .block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::NONE)
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
 
@@ -4431,9 +4430,9 @@ fn render_table_lines(
     }
 
     let area_width = table_area_width(&widths, spacing)
-        .max(3)
+        .max(1)
         .min(u16::MAX as usize) as u16;
-    let area_height = table_visual_height(table, max_total_width).max(3);
+    let area_height = table_visual_height(table, max_total_width).max(1);
     let area = Rect::new(0, 0, area_width, area_height);
     let mut buffer = ratatui::buffer::Buffer::empty(area);
     Widget::render(widget, area, &mut buffer);
@@ -9902,7 +9901,7 @@ mod tests {
     }
 
     #[test]
-    fn render_table_text_produces_borders_and_bold_header() {
+    fn render_table_text_produces_bold_header_without_borders() {
         let table = ParsedTable {
             rows: vec![
                 vec!["Key".into(), "Value".into()],
@@ -9921,13 +9920,27 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
-        assert!(flat[0].starts_with('┌'), "top border: {:?}", flat[0]);
-        assert!(flat[1].contains("Key"), "header row: {:?}", flat[1]);
-        assert!(flat[1].contains("Value"), "header row: {:?}", flat[1]);
-        assert!(flat[2].starts_with('│'), "data row: {:?}", flat[2]);
-        assert!(flat[3].starts_with('└'), "bottom border: {:?}", flat[3]);
+        assert!(!flat.is_empty(), "should have rows");
+        assert!(
+            flat[0].contains("Key"),
+            "header row should contain Key: {:?}",
+            flat[0]
+        );
+        assert!(
+            flat[0].contains("Value"),
+            "header row should contain Value: {:?}",
+            flat[0]
+        );
+        assert!(
+            flat.iter().all(|line| !line.contains('┌') && !line.contains('└') && !line.contains('│')),
+            "borderless table should not contain box-drawing chars: {flat:?}"
+        );
+        assert!(
+            flat.iter().any(|line| line.contains("name") && line.contains("dext")),
+            "data row should contain name/dext: {flat:?}"
+        );
 
-        let header_style = rendered[1]
+        let header_style = rendered[0]
             .spans
             .iter()
             .find(|span| span.content.contains("Key"))

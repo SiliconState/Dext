@@ -100,6 +100,7 @@ pub(crate) struct TurnRuntimeState {
     host_probe_passed: HashSet<String>,
     external_result_cache: HashMap<String, (String, Option<bool>)>,
     bash_attempt_history: Vec<(String, bool, u64)>,
+    tool_failure_budget: HashMap<String, (String, usize)>,
     mutation_epoch: u64,
     telemetry: ExternalTelemetry,
 }
@@ -115,6 +116,7 @@ impl Default for TurnRuntimeState {
             host_probe_passed: HashSet::new(),
             external_result_cache: HashMap::new(),
             bash_attempt_history: Vec::new(),
+            tool_failure_budget: HashMap::new(),
             mutation_epoch: 0,
             telemetry: ExternalTelemetry::default(),
         }
@@ -160,25 +162,66 @@ impl TurnRuntimeState {
 
     pub(crate) fn bash_similarity_guard(
         &mut self,
-        bash_similarity_key: Option<&str>,
+        similarity_key: Option<&str>,
         command: Option<&str>,
     ) -> Option<String> {
-        let sim_key = bash_similarity_key?;
-        if command.is_some_and(is_safe_repeated_validation_command) {
-            return None;
+        let sim_key = similarity_key?;
+        if let Some(cmd) = command {
+            if is_safe_repeated_validation_command(cmd) {
+                return None;
+            }
         }
+        let is_file_tool = sim_key.contains("write_file:") || sim_key.contains("edit_file:");
         let similar_unproductive = self
             .bash_attempt_history
             .iter()
             .filter(|(seen_key, productive, epoch)| {
-                !*productive && *epoch == self.mutation_epoch && commands_similar(sim_key, seen_key)
+                if *productive || *epoch != self.mutation_epoch {
+                    return false;
+                }
+                if is_file_tool {
+                    seen_key == sim_key
+                } else {
+                    commands_similar(sim_key, seen_key)
+                }
             })
             .count();
         if similar_unproductive >= 3 {
             self.telemetry.similarity_blocks = self.telemetry.similarity_blocks.saturating_add(1);
-            Some(
-                "bash similarity guard: this command is too similar to multiple earlier unproductive attempts this turn. Stop looping on near-duplicates and pivot strategy (new source, new method, or ask user).".to_string(),
-            )
+            if is_file_tool {
+                Some(
+                    "file write similarity guard: this file operation is too similar to multiple earlier unproductive attempts this turn. Stop retrying the same file path and pivot strategy (check file content first, use a different approach, or ask the user).".to_string(),
+                )
+            } else {
+                Some(
+                    "bash similarity guard: this command is too similar to multiple earlier unproductive attempts this turn. Stop looping on near-duplicates and pivot strategy (new source, new method, or ask user).".to_string(),
+                )
+            }
+        } else {
+            None
+        }
+    }
+
+    const TOOL_RETRY_BUDGET: usize = 3;
+
+    pub(crate) fn tool_retry_guard(
+        &mut self,
+        tool_name: &str,
+        error_summary: &str,
+    ) -> Option<String> {
+        let key = normalize_tool_failure_key(tool_name, error_summary);
+        let entry = self
+            .tool_failure_budget
+            .entry(key)
+            .or_insert_with(|| (error_summary.to_string(), 0));
+        entry.1 = entry.1.saturating_add(1);
+        if entry.1 > Self::TOOL_RETRY_BUDGET {
+            self.telemetry.circuit_breaker_trips =
+                self.telemetry.circuit_breaker_trips.saturating_add(1);
+            Some(format!(
+                "tool retry budget exceeded: {tool_name} has failed {} times with the same error ({}). Stop retrying this tool with the same arguments and pivot strategy (use a different tool, change approach, or ask the user).",
+                entry.1, entry.0
+            ))
         } else {
             None
         }
@@ -863,6 +906,16 @@ fn primary_bash_similarity_line(command: &str) -> &str {
         })
         .or_else(|| command.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or(command)
+}
+
+fn normalize_tool_failure_key(tool_name: &str, error_summary: &str) -> String {
+    let normalized_error: String = error_summary
+        .split_whitespace()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    format!("{tool_name}::{normalized_error}")
 }
 
 pub(crate) fn normalize_bash_similarity_key(command: &str) -> String {

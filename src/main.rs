@@ -7227,6 +7227,7 @@ struct ProviderHealthState {
     retry_after: Option<u64>,
     mode: Option<String>,
     disabled_for_turn: bool,
+    consecutive_server_errors: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -9359,7 +9360,14 @@ impl Agent {
         state.last_error = Some(format!("HTTP {status}: {}", summarize_inline(text, 220)));
         state.retry_after = retry_after;
         state.mode = Some(api_family_label(self.api_provider).to_string());
-        state.disabled_for_turn = matches!(status.as_u16(), 401 | 403 | 429);
+        let is_server_error = matches!(status.as_u16(), 502 | 503 | 504);
+        if is_server_error {
+            state.consecutive_server_errors = state.consecutive_server_errors.saturating_add(1);
+        } else {
+            state.consecutive_server_errors = 0;
+        }
+        state.disabled_for_turn = matches!(status.as_u16(), 401 | 403 | 429)
+            || (is_server_error && state.consecutive_server_errors >= 3);
     }
 
     fn record_provider_stream_failure(&mut self, text: &str) {
@@ -11380,6 +11388,10 @@ impl Agent {
                     Some(orchestrator::normalize_bash_similarity_key(
                         input["command"].as_str().unwrap_or(""),
                     ))
+                } else if matches!(name.as_str(), "write_file" | "edit_file") {
+                    input["path"]
+                        .as_str()
+                        .map(|p| format!("{name}:{p}"))
                 } else {
                     None
                 };
@@ -11388,10 +11400,18 @@ impl Agent {
                 let mut local_sudo_auth_needed = false;
 
                 if let Err(msg) = tool_policy::validate_tool_input(&name, &input) {
-                    plan = Some(Plan::Immediate {
-                        content: msg,
-                        is_error: Some(true),
-                    });
+                    if let Some(budget_msg) = turn_state.tool_retry_guard(&name, &msg) {
+                        emit_external_telemetry(self.sink.as_mut(), &turn_state);
+                        plan = Some(Plan::Immediate {
+                            content: budget_msg,
+                            is_error: Some(true),
+                        });
+                    } else {
+                        plan = Some(Plan::Immediate {
+                            content: msg,
+                            is_error: Some(true),
+                        });
+                    }
                 }
 
                 if plan.is_none() && name == "subagent" {

@@ -920,6 +920,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
                 retry_after: Some(10),
                 mode: Some("chatgpt-responses".to_string()),
                 disabled_for_turn: true,
+                consecutive_server_errors: 0,
             },
         );
         saved.session_usage = Usage {
@@ -3404,6 +3405,7 @@ fn compaction_evidence_includes_ledger_verification_provider_health_and_tool_ref
             retry_after: None,
             mode: Some("chatgpt-responses".to_string()),
             disabled_for_turn: true,
+            consecutive_server_errors: 0,
         },
     );
     let msgs = vec![
@@ -3978,6 +3980,7 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
             last_error: Some("temporary upstream error ".repeat(2000)),
             retry_after: None,
             disabled_for_turn: false,
+            consecutive_server_errors: 0,
         },
     );
 
