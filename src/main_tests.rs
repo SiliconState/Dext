@@ -99,6 +99,8 @@ fn test_agent(root: &Path) -> Agent {
         track_origin: None,
         privacy: PrivacyPolicy::default(),
         detached_subagent_steer_path: None,
+        checkpoint_cache: git_checkpoints::RepoRootCache::new(),
+        checkpoint_ordinal: 0,
     }
 }
 

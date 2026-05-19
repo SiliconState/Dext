@@ -1,3 +1,6 @@
+mod git_checkpoints;
+mod memory_merge;
+mod mutation_preview;
 mod orchestrator;
 mod packs;
 mod provider;
@@ -8232,6 +8235,8 @@ struct Agent {
     track_origin: Option<TrackOrigin>,
     privacy: PrivacyPolicy,
     detached_subagent_steer_path: Option<PathBuf>,
+    checkpoint_cache: git_checkpoints::RepoRootCache,
+    checkpoint_ordinal: usize,
 }
 
 impl Agent {
@@ -8378,6 +8383,8 @@ impl Agent {
             track_origin: None,
             privacy: PrivacyPolicy::from_env(),
             detached_subagent_steer_path: None,
+            checkpoint_cache: git_checkpoints::RepoRootCache::new(),
+            checkpoint_ordinal: 0,
         })
     }
 
@@ -8859,6 +8866,48 @@ impl Agent {
             Some("browser recipe enabled: use bash with agent-browser (start with `agent-browser skills get core --full`) for browser automation when useful.".to_string())
         } else {
             Some("browser recipe requested, but agent-browser is not on PATH; install it or disable with /browser off.".to_string())
+        }
+    }
+
+    fn compute_mutation_preview(&self, name: &str, input: &Value) -> Option<String> {
+        let root = &self.sandbox_root;
+        match name {
+            "write_file" => {
+                let path_str = input["path"].as_str()?;
+                let content = input["content"].as_str()?;
+                match mutation_preview::preview_write_file(root, path_str, content) {
+                    Ok(p) => Some(format_preview(&p)),
+                    Err(_) => None,
+                }
+            }
+            "edit_file" => {
+                let path_str = input["path"].as_str()?;
+                let old = input["old_string"].as_str()?;
+                let new = input["new_string"].as_str()?;
+                match mutation_preview::preview_edit_file(root, path_str, old, new) {
+                    Ok(p) => Some(format_preview(&p)),
+                    Err(e) => Some(format!("preview error: {e}")),
+                }
+            }
+            "multi_edit" => {
+                let path_str = input["path"].as_str()?;
+                let edits_arr = input["edits"].as_array()?;
+                let edits: Vec<_> = edits_arr
+                    .iter()
+                    .filter_map(|e| {
+                        Some(mutation_preview::MultiEdit {
+                            old_string: e["old_string"].as_str()?.to_string(),
+                            new_string: e["new_string"].as_str()?.to_string(),
+                            replace_all: e["replace_all"].as_bool().unwrap_or(false),
+                        })
+                    })
+                    .collect();
+                match mutation_preview::preview_multi_edit(root, path_str, &edits) {
+                    Ok(p) => Some(format_preview(&p)),
+                    Err(e) => Some(format!("preview error: {e}")),
+                }
+            }
+            _ => None,
         }
     }
 
@@ -11572,6 +11621,12 @@ impl Agent {
                     {
                         false
                     } else if needs_permission(&name) && !self.tool_auto_approved(&name, &input) {
+                        // Show mutation preview for direct file tools before asking permission
+                        if matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit") {
+                            if let Some(preview) = self.compute_mutation_preview(&name, &input) {
+                                self.sink.emit(AgentEvent::Info(preview));
+                            }
+                        }
                         match self.sink.request_permission(&name, &input) {
                             Choice::Once => true,
                             Choice::Always => {
@@ -11633,6 +11688,32 @@ impl Agent {
                     && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
                 {
                     self.work_ledger_note_file_change(&input);
+                }
+
+                // Create recovery checkpoint before write-risk mutations
+                if matches!(plan, Plan::Builtin)
+                    && git_checkpoints::tool_needs_checkpoint(&name, &input)
+                    && self.checkpoint_cache.get(&self.sandbox_root).ok().flatten().is_some()
+                {
+                    let paths_hint: Vec<String> = input["path"]
+                        .as_str()
+                        .map(|p| vec![p.to_string()])
+                        .unwrap_or_default();
+                    self.checkpoint_ordinal += 1;
+                    match git_checkpoints::create_checkpoint(
+                        &self.sandbox_root,
+                        &name,
+                        &paths_hint,
+                        self.checkpoint_ordinal,
+                    ) {
+                        Ok(Some(cp)) => {
+                            self.append_latest_log("checkpoint", &format!("created {}", cp.id));
+                        }
+                        Ok(None) => {} // not a git repo
+                        Err(e) => {
+                            eprintln!("[checkpoint warning: {e}]");
+                        }
+                    }
                 }
 
                 if matches!(plan, Plan::Builtin)
@@ -12977,6 +13058,8 @@ impl Agent {
             track_origin: self.track_origin.clone(),
             privacy: self.privacy.clone(),
             detached_subagent_steer_path: None,
+            checkpoint_cache: git_checkpoints::RepoRootCache::new(),
+            checkpoint_ordinal: 0,
         };
 
         if !request.privacy_enabled {
@@ -14483,6 +14566,157 @@ fn resolve_session_selector(root: &Path, selector: &str) -> Result<PathBuf> {
     named_session_path_for_root(root, trimmed)
 }
 
+fn format_preview(p: &mutation_preview::MutationPreview) -> String {
+    let status = if p.is_new_file {
+        "new file".to_string()
+    } else {
+        format!("{}+ {}-", p.added, p.removed)
+    };
+    let mut out = format!(
+        "preview: {} ({}){}",
+        p.path.display(),
+        status,
+        if p.truncated { " [truncated]" } else { "" }
+    );
+    if !p.diff.is_empty() && p.diff != "(no changes)" {
+        out.push('\n');
+        out.push_str(&p.diff);
+    }
+    out
+}
+
+fn handle_undo_cli(args: &[String], root: &Path) -> i32 {
+    if args.is_empty() || args.iter().any(|a| a == "--list" || a == "list") {
+        match git_checkpoints::list_checkpoints(root, 20) {
+            Ok(cps) if cps.is_empty() => println!("no checkpoints"),
+            Ok(cps) => {
+                for cp in &cps {
+                    println!("{}  {}  {}", cp.id, cp.tool_name, cp.paths_hint.join(","));
+                }
+            }
+            Err(e) => { eprintln!("error: {e}"); return 1; }
+        }
+        return 0;
+    }
+    if args.iter().any(|a| a == "--prune" || a == "prune") {
+        match git_checkpoints::prune(root, None, None) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => { eprintln!("error: {e}"); return 1; }
+        }
+        return 0;
+    }
+    let apply = args.iter().any(|a| a == "--apply");
+    let reset = args.iter().any(|a| a == "--reset-head");
+    let id_arg = args.iter().find(|a| !a.starts_with('-'));
+    let target = if let Some(id) = id_arg {
+        match git_checkpoints::find_checkpoint(root, id) {
+            Ok(Some(cp)) => cp,
+            Ok(None) => { eprintln!("checkpoint not found: {id}"); return 1; }
+            Err(e) => { eprintln!("error: {e}"); return 1; }
+        }
+    } else {
+        match git_checkpoints::latest_checkpoint(root) {
+            Ok(Some(cp)) => cp,
+            Ok(None) => { eprintln!("no checkpoints"); return 1; }
+            Err(e) => { eprintln!("error: {e}"); return 1; }
+        }
+    };
+    let mode = if reset {
+        git_checkpoints::RestoreMode::ResetHead
+    } else if apply {
+        git_checkpoints::RestoreMode::Worktree
+    } else {
+        git_checkpoints::RestoreMode::Preview
+    };
+    match git_checkpoints::restore_worktree(root, &target, mode) {
+        Ok(msg) => println!("{msg}"),
+        Err(e) => { eprintln!("error: {e}"); return 1; }
+    }
+    0
+}
+
+fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
+    let sub = args.first().map(String::as_str).unwrap_or("check");
+    match sub {
+        "check" => {
+            match memory_merge::check(root) {
+                Ok(status) => {
+                    println!("memory merge: {}", if status.memory_registered { "registered" } else { "not registered" });
+                    println!("recall merge: {}", if status.recall_registered { "registered" } else { "not registered" });
+                    println!("local attributes: {}", if status.gitattributes_local { "yes" } else { "no" });
+                    println!("versioned attributes: {}", if status.gitattributes_versioned { "yes" } else { "no" });
+                    if !status.memory_registered {
+                        eprintln!("run 'dext memory register' to enable section-aware merging");
+                    }
+                }
+                Err(e) => { eprintln!("error: {e}"); return 1; }
+            }
+            0
+        }
+        "register" => {
+            let versioned = args.iter().any(|a| a == "--versioned-attributes");
+            let modes = if args.iter().any(|a| a == "--recall") {
+                vec![memory_merge::RegisterMode::Recall]
+            } else if args.iter().any(|a| a == "--memory") {
+                vec![memory_merge::RegisterMode::Memory]
+            } else {
+                vec![memory_merge::RegisterMode::Memory, memory_merge::RegisterMode::Recall]
+            };
+            for mode in modes {
+                if let Err(e) = memory_merge::register(root, mode, versioned) {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
+            }
+            println!("registered memory merge driver(s)");
+            0
+        }
+        "unregister" => {
+            if let Err(e) = memory_merge::unregister(root) {
+                eprintln!("error: {e}");
+                return 1;
+            }
+            println!("unregistered memory merge drivers");
+            0
+        }
+        "merge" => {
+            let is_recall = args.iter().any(|a| a == "--recall");
+            // Git merge driver protocol: %O %A %B %L %P
+            // %O=base %A=ours %B=theirs %L=marker-size %P=path
+            let positional: Vec<&String> = args.iter()
+                .filter(|a| !a.starts_with('-'))
+                .collect();
+            if positional.len() < 3 {
+                eprintln!("usage: dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]");
+                return 2;
+            }
+            let base_content = std::fs::read_to_string(positional[0]).unwrap_or_default();
+            let ours_content = std::fs::read_to_string(positional[1]).unwrap_or_default();
+            let theirs_content = std::fs::read_to_string(positional[2]).unwrap_or_default();
+
+            let outcome = if is_recall {
+                memory_merge::merge_recall(&base_content, &ours_content, &theirs_content)
+            } else {
+                memory_merge::merge_memory(&base_content, &ours_content, &theirs_content)
+            };
+
+            // Write result to ours file (Git merge driver protocol)
+            if let Err(e) = std::fs::write(positional[1], &outcome.content) {
+                eprintln!("error writing merge result: {e}");
+                return 1;
+            }
+            for w in &outcome.warnings {
+                eprintln!("warning: {w}");
+            }
+            if outcome.clean { 0 } else { 1 }
+        }
+        _ => {
+            eprintln!("usage: dext memory [check|register|unregister|merge]");
+            2
+        }
+    }
+}
+
 fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
     if argv.is_empty() {
         return Ok(None);
@@ -14926,6 +15160,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(
                 w,
                 "  /hooks [reload]           show hook config or reload from disk"
+            );
+            let _ = writeln!(
+                w,
+                "  /undo [--apply|--list|<id>] preview or restore latest checkpoint"
             );
             let _ = writeln!(w, "  /version                  show dext version");
         }
@@ -15911,6 +16149,74 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 agent.hooks.post_tool.len(),
                 agent.hooks.user_prompt.len()
             );
+        }
+        "undo" => {
+            let mut parts = arg.splitn(2, char::is_whitespace);
+            let first = parts.next().unwrap_or("");
+            let second = parts.next().unwrap_or("").trim();
+            if first == "--list" || first == "list" {
+                match git_checkpoints::list_checkpoints(&agent.sandbox_root, 10) {
+                    Ok(cps) if cps.is_empty() => { let _ = writeln!(w, "no checkpoints"); }
+                    Ok(cps) => {
+                        for cp in &cps {
+                            let _ = writeln!(w, "{}  {}  {}", cp.id, cp.tool_name, cp.paths_hint.join(","));
+                        }
+                    }
+                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                }
+            } else if first == "--prune" || first == "prune" {
+                match git_checkpoints::prune(&agent.sandbox_root, None, None) {
+                    Ok(msg) => { let _ = writeln!(w, "{msg}"); }
+                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                }
+            } else if first == "--apply" {
+                match git_checkpoints::latest_checkpoint(&agent.sandbox_root) {
+                    Ok(Some(cp)) => {
+                        match git_checkpoints::restore_worktree(
+                            &agent.sandbox_root,
+                            &cp,
+                            git_checkpoints::RestoreMode::Worktree,
+                        ) {
+                            Ok(msg) => { let _ = writeln!(w, "{msg}"); }
+                            Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                        }
+                    }
+                    Ok(None) => { let _ = writeln!(w, "no checkpoints"); }
+                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                }
+            } else if !first.is_empty() && first != "--preview" {
+                // Specific checkpoint id
+                let apply = second == "--apply";
+                match git_checkpoints::find_checkpoint(&agent.sandbox_root, first) {
+                    Ok(Some(cp)) => {
+                        let mode = if apply {
+                            git_checkpoints::RestoreMode::Worktree
+                        } else {
+                            git_checkpoints::RestoreMode::Preview
+                        };
+                        match git_checkpoints::restore_worktree(
+                            &agent.sandbox_root, &cp, mode,
+                        ) {
+                            Ok(msg) => { let _ = writeln!(w, "{msg}"); }
+                            Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                        }
+                    }
+                    Ok(None) => { let _ = writeln!(w, "checkpoint not found: {first}"); }
+                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                }
+            } else {
+                // Default: preview latest
+                match git_checkpoints::latest_checkpoint(&agent.sandbox_root) {
+                    Ok(Some(cp)) => {
+                        match git_checkpoints::preview_restore(&agent.sandbox_root, &cp) {
+                            Ok(msg) => { let _ = writeln!(w, "{msg}"); }
+                            Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                        }
+                    }
+                    Ok(None) => { let _ = writeln!(w, "no checkpoints"); }
+                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                }
+            }
         }
         _ => {
             let _ = writeln!(w, "unknown command: /{cmd} — try /help");
@@ -17028,6 +17334,24 @@ async fn main() -> Result<()> {
         release_registered_locks();
         std::process::exit(code);
     }
+    if argv.first().is_some_and(|a| a == "undo") {
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let code = handle_undo_cli(&argv[1..], &root);
+        release_registered_locks();
+        std::process::exit(code);
+    }
+    if argv.first().is_some_and(|a| a == "memory") {
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let code = handle_memory_cli(&argv[1..], &root);
+        release_registered_locks();
+        std::process::exit(code);
+    }
     if argv.iter().any(|a| a == "-h" || a == "--help") {
         println!("usage: dext [TASK...]        run one-shot with TASK (joined with spaces)");
         println!("       dext -p               read task from stdin, run one-shot");
@@ -17077,6 +17401,12 @@ async fn main() -> Result<()> {
         println!("       dext --eval [NAME]    run eval harness (optionally a single case)");
         println!("       dext --trust          auto-approve gated tools");
         println!("       dext auth ...         provider/model/auth management commands");
+        println!("       dext undo --list      list recent Dext checkpoints");
+        println!("       dext undo --preview <id>  non-interactive preview");
+        println!("       dext undo --apply <id>   non-interactive apply");
+        println!("       dext memory check    check memory merge registration");
+        println!("       dext memory register register merge drivers (local)");
+        println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
             "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
