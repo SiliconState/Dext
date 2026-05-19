@@ -7791,3 +7791,121 @@ fn parse_cli_options_accepts_pack_flag() -> Result<()> {
     assert_eq!(opts.positional, vec!["do thing".to_string()]);
     Ok(())
 }
+
+#[test]
+fn squash_identical_error_result_content_preserves_tool_result_ids() {
+    let results = vec![
+        Block::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: "missing command".to_string(),
+            is_error: Some(true),
+            metadata: ToolResultMetadata::default(),
+        },
+        Block::ToolResult {
+            tool_use_id: "call_2".to_string(),
+            content: "missing command".to_string(),
+            is_error: Some(true),
+            metadata: ToolResultMetadata::default(),
+        },
+        Block::ToolResult {
+            tool_use_id: "call_3".to_string(),
+            content: "missing command".to_string(),
+            is_error: Some(true),
+            metadata: ToolResultMetadata::default(),
+        },
+    ];
+    let squashed = squash_identical_error_result_content(results);
+    assert_eq!(squashed.len(), 3, "must preserve one result per tool_use");
+    let ids: Vec<&str> = squashed
+        .iter()
+        .map(|block| match block {
+            Block::ToolResult { tool_use_id, .. } => tool_use_id.as_str(),
+            _ => panic!("expected ToolResult"),
+        })
+        .collect();
+    assert_eq!(ids, vec!["call_1", "call_2", "call_3"]);
+    let Block::ToolResult { content, .. } = &squashed[0] else {
+        panic!("expected ToolResult");
+    };
+    assert!(
+        content.contains("squashed: 3 identical error results"),
+        "{content}"
+    );
+    assert!(content.contains("missing command"), "{content}");
+    let Block::ToolResult { content, .. } = &squashed[1] else {
+        panic!("expected ToolResult");
+    };
+    assert!(content.contains("duplicate error elided"), "{content}");
+}
+
+#[test]
+fn squash_preserves_non_error_results() {
+    let results = vec![
+        Block::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: "ok output".to_string(),
+            is_error: None,
+            metadata: ToolResultMetadata::default(),
+        },
+        Block::ToolResult {
+            tool_use_id: "call_2".to_string(),
+            content: "ok output".to_string(),
+            is_error: None,
+            metadata: ToolResultMetadata::default(),
+        },
+    ];
+    let squashed = squash_identical_error_result_content(results);
+    assert_eq!(squashed.len(), 2, "non-error results should not collapse");
+}
+
+#[test]
+fn squash_handles_mixed_error_types() {
+    let results = vec![
+        Block::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: "error A".to_string(),
+            is_error: Some(true),
+            metadata: ToolResultMetadata::default(),
+        },
+        Block::ToolResult {
+            tool_use_id: "call_2".to_string(),
+            content: "error B".to_string(),
+            is_error: Some(true),
+            metadata: ToolResultMetadata::default(),
+        },
+        Block::ToolResult {
+            tool_use_id: "call_3".to_string(),
+            content: "error A".to_string(),
+            is_error: Some(true),
+            metadata: ToolResultMetadata::default(),
+        },
+    ];
+    let squashed = squash_identical_error_result_content(results);
+    // error A run, then error B (standalone), then error A (different run)
+    assert_eq!(
+        squashed.len(),
+        3,
+        "different error messages should not merge"
+    );
+}
+
+#[test]
+fn squash_small_batches_unchanged() {
+    let results = vec![
+        Block::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: "err".to_string(),
+            is_error: Some(true),
+            metadata: ToolResultMetadata::default(),
+        },
+        Block::ToolResult {
+            tool_use_id: "call_2".to_string(),
+            content: "err".to_string(),
+            is_error: Some(true),
+            metadata: ToolResultMetadata::default(),
+        },
+    ];
+    // len <= 2: returned as-is
+    let squashed = squash_identical_error_result_content(results);
+    assert_eq!(squashed.len(), 2);
+}

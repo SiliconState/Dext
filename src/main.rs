@@ -602,6 +602,82 @@ fn cap_tool_output(s: String) -> String {
     cap_tool_output_with_cap(s, TOOL_RESULT_CAP)
 }
 
+/// Squash repeated identical error text while preserving one ToolResult block
+/// per tool call.  Providers require every tool_use id to receive a matching
+/// result, so this must not remove blocks.
+fn squash_identical_error_result_content(results: Vec<Block>) -> Vec<Block> {
+    if results.len() <= 2 {
+        return results;
+    }
+
+    let mut squashed = Vec::with_capacity(results.len());
+    let mut idx = 0usize;
+    while idx < results.len() {
+        let Some(content) = error_result_content(&results[idx]) else {
+            squashed.push(results[idx].clone());
+            idx += 1;
+            continue;
+        };
+
+        let mut end = idx + 1;
+        while end < results.len()
+            && error_result_content(&results[end]).is_some_and(|next| next == content)
+        {
+            end += 1;
+        }
+
+        let run_len = end - idx;
+        if run_len < 3 {
+            squashed.extend(results[idx..end].iter().cloned());
+        } else {
+            for (offset, block) in results[idx..end].iter().cloned().enumerate() {
+                let Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    metadata,
+                } = block
+                else {
+                    squashed.push(block);
+                    continue;
+                };
+                let content = if offset == 0 {
+                    format!(
+                        "{content}\n\n[squashed: {run_len} identical error results in this run; duplicate payloads elided below]"
+                    )
+                } else {
+                    format!(
+                        "[duplicate error elided: same as previous tool result; item {}/{} in run]",
+                        offset + 1,
+                        run_len
+                    )
+                };
+                squashed.push(Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    metadata,
+                });
+            }
+        }
+
+        idx = end;
+    }
+    squashed
+}
+
+fn error_result_content(block: &Block) -> Option<&str> {
+    let Block::ToolResult {
+        content,
+        is_error: Some(true),
+        ..
+    } = block
+    else {
+        return None;
+    };
+    Some(content.as_str())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileSignature {
     len: u64,
@@ -11220,6 +11296,15 @@ impl Agent {
                 })
                 .collect();
 
+            let empty_call_count = tool_calls
+                .iter()
+                .filter(|(_, _, input)| {
+                    input.as_object().is_some_and(|m| m.is_empty()) || input.is_null()
+                })
+                .count();
+            turn_state.record_empty_tool_calls(empty_call_count);
+            let empty_tool_call_loop_note = turn_state.empty_tool_call_loop_note();
+
             if tool_calls.is_empty() {
                 let coverage = objective.assess_history(&self.history);
                 self.sync_work_ledger_with_objective_coverage(&coverage);
@@ -11389,9 +11474,7 @@ impl Agent {
                         input["command"].as_str().unwrap_or(""),
                     ))
                 } else if matches!(name.as_str(), "write_file" | "edit_file") {
-                    input["path"]
-                        .as_str()
-                        .map(|p| format!("{name}:{p}"))
+                    input["path"].as_str().map(|p| format!("{name}:{p}"))
                 } else {
                     None
                 };
@@ -11948,11 +12031,36 @@ impl Agent {
                 });
             }
 
+            let squashed_results = squash_identical_error_result_content(results);
             self.history.push(Message {
                 role: "user".to_string(),
-                content: results,
+                content: squashed_results,
             });
             self.checkpoint_latest_session("after_tool_results");
+
+            if let Some(halt) = turn_state.empty_tool_call_halt_message() {
+                self.sink.emit(AgentEvent::Warn(halt.clone()));
+                self.append_latest_log("empty_tool_call_halt", &halt);
+                self.history.push(Message {
+                    role: "assistant".to_string(),
+                    content: vec![Block::Text { text: halt }],
+                });
+                self.checkpoint_latest_session("after_empty_tool_call_halt");
+                break;
+            }
+
+            if let Some(note) = empty_tool_call_loop_note {
+                self.sink.emit(AgentEvent::Warn(note.clone()));
+                self.append_latest_log("empty_tool_call_loop", &note);
+                self.history.push(Message {
+                    role: "user".to_string(),
+                    content: vec![Block::Text {
+                        text: format!("[runtime-note] {note}"),
+                    }],
+                });
+                self.checkpoint_latest_session("after_empty_tool_call_hint");
+                continue;
+            }
 
             if mutation_succeeded {
                 action_contract_must_mutate = false;

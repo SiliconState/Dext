@@ -88,6 +88,7 @@ pub(crate) struct ExternalTelemetry {
     pub(crate) circuit_breaker_trips: usize,
     pub(crate) partial_delivery_hints: usize,
     pub(crate) http_retries: usize,
+    pub(crate) empty_tool_call_hints: usize,
 }
 
 #[derive(Debug)]
@@ -103,6 +104,8 @@ pub(crate) struct TurnRuntimeState {
     tool_failure_budget: HashMap<String, (String, usize)>,
     mutation_epoch: u64,
     telemetry: ExternalTelemetry,
+    empty_tool_call_streak: usize,
+    empty_tool_call_note_emitted: bool,
 }
 
 impl Default for TurnRuntimeState {
@@ -119,6 +122,8 @@ impl Default for TurnRuntimeState {
             tool_failure_budget: HashMap::new(),
             mutation_epoch: 0,
             telemetry: ExternalTelemetry::default(),
+            empty_tool_call_streak: 0,
+            empty_tool_call_note_emitted: false,
         }
     }
 }
@@ -221,6 +226,56 @@ impl TurnRuntimeState {
             Some(format!(
                 "tool retry budget exceeded: {tool_name} has failed {} times with the same error ({}). Stop retrying this tool with the same arguments and pivot strategy (use a different tool, change approach, or ask the user).",
                 entry.1, entry.0
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn record_empty_tool_calls(&mut self, count: usize) {
+        if count > 0 {
+            self.empty_tool_call_streak = self.empty_tool_call_streak.saturating_add(1);
+        } else {
+            self.empty_tool_call_streak = 0;
+        }
+    }
+
+    /// After enough consecutive empty-tool-call iterations, inject a recovery
+    /// hint.  The provider (notably GLM) sometimes drops function_call
+    /// arguments when the intended payload is large, producing `input: {}`.
+    /// The model cannot self-correct from this loop without a structural hint.
+    pub(crate) fn empty_tool_call_loop_note(&mut self) -> Option<String> {
+        if self.empty_tool_call_note_emitted {
+            return None;
+        }
+        // Provider keeps emitting tool calls with empty arguments — likely a
+        // generation bug where large payloads get silently dropped.
+        const EMPTY_STREAK_THRESHOLD: usize = 4;
+        if self.empty_tool_call_streak >= EMPTY_STREAK_THRESHOLD {
+            self.empty_tool_call_note_emitted = true;
+            self.telemetry.empty_tool_call_hints =
+                self.telemetry.empty_tool_call_hints.saturating_add(1);
+            Some(
+                "Your last several tool calls had completely empty arguments (no parameters at all). \
+                 This is a provider generation bug that occurs when the intended payload is too large. \
+                 Recovery strategy: (1) write a small placeholder file first with write_file, \
+                 (2) then build the full content incrementally using multiple edit_file calls, \
+                 each with a small chunk (under 4 KB of new_string). \
+                 Do NOT attempt to pass large content in a single tool call again this turn."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn empty_tool_call_halt_message(&self) -> Option<String> {
+        const EMPTY_HALT_THRESHOLD: usize = 8;
+        if self.empty_tool_call_note_emitted && self.empty_tool_call_streak >= EMPTY_HALT_THRESHOLD
+        {
+            Some(format!(
+                "[halted: provider emitted empty tool arguments for {} consecutive tool rounds, even after a recovery hint. Stop this turn to avoid burning iterations; retry with smaller chunks or switch provider/model.]",
+                self.empty_tool_call_streak
             ))
         } else {
             None
@@ -1856,5 +1911,60 @@ mod tests {
 
         assert!(ui_cap < 8_000, "ui cap should shrink");
         assert!(result_cap < 12_000, "result cap should shrink");
+    }
+
+    #[test]
+    fn empty_tool_call_streak_triggers_after_threshold() {
+        let mut state = TurnRuntimeState::new();
+        assert!(state.empty_tool_call_loop_note().is_none());
+
+        for _ in 0..3 {
+            state.record_empty_tool_calls(2);
+            assert!(state.empty_tool_call_loop_note().is_none());
+        }
+
+        state.record_empty_tool_calls(1);
+        let note = state
+            .empty_tool_call_loop_note()
+            .expect("should trigger after 4 consecutive empty-call iterations");
+        assert!(note.contains("empty arguments"), "{note}");
+        assert!(note.contains("edit_file"), "{note}");
+
+        // Does not re-trigger
+        state.record_empty_tool_calls(5);
+        assert!(state.empty_tool_call_loop_note().is_none());
+    }
+
+    #[test]
+    fn empty_tool_call_streak_resets_on_nonempty_calls() {
+        let mut state = TurnRuntimeState::new();
+
+        for _ in 0..3 {
+            state.record_empty_tool_calls(1);
+        }
+        assert!(state.empty_tool_call_loop_note().is_none());
+
+        // Non-empty calls reset the streak
+        state.record_empty_tool_calls(0);
+        assert!(state.empty_tool_call_loop_note().is_none());
+
+        for _ in 0..3 {
+            state.record_empty_tool_calls(1);
+        }
+        assert!(state.empty_tool_call_loop_note().is_none());
+
+        state.record_empty_tool_calls(1);
+        assert!(state.empty_tool_call_loop_note().is_some());
+
+        for _ in 0..3 {
+            state.record_empty_tool_calls(1);
+            assert!(state.empty_tool_call_halt_message().is_none());
+        }
+        state.record_empty_tool_calls(1);
+        let halt = state
+            .empty_tool_call_halt_message()
+            .expect("should halt after continued empty-call loop");
+        assert!(halt.contains("halted"), "{halt}");
+        assert!(halt.contains("switch provider/model"), "{halt}");
     }
 }

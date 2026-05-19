@@ -2200,7 +2200,8 @@ fn status_detail_spans(state: &TuiState) -> Vec<Span<'_>> {
         + ext.similarity_blocks
         + ext.circuit_breaker_trips
         + ext.partial_delivery_hints
-        + ext.http_retries;
+        + ext.http_retries
+        + ext.empty_tool_call_hints;
     if ext_total > 0 {
         spans.push(Span::styled(
             " · ext",
@@ -2212,6 +2213,7 @@ fn status_detail_spans(state: &TuiState) -> Vec<Span<'_>> {
             (ext.similarity_blocks, "sg", Color::Magenta),
             (ext.partial_delivery_hints, "ph", Color::Green),
             (ext.http_retries, "rt", Color::DarkGray),
+            (ext.empty_tool_call_hints, "et", Color::Red),
         ];
         for (value, label, color) in counters {
             if value > 0 {
@@ -4362,9 +4364,7 @@ fn table_visual_height(table: &ParsedTable, max_total_width: usize) -> u16 {
     }
     let header_rows = table.header_rows.min(table.rows.len());
     let body_rows = table.rows.len().saturating_sub(header_rows);
-    header_rows
-        .saturating_add(body_rows)
-        .min(u16::MAX as usize) as u16
+    header_rows.saturating_add(body_rows).min(u16::MAX as usize) as u16
 }
 
 fn render_table_lines(
@@ -9136,12 +9136,16 @@ mod tests {
             circuit_breaker_trips: 3,
             partial_delivery_hints: 1,
             http_retries: 4,
+            empty_tool_call_hints: 6,
         };
         let rendered = status_detail_spans(&state)
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(rendered.contains("ext d2 cb3 sg1 ph1 rt4"), "{rendered}");
+        assert!(
+            rendered.contains("ext d2 cb3 sg1 ph1 rt4 et6"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -9158,6 +9162,7 @@ mod tests {
             circuit_breaker_trips: 0,
             partial_delivery_hints: 0,
             http_retries: 0,
+            empty_tool_call_hints: 0,
         };
         let rendered = status_detail_spans(&state)
             .into_iter()
@@ -9168,6 +9173,7 @@ mod tests {
         assert!(!rendered.contains("cb0"), "{rendered}");
         assert!(!rendered.contains("ph0"), "{rendered}");
         assert!(!rendered.contains("rt0"), "{rendered}");
+        assert!(!rendered.contains("et0"), "{rendered}");
     }
 
     #[test]
@@ -9932,11 +9938,13 @@ mod tests {
             flat[0]
         );
         assert!(
-            flat.iter().all(|line| !line.contains('┌') && !line.contains('└') && !line.contains('│')),
+            flat.iter()
+                .all(|line| !line.contains('┌') && !line.contains('└') && !line.contains('│')),
             "borderless table should not contain box-drawing chars: {flat:?}"
         );
         assert!(
-            flat.iter().any(|line| line.contains("name") && line.contains("dext")),
+            flat.iter()
+                .any(|line| line.contains("name") && line.contains("dext")),
             "data row should contain name/dext: {flat:?}"
         );
 

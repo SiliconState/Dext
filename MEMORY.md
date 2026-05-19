@@ -23,6 +23,18 @@
 
 ## Recent Decisions
 
+- **GLM-5.1 empty-tool-argument loop (session 1779186436)**
+  *Choice:* Investigated a 299-iteration session where 76% of tool calls failed. Root cause: GLM-5.1 silently drops function_call arguments when the intended JSON payload is large (multi-KB content strings), emitting `tool_use` blocks with `input: {}`. The model entered a 186-iteration degenerate loop of empty `bash` calls, self-diagnosed the issue in its text output but could not break out. User had to explicitly say "try chunking" for recovery.
+  *Why:* Three compounding failures: (1) no heuristic break for repeated identical empty-tool failures, (2) no runtime hint to suggest chunking or alternative strategies, (3) error-message deduplication missing — 186 identical "missing command" errors pollute context without signal.
+  *Mitigations to build:* (a) detect N-consecutive empty-input tool calls and inject a "chunk your output or use a different tool" runtime note, (b) coalesce repeated identical errors in context, (c) consider GLM-specific payload-size advisory for write-heavy ops.
+  `2026-05-22` `active`
+
+- **Git-native recovery/memory plan (GCMR review)**
+  *Choice:* Keep the Git plumbing but reject a broad "counterfactual runtime." Build Dext-fit primitives in this order: (1) pre-mutation recovery refs plus `/undo` preview, (2) explicit local memory merge/check/register for `MEMORY.md` and `recall.md`, (3) mutation previews starting with simple in-memory diffs and only later optional `GIT_INDEX_FILE` previews. Do not add provider-visible tools.
+  *Why:* Recovery refs give the best safety ROI without prompt/tool bloat. Memory merge protects core context assets. Alternate indexes are useful only after simpler previews, and rejected candidates/notes/bisect/rerere/replace/bundles add clutter or duplicate session state.
+  *Constraints:* No automatic `.git/config`, `.gitattributes`, or hook edits; no silent `HEAD` moves; hidden refs under `refs/dext/...` with pruning; graceful no-op outside Git; honest limitations for untracked files and external side effects.
+  `2026-05-18` `active`
+
 - **Compaction active and end-turn thresholds**
   *Choice:* Standard mode auto-compacts at 90% of model context at end-turn and 80% after safe active tool-result checkpoints; explicit /compact percent and DEXT_MAX_HISTORY_CHARS overrides still win.
   *Why:* Earlier compaction preserves evidence before active turns exceed provider context while keeping end-turn compaction near the tail and budget-conscious.

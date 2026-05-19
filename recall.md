@@ -72,7 +72,7 @@ Keep this file compact and curated.
 - For ambiguous cleanup asks, ask once max; if unresolved, default to reversible `git stash` and verify.
 
 ## Current focus
-- Compaction thresholds now use standard 90% end-turn / 80% active safe-checkpoint triggers with recent tool evidence preserved; verification/install passed after this update. Broader dirty tree still includes provider/auth, subagent/tool, and TUI changes across `.env.example`, `Cargo.toml`, `Cargo.lock`, `README.md`, `docs/USAGE.md`, `src/main.rs`, `src/main_tests.rs`, `src/orchestrator.rs`, `src/provider.rs`, `src/tools.rs`, and `src/tui.rs`.
+- Git-native recovery/memory plan: reject a broad counterfactual runtime. Build Dext-fit primitives in order: pre-mutation recovery refs + `/undo` preview; explicit local memory merge/check/register for `MEMORY.md`/`recall.md`; then mutation previews starting with simple diffs before optional `GIT_INDEX_FILE` previews. No provider-visible tools, no automatic Git config/attribute/hook edits, no silent `HEAD` moves.
 
 ## Open question
 - How much historical detail should remain prompt-injected versus only in
