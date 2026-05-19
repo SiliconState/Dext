@@ -11,6 +11,8 @@ system prompt from the sandbox root, so keep it short and high-signal.
 - `src/tools.rs` — tool catalog, permission/parallel metadata, and lean/full
   provider tool schemas.
 - `src/provider.rs` — provider catalog/auth, request shaping, and normalization.
+- `src/git_checkpoints.rs`, `src/mutation_preview.rs`, `src/memory_merge.rs` —
+  Git-native recovery refs, file mutation previews, and memory merge helpers.
 - `src/tui.rs` — ratatui inline TUI using the regular terminal buffer.
 - `benches/dext_bench.rs` — criterion perf harness.
 

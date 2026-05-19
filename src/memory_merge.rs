@@ -12,6 +12,7 @@ pub(crate) struct ParsedMemory {
 
 #[derive(Clone)]
 pub(crate) struct Section {
+    pub level: usize,
     pub heading_path: Vec<String>,
     pub heading_line: String,
     pub body: String,
@@ -43,41 +44,36 @@ const MERGE_DRIVER_RECALL: &str = "dext-recall";
 pub(crate) fn parse_memory(input: &str) -> ParsedMemory {
     let mut preamble = String::new();
     let mut sections: Vec<Section> = Vec::new();
+    let mut current_level = 0usize;
     let mut current_heading_path: Vec<String> = Vec::new();
     let mut current_heading_line = String::new();
     let mut current_body = String::new();
+    let mut stack: Vec<String> = Vec::new();
     let mut in_preamble = true;
 
     for line in input.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix('#') {
-            let hashes = trimmed.len() - rest.len();
-            let level = hashes.min(6);
-            if level >= 1 {
-                if in_preamble {
-                    // First heading ends preamble
-                    in_preamble = false;
-                } else if !current_heading_line.is_empty() {
-                    // Flush previous section
-                    sections.push(Section {
-                        heading_path: current_heading_path.clone(),
-                        heading_line: current_heading_line.clone(),
-                        body: current_body.trim_end().to_string(),
-                    });
-                    current_body.clear();
-                }
-                current_heading_line = trimmed.to_string();
-                current_heading_path = trimmed
-                    .trim_start_matches('#')
-                    .trim()
-                    .split(' ')
-                    .map(String::from)
-                    .collect();
-                continue;
+        if let Some((level, title)) = parse_heading(line) {
+            if in_preamble {
+                in_preamble = false;
+            } else if !current_heading_line.is_empty() {
+                sections.push(Section {
+                    level: current_level,
+                    heading_path: current_heading_path.clone(),
+                    heading_line: current_heading_line.clone(),
+                    body: current_body.trim_end().to_string(),
+                });
+                current_body.clear();
             }
+            stack.truncate(level.saturating_sub(1));
+            stack.push(title.to_string());
+            current_level = level;
+            current_heading_path = stack.clone();
+            current_heading_line = line.trim_end().to_string();
+            continue;
         }
+
         if in_preamble {
-            if !preamble.is_empty() || !line.is_empty() {
+            if !preamble.is_empty() || !line.trim().is_empty() {
                 preamble.push_str(line);
                 preamble.push('\n');
             }
@@ -87,9 +83,9 @@ pub(crate) fn parse_memory(input: &str) -> ParsedMemory {
         }
     }
 
-    // Flush last section
     if !current_heading_line.is_empty() {
         sections.push(Section {
+            level: current_level,
             heading_path: current_heading_path,
             heading_line: current_heading_line,
             body: current_body.trim_end().to_string(),
@@ -102,8 +98,56 @@ pub(crate) fn parse_memory(input: &str) -> ParsedMemory {
     }
 }
 
+fn parse_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_end();
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let after_hashes = trimmed.get(hashes..)?;
+    if !after_hashes.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = after_hashes.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((hashes, rest.trim_end_matches('#').trim_end()))
+}
+
 fn section_key(s: &Section) -> String {
-    s.heading_path.join(" ").to_ascii_lowercase()
+    s.heading_path
+        .iter()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
+fn merge_list_body(base: &str, ours: &str, theirs: &str) -> Option<String> {
+    fn list_like(body: &str) -> bool {
+        body.lines().all(|line| {
+            let trimmed = line.trim();
+            trimmed.is_empty()
+                || trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || trimmed.starts_with("+ ")
+        })
+    }
+    if !list_like(base) || !list_like(ours) || !list_like(theirs) {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in ours.lines().chain(theirs.lines()) {
+        let norm = line.trim().to_ascii_lowercase();
+        if norm.is_empty() {
+            continue;
+        }
+        if seen.insert(norm) {
+            out.push(line.to_string());
+        }
+    }
+    Some(out.join("\n"))
 }
 
 fn render_parsed(pm: &ParsedMemory) -> String {
@@ -153,7 +197,9 @@ pub(crate) fn merge_memory(base: &str, ours: &str, theirs: &str) -> MergeOutcome
     // Track all known section keys in stable order
     let mut seen_keys = std::collections::HashSet::new();
     let mut all_keys: Vec<String> = Vec::new();
-    for s in base_parsed.sections.iter()
+    for s in base_parsed
+        .sections
+        .iter()
         .chain(ours_parsed.sections.iter())
         .chain(theirs_parsed.sections.iter())
     {
@@ -170,9 +216,7 @@ pub(crate) fn merge_memory(base: &str, ours: &str, theirs: &str) -> MergeOutcome
 
         match (base_sec, ours_sec, theirs_sec) {
             // Same in all — keep
-            (Some(b), Some(o), Some(t))
-                if o.body == b.body && t.body == b.body =>
-            {
+            (Some(b), Some(o), Some(t)) if o.body == b.body && t.body == b.body => {
                 sections.push((*o).clone());
             }
             // Only ours changed from base
@@ -187,8 +231,17 @@ pub(crate) fn merge_memory(base: &str, ours: &str, theirs: &str) -> MergeOutcome
             (Some(_), Some(o), Some(t)) if o.body == t.body => {
                 sections.push((*o).clone());
             }
-            // Both changed differently — conflict
-            (Some(_), Some(o), Some(t)) => {
+            // Both changed differently: union pure list sections, otherwise conflict.
+            (Some(b), Some(o), Some(t)) => {
+                if let Some(body) = merge_list_body(&b.body, &o.body, &t.body) {
+                    sections.push(Section {
+                        level: o.level,
+                        heading_path: o.heading_path.clone(),
+                        heading_line: o.heading_line.clone(),
+                        body,
+                    });
+                    continue;
+                }
                 clean = false;
                 warnings.push(format!("conflict in section '{}'", key));
                 let mut body = String::new();
@@ -200,6 +253,7 @@ pub(crate) fn merge_memory(base: &str, ours: &str, theirs: &str) -> MergeOutcome
                 body.push('\n');
                 body.push_str(">>>>>>> theirs\n");
                 sections.push(Section {
+                    level: o.level,
                     heading_path: o.heading_path.clone(),
                     heading_line: o.heading_line.clone(),
                     body,
@@ -213,17 +267,27 @@ pub(crate) fn merge_memory(base: &str, ours: &str, theirs: &str) -> MergeOutcome
             (None, None, Some(t)) => {
                 sections.push((*t).clone());
             }
-            // New in both — union
+            // New in both: take identical additions, otherwise mark an explicit conflict.
             (None, Some(o), Some(t)) => {
                 if o.body == t.body {
                     sections.push((*o).clone());
                 } else {
-                    sections.push((*o).clone());
-                    sections.push((*t).clone());
-                    warnings.push(format!(
-                        "new section '{}' in both sides; kept both",
-                        key
-                    ));
+                    clean = false;
+                    warnings.push(format!("conflict in new section '{}'", key));
+                    let mut body = String::new();
+                    body.push_str("<<<<<<< ours\n");
+                    body.push_str(&o.body);
+                    body.push('\n');
+                    body.push_str("=======\n");
+                    body.push_str(&t.body);
+                    body.push('\n');
+                    body.push_str(">>>>>>> theirs\n");
+                    sections.push(Section {
+                        level: o.level,
+                        heading_path: o.heading_path.clone(),
+                        heading_line: o.heading_line.clone(),
+                        body,
+                    });
                 }
             }
             // Removed in one side
@@ -256,72 +320,38 @@ pub(crate) fn merge_memory(base: &str, ours: &str, theirs: &str) -> MergeOutcome
 }
 
 pub(crate) fn merge_recall(base: &str, ours: &str, theirs: &str) -> MergeOutcome {
-    let warnings = Vec::new();
-
-    // Split into lines, dedupe by normalized content
-    let base_lines: Vec<&str> = base.lines().collect();
-    let ours_lines: Vec<&str> = ours.lines().collect();
-    let theirs_lines: Vec<&str> = theirs.lines().collect();
-
+    let base_set: std::collections::HashSet<String> = base
+        .lines()
+        .map(normalize_recall_line)
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut seen = std::collections::HashSet::new();
     let mut result: Vec<String> = Vec::new();
 
-    // Start with base
-    for line in &base_lines {
+    for line in ours.lines() {
         let norm = normalize_recall_line(line);
-        if !norm.is_empty() {
-            seen.insert(norm);
+        if norm.is_empty() || seen.insert(norm) {
+            result.push(line.to_string());
         }
-        result.push(line.to_string());
     }
 
-    // Add ours additions
-    for line in &ours_lines {
+    for line in theirs.lines() {
         let norm = normalize_recall_line(line);
-        if norm.is_empty() || seen.contains(&norm) {
+        if norm.is_empty() || base_set.contains(&norm) || !seen.insert(norm) {
             continue;
         }
-        seen.insert(norm);
         result.push(line.to_string());
     }
 
-    // Add theirs additions
-    for line in &theirs_lines {
-        let norm = normalize_recall_line(line);
-        if norm.is_empty() || seen.contains(&norm) {
-            continue;
-        }
-        seen.insert(norm);
-        result.push(line.to_string());
-    }
-
-    // Remove lines that were in base but missing from both ours and theirs
-    let ours_set: std::collections::HashSet<String> =
-        ours_lines.iter().map(|l| normalize_recall_line(l)).collect();
-    let theirs_set: std::collections::HashSet<String> =
-        theirs_lines.iter().map(|l| normalize_recall_line(l)).collect();
-    result.retain(|line| {
-        let norm = normalize_recall_line(line);
-        if norm.is_empty() {
-            return true;
-        }
-        // Keep if it wasn't in base, or if at least one side still has it
-        !base_lines.iter().any(|l| normalize_recall_line(l) == norm)
-            || ours_set.contains(&norm)
-            || theirs_set.contains(&norm)
-    });
-
-    let content = result.join("\n");
-    if content.ends_with('\n') {
-        // fine
-    } else if !content.is_empty() {
-        // add trailing newline
+    let mut content = result.join("\n");
+    if !content.is_empty() {
+        content.push('\n');
     }
 
     MergeOutcome {
         content,
-        clean: warnings.is_empty(),
-        warnings,
+        clean: true,
+        warnings: Vec::new(),
     }
 }
 
@@ -338,6 +368,7 @@ pub(crate) fn register(
     mode: RegisterMode,
     versioned_attributes: bool,
 ) -> Result<(), String> {
+    let repo_root = find_repo_root(repo)?;
     let git_dir = find_git_dir(repo)?;
     let driver_name = match mode {
         RegisterMode::Memory => MERGE_DRIVER_MEMORY,
@@ -357,18 +388,22 @@ pub(crate) fn register(
             "Dext section-aware memory merge",
         ],
     )?;
+    let driver_command = match mode {
+        RegisterMode::Memory => "dext memory merge %O %A %B %L %P",
+        RegisterMode::Recall => "dext memory merge --recall %O %A %B %L %P",
+    };
     run_git(
         repo,
         &[
             "config",
             &format!("merge.{driver_name}.driver"),
-            &format!("dext memory merge {} %O %A %B %L %P", if mode == RegisterMode::Recall { "--recall" } else { "" }),
+            driver_command,
         ],
     )?;
 
     // Write gitattributes
     let attr_path = if versioned_attributes {
-        repo.join(".gitattributes")
+        repo_root.join(".gitattributes")
     } else {
         git_dir.join("info").join("attributes")
     };
@@ -414,9 +449,7 @@ pub(crate) fn unregister(repo: &Path) -> Result<(), String> {
         let content = std::fs::read_to_string(&attr_path).unwrap_or_default();
         let filtered: String = content
             .lines()
-            .filter(|l| {
-                !l.contains("merge=dext-memory") && !l.contains("merge=dext-recall")
-            })
+            .filter(|l| !l.contains("merge=dext-memory") && !l.contains("merge=dext-recall"))
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&attr_path, format!("{filtered}\n"))
@@ -427,6 +460,7 @@ pub(crate) fn unregister(repo: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn check(repo: &Path) -> Result<MemoryMergeStatus, String> {
+    let repo_root = find_repo_root(repo).unwrap_or_else(|_| repo.to_path_buf());
     let git_dir_result = find_git_dir(repo);
 
     let git_dir = match git_dir_result {
@@ -443,17 +477,25 @@ pub(crate) fn check(repo: &Path) -> Result<MemoryMergeStatus, String> {
 
     let memory_config = run_git(
         repo,
-        &["config", "--local", &format!("merge.{MERGE_DRIVER_MEMORY}.driver")],
+        &[
+            "config",
+            "--local",
+            &format!("merge.{MERGE_DRIVER_MEMORY}.driver"),
+        ],
     )
     .is_ok();
     let recall_config = run_git(
         repo,
-        &["config", "--local", &format!("merge.{MERGE_DRIVER_RECALL}.driver")],
+        &[
+            "config",
+            "--local",
+            &format!("merge.{MERGE_DRIVER_RECALL}.driver"),
+        ],
     )
     .is_ok();
 
     let local_attr = git_dir.join("info").join("attributes");
-    let versioned_attr = repo.join(".gitattributes");
+    let versioned_attr = repo_root.join(".gitattributes");
 
     let local_content = std::fs::read_to_string(&local_attr).unwrap_or_default();
     let versioned_content = std::fs::read_to_string(&versioned_attr).unwrap_or_default();
@@ -471,9 +513,14 @@ pub(crate) fn check(repo: &Path) -> Result<MemoryMergeStatus, String> {
     })
 }
 
+fn find_repo_root(repo: &Path) -> Result<PathBuf, String> {
+    let out = run_git(repo, &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(out.trim()))
+}
+
 fn find_git_dir(repo: &Path) -> Result<PathBuf, String> {
-    let out = run_git(repo, &["rev-parse", "--git-dir"])?;
-    let git_dir = repo.join(out.trim());
+    let out = run_git(repo, &["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = PathBuf::from(out.trim());
     if git_dir.is_dir() {
         Ok(git_dir)
     } else {
@@ -493,4 +540,3 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
-

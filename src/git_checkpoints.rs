@@ -33,12 +33,23 @@ pub(crate) enum RestoreMode {
 }
 
 pub(crate) fn repo_root(root: &Path) -> Result<Option<PathBuf>, String> {
-    let out = run_git(root, &["rev-parse", "--show-toplevel"])?;
-    let trimmed = out.trim();
-    if trimmed.is_empty() {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("git spawn: {e}"))?;
+    if output.status.success() {
+        let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((!trimmed.is_empty()).then(|| PathBuf::from(trimmed)));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("not a git repository") || stderr.contains("outside repository") {
         return Ok(None);
     }
-    Ok(Some(PathBuf::from(trimmed)))
+    Err(format!(
+        "git rev-parse --show-toplevel: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
@@ -54,11 +65,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn run_git_env(
-    cwd: &Path,
-    args: &[&str],
-    env: &[(&str, &str)],
-) -> Result<String, String> {
+fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(args).current_dir(cwd);
     for (k, v) in env {
@@ -74,7 +81,13 @@ fn run_git_env(
 
 fn sanitize_ref_component(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
 }
 
@@ -86,8 +99,8 @@ fn now_ms() -> u128 {
 }
 
 fn session_tag() -> String {
-    let session = std::env::var("DEXT_SESSION_TAG")
-        .unwrap_or_else(|_| format!("{}", std::process::id()));
+    let session =
+        std::env::var("DEXT_SESSION_TAG").unwrap_or_else(|_| format!("{}", std::process::id()));
     sanitize_ref_component(&session)
 }
 
@@ -136,9 +149,53 @@ fn is_tracked(git_root: &Path, rel: &Path) -> bool {
     .is_ok()
 }
 
+fn resolve_existing_repo_path(
+    root: &Path,
+    git_root: &Path,
+    user_path: &str,
+) -> Option<(PathBuf, PathBuf)> {
+    let candidate = if Path::new(user_path).is_absolute() {
+        PathBuf::from(user_path)
+    } else {
+        root.join(user_path)
+    };
+    let abs = std::fs::canonicalize(candidate).ok()?;
+    let rel = abs.strip_prefix(git_root).ok()?.to_path_buf();
+    Some((abs, rel))
+}
+
+fn repo_relative_hint(git_root: &Path, path_str: &str) -> PathBuf {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        path.strip_prefix(git_root).unwrap_or(path).to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn tree_has_path(git_root: &Path, oid: &str, rel: &str) -> bool {
+    run_git(git_root, &["cat-file", "-e", &format!("{oid}:{rel}")]).is_ok()
+}
+
+fn remove_worktree_path(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            std::fs::remove_dir_all(path).map_err(|e| format!("remove dir: {e}"))?;
+            Ok(true)
+        }
+        Ok(_) => {
+            std::fs::remove_file(path).map_err(|e| format!("remove file: {e}"))?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("stat path: {e}")),
+    }
+}
+
 /// Create a recovery checkpoint before a workspace mutation.
 /// Returns None if not in a Git repo. Returns error only on unexpected
 /// failures; checkpoint errors should warn but not block tool execution.
+#[cfg(test)]
 pub(crate) fn create_checkpoint(
     root: &Path,
     tool: &str,
@@ -148,7 +205,16 @@ pub(crate) fn create_checkpoint(
     let Some(git_root) = repo_root(root)? else {
         return Ok(None);
     };
+    create_checkpoint_in_repo(root, &git_root, tool, paths_hint, ordinal).map(Some)
+}
 
+pub(crate) fn create_checkpoint_in_repo(
+    root: &Path,
+    git_root: &Path,
+    tool: &str,
+    paths_hint: &[String],
+    ordinal: usize,
+) -> Result<Checkpoint, String> {
     let ts = now_ms();
     let sess = session_tag();
     let tool_sanitized = sanitize_ref_component(tool);
@@ -174,23 +240,17 @@ pub(crate) fn create_checkpoint(
     };
 
     // Store the ref
-    run_git(
-        &git_root,
-        &["update-ref", &ref_name, &oid],
-    )?;
+    run_git(&git_root, &["update-ref", &ref_name, &oid])?;
 
-    // Handle untracked sidecar for direct file tools
+    // Handle untracked sidecar for direct file tools.
     let mut includes_untracked_sidecar = false;
     let file_tools = ["write_file", "edit_file", "multi_edit"];
     if file_tools.contains(&tool) {
         for path_str in paths_hint {
-            let abs = root.join(path_str);
-            if abs.exists() {
-                let rel = abs.strip_prefix(&git_root).unwrap_or(&abs);
-                if !is_tracked(&git_root, rel) {
-                    let _ = save_untracked_sidecar(
-                        &git_root, &id, &abs, rel,
-                    );
+            if let Some((abs, rel)) = resolve_existing_repo_path(root, &git_root, path_str) {
+                if !is_tracked(&git_root, &rel)
+                    && save_untracked_sidecar(&git_root, &id, &abs, &rel).is_ok()
+                {
                     includes_untracked_sidecar = true;
                 }
             }
@@ -208,9 +268,9 @@ pub(crate) fn create_checkpoint(
         includes_untracked_sidecar,
     };
 
-    append_manifest(&git_root, &cp)?;
+    append_manifest(git_root, &cp)?;
 
-    Ok(Some(cp))
+    Ok(cp)
 }
 
 fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
@@ -256,11 +316,14 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
     if parts.len() < 7 {
         return None;
     }
-    let paths_hint = parts.get(7)
-        .map(|s| s.split(',')
-            .map(String::from)
-            .filter(|p| !p.is_empty())
-            .collect())
+    let paths_hint = parts
+        .get(7)
+        .map(|s| {
+            s.split(',')
+                .map(String::from)
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     Some(Checkpoint {
         id: parts[0].to_string(),
@@ -274,10 +337,7 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
     })
 }
 
-pub(crate) fn list_checkpoints(
-    root: &Path,
-    limit: usize,
-) -> Result<Vec<Checkpoint>, String> {
+pub(crate) fn list_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
     let Some(git_root) = repo_root(root)? else {
         return Ok(Vec::new());
     };
@@ -293,10 +353,7 @@ pub(crate) fn list_checkpoints(
     Ok(cps)
 }
 
-pub(crate) fn preview_restore(
-    root: &Path,
-    cp: &Checkpoint,
-) -> Result<String, String> {
+pub(crate) fn preview_restore(root: &Path, cp: &Checkpoint) -> Result<String, String> {
     let Some(git_root) = repo_root(root)? else {
         return Err("not a git repository".to_string());
     };
@@ -314,22 +371,16 @@ pub(crate) fn preview_restore(
         out.push_str("Includes untracked file sidecar(s)\n");
     }
 
-    // Show diff of checkpoint vs HEAD
-    let diff = run_git(
-        &git_root,
-        &["diff", "--stat", &cp.oid, "HEAD"],
-    ).unwrap_or_else(|e| format!("(diff unavailable: {e})"));
+    // Show diff of checkpoint restore target vs current worktree.
+    let diff = run_git(&git_root, &["diff", "--stat", &cp.oid])
+        .unwrap_or_else(|e| format!("(diff unavailable: {e})"));
     if !diff.trim().is_empty() {
-        out.push_str("\nDiff vs current HEAD:\n");
+        out.push_str("\nRestore diff vs current worktree:\n");
         out.push_str(&diff);
     }
 
-    // Show a capped unified diff
-    let full_diff = run_git_env(
-        &git_root,
-        &["diff", "--no-color", &cp.oid, "HEAD"],
-        &[],
-    ).unwrap_or_default();
+    let full_diff =
+        run_git_env(&git_root, &["diff", "--no-color", &cp.oid], &[]).unwrap_or_default();
     let capped = cap_diff(&full_diff, 4000);
     if !capped.is_empty() {
         out.push_str("\nUnified diff (capped):\n");
@@ -385,24 +436,27 @@ pub(crate) fn restore_worktree(
 
     if !cp.paths_hint.is_empty() {
         for path_str in &cp.paths_hint {
-            let rel = Path::new(path_str);
-            let rel_from_git = rel.strip_prefix(&git_root).unwrap_or(rel);
-            let result = run_git(
-                &git_root,
-                &["checkout", &cp.oid, "--", rel_from_git.to_str().unwrap_or(path_str)],
-            );
-            match result {
-                Ok(_) => restored.push(path_str.clone()),
-                Err(e) => {
-                    // Continue restoring other paths
-                    eprintln!("warning: could not restore {path_str}: {e}");
-                }
+            let rel = repo_relative_hint(&git_root, path_str);
+            let rel_str = rel.to_string_lossy().to_string();
+            let result = if tree_has_path(&git_root, &cp.oid, &rel_str) {
+                run_git(&git_root, &["checkout", &cp.oid, "--", &rel_str]).map(|_| {
+                    restored.push(rel_str.clone());
+                })
+            } else {
+                remove_worktree_path(&git_root.join(&rel)).map(|removed| {
+                    if removed {
+                        restored.push(format!("removed {rel_str}"));
+                    }
+                })
+            };
+            if let Err(e) = result {
+                eprintln!("warning: could not restore {path_str}: {e}");
             }
         }
     }
 
     // If no specific paths or mode is WorktreeAndIndex, full checkout
-    if mode == RestoreMode::WorktreeAndIndex || restored.is_empty() {
+    if mode == RestoreMode::WorktreeAndIndex || cp.paths_hint.is_empty() {
         run_git(&git_root, &["checkout", &cp.oid, "--", "."])?;
         restored.push("(all worktree files)".to_string());
     }
@@ -481,10 +535,7 @@ pub(crate) fn prune(
         }
         let age = now.saturating_sub(cp.created_at_ms);
         if age > max_age_ms {
-            let _ = run_git(
-                &git_root,
-                &["update-ref", "-d", &cp.ref_name],
-            );
+            let _ = run_git(&git_root, &["update-ref", "-d", &cp.ref_name]);
             let _ = std::fs::remove_dir_all(sidecar_dir(&git_root, &cp.id));
             removed += 1;
         }
@@ -493,9 +544,7 @@ pub(crate) fn prune(
     // Rebuild manifest with remaining entries
     let remaining: Vec<Checkpoint> = cps
         .into_iter()
-        .filter(|cp| {
-            run_git(&git_root, &["rev-parse", "--verify", &cp.ref_name]).is_ok()
-        })
+        .filter(|cp| run_git(&git_root, &["rev-parse", "--verify", &cp.ref_name]).is_ok())
         .collect();
 
     let dir = checkpoints_manifest_dir(&git_root);
@@ -506,16 +555,23 @@ pub(crate) fn prune(
         .map(|cp| format_manifest_line(cp))
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(&manifest_path, if content.is_empty() { String::new() } else { format!("{content}\n") })
-        .map_err(|e| format!("manifest write: {e}"))?;
+    std::fs::write(
+        &manifest_path,
+        if content.is_empty() {
+            String::new()
+        } else {
+            format!("{content}\n")
+        },
+    )
+    .map_err(|e| format!("manifest write: {e}"))?;
 
-    Ok(format!("pruned {removed} checkpoint(s), {} remaining", remaining.len()))
+    Ok(format!(
+        "pruned {removed} checkpoint(s), {} remaining",
+        remaining.len()
+    ))
 }
 
-pub(crate) fn find_checkpoint(
-    root: &Path,
-    id_or_ref: &str,
-) -> Result<Option<Checkpoint>, String> {
+pub(crate) fn find_checkpoint(root: &Path, id_or_ref: &str) -> Result<Option<Checkpoint>, String> {
     let cps = list_checkpoints(root, 100)?;
     // Try exact id match
     if let Some(cp) = cps.iter().find(|cp| cp.id == id_or_ref) {
@@ -539,7 +595,13 @@ pub(crate) fn latest_checkpoint(root: &Path) -> Result<Option<Checkpoint>, Strin
 
 /// Determine if a tool needs a checkpoint based on command risk.
 pub(crate) fn tool_needs_checkpoint(name: &str, input: &serde_json::Value) -> bool {
-    let always = ["write_file", "edit_file", "multi_edit", "todo_write", "git_commit"];
+    let always = [
+        "write_file",
+        "edit_file",
+        "multi_edit",
+        "todo_write",
+        "git_commit",
+    ];
     if always.contains(&name) {
         return true;
     }

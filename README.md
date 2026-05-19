@@ -14,6 +14,7 @@ Dext is source-first: prompts, runtime state, tool policies, provider wiring, an
 - Project-scoped latest sessions, named session export/analyze/grep/failure/verification helpers.
 - Permission and sandbox profiles for read-only, workspace-write, and explicit danger modes.
 - Eval harness, release tests, and a PTY-backed TUI smoke test.
+- Git-native safety helpers: pre-mutation checkpoints, `/undo`/`dext undo`, mutation previews, and explicit memory-file merge-driver registration.
 
 ## Install
 
@@ -91,6 +92,8 @@ dext --fork
 dext sessions
 dext session export latest html dext-session.html
 dext session analyze latest
+dext undo --list
+dext memory check
 dext pack list
 dext pack inspect autoresearch
 dext pack run autoresearch "optimize the benchmark in this repo"
@@ -110,6 +113,9 @@ Interactive slash commands:
 /sandbox-profile read-only|workspace-write|danger-full-access
 /context standard|frugal|tiny
 /tool-profile lean|full
+/preview off|simple|git
+/undo --list
+/undo
 /compact status
 /pack list
 /pack inspect autoresearch
@@ -119,6 +125,75 @@ Interactive slash commands:
 /sessions analyze|grep|failures|verify-log|decisions
 ```
 
+
+## Git safety and memory merging
+
+Dext creates lightweight Git checkpoints before approved write-risk tool calls
+when the sandbox root is inside a Git repository, with direct file mutations
+receiving path-specific restore hints. Checkpoints live under hidden refs
+(`refs/dext/checkpoints/`) with local manifests in `.dext/checkpoints/`.
+They are best-effort safety snapshots for Dext edits; they do not replace normal
+commits, and they do not cover arbitrary external side effects.
+
+Use undo commands to inspect or restore checkpointed paths:
+
+```bash
+dext undo --list
+dext undo --preview <checkpoint-id>
+dext undo --apply <checkpoint-id>
+dext undo --prune
+```
+
+In an interactive session:
+
+```text
+/undo --list
+/undo                 # preview latest checkpoint
+/undo --apply         # restore latest checkpointed worktree paths
+/undo <id>
+/undo <id> --apply
+/undo --prune
+```
+
+Normal undo restores worktree paths and never silently moves `HEAD`. The CLI's
+explicit `--reset-head` mode is only for cases where you intentionally want a
+checkpoint to move the current branch state.
+
+Mutation previews show capped diffs for direct file-writing tools before an
+approval prompt:
+
+```bash
+dext --preview off|simple|git
+DEXT_MUTATION_PREVIEW=simple
+```
+
+Inside Dext:
+
+```text
+/preview              # status
+/preview simple
+/preview off
+```
+
+`git` preview mode is accepted for forward compatibility and currently falls
+back to simple in-memory previews.
+
+Dext can also register section-aware Git merge drivers for its memory files:
+
+```bash
+dext memory check
+dext memory register
+dext memory unregister
+# used by Git after registration:
+dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]
+```
+
+Registration is local-only by default: it writes repository-local Git config and
+local attributes. Use `dext memory register --versioned-attributes` only when you
+want `.gitattributes` entries committed for the project. `dext memory merge` is
+the Git merge-driver entry point and is not normally run by hand. The merge
+driver covers `MEMORY.md` and `recall.md` and is explicit; Dext does not
+silently edit Git config or attributes during normal agent runs.
 
 ## Packs
 
@@ -179,6 +254,7 @@ DEXT_APPROVAL=ask
 DEXT_SANDBOX_PROFILE=workspace-write
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOL_PROFILE=lean
+DEXT_MUTATION_PREVIEW=simple
 DEXT_BUDGET_CAP=$5
 ```
 
@@ -199,6 +275,9 @@ Use the TUI smoke test after changing `src/tui.rs`.
 ## Repository map
 
 - `src/main.rs` — agent loop, tool execution, CLI, slash commands, evals, orchestration.
+- `src/git_checkpoints.rs` — Git-native pre-mutation checkpoints, hidden recovery refs, undo preview/apply support.
+- `src/mutation_preview.rs` — capped in-memory diffs for direct file-tool approval prompts.
+- `src/memory_merge.rs` — explicit Git merge-driver helpers for `MEMORY.md` and `recall.md`.
 - `src/provider.rs` — provider catalog, auth, OAuth/API-key handling, request shaping.
 - `src/session.rs` — session persistence, project state paths, logs, lock cleanup, terminal restore.
 - `src/tools.rs` — tool catalog and provider-facing tool schemas.

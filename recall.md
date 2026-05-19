@@ -72,7 +72,7 @@ Keep this file compact and curated.
 - For ambiguous cleanup asks, ask once max; if unresolved, default to reversible `git stash` and verify.
 
 ## Current focus
-- Git-native recovery/memory plan: reject a broad counterfactual runtime. Build Dext-fit primitives in order: pre-mutation recovery refs + `/undo` preview; explicit local memory merge/check/register for `MEMORY.md`/`recall.md`; then mutation previews starting with simple diffs before optional `GIT_INDEX_FILE` previews. No provider-visible tools, no automatic Git config/attribute/hook edits, no silent `HEAD` moves.
+- Git-native recovery/memory primitives are implemented and documented: pre-mutation recovery refs with `/undo`/`dext undo`, explicit `dext memory check/register`, and mutation previews. Keep follow-ups Dext-fit: improve previews toward optional alternate-index mode; no provider-visible tools, automatic Git config edits, or silent `HEAD` moves.
 
 ## Open question
 - How much historical detail should remain prompt-injected versus only in

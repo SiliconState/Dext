@@ -11,6 +11,8 @@ dext --fork           resume latest into an isolated unsaved branch
 dext sessions         list project latest + named sessions
 dext session ...      export/analyze/grep/failures/verify-log/decisions
 dext auth ...         provider/model/auth management
+dext undo ...         list, preview, or restore Dext Git checkpoints
+dext memory ...       check/register memory-file merge drivers
 dext --eval [NAME]    run eval harness
 ```
 
@@ -108,6 +110,9 @@ Useful slash commands:
 /sandbox-profile read-only    prevent write operations
 /context tiny                 skinny local/token mode
 /compact status               inspect compaction threshold/history size
+/preview simple              show direct file-tool mutation previews
+/undo                        preview latest Dext Git checkpoint
+/undo --apply                restore latest checkpointed worktree paths
 /tokens                       approximate token-heavy messages
 /save name                    save a named session
 /export html session.html     export transcript
@@ -124,6 +129,9 @@ dext "inspect this repo and list missing tests"
 printf 'summarize stdin\n' | dext -p
 dext --output json "return a short answer"
 dext --output stream-json "run a small diagnostic"
+dext --preview simple "make a small documented edit"
+dext undo --list
+dext memory check
 dext pack run autoresearch "improve this benchmark"
 dext --pack autoresearch "improve this benchmark"
 ```
@@ -179,6 +187,78 @@ Inside a session:
 ```
 
 Conversational invocation also works when the message clearly asks to run/use a known pack, for example: `run autoresearch on reducing test runtime`.
+
+## Git checkpoints, undo, and mutation previews
+
+When Dext is running inside a Git repository, approved write-risk tool calls can
+create lightweight recovery checkpoints before the operation happens. Direct
+file mutations receive path-specific restore hints. Checkpoints use hidden refs
+under `refs/dext/checkpoints/` and local manifests under `.dext/checkpoints/`.
+They are intended for Dext write recovery, not as a
+replacement for commits.
+
+CLI undo commands:
+
+```bash
+dext undo --list
+dext undo --preview <checkpoint-id>
+dext undo --apply <checkpoint-id>
+dext undo --prune
+```
+
+Interactive undo commands:
+
+```text
+/undo --list
+/undo                 # preview latest checkpoint
+/undo --apply         # restore latest checkpointed worktree paths
+/undo <id>
+/undo <id> --apply
+/undo --prune
+```
+
+Normal undo restores checkpointed worktree paths and does not move `HEAD`.
+Moving `HEAD` requires the CLI's explicit reset-head mode.
+
+Mutation previews are shown before permission prompts for `write_file`,
+`edit_file`, and `multi_edit` when preview mode is enabled:
+
+```bash
+dext --preview off|simple|git
+DEXT_MUTATION_PREVIEW=simple
+```
+
+Inside a session:
+
+```text
+/preview
+/preview simple
+/preview off
+```
+
+`git` is accepted as a preview mode but currently falls back to simple previews.
+Future work may use an alternate Git index for richer tree-aware previews.
+
+## Memory merge drivers
+
+Dext's durable memory files (`MEMORY.md` and `recall.md`) can be registered with
+section-aware Git merge drivers. Registration is explicit and local-only by
+default.
+
+```bash
+dext memory check
+dext memory register
+dext memory unregister
+# used by Git after registration:
+dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]
+```
+
+`dext memory register` configures repository-local Git merge drivers and local
+attributes. Use `dext memory register --versioned-attributes` only if the project
+should commit `.gitattributes` entries for those memory files. Running
+`dext memory check` from a subdirectory still resolves the repository toplevel
+before reporting versioned attributes. `dext memory merge` is the Git
+merge-driver entry point and is not normally run by hand.
 
 ## Context and cost controls
 
@@ -271,6 +351,7 @@ DEXT_APPROVAL=ask
 DEXT_SANDBOX_PROFILE=workspace-write
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOL_PROFILE=lean
+DEXT_MUTATION_PREVIEW=simple
 DEXT_THINKING_EFFORT=off
 DEXT_BUDGET_CAP='$5'
 DEXT_EXTERNAL_TIMEOUT_SECS=60

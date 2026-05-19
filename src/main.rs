@@ -801,6 +801,41 @@ pub(crate) enum OutputMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
+pub(crate) enum MutationPreviewMode {
+    Off,
+    #[default]
+    Simple,
+    Git,
+}
+
+impl MutationPreviewMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" | "0" => Some(Self::Off),
+            "simple" | "on" | "true" | "1" => Some(Self::Simple),
+            "git" => Some(Self::Git),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Simple => "simple",
+            Self::Git => "git",
+        }
+    }
+
+    fn from_env() -> Self {
+        std::env::var("DEXT_MUTATION_PREVIEW")
+            .ok()
+            .and_then(|v| Self::parse(&v))
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum ApprovalProfile {
     #[default]
     Ask,
@@ -8220,6 +8255,7 @@ struct Agent {
     browser_recipe: BrowserRecipe,
     context_mode: ContextMode,
     tool_profile: ToolProfile,
+    preview_mode: MutationPreviewMode,
     budget_cap: Option<BudgetCap>,
     budget_exhausted: bool,
     // Caps concurrent builtin tool execution. Model may request 20 read_files at once; without
@@ -8371,6 +8407,7 @@ impl Agent {
             browser_recipe,
             context_mode,
             tool_profile,
+            preview_mode: MutationPreviewMode::from_env(),
             budget_cap,
             budget_exhausted: false,
             builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
@@ -8820,6 +8857,8 @@ impl Agent {
         self.shelf_registry = shelves::ShelfRegistry::discover(&self.sandbox_root);
         self.hooks = Hooks::load(&self.sandbox_root);
         self.git_context = git_summary(&self.sandbox_root);
+        self.checkpoint_cache = git_checkpoints::RepoRootCache::new();
+        self.checkpoint_ordinal = 0;
         self.refresh_state_paths();
         record_crash_session_id(&self.latest_session_path);
         if let Some(lock) = next_lock {
@@ -8866,6 +8905,30 @@ impl Agent {
             Some("browser recipe enabled: use bash with agent-browser (start with `agent-browser skills get core --full`) for browser automation when useful.".to_string())
         } else {
             Some("browser recipe requested, but agent-browser is not on PATH; install it or disable with /browser off.".to_string())
+        }
+    }
+
+    fn maybe_create_tool_checkpoint(&mut self, name: &str, input: &Value) {
+        if !git_checkpoints::tool_needs_checkpoint(name, input) {
+            return;
+        }
+        let Some(git_root) = self.checkpoint_cache.get(&self.sandbox_root).ok().flatten() else {
+            return;
+        };
+        let paths_hint: Vec<String> = input["path"]
+            .as_str()
+            .map(|p| vec![p.to_string()])
+            .unwrap_or_default();
+        self.checkpoint_ordinal += 1;
+        match git_checkpoints::create_checkpoint_in_repo(
+            &self.sandbox_root,
+            &git_root,
+            name,
+            &paths_hint,
+            self.checkpoint_ordinal,
+        ) {
+            Ok(cp) => self.append_latest_log("checkpoint", &format!("created {}", cp.id)),
+            Err(e) => eprintln!("[checkpoint warning: {e}]"),
         }
     }
 
@@ -11622,7 +11685,9 @@ impl Agent {
                         false
                     } else if needs_permission(&name) && !self.tool_auto_approved(&name, &input) {
                         // Show mutation preview for direct file tools before asking permission
-                        if matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit") {
+                        if self.preview_mode != MutationPreviewMode::Off
+                            && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
+                        {
                             if let Some(preview) = self.compute_mutation_preview(&name, &input) {
                                 self.sink.emit(AgentEvent::Info(preview));
                             }
@@ -11690,30 +11755,9 @@ impl Agent {
                     self.work_ledger_note_file_change(&input);
                 }
 
-                // Create recovery checkpoint before write-risk mutations
-                if matches!(plan, Plan::Builtin)
-                    && git_checkpoints::tool_needs_checkpoint(&name, &input)
-                    && self.checkpoint_cache.get(&self.sandbox_root).ok().flatten().is_some()
-                {
-                    let paths_hint: Vec<String> = input["path"]
-                        .as_str()
-                        .map(|p| vec![p.to_string()])
-                        .unwrap_or_default();
-                    self.checkpoint_ordinal += 1;
-                    match git_checkpoints::create_checkpoint(
-                        &self.sandbox_root,
-                        &name,
-                        &paths_hint,
-                        self.checkpoint_ordinal,
-                    ) {
-                        Ok(Some(cp)) => {
-                            self.append_latest_log("checkpoint", &format!("created {}", cp.id));
-                        }
-                        Ok(None) => {} // not a git repo
-                        Err(e) => {
-                            eprintln!("[checkpoint warning: {e}]");
-                        }
-                    }
+                // Create recovery checkpoint before write-risk mutations.
+                if matches!(plan, Plan::Builtin) {
+                    self.maybe_create_tool_checkpoint(&name, &input);
                 }
 
                 if matches!(plan, Plan::Builtin)
@@ -13046,6 +13090,7 @@ impl Agent {
             browser_recipe: request.browser_recipe,
             context_mode: request.context_mode,
             tool_profile: request.tool_profile,
+            preview_mode: self.preview_mode,
             budget_cap: request.budget_cap,
             budget_exhausted: false,
             builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
@@ -14594,14 +14639,20 @@ fn handle_undo_cli(args: &[String], root: &Path) -> i32 {
                     println!("{}  {}  {}", cp.id, cp.tool_name, cp.paths_hint.join(","));
                 }
             }
-            Err(e) => { eprintln!("error: {e}"); return 1; }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
         }
         return 0;
     }
     if args.iter().any(|a| a == "--prune" || a == "prune") {
         match git_checkpoints::prune(root, None, None) {
             Ok(msg) => println!("{msg}"),
-            Err(e) => { eprintln!("error: {e}"); return 1; }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
         }
         return 0;
     }
@@ -14611,14 +14662,26 @@ fn handle_undo_cli(args: &[String], root: &Path) -> i32 {
     let target = if let Some(id) = id_arg {
         match git_checkpoints::find_checkpoint(root, id) {
             Ok(Some(cp)) => cp,
-            Ok(None) => { eprintln!("checkpoint not found: {id}"); return 1; }
-            Err(e) => { eprintln!("error: {e}"); return 1; }
+            Ok(None) => {
+                eprintln!("checkpoint not found: {id}");
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
         }
     } else {
         match git_checkpoints::latest_checkpoint(root) {
             Ok(Some(cp)) => cp,
-            Ok(None) => { eprintln!("no checkpoints"); return 1; }
-            Err(e) => { eprintln!("error: {e}"); return 1; }
+            Ok(None) => {
+                eprintln!("no checkpoints");
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
         }
     };
     let mode = if reset {
@@ -14630,7 +14693,10 @@ fn handle_undo_cli(args: &[String], root: &Path) -> i32 {
     };
     match git_checkpoints::restore_worktree(root, &target, mode) {
         Ok(msg) => println!("{msg}"),
-        Err(e) => { eprintln!("error: {e}"); return 1; }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
     }
     0
 }
@@ -14641,15 +14707,46 @@ fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
         "check" => {
             match memory_merge::check(root) {
                 Ok(status) => {
-                    println!("memory merge: {}", if status.memory_registered { "registered" } else { "not registered" });
-                    println!("recall merge: {}", if status.recall_registered { "registered" } else { "not registered" });
-                    println!("local attributes: {}", if status.gitattributes_local { "yes" } else { "no" });
-                    println!("versioned attributes: {}", if status.gitattributes_versioned { "yes" } else { "no" });
+                    println!(
+                        "memory merge: {}",
+                        if status.memory_registered {
+                            "registered"
+                        } else {
+                            "not registered"
+                        }
+                    );
+                    println!(
+                        "recall merge: {}",
+                        if status.recall_registered {
+                            "registered"
+                        } else {
+                            "not registered"
+                        }
+                    );
+                    println!(
+                        "local attributes: {}",
+                        if status.gitattributes_local {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    );
+                    println!(
+                        "versioned attributes: {}",
+                        if status.gitattributes_versioned {
+                            "yes"
+                        } else {
+                            "no"
+                        }
+                    );
                     if !status.memory_registered {
                         eprintln!("run 'dext memory register' to enable section-aware merging");
                     }
                 }
-                Err(e) => { eprintln!("error: {e}"); return 1; }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return 1;
+                }
             }
             0
         }
@@ -14660,7 +14757,10 @@ fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
             } else if args.iter().any(|a| a == "--memory") {
                 vec![memory_merge::RegisterMode::Memory]
             } else {
-                vec![memory_merge::RegisterMode::Memory, memory_merge::RegisterMode::Recall]
+                vec![
+                    memory_merge::RegisterMode::Memory,
+                    memory_merge::RegisterMode::Recall,
+                ]
             };
             for mode in modes {
                 if let Err(e) = memory_merge::register(root, mode, versioned) {
@@ -14683,11 +14783,15 @@ fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
             let is_recall = args.iter().any(|a| a == "--recall");
             // Git merge driver protocol: %O %A %B %L %P
             // %O=base %A=ours %B=theirs %L=marker-size %P=path
-            let positional: Vec<&String> = args.iter()
+            let positional: Vec<&String> = args
+                .iter()
+                .skip(1)
                 .filter(|a| !a.starts_with('-'))
                 .collect();
             if positional.len() < 3 {
-                eprintln!("usage: dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]");
+                eprintln!(
+                    "usage: dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]"
+                );
                 return 2;
             }
             let base_content = std::fs::read_to_string(positional[0]).unwrap_or_default();
@@ -15018,6 +15122,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(
                 w,
                 "  /approval [profile]       ask|auto-read|auto-write|never|always"
+            );
+            let _ = writeln!(
+                w,
+                "  /preview [mode]          off|simple|git mutation previews"
             );
             let _ = writeln!(
                 w,
@@ -15352,6 +15460,20 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     w,
                     "usage: /approval [ask|auto-read|auto-write|never|always]"
                 );
+            }
+        }
+        "preview" => {
+            if arg.is_empty() || arg == "status" {
+                let _ = writeln!(w, "mutation preview: {}", agent.preview_mode.as_str());
+                let _ = writeln!(w, "modes: off, simple, git");
+            } else if let Some(mode) = MutationPreviewMode::parse(arg) {
+                agent.preview_mode = mode;
+                let _ = writeln!(w, "mutation preview -> {}", mode.as_str());
+                if mode == MutationPreviewMode::Git {
+                    let _ = writeln!(w, "git previews currently fall back to simple previews");
+                }
+            } else {
+                let _ = writeln!(w, "usage: /preview [off|simple|git]");
             }
         }
         "sandbox-profile" => {
@@ -16156,18 +16278,32 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let second = parts.next().unwrap_or("").trim();
             if first == "--list" || first == "list" {
                 match git_checkpoints::list_checkpoints(&agent.sandbox_root, 10) {
-                    Ok(cps) if cps.is_empty() => { let _ = writeln!(w, "no checkpoints"); }
+                    Ok(cps) if cps.is_empty() => {
+                        let _ = writeln!(w, "no checkpoints");
+                    }
                     Ok(cps) => {
                         for cp in &cps {
-                            let _ = writeln!(w, "{}  {}  {}", cp.id, cp.tool_name, cp.paths_hint.join(","));
+                            let _ = writeln!(
+                                w,
+                                "{}  {}  {}",
+                                cp.id,
+                                cp.tool_name,
+                                cp.paths_hint.join(",")
+                            );
                         }
                     }
-                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                    Err(e) => {
+                        let _ = writeln!(w, "error: {e}");
+                    }
                 }
             } else if first == "--prune" || first == "prune" {
                 match git_checkpoints::prune(&agent.sandbox_root, None, None) {
-                    Ok(msg) => { let _ = writeln!(w, "{msg}"); }
-                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                    Ok(msg) => {
+                        let _ = writeln!(w, "{msg}");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(w, "error: {e}");
+                    }
                 }
             } else if first == "--apply" {
                 match git_checkpoints::latest_checkpoint(&agent.sandbox_root) {
@@ -16177,12 +16313,20 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                             &cp,
                             git_checkpoints::RestoreMode::Worktree,
                         ) {
-                            Ok(msg) => { let _ = writeln!(w, "{msg}"); }
-                            Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                            Ok(msg) => {
+                                let _ = writeln!(w, "{msg}");
+                            }
+                            Err(e) => {
+                                let _ = writeln!(w, "error: {e}");
+                            }
                         }
                     }
-                    Ok(None) => { let _ = writeln!(w, "no checkpoints"); }
-                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                    Ok(None) => {
+                        let _ = writeln!(w, "no checkpoints");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(w, "error: {e}");
+                    }
                 }
             } else if !first.is_empty() && first != "--preview" {
                 // Specific checkpoint id
@@ -16194,27 +16338,41 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         } else {
                             git_checkpoints::RestoreMode::Preview
                         };
-                        match git_checkpoints::restore_worktree(
-                            &agent.sandbox_root, &cp, mode,
-                        ) {
-                            Ok(msg) => { let _ = writeln!(w, "{msg}"); }
-                            Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                        match git_checkpoints::restore_worktree(&agent.sandbox_root, &cp, mode) {
+                            Ok(msg) => {
+                                let _ = writeln!(w, "{msg}");
+                            }
+                            Err(e) => {
+                                let _ = writeln!(w, "error: {e}");
+                            }
                         }
                     }
-                    Ok(None) => { let _ = writeln!(w, "checkpoint not found: {first}"); }
-                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                    Ok(None) => {
+                        let _ = writeln!(w, "checkpoint not found: {first}");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(w, "error: {e}");
+                    }
                 }
             } else {
                 // Default: preview latest
                 match git_checkpoints::latest_checkpoint(&agent.sandbox_root) {
                     Ok(Some(cp)) => {
                         match git_checkpoints::preview_restore(&agent.sandbox_root, &cp) {
-                            Ok(msg) => { let _ = writeln!(w, "{msg}"); }
-                            Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                            Ok(msg) => {
+                                let _ = writeln!(w, "{msg}");
+                            }
+                            Err(e) => {
+                                let _ = writeln!(w, "error: {e}");
+                            }
                         }
                     }
-                    Ok(None) => { let _ = writeln!(w, "no checkpoints"); }
-                    Err(e) => { let _ = writeln!(w, "error: {e}"); }
+                    Ok(None) => {
+                        let _ = writeln!(w, "no checkpoints");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(w, "error: {e}");
+                    }
                 }
             }
         }
@@ -16906,6 +17064,7 @@ pub(crate) struct CliOptions {
     pub(crate) thinking_effort: Option<ThinkingEffort>,
     pub(crate) context_mode: Option<ContextMode>,
     pub(crate) tool_profile: Option<ToolProfile>,
+    pub(crate) preview_mode: Option<MutationPreviewMode>,
     pub(crate) pack: Option<String>,
 }
 
@@ -16926,6 +17085,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut thinking_effort: Option<ThinkingEffort> = None;
     let mut context_mode: Option<ContextMode> = None;
     let mut tool_profile: Option<ToolProfile> = None;
+    let mut preview_mode: Option<MutationPreviewMode> = None;
     let mut pack: Option<String> = None;
     let mut i = 0usize;
     while i < argv.len() {
@@ -16962,6 +17122,15 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .ok_or_else(|| anyhow::anyhow!("--tool-profile requires full|lean"))?;
                 tool_profile = Some(ToolProfile::parse(value).ok_or_else(|| {
                     anyhow::anyhow!("invalid --tool-profile '{value}' (expected full|lean)")
+                })?);
+            }
+            "--preview" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--preview requires off|simple|git"))?;
+                preview_mode = Some(MutationPreviewMode::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("invalid --preview '{value}' (expected off|simple|git)")
                 })?);
             }
             "--pack" => {
@@ -17110,6 +17279,12 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     anyhow::anyhow!("invalid tool profile '{value}' (expected full|lean)")
                 })?);
             }
+            _ if arg.starts_with("--preview=") => {
+                let value = arg.trim_start_matches("--preview=");
+                preview_mode = Some(MutationPreviewMode::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("invalid --preview '{value}' (expected off|simple|git)")
+                })?);
+            }
             _ if arg.starts_with("--budget=") => {
                 let value = arg.trim_start_matches("--budget=");
                 let cap = BudgetCap::parse(value).ok_or_else(|| {
@@ -17195,6 +17370,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         thinking_effort,
         context_mode,
         tool_profile,
+        preview_mode,
         pack,
     })
 }
@@ -17387,6 +17563,7 @@ async fn main() -> Result<()> {
             "       dext --budget CAP     stop before more model calls once CAP is reached ($ or tokens)"
         );
         println!("       dext --approval ask|auto-read|auto-write|never|always");
+        println!("       dext --preview off|simple|git  mutation preview mode");
         println!("       dext --sandbox read-only|workspace-write|danger-full-access");
         println!("       dext --browser agent-browser    add optional browser automation recipe");
         println!("       dext --effort off|low|medium|high|xhigh  set provider reasoning effort");
@@ -17409,7 +17586,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOL_PROFILE=lean|full, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }
@@ -17475,6 +17652,9 @@ async fn main() -> Result<()> {
     }
     if let Some(profile) = opts.tool_profile {
         agent.tool_profile = profile;
+    }
+    if let Some(mode) = opts.preview_mode {
+        agent.preview_mode = mode;
     }
     if agent.context_mode.is_frugal() {
         agent.tool_profile = ToolProfile::Lean;

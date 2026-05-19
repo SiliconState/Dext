@@ -13,13 +13,15 @@ compaction evidence, and curated memory. A broad counterfactual layer would
 mostly duplicate those systems while adding Git object-store clutter and user
 surprise.
 
-Build three narrow Git-native primitives instead:
+Build three narrow Git-native primitives instead; the first implementation is
+now in core with Phase 4 still deferred:
 
-1. **Pre-mutation recovery refs + `/undo` preview** — build first.
+1. **Pre-mutation recovery refs + `/undo` preview** — implemented.
 2. **Explicit local memory merge/check/register** for `MEMORY.md` and
-   `recall.md` — build second.
-3. **Mutation previews** — start with simple in-memory diffs, then add optional
-   `GIT_INDEX_FILE` previews only where Git tree semantics help.
+   `recall.md` — implemented.
+3. **Mutation previews** — simple in-memory diffs are implemented; optional
+   `GIT_INDEX_FILE` previews remain deferred for cases where Git tree semantics
+   help.
 
 ---
 
@@ -51,13 +53,13 @@ tools.
 ## Build order
 
 ```text
-Phase 1: Recovery refs + /undo preview
+Phase 1: Recovery refs + /undo preview          implemented
     ↓
-Phase 2: Memory merge/check/register
+Phase 2: Memory merge/check/register            implemented
     ↓
-Phase 3: Simple mutation previews
+Phase 3: Simple mutation previews               implemented
     ↓
-Phase 4: Optional GIT_INDEX_FILE previews
+Phase 4: Optional GIT_INDEX_FILE previews        deferred
 ```
 
 Rationale:
@@ -65,7 +67,23 @@ Rationale:
 1. Recovery refs are the highest ROI safety primitive and can protect later work.
 2. Memory merge protects Dext's long-term context layer.
 3. Simple previews deliver most approval value without Git complexity.
-4. Alternate indexes are useful only after the preview UX is proven.
+4. Alternate indexes are useful only after the preview UX is proven and remain
+   optional follow-up work.
+
+---
+
+## Implemented surface
+
+- `src/git_checkpoints.rs` creates, lists, previews, restores, and prunes
+  recovery refs under `refs/dext/checkpoints/`. It stores local manifests and
+  untracked sidecars under `.dext/checkpoints/`.
+- `/undo` and `dext undo` expose checkpoint listing, preview, apply, and prune.
+  Normal apply restores worktree paths and does not move `HEAD`.
+- `src/memory_merge.rs` powers `dext memory check/register/unregister/merge`.
+  Registration is local-only by default; versioned attributes are opt-in.
+- `src/mutation_preview.rs` powers capped previews for `write_file`,
+  `edit_file`, and `multi_edit` via `/preview`, `--preview`, and
+  `DEXT_MUTATION_PREVIEW`.
 
 ---
 
@@ -84,10 +102,6 @@ Rationale:
 
 ## Full plan
 
-See [`docs/recovery.md`](recovery.md) for:
-
-- detailed implementation plan;
-- Dext integration points;
-- performance and agent-impact analysis;
-- telemetry/metrics;
-- tests and done criteria.
+See [`docs/USAGE.md`](USAGE.md) and [`../README.md`](../README.md) for the
+current user-facing recovery, preview, and memory-merge commands. This file now
+serves as the design decision record and follow-up index.

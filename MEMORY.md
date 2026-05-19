@@ -35,6 +35,11 @@
   *Constraints:* No automatic `.git/config`, `.gitattributes`, or hook edits; no silent `HEAD` moves; hidden refs under `refs/dext/...` with pruning; graceful no-op outside Git; honest limitations for untracked files and external side effects.
   `2026-05-18` `active`
 
+- **Git-native recovery primitives implemented**
+  *Choice:* Added core recovery refs/checkpoints with `/undo` and `dext undo`, explicit `dext memory check/register` merge-driver support for `MEMORY.md`/`recall.md`, and mutation previews for file-writing tools behind `/preview`, `--preview`, and `DEXT_MUTATION_PREVIEW`.
+  *Why:* Delivers the GCMR plan as Dext-native primitives without provider-visible tool bloat or automatic Git config changes. Memory merge registration resolves the Git toplevel before touching versioned `.gitattributes`; preview `git` mode is accepted but currently falls back to simple in-memory previews until alternate-index previews are built. User-facing documentation now lives in `README.md`, `docs/USAGE.md`, `docs/ARCHITECTURE.md`, `docs/gcmr-plan.md`, `SECURITY.md`, and `CHANGELOG.md`; `docs/recovery.md` remains only a working/design file.
+  `2026-05-19` `active`
+
 - **Compaction active and end-turn thresholds**
   *Choice:* Standard mode auto-compacts at 90% of model context at end-turn and 80% after safe active tool-result checkpoints; explicit /compact percent and DEXT_MAX_HISTORY_CHARS overrides still win.
   *Why:* Earlier compaction preserves evidence before active turns exceed provider context while keeping end-turn compaction near the tail and budget-conscious.

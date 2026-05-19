@@ -43,10 +43,7 @@ pub(crate) fn preview_edit_file(
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     let count = content.matches(old).count();
     if count == 0 {
-        return Err(format!(
-            "old_string not found in {}",
-            path.display()
-        ));
+        return Err(format!("old_string not found in {}", path.display()));
     }
     if count > 1 {
         return Err(format!(
@@ -186,13 +183,6 @@ fn compute_simple_diff(before: &str, after: &str) -> String {
         }
     }
 
-    // Handle trailing lines in after
-    for i in before_lines.len()..after_lines.len() {
-        if let Some(line) = after_lines.get(i) {
-            result.push_str(&format!("+{line}\n"));
-        }
-    }
-
     result
 }
 
@@ -213,23 +203,27 @@ fn cap_string(s: &str, max: usize) -> String {
 }
 
 fn canonical_within(root: &Path, path_str: &str) -> Result<PathBuf, String> {
-    let path = root.join(path_str);
-    // Simple canonical resolution — avoid canonicalize() since file may not exist
-    let path = if path.is_absolute() {
-        path
+    let candidate = if Path::new(path_str).is_absolute() {
+        PathBuf::from(path_str)
     } else {
-        std::path::PathBuf::from(path_str).to_path_buf()
+        root.join(path_str)
     };
-    // Verify it stays within root
-    let try_canon = std::fs::canonicalize(&path)
-        .or_else(|_| {
-            // File may not exist yet; canonicalize parent
-            if let Some(parent) = path.parent() {
-                std::fs::canonicalize(parent).map(|p| p.join(path.file_name().unwrap_or_default()))
-            } else {
-                Ok(path.clone())
-            }
-        })
-        .unwrap_or(path);
-    Ok(try_canon)
+    let canonical = match std::fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(_) => {
+            let parent = candidate.parent().ok_or("path has no parent")?;
+            let name = candidate.file_name().ok_or("path has no filename")?;
+            let parent = std::fs::canonicalize(parent)
+                .map_err(|e| format!("parent dir does not exist or is not accessible: {e}"))?;
+            parent.join(name)
+        }
+    };
+    if !canonical.starts_with(root) {
+        return Err(format!(
+            "path outside sandbox ({}): {}",
+            root.display(),
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }

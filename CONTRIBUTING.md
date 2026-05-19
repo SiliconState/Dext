@@ -71,6 +71,7 @@ Do not commit:
 
 - `.env`
 - `.dext/`
+- `.dext/checkpoints/`
 - `target/`
 - `dext-session-*`
 - `DEXT.todo.json`

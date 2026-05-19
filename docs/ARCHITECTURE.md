@@ -9,7 +9,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 3. A project-scoped agent is created with sandbox, approval, context, and tool profile settings.
 4. Interactive TUI, plain REPL, one-shot, eval, or session subcommand mode is selected.
 5. Each model turn streams assistant text/thinking/tool calls through an `EventSink`.
-6. Tool calls are validated, permission-checked, executed, summarized, and appended to history.
+6. Tool calls are validated, permission-checked, optionally previewed, checkpointed when write-risk warrants it, executed, summarized, and appended to history.
 7. Session checkpoints, logs, provider health, work ledger, and verification records are persisted.
 
 ## Core modules
@@ -21,6 +21,21 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Built-in tool implementations.
   - Eval harness.
   - Prompt/context assembly, compaction, and event emission.
+
+- `src/git_checkpoints.rs`
+  - Git repository discovery for recovery snapshots.
+  - Hidden checkpoint refs under `refs/dext/checkpoints/`.
+  - Local checkpoint manifests and untracked-file sidecars under `.dext/checkpoints/`.
+  - Undo list/preview/apply/prune helpers used by `/undo` and `dext undo`.
+
+- `src/mutation_preview.rs`
+  - Capped in-memory previews for `write_file`, `edit_file`, and `multi_edit`.
+  - Sandbox-contained path resolution for previewed mutations.
+
+- `src/memory_merge.rs`
+  - Section-aware merge helpers for `MEMORY.md`.
+  - Compact merge helpers for `recall.md`.
+  - Explicit local Git merge-driver check/register/unregister support.
 
 - `src/provider.rs`
   - Provider profile/catalog loading and normalization.
@@ -109,6 +124,28 @@ Profiles:
 - Sandbox: `read-only`, `workspace-write`, `danger-full-access`.
 
 `--trust` enables trust mode and auto-approves gated tools.
+
+## Git recovery and memory safety
+
+Dext's Git-native recovery features are local runtime helpers, not
+provider-visible tools:
+
+- Before approved write-risk tool calls, Dext can create a checkpoint under
+  hidden refs (`refs/dext/checkpoints/`) plus local manifests in
+  `.dext/checkpoints/`. Direct file mutations receive path-specific restore
+  hints.
+- `/undo` and `dext undo` list, preview, and apply checkpoint restores. Normal
+  restore updates worktree paths only; moving `HEAD` requires an explicit
+  reset-head mode.
+- Mutation previews render capped in-memory diffs for `write_file`, `edit_file`,
+  and `multi_edit` before permission approval. The current `git` preview mode
+  falls back to simple previews.
+- Memory merge registration is explicit through `dext memory check/register`.
+  It is local-only by default and targets `MEMORY.md` plus `recall.md`.
+
+These helpers no-op outside Git repositories and preserve Dext's lean tool
+surface: the model still sees the regular filesystem/Git tools, not extra
+recovery tools.
 
 ## Context modes
 

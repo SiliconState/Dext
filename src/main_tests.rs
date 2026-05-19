@@ -87,6 +87,7 @@ fn test_agent(root: &Path) -> Agent {
         browser_recipe: BrowserRecipe::default(),
         context_mode: ContextMode::default(),
         tool_profile: ToolProfile::default(),
+        preview_mode: MutationPreviewMode::default(),
         budget_cap: None,
         budget_exhausted: false,
         builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
@@ -110,6 +111,97 @@ fn drain_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Ve
         events.push(event);
     }
     events
+}
+
+fn git_ok(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn git_checkpoint_non_git_is_noop() {
+    let root = temp_test_dir("checkpoint-non-git");
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "write_file", &[], 1)
+        .expect("checkpoint non-git");
+    assert!(checkpoint.is_none());
+}
+
+#[test]
+fn git_checkpoint_sidecar_restores_untracked_file() {
+    let root = temp_test_dir("checkpoint-sidecar");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    std::fs::write(root.join("note.txt"), "before\n").expect("write untracked");
+    let cp = git_checkpoints::create_checkpoint(&root, "write_file", &["note.txt".to_string()], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    std::fs::write(root.join("note.txt"), "after\n").expect("mutate untracked");
+
+    git_checkpoints::restore_worktree(&root, &cp, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore checkpoint");
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).expect("read restored"),
+        "before\n"
+    );
+}
+
+#[test]
+fn memory_merge_recall_prefers_ours_and_dedupes_theirs() {
+    let base = "# Dext recall\n- keep\n- remove\n";
+    let ours = "# Dext recall\n- keep\n- ours\n";
+    let theirs = "# Dext recall\n- keep\n- remove\n- theirs\n";
+    let merged = memory_merge::merge_recall(base, ours, theirs);
+    assert!(merged.clean);
+    assert!(merged.content.contains("- ours"));
+    assert!(merged.content.contains("- theirs"));
+    assert!(!merged.content.contains("- remove\n"));
+    assert_eq!(merged.content.matches("- keep").count(), 1);
+}
+
+#[test]
+fn mutation_preview_new_file_does_not_duplicate_added_lines() {
+    let root = temp_test_dir("mutation-preview-new");
+    let preview =
+        mutation_preview::preview_write_file(&root, "new.txt", "a\nb\n").expect("preview new file");
+    assert_eq!(preview.added, 2);
+    assert_eq!(preview.diff.matches("+a").count(), 1);
+    assert_eq!(preview.diff.matches("+b").count(), 1);
+}
+
+#[test]
+fn memory_merge_cli_skips_merge_subcommand_for_positionals() {
+    let root = temp_test_dir("memory-merge-cli");
+    let base = root.join("base.md");
+    let ours = root.join("ours.md");
+    let theirs = root.join("theirs.md");
+    std::fs::write(&base, "# Memory\n\n## A\nbase\n").expect("write base");
+    std::fs::write(&ours, "# Memory\n\n## A\nours\n").expect("write ours");
+    std::fs::write(&theirs, "# Memory\n\n## A\nbase\n").expect("write theirs");
+
+    let args = vec![
+        "merge".to_string(),
+        base.display().to_string(),
+        ours.display().to_string(),
+        theirs.display().to_string(),
+    ];
+    assert_eq!(handle_memory_cli(&args, &root), 0);
+    let merged = std::fs::read_to_string(&ours).expect("read merged");
+    assert!(merged.contains("ours"), "{merged}");
+    assert!(!merged.contains("theirs"), "{merged}");
 }
 
 struct SessionReplayFixture {

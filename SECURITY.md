@@ -24,6 +24,7 @@ Never commit real credentials. The following must remain local/private:
 
 - `.env`
 - `.dext/`
+- `.dext/checkpoints/` recovery manifests and sidecars
 - `~/.dext/auth.json`
 - `~/.dext/providers.json` if it contains private endpoints or tokens
 - `dext-session-*.jsonl`
@@ -67,4 +68,7 @@ Also scan untracked and ignored files before deciding what to preserve locally v
 - `--approval never` prevents privileged tool execution.
 - `--sandbox read-only` is recommended for review-only tasks.
 - `--trust` and `danger-full-access` are high-trust modes. Use only in controlled environments.
+- Dext Git checkpoints are best-effort local recovery aids. They may include
+  file content in hidden refs or `.dext/checkpoints/` sidecars, and they do not
+  cover arbitrary external side effects.
 - OAuth/API-key login should use Dext's official CLI/slash flows. Do not copy credentials from unrelated tools or stores.
