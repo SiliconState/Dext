@@ -106,7 +106,7 @@ Useful slash commands:
 /help                         show commands
 /status                       runtime diagnostics
 /tools                        list exposed/approval/auto-approved tools
-/toolset full                 expose specialized tools for this session
+/tools full                   expose specialized tools for this session
 /approval ask                 ask before privileged tools
 /sandbox-profile read-only    prevent write operations
 /context tiny                 skinny local/token mode
@@ -274,7 +274,7 @@ dext --budget '$2'
 dext --budget 200000t
 ```
 
-Frugal mode uses lean schemas, a smaller toolset, smaller caps, and more aggressive context reduction. Tiny mode keeps frugal's lean tools, uses a condensed prompt only for tiny, and caps history around 80% of the local model window (bounded 8k–32k chars). Standard mode and frugal mode keep the regular main-agent prompt. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/toolset full` when you need them.
+Frugal mode uses lean schemas, a smaller toolset, smaller caps, and more aggressive context reduction. Tiny mode keeps frugal's lean tools, uses a condensed prompt only for tiny, and caps history around 80% of the local model window (bounded 8k–32k chars). Standard mode and frugal mode keep the regular main-agent prompt. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
 
 ## Permission and sandbox controls
 

@@ -3509,6 +3509,28 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
 }
 
 #[test]
+fn runtime_control_command_updates_tools_mid_run() {
+    let root = temp_test_dir("runtime-control-tools");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let mut out = Vec::new();
+
+    assert!(agent.tools.iter().all(|t| t.name != "jq"));
+    let handled = apply_runtime_control_command(&mut agent, "/tools full", |msg| out.push(msg));
+    assert!(handled);
+    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
+    assert!(agent.tools.iter().any(|t| t.name == "jq"));
+    assert!(
+        out.iter().any(|msg| msg.contains("tools -> full")
+            && msg.contains("applies immediately")
+            && msg.contains("next model request")),
+        "{out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn runtime_control_command_updates_compact_threshold_by_percent() {
     let root = temp_test_dir("runtime-control-compact");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -4267,20 +4289,20 @@ fn default_tool_profile_is_lean_for_prompt_budget() {
 }
 
 #[test]
-fn slash_toolset_switches_specialized_tool_visibility() {
-    let root = temp_test_dir("slash-toolset");
+fn slash_tools_switches_specialized_tool_visibility() {
+    let root = temp_test_dir("slash-tools");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent.set_sink(Box::new(ChannelSink { tx }));
 
     assert!(agent.tools.iter().all(|t| t.name != "jq"));
-    assert_eq!(handle_slash("/toolset full", &mut agent), Some(true));
+    assert_eq!(handle_slash("/tools full", &mut agent), Some(true));
     assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
     assert!(agent.tools.iter().any(|t| t.name == "jq"));
 
     assert_eq!(handle_slash("/context frugal", &mut agent), Some(true));
-    assert_eq!(handle_slash("/toolset default", &mut agent), Some(true));
+    assert_eq!(handle_slash("/tools default", &mut agent), Some(true));
     assert_eq!(agent.tool_context_profile(), ToolContextProfile::Frugal);
     assert!(agent.tools.iter().all(|t| t.name != "jq"));
     let slash = drain_events(&mut rx)
@@ -4291,9 +4313,9 @@ fn slash_toolset_switches_specialized_tool_visibility() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(slash.contains("toolset -> full"), "{slash}");
+    assert!(slash.contains("tools -> full"), "{slash}");
     assert!(slash.contains("context mode -> frugal"), "{slash}");
-    assert!(slash.contains("pins toolset frugal"), "{slash}");
+    assert!(slash.contains("pins tools frugal"), "{slash}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -5118,7 +5140,8 @@ fn provider_runtime_and_slash_registries_are_split() {
         .collect();
     assert!(slash_names.contains("subagent"));
     assert!(slash_names.contains("browser"));
-    assert!(slash_names.contains("toolset"));
+    assert!(slash_names.contains("tools"));
+    assert!(!slash_names.contains("toolset"));
     assert!(slash_names.contains("pack"));
     assert!(slash_names.contains("shelves"));
     assert!(!slash_names.contains("read_file"));

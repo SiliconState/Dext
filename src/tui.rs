@@ -298,8 +298,8 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     },
     SlashCmd {
         name: "/tools",
-        args: "",
-        help: "list tools",
+        args: "[default|full|status]",
+        help: "list/switch tools",
     },
     SlashCmd {
         name: "/history",
@@ -489,6 +489,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
 ];
 
 static TRUST_ARGS: &[&str] = &["on", "off", "status"];
+static TOOLS_ARGS: &[&str] = &["default", "full", "status"];
 static EFFORT_ARGS: &[&str] = &["off", "low", "medium", "high", "xhigh"];
 static WORK_MAP_SESSION_ARGS: &[&str] = &["current", "latest"];
 static TRACK_ARGS: &[&str] = &["open", "list"];
@@ -684,6 +685,7 @@ fn slash_completions(input: &str) -> Vec<SlashCompletion> {
 
         let sub_args = match cmd_part {
             "trust" => Some(TRUST_ARGS),
+            "tools" => Some(TOOLS_ARGS),
             "effort" => Some(EFFORT_ARGS),
             "map" | "packet" | "focus" => Some(WORK_MAP_SESSION_ARGS),
             "track" => Some(TRACK_ARGS),

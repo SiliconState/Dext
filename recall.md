@@ -13,7 +13,7 @@ Keep this file compact and curated.
 ## Durable decisions
 - Default provider-visible toolset intentionally hides specialized tools
   (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) unless the user opts into
-  `--toolset full` or `DEXT_TOOLSET=full`; keep implementations available.
+  `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`; keep implementations available.
 - `--frugal` / `/context frugal` enable low-token operation: lean tool schemas,
   a smaller frugal toolset, reduced context/history/tool caps, deterministic
   compaction, and medium default effort.

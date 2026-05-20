@@ -43,8 +43,8 @@ pub(crate) fn slash_command_definitions() -> Vec<SlashCommand> {
             description: "Enable/status optional agent-browser automation for heavy web/HTML work.",
         },
         SlashCommand {
-            name: "toolset",
-            usage: "/toolset [default|full|status]",
+            name: "tools",
+            usage: "/tools [default|full|status]",
             description: "Show or switch the provider-visible tool count profile.",
         },
         SlashCommand {

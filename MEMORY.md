@@ -23,9 +23,9 @@
 
 ## Recent Decisions
 
-- **Provider-visible toolset reduction; capability filesystem parked**
-  *Choice:* Keep implementations for specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) but hide them from the default provider-visible toolset; expose them only through explicit full toolset opt-in. Frugal/tiny modes force a still smaller toolset. Capability-as-filesystem (`.dext/cap/` or virtual `/cap/...`) is not implemented and should not be built in core without a concrete, high-value use case; at most, prototype explicitly behind packs/shelves with reviewable files and normal file/bash flows.
-  *Why:* Toolset reduction gives immediate prompt/schema savings without adding a new abstraction. Capability FS has too many unresolved risks for core now: permission ambiguity, hidden side effects, lifecycle cleanup, sandbox boundary confusion, streaming/progress, concurrency/locking, discoverability, secrets/privacy, error semantics, versioning, and recreating a plugin protocol. Park it hard.
+- **Provider-visible toolset reduction; `/tools` owns slash switching**
+  *Choice:* Keep implementations for specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) but hide them from the default provider-visible toolset; expose them only through explicit full toolset opt-in. CLI/env opt-ins remain `--toolset full` and `DEXT_TOOLSET=full`, but interactive switching belongs to existing `/tools full|default|status`, not a separate `/toolset` command. Frugal/tiny modes force a still smaller toolset. Capability-as-filesystem (`.dext/cap/` or virtual `/cap/...`) is not implemented and should not be built in core without a concrete, high-value use case; at most, prototype explicitly behind packs/shelves with reviewable files and normal file/bash flows.
+  *Why:* Toolset reduction gives immediate prompt/schema savings without adding a new abstraction. `/tools` already owns tool visibility/status, so a second slash command duplicates the model and user interface. Capability FS has too many unresolved risks for core now: permission ambiguity, hidden side effects, lifecycle cleanup, sandbox boundary confusion, streaming/progress, concurrency/locking, discoverability, secrets/privacy, error semantics, versioning, and recreating a plugin protocol. Park it hard.
   `2026-05-20` `active`
 
 - **GLM-5.1 empty-tool-argument loop (session 1779186436)**

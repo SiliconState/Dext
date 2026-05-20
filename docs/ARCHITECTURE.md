@@ -96,7 +96,7 @@ Dext exposes a deliberately small default native tool set:
 - Tasks: `todo_read`, `todo_write`.
 - Optional browser recipe: `browser` only when enabled.
 
-The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/toolset full`. Frugal/tiny context modes force an even smaller toolset and hide `http` unless the user switches back to standard mode.
+The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`. Frugal/tiny context modes force an even smaller toolset and hide `http` unless the user switches back to standard mode.
 
 Lean schemas are the default to reduce prompt cost. Full schemas are available with `--tool-profile full` or `/tool-profile full`.
 

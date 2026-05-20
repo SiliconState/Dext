@@ -82,7 +82,7 @@ dext --context-mode tiny --effort off
 /effort off
 ```
 
-The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/toolset full` only when you need the complete catalog.
+The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/tools full` only when you need the complete catalog.
 
 ## Common commands
 
@@ -114,7 +114,7 @@ Interactive slash commands:
 /approval ask|auto-read|auto-write|never|always
 /sandbox-profile read-only|workspace-write|danger-full-access
 /context standard|frugal|tiny
-/toolset default|full
+/tools default|full
 /tool-profile lean|full
 /preview off|simple|git
 /undo --list

@@ -886,7 +886,7 @@ description: One-line workflow summary
 <tr><td><code>/help</code></td><td>Show available commands</td></tr>
 <tr><td><code>/quit</code>, <code>/exit</code></td><td>Exit Dext</td></tr>
 <tr><td><code>/reset</code></td><td>Clear conversation history</td></tr>
-<tr><td><code>/tools</code></td><td>List available tools</td></tr>
+<tr><td><code>/tools [default|full]</code></td><td>List or switch provider-visible tools</td></tr>
 <tr><td><code>/history</code></td><td>Show turn count and last 5 messages</td></tr>
 <tr><td><code>/system [text]</code></td><td>Show or replace system prompt</td></tr>
 <tr><td><code>/allow &lt;tool&gt;</code></td><td>Auto-approve a specific tool for this session</td></tr>
@@ -906,7 +906,6 @@ description: One-line workflow summary
 <tr><td><code>/compact [N%]</code></td><td>Run compaction or set threshold</td></tr>
 <tr><td><code>/context [mode]</code></td><td>Set context mode: standard, frugal, tiny</td></tr>
 <tr><td><code>/tool-profile [lean|full]</code></td><td>Set provider tool schema verbosity</td></tr>
-<tr><td><code>/toolset [default|full]</code></td><td>Set provider-visible tool count profile</td></tr>
 <tr><td><code>/usage</code></td><td>Show cumulative token usage</td></tr>
 <tr><td><code>/status</code></td><td>Show runtime diagnostics</td></tr>
 <tr><td><code>/tokens</code></td><td>Approximate tokens per message and top context hogs</td></tr>
@@ -929,7 +928,7 @@ description: One-line workflow summary
 <section class="collapsible-section">
 <h2 id="tools-reference" class="collapsible-header">Tool Reference</h2>
 <div class="collapsible-content">
-<p>19 tools remain implemented, but standard mode exposes a smaller default set. Specialized tools (<code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>git_log</code>, <code>csvkit</code>) are hidden unless <code>dext --toolset full</code>, <code>DEXT_TOOLSET=full</code>, or <code>/toolset full</code> is used. Browser stays opt-in through the browser recipe.</p>
+<p>19 tools remain implemented, but standard mode exposes a smaller default set. Specialized tools (<code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>git_log</code>, <code>csvkit</code>) are hidden unless <code>dext --toolset full</code>, <code>DEXT_TOOLSET=full</code>, or <code>/tools full</code> is used. Browser stays opt-in through the browser recipe.</p>
 <h3>File Operations</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>

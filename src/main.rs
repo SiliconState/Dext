@@ -7290,42 +7290,166 @@ impl ToolContextProfile {
     }
 }
 
-fn tool_name_allowed_in_profile(name: &str, profile: ToolContextProfile) -> bool {
-    const DEFAULT_TOOLS: &[&str] = &[
-        "read_file",
-        "read_symbol",
-        "write_file",
-        "edit_file",
-        "multi_edit",
-        "bash",
-        "fd",
-        "rg",
-        "http",
-        "browser",
-        "git_diff",
-        "git_commit",
-        "todo_read",
-        "todo_write",
-    ];
-    const FRUGAL_TOOLS: &[&str] = &[
-        "read_file",
-        "read_symbol",
-        "write_file",
-        "edit_file",
-        "multi_edit",
-        "bash",
-        "fd",
-        "rg",
-        "browser",
-        "git_diff",
-        "todo_read",
-        "todo_write",
-    ];
+const DEFAULT_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "read_symbol",
+    "write_file",
+    "edit_file",
+    "multi_edit",
+    "bash",
+    "fd",
+    "rg",
+    "http",
+    "browser",
+    "git_diff",
+    "git_commit",
+    "todo_read",
+    "todo_write",
+];
 
+const FRUGAL_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "read_symbol",
+    "write_file",
+    "edit_file",
+    "multi_edit",
+    "bash",
+    "fd",
+    "rg",
+    "browser",
+    "git_diff",
+    "todo_read",
+    "todo_write",
+];
+
+const SPECIALIZED_TOOL_NAMES: &[&str] = &["jq", "fzf", "awk", "git_log", "csvkit"];
+
+fn tool_name_allowed_in_profile(name: &str, profile: ToolContextProfile) -> bool {
     match profile {
         ToolContextProfile::Full => true,
-        ToolContextProfile::Default => DEFAULT_TOOLS.contains(&name),
-        ToolContextProfile::Frugal => FRUGAL_TOOLS.contains(&name),
+        ToolContextProfile::Default => DEFAULT_TOOL_NAMES.contains(&name),
+        ToolContextProfile::Frugal => FRUGAL_TOOL_NAMES.contains(&name),
+    }
+}
+
+struct ToolsCommandResult {
+    output: String,
+    changed: bool,
+}
+
+fn render_tools_status(agent: &Agent) -> String {
+    use std::fmt::Write as _;
+
+    let header = agent.session_header();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "tools: {} (schemas {}, browser {})",
+        agent.tool_context_profile().as_str(),
+        agent.wire_tool_profile().as_str(),
+        agent.browser_recipe().as_str()
+    );
+    let _ = writeln!(out, "usage: /tools [status|default|full]");
+    let _ = writeln!(
+        out,
+        "exposed ({}): {}",
+        header.exposed_tools.len(),
+        render_limited_csv(&header.exposed_tools, SLASH_LIST_LIMIT, "(none)", "tools")
+    );
+    let _ = writeln!(
+        out,
+        "approval-required ({}): {}",
+        header.approval_required_tools.len(),
+        render_limited_csv(
+            &header.approval_required_tools,
+            SLASH_LIST_LIMIT,
+            "(none)",
+            "tools"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "auto-approved now ({}): {}",
+        header.auto_approved_tools.len(),
+        render_limited_csv(
+            &header.auto_approved_tools,
+            SLASH_LIST_LIMIT,
+            "(none)",
+            "tools"
+        )
+    );
+
+    let hidden_specialized: Vec<String> = SPECIALIZED_TOOL_NAMES
+        .iter()
+        .filter(|name| !agent.tools.iter().any(|tool| tool.name == **name))
+        .map(|name| (*name).to_string())
+        .collect();
+    if !hidden_specialized.is_empty() {
+        if agent.context_mode.is_frugal() {
+            let _ = writeln!(
+                out,
+                "hidden by {} context: {} (switch /context standard before /tools full)",
+                agent.context_mode.as_str(),
+                hidden_specialized.join(", ")
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "hidden until /tools full: {}",
+                hidden_specialized.join(", ")
+            );
+        }
+    }
+    if agent.browser_recipe() == BrowserRecipe::Disabled {
+        let _ = writeln!(out, "browser: off (separate /browser agent-browser opt-in)");
+    }
+    out.trim_end().to_string()
+}
+
+fn handle_tools_command(agent: &mut Agent, arg: &str) -> ToolsCommandResult {
+    let raw = arg.trim();
+    let normalized = raw.to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "status" | "list" | "ls" => ToolsCommandResult {
+            output: render_tools_status(agent),
+            changed: false,
+        },
+        "default" | "standard" | "core" | "full" | "all" => {
+            if agent.context_mode.is_frugal() {
+                return ToolsCommandResult {
+                    output: format!(
+                        "context mode {} pins tools {}; switch /context standard before changing /tools",
+                        agent.context_mode.as_str(),
+                        agent.tool_context_profile().as_str()
+                    ),
+                    changed: false,
+                };
+            }
+            let profile =
+                ToolContextProfile::parse_selectable(raw).unwrap_or(ToolContextProfile::Default);
+            let before = agent.tool_context_profile();
+            agent.tool_context_profile = profile.effective(agent.context_mode);
+            agent.refresh_tools_for_context();
+            let browser_note = if agent.browser_recipe() == BrowserRecipe::Disabled {
+                "; browser off"
+            } else {
+                ""
+            };
+            ToolsCommandResult {
+                output: format!(
+                    "tools -> {} ({} exposed; schemas {}{})",
+                    agent.tool_context_profile().as_str(),
+                    agent.tools.len(),
+                    agent.wire_tool_profile().as_str(),
+                    browser_note
+                ),
+                changed: before != agent.tool_context_profile(),
+            }
+        }
+        _ => ToolsCommandResult {
+            output: "usage: /tools [status|default|full]".to_string(),
+            changed: false,
+        },
     }
 }
 
@@ -7691,6 +7815,22 @@ fn apply_runtime_control_command(
             Ok(msg) => emit(msg),
             Err(e) => emit(format!("[err] {e:#}")),
         }
+        return true;
+    }
+
+    if cmd == "tools" {
+        let result = handle_tools_command(agent, arg);
+        emit(format!(
+            "{}{}",
+            result.output,
+            if result.changed {
+                " (applies immediately to the next model request)"
+            } else if arg.trim().is_empty() || arg.trim().eq_ignore_ascii_case("status") {
+                ""
+            } else {
+                " (no tool visibility change)"
+            }
+        ));
         return true;
     }
 
@@ -15161,7 +15301,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "  /help                     show this");
             let _ = writeln!(w, "  /quit, /exit              exit dext");
             let _ = writeln!(w, "  /reset                    clear conversation history");
-            let _ = writeln!(w, "  /tools                    list available tools");
+            let _ = writeln!(
+                w,
+                "  /tools [default|full]     list or switch provider-visible tools"
+            );
             let _ = writeln!(
                 w,
                 "  /history                  show turn count and last 5 messages"
@@ -15252,10 +15395,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(
                 w,
                 "  /tool-profile [lean|full] provider tool schema verbosity (default lean)"
-            );
-            let _ = writeln!(
-                w,
-                "  /toolset [default|full]   provider-visible tool count profile"
             );
             let _ = writeln!(
                 w,
@@ -15355,35 +15494,8 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "cleared {n} messages");
         }
         "tools" => {
-            let header = agent.session_header();
-            let _ = writeln!(
-                w,
-                "exposed ({}): {}",
-                header.exposed_tools.len(),
-                render_limited_csv(&header.exposed_tools, SLASH_LIST_LIMIT, "(none)", "tools")
-            );
-            let _ = writeln!(
-                w,
-                "approval-required ({}): {}",
-                header.approval_required_tools.len(),
-                render_limited_csv(
-                    &header.approval_required_tools,
-                    SLASH_LIST_LIMIT,
-                    "(none)",
-                    "tools"
-                )
-            );
-            let _ = writeln!(
-                w,
-                "auto-approved now ({}): {}",
-                header.auto_approved_tools.len(),
-                render_limited_csv(
-                    &header.auto_approved_tools,
-                    SLASH_LIST_LIMIT,
-                    "(none)",
-                    "tools"
-                )
-            );
+            let result = handle_tools_command(agent, arg);
+            let _ = writeln!(w, "{}", result.output);
         }
         "history" => {
             let _ = writeln!(w, "history: {} messages", agent.history.len());
@@ -15850,24 +15962,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 );
             } else {
                 let _ = writeln!(w, "usage: /tool-profile [lean|full|status]");
-            }
-        }
-        "toolset" | "tool-context" => {
-            if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
-                let _ = writeln!(w, "toolset: {}", agent.tool_context_profile().as_str());
-            } else if agent.context_mode.is_frugal() {
-                let _ = writeln!(
-                    w,
-                    "context mode {} pins toolset {}; switch /context standard before changing toolset",
-                    agent.context_mode.as_str(),
-                    agent.tool_context_profile().as_str()
-                );
-            } else if let Some(profile) = ToolContextProfile::parse_selectable(arg) {
-                agent.tool_context_profile = profile.effective(agent.context_mode);
-                agent.refresh_tools_for_context();
-                let _ = writeln!(w, "toolset -> {}", agent.tool_context_profile().as_str());
-            } else {
-                let _ = writeln!(w, "usage: /toolset [default|full|status]");
             }
         }
         "compact" => match arg.to_ascii_lowercase().as_str() {
