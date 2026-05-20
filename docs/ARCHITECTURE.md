@@ -86,17 +86,21 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 ## Tool model
 
-Dext exposes a deliberately small native tool set:
+Dext exposes a deliberately small default native tool set:
 
 - Filesystem: `read_file`, `read_symbol`, `write_file`, `edit_file`, `multi_edit`.
-- Search: `fd`, `rg`, `fzf`.
-- Shell/data: `bash`, `jq`, `awk`, `csvkit`.
+- Search: `fd`, `rg`.
+- Shell/process: `bash`.
 - Network: `http`.
-- Git: `git_diff`, `git_log`, `git_commit`.
+- Git: `git_diff`, `git_commit`.
 - Tasks: `todo_read`, `todo_write`.
 - Optional browser recipe: `browser` only when enabled.
 
+The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/toolset full`. Frugal/tiny context modes force an even smaller toolset and hide `http` unless the user switches back to standard mode.
+
 Lean schemas are the default to reduce prompt cost. Full schemas are available with `--tool-profile full` or `/tool-profile full`.
+
+Capability-as-filesystem is deliberately parked. Dext does not implement `.dext/cap/` or virtual `/cap/...` today, and it should not become core without a concrete high-value use case and a safe pack/shelf prototype first. The unresolved risks are broad: permission mapping, hidden side effects, lifecycle cleanup, sandbox boundaries, streaming/progress, concurrency, discoverability, secrets/privacy, error semantics, versioning, and plugin-protocol creep.
 
 ## Sessions and state
 

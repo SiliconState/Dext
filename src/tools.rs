@@ -43,6 +43,11 @@ pub(crate) fn slash_command_definitions() -> Vec<SlashCommand> {
             description: "Enable/status optional agent-browser automation for heavy web/HTML work.",
         },
         SlashCommand {
+            name: "toolset",
+            usage: "/toolset [default|full|status]",
+            description: "Show or switch the provider-visible tool count profile.",
+        },
+        SlashCommand {
             name: "pack",
             usage: "/pack [list|inspect <name>|run <name> <task>]",
             description: "Discover and invoke source-first Dext packs without provider-visible tools.",

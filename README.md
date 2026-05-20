@@ -10,7 +10,7 @@ Dext is source-first: prompts, runtime state, tool policies, provider wiring, an
 - One-shot mode for scripted tasks and JSON/stream-JSON output for automation.
 - Provider catalog with built-in GLM and ChatGPT/Codex profiles plus env/catalog overrides.
 - OAuth/API-key auth flows stored outside the repo under Dext state directories.
-- Lean default tool schemas with optional full schemas and frugal context mode.
+- Lean default tool schemas and smaller default toolset, with optional full schemas/full toolset and frugal context mode.
 - Project-scoped latest sessions, named session export/analyze/grep/failure/verification helpers.
 - Permission and sandbox profiles for read-only, workspace-write, and explicit danger modes.
 - Eval harness, release tests, and a PTY-backed TUI smoke test.
@@ -82,6 +82,8 @@ dext --context-mode tiny --effort off
 /effort off
 ```
 
+The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/toolset full` only when you need the complete catalog.
+
 ## Common commands
 
 CLI:
@@ -112,6 +114,7 @@ Interactive slash commands:
 /approval ask|auto-read|auto-write|never|always
 /sandbox-profile read-only|workspace-write|danger-full-access
 /context standard|frugal|tiny
+/toolset default|full
 /tool-profile lean|full
 /preview off|simple|git
 /undo --list
@@ -253,6 +256,7 @@ DEXT_LOGS_DIR=~/.dext/logs
 DEXT_APPROVAL=ask
 DEXT_SANDBOX_PROFILE=workspace-write
 DEXT_CONTEXT_MODE=standard
+DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean
 DEXT_MUTATION_PREVIEW=simple
 DEXT_BUDGET_CAP=$5

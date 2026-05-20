@@ -58,6 +58,7 @@ fn test_agent(root: &Path) -> Agent {
         tools: provider_tool_definitions()
             .into_iter()
             .filter(|t| t.name != "browser")
+            .filter(|t| tool_name_allowed_in_profile(t.name, ToolContextProfile::Default))
             .collect(),
         allowed: HashSet::new(),
         deny_tools: HashSet::new(),
@@ -86,6 +87,7 @@ fn test_agent(root: &Path) -> Agent {
         sandbox_profile: SandboxProfile::default(),
         browser_recipe: BrowserRecipe::default(),
         context_mode: ContextMode::default(),
+        tool_context_profile: ToolContextProfile::default(),
         tool_profile: ToolProfile::default(),
         preview_mode: MutationPreviewMode::default(),
         budget_cap: None,
@@ -976,6 +978,10 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         let mut saved = test_agent(&sandbox);
         saved.model = "saved-model".to_string();
         saved.thinking_effort = ThinkingEffort::XHigh;
+        saved.context_mode = ContextMode::Standard;
+        saved.tool_context_profile = ToolContextProfile::Full;
+        saved.tool_profile = ToolProfile::Full;
+        saved.refresh_tools_for_context();
         saved.system = "saved-system".to_string();
         saved.allowed.insert("read_file".to_string());
         saved.allowed.insert("write_file".to_string());
@@ -1067,6 +1073,10 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
             saved_header_line.contains("\"provenance\""),
             "{saved_header_line}"
         );
+        assert!(
+            saved_header_line.contains("\"tool_context_profile\":\"full\""),
+            "{saved_header_line}"
+        );
 
         let saved_header: SessionHeader = serde_json::from_str(&saved_header_line)?;
         assert_eq!(saved_header.system, "saved-system");
@@ -1101,6 +1111,10 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
                 .auto_approved_tools
                 .contains(&"write_file".to_string())
         );
+        assert_eq!(saved_header.context_mode, ContextMode::Standard);
+        assert_eq!(saved_header.tool_context_profile, ToolContextProfile::Full);
+        assert_eq!(saved_header.tool_profile, ToolProfile::Full);
+        assert!(saved_header.exposed_tools.contains(&"jq".to_string()));
         assert_eq!(saved_header.work_ledger.current_phase, "done");
         assert!(saved_header.work_ledger.next_actions.is_empty());
         assert_eq!(
@@ -1115,6 +1129,10 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
 
         assert_eq!(loaded.model, "saved-model");
         assert_eq!(loaded.thinking_effort, ThinkingEffort::XHigh);
+        assert_eq!(loaded.context_mode, ContextMode::Standard);
+        assert_eq!(loaded.tool_context_profile(), ToolContextProfile::Full);
+        assert_eq!(loaded.tool_profile, ToolProfile::Full);
+        assert!(loaded.tools.iter().any(|t| t.name == "jq"));
         assert_eq!(loaded.system, "saved-system");
         assert_eq!(loaded.sandbox_root, sandbox);
         assert_eq!(loaded.session_usage.input, 11);
@@ -1874,6 +1892,86 @@ fn approval_and_sandbox_profiles_enforce_policy() {
 }
 
 #[test]
+fn default_toolset_hides_specialized_tools_and_frugal_is_smaller() {
+    let root = temp_test_dir("toolset-default-frugal");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.refresh_tools_for_context();
+    let default_names: HashSet<&str> = agent.tools.iter().map(|t| t.name).collect();
+
+    for name in [
+        "read_file",
+        "read_symbol",
+        "write_file",
+        "edit_file",
+        "multi_edit",
+        "bash",
+        "fd",
+        "rg",
+        "http",
+        "git_diff",
+        "git_commit",
+        "todo_read",
+        "todo_write",
+    ] {
+        assert!(default_names.contains(name), "default should expose {name}");
+    }
+    for name in ["jq", "fzf", "awk", "git_log", "csvkit", "browser"] {
+        assert!(!default_names.contains(name), "default should hide {name}");
+    }
+
+    agent.tool_context_profile = ToolContextProfile::Full;
+    agent.context_mode = ContextMode::Frugal;
+    agent.refresh_tools_for_context();
+    let frugal_names: HashSet<&str> = agent.tools.iter().map(|t| t.name).collect();
+    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Frugal);
+    assert!(frugal_names.len() < default_names.len());
+    assert!(!frugal_names.contains("http"));
+    assert!(frugal_names.contains("bash"));
+    assert!(frugal_names.contains("git_diff"));
+
+    agent.allowed.insert("jq".to_string());
+    agent.allowed.insert("bash".to_string());
+    agent.deny_tools.insert("csvkit".to_string());
+    agent.deny_tools.insert("rg".to_string());
+    agent.refresh_tools_for_context();
+    assert!(!agent.allowed.contains("jq"));
+    assert!(agent.allowed.contains("bash"));
+    assert!(!agent.deny_tools.contains("csvkit"));
+    assert!(agent.deny_tools.contains("rg"));
+
+    agent.context_mode = ContextMode::Standard;
+    agent.tool_context_profile = ToolContextProfile::Default;
+    agent.set_browser_recipe(BrowserRecipe::AgentBrowser);
+    assert!(agent.tools.iter().any(|t| t.name == "browser"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn full_toolset_env_exposes_specialized_tools_without_browser_by_default() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("toolset-full-env");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    unsafe { std::env::set_var("DEXT_TOOLSET", "full") };
+    let result = (|| -> Result<()> {
+        let mut agent = test_agent(&root);
+        agent.tool_context_profile = ToolContextProfile::from_env();
+        agent.refresh_tools_for_context();
+        let names: HashSet<&str> = agent.tools.iter().map(|t| t.name).collect();
+        for name in ["jq", "fzf", "awk", "git_log", "csvkit"] {
+            assert!(names.contains(name), "full toolset should expose {name}");
+        }
+        assert!(!names.contains("browser"));
+        assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
+        Ok(())
+    })();
+    unsafe { std::env::remove_var("DEXT_TOOLSET") };
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn browser_recipe_toggles_browser_tool() {
     let root = temp_test_dir("browser-recipe");
     let mut agent = test_agent(&root);
@@ -1883,9 +1981,12 @@ fn browser_recipe_toggles_browser_tool() {
     assert!(agent.tools.iter().any(|t| t.name == "browser"));
     assert_eq!(agent.browser_recipe(), BrowserRecipe::AgentBrowser);
 
+    agent.set_approval_profile(ApprovalProfile::Always);
+    assert!(agent.allowed.contains("browser"));
     agent.set_browser_recipe(BrowserRecipe::Disabled);
     assert!(agent.tools.iter().all(|t| t.name != "browser"));
     assert_eq!(agent.browser_recipe(), BrowserRecipe::Disabled);
+    assert!(!agent.allowed.contains("browser"));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3798,6 +3899,7 @@ fn subagent_request_inherits_parent_capability_profile() {
     agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
     agent.set_browser_recipe(BrowserRecipe::AgentBrowser);
     agent.set_thinking_effort(ThinkingEffort::High);
+    agent.tool_context_profile = ToolContextProfile::Full;
     agent.context_mode = ContextMode::Frugal;
     agent.tool_profile = ToolProfile::Lean;
     agent.set_budget_cap(BudgetCap::parse("25k tokens"));
@@ -3814,7 +3916,12 @@ fn subagent_request_inherits_parent_capability_profile() {
     assert_eq!(request.browser_recipe, BrowserRecipe::AgentBrowser);
     assert_eq!(request.thinking_effort, ThinkingEffort::High);
     assert_eq!(request.context_mode, ContextMode::Frugal);
+    assert_eq!(request.tool_context_profile, ToolContextProfile::Frugal);
     assert_eq!(request.tool_profile, ToolProfile::Lean);
+    assert!(!tool_name_allowed_in_profile(
+        "http",
+        ToolContextProfile::Frugal
+    ));
     assert_eq!(request.max_iterations, Some(7));
     assert_eq!(
         request.allowed_tools,
@@ -3822,6 +3929,11 @@ fn subagent_request_inherits_parent_capability_profile() {
     );
     assert!(!request.privacy_enabled);
     assert_eq!(request.to_tool_input()["task"], "survey repo");
+    assert_eq!(
+        request.to_tool_input()["tool_context_profile"],
+        json!("frugal")
+    );
+    assert_eq!(request.to_tool_input()["tool_profile"], json!("lean"));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -4155,6 +4267,38 @@ fn default_tool_profile_is_lean_for_prompt_budget() {
 }
 
 #[test]
+fn slash_toolset_switches_specialized_tool_visibility() {
+    let root = temp_test_dir("slash-toolset");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert!(agent.tools.iter().all(|t| t.name != "jq"));
+    assert_eq!(handle_slash("/toolset full", &mut agent), Some(true));
+    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
+    assert!(agent.tools.iter().any(|t| t.name == "jq"));
+
+    assert_eq!(handle_slash("/context frugal", &mut agent), Some(true));
+    assert_eq!(handle_slash("/toolset default", &mut agent), Some(true));
+    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Frugal);
+    assert!(agent.tools.iter().all(|t| t.name != "jq"));
+    let slash = drain_events(&mut rx)
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(slash.contains("toolset -> full"), "{slash}");
+    assert!(slash.contains("context mode -> frugal"), "{slash}");
+    assert!(slash.contains("pins toolset frugal"), "{slash}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn slash_system_displays_composed_prompt_with_project_context() {
     let root = temp_test_dir("slash-system-composed");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -4206,6 +4350,27 @@ fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
     assert!(ContextMode::Tiny.is_frugal());
     assert!(ContextMode::Tiny.is_tiny());
     assert!(!ContextMode::Frugal.is_tiny());
+    assert_eq!(
+        ToolContextProfile::parse("full"),
+        Some(ToolContextProfile::Full)
+    );
+    assert_eq!(
+        ToolContextProfile::parse("standard"),
+        Some(ToolContextProfile::Default)
+    );
+    assert_eq!(
+        ToolContextProfile::parse("frugal"),
+        Some(ToolContextProfile::Frugal)
+    );
+    assert_eq!(ToolContextProfile::parse_selectable("frugal"), None);
+    assert_eq!(
+        ToolContextProfile::Full.effective(ContextMode::Frugal),
+        ToolContextProfile::Frugal
+    );
+    assert_eq!(
+        ToolContextProfile::Frugal.effective(ContextMode::Standard),
+        ToolContextProfile::Default
+    );
 }
 
 #[test]
@@ -4620,6 +4785,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--browser=agent-browser".to_string(),
         "--frugal".to_string(),
         "--context-mode=tiny".to_string(),
+        "--tool-context-profile=full".to_string(),
         "--tool-profile=lean".to_string(),
         format!("@{}", task_file.display()),
         "tail".to_string(),
@@ -4634,6 +4800,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
     assert_eq!(opts.sandbox_profile, Some(SandboxProfile::ReadOnly));
     assert_eq!(opts.browser_recipe, Some(BrowserRecipe::AgentBrowser));
     assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
+    assert_eq!(opts.tool_context_profile, Some(ToolContextProfile::Full));
     assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
     assert_eq!(
         opts.positional,
@@ -4754,14 +4921,14 @@ fn turn_diagnostics_serializes_runtime_observability() {
         workaround_fired: true,
         turn_duration_ms: Some(123),
         context_mode: Some(ContextMode::Frugal),
-        tool_profile: Some("lean".to_string()),
+        tool_profile: Some("frugal:lean".to_string()),
         compacted: Some(true),
     };
     let value = serde_json::to_value(ev).expect("serialize event");
     assert_eq!(value["event"], "turn_diagnostics");
     assert_eq!(value["data"]["turn_duration_ms"], 123);
     assert_eq!(value["data"]["context_mode"], "Frugal");
-    assert_eq!(value["data"]["tool_profile"], "lean");
+    assert_eq!(value["data"]["tool_profile"], "frugal:lean");
     assert_eq!(value["data"]["compacted"], true);
 }
 
@@ -4920,6 +5087,18 @@ fn provider_runtime_and_slash_registries_are_split() {
         .collect();
     assert!(!provider_names.contains("subagent"));
     assert!(provider_names.contains("read_file"));
+    assert!(provider_names.contains("jq"));
+    assert!(provider_names.contains("csvkit"));
+
+    let default_names: HashSet<&str> = provider_tool_definitions()
+        .iter()
+        .filter(|tool| tool_name_allowed_in_profile(tool.name, ToolContextProfile::Default))
+        .map(|tool| tool.name)
+        .collect();
+    assert!(default_names.contains("read_file"));
+    assert!(!default_names.contains("jq"));
+    assert!(!default_names.contains("csvkit"));
+    assert!(!default_names.contains("git_log"));
 
     let runtime_names: HashSet<&str> = runtime_tool_definitions()
         .iter()
@@ -4939,6 +5118,7 @@ fn provider_runtime_and_slash_registries_are_split() {
         .collect();
     assert!(slash_names.contains("subagent"));
     assert!(slash_names.contains("browser"));
+    assert!(slash_names.contains("toolset"));
     assert!(slash_names.contains("pack"));
     assert!(slash_names.contains("shelves"));
     assert!(!slash_names.contains("read_file"));

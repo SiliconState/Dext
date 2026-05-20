@@ -23,6 +23,11 @@
 
 ## Recent Decisions
 
+- **Provider-visible toolset reduction; capability filesystem parked**
+  *Choice:* Keep implementations for specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) but hide them from the default provider-visible toolset; expose them only through explicit full toolset opt-in. Frugal/tiny modes force a still smaller toolset. Capability-as-filesystem (`.dext/cap/` or virtual `/cap/...`) is not implemented and should not be built in core without a concrete, high-value use case; at most, prototype explicitly behind packs/shelves with reviewable files and normal file/bash flows.
+  *Why:* Toolset reduction gives immediate prompt/schema savings without adding a new abstraction. Capability FS has too many unresolved risks for core now: permission ambiguity, hidden side effects, lifecycle cleanup, sandbox boundary confusion, streaming/progress, concurrency/locking, discoverability, secrets/privacy, error semantics, versioning, and recreating a plugin protocol. Park it hard.
+  `2026-05-20` `active`
+
 - **GLM-5.1 empty-tool-argument loop (session 1779186436)**
   *Choice:* Investigated a 299-iteration session where 76% of tool calls failed. Root cause: GLM-5.1 silently drops function_call arguments when the intended JSON payload is large (multi-KB content strings), emitting `tool_use` blocks with `input: {}`. The model entered a 186-iteration degenerate loop of empty `bash` calls, self-diagnosed the issue in its text output but could not break out. User had to explicitly say "try chunking" for recovery.
   *Why:* Three compounding failures: (1) no heuristic break for repeated identical empty-tool failures, (2) no runtime hint to suggest chunking or alternative strategies, (3) error-message deduplication missing — 186 identical "missing command" errors pollute context without signal.

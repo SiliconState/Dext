@@ -468,7 +468,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>Full</code></td><td>Complete tool descriptions and full JSON schemas</td><td>Full</td></tr>
 <tr><td><code>Lean</code> (default)</td><td>Compact one-liner descriptions, schemas without field descriptions</td><td>Stripped</td></tr>
 </table>
-<p>Controlled via <code>DEXT_TOOL_PROFILE</code>. Lean mode saves significant prompt tokens per turn.</p>
+<p>Controlled via <code>DEXT_TOOL_PROFILE</code>. Lean mode saves significant prompt tokens per turn. A separate toolset profile is selected by <code>--toolset</code> or <code>DEXT_TOOLSET</code>: <code>default</code> hides specialized tools, <code>full</code> exposes the complete catalog, and frugal/tiny context modes force the smaller frugal set.</p>
 <h3>Tool Classification</h3>
 <table>
 <tr><th>Category</th><th>Tools</th></tr>
@@ -843,8 +843,9 @@ description: One-line workflow summary
 <tr><td><code>dext session ...</code></td><td>Inspect/export/analyze project-scoped latest or named sessions</td></tr>
 <tr><td><code>dext --cd &lt;dir&gt;</code></td><td>Change working directory</td></tr>
 <tr><td><code>dext --no-session</code></td><td>Don't save session</td></tr>
-<tr><td><code>dext --frugal</code></td><td>Low-token mode (lean schemas, reduced context, medium default effort)</td></tr>
+<tr><td><code>dext --frugal</code></td><td>Low-token mode (lean schemas, smaller toolset, reduced context, medium default effort)</td></tr>
 <tr><td><code>dext --context-mode standard|frugal|tiny</code></td><td>Choose context/cap mode</td></tr>
+<tr><td><code>dext --toolset default|full</code></td><td>Choose provider-visible tool count profile</td></tr>
 <tr><td><code>dext --tool-profile lean|full</code></td><td>Choose provider tool schema verbosity</td></tr>
 <tr><td><code>dext --preview off|simple|git</code></td><td>Choose mutation preview mode</td></tr>
 <tr><td><code>dext --sandbox read-only|workspace-write|danger-full-access</code></td><td>Set sandbox profile</td></tr>
@@ -905,6 +906,7 @@ description: One-line workflow summary
 <tr><td><code>/compact [N%]</code></td><td>Run compaction or set threshold</td></tr>
 <tr><td><code>/context [mode]</code></td><td>Set context mode: standard, frugal, tiny</td></tr>
 <tr><td><code>/tool-profile [lean|full]</code></td><td>Set provider tool schema verbosity</td></tr>
+<tr><td><code>/toolset [default|full]</code></td><td>Set provider-visible tool count profile</td></tr>
 <tr><td><code>/usage</code></td><td>Show cumulative token usage</td></tr>
 <tr><td><code>/status</code></td><td>Show runtime diagnostics</td></tr>
 <tr><td><code>/tokens</code></td><td>Approximate tokens per message and top context hogs</td></tr>
@@ -927,7 +929,7 @@ description: One-line workflow summary
 <section class="collapsible-section">
 <h2 id="tools-reference" class="collapsible-header">Tool Reference</h2>
 <div class="collapsible-content">
-<p>19 provider-visible tools are available. Each has a full and lean description variant; runtime-only slash commands are documented separately.</p>
+<p>19 tools remain implemented, but standard mode exposes a smaller default set. Specialized tools (<code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>git_log</code>, <code>csvkit</code>) are hidden unless <code>dext --toolset full</code>, <code>DEXT_TOOLSET=full</code>, or <code>/toolset full</code> is used. Browser stays opt-in through the browser recipe.</p>
 <h3>File Operations</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
@@ -942,31 +944,31 @@ description: One-line workflow summary
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
 <tr><td><code>fd</code></td><td>Read</td><td>Find files by regex pattern (fd).</td></tr>
 <tr><td><code>rg</code></td><td>Read</td><td>Search file contents with ripgrep.</td></tr>
-<tr><td><code>fzf</code></td><td>Read</td><td>Non-interactive fuzzy filter.</td></tr>
+<tr><td><code>fzf</code></td><td>Read, full toolset</td><td>Non-interactive fuzzy filter.</td></tr>
 </table>
 <h3>Shell &amp; Process</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
 <tr><td><code>bash</code></td><td>Varies</td><td>Execute shell command with pipefail. Risk classified.</td></tr>
-<tr><td><code>awk</code></td><td>Varies</td><td>AWK text processor. Optional stdin.</td></tr>
+<tr><td><code>awk</code></td><td>Varies, full toolset</td><td>AWK text processor. Optional stdin.</td></tr>
 </table>
 <h3>Data Processing</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
-<tr><td><code>jq</code></td><td>Read</td><td>Query/transform JSON.</td></tr>
-<tr><td><code>csvkit</code></td><td>Varies</td><td>CSV processing suite: csvcut, csvstat, csvgrep, csvjson, etc.</td></tr>
+<tr><td><code>jq</code></td><td>Read, full toolset</td><td>Query/transform JSON.</td></tr>
+<tr><td><code>csvkit</code></td><td>Varies, full toolset</td><td>CSV processing suite: csvcut, csvstat, csvgrep, csvjson, etc.</td></tr>
 </table>
 <h3>HTTP &amp; Browser</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
 <tr><td><code>http</code></td><td>Varies</td><td>HTTPie-style HTTP client.</td></tr>
-<tr><td><code>browser</code></td><td>Write</td><td>Optional agent-browser automation.</td></tr>
+<tr><td><code>browser</code></td><td>Write, opt-in</td><td>Optional agent-browser automation.</td></tr>
 </table>
 <h3>Git Operations</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
 <tr><td><code>git_diff</code></td><td>Read</td><td>Show git diff. Prefer stat=true first.</td></tr>
-<tr><td><code>git_log</code></td><td>Read</td><td>Show recent git log entries.</td></tr>
+<tr><td><code>git_log</code></td><td>Read, full toolset</td><td>Show recent git log entries.</td></tr>
 <tr><td><code>git_commit</code></td><td>Write</td><td>Stage files and create commit.</td></tr>
 </table>
 <h3>Task Management</h3>
@@ -997,6 +999,7 @@ description: One-line workflow summary
 <tr><td><code>ANTHROPIC_BASE_URL</code></td><td>Profile default</td><td>Override Anthropic-family base URL</td></tr>
 <tr><td><code>OPENAI_BASE_URL</code></td><td>Profile default</td><td>Override OpenAI-family base URL</td></tr>
 <tr><td><code>DEXT_CONTEXT_MODE</code></td><td>standard</td><td>Context mode: standard, frugal, tiny</td></tr>
+<tr><td><code>DEXT_TOOLSET</code></td><td>default</td><td>Provider-visible tool count profile: default, full</td></tr>
 <tr><td><code>DEXT_TOOL_PROFILE</code></td><td>lean</td><td>Tool schema profile: full, lean</td></tr>
 <tr><td><code>DEXT_MUTATION_PREVIEW</code></td><td>simple</td><td>Mutation preview mode: off, simple, git</td></tr>
 <tr><td><code>DEXT_APPROVAL</code></td><td>ask</td><td>Approval profile: ask, auto-read, auto-write, never, always</td></tr>

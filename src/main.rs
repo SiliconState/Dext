@@ -88,7 +88,7 @@ const SUDO_AUTH_GUIDANCE: &str = "sudo auth is local only. If this command needs
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
 pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "DEXT_ALLOW_BREAK_SYSTEM_PACKAGES";
 const AUTH_CIRCUIT_BREAKER_THRESHOLD: usize = 2;
-const TOOL_CATALOG_VERSION: u32 = 3;
+const TOOL_CATALOG_VERSION: u32 = 4;
 const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     ".git",
     ".hg",
@@ -1463,6 +1463,7 @@ struct SubagentRequest {
     browser_recipe: BrowserRecipe,
     thinking_effort: ThinkingEffort,
     context_mode: ContextMode,
+    tool_context_profile: ToolContextProfile,
     tool_profile: ToolProfile,
     budget_cap: Option<BudgetCap>,
     privacy_enabled: bool,
@@ -1480,6 +1481,7 @@ impl Default for SubagentRequest {
             browser_recipe: BrowserRecipe::default(),
             thinking_effort: ThinkingEffort::default(),
             context_mode: ContextMode::default(),
+            tool_context_profile: ToolContextProfile::default(),
             tool_profile: ToolProfile::default(),
             budget_cap: None,
             privacy_enabled: true,
@@ -1506,6 +1508,7 @@ impl SubagentRequest {
             browser_recipe: agent.browser_recipe,
             thinking_effort: agent.thinking_effort,
             context_mode: agent.context_mode,
+            tool_context_profile: agent.tool_context_profile(),
             tool_profile: agent.tool_profile,
             budget_cap: agent.budget_cap,
             privacy_enabled: agent.privacy.enabled,
@@ -1515,6 +1518,8 @@ impl SubagentRequest {
     fn to_tool_input(&self) -> Value {
         let mut input = json!({
             "task": self.task,
+            "tool_context_profile": self.tool_context_profile,
+            "tool_profile": self.tool_profile,
         });
         if let Some(max_iterations) = self.max_iterations {
             input["max_iterations"] = json!(max_iterations);
@@ -1957,6 +1962,7 @@ async fn run_subagent_runtime(input_path: &Path, output_path: &Path) -> Result<(
     if request.context_mode.is_tiny() && request.system.as_deref().unwrap_or("").trim().is_empty() {
         agent.system = TINY_SYSTEM.to_string();
     }
+    agent.tool_context_profile = request.tool_context_profile.effective(request.context_mode);
     agent.tool_profile = request.tool_profile;
     agent.set_budget_cap(request.budget_cap);
     if !request.privacy_enabled {
@@ -6954,8 +6960,8 @@ Runtime: privileged ops are auto-approved; if approval is denied, ask the user. 
 Project state: use todo_read/todo_write for nontrivial work. Treat DEXT.md/recall.md as guidance; update recall.md only for durable decisions.
 Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Avoid broad reads; paginate. Use read-only tools in parallel.
 Editing: always read before editing. Use edit_file for small changes, multi_edit for batches, write_file for new files. Checkpoint before large edits.
-Git: inspect status/diff before editing tracked files. Use git_commit (not raw git). Use git_log only when history is needed.
-Shell: preserve pipefail in bash. Dext rg/fd/jq/http are direct tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Validate external sources before scaling. On auth failures, ask for credentials.
+Git: inspect status/diff before editing tracked files. Use git_commit (not raw git) for commits. Use bash git log only when history is needed.
+Shell: preserve pipefail in bash. Dext rg/fd/http are direct tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Validate external sources before scaling. On auth failures, ask for credentials.
 Browser: if browser_recipe=agent-browser, invoke agent-browser only when useful; start with agent-browser skills get core.
 Subagents: do not call subagent directly; suggest /subagent if delegation is requested. Review subagent output before acting.
 Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
@@ -7021,10 +7027,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "read_symbol",
     "fd",
     "rg",
-    "fzf",
-    "jq",
     "git_diff",
-    "git_log",
     "todo_read",
 ];
 
@@ -7067,8 +7070,8 @@ fn read_project_todo_summary(root: &Path, max_items: usize) -> Option<String> {
 }
 
 const PLAN_SYSTEM: &str = "\
-You are a planning agent. You have READ-ONLY tools: read_file, fd, rg, fzf, jq, \
-git_diff, git_log, todo_read. Explore the codebase and produce a concrete implementation plan.
+You are a planning agent. You have READ-ONLY tools: read_file, read_symbol, fd, rg, \
+git_diff, todo_read. Explore the codebase and produce a concrete implementation plan.
 
 Output sections, in this order:
 1. Task — restate in one sentence.
@@ -7234,45 +7237,95 @@ impl ContextMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 enum ToolContextProfile {
+    #[default]
+    Default,
+    Frugal,
     Full,
-    Lean,
 }
 
 impl ToolContextProfile {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "default" | "standard" | "core" => Some(Self::Default),
+            "frugal" | "slim" | "minimal" | "tiny" => Some(Self::Frugal),
+            "full" | "all" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    fn parse_selectable(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "default" | "standard" | "core" => Some(Self::Default),
+            "full" | "all" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    fn from_env() -> Self {
+        std::env::var("DEXT_TOOLSET")
+            .ok()
+            .and_then(|v| Self::parse(&v))
+            .unwrap_or_default()
+    }
+
+    fn effective(self, context_mode: ContextMode) -> Self {
+        if context_mode.is_frugal() {
+            Self::Frugal
+        } else if self == Self::Frugal {
+            Self::Default
+        } else {
+            self
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
+            Self::Default => "default",
+            Self::Frugal => "frugal",
             Self::Full => "full",
-            Self::Lean => "lean",
         }
     }
 }
 
 fn tool_name_allowed_in_profile(name: &str, profile: ToolContextProfile) -> bool {
+    const DEFAULT_TOOLS: &[&str] = &[
+        "read_file",
+        "read_symbol",
+        "write_file",
+        "edit_file",
+        "multi_edit",
+        "bash",
+        "fd",
+        "rg",
+        "http",
+        "browser",
+        "git_diff",
+        "git_commit",
+        "todo_read",
+        "todo_write",
+    ];
+    const FRUGAL_TOOLS: &[&str] = &[
+        "read_file",
+        "read_symbol",
+        "write_file",
+        "edit_file",
+        "multi_edit",
+        "bash",
+        "fd",
+        "rg",
+        "browser",
+        "git_diff",
+        "todo_read",
+        "todo_write",
+    ];
+
     match profile {
         ToolContextProfile::Full => true,
-        ToolContextProfile::Lean => matches!(
-            name,
-            "read_file"
-                | "read_symbol"
-                | "fd"
-                | "rg"
-                | "fzf"
-                | "jq"
-                | "write_file"
-                | "edit_file"
-                | "multi_edit"
-                | "bash"
-                | "http"
-                | "awk"
-                | "csvkit"
-                | "git_diff"
-                | "git_log"
-                | "git_commit"
-                | "todo_read"
-                | "todo_write"
-        ),
+        ToolContextProfile::Default => DEFAULT_TOOLS.contains(&name),
+        ToolContextProfile::Frugal => FRUGAL_TOOLS.contains(&name),
     }
 }
 
@@ -7410,6 +7463,8 @@ struct SessionHeader {
     #[serde(default)]
     context_mode: ContextMode,
     #[serde(default)]
+    tool_context_profile: ToolContextProfile,
+    #[serde(default)]
     tool_profile: ToolProfile,
     #[serde(default)]
     provenance: SessionProvenance,
@@ -7444,6 +7499,7 @@ impl Default for SessionHeader {
             budget_cap: None,
             browser_recipe: BrowserRecipe::default(),
             context_mode: ContextMode::default(),
+            tool_context_profile: ToolContextProfile::default(),
             tool_profile: ToolProfile::Full,
             provenance: SessionProvenance::default(),
             work_ledger: WorkLedger::default(),
@@ -7597,7 +7653,6 @@ fn apply_runtime_model_command(agent: &mut Agent, arg: &str) -> Result<String> {
     }
     agent.model = target_model.clone();
     agent.pin_model_for_provider(&target_provider, &target_model);
-    agent.refresh_tools_for_context();
     match set_provider_default_model_in_catalog(&target_provider, &target_model) {
         Ok(()) if provider_changed => Ok(format!(
             "model -> {} (provider -> {}; saved as default; applies immediately to the next model request)",
@@ -8254,6 +8309,7 @@ struct Agent {
     sandbox_profile: SandboxProfile,
     browser_recipe: BrowserRecipe,
     context_mode: ContextMode,
+    tool_context_profile: ToolContextProfile,
     tool_profile: ToolProfile,
     preview_mode: MutationPreviewMode,
     budget_cap: Option<BudgetCap>,
@@ -8353,11 +8409,7 @@ impl Agent {
             ToolProfile::from_env()
         };
         let budget_cap = BudgetCap::from_env();
-        let tool_context_profile = if context_mode.is_frugal() {
-            ToolContextProfile::Lean
-        } else {
-            ToolContextProfile::Full
-        };
+        let tool_context_profile = ToolContextProfile::from_env().effective(context_mode);
         let tools: Vec<Tool> = provider_tool_definitions()
             .into_iter()
             .filter(|t| browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser")
@@ -8406,6 +8458,7 @@ impl Agent {
             sandbox_profile: SandboxProfile::default(),
             browser_recipe,
             context_mode,
+            tool_context_profile,
             tool_profile,
             preview_mode: MutationPreviewMode::from_env(),
             budget_cap,
@@ -8486,6 +8539,7 @@ impl Agent {
     fn reload_provider(&mut self, selected: Option<&str>, require_credentials: bool) -> Result<()> {
         let resolved = resolve_runtime_provider(selected, require_credentials)?;
         self.apply_runtime_provider(resolved);
+        self.refresh_tools_for_context();
         Ok(())
     }
 
@@ -8499,7 +8553,11 @@ impl Agent {
             workaround_fired: false,
             turn_duration_ms: None,
             context_mode: Some(self.context_mode),
-            tool_profile: Some(self.tool_profile.as_str().to_string()),
+            tool_profile: Some(format!(
+                "{}:{}",
+                self.tool_context_profile().as_str(),
+                self.wire_tool_profile().as_str()
+            )),
             compacted: None,
         });
     }
@@ -9571,11 +9629,7 @@ impl Agent {
     }
 
     fn tool_context_profile(&self) -> ToolContextProfile {
-        if self.context_mode.is_frugal() {
-            ToolContextProfile::Lean
-        } else {
-            ToolContextProfile::Full
-        }
+        self.tool_context_profile.effective(self.context_mode)
     }
 
     fn refresh_tools_for_context(&mut self) {
@@ -9585,6 +9639,10 @@ impl Agent {
             .filter(|t| self.browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser")
             .filter(|t| tool_name_allowed_in_profile(t.name, profile))
             .collect();
+        let exposed: HashSet<&str> = self.tools.iter().map(|t| t.name).collect();
+        self.allowed.retain(|name| exposed.contains(name.as_str()));
+        self.deny_tools
+            .retain(|name| exposed.contains(name.as_str()));
     }
 
     fn wire_tool_profile(&self) -> ToolProfile {
@@ -9927,6 +9985,7 @@ impl Agent {
             budget_cap: self.budget_cap,
             browser_recipe: self.browser_recipe,
             context_mode: self.context_mode,
+            tool_context_profile: self.tool_context_profile(),
             tool_profile: self.tool_profile,
             provenance,
             work_ledger: self.cleaned_work_ledger(),
@@ -10085,6 +10144,7 @@ impl Agent {
             budget_cap,
             browser_recipe,
             context_mode,
+            tool_context_profile,
             tool_profile,
             work_ledger,
             provider_health,
@@ -10113,6 +10173,7 @@ impl Agent {
         self.track_origin = track_origin;
         self.privacy = privacy;
         self.context_mode = context_mode;
+        self.tool_context_profile = tool_context_profile.effective(context_mode);
         self.tool_profile = if self.context_mode.is_frugal() {
             ToolProfile::Lean
         } else {
@@ -12307,7 +12368,11 @@ impl Agent {
             workaround_fired: workaround_fired_this_turn,
             turn_duration_ms: Some(millis_u64(turn_started_at.elapsed())),
             context_mode: Some(self.context_mode),
-            tool_profile: Some(self.tool_profile.as_str().to_string()),
+            tool_profile: Some(format!(
+                "{}:{}",
+                self.tool_context_profile().as_str(),
+                self.wire_tool_profile().as_str()
+            )),
             compacted: Some(compacted_this_turn),
         });
         self.sink.emit(AgentEvent::TurnEnd { usage: turn_usage });
@@ -13033,11 +13098,7 @@ impl Agent {
             .filter(|t| {
                 tool_name_allowed_in_profile(
                     t.name,
-                    if request.context_mode.is_frugal() {
-                        ToolContextProfile::Lean
-                    } else {
-                        ToolContextProfile::Full
-                    },
+                    request.tool_context_profile.effective(request.context_mode),
                 )
             })
             .filter(|t| match &whitelist {
@@ -13089,6 +13150,7 @@ impl Agent {
             sandbox_profile: request.sandbox_profile,
             browser_recipe: request.browser_recipe,
             context_mode: request.context_mode,
+            tool_context_profile: request.tool_context_profile.effective(request.context_mode),
             tool_profile: request.tool_profile,
             preview_mode: self.preview_mode,
             budget_cap: request.budget_cap,
@@ -15193,6 +15255,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
+                "  /toolset [default|full]   provider-visible tool count profile"
+            );
+            let _ = writeln!(
+                w,
                 "  /compact [status|auto|N]   summarize older history or set the auto-compaction threshold"
             );
             let _ = writeln!(
@@ -15579,7 +15645,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     provider_id_from_selector(&catalog, arg).and_then(|target| {
                         set_active_provider_in_catalog(&target).and_then(|_| {
                             agent.reload_provider(Some(&target), false)?;
-                            agent.refresh_tools_for_context();
                             Ok(())
                         })
                     })
@@ -15650,7 +15715,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     let provider_id = login.provider_id.clone();
                     match agent.reload_provider(None, false) {
                         Ok(()) => {
-                            agent.refresh_tools_for_context();
                             if awaiting {
                                 agent.set_pending_login_provider(Some(provider_id));
                                 format!(
@@ -15691,7 +15755,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     agent.clear_pending_login();
                 }
                 let _ = agent.reload_provider(None, false);
-                agent.refresh_tools_for_context();
             }) {
                 Ok(msg) => {
                     let _ = writeln!(w, "{msg}");
@@ -15749,13 +15812,14 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 let _ = writeln!(w, "context mode: {}", agent.context_mode.as_str());
             } else if let Some(mode) = ContextMode::parse(arg) {
                 agent.context_mode = mode;
+                agent.tool_context_profile = agent.tool_context_profile.effective(mode);
                 if mode.is_frugal() {
                     agent.tool_profile = ToolProfile::Lean;
                 }
                 agent.refresh_tools_for_context();
                 let _ = writeln!(
                     w,
-                    "context mode -> {} (compact threshold {}, tool profile {})",
+                    "context mode -> {} (compact threshold {}, toolset {})",
                     agent.context_mode.as_str(),
                     agent.compact_threshold_chars(),
                     agent.tool_context_profile().as_str()
@@ -15766,7 +15830,12 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         }
         "tool-profile" | "tools-profile" => {
             if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
-                let _ = writeln!(w, "tool profile: {}", agent.tool_context_profile().as_str());
+                let _ = writeln!(
+                    w,
+                    "tool profile: {} (toolset {})",
+                    agent.wire_tool_profile().as_str(),
+                    agent.tool_context_profile().as_str()
+                );
             } else if let Some(profile) = ToolProfile::parse(arg) {
                 agent.tool_profile = profile;
                 if agent.context_mode.is_frugal() {
@@ -15775,11 +15844,30 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 agent.refresh_tools_for_context();
                 let _ = writeln!(
                     w,
-                    "tool profile -> {}",
+                    "tool profile -> {} (toolset {})",
+                    agent.wire_tool_profile().as_str(),
                     agent.tool_context_profile().as_str()
                 );
             } else {
                 let _ = writeln!(w, "usage: /tool-profile [lean|full|status]");
+            }
+        }
+        "toolset" | "tool-context" => {
+            if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
+                let _ = writeln!(w, "toolset: {}", agent.tool_context_profile().as_str());
+            } else if agent.context_mode.is_frugal() {
+                let _ = writeln!(
+                    w,
+                    "context mode {} pins toolset {}; switch /context standard before changing toolset",
+                    agent.context_mode.as_str(),
+                    agent.tool_context_profile().as_str()
+                );
+            } else if let Some(profile) = ToolContextProfile::parse_selectable(arg) {
+                agent.tool_context_profile = profile.effective(agent.context_mode);
+                agent.refresh_tools_for_context();
+                let _ = writeln!(w, "toolset -> {}", agent.tool_context_profile().as_str());
+            } else {
+                let _ = writeln!(w, "usage: /toolset [default|full|status]");
             }
         }
         "compact" => match arg.to_ascii_lowercase().as_str() {
@@ -15859,7 +15947,8 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 agent.thinking_effort.as_str()
             );
             let _ = writeln!(w, "context mode: {}", agent.context_mode.as_str());
-            let _ = writeln!(w, "tool profile: {}", agent.tool_context_profile().as_str());
+            let _ = writeln!(w, "schemas: {}", agent.wire_tool_profile().as_str());
+            let _ = writeln!(w, "toolset: {}", agent.tool_context_profile().as_str());
             let _ = writeln!(w, "compact threshold: {}", agent.compact_threshold_chars());
             let _ = writeln!(w, "approval profile: {}", agent.approval_profile().as_str());
             let _ = writeln!(w, "sandbox profile: {}", agent.sandbox_profile().as_str());
@@ -17063,6 +17152,7 @@ pub(crate) struct CliOptions {
     pub(crate) browser_recipe: Option<BrowserRecipe>,
     pub(crate) thinking_effort: Option<ThinkingEffort>,
     pub(crate) context_mode: Option<ContextMode>,
+    pub(crate) tool_context_profile: Option<ToolContextProfile>,
     pub(crate) tool_profile: Option<ToolProfile>,
     pub(crate) preview_mode: Option<MutationPreviewMode>,
     pub(crate) pack: Option<String>,
@@ -17084,6 +17174,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut browser_recipe: Option<BrowserRecipe> = None;
     let mut thinking_effort: Option<ThinkingEffort> = None;
     let mut context_mode: Option<ContextMode> = None;
+    let mut tool_context_profile: Option<ToolContextProfile> = None;
     let mut tool_profile: Option<ToolProfile> = None;
     let mut preview_mode: Option<MutationPreviewMode> = None;
     let mut pack: Option<String> = None;
@@ -17114,6 +17205,16 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                         "invalid --context-mode '{value}' (expected standard|frugal|tiny)"
                     )
                 })?);
+            }
+            "--toolset" | "--tool-context-profile" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--toolset requires default|full"))?;
+                tool_context_profile =
+                    Some(ToolContextProfile::parse_selectable(value).ok_or_else(|| {
+                        anyhow::anyhow!("invalid --toolset '{value}' (expected default|full)")
+                    })?);
             }
             "--tool-profile" => {
                 i += 1;
@@ -17273,6 +17374,16 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                 }
                 pack = Some(value.to_string());
             }
+            _ if arg.starts_with("--toolset=") || arg.starts_with("--tool-context-profile=") => {
+                let value = arg
+                    .strip_prefix("--toolset=")
+                    .or_else(|| arg.strip_prefix("--tool-context-profile="))
+                    .unwrap_or_default();
+                tool_context_profile =
+                    Some(ToolContextProfile::parse_selectable(value).ok_or_else(|| {
+                        anyhow::anyhow!("invalid toolset '{value}' (expected default|full)")
+                    })?);
+            }
             _ if arg.starts_with("--tool-profile=") => {
                 let value = arg.trim_start_matches("--tool-profile=");
                 tool_profile = Some(ToolProfile::parse(value).ok_or_else(|| {
@@ -17369,6 +17480,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         browser_recipe,
         thinking_effort,
         context_mode,
+        tool_context_profile,
         tool_profile,
         preview_mode,
         pack,
@@ -17572,6 +17684,8 @@ async fn main() -> Result<()> {
         );
         println!("       dext --context-mode tiny      skinny local mode with condensed prompt");
         println!("       dext --context-mode standard|frugal|tiny");
+        println!("       dext --toolset default|full  choose provider-visible tool count profile");
+        println!("       dext --tool-context-profile default|full  alias for --toolset");
         println!(
             "       dext --tool-profile lean|full  choose provider tool schema verbosity (default lean)"
         );
@@ -17586,7 +17700,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }
@@ -17645,10 +17759,13 @@ async fn main() -> Result<()> {
     }
     if let Some(mode) = opts.context_mode {
         agent.context_mode = mode;
+        agent.tool_context_profile = agent.tool_context_profile.effective(mode);
         if mode.is_frugal() {
             agent.tool_profile = ToolProfile::Lean;
         }
-        agent.refresh_tools_for_context();
+    }
+    if let Some(profile) = opts.tool_context_profile {
+        agent.tool_context_profile = profile.effective(agent.context_mode);
     }
     if let Some(profile) = opts.tool_profile {
         agent.tool_profile = profile;
@@ -17674,10 +17791,13 @@ async fn main() -> Result<()> {
             Ok(path) => {
                 if let Some(mode) = opts.context_mode {
                     agent.context_mode = mode;
+                    agent.tool_context_profile = agent.tool_context_profile.effective(mode);
                     if mode.is_frugal() {
                         agent.tool_profile = ToolProfile::Lean;
                     }
-                    agent.refresh_tools_for_context();
+                }
+                if let Some(profile) = opts.tool_context_profile {
+                    agent.tool_context_profile = profile.effective(agent.context_mode);
                 }
                 if let Some(profile) = opts.tool_profile {
                     agent.tool_profile = profile;
@@ -17731,9 +17851,11 @@ async fn main() -> Result<()> {
             eprintln!("[sandbox] profile {}", agent.sandbox_profile().as_str());
         }
         if agent.context_mode.is_frugal() {
-            eprintln!("[context] frugal mode — lean tools, smaller caps, deterministic compaction");
-        } else if agent.tool_context_profile() != ToolContextProfile::Full {
-            eprintln!("[tools] profile {}", agent.tool_context_profile().as_str());
+            eprintln!(
+                "[context] frugal mode — lean schemas, smaller toolset, smaller caps, deterministic compaction"
+            );
+        } else if agent.tool_context_profile() != ToolContextProfile::Default {
+            eprintln!("[tools] toolset {}", agent.tool_context_profile().as_str());
         }
         if agent.browser_recipe() != BrowserRecipe::Disabled {
             eprintln!("[browser] recipe {}", agent.browser_recipe().as_str());

@@ -757,6 +757,10 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .as_str()
             .and_then(crate::ContextMode::parse)
             .unwrap_or_default(),
+        tool_context_profile: meta["tool_context_profile"]
+            .as_str()
+            .and_then(crate::ToolContextProfile::parse)
+            .unwrap_or_default(),
         tool_profile: meta["tool_profile"]
             .as_str()
             .and_then(crate::ToolProfile::parse)

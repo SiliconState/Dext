@@ -11,12 +11,17 @@ Keep this file compact and curated.
   in commits, session logs, or `MEMORY.md`.
 
 ## Durable decisions
-- Tool surface should stay lean; avoid overlapping tools that bloat prompts.
+- Default provider-visible toolset intentionally hides specialized tools
+  (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) unless the user opts into
+  `--toolset full` or `DEXT_TOOLSET=full`; keep implementations available.
 - `--frugal` / `/context frugal` enable low-token operation: lean tool schemas,
-  reduced context/history/tool caps, deterministic compaction, and medium
-  default effort.
+  a smaller frugal toolset, reduced context/history/tool caps, deterministic
+  compaction, and medium default effort.
 - Standard prompts should also stay budget-conscious: compact system sections,
   capped runtime ledger/provider health, and minimal prompt-facing memory.
+- Capability-as-filesystem (`.dext/cap/` or virtual `/cap/...`) is parked hard:
+  not implemented, not core-bound, and only worth revisiting for a concrete
+  high-value use case after explicit packs/shelves prototypes prove safety.
 - `MEMORY.md` is the long-form source of truth; `recall.md` is
   only the compact prompt-facing cache.
 - Eval supports outcome-oriented assertions on files and command output.
