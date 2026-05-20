@@ -113,6 +113,12 @@ pre:hover .copy-btn{opacity:1}
   <button class="nav-section" data-target="sec-arch">Architecture <span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-arch">
     <li><a href="#architecture">Architecture Overview</a></li>
+    <li class="sub"><a href="#system-diagrams">System Diagrams</a></li>
+    <li class="sub"><a href="#turn-loop-sequence">Turn Loop Sequence</a></li>
+    <li class="sub"><a href="#tool-execution-sequence">Tool Execution Sequence</a></li>
+    <li class="sub"><a href="#checkpoint-sequence">Checkpoint Sequence</a></li>
+    <li class="sub"><a href="#turn-loop-flowchart">Turn Loop Flowchart</a></li>
+    <li class="sub"><a href="#checkpoint-flowchart">Checkpoint Flowchart</a></li>
     <li class="sub"><a href="#main-rs">Main.rs</a></li>
     <li class="sub"><a href="#session-rs">Session.rs</a></li>
     <li class="sub"><a href="#provider-rs">Provider.rs</a></li>
@@ -125,6 +131,7 @@ pre:hover .copy-btn{opacity:1}
   <button class="nav-section" data-target="sec-safety">Safety &amp; Recovery <span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-safety">
     <li><a href="#git-checkpoints-rs">Git_checkpoints.rs</a></li>
+    <li class="sub"><a href="#checkpoint-flowchart">Checkpoint Flowchart</a></li>
     <li class="sub"><a href="#mutation-preview-rs">Mutation_preview.rs</a></li>
     <li class="sub"><a href="#memory-merge-rs">Memory_merge.rs</a></li>
   </ul>
@@ -228,6 +235,156 @@ dext --frugal --effort off    # low-token mode</code></pre>
                        Append to History → Next Turn
                                     ↓
                        Compaction (if context pressure)</code></pre>
+
+<h2 id="system-diagrams">System Diagrams</h2>
+<p>This section documents executable runtime behavior with sequence-style diagrams and flow charts. These diagrams are intentionally text-first so they remain diff-friendly and reviewable in Git.</p>
+
+<h3 id="turn-loop-sequence">Turn Loop Sequence (User → Provider → Tools → State)</h3>
+<pre><code>[User]
+  │ prompt / steering
+  ▼
+[Agent.main.rs]
+  │ compose system + project + memory + shelf summary + history
+  │ choose context profile (standard/frugal/tiny)
+  ▼
+[Provider Request Builder]
+  │ api family: anthropic | openai-compatible | chatgpt
+  │ stream request (SSE)
+  ▼
+[Provider Stream]
+  │ emits blocks: text | thinking | tool_use
+  ▼
+[Agent Stream Handler]
+  ├─ text/thinking → append to transcript + event sink
+  ├─ tool_use     → validate input + classify risk + permission gate
+  │                 ├─ denied → tool_result(error/denied)
+  │                 └─ approved → tool execution path
+  ▼
+[Tool Dispatcher]
+  ├─ read-only tools may run in parallel batches
+  ├─ mutating tools run serialized with checkpoint/preview safety
+  ▼
+[Tool Results]
+  │ summarize + cap output + append tool_result blocks
+  ▼
+[History &amp; Ledger]
+  │ update usage, provider health, work ledger, verification records
+  │ compact if pressure threshold reached
+  ▼
+[Session Persistence]
+  │ write JSONL header/messages + rotate latest.log if needed
+  ▼
+[next turn or final response]</code></pre>
+
+<h3 id="tool-execution-sequence">Tool Execution Sequence (Validation, Permission, Execution)</h3>
+<pre><code>[tool_use block]
+  ▼
+validate_tool_input(name,input)
+  ├─ invalid → immediate tool_result(error)
+  └─ valid
+      ▼
+classify_command_risk(name,input)
+  ▼
+approval profile gate (ask|auto-read|auto-write|never|always)
+  ├─ deny  → tool_result(denied)
+  └─ allow
+      ▼
+(optional) mutation preview for direct file tools
+      ▼
+(optional) checkpoint create for write-risk mutations
+      ▼
+execute tool implementation
+  ├─ native rust path (file edits, git wrappers, session helpers)
+  └─ external process path (bash/rg/fd/jq/awk/csvkit/etc.)
+      ▼
+capture stdout/stderr/exit + auth marker detection
+      ▼
+tool_result append + telemetry + ledger updates</code></pre>
+
+<h3 id="checkpoint-sequence">Checkpoint Lifecycle Sequence (Write-Risk Tools)</h3>
+<pre><code>[approved mutating tool call]
+  ▼
+resolve git root
+  ├─ none: skip checkpoint path (non-git workspace)
+  └─ found:
+      ▼
+create checkpoint ref under refs/dext/checkpoints/&lt;session&gt;/...
+      ▼
+if dirty worktree: git stash create snapshot oid
+      ▼
+if direct file edit and untracked paths touched:
+  save sidecar copies under .dext/checkpoints/&lt;id&gt;/
+      ▼
+append manifest entry (.dext/checkpoints/manifest.txt)
+      ▼
+run mutation
+      ▼
+restore modes available:
+  preview | worktree | worktree+index | reset-head</code></pre>
+
+<h3 id="turn-loop-flowchart">Turn Loop Flowchart</h3>
+<pre><code>┌────────────────────────────┐
+│ Start Turn / Receive Input │
+└──────────────┬─────────────┘
+               ▼
+┌────────────────────────────┐
+│ Build Prompt + Runtime Env │
+└──────────────┬─────────────┘
+               ▼
+┌────────────────────────────┐
+│ Stream Provider Response   │
+└──────────────┬─────────────┘
+               ▼
+      ┌───────────────────┐
+      │ Block Type Switch │
+      └───┬─────────┬─────┘
+          │         │
+          ▼         ▼
+   text/thinking   tool_use
+      │             │
+      ▼             ▼
+ append transcript  validate+approve+execute
+      │             │
+      └──────┬──────┘
+             ▼
+┌────────────────────────────┐
+│ Update usage/ledger/health │
+└──────────────┬─────────────┘
+               ▼
+      ┌───────────────────┐
+      │ Context pressure? │
+      └───┬─────────┬─────┘
+          │no       │yes
+          ▼         ▼
+      next turn   compact history
+          │         │
+          └────┬────┘
+               ▼
+      final response / idle</code></pre>
+
+<h3 id="checkpoint-flowchart">Checkpoint + Restore Flowchart</h3>
+<pre><code>┌────────────────────────────┐
+│ Mutating Tool Approved     │
+└──────────────┬─────────────┘
+               ▼
+      ┌───────────────────┐
+      │ In Git workspace? │
+      └───┬─────────┬─────┘
+          │no       │yes
+          ▼         ▼
+   execute write   create checkpoint ref
+                     │
+                     ▼
+            capture dirty snapshot (stash create)
+                     │
+                     ▼
+            capture untracked sidecars (if needed)
+                     │
+                     ▼
+                execute mutation
+                     │
+                     ▼
+       undo paths: list → preview → apply restore mode</code></pre>
 
 <h3>Key Enums and Structs</h3>
 <table>
