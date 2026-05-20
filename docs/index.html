@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dext — Documentation</title>
+<style>
+:root[data-theme="dark"]{
+--bg:#0d1117;--surface:#161b22;--surface2:#1c2333;--border:#30363d;
+--text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--purple:#bc8cff;
+--yellow:#e3b341;--green:#3fb950;--red:#f85149;--orange:#d29922;
+--code-bg:#1a1f2b;--nav-bg:#0d1117;--nav-active:rgba(88,166,255,.15);
+--tip-bg:rgba(63,185,80,.08);--warn-bg:rgba(210,153,34,.08);
+--copy-ok:#3fb950;--scrollbar-track:#161b22;--scrollbar-thumb:#30363d;
+}
+:root[data-theme="light"]{
+--bg:#ffffff;--surface:#f6f8fa;--surface2:#f0f2f5;--border:#d0d7de;
+--text:#1f2328;--dim:#656d76;--accent:#0969da;--purple:#8250df;
+--yellow:#9a6700;--green:#1a7f37;--red:#cf222e;--orange:#9a6700;
+--code-bg:#eff1f3;--nav-bg:#f6f8fa;--nav-active:rgba(9,105,218,.12);
+--tip-bg:rgba(26,127,55,.08);--warn-bg:rgba(154,103,0,.08);
+--copy-ok:#1a7f37;--scrollbar-track:#f6f8fa;--scrollbar-thumb:#d0d7de;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.65}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code-bg);border:1px solid var(--border);border-radius:4px;padding:1px 6px;font-size:.87em;color:var(--yellow)}
+pre{font-family:inherit;background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:1rem;overflow-x:auto;margin:1rem 0;font-size:.87em;line-height:1.55;position:relative}
+pre code{background:none;border:none;padding:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+h1,h2,h3,h4{color:var(--text);margin-top:1.8rem;margin-bottom:.5rem;scroll-margin-top:70px}
+h1{font-size:1.85rem;border-bottom:2px solid var(--purple);padding-bottom:.4rem;margin-top:2.2rem}
+h2{font-size:1.4rem;border-bottom:1px solid var(--border);padding-bottom:.25rem}
+h3{font-size:1.15rem;color:var(--accent)}
+h4{font-size:1rem;color:var(--dim)}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.9rem}
+th,td{border:1px solid var(--border);padding:.45rem .7rem;text-align:left}
+th{background:var(--surface);color:var(--dim);font-weight:600;font-size:.82em;text-transform:uppercase;letter-spacing:.04em}
+tr:nth-child(even){background:var(--surface)}
+.badge{display:inline-block;font-size:.68em;padding:2px 8px;border-radius:10px;font-weight:600;vertical-align:middle}
+.badge-rs{background:var(--green);color:#fff}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.1rem 1.3rem;margin:1rem 0}
+.card h3{margin-top:0}
+.tip{border-left:4px solid var(--green);padding:.7rem 1rem;background:var(--tip-bg);border-radius:0 8px 8px 0;margin:1rem 0}
+.warn{border-left:4px solid var(--orange);padding:.7rem 1rem;background:var(--warn-bg);border-radius:0 8px 8px 0;margin:1rem 0}
+.sidenav{position:fixed;top:0;left:0;width:260px;height:100vh;background:var(--nav-bg);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;overflow:hidden}
+.nav-header{display:flex;align-items:center;justify-content:space-between;padding:.85rem 1rem;border-bottom:1px solid var(--border)}
+.nav-logo{font-size:1.05rem;font-weight:700;color:var(--purple);text-decoration:none}
+.theme-toggle{background:none;border:1px solid var(--border);border-radius:6px;padding:2px 8px;cursor:pointer;font-size:1rem;color:var(--dim);line-height:1}
+.theme-toggle:hover{border-color:var(--accent);color:var(--accent)}
+[data-theme="dark"] .icon-sun{display:inline}[data-theme="dark"] .icon-moon{display:none}
+[data-theme="light"] .icon-sun{display:none}[data-theme="light"] .icon-moon{display:inline}
+.nav-search{padding:.5rem .75rem}
+.nav-search input{width:100%;padding:.4rem .6rem;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:.82em;outline:none}
+.nav-search input:focus{border-color:var(--accent)}
+.nav-tree{flex:1;overflow-y:auto;padding:.25rem .5rem 1.5rem;scrollbar-width:thin;scrollbar-color:var(--scrollbar-thumb) var(--scrollbar-track)}
+.nav-group{margin:.15rem 0}
+.nav-section{display:flex;align-items:center;justify-content:space-between;width:100%;background:none;border:none;padding:.35rem .5rem;color:var(--dim);font-size:.72em;font-weight:700;text-transform:uppercase;letter-spacing:.07em;cursor:pointer;border-radius:4px}
+.nav-section:hover{background:var(--nav-active);color:var(--text)}
+.nav-section .arrow{transition:transform .2s;font-size:.85em}
+.nav-section.collapsed .arrow{transform:rotate(-90deg)}
+.nav-items{list-style:none;padding:.1rem 0 .1rem .6rem;margin:0}
+.nav-items li{margin:.12rem 0}
+.nav-items a{color:var(--dim);font-size:.82em;display:block;padding:.18rem .5rem;border-radius:4px;text-decoration:none;border-left:2px solid transparent}
+.nav-items a:hover{color:var(--accent);background:var(--nav-active)}
+.nav-items a.active{color:var(--accent);background:var(--nav-active);border-left-color:var(--accent);font-weight:600}
+.nav-items li.sub a{padding-left:1rem;font-size:.8em}
+.nav-items.hidden{display:none}
+.main{margin-left:260px;padding:1.5rem 2.5rem 4rem;max-width:920px;min-height:100vh}
+.menu-toggle{display:none;position:fixed;top:.75rem;left:.75rem;z-index:200;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.3rem .6rem;font-size:1.2rem;cursor:pointer;color:var(--dim)}
+.menu-toggle:hover{border-color:var(--accent);color:var(--accent)}
+.back-to-top{position:fixed;bottom:1.5rem;right:1.5rem;z-index:90;background:var(--surface);border:1px solid var(--border);border-radius:50%;width:36px;height:36px;font-size:1.1rem;cursor:pointer;color:var(--dim);opacity:0;transition:opacity .3s;pointer-events:none}
+.back-to-top.visible{opacity:1;pointer-events:auto}
+.back-to-top:hover{border-color:var(--accent);color:var(--accent)}
+.copy-btn{position:absolute;top:.4rem;right:.4rem;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:.72em;cursor:pointer;color:var(--dim);opacity:0;transition:opacity .2s}
+pre:hover .copy-btn{opacity:1}
+.copy-btn.copied{color:var(--copy-ok);border-color:var(--copy-ok)}
+.collapsible-header{cursor:pointer;user-select:none;display:flex;align-items:center;gap:.5rem}
+.collapsible-header::before{content:"▾";font-size:.8em;transition:transform .2s;display:inline-block;color:var(--dim)}
+.collapsible-header.collapsed::before{transform:rotate(-90deg)}
+.collapsible-content{overflow:hidden;transition:max-height .3s ease}
+.collapsible-content.collapsed{max-height:0!important}
+@media(max-width:900px){
+.sidenav{transform:translateX(-100%);transition:transform .3s}
+.sidenav.open{transform:translateX(0)}
+.main{margin-left:0;padding:1.2rem 1rem 4rem}
+.menu-toggle{display:block}
+}
+</style>
+</head>
+<body>
+<nav class="sidenav" id="sidenav">
+<div class="nav-header">
+  <a href="#overview" class="nav-logo">Dext Docs</a>
+  <button class="theme-toggle" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+    <span class="icon-sun">☀</span><span class="icon-moon">☽</span>
+  </button>
+</div>
+<div class="nav-search">
+  <input type="text" id="nav-search" placeholder="Search docs…" autocomplete="off">
+</div>
+<nav class="nav-tree" id="nav-tree">
+<div class="nav-group">
+  <button class="nav-section" data-target="sec-overview">Overview <span class="arrow">▾</span></button>
+  <ul class="nav-items" id="sec-overview">
+    <li><a href="#overview">Introduction</a></li>
+    <li><a href="#quickstart">Quick Start</a></li>
+    <li><a href="#project-layout">Project Layout</a></li>
+  </ul>
+</div>
+<div class="nav-group">
+  <button class="nav-section" data-target="sec-arch">Architecture <span class="arrow">▾</span></button>
+  <ul class="nav-items" id="sec-arch">
+    <li><a href="#architecture">Architecture Overview</a></li>
+    <li class="sub"><a href="#main-rs">Main.rs</a></li>
+    <li class="sub"><a href="#session-rs">Session.rs</a></li>
+    <li class="sub"><a href="#provider-rs">Provider.rs</a></li>
+    <li class="sub"><a href="#tools-rs">Tools.rs</a></li>
+    <li class="sub"><a href="#tool-policy-rs">Tool_policy.rs</a></li>
+    <li class="sub"><a href="#tui-rs">Tui.rs</a></li>
+  </ul>
+</div>
+<div class="nav-group">
+  <button class="nav-section" data-target="sec-safety">Safety &amp; Recovery <span class="arrow">▾</span></button>
+  <ul class="nav-items" id="sec-safety">
+    <li><a href="#git-checkpoints-rs">Git_checkpoints.rs</a></li>
+    <li class="sub"><a href="#mutation-preview-rs">Mutation_preview.rs</a></li>
+    <li class="sub"><a href="#memory-merge-rs">Memory_merge.rs</a></li>
+  </ul>
+</div>
+<div class="nav-group">
+  <button class="nav-section" data-target="sec-ext">Extensibility <span class="arrow">▾</span></button>
+  <ul class="nav-items" id="sec-ext">
+    <li><a href="#orchestrator-rs">Orchestrator.rs</a></li>
+    <li class="sub"><a href="#packs-rs">Packs.rs</a></li>
+    <li class="sub"><a href="#shelves-rs">Shelves.rs</a></li>
+  </ul>
+</div>
+<div class="nav-group">
+  <button class="nav-section" data-target="sec-test">Testing &amp; Perf <span class="arrow">▾</span></button>
+  <ul class="nav-items" id="sec-test">
+    <li><a href="#testing">Testing</a></li>
+    <li><a href="#benchmarks">Benchmarks</a></li>
+  </ul>
+</div>
+<div class="nav-group">
+  <button class="nav-section" data-target="sec-ref">Reference <span class="arrow">▾</span></button>
+  <ul class="nav-items" id="sec-ref">
+    <li><a href="#cli-reference">CLI Reference</a></li>
+    <li class="sub"><a href="#slash-commands">Slash Commands</a></li>
+    <li class="sub"><a href="#tools-reference">Tool Reference</a></li>
+    <li class="sub"><a href="#env-vars">Environment Variables</a></li>
+    <li class="sub"><a href="#providers">Providers</a></li>
+    <li class="sub"><a href="#config-files">Configuration Files</a></li>
+  </ul>
+</div>
+</nav>
+</nav>
+<button class="menu-toggle" id="menu-toggle" aria-label="Toggle menu">☰</button>
+<button class="back-to-top" id="back-to-top" aria-label="Back to top">↑</button>
+<main class="main" id="main-content">
+<h1 id="overview">Dext — Technical Documentation</h1>
+<p>Dext is a <strong>single-binary Rust coding agent</strong> that runs from your terminal. It keeps project-scoped session state and gives the model a curated set of native tools for filesystem operations, search, shell execution, data processing, HTTP requests, Git operations, and task tracking.</p>
+<p>Dext is <strong>source-first</strong>: prompts, runtime state, tool policies, provider wiring, and the TUI all live in the repository with no external service required beyond your chosen model provider.</p>
+
+<div class="tip"><strong>Developer Rebuild Path:</strong> to rebuild Dext from source, implement core behavior in <code>src/main.rs</code> + module files, run <code>cargo build --release</code>, run <code>cargo test --release</code> (and <code>cargo test --release --test tui_smoke -- --nocapture</code> when TUI changes), then reinstall with <code>cargo install --path . --force</code>. This keeps the CLI binary on <code>PATH</code> in sync with source.</div>
+<p>Architecturally, Dext is organized as a thin orchestrator around a stable module set: request shaping and auth (<code>provider.rs</code>), policy and tool schema surfaces (<code>tools.rs</code>, <code>tool_policy.rs</code>), project/session state (<code>session.rs</code>), interactive rendering (<code>tui.rs</code>), safety/recovery primitives (<code>git_checkpoints.rs</code>, <code>mutation_preview.rs</code>, <code>memory_merge.rs</code>), and extensibility metadata/runtime (<code>packs.rs</code>, <code>shelves.rs</code>, <code>orchestrator.rs</code>).</p>
+
+<section class="collapsible-section">
+<h2 id="quickstart" class="collapsible-header">Quick Start</h2>
+<div class="collapsible-content">
+<div class="card">
+<h3>Install</h3>
+<pre><code>git clone https://github.com/SiliconState/Dext.git
+cd Dext
+cargo install --path . --force</code></pre>
+</div>
+<div class="card">
+<h3>Authenticate</h3>
+<pre><code>dext auth providers          # list available providers
+dext auth login chatgpt      # ChatGPT/Codex OAuth
+dext auth login glm &lt;key&gt;    # ZAI GLM API key
+dext auth login openai &lt;key&gt; # OpenAI Platform key</code></pre>
+</div>
+<div class="card">
+<h3>Run</h3>
+<pre><code>dext                          # interactive session
+dext "summarize this repo"    # one-shot
+dext --frugal --effort off    # low-token mode</code></pre>
+</div>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="project-layout" class="collapsible-header">Project Layout</h2>
+<div class="collapsible-content">
+<table>
+<tr><th>File</th><th>Lines</th><th>Purpose</th></tr>
+<tr><td><code>src/main.rs</code></td><td>~18,000</td><td>Agent loop, HTTP provider, permissions, sandboxing, slash commands, CLI entry, eval</td></tr>
+<tr><td><code>src/main_tests.rs</code></td><td>~8,000</td><td>Unit and integration tests for main.rs</td></tr>
+<tr><td><code>src/tui.rs</code></td><td>~10,300</td><td>Ratatui inline TUI, permission prompts, transcript rendering</td></tr>
+<tr><td><code>src/provider.rs</code></td><td>~3,150</td><td>Provider catalog, auth, request shaping, model normalization</td></tr>
+<tr><td><code>src/session.rs</code></td><td>~770</td><td>Session/log persistence, project state locks, atomic I/O</td></tr>
+<tr><td><code>src/tools.rs</code></td><td>~490</td><td>Tool definitions, permission metadata, parallel-safe classification</td></tr>
+<tr><td><code>src/orchestrator.rs</code></td><td>~1,970</td><td>Work phases, similarity guards, objective tracking, adaptive caps</td></tr>
+<tr><td><code>src/git_checkpoints.rs</code></td><td>~630</td><td>Git-native recovery refs, /undo, sidecar files, pruning</td></tr>
+<tr><td><code>src/mutation_preview.rs</code></td><td>~229</td><td>In-memory unified diffs before applying file mutations</td></tr>
+<tr><td><code>src/memory_merge.rs</code></td><td>~542</td><td>Section-aware merge driver for MEMORY.md and recall.md</td></tr>
+<tr><td><code>src/packs.rs</code></td><td>~502</td><td>Pack discovery, invocation, conversational pack inference</td></tr>
+<tr><td><code>src/shelves.rs</code></td><td>~1,069</td><td>Typed shelf registry with abilities, signals, effects</td></tr>
+<tr><td><code>src/tool_policy.rs</code></td><td>~873</td><td>Command risk classification, input validation, bash guardrails</td></tr>
+<tr><td><code>benches/dext_bench.rs</code></td><td>~266</td><td>Criterion perf harness</td></tr>
+<tr><td><code>tests/tui_smoke.rs</code></td><td>~383</td><td>PTY-backed TUI smoke test</td></tr>
+</table>
+</div>
+</section>
+<h1 id="architecture">Architecture</h1>
+<p>Dext follows a <strong>single-binary architecture</strong> with no plugins or external services. The agent loop in <code>main.rs</code> drives everything: it composes prompts, makes streaming HTTP requests to model providers, dispatches tool calls, handles permissions, and manages session state.</p>
+
+<h3>High-Level Data Flow</h3>
+<pre><code>User Input → Agent Loop → Provider HTTP (streaming SSE)
+                                    ↓
+                            Response Blocks (text/thinking/tool_use)
+                                    ↓
+                       Tool Dispatch → Execute → Result
+                                    ↓
+                       Append to History → Next Turn
+                                    ↓
+                       Compaction (if context pressure)</code></pre>
+
+<h3>Key Enums and Structs</h3>
+<table>
+<tr><th>Type</th><th>Defined In</th><th>Purpose</th></tr>
+<tr><td><code>ThinkingEffort</code></td><td>main.rs</td><td>Reasoning depth: Off, Low, Medium, High, XHigh</td></tr>
+<tr><td><code>OutputMode</code></td><td>main.rs</td><td>Text, Json, StreamJson — output format for non-interactive mode</td></tr>
+<tr><td><code>ApprovalProfile</code></td><td>main.rs</td><td>Ask, AutoRead, AutoWrite, Never, Always — permission gating</td></tr>
+<tr><td><code>SandboxProfile</code></td><td>main.rs</td><td>ReadOnly, WorkspaceWrite, DangerFullAccess</td></tr>
+<tr><td><code>ContextMode</code></td><td>main.rs</td><td>Standard, Frugal, Tiny — context window management</td></tr>
+<tr><td><code>MutationPreviewMode</code></td><td>main.rs</td><td>Off, Simple, Git — diff preview before mutations</td></tr>
+<tr><td><code>BrowserRecipe</code></td><td>main.rs</td><td>Disabled, AgentBrowser — browser automation toggle</td></tr>
+<tr><td><code>Usage</code></td><td>main.rs</td><td>Token tracking: input, output, cache_create, cache_read</td></tr>
+<tr><td><code>BudgetCap</code></td><td>main.rs</td><td>Session budget limits in USD or tokens</td></tr>
+<tr><td><code>WorkLedger</code></td><td>main.rs</td><td>Objective, phase, decisions, pending/done/blocked items</td></tr>
+<tr><td><code>SessionHeader</code></td><td>main.rs</td><td>Persisted session metadata with full provenance</td></tr>
+<tr><td><code>Message / Block</code></td><td>main.rs</td><td>Conversation history: Text, Thinking, ToolUse, ToolResult</td></tr>
+<tr><td><code>AgentEvent</code></td><td>main.rs</td><td>Event stream: TurnStart, TextDelta, ToolCallResult, etc.</td></tr>
+</table>
+
+<section class="collapsible-section">
+<h2 id="main-rs" class="collapsible-header">Main.rs — Agent Core <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>At ~18,000 lines, <code>main.rs</code> is the heart of Dext. It contains:</p>
+<h3>Agent Loop</h3>
+<p>The central <code>Agent</code> struct drives a turn-based loop:</p>
+<ol>
+<li><strong>Prompt composition</strong> — Builds the system prompt from <code>DEXT.md</code>, project context, tool catalog, session header, work ledger, shelf abilities, and recall cache.</li>
+<li><strong>History management</strong> — Maintains a <code>Vec&lt;Message&gt;</code> with automatic compaction when context pressure exceeds configurable thresholds (default: 90% at end-turn, 80% after safe tool-result checkpoints).</li>
+<li><strong>Provider dispatch</strong> — Sends streaming requests to the active provider. Parses SSE chunks into <code>Block</code> variants.</li>
+<li><strong>Tool execution</strong> — Dispatches <code>tool_use</code> blocks to native Rust implementations. Supports parallel execution for read-only tools.</li>
+<li><strong>Permission gating</strong> — Routes tool calls through <code>EventSink::request_permission()</code> based on the active <code>ApprovalProfile</code> and tool risk classification.</li>
+<li><strong>Steering</strong> — Active-turn user input is routed to a steering channel, injected at safe boundaries.</li>
+</ol>
+<h3>Stream Parsing</h3>
+<table>
+<tr><th>Provider</th><th>API</th><th>Request Builder</th></tr>
+<tr><td>Anthropic / GLM</td><td>Messages API (<code>/v1/messages</code>)</td><td><code>Request</code> struct with <code>AnthropicThinking</code></td></tr>
+<tr><td>OpenAI / DeepSeek / Local</td><td>Chat Completions (<code>/v1/chat/completions</code>)</td><td><code>OaiRequest</code> with <code>reasoning_effort</code></td></tr>
+<tr><td>ChatGPT / Codex</td><td>Responses API (<code>/codex/responses</code>)</td><td><code>build_chatgpt_request()</code></td></tr>
+</table>
+<h3>Session Persistence</h3>
+<p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). This header is the replay anchor for deterministic restore behavior.</p>
+<h3>Eval Harness</h3>
+<p>Outcome-oriented assertions on files and command output. The eval path validates objective completion semantically (not just command exit) and records verification artifacts for later audit. Run via <code>dext --eval</code>.</p>
+<h3>Crash Recovery</h3>
+<p>A panic hook writes crash snapshots to <code>~/.dext/crashes/</code> with session ID, last event IDs, terminal state, and backtrace, then restores terminal settings on next launch to avoid broken TTY state after crashes.</p>
+</div>
+</section>
+<section class="collapsible-section">
+<h2 id="session-rs" class="collapsible-header">Session.rs — Session &amp; State <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>Manages all persistent state for Dext sessions, logs, and project-scoped data.</p>
+<h3>State Directories</h3>
+<pre><code>~/.dext/                         # DEXT_HOME (overridable)
+├── providers.json               # Provider catalog
+├── auth.json                    # Stored credentials (0600 on Unix)
+├── crashes/                     # Crash snapshots
+├── shelves/                     # User-scoped shelves
+├── packs/                       # User-scoped packs
+└── projects/
+    └── &lt;project-key&gt;/
+        ├── owner.lock.json      # Project state lock
+        ├── sessions/
+        │   ├── _latest.jsonl    # Auto-saved latest session
+        │   └── &lt;name&gt;.jsonl     # Named sessions
+        └── logs/
+            ├── latest.log       # Capped at 64KB
+            └── latest.log.1..N  # Rotated archives</code></pre>
+<h3>Project Key</h3>
+<p>Each project gets a stable key derived from its canonical path: <code>&lt;slug&gt;-&lt;FNV-1a-hash&gt;</code>. This ensures isolated state per project even with identical directory names.</p>
+<h3>Atomic Writes</h3>
+<p>All state files use atomic write via temp file + rename. On Windows, uses <code>MoveFileExW</code>; on Unix, uses <code>fs::rename</code>.</p>
+<h3>Project State Lock</h3>
+<p>A file-based lock (<code>owner.lock.json</code>) prevents concurrent Dext processes from corrupting project state. Lock records include PID/token ownership and are released through a cleanup registry. Stale locks (older than 24 hours) are auto-cleaned.</p>
+<h3>Log Rotation</h3>
+<p><code>latest.log</code> is capped at 64KB. When exceeded, existing content is rotated to <code>latest.log.N</code> (configurable via <code>DEXT_LOG_ARCHIVES</code>, max 16).</p>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="provider-rs" class="collapsible-header">Provider.rs — Provider Catalog <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>Manages the catalog of model providers, authentication, request shaping, and model normalization.</p>
+<h3>ApiProvider Enum</h3>
+<p>Three wire-format families:</p>
+<ul>
+<li><code>Anthropic</code> — Anthropic Messages API (also used by GLM via <code>api.z.ai/api/anthropic</code>)</li>
+<li><code>OpenAi</code> — OpenAI Chat Completions API (also used by DeepSeek, local llama.cpp)</li>
+<li><code>ChatGpt</code> — ChatGPT Responses API (OAuth-backed)</li>
+</ul>
+<h3>Built-in Providers</h3>
+<table>
+<tr><th>ID</th><th>Display</th><th>API</th><th>Default Model</th><th>Auth</th></tr>
+<tr><td><code>glm</code></td><td>ZAI GLM</td><td>Anthropic</td><td>glm-4.6</td><td>API Key (<code>ZAI_API_KEY</code>)</td></tr>
+<tr><td><code>chatgpt</code></td><td>ChatGPT</td><td>ChatGPT Responses</td><td>gpt-5.4</td><td>OAuth (OpenAI auth)</td></tr>
+<tr><td><code>openai</code></td><td>OpenAI API</td><td>OpenAI</td><td>gpt-5</td><td>API Key (<code>OPENAI_API_KEY</code>)</td></tr>
+<tr><td><code>anthropic</code></td><td>Anthropic</td><td>Anthropic</td><td>claude-sonnet-4-5</td><td>API Key (<code>ANTHROPIC_API_KEY</code>)</td></tr>
+<tr><td><code>deepseek</code></td><td>DeepSeek</td><td>OpenAI</td><td>deepseek-chat</td><td>API Key (<code>DEEPSEEK_API_KEY</code>)</td></tr>
+<tr><td><code>local</code></td><td>Local llama.cpp</td><td>OpenAI</td><td>qwen-local</td><td>None</td></tr>
+</table>
+<h3>Provider Resolution Chain</h3>
+<ol>
+<li><code>DEXT_PROVIDER</code> env var</li>
+<li><code>DEXT_PROFILE</code> env var</li>
+<li><code>DEXT_API_PROVIDER</code> env var</li>
+<li><code>active_provider</code> field in <code>providers.json</code></li>
+<li>Default: <code>glm</code></li>
+</ol>
+<h3>Model Resolution Chain</h3>
+<ol>
+<li><code>DEXT_MODEL_{PROVIDER}</code> (provider-specific)</li>
+<li><code>DEXT_MODEL</code> (with <code>DEXT_MODEL_FORCE</code> override)</li>
+<li>Profile's <code>default_model</code></li>
+</ol>
+<h3>ChatGPT Model Normalization</h3>
+<p>Compact aliases are canonicalized: <code>gpt5codex</code> → <code>gpt-5-codex</code>, <code>gpt54</code> → <code>gpt-5.4</code>, etc. GLM models get auto-prefixed with <code>glm-</code> if missing.</p>
+<h3>Authentication</h3>
+<p>Credentials stored in <code>~/.dext/auth.json</code>. Two types: <code>ApiKey</code> (plain key, supports env var refs and <code>!command</code> secret references) and <code>OAuth</code> (access token + refresh token + expiry, used by ChatGPT). Provider/profile resolution merges built-ins with user catalog overrides while pruning retired bundled providers.</p>
+</div>
+</section>
+<section class="collapsible-section">
+<h2 id="tools-rs" class="collapsible-header">Tools.rs — Tool Catalog <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>Defines all provider-visible tools, their schemas, permission requirements, and parallel-safety classification.</p>
+<h3>Tool Profiles</h3>
+<table>
+<tr><th>Profile</th><th>Description</th><th>Schemas</th></tr>
+<tr><td><code>Full</code></td><td>Complete tool descriptions and full JSON schemas</td><td>Full</td></tr>
+<tr><td><code>Lean</code> (default)</td><td>Compact one-liner descriptions, schemas without field descriptions</td><td>Stripped</td></tr>
+</table>
+<p>Controlled via <code>DEXT_TOOL_PROFILE</code>. Lean mode saves significant prompt tokens per turn.</p>
+<h3>Tool Classification</h3>
+<table>
+<tr><th>Category</th><th>Tools</th></tr>
+<tr><td><strong>Read-only (parallel-safe)</strong></td><td><code>read_file</code>, <code>read_symbol</code>, <code>fd</code>, <code>rg</code>, <code>jq</code>, <code>fzf</code>, <code>git_diff</code>, <code>git_log</code>, <code>todo_read</code></td></tr>
+<tr><td><strong>Needs permission</strong></td><td><code>bash</code>, <code>browser</code>, <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>http</code>, <code>awk</code>, <code>csvkit</code>, <code>git_commit</code>, <code>todo_write</code></td></tr>
+<tr><td><strong>External process</strong></td><td><code>fd</code>, <code>rg</code>, <code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>csvkit</code>, <code>git_diff</code>, <code>git_log</code></td></tr>
+</table>
+<h3>Wire Format Adapters</h3>
+<ul>
+<li><code>wire_tools()</code> — Anthropic format with <code>cache_control: ephemeral</code></li>
+<li><code>wire_tools_oai()</code> — OpenAI <code>function</code> type format</li>
+<li><code>wire_tools_chatgpt()</code> — ChatGPT flattened format with <code>strict: null</code></li>
+</ul>
+<p>Runtime-only slash commands (subagent, pack, shelves, browser) are intentionally separate from provider-visible tools to keep provider prompts lean and policy-centralized.</p>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="tool-policy-rs" class="collapsible-header">Tool_policy.rs — Risk &amp; Guards <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>Validates tool inputs, classifies command risk, and enforces bash guardrails.</p>
+<h3>Command Risk Levels</h3>
+<table>
+<tr><th>Risk</th><th>Description</th><th>Examples</th></tr>
+<tr><td><code>Read</code></td><td>Read-only operations</td><td><code>ls</code>, <code>cat</code>, <code>git status</code>, <code>http GET</code></td></tr>
+<tr><td><code>Write</code></td><td>Modifies files or state</td><td><code>write_file</code>, <code>edit_file</code>, non-dangerous bash</td></tr>
+<tr><td><code>Danger</code></td><td>Destructive or sensitive operations</td><td><code>sudo</code>, <code>rm -rf</code>, <code>git push</code>, HTTP POST/DELETE</td></tr>
+</table>
+<h3>Bash Guardrails</h3>
+<ul>
+<li>Auto-injects <code>set -o pipefail</code> if missing</li>
+<li>Blocks <code>--break-system-packages</code> pip flag (overridable)</li>
+<li>Detects sudo commands needing password and routes to local auth prompt</li>
+<li>Advisories: prefer <code>rg</code> over <code>grep -r</code>, prefer <code>fd</code> over <code>find</code></li>
+</ul>
+<h3>Input Validation</h3>
+<p>Every tool call is validated for required fields before execution. Missing/empty required fields, type mismatches, and mutually exclusive params are caught early with descriptive errors.</p>
+<h3>Auth Failure Detection</h3>
+<p>Tool output is scanned for auth failure markers (<code>unauthorized</code>, <code>401</code>, <code>403</code>, <code>invalid api key</code>) to trigger circuit breakers and prevent repeated credential burn on failing hosts.</p>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="tui-rs" class="collapsible-header">Tui.rs — Terminal UI <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>A full-featured inline TUI built on <strong>ratatui + crossterm</strong> that renders in the regular terminal buffer (no alternate-screen takeover).</p>
+<h3>Layout</h3>
+<ul>
+<li><strong>Transcript area</strong> — Scrollable message history with user, assistant, tool, thinking, and steering lines</li>
+<li><strong>Live status bar</strong> — Provider, model, thinking effort, approval profile, context pressure, usage stats</li>
+<li><strong>Input panel</strong> — Multi-line text input with history (200 entries), completion for slash commands</li>
+<li><strong>Work map drawer</strong> — Collapsible work-ledger visualization</li>
+</ul>
+<h3>Permission Prompts</h3>
+<p>Tool calls requiring permission show inline prompts with risk tier color coding (yellow for Read/Write, red for Danger). Choices: Once, Always (session), Deny.</p>
+<h3>Key Bindings</h3>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><code>Enter</code></td><td>Submit input (or insert newline in multi-line mode)</td></tr>
+<tr><td><code>Ctrl+O</code></td><td>Toggle single-line / multi-line input</td></tr>
+<tr><td><code>Ctrl+D</code></td><td>Quit</td></tr>
+<tr><td><code>Ctrl+C</code></td><td>Interrupt current turn</td></tr>
+<tr><td><code>Up/Down</code></td><td>Navigate input history</td></tr>
+<tr><td><code>Scroll</code></td><td>Navigate transcript</td></tr>
+<tr><td><code>?</code></td><td>Show keymap help</td></tr>
+</table>
+<h3>Tool Result Rendering</h3>
+<p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints.</p>
+<h3>Markdown Rendering</h3>
+<p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence.</p>
+</div>
+</section>
+<h1 id="safety-recovery">Safety &amp; Recovery</h1>
+
+<section class="collapsible-section">
+<h2 id="git-checkpoints-rs" class="collapsible-header">Git_checkpoints.rs <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>Git-native recovery checkpoints created before every workspace mutation.</p>
+<h3>Checkpoint Lifecycle</h3>
+<ol>
+<li><strong>Create</strong> — Before a tool executes, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;</code></li>
+<li><strong>Dirty state capture</strong> — If the worktree is dirty, <code>git stash create</code> captures a snapshot without touching the working tree or reflog</li>
+<li><strong>Untracked sidecar</strong> — For direct file tools, untracked files are saved to <code>.dext/checkpoints/&lt;id&gt;/</code></li>
+<li><strong>Manifest</strong> — Appended to <code>.dext/checkpoints/manifest.txt</code> (capped at 64 entries)</li>
+</ol>
+<h3>Restore Modes</h3>
+<table>
+<tr><th>Mode</th><th>Description</th></tr>
+<tr><td><code>Preview</code></td><td>Show diff vs current worktree without modifying anything</td></tr>
+<tr><td><code>Worktree</code></td><td>Checkout affected paths from checkpoint OID</td></tr>
+<tr><td><code>WorktreeAndIndex</code></td><td>Full worktree checkout from checkpoint OID</td></tr>
+<tr><td><code>ResetHead</code></td><td>Hard reset HEAD to checkpoint's original HEAD</td></tr>
+</table>
+<h3>Pruning</h3>
+<p>Default: keep 20 newest, remove entries older than 7 days. Pruning rebuilds local manifests and deletes associated sidecar checkpoint directories for bounded disk growth.</p>
+<h3>Checkpoint Triggers</h3>
+<p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Bash/awk/csvkit only if command risk is not Read.</p>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="mutation-preview-rs" class="collapsible-header">Mutation_preview.rs <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>Generates in-memory unified diffs before applying file mutations. Shows the preview during permission prompts.</p>
+<h3>Preview Flow</h3>
+<ol>
+<li>Read the current file content (or empty for new files)</li>
+<li>Compute the proposed content (apply edit/multi-edit transforms in memory)</li>
+<li>Generate a line-level diff with context lines</li>
+<li>Cap at 4KB with truncation notice</li>
+<li>Show added/removed line counts and whether it's a new file</li>
+</ol>
+<h3>Sandbox Validation</h3>
+<p>All paths are canonicalized and validated to be within the sandbox root. Paths outside the sandbox are rejected.</p>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="memory-merge-rs" class="collapsible-header">Memory_merge.rs <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>A section-aware merge driver for <code>MEMORY.md</code> and <code>recall.md</code> that protects Dext's memory from bad text merges.</p>
+<h3>Memory Merge Algorithm</h3>
+<ol>
+<li><strong>Parse</strong> — Split both versions into preamble + sections (by heading hierarchy)</li>
+<li><strong>Index</strong> — Map sections by heading path (e.g., <code>["Durable decisions", "Tool surface"]</code>)</li>
+<li><strong>Three-way merge</strong> — For each section: if only one side changed, take that; if both changed identically, take either; if conflicting, produce explicit conflict markers</li>
+<li><strong>List merging</strong> — Pure list sections are union-merged by normalized content</li>
+<li><strong>Never silently drop</strong> — Conflicts are always marked explicitly</li>
+</ol>
+<h3>Recall Merge</h3>
+<p><code>recall.md</code> uses simpler line-based union merge: deduplicate by normalized content, prefer "ours" ordering.</p>
+<h3>Git Integration</h3>
+<p>Register via <code>dext memory register</code> which configures Git merge drivers (<code>dext-memory</code>, <code>dext-recall</code>) in local config and writes local or versioned gitattributes entries. Registration is explicit; Dext does not silently mutate global Git config.</p>
+</div>
+</section>
+<h1 id="extensibility">Extensibility</h1>
+
+<section class="collapsible-section">
+<h2 id="orchestrator-rs" class="collapsible-header">Orchestrator.rs — Runtime Intelligence <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p>Per-turn runtime state that guards against loops, manages external resource access, and tracks objectives.</p>
+<h3>Work Phases</h3>
+<table>
+<tr><th>Phase</th><th>Description</th></tr>
+<tr><td><code>Probe</code></td><td>Initial exploration — reading files, searching, understanding the codebase</td></tr>
+<tr><td><code>Scale</code></td><td>Expanded collection — triggered when probe passes for external hosts</td></tr>
+<tr><td><code>Synthesize</code></td><td>Final delivery — writing files, committing, producing the answer</td></tr>
+</table>
+<h3>Guard Systems</h3>
+<ul>
+<li><strong>Dedupe cache</strong> — Short-circuits identical external requests within a turn</li>
+<li><strong>Similarity guard</strong> — Blocks after 3+ similar unproductive bash/file operations</li>
+<li><strong>Tool retry budget</strong> — Circuit breaker after 3+ failures with same error signature</li>
+<li><strong>Empty tool call loop detection</strong> — Detects provider bug where tool arguments are dropped (threshold: 4 consecutive empty calls)</li>
+<li><strong>Auth circuit breaker</strong> — Blocks hosts after 2 auth failures</li>
+<li><strong>Feasibility guard</strong> — Requires single-item probes before bulk external collection</li>
+</ul>
+<h3>Objective Tracker</h3>
+<p>Parses user prompts to extract checkpoints (plan, analyze, implement, verify, document). Tracks satisfaction by examining tool usage patterns, bash commands, and assistant text.</p>
+<h3>Adaptive Caps</h3>
+<p>Tool UI content and result caps scale down dynamically based on context pressure: ≥90% → 25%, ≥75% → 50%, ≥60% → 75% of default. This preserves critical evidence near context limits while reducing prompt bloat.</p>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="packs-rs" class="collapsible-header">Packs.rs — Pack System <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p><strong>Packs are workflow documents, not plugin binaries.</strong> The runtime reads pack metadata and <code>PACK.md</code>, then executes the workflow through the existing Dext tool surface. This keeps packs provider-neutral and auditable.</p>
+
+<h3>Design Contract</h3>
+<ul>
+<li>No provider-visible tool expansion: packs orchestrate existing tools (<code>bash</code>, <code>read_file</code>, <code>rg</code>, etc.).</li>
+<li>Source-first reviewability: every pack is plain files in a directory.</li>
+<li>Deterministic discovery and precedence: first resolved name wins after ordered search roots.</li>
+<li>Optional hooks via <code>phooks.json</code>, isolated from project <code>hooks.json</code>.</li>
+</ul>
+
+<div class="warn"><strong>Important:</strong> <code>autoresearch</code> is a <strong>sample pack</strong>, not core Dext runtime functionality. Dext core only provides pack loading/execution infrastructure.</div>
+
+<h3>Pack Object Model (<code>PackInfo</code>)</h3>
+<p><code>packs.rs</code> normalizes each discovered pack into <code>PackInfo</code> with:</p>
+<ul>
+<li><code>name</code>, <code>description</code> (from front matter or directory defaults)</li>
+<li><code>path</code>, <code>pack_md_path</code>, optional <code>phooks_path</code></li>
+<li><code>source</code> label (project/env/user/bundled) and optional shelf ownership</li>
+</ul>
+<p>Invocation wraps this as <code>PackInvocation { pack, task }</code> so the task is explicit and auditable.</p>
+
+<h3>Discovery Precedence</h3>
+<ol>
+<li><code>DEXT_PACK_*_DIR</code> direct overrides</li>
+<li>Project shelves and packs: <code>.dext/shelves/*/packs</code>, <code>.dext/packs</code>, <code>packs</code></li>
+<li>Runtime env roots: <code>DEXT_SHELVES_DIR</code>, <code>DEXT_PACKS_DIR</code></li>
+<li>User roots: <code>~/.dext/shelves/*/packs</code>, <code>~/.dext/packs</code></li>
+<li>Bundled repository packs (examples/templates)</li>
+</ol>
+<p>The resolver deduplicates by canonicalized path and normalized pack name. Name collisions are resolved by precedence order, not random filesystem order.</p>
+
+<h3>Pack Layout and Front Matter</h3>
+<pre><code>my-pack/
+├── PACK.md          # required; markdown workflow with YAML front matter
+├── phooks.json      # optional hook template for this pack
+├── bin/             # optional helper scripts
+└── README.md        # optional human docs</code></pre>
+<pre><code>---
+name: my-pack
+description: One-line workflow summary
+---
+
+# Workflow
+1) Setup
+2) Probe
+3) Transform
+4) Verify
+5) Deliver
+</code></pre>
+<p>Only <code>PACK.md</code> is required. Front matter fields are intentionally minimal to keep packs simple and portable.</p>
+
+<h3>Prompt Injection Model</h3>
+<p><code>pack_prompt()</code> builds a bounded invocation prompt (cap: <code>PACK_PROMPT_CAP = 32_000</code> bytes) containing:</p>
+<ul>
+<li>pack identity and source metadata</li>
+<li>paths for workflow and optional hooks</li>
+<li>pack-scoped env exports (<code>DEXT_PACK_DIR</code>, <code>DEXT_PACK_&lt;NAME&gt;_DIR</code>)</li>
+<li>full <code>PACK.md</code> workflow body</li>
+<li>explicit user task text</li>
+</ul>
+<p>This gives the model procedural guidance without changing core runtime policy.</p>
+
+<h3>Execution Paths</h3>
+<ul>
+<li>CLI: <code>dext pack list</code>, <code>dext pack inspect &lt;name&gt;</code>, <code>dext pack run &lt;name&gt; &quot;task&quot;</code></li>
+<li>Interactive: <code>/pack list</code>, <code>/pack inspect &lt;name&gt;</code>, <code>/pack run &lt;name&gt; task</code></li>
+<li>Conversational detection: <code>invoke &lt;name&gt;</code> / <code>run &lt;name&gt; on ...</code> patterns mapped by selector inference</li>
+</ul>
+
+<h3>Operational Guidance for Pack Authors</h3>
+<ul>
+<li>Write reproducible loops: inputs, stop conditions, verification gates.</li>
+<li>Keep shell helpers idempotent; prefer deterministic outputs for agent reuse.</li>
+<li>Use <code>phooks.json</code> only when needed; packs must still function without hooks.</li>
+<li>Treat pack workflows as code: version, test on disposable repos, and review diffs.</li>
+</ul>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="shelves-rs" class="collapsible-header">Shelves.rs — Shelf Registry <span class="badge badge-rs">.rs</span></h2>
+<div class="collapsible-content">
+<p><strong>Shelves are typed metadata registries over packs.</strong> They describe capabilities and signal/effect behavior without adding provider-visible tools.</p>
+
+<h3>Why Shelves Exist</h3>
+<ul>
+<li>Give the model structured capability hints (commands/hooks/context) with low token cost.</li>
+<li>Separate extension metadata from prompt prose.</li>
+<li>Enable scoped override rules across core/user/project/run environments.</li>
+</ul>
+
+<h3>Manifest and Type System</h3>
+<p><code>shelf.json</code> is parsed into <code>ShelfManifest</code> → <code>PackManifest</code> → <code>Ability</code> enums:</p>
+<table>
+<tr><th>Type</th><th>Purpose</th></tr>
+<tr><td><code>ShelfManifest</code></td><td>Identity, description, origin/scope, mode, and contained packs</td></tr>
+<tr><td><code>PackManifest</code></td><td>Pack id/name/version/description with typed abilities</td></tr>
+<tr><td><code>Ability</code></td><td><code>Tool</code>, <code>Command</code>, <code>Hook</code>, <code>Context</code></td></tr>
+<tr><td><code>Grant</code></td><td>Read/Write/Network/Process/Secret/Browser permission intent metadata</td></tr>
+<tr><td><code>Exposure</code></td><td>Hidden / OnDemand / Visible model-facing exposure level</td></tr>
+</table>
+
+<h3>Signals and Effects Runtime</h3>
+<p>Shelves can receive lifecycle signals and emit effects:</p>
+<table>
+<tr><th>Signals</th><th>Typical Use</th></tr>
+<tr><td><code>load</code>, <code>prompt</code>, <code>tool(before|after)</code>, <code>turn(start|end)</code>, <code>compact</code>, <code>shutdown</code></td><td>Instrument workflows, context shaping, policy hooks</td></tr>
+</table>
+<table>
+<tr><th>Effects</th><th>Behavior</th></tr>
+<tr><td><code>note</code></td><td>Diagnostic annotation</td></tr>
+<tr><td><code>context</code></td><td>Inject prioritized context text</td></tr>
+<tr><td><code>block</code></td><td>Hard-stop signal flow with explicit reason</td></tr>
+<tr><td><code>rewrite_tool</code></td><td>Transform tool input payload before execution</td></tr>
+<tr><td><code>state</code></td><td>Persist shelf-scoped state key/value</td></tr>
+</table>
+<p><code>Block</code> effects terminate flow early by design.</p>
+
+<h3>Discovery and Scope Precedence</h3>
+<table>
+<tr><th>Scope</th><th>Rank</th><th>Location</th><th>Intent</th></tr>
+<tr><td><code>Core</code></td><td>0</td><td>Bundled shelves</td><td>Base defaults</td></tr>
+<tr><td><code>User</code></td><td>1</td><td><code>~/.dext/shelves</code></td><td>User-level customization</td></tr>
+<tr><td><code>Project</code></td><td>2</td><td><code>.dext/shelves</code></td><td>Repo-specific policy/context</td></tr>
+<tr><td><code>Run</code></td><td>3</td><td><code>DEXT_SHELVES_DIR</code></td><td>Per-invocation highest-priority overrides</td></tr>
+</table>
+<p><code>resolve()</code> keeps one winning ability per key using tuple ordering by scope rank and stable discovery order. This gives deterministic override semantics.</p>
+
+<h3>Prompt and CLI Surfaces</h3>
+<ul>
+<li><code>render_registry_listing()</code> powers <code>dext shelves</code> / <code>/shelves</code> operator visibility.</li>
+<li><code>registry_summary_for_prompt()</code> injects compact typed ability summaries into model context.</li>
+<li>Ability metadata is provider-neutral and does not modify the external tool schema.</li>
+</ul>
+
+<h3>Methodology for Building Shelf Ecosystems</h3>
+<ol>
+<li>Start with pure packs; add shelf metadata only for reusable capability contracts.</li>
+<li>Define ability keys as stable API-like surfaces.</li>
+<li>Use project scope for repository policy, user scope for personal defaults, run scope for experiments.</li>
+<li>Treat <code>shelf.json</code> as versioned interface documentation and test precedence resolution.</li>
+</ol>
+</div>
+</section>
+<h1 id="testing-perf">Testing &amp; Performance</h1>
+
+<section class="collapsible-section">
+<h2 id="testing" class="collapsible-header">Testing</h2>
+<div class="collapsible-content">
+<h3>Unit Tests (main_tests.rs)</h3>
+<p>~8,000 lines of tests covering:</p>
+<ul>
+<li>Provider catalog loading, normalization, and model resolution</li>
+<li>Auth store operations (save, load, normalize)</li>
+<li>Session header parsing and backwards compatibility</li>
+<li>Tool input validation and risk classification</li>
+<li>Bash guardrails and sudo detection</li>
+<li>Memory merge algorithms (section-aware and recall)</li>
+<li>Checkpoint creation and restore logic</li>
+<li>Objective tracking and satisfaction assessment</li>
+<li>URL host extraction and bulk network detection</li>
+</ul>
+<p>Run with: <code>cargo test --release</code></p>
+<h3>TUI Smoke Test (tests/tui_smoke.rs)</h3>
+<p>Spawns the real Dext binary in a Unix PTY at various terminal sizes (80×24, 120×40, 180×40) and verifies:</p>
+<ul>
+<li>Application launches and shows version, sandbox, model info</li>
+<li>Help keymap is visible when <code>?</code> is pressed</li>
+<li>Clean exit on Ctrl+D with success status</li>
+<li>No crash markers (<code>panicked at</code>, <code>[error]</code>)</li>
+</ul>
+<p>Run with: <code>cargo test --release --test tui_smoke -- --nocapture</code></p>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="benchmarks" class="collapsible-header">Benchmarks (benches/dext_bench.rs)</h2>
+<div class="collapsible-content">
+<p>Criterion benchmarks for performance-critical paths:</p>
+<table>
+<tr><th>Benchmark</th><th>What it measures</th></tr>
+<tr><td><code>sse_parse/stream_512_deltas</code></td><td>SSE event parsing throughput (512 delta events)</td></tr>
+<tr><td><code>tool_read_file/100k_linebuf</code></td><td>Line-numbered file reading with cap (100KB file)</td></tr>
+<tr><td><code>session_serialize/1k_messages</code></td><td>JSON serialization of 1000 messages</td></tr>
+<tr><td><code>log_append</code></td><td>Log append: full-rewrite vs fast-append (100 events, 64KB cap)</td></tr>
+<tr><td><code>json_parse/sse_delta_event</code></td><td>Single SSE delta JSON parse latency</td></tr>
+</table>
+<p>Run with: <code>cargo bench</code></p>
+<h3>Build Profile</h3>
+<p>Release builds use: <code>lto = false</code>, <code>codegen-units = 16</code>, <code>strip = "symbols"</code> — optimized for build speed while keeping binary size small.</p>
+</div>
+</section>
+<h1 id="cli-reference">Reference</h1>
+
+<section class="collapsible-section">
+<h2 id="cli-reference-cmds" class="collapsible-header">CLI Reference</h2>
+<div class="collapsible-content">
+<table>
+<tr><th>Command</th><th>Description</th></tr>
+<tr><td><code>dext</code></td><td>Start interactive session</td></tr>
+<tr><td><code>dext "prompt"</code></td><td>One-shot task</td></tr>
+<tr><td><code>dext -p</code></td><td>Read prompt from stdin</td></tr>
+<tr><td><code>dext --resume</code></td><td>Resume latest session</td></tr>
+<tr><td><code>dext --fork</code></td><td>Fork latest session into new session</td></tr>
+<tr><td><code>dext --session &lt;name&gt;</code></td><td>Load named session</td></tr>
+<tr><td><code>dext --cd &lt;dir&gt;</code></td><td>Change working directory</td></tr>
+<tr><td><code>dext --no-session</code></td><td>Don't save session</td></tr>
+<tr><td><code>dext --frugal</code></td><td>Low-token mode (lean schemas, reduced context)</td></tr>
+<tr><td><code>dext --eval</code></td><td>Run eval harness</td></tr>
+<tr><td><code>dext --output json|stream-json</code></td><td>Machine-readable output</td></tr>
+<tr><td><code>dext --effort off|low|medium|high|xhigh</code></td><td>Thinking effort</td></tr>
+<tr><td><code>dext --approval ask|auto-read|auto-write|never|always</code></td><td>Approval profile</td></tr>
+<tr><td><code>dext --budget &lt;amount&gt;</code></td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
+</table>
+<h3>Auth Subcommands</h3>
+<table>
+<tr><th>Command</th><th>Description</th></tr>
+<tr><td><code>dext auth providers</code></td><td>List available providers</td></tr>
+<tr><td><code>dext auth login &lt;provider&gt; [key]</code></td><td>Login to a provider</td></tr>
+<tr><td><code>dext auth logout &lt;provider&gt;</code></td><td>Remove stored credentials</td></tr>
+<tr><td><code>dext auth status</code></td><td>Show auth status for all providers</td></tr>
+</table>
+<h3>Other Subcommands</h3>
+<table>
+<tr><th>Command</th><th>Description</th></tr>
+<tr><td><code>dext undo --list</code></td><td>List recovery checkpoints</td></tr>
+<tr><td><code>dext undo --apply</code></td><td>Restore latest checkpoint</td></tr>
+<tr><td><code>dext memory check</code></td><td>Check merge driver registration</td></tr>
+<tr><td><code>dext memory register</code></td><td>Register merge drivers</td></tr>
+<tr><td><code>dext pack list</code></td><td>List available packs</td></tr>
+<tr><td><code>dext pack inspect &lt;name&gt;</code></td><td>Show pack details</td></tr>
+<tr><td><code>dext pack run &lt;name&gt; "task"</code></td><td>Run a pack</td></tr>
+<tr><td><code>dext shelves</code></td><td>List shelf manifests and abilities</td></tr>
+</table>
+</div>
+</section>
+<section class="collapsible-section">
+<h2 id="slash-commands" class="collapsible-header">Slash Commands</h2>
+<div class="collapsible-content">
+<table>
+<tr><th>Command</th><th>Description</th></tr>
+<tr><td><code>/help</code></td><td>Show available commands</td></tr>
+<tr><td><code>/quit</code>, <code>/exit</code></td><td>Exit Dext</td></tr>
+<tr><td><code>/reset</code></td><td>Clear conversation history</td></tr>
+<tr><td><code>/tools</code></td><td>List available tools</td></tr>
+<tr><td><code>/history</code></td><td>Show turn count and last 5 messages</td></tr>
+<tr><td><code>/system [text]</code></td><td>Show or replace system prompt</td></tr>
+<tr><td><code>/allow &lt;tool&gt;</code></td><td>Auto-approve a specific tool for this session</td></tr>
+<tr><td><code>/revoke &lt;tool&gt;</code></td><td>Remove auto-approval for a tool</td></tr>
+<tr><td><code>/allowed</code></td><td>List auto-approved tools</td></tr>
+<tr><td><code>/trust [on|off|status]</code></td><td>Auto-approve all gated tools</td></tr>
+<tr><td><code>/approval [profile]</code></td><td>Set approval profile</td></tr>
+<tr><td><code>/sandbox-profile [profile]</code></td><td>Set sandbox: read-only, workspace-write, danger-full-access</td></tr>
+<tr><td><code>/effort [level]</code></td><td>Set thinking effort: off, low, medium, high, xhigh</td></tr>
+<tr><td><code>/model [name]</code></td><td>Show or change model</td></tr>
+<tr><td><code>/provider [id]</code></td><td>Show or change provider</td></tr>
+<tr><td><code>/models</code></td><td>List available models</td></tr>
+<tr><td><code>/providers</code></td><td>List providers and auth status</td></tr>
+<tr><td><code>/login &lt;provider&gt; [key]</code></td><td>Login to a provider</td></tr>
+<tr><td><code>/logout &lt;provider&gt;</code></td><td>Logout from a provider</td></tr>
+<tr><td><code>/compact [N%]</code></td><td>Run compaction or set threshold</td></tr>
+<tr><td><code>/context [mode]</code></td><td>Set context mode: standard, frugal, tiny</td></tr>
+<tr><td><code>/budget [cap]</code></td><td>Set or show budget cap</td></tr>
+<tr><td><code>/browser [off|agent-browser|status]</code></td><td>Browser automation control</td></tr>
+<tr><td><code>/subagent &lt;task&gt; [options]</code></td><td>Run a subagent task</td></tr>
+<tr><td><code>/pack list|inspect|run</code></td><td>Pack management</td></tr>
+<tr><td><code>/shelves</code></td><td>Show shelf registry</td></tr>
+<tr><td><code>/undo [--list|--apply]</code></td><td>Recovery checkpoint management</td></tr>
+<tr><td><code>/memory check|register</code></td><td>Memory merge driver management</td></tr>
+</table>
+</div>
+</section>
+<section class="collapsible-section">
+<h2 id="tools-reference" class="collapsible-header">Tool Reference</h2>
+<div class="collapsible-content">
+<p>18 provider-visible tools are available. Each has a full and lean description variant.</p>
+<h3>File Operations</h3>
+<table>
+<tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
+<tr><td><code>read_file</code></td><td>Read</td><td>Read file with line numbers. Explicit offset+limit gets larger cap.</td></tr>
+<tr><td><code>read_symbol</code></td><td>Read</td><td>Locate a source symbol or block around a line number.</td></tr>
+<tr><td><code>write_file</code></td><td>Write</td><td>Write content to file, creating parent dirs. Overwrites existing.</td></tr>
+<tr><td><code>edit_file</code></td><td>Write</td><td>Replace exactly one occurrence of old_string with new_string.</td></tr>
+<tr><td><code>multi_edit</code></td><td>Write</td><td>Batch of exact-string edits applied atomically to one file.</td></tr>
+</table>
+<h3>Search &amp; Discovery</h3>
+<table>
+<tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
+<tr><td><code>fd</code></td><td>Read</td><td>Find files by regex pattern (fd).</td></tr>
+<tr><td><code>rg</code></td><td>Read</td><td>Search file contents with ripgrep.</td></tr>
+<tr><td><code>fzf</code></td><td>Read</td><td>Non-interactive fuzzy filter.</td></tr>
+</table>
+<h3>Shell &amp; Process</h3>
+<table>
+<tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
+<tr><td><code>bash</code></td><td>Varies</td><td>Execute shell command with pipefail. Risk classified.</td></tr>
+<tr><td><code>awk</code></td><td>Varies</td><td>AWK text processor. Optional stdin.</td></tr>
+</table>
+<h3>Data Processing</h3>
+<table>
+<tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
+<tr><td><code>jq</code></td><td>Read</td><td>Query/transform JSON.</td></tr>
+<tr><td><code>csvkit</code></td><td>Varies</td><td>CSV processing suite: csvcut, csvstat, csvgrep, csvjson, etc.</td></tr>
+</table>
+<h3>HTTP &amp; Browser</h3>
+<table>
+<tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
+<tr><td><code>http</code></td><td>Varies</td><td>HTTPie-style HTTP client.</td></tr>
+<tr><td><code>browser</code></td><td>Write</td><td>Optional agent-browser automation.</td></tr>
+</table>
+<h3>Git Operations</h3>
+<table>
+<tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
+<tr><td><code>git_diff</code></td><td>Read</td><td>Show git diff. Prefer stat=true first.</td></tr>
+<tr><td><code>git_log</code></td><td>Read</td><td>Show recent git log entries.</td></tr>
+<tr><td><code>git_commit</code></td><td>Write</td><td>Stage files and create commit.</td></tr>
+</table>
+<h3>Task Management</h3>
+<table>
+<tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
+<tr><td><code>todo_read</code></td><td>Read</td><td>Read project todo list.</td></tr>
+<tr><td><code>todo_write</code></td><td>Write</td><td>Replace project todo list.</td></tr>
+</table>
+</div>
+</section>
+<section class="collapsible-section">
+<h2 id="env-vars" class="collapsible-header">Environment Variables</h2>
+<div class="collapsible-content">
+<table>
+<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+<tr><td><code>DEXT_HOME</code></td><td><code>~/.dext</code></td><td>Dext state directory</td></tr>
+<tr><td><code>DEXT_SESSIONS_DIR</code></td><td>Project-scoped</td><td>Override sessions directory</td></tr>
+<tr><td><code>DEXT_LOGS_DIR</code></td><td>Project-scoped</td><td>Override logs directory</td></tr>
+<tr><td><code>DEXT_LOG_ARCHIVES</code></td><td>0</td><td>Number of log archives to keep (max 16)</td></tr>
+<tr><td><code>DEXT_PROVIDER</code></td><td>Catalog active</td><td>Active provider ID</td></tr>
+<tr><td><code>DEXT_PROFILE</code></td><td>Catalog active</td><td>Alias for DEXT_PROVIDER</td></tr>
+<tr><td><code>DEXT_API_PROVIDER</code></td><td>Catalog active</td><td>Provider selection by API family</td></tr>
+<tr><td><code>DEXT_API_KEY</code></td><td>—</td><td>Override API key for any provider</td></tr>
+<tr><td><code>DEXT_MODEL</code></td><td>Profile default</td><td>Override model for any provider</td></tr>
+<tr><td><code>DEXT_MODEL_FORCE</code></td><td>false</td><td>Force DEXT_MODEL even if incompatible</td></tr>
+<tr><td><code>DEXT_MODEL_{PROVIDER}</code></td><td>—</td><td>Provider-specific model override</td></tr>
+<tr><td><code>DEXT_BASE_URL</code></td><td>Profile default</td><td>Override base URL for any provider</td></tr>
+<tr><td><code>DEXT_CONTEXT_MODE</code></td><td>standard</td><td>Context mode: standard, frugal, tiny</td></tr>
+<tr><td><code>DEXT_TOOL_PROFILE</code></td><td>lean</td><td>Tool schema profile: full, lean</td></tr>
+<tr><td><code>DEXT_MUTATION_PREVIEW</code></td><td>simple</td><td>Mutation preview mode: off, simple, git</td></tr>
+<tr><td><code>DEXT_BUDGET_CAP</code></td><td>—</td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
+<tr><td><code>DEXT_CONTEXT_WINDOW_TOKENS</code></td><td>Profile default</td><td>Override context window size</td></tr>
+<tr><td><code>DEXT_BASH_TIMEOUT_SECS</code></td><td>60</td><td>Default bash command timeout</td></tr>
+<tr><td><code>DEXT_ALLOW_BREAK_SYSTEM_PACKAGES</code></td><td>false</td><td>Allow --break-system-packages pip flag</td></tr>
+<tr><td><code>DEXT_SUDO_ASKPASS</code></td><td>—</td><td>Custom askpass helper for sudo</td></tr>
+<tr><td><code>DEXT_SHELVES_DIR</code></td><td>—</td><td>Additional shelf directories</td></tr>
+<tr><td><code>DEXT_PACKS_DIR</code></td><td>—</td><td>Additional pack directories</td></tr>
+<tr><td><code>DEXT_SESSION_TAG</code></td><td>PID</td><td>Session tag for checkpoint ref names</td></tr>
+<tr><td><code>ANTHROPIC_API_KEY</code></td><td>—</td><td>Anthropic API key</td></tr>
+<tr><td><code>OPENAI_API_KEY</code></td><td>—</td><td>OpenAI API key</td></tr>
+<tr><td><code>ZAI_API_KEY</code></td><td>—</td><td>ZAI GLM API key</td></tr>
+<tr><td><code>DEEPSEEK_API_KEY</code></td><td>—</td><td>DeepSeek API key</td></tr>
+</table>
+</div>
+</section>
+<section class="collapsible-section">
+<h2 id="providers" class="collapsible-header">Provider Details</h2>
+<div class="collapsible-content">
+<h3>GLM (ZAI)</h3>
+<ul>
+<li>Default provider. Uses Anthropic-compatible API at <code>api.z.ai/api/anthropic</code></li>
+<li>Models: glm-4.6, glm-5.0, glm-5.1 — Context: 200K tokens</li>
+<li>Auth: API key via <code>ZAI_API_KEY</code> or <code>dext auth login glm &lt;key&gt;</code></li>
+</ul>
+<h3>ChatGPT / Codex</h3>
+<ul>
+<li>Uses OpenAI OAuth flow with local callback server on port 1455</li>
+<li>Models: gpt-5.4, gpt-5.4-mini, gpt-5.5, gpt-5.3-codex, o3, o4-mini, gpt-4.1 (1M ctx)</li>
+<li>Context: 272K tokens (model-specific) — Auth: OAuth via <code>dext auth login chatgpt</code></li>
+</ul>
+<h3>OpenAI API</h3>
+<ul>
+<li>Standard OpenAI Platform API</li>
+<li>Models: gpt-5, gpt-5-mini, gpt-4.1, gpt-4o, o3, o4-mini — Context: 400K tokens</li>
+<li>Auth: API key via <code>OPENAI_API_KEY</code> or <code>dext auth login openai &lt;key&gt;</code></li>
+</ul>
+<h3>Anthropic</h3>
+<ul>
+<li>Models: claude-sonnet-4-5, claude-opus-4-1, claude-haiku-4-5 — Context: 200K tokens</li>
+<li>Auth: API key via <code>ANTHROPIC_API_KEY</code> or <code>dext auth login anthropic &lt;key&gt;</code></li>
+</ul>
+<h3>DeepSeek</h3>
+<ul>
+<li>OpenAI-compatible API</li>
+<li>Models: deepseek-chat, deepseek-reasoner — Context: 128K tokens</li>
+</ul>
+<h3>Local (llama.cpp)</h3>
+<ul>
+<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — Context: 4K tokens</li>
+</ul>
+</div>
+</section>
+
+<section class="collapsible-section">
+<h2 id="config-files" class="collapsible-header">Configuration Files</h2>
+<div class="collapsible-content">
+<h3><code>providers.json</code> (~/.dext/providers.json)</h3>
+<p>Provider catalog with merged built-in + custom profiles. Editable via <code>/provider</code> and <code>/model</code> commands. Auto-normalized on load.</p>
+<h3><code>auth.json</code> (~/.dext/auth.json)</h3>
+<p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types.</p>
+<h3><code>DEXT.md</code> (project root)</h3>
+<p>Project-specific context injected into the system prompt. Auto-detected from the sandbox root.</p>
+<h3><code>MEMORY.md</code> (project root)</h3>
+<p>Durable long-form memory for the project. Section-aware merge driver prevents data loss during concurrent edits.</p>
+<h3><code>recall.md</code> (project root)</h3>
+<p>Compact prompt-facing recall cache. Line-based union merge for safe concurrent edits.</p>
+<h3><code>.gitattributes</code></h3>
+<p>When memory merge is registered, entries are added for <code>MEMORY.md merge=dext-memory</code> and <code>recall.md merge=dext-recall</code>.</p>
+<h3><code>hooks.json</code> (project .dext/)</h3>
+<p>Project hooks configuration (not the same as pack <code>phooks.json</code>).</p>
+</div>
+</section>
+
+<hr>
+<p style="color:var(--dim);font-size:.85rem;margin-top:3rem">Generated from Dext source code. Last updated: 2025. For the latest, see <a href="https://github.com/SiliconState/Dext">github.com/SiliconState/Dext</a>.</p>
+</main>
+<script>
+(function(){
+// Theme toggle
+const root=document.documentElement,stored=localStorage.getItem('dext-docs-theme');
+if(stored)root.setAttribute('data-theme',stored);
+document.getElementById('theme-toggle').addEventListener('click',()=>{
+const t=root.getAttribute('data-theme')==='dark'?'light':'dark';
+root.setAttribute('data-theme',t);localStorage.setItem('dext-docs-theme',t);
+});
+
+// Collapsible nav sections
+document.querySelectorAll('.nav-section').forEach(btn=>{
+btn.addEventListener('click',()=>{
+btn.classList.toggle('collapsed');
+const ul=document.getElementById(btn.dataset.target);
+if(ul)ul.classList.toggle('hidden');
+});
+});
+
+// Collapsible content sections
+document.querySelectorAll('.collapsible-header').forEach(h=>{
+h.addEventListener('click',()=>{
+h.classList.toggle('collapsed');
+const c=h.nextElementSibling;
+if(c&&c.classList.contains('collapsible-content')){
+if(h.classList.contains('collapsed')){
+c.style.maxHeight='0';c.classList.add('collapsed');
+}else{
+c.classList.remove('collapsed');
+c.style.maxHeight=c.scrollHeight+'px';
+setTimeout(()=>c.style.maxHeight='none',350);
+}
+}
+});
+});
+
+// Copy buttons on pre blocks
+document.querySelectorAll('pre').forEach(pre=>{
+const btn=document.createElement('button');
+btn.className='copy-btn';btn.textContent='Copy';
+btn.addEventListener('click',()=>{
+navigator.clipboard.writeText(pre.textContent.replace(/^Copy$/m,'').trim()).then(()=>{
+btn.textContent='Copied!';btn.classList.add('copied');
+setTimeout(()=>{btn.textContent='Copy';btn.classList.remove('copied');},1500);
+});
+});
+pre.style.position='relative';pre.appendChild(btn);
+});
+
+// Scroll spy
+const navLinks=document.querySelectorAll('.nav-items a');
+const sections=[];
+navLinks.forEach(a=>{
+const el=document.getElementById(a.getAttribute('href').slice(1));
+if(el)sections.push({el,a});
+});
+function updateSpy(){
+let current=null;
+for(let i=sections.length-1;i>=0;i--){
+if(sections[i].el.getBoundingClientRect().top<=120){current=sections[i];break;}
+}
+navLinks.forEach(a=>a.classList.remove('active'));
+if(current)current.a.classList.add('active');
+// Auto-expand nav group containing active item
+if(current){
+const group=current.a.closest('.nav-group');
+if(group){
+const btn=group.querySelector('.nav-section');
+const ul=group.querySelector('.nav-items');
+if(btn&&btn.classList.contains('collapsed'))btn.classList.remove('collapsed');
+if(ul&&ul.classList.contains('hidden'))ul.classList.remove('hidden');
+}
+}
+}
+window.addEventListener('scroll',updateSpy,{passive:true});
+updateSpy();
+
+// Nav search filter
+const searchInput=document.getElementById('nav-search');
+if(searchInput){
+searchInput.addEventListener('input',()=>{
+const q=searchInput.value.toLowerCase().trim();
+document.querySelectorAll('.nav-items').forEach(ul=>{
+let any=false;
+ul.querySelectorAll('li').forEach(li=>{
+const match=!q||li.textContent.toLowerCase().includes(q);
+li.style.display=match?'':'none';
+if(match)any=true;
+});
+if(q){ul.classList.remove('hidden');
+const btn=ul.previousElementSibling;
+if(btn&&btn.classList.contains('nav-section'))btn.classList.remove('collapsed');
+}
+if(!q&&!any)ul.classList.add('hidden');
+});
+});
+}
+
+// Back to top
+const btt=document.getElementById('back-to-top');
+window.addEventListener('scroll',()=>{
+btt.classList.toggle('visible',window.scrollY>400);
+},{passive:true});
+btt.addEventListener('click',()=>window.scrollTo({top:0,behavior:'smooth'}));
+
+// Mobile menu toggle
+const sidebar=document.getElementById('sidenav');
+document.getElementById('menu-toggle').addEventListener('click',()=>{
+sidebar.classList.toggle('open');
+});
+sidebar.querySelectorAll('a').forEach(a=>{
+a.addEventListener('click',()=>sidebar.classList.remove('open'));
+});
+})();
+</script>
+</body>
+</html>
