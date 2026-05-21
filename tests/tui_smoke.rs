@@ -28,6 +28,50 @@ fn tui_smoke_launches_narrow_and_wide_terminals() {
     run_tui_smoke(TUI_WIDE_COLS, TUI_WIDE_ROWS, false);
 }
 
+#[test]
+fn tui_smoke_shift_enter_inserts_newline() {
+    let temp = TempDir::new("dext-tui-shift-enter").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&sandbox).expect("sandbox");
+    fs::create_dir_all(&dext_home).expect("dext home");
+    fs::create_dir_all(&home).expect("home");
+
+    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).expect("open pty");
+    let mut child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &dext_home,
+        &home,
+        &[("TERM_PROGRAM", "WezTerm")],
+    )
+    .expect("spawn dext in pty");
+
+    assert_visible(&mut pty, &mut child, "Dext v", Duration::from_secs(5));
+    pty.write_all_retry(b"hello").expect("send text");
+    pty.write_all_retry(b"\x1b[13;2u")
+        .expect("send Shift+Enter CSI-u");
+    pty.write_all_retry(b"world").expect("send more text");
+    assert_visible(&mut pty, &mut child, "hello", Duration::from_secs(2));
+    assert_visible(&mut pty, &mut child, "world", Duration::from_secs(2));
+    let visible = pty.visible_text();
+    assert!(
+        visible.contains("│hello") && visible.contains("│     world"),
+        "{}",
+        tail(&visible, 3000)
+    );
+
+    pty.write_all_retry(&[0x04]).expect("send Ctrl+D");
+    let status = wait_for_exit(&mut child, Duration::from_secs(5), || pty.visible_text())
+        .expect("wait for dext exit");
+    assert!(
+        status.success(),
+        "visible tail:\n{}",
+        tail(&pty.visible_text(), 3000)
+    );
+}
+
 fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
     let temp = TempDir::new("dext-tui-smoke").expect("temp dir");
     let sandbox = temp.path().join("sandbox");
@@ -49,6 +93,7 @@ fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
         pty.write_all_retry(b"?").expect("send help key");
         assert_visible(&mut pty, &mut child, "keymap", Duration::from_secs(3));
         assert_visible(&mut pty, &mut child, "Ctrl+O", Duration::from_secs(2));
+        assert_visible(&mut pty, &mut child, "Ctrl+T", Duration::from_secs(2));
         assert_visible(
             &mut pty,
             &mut child,
@@ -77,6 +122,16 @@ fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
 }
 
 fn spawn_dext(pty: &Pty, sandbox: &Path, dext_home: &Path, home: &Path) -> io::Result<Child> {
+    spawn_dext_with_env(pty, sandbox, dext_home, home, &[])
+}
+
+fn spawn_dext_with_env(
+    pty: &Pty,
+    sandbox: &Path,
+    dext_home: &Path,
+    home: &Path,
+    extra_env: &[(&str, &str)],
+) -> io::Result<Child> {
     let slave = pty.slave_fd();
     let stdin = unsafe { File::from_raw_fd(dup_fd(slave)?) };
     let stdout = unsafe { File::from_raw_fd(dup_fd(slave)?) };
@@ -98,6 +153,10 @@ fn spawn_dext(pty: &Pty, sandbox: &Path, dext_home: &Path, home: &Path) -> io::R
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     unsafe {
         cmd.pre_exec(move || {

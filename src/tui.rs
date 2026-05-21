@@ -1,7 +1,8 @@
 use anyhow::Result;
 use crossterm::event::{
     self as cterm_event, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::enable_raw_mode;
 use ratatui::Terminal;
@@ -42,6 +43,7 @@ const TOOL_DENSITY_SEPARATOR_EVERY: usize = 10;
 const RG_LINE_TRUNCATE_CELLS: usize = 220;
 const TRANSCRIPT_WRAP_GUARD_COLS: u16 = 1;
 const INPUT_MAX_PANEL_ROWS: u16 = 12;
+const PASTE_WORD_THRESHOLD: usize = 50;
 const CONTEXT_BAR_CELLS: usize = 10;
 const WORK_MAP_DRAWER_MAX_ROWS: usize = 10;
 const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 8;
@@ -89,6 +91,13 @@ struct ToolChunk {
     call_tag: String,
     summary: String,
     content: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputPreviewSpan {
+    start: usize,
+    end: usize,
+    words: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -780,6 +789,7 @@ struct TuiState {
     live_tools: Vec<LiveTool>,
     input: String,
     cursor: usize,
+    input_preview_spans: Vec<InputPreviewSpan>,
     history: VecDeque<String>,
     history_idx: Option<usize>,
     status: String,
@@ -874,6 +884,7 @@ impl TuiState {
             live_tools: Vec::new(),
             input: String::new(),
             cursor: 0,
+            input_preview_spans: Vec::new(),
             history: VecDeque::new(),
             history_idx: None,
             status: "ready".into(),
@@ -1125,10 +1136,86 @@ impl TuiState {
             .slash_acomp_sel
             .unwrap_or(0)
             .min(completions.len().saturating_sub(1));
-        self.input = completions[idx].text.clone();
-        self.cursor = self.input.len();
+        self.replace_input(completions[idx].text.clone());
         self.reset_slash_completion_selection();
         true
+    }
+
+    fn replace_input(&mut self, input: String) {
+        self.input = input;
+        self.cursor = self.input.len();
+        self.input_preview_spans.clear();
+        self.input_display_override = None;
+    }
+
+    fn clear_input(&mut self) {
+        self.replace_input(String::new());
+    }
+
+    fn insert_input_str(&mut self, text: &str) {
+        let at = self.cursor;
+        self.input.insert_str(at, text);
+        let len = text.len();
+        for span in &mut self.input_preview_spans {
+            if at <= span.start {
+                span.start += len;
+                span.end += len;
+            } else if at < span.end {
+                span.end += len;
+                span.words = count_words(&self.input[span.start..span.end]);
+            }
+        }
+        self.cursor += len;
+    }
+
+    fn insert_input_char(&mut self, c: char) {
+        let mut buf = [0u8; 4];
+        self.insert_input_str(c.encode_utf8(&mut buf));
+    }
+
+    fn remove_input_range(&mut self, start: usize, end: usize) {
+        self.input.replace_range(start..end, "");
+        if start < end {
+            let len = end - start;
+            for span in &mut self.input_preview_spans {
+                if end <= span.start {
+                    span.start -= len;
+                    span.end -= len;
+                } else if start >= span.end {
+                    continue;
+                } else if start <= span.start && end >= span.end {
+                    span.end = span.start;
+                    span.words = 0;
+                } else {
+                    let overlap_start = start.max(span.start);
+                    let overlap_end = end.min(span.end);
+                    span.end -= overlap_end.saturating_sub(overlap_start);
+                    if start < span.start {
+                        let prefix_removed = span.start - start;
+                        span.start -= prefix_removed;
+                        span.end -= prefix_removed;
+                    }
+                    if span.start < span.end && span.end <= self.input.len() {
+                        span.words = count_words(&self.input[span.start..span.end]);
+                    }
+                }
+            }
+        }
+        self.cursor = self.cursor.min(self.input.len());
+        self.refresh_input_display_override();
+    }
+
+    fn refresh_input_display_override(&mut self) {
+        let input_len = self.input.len();
+        self.input_preview_spans.retain(|span| {
+            span.start < span.end
+                && span.end <= input_len
+                && self.input.is_char_boundary(span.start)
+                && self.input.is_char_boundary(span.end)
+                && span.words > PASTE_WORD_THRESHOLD
+        });
+        self.input_display_override =
+            abstract_input_with_spans(&self.input, &self.input_preview_spans);
     }
 
     fn work_map_is_active(&self) -> bool {
@@ -3188,6 +3275,14 @@ fn input_editor_text(state: &TuiState) -> Cow<'_, str> {
     }
 }
 
+fn input_display_cursor(state: &TuiState) -> usize {
+    if state.input_display_override.is_some() {
+        input_editor_text(state).len()
+    } else {
+        state.cursor
+    }
+}
+
 fn input_panel_height(state: &TuiState, area_height: u16, area_width: u16) -> u16 {
     let available = area_height.saturating_sub(1).max(1);
     let min_panel = 3.min(available);
@@ -3197,7 +3292,9 @@ fn input_panel_height(state: &TuiState, area_height: u16, area_width: u16) -> u1
         .min(available);
 
     let cols = area_width.saturating_sub(2).max(1) as usize;
-    let (wrapped, _, _) = wrap_input_visual(&input_editor_text(state), state.cursor, cols);
+    let editor_text = input_editor_text(state);
+    let (wrapped, _, _) =
+        wrap_input_visual(editor_text.as_ref(), input_display_cursor(state), cols);
     let text_rows = wrapped.len().max(1) as u16;
     let drawer_rows = work_map_drawer_height(state, area_width) as u16;
     let desired = text_rows.saturating_add(2).saturating_add(drawer_rows);
@@ -3229,6 +3326,7 @@ fn count_words(s: &str) -> usize {
     s.split_whitespace().count()
 }
 
+#[cfg(test)]
 fn split_display_paragraphs(s: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0;
@@ -3257,31 +3355,66 @@ fn split_display_paragraphs(s: &str) -> Vec<&str> {
     result
 }
 
+#[cfg(test)]
 fn abstract_input_for_display(input: &str) -> Option<String> {
-    const PASTE_WORD_THRESHOLD: usize = 50;
-
     let paragraphs = split_display_paragraphs(input);
-    let mut out = String::with_capacity(input.len().min(512));
-    let mut changed = false;
-    let mut paste_idx = 0usize;
-    let mut first = true;
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+
     for para in paragraphs {
-        if !first {
-            out.push_str("\n\n");
-        }
-        first = false;
+        let leading = input[offset..]
+            .find(para)
+            .map(|relative| offset + relative)
+            .unwrap_or(offset);
+        let end = leading.saturating_add(para.len());
         let words = count_words(para);
         if words > PASTE_WORD_THRESHOLD {
-            paste_idx += 1;
-            changed = true;
-            out.push_str(&format!(
-                "[paste #{paste_idx} +{words} words hidden — full content preserved for Enter]"
-            ));
-        } else {
-            out.push_str(para);
+            spans.push(InputPreviewSpan {
+                start: leading,
+                end,
+                words,
+            });
         }
+        offset = end;
     }
-    changed.then_some(out)
+
+    abstract_input_with_spans(input, &spans)
+}
+
+fn abstract_input_with_spans(input: &str, spans: &[InputPreviewSpan]) -> Option<String> {
+    if spans.is_empty() {
+        return None;
+    }
+
+    let mut sorted = spans
+        .iter()
+        .filter(|span| {
+            span.start < span.end
+                && span.end <= input.len()
+                && input.is_char_boundary(span.start)
+                && input.is_char_boundary(span.end)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    sorted.sort_by_key(|span| span.start);
+
+    let mut out = String::with_capacity(input.len().min(512));
+    let mut cursor = 0usize;
+    let mut paste_idx = 0usize;
+    for span in sorted {
+        if span.start < cursor {
+            continue;
+        }
+        out.push_str(&input[cursor..span.start]);
+        paste_idx += 1;
+        out.push_str(&format!(
+            "[paste #{paste_idx} +{} words hidden — full content preserved for Enter]",
+            span.words
+        ));
+        cursor = span.end;
+    }
+    out.push_str(&input[cursor..]);
+    Some(out)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -5872,11 +6005,11 @@ fn input_hint_text(state: &TuiState) -> &'static str {
     } else if state.work_map_is_active() {
         "Enter focus · p packet · t track · Esc close"
     } else if state.input_display_override.is_some() {
-        "paste preview · Enter sends full input · edit reveals"
+        "paste preview · Enter sends full input"
     } else if state.agent_busy {
-        "steering mode · local auth secrets withheld"
+        "Steering mode · Local auth secrets withheld"
     } else {
-        "Enter send · Shift+Enter newline · Ctrl+O expand · Ctrl+I inspect"
+        ""
     }
 }
 
@@ -6036,6 +6169,8 @@ fn help_overlay_text() -> Text<'static> {
     let keymap_rows: &[(&str, &str)] = &[
         ("Enter", "submit prompt"),
         ("Shift+Enter / Alt+Enter", "insert newline"),
+        ("Ctrl+O", "toggle last tool output"),
+        ("Ctrl+T", "toggle token/status details"),
         ("Paste", "multi-line paste is inserted without auto-submit"),
         ("Esc", "clear input / close this help"),
         ("Ctrl+C", "interrupt agent (twice = quit)"),
@@ -6044,9 +6179,7 @@ fn help_overlay_text() -> Text<'static> {
             "never type sudo passwords here; use local auth prompts",
         ),
         ("Ctrl+D", "quit"),
-        ("Ctrl+O", "toggle last tool output"),
         ("Ctrl+V", "toggle thinking detail"),
-        ("Ctrl+T", "toggle token/status details"),
         ("Ctrl+I", "toggle inspector/debug pane"),
         (
             "Tab / Shift+Tab",
@@ -6545,8 +6678,9 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
 
     let wrap_cols = input_area.width.saturating_sub(2).max(1) as usize;
     let editor_text = input_editor_text(state);
+    let display_cursor = input_display_cursor(state);
     let (wrapped, cursor_row, cursor_col) =
-        wrap_input_visual(editor_text.as_ref(), state.cursor, wrap_cols);
+        wrap_input_visual(editor_text.as_ref(), display_cursor, wrap_cols);
     let inner_rows = input_area.height.saturating_sub(2).max(1) as usize;
     let drawer_height = work_map_drawer_height(state, input_area.width).min(inner_rows);
     let hint_rows = 0usize;
@@ -6579,18 +6713,16 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         lines.extend(work_map_drawer_lines(state, wrap_cols as u16, drawer_rows));
     }
 
-    let input = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title_bottom(
-                Line::from(Span::styled(
-                    input_hint_text(state),
-                    Style::default().fg(Color::DarkGray),
-                ))
-                .right_aligned(),
-            )
-            .border_style(input_border_style(state)),
-    );
+    let hint = input_hint_text(state);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(input_border_style(state));
+    if !hint.is_empty() {
+        block = block.title_bottom(
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))).right_aligned(),
+        );
+    }
+    let input = Paragraph::new(lines).block(block);
     render_widget_safe(frame, input, input_area);
 
     if state.pending_perm.is_none()
@@ -6705,9 +6837,16 @@ fn handle_paste(state: &mut TuiState, pasted: String) {
         state.status = "local secret paste withheld".to_string();
         return;
     }
-    state.input.insert_str(state.cursor, &pasted);
-    state.cursor += pasted.len();
-    state.input_display_override = abstract_input_for_display(&state.input);
+    let start = state.cursor;
+    state.insert_input_str(&pasted);
+    let end = state.cursor;
+    let words = count_words(&pasted);
+    if words > PASTE_WORD_THRESHOLD {
+        state
+            .input_preview_spans
+            .push(InputPreviewSpan { start, end, words });
+    }
+    state.refresh_input_display_override();
     if state.input_display_override.is_some() {
         state.status =
             "large paste collapsed in editor — full content preserved for Enter".to_string();
@@ -6735,10 +6874,8 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
 }
 
 fn insert_command_into_input(state: &mut TuiState, command: String) {
-    state.input = command;
-    state.cursor = state.input.len();
+    state.replace_input(command);
     state.clear_slash_completion_selection();
-    state.input_display_override = None;
 }
 
 fn handle_work_map_key(state: &mut TuiState, key: KeyEvent) -> bool {
@@ -6879,25 +7016,6 @@ fn handle_key(
         m.contains(KeyModifiers::CONTROL)
             && !m.intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META)
     };
-    let editing_key = matches!(
-        key.code,
-        KeyCode::Char(_)
-            | KeyCode::Backspace
-            | KeyCode::Delete
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Home
-            | KeyCode::End
-            | KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::Enter
-    );
-    if state.input_display_override.is_some() && editing_key && key.code != KeyCode::Enter {
-        state.input_display_override = None;
-        state.status = "paste preview cleared — editing full input".to_string();
-    }
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), m) if is_ctrl(m) => {
             if state.agent_busy {
@@ -6911,10 +7029,8 @@ fn handle_key(
                 state.quit = true;
                 let _ = agent_input.send(FromTui::Quit);
             } else {
-                state.input.clear();
-                state.cursor = 0;
+                state.clear_input();
                 state.clear_slash_completion_selection();
-                state.input_display_override = None;
                 state.status = "input cleared (Ctrl+C again to quit)".to_string();
             }
         }
@@ -6996,15 +7112,12 @@ fn handle_key(
                         state.status = "interrupting… Esc again quits".to_string();
                     }
                 } else {
-                    state.input.clear();
-                    state.cursor = 0;
+                    state.clear_input();
                     state.clear_slash_completion_selection();
-                    state.input_display_override = None;
                     state.status = "input cleared; Esc again interrupts".to_string();
                 }
             } else if !state.input.is_empty() {
-                state.input.clear();
-                state.cursor = 0;
+                state.clear_input();
                 state.clear_slash_completion_selection();
                 state.status = "input cleared".to_string();
             }
@@ -7022,9 +7135,8 @@ fn handle_key(
             }
         }
         (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) => {
-            state.input.insert(state.cursor, '\n');
-            state.cursor += 1;
-            state.input_display_override = None;
+            state.insert_input_char('\n');
+            state.refresh_input_display_override();
         }
         (KeyCode::Enter, _) => {
             state.work_map = None;
@@ -7037,10 +7149,8 @@ fn handle_key(
                     state.queue(Line_::Warn(
                         "input withheld: do not enter sudo passwords or local auth secrets in chat; use the local auth prompt".to_string(),
                     ));
-                    state.input.clear();
-                    state.cursor = 0;
+                    state.clear_input();
                     state.clear_slash_completion_selection();
-                    state.input_display_override = None;
                     state.status = "local secret withheld from provider".to_string();
                     return;
                 }
@@ -7050,10 +7160,8 @@ fn handle_key(
                 } else {
                     state.status = "queue unavailable".to_string();
                 }
-                state.input.clear();
-                state.cursor = 0;
+                state.clear_input();
                 state.clear_slash_completion_selection();
-                state.input_display_override = None;
                 return;
             }
             state.queue(Line_::TurnSep);
@@ -7065,10 +7173,8 @@ fn handle_key(
                 state.history.push_back(text.clone());
             }
             state.history_idx = None;
-            state.input.clear();
-            state.cursor = 0;
+            state.clear_input();
             state.clear_slash_completion_selection();
-            state.input_display_override = None;
             let _ = agent_input.send(FromTui::Submit(text));
         }
         (KeyCode::PageUp, _) => {
@@ -7102,10 +7208,9 @@ fn handle_key(
                     .last()
                     .map(|c| c.len_utf8())
                     .unwrap_or(0);
-                state
-                    .input
-                    .replace_range(state.cursor - prev..state.cursor, "");
-                state.cursor -= prev;
+                let start = state.cursor - prev;
+                state.remove_input_range(start, state.cursor);
+                state.cursor = start;
                 state.reset_slash_completion_selection();
             }
         }
@@ -7116,9 +7221,7 @@ fn handle_key(
                     .next()
                     .map(|c| c.len_utf8())
                     .unwrap_or(0);
-                state
-                    .input
-                    .replace_range(state.cursor..state.cursor + next, "");
+                state.remove_input_range(state.cursor, state.cursor + next);
                 state.reset_slash_completion_selection();
             }
         }
@@ -7165,8 +7268,7 @@ fn handle_key(
                 Some(i) => i.saturating_sub(1),
             };
             if let Some(prev) = state.history.get(idx) {
-                state.input = prev.clone();
-                state.cursor = state.input.len();
+                state.replace_input(prev.clone());
                 state.history_idx = Some(idx);
                 state.reset_slash_completion_selection();
             }
@@ -7179,31 +7281,39 @@ fn handle_key(
                 return;
             };
             if i + 1 < state.history.len() {
-                state.input = state.history[i + 1].clone();
-                state.cursor = state.input.len();
+                state.replace_input(state.history[i + 1].clone());
                 state.history_idx = Some(i + 1);
                 state.reset_slash_completion_selection();
             } else {
-                state.input.clear();
-                state.cursor = 0;
+                state.clear_input();
                 state.history_idx = None;
                 state.clear_slash_completion_selection();
-                state.input_display_override = None;
             }
         }
         (KeyCode::Char(c), m)
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
-            state.input.insert(state.cursor, c);
-            state.cursor += c.len_utf8();
+            state.insert_input_char(c);
+            state.refresh_input_display_override();
             state.reset_slash_completion_selection();
         }
         _ => {}
     }
 }
 
+#[cfg(unix)]
+fn terminal_supports_keyboard_enhancement() -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+fn terminal_supports_keyboard_enhancement() -> bool {
+    false
+}
+
 struct TerminalGuard {
     active: bool,
+    keyboard_enhancement_enabled: bool,
 }
 
 impl TerminalGuard {
@@ -7211,25 +7321,45 @@ impl TerminalGuard {
         enable_raw_mode()?;
         crate::session::set_tui_active(true);
 
+        let keyboard_enhancement_enabled = terminal_supports_keyboard_enhancement();
+        let keyboard_flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
         let mut out = io::stdout();
-        if let Err(err) = crossterm::execute!(
-            out,
-            EnableBracketedPaste,
-            crossterm::cursor::SetCursorStyle::SteadyBlock,
-            crossterm::cursor::Show
-        ) {
+        let execute_result = if keyboard_enhancement_enabled {
+            crossterm::execute!(
+                out,
+                EnableBracketedPaste,
+                PushKeyboardEnhancementFlags(keyboard_flags),
+                crossterm::cursor::SetCursorStyle::SteadyBlock,
+                crossterm::cursor::Show
+            )
+        } else {
+            crossterm::execute!(
+                out,
+                EnableBracketedPaste,
+                crossterm::cursor::SetCursorStyle::SteadyBlock,
+                crossterm::cursor::Show
+            )
+        };
+        if let Err(err) = execute_result {
             crate::session::restore_terminal_if_tui();
             return Err(err);
         }
 
         out.flush()?;
-        Ok(Self { active: true })
+        Ok(Self {
+            active: true,
+            keyboard_enhancement_enabled,
+        })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.active {
+            if self.keyboard_enhancement_enabled {
+                let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
+            }
             crate::session::restore_terminal_if_tui();
             self.active = false;
         }
@@ -7748,7 +7878,28 @@ mod tests {
         );
         state.agent_busy = true;
 
-        assert!(input_hint_text(&state).contains("local auth secrets withheld"));
+        assert_eq!(
+            input_hint_text(&state),
+            "Steering mode · Local auth secrets withheld"
+        );
+    }
+
+    #[test]
+    fn ready_input_hint_is_empty_and_help_lists_keymap() {
+        let state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        assert_eq!(input_hint_text(&state), "");
+
+        let help = flatten_lines(&help_overlay_text()).join("\n");
+        assert!(help.contains("Enter"), "{help}");
+        assert!(help.contains("Shift+Enter / Alt+Enter"), "{help}");
+        assert!(help.contains("Ctrl+O"), "{help}");
+        assert!(help.contains("Ctrl+I"), "{help}");
+        assert!(help.contains("Ctrl+T"), "{help}");
     }
 
     #[test]
@@ -9342,6 +9493,80 @@ mod tests {
         assert!(result.contains("[paste #2 +80 words hidden"));
         assert!(result.contains("do stuff"));
         assert!(result.contains("middle text"));
+    }
+
+    #[test]
+    fn paste_preview_survives_typing_after_collapsed_paste() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let paste = (0..60).map(|i| format!("word{i}\n")).collect::<String>();
+        handle_paste(&mut state, paste.clone());
+        let initial_preview = state.input_display_override.clone().expect("paste preview");
+        assert!(initial_preview.contains("[paste #1 +60 words hidden"));
+        assert!(!initial_preview.contains("word30"));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        for c in " done".chars() {
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
+                &tx,
+                &steering_tx,
+                &interrupt,
+            );
+        }
+
+        let preview = state.input_display_override.expect("preview after typing");
+        assert!(preview.contains("[paste #1 +60 words hidden"), "{preview}");
+        assert!(preview.ends_with(" done"), "{preview}");
+        assert!(!preview.contains("word30"), "{preview}");
+        assert_eq!(state.input, format!("{} done", paste));
+    }
+
+    #[test]
+    fn shift_or_alt_enter_inserts_newline_without_submit() {
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let mut state = TuiState::new(
+                "test-model".to_string(),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            state.replace_input("hello".to_string());
+
+            let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+            let interrupt = Arc::new(AtomicBool::new(false));
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, modifiers),
+                &submit_tx,
+                &steering_tx,
+                &interrupt,
+            );
+
+            assert_eq!(state.input, "hello\n");
+            assert!(submit_rx.try_recv().is_err());
+            assert!(steering_rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn keyboard_enhancement_is_enabled_on_unix() {
+        assert!(terminal_supports_keyboard_enhancement());
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn keyboard_enhancement_is_off_for_non_unix() {
+        assert!(!terminal_supports_keyboard_enhancement());
     }
 
     #[test]
