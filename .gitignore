@@ -27,3 +27,6 @@ __pycache__/
 /docs/*.jsonl
 Screenshot*.jpg
 Screenshot*.png
+
+MEMORY.md
+recall.md
