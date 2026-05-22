@@ -251,7 +251,46 @@ fn bash_command_advisory(command: &str) -> Option<String> {
                 .to_string(),
         );
     }
+    if background_process_without_supervisor(command) {
+        return Some(
+            "bash advisory: bash calls are atomic and Dext cleans the process group after the shell exits; &, nohup, and disown will not persist, and setsid-style detaches are unsupported because they escape Dext cleanup. For a user-requested persistent local service, use an OS supervisor instead (Linux systemd example: systemd-run --user --unit=dext-<name> --same-dir <cmd>, inspect with systemctl --user status dext-<name>, stop with systemctl --user stop dext-<name>)."
+                .to_string(),
+        );
+    }
     None
+}
+
+fn background_process_without_supervisor(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let words = shell_words(&lower);
+    command_has_background_ampersand(&lower)
+        || words.iter().any(|word| {
+            matches!(word.as_str(), "nohup" | "disown" | "setsid")
+                || word.ends_with("/nohup")
+                || word.ends_with("/setsid")
+        })
+}
+
+fn command_has_background_ampersand(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    for (idx, ch) in chars.iter().enumerate() {
+        match *ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '&' if !in_single && !in_double => {
+                let prev = idx.checked_sub(1).and_then(|pos| chars.get(pos)).copied();
+                let next = chars.get(idx + 1).copied();
+                if matches!(prev, Some('&' | '>' | '<')) || matches!(next, Some('&' | '>')) {
+                    continue;
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn cargo_test_multi_filter_advisory(command: &str) -> Option<String> {
@@ -785,6 +824,41 @@ mod tests {
             )
             .is_none()
         );
+
+        let background_amp = tool_input_advisory(
+            "bash",
+            &json!({"command": "python3 -m http.server 8000 >/tmp/dext.log 2>&1 &"}),
+        )
+        .expect("background ampersand should warn");
+        assert!(
+            background_amp.contains("bash calls are atomic"),
+            "{background_amp}"
+        );
+
+        let background = tool_input_advisory(
+            "bash",
+            &json!({"command": "nohup python3 -m http.server 8000 >/tmp/dext.log 2>&1 &"}),
+        )
+        .expect("background process should warn");
+        assert!(background.contains("bash calls are atomic"), "{background}");
+        assert!(background.contains("systemd-run --user"), "{background}");
+
+        let detached = tool_input_advisory(
+            "bash",
+            &json!({"command": "setsid python3 -m http.server 8000 >/tmp/dext.log 2>&1"}),
+        )
+        .expect("setsid detach should warn");
+        assert!(detached.contains("unsupported"), "{detached}");
+
+        assert!(
+            tool_input_advisory(
+                "bash",
+                &json!({"command": "systemd-run --user --unit=dext-preview --same-dir python3 -m http.server 8000"}),
+            )
+            .is_none()
+        );
+        assert!(tool_input_advisory("bash", &json!({"command": "echo ok && echo done"})).is_none());
+        assert!(tool_input_advisory("bash", &json!({"command": "printf '%s' ok 2>&1"})).is_none());
 
         let symbol = tool_input_advisory(
             "read_symbol",

@@ -129,6 +129,21 @@ Interactive slash commands:
 ```
 
 
+## Persistent local services
+
+Dext treats each bash call as atomic: commands run in a dedicated process group and that group is cleaned up after the shell exits, times out, or is interrupted. Do not expect `cmd &`, `nohup`, or `disown` to keep servers alive across tool calls. `setsid`-style detaches are unsupported because they escape Dext cleanup.
+
+Prefer static files or one-shot commands when possible. If the user explicitly needs a long-lived local service, use the host OS supervisor and clean it up when finished. On Linux with systemd:
+
+```bash
+systemd-run --user --unit=dext-preview --same-dir python3 -m http.server 8000
+systemctl --user status dext-preview
+journalctl --user-unit dext-preview -n 100 --no-pager
+systemctl --user stop dext-preview
+```
+
+Use `dext-` prefixes for agent-started units so they are easy to inspect and stop (`systemctl --user list-units 'dext-*'`). On macOS/Windows or Linux without systemd, use the platform's native supervisor if needed; otherwise avoid persistent background processes.
+
 ## Git safety and memory merging
 
 Dext creates lightweight Git checkpoints before approved write-risk tool calls

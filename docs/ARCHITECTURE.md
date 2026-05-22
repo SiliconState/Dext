@@ -90,13 +90,15 @@ Dext exposes a deliberately small default native tool set:
 
 - Filesystem: `read_file`, `read_symbol`, `write_file`, `edit_file`, `multi_edit`.
 - Search: `fd`, `rg`.
-- Shell/process: `bash`.
+- Shell/process: `bash` (atomic per call; the tool process group is cleaned up after exit).
 - Network: `http`.
 - Git: `git_diff`, `git_commit`.
 - Tasks: `todo_read`, `todo_write`.
 - Optional browser recipe: `browser` only when enabled.
 
 The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`. Frugal/tiny context modes force an even smaller toolset and hide `http` unless the user switches back to standard mode.
+
+Bash is intentionally transaction-like: Dext starts tool commands in their own process group and cleans that group after the shell exits or is interrupted, so shell backgrounding (`cmd &`), `nohup`, and `disown` are not a supported way to keep servers alive across tool calls. `setsid`-style detaches are also unsupported because they escape Dext cleanup. If the user explicitly needs a persistent local service, prefer OS supervision without adding a Dext daemon tool. On Linux with systemd, use `systemd-run --user --unit=dext-<name> --same-dir <cmd>`, inspect with `systemctl --user status dext-<name>`/`journalctl --user-unit dext-<name>`, and stop it with `systemctl --user stop dext-<name>` when finished. Keep unit names prefixed with `dext-`; on platforms without systemd, use the platform's native supervisor or avoid a persistent service.
 
 Lean schemas are the default to reduce prompt cost. Full schemas are available with `--tool-profile full` or `/tool-profile full`.
 

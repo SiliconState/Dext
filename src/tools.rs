@@ -170,7 +170,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "bash",
-            description: "Execute a shell command via bash -c and return exit code, stdout, and stderr. Commands run with pipefail enabled. Stdout/stderr are capped, and the process is timed out if it runs too long; set timeout for legitimate long tasks. Prefer heredocs/arrays for complex quoting, and treat unexpected stderr on exit 0 as suspicious. The unsafe pip flag '--break-system-packages' is blocked unless explicitly overridden.",
+            description: "Execute a shell command via bash -c and return exit code, stdout, and stderr. Commands run with pipefail enabled. Stdout/stderr are capped, and the process is timed out if it runs too long; set timeout for legitimate long tasks. Bash calls are atomic: Dext cleans the tool process group after the shell exits, so shell backgrounding, nohup, or disown are not persistent; setsid-style detaches are unsupported because they escape Dext cleanup. For user-requested persistent local services, prefer an OS supervisor (on Linux with systemd: systemd-run --user with a dext- unit, then inspect/stop it with systemctl --user). Prefer heredocs/arrays for complex quoting, and treat unexpected stderr on exit 0 as suspicious. The unsafe pip flag '--break-system-packages' is blocked unless explicitly overridden.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -399,7 +399,7 @@ fn lean_description(name: &str, fallback: &str) -> String {
         "write_file" => "Write file content.",
         "edit_file" => "Replace one exact string in a file.",
         "multi_edit" => "Apply atomic exact-string edits to one file.",
-        "bash" => "Run bash command with pipefail; stdout/stderr capped.",
+        "bash" => "Run atomic bash command; pipefail; stdout/stderr capped. Use supervised dext- service for persistence.",
         "fd" => "Find files by regex pattern.",
         "rg" => "Search text with ripgrep.",
         "jq" => "Run jq on JSON text or file.",

@@ -7040,14 +7040,14 @@ Project state: use todo_read/todo_write for nontrivial work. Treat DEXT.md/recal
 Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Avoid broad reads; paginate. Use read-only tools in parallel.
 Editing: always read before editing. Use edit_file for small changes, multi_edit for batches, write_file for new files. Checkpoint before large edits.
 Git: inspect status/diff before editing tracked files. Use git_commit (not raw git) for commits. Use bash git log only when history is needed.
-Shell: preserve pipefail in bash. Dext rg/fd/http are direct tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Validate external sources before scaling. On auth failures, ask for credentials.
+Shell: preserve pipefail in bash. Treat bash calls as atomic: Dext cleans the tool process group after each call, so do not use shell backgrounding, nohup, or disown for persistence; setsid-style detaches are unsupported because they escape Dext cleanup. For user-requested persistent local services, use an OS supervisor when available (Linux: systemd-run --user with dext- unit, check status/logs, stop it when done). Dext rg/fd/http are direct tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Validate external sources before scaling. On auth failures, ask for credentials.
 Browser: if browser_recipe=agent-browser, invoke agent-browser only when useful; start with agent-browser skills get core.
 Subagents: do not call subagent directly; suggest /subagent if delegation is requested. Review subagent output before acting.
 Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
 Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
 Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.";
 
-const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Inspect before edits. Prefer rg/fd then focused reads. Keep tool output small. Use todo for nontrivial work. Make surgical changes. Verify narrowly. Final: changed, tests, gaps.";
+const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Inspect before edits. Prefer rg/fd then focused reads. Keep tool output small. Use todo for nontrivial work. Make surgical changes. Bash is atomic; use supervised dext- services only for requested persistence. Verify narrowly. Final: changed, tests, gaps.";
 
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     let mut sections = Vec::new();

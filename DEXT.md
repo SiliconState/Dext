@@ -3,6 +3,12 @@
 Dext is a single-binary Rust coding agent. This file is auto-injected into the
 system prompt from the sandbox root, so keep it short and high-signal.
 
+## Shell process lifecycle
+
+The `bash` tool is deliberately atomic. Dext launches bash in a separate process group with `kill_on_drop`; after normal exit, timeout, or interrupt it terminates the tool process group. This keeps hidden shell state and orphaned background jobs out of the agent lifecycle.
+
+`nohup`, `disown`, and `cmd &` are therefore not supported persistence mechanisms for agent-started servers. `setsid`-style detaches are also unsupported because they escape Dext cleanup. When a user explicitly needs a long-lived local service, prefer the host OS supervisor instead of adding Dext daemon state or a provider-visible daemon tool. On Linux with systemd, use `systemd-run --user --unit=dext-<name> --same-dir <cmd>`, inspect with `systemctl --user status dext-<name>`/`journalctl --user-unit dext-<name>`, and stop it with `systemctl --user stop dext-<name>` when done. Prefix agent-started units with `dext-` so cleanup is discoverable.
+
 ## Architecture
 - `src/main.rs` — agent loop, provider HTTP, permissions/sandboxing, slash
   commands, CLI entry, eval, and remaining orchestration.
