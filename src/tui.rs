@@ -49,7 +49,7 @@ const WORK_MAP_DRAWER_MAX_ROWS: usize = 10;
 const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 8;
 const WORK_MAP_DRAWER_MIN_EDITOR_ROWS: usize = 1;
 const THINKING_BG: Color = Color::Indexed(235);
-const STEERING_BG: Color = Color::Indexed(237);
+const STEERING_BG: Color = Color::Indexed(236);
 const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -5509,14 +5509,17 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
         Line_::Steering(s) => {
             let sanitized = sanitize_display_text(s);
             let body_style = Style::default()
-                .fg(Color::LightMagenta)
+                .fg(Color::Indexed(215))
                 .bg(STEERING_BG)
                 .add_modifier(Modifier::ITALIC);
-            let border_style = Style::default().fg(Color::Indexed(177)).bg(STEERING_BG);
+            let gutter_style = Style::default()
+                .fg(Color::Indexed(214))
+                .bg(STEERING_BG)
+                .add_modifier(Modifier::BOLD);
             push_prefixed_wrapped_line(
                 &mut lines,
-                ">> ",
-                border_style,
+                "┃ ",
+                gutter_style,
                 &sanitized,
                 body_style,
                 width,
@@ -8558,23 +8561,26 @@ mod tests {
     }
 
     #[test]
-    fn steering_history_has_distinct_highlight_and_lane() {
+    fn steering_history_has_distinct_highlight_and_gutter() {
         let text = line_to_text(
             &Line_::Steering("wolf = dext my bad. old names.".to_string()),
             80,
         );
         let lines = flatten_lines(&text);
         let body_style = span_style_for(&text, "wolf = dext").expect("steering body");
-        let prefix_style = span_style_for(&text, ">>").expect("steering prefix");
+        let gutter_style = span_style_for(&text, "┃").expect("steering gutter");
 
         assert_eq!(
             lines.first().map(String::as_str),
-            Some(">> wolf = dext my bad. old names.")
+            Some("┃ wolf = dext my bad. old names.")
         );
+        assert!(lines.iter().all(|line| !line.contains(">>")));
         assert_eq!(body_style.bg, Some(STEERING_BG));
-        assert_eq!(prefix_style.bg, Some(STEERING_BG));
+        assert_eq!(gutter_style.bg, Some(STEERING_BG));
         assert_ne!(body_style.bg, Some(THINKING_BG));
-        assert_eq!(body_style.fg, Some(Color::LightMagenta));
+        assert_eq!(body_style.fg, Some(Color::Indexed(215)));
+        assert_eq!(gutter_style.fg, Some(Color::Indexed(214)));
+        assert!(gutter_style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
