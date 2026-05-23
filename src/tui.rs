@@ -3408,7 +3408,7 @@ fn abstract_input_with_spans(input: &str, spans: &[InputPreviewSpan]) -> Option<
         out.push_str(&input[cursor..span.start]);
         paste_idx += 1;
         out.push_str(&format!(
-            "[paste #{paste_idx} +{} words hidden — full content preserved for Enter]",
+            "[paste #{paste_idx} +{} words hidden]",
             span.words
         ));
         cursor = span.end;
@@ -6851,8 +6851,7 @@ fn handle_paste(state: &mut TuiState, pasted: String) {
     }
     state.refresh_input_display_override();
     if state.input_display_override.is_some() {
-        state.status =
-            "large paste collapsed in editor — full content preserved for Enter".to_string();
+        state.status = "large paste collapsed in editor".to_string();
     }
     state.reset_slash_completion_selection();
 }
@@ -9517,7 +9516,8 @@ mod tests {
         let long: String = (0..60).map(|i| format!("w{i}\n")).collect();
         let long = long.trim_end();
         let result = abstract_input_for_display(long).expect("collapsed paste preview");
-        assert!(result.contains("[paste #1 +60 words hidden"));
+        assert!(result.contains("[paste #1 +60 words hidden]"));
+        assert!(!result.contains("full content preserved"));
         assert!(!result.contains("w30"));
     }
 
@@ -9529,7 +9529,7 @@ mod tests {
         let result = abstract_input_for_display(&input).expect("collapsed second paragraph");
         assert!(result.contains("instruction 0"));
         assert!(result.contains("instruction 2"));
-        assert!(result.contains("[paste #1 +60 words hidden"));
+        assert!(result.contains("[paste #1 +60 words hidden]"));
         assert!(!result.contains("paste_line_30"));
     }
 
@@ -9547,8 +9547,8 @@ mod tests {
             fourth.trim_end()
         );
         let result = abstract_input_for_display(&input).expect("multiple collapsed pastes");
-        assert!(result.contains("[paste #1 +55 words hidden"));
-        assert!(result.contains("[paste #2 +80 words hidden"));
+        assert!(result.contains("[paste #1 +55 words hidden]"));
+        assert!(result.contains("[paste #2 +80 words hidden]"));
         assert!(result.contains("do stuff"));
         assert!(result.contains("middle text"));
     }
@@ -9564,7 +9564,9 @@ mod tests {
         let paste = (0..60).map(|i| format!("word{i}\n")).collect::<String>();
         handle_paste(&mut state, paste.clone());
         let initial_preview = state.input_display_override.clone().expect("paste preview");
-        assert!(initial_preview.contains("[paste #1 +60 words hidden"));
+        assert!(initial_preview.contains("[paste #1 +60 words hidden]"));
+        assert!(!initial_preview.contains("full content preserved"));
+        assert_eq!(state.status, "large paste collapsed in editor");
         assert!(!initial_preview.contains("word30"));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -9581,7 +9583,7 @@ mod tests {
         }
 
         let preview = state.input_display_override.expect("preview after typing");
-        assert!(preview.contains("[paste #1 +60 words hidden"), "{preview}");
+        assert!(preview.contains("[paste #1 +60 words hidden]"), "{preview}");
         assert!(preview.ends_with(" done"), "{preview}");
         assert!(!preview.contains("word30"), "{preview}");
         assert_eq!(state.input, format!("{} done", paste));
