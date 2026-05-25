@@ -203,10 +203,11 @@ fn cap_string(s: &str, max: usize) -> String {
 }
 
 fn canonical_within(root: &Path, path_str: &str) -> Result<PathBuf, String> {
+    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let candidate = if Path::new(path_str).is_absolute() {
         PathBuf::from(path_str)
     } else {
-        root.join(path_str)
+        root_canon.join(path_str)
     };
     let canonical = match std::fs::canonicalize(&candidate) {
         Ok(path) => path,
@@ -218,10 +219,10 @@ fn canonical_within(root: &Path, path_str: &str) -> Result<PathBuf, String> {
             parent.join(name)
         }
     };
-    if !canonical.starts_with(root) {
+    if !canonical.starts_with(&root_canon) {
         return Err(format!(
             "path outside sandbox ({}): {}",
-            root.display(),
+            root_canon.display(),
             canonical.display()
         ));
     }

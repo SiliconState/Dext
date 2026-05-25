@@ -4,8 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,8 +62,8 @@ fn tui_smoke_shift_enter_inserts_newline() {
     );
 
     pty.write_all_retry(&[0x04]).expect("send Ctrl+D");
-    let status = wait_for_exit(&mut child, Duration::from_secs(5), || pty.visible_text())
-        .expect("wait for dext exit");
+    let status =
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).expect("wait for dext exit");
     assert!(
         status.success(),
         "visible tail:\n{}",
@@ -103,8 +102,8 @@ fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
     }
 
     pty.write_all_retry(&[0x04]).expect("send Ctrl+D");
-    let status = wait_for_exit(&mut child, Duration::from_secs(5), || pty.visible_text())
-        .expect("wait for dext exit");
+    let status =
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).expect("wait for dext exit");
     pty.read_available().expect("final pty drain");
     let visible = pty.visible_text();
 
@@ -132,10 +131,9 @@ fn spawn_dext_with_env(
     home: &Path,
     extra_env: &[(&str, &str)],
 ) -> io::Result<Child> {
-    let slave = pty.slave_fd();
-    let stdin = unsafe { File::from_raw_fd(dup_fd(slave)?) };
-    let stdout = unsafe { File::from_raw_fd(dup_fd(slave)?) };
-    let stderr = unsafe { File::from_raw_fd(dup_fd(slave)?) };
+    let stdin = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
+    let stdout = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
+    let stderr = unsafe { File::from_raw_fd(dup_fd(pty.slave_file())?) };
     let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_dext"));
@@ -145,6 +143,7 @@ fn spawn_dext_with_env(
         .env_clear()
         .env("PATH", path)
         .env("TERM", "xterm-256color")
+        .env("TERM_PROGRAM", "Apple_Terminal")
         .env("COLORTERM", "truecolor")
         .env("LANG", "C.UTF-8")
         .env("HOME", home)
@@ -158,19 +157,19 @@ fn spawn_dext_with_env(
         cmd.env(key, value);
     }
 
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::ioctl(slave, libc::TIOCSCTTY, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
     cmd.spawn()
+}
+
+fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        let pid = child.id() as libc::pid_t;
+        let _ = libc::kill(-pid, libc::SIGTERM);
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn assert_visible(pty: &mut Pty, child: &mut Child, needle: &str, timeout: Duration) {
@@ -179,6 +178,7 @@ fn assert_visible(pty: &mut Pty, child: &mut Child, needle: &str, timeout: Durat
         .unwrap_or_else(|err| panic!("waiting for {needle:?} failed: {err}"));
     if !found {
         let visible = pty.visible_text();
+        terminate_child(child);
         panic!(
             "did not see {needle:?} within {timeout:?}; visible tail:\n{}",
             tail(&visible, 3000)
@@ -189,17 +189,19 @@ fn assert_visible(pty: &mut Pty, child: &mut Child, needle: &str, timeout: Durat
 fn wait_for_exit(
     child: &mut Child,
     timeout: Duration,
-    capture: impl FnOnce() -> String,
+    pty: &mut Pty,
 ) -> io::Result<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
+        pty.read_available()?;
+        pty.answer_cursor_position_queries()?;
         if let Some(status) = child.try_wait()? {
+            pty.read_available()?;
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            let visible = capture();
-            let _ = child.kill();
-            let _ = child.wait();
+            let visible = pty.visible_text();
+            terminate_child(child);
             panic!(
                 "dext did not exit within {timeout:?}; visible tail:\n{}",
                 tail(&visible, 3000)
@@ -226,7 +228,7 @@ fn assert_no_crash_text(visible: &str) {
 
 struct Pty {
     master: File,
-    slave: RawFd,
+    slave: File,
     capture: Vec<u8>,
 }
 
@@ -234,7 +236,7 @@ impl Pty {
     fn open(cols: u16, rows: u16) -> io::Result<Self> {
         let mut master = -1;
         let mut slave = -1;
-        let winsize = libc::winsize {
+        let mut winsize = libc::winsize {
             ws_row: rows,
             ws_col: cols,
             ws_xpixel: 0,
@@ -245,8 +247,8 @@ impl Pty {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &winsize,
+                std::ptr::null_mut(),
+                &mut winsize,
             )
         };
         if rc == -1 {
@@ -254,6 +256,7 @@ impl Pty {
         }
         set_nonblocking(master)?;
         let master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
         Ok(Self {
             master,
             slave,
@@ -261,8 +264,8 @@ impl Pty {
         })
     }
 
-    fn slave_fd(&self) -> RawFd {
-        self.slave
+    fn slave_file(&self) -> &File {
+        &self.slave
     }
 
     fn read_available(&mut self) -> io::Result<()> {
@@ -343,16 +346,8 @@ impl Pty {
     }
 }
 
-impl Drop for Pty {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.slave);
-        }
-    }
-}
-
-fn dup_fd(fd: RawFd) -> io::Result<RawFd> {
-    let duped = unsafe { libc::dup(fd) };
+fn dup_fd(file: &File) -> io::Result<std::os::fd::RawFd> {
+    let duped = unsafe { libc::dup(file.as_raw_fd()) };
     if duped == -1 {
         Err(io::Error::last_os_error())
     } else {

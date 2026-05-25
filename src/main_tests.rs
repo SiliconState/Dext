@@ -3,9 +3,10 @@ use crate::provider::{
     list_models_for_available_providers, merge_provider_profile, normalize_chatgpt_model_slug,
     resolve_provider_model_selection,
 };
+#[cfg(target_os = "linux")]
+use crate::session::process_exists;
 use crate::session::{
-    append_log_line, cap_latest_log_buffer, process_exists, render_limited_lines,
-    validate_session_name,
+    append_log_line, cap_latest_log_buffer, render_limited_lines, validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
@@ -464,8 +465,13 @@ fn potential_login_secret_is_not_serialized_to_provider_request() {
 #[cfg(unix)]
 #[test]
 fn sudo_askpass_script_uses_local_tty_and_never_echoes_chat_guidance() {
-    let script = sudo_askpass_script_content_with_paths("/tmp/zenity'bad", "/tmp/kdialog");
+    let script = sudo_askpass_script_content_with_paths(
+        "/tmp/zenity'bad",
+        "/tmp/kdialog",
+        "/usr/bin/osascript",
+    );
     assert!(script.contains("/dev/tty"), "{script}");
+    assert!(script.contains("osascript"), "{script}");
     assert!(
         script.contains("Dext local sudo prompt requires a TTY"),
         "{script}"
@@ -2862,8 +2868,11 @@ fn fd_falls_back_to_find_when_not_on_path() {
     .expect("prepare fd tool");
 
     if bin == "find" {
-        assert_eq!(args[0], root.to_string_lossy());
-        assert_eq!(&args[1..3], &["-type", "f"]);
+        let type_idx = args
+            .iter()
+            .position(|arg| arg == "-type")
+            .expect("find args include -type");
+        assert_eq!(args[type_idx + 1], "f");
         assert!(args.iter().any(|a| a.contains(".rs")));
     } else {
         assert_eq!(bin, "fd");
@@ -3138,17 +3147,15 @@ fn fd_find_fallback_translates_type_and_consumes_value() {
         &root,
     );
     assert_eq!(bin, "find");
-    assert_eq!(args[0], root.to_string_lossy());
-    assert_eq!(
-        &args[1..7],
-        &[
-            "-type",
-            "f",
-            "-regextype",
-            "posix-extended",
-            "-regex",
-            ".*^DEXT(\\.memory)?\\.md$.*"
-        ]
+    let type_idx = args
+        .iter()
+        .position(|arg| arg == "-type")
+        .expect("find args include -type");
+    assert_eq!(args[type_idx + 1], "f");
+    assert!(args.iter().any(|arg| arg == "-regex"), "{args:?}");
+    assert!(
+        args.iter().any(|arg| arg == "(.*/)?DEXT(\\.memory)?\\.md$"),
+        "{args:?}"
     );
     assert!(
         !args.iter().any(|a| a == "--type" || a == "-H"),
@@ -3229,7 +3236,11 @@ fn fd_find_fallback_maps_directory_type() {
         &root,
     );
     assert_eq!(bin, "find");
-    assert_eq!(&args[1..3], &["-type", "d"]);
+    let type_idx = args
+        .iter()
+        .position(|arg| arg == "-type")
+        .expect("find args include -type");
+    assert_eq!(args[type_idx + 1], "d");
 
     let _ = std::fs::remove_dir_all(&root);
 }

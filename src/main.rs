@@ -764,10 +764,11 @@ impl ReadFileCache {
 }
 
 fn canonical_within(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
+    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let candidate = if Path::new(user_path).is_absolute() {
         PathBuf::from(user_path)
     } else {
-        root.join(user_path)
+        root_canon.join(user_path)
     };
     let canonical = match std::fs::canonicalize(&candidate) {
         Ok(p) => p,
@@ -780,10 +781,10 @@ fn canonical_within(root: &Path, user_path: &str) -> std::result::Result<PathBuf
             parent_canon.join(name)
         }
     };
-    if !canonical.starts_with(root) {
+    if !canonical.starts_with(&root_canon) {
         return Err(format!(
             "path outside sandbox ({}): {}",
-            root.display(),
+            root_canon.display(),
             canonical.display()
         ));
     }
@@ -3700,6 +3701,45 @@ fn fd_exclude_path_patterns(glob: &str) -> Vec<String> {
     }
 }
 
+fn find_supports_bsd_extended_regex_flag() -> bool {
+    cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+}
+
+fn regex_ends_with_unescaped_dollar(pattern: &str) -> bool {
+    if !pattern.ends_with('$') {
+        return false;
+    }
+    let backslashes = pattern[..pattern.len().saturating_sub(1)]
+        .bytes()
+        .rev()
+        .take_while(|b| *b == b'\\')
+        .count();
+    backslashes % 2 == 0
+}
+
+fn fd_find_fallback_regex(pattern: &str) -> String {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return ".*".to_string();
+    }
+
+    let anchored_start = trimmed.starts_with('^');
+    let anchored_end = regex_ends_with_unescaped_dollar(trimmed);
+    let body = trimmed.strip_prefix('^').unwrap_or(trimmed);
+    match (anchored_start, anchored_end) {
+        (true, true) => format!("(.*/)?{body}"),
+        (true, false) => format!("(.*/)?({body}).*"),
+        (false, true) => format!(".*({body})"),
+        (false, false) => format!(".*({body}).*"),
+    }
+}
+
 fn build_fd_find_fallback_args(search_root: &Path, pattern: &str, extra: &[String]) -> Vec<String> {
     let mut find_type = "f".to_string();
     let mut name_globs: Vec<String> = Vec::new();
@@ -3783,15 +3823,20 @@ fn build_fd_find_fallback_args(search_root: &Path, pattern: &str, extra: &[Strin
         }
     }
 
-    let mut args: Vec<String> = vec![
+    let mut args: Vec<String> = Vec::new();
+    let bsd_find = find_supports_bsd_extended_regex_flag();
+    if bsd_find {
+        args.push("-E".into());
+    }
+    args.extend([
         search_root.to_string_lossy().to_string(),
         "-type".into(),
         find_type,
-        "-regextype".into(),
-        "posix-extended".into(),
-        "-regex".into(),
-        format!(".*{}.*", pattern),
-    ];
+    ]);
+    if !bsd_find {
+        args.extend(["-regextype".into(), "posix-extended".into()]);
+    }
+    args.extend(["-regex".into(), fd_find_fallback_regex(pattern)]);
     for exclude in exclude_globs {
         args.push("!".into());
         args.push("-path".into());
@@ -6410,11 +6455,42 @@ fn write_sudo_askpass_script(root: &Path) -> std::result::Result<PathBuf, String
 }
 
 #[cfg(unix)]
-fn sudo_askpass_script_content_with_paths(zenity: &str, kdialog: &str) -> String {
+fn sudo_askpass_script_content_with_paths(zenity: &str, kdialog: &str, osascript: &str) -> String {
+    let zenity = shell_single_quote(zenity);
+    let kdialog = shell_single_quote(kdialog);
+    let osascript = shell_single_quote(osascript);
     format!(
-        "#!/bin/sh\nset -eu\nPROMPT=${{1:-'sudo password:'}}\nif command -v zenity >/dev/null 2>&1; then\n  exec {} --password --title='Dext local sudo prompt' --text=\"$PROMPT\"\nfi\nif command -v kdialog >/dev/null 2>&1; then\n  exec {} --password \"$PROMPT\"\nfi\nif [ -r /dev/tty ] && [ -w /dev/tty ]; then\n  printf 'Dext needs your sudo password locally for: %s\\n' \"$PROMPT\" >/dev/tty\n  printf 'Password: ' >/dev/tty\n  stty -echo </dev/tty\n  IFS= read -r password </dev/tty\n  stty echo </dev/tty\n  printf '\\n' >/dev/tty\n  printf '%s\\n' \"$password\"\n  exit 0\nfi\nprintf '%s\\n' 'Dext local sudo prompt requires a TTY, zenity, or kdialog.' >&2\nexit 1\n",
-        shell_single_quote(zenity),
-        shell_single_quote(kdialog),
+        r#"#!/bin/sh
+set -eu
+PROMPT=${{1:-'sudo password:'}}
+if command -v zenity >/dev/null 2>&1; then
+  exec {zenity} --password --title='Dext local sudo prompt' --text="$PROMPT"
+fi
+if command -v kdialog >/dev/null 2>&1; then
+  exec {kdialog} --password "$PROMPT"
+fi
+if [ -x {osascript} ] || command -v osascript >/dev/null 2>&1; then
+  exec {osascript} \
+    -e 'on run argv' \
+    -e 'set promptText to item 1 of argv' \
+    -e 'display dialog promptText default answer "" with hidden answer with title "Dext local sudo prompt" buttons {{"OK"}} default button "OK"' \
+    -e 'text returned of result' \
+    -e 'end run' \
+    "$PROMPT"
+fi
+if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  printf 'Dext needs your sudo password locally for: %s\n' "$PROMPT" >/dev/tty
+  printf 'Password: ' >/dev/tty
+  stty -echo </dev/tty
+  IFS= read -r password </dev/tty
+  stty echo </dev/tty
+  printf '\n' >/dev/tty
+  printf '%s\n' "$password"
+  exit 0
+fi
+printf '%s\n' 'Dext local sudo prompt requires a TTY, osascript, zenity, or kdialog.' >&2
+exit 1
+"#
     )
 }
 
@@ -6426,7 +6502,10 @@ fn sudo_askpass_script_content() -> String {
     let kdialog = find_binary_on_path("kdialog")
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "kdialog".to_string());
-    sudo_askpass_script_content_with_paths(&zenity, &kdialog)
+    let osascript = find_binary_on_path("osascript")
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "osascript".to_string());
+    sudo_askpass_script_content_with_paths(&zenity, &kdialog, &osascript)
 }
 
 #[cfg(not(unix))]

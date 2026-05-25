@@ -7304,9 +7304,61 @@ fn handle_key(
     }
 }
 
+const KEYBOARD_ENHANCEMENT_ENV: &str = "DEXT_KEYBOARD_ENHANCEMENT";
+
+#[cfg(unix)]
+fn parse_bool_env(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "force" => Some(true),
+        "" | "0" | "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn terminal_identity_supports_keyboard_enhancement(
+    term: &str,
+    term_program: &str,
+    marker_env_present: bool,
+) -> bool {
+    if marker_env_present {
+        return true;
+    }
+    let term = term.to_ascii_lowercase();
+    let term_program = term_program.to_ascii_lowercase();
+    ["kitty", "wezterm", "alacritty", "foot", "ghostty", "rio"]
+        .iter()
+        .any(|needle| term.contains(needle) || term_program.contains(needle))
+}
+
+#[cfg(unix)]
+fn terminal_env_advertises_keyboard_enhancement() -> bool {
+    let marker_env_present = [
+        "KITTY_WINDOW_ID",
+        "WEZTERM_EXECUTABLE",
+        "ALACRITTY_LOG",
+        "GHOSTTY_RESOURCES_DIR",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some());
+    terminal_identity_supports_keyboard_enhancement(
+        &std::env::var("TERM").unwrap_or_default(),
+        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        marker_env_present,
+    )
+}
+
 #[cfg(unix)]
 fn terminal_supports_keyboard_enhancement() -> bool {
-    true
+    if let Ok(raw) = std::env::var(KEYBOARD_ENHANCEMENT_ENV)
+        && let Some(on) = parse_bool_env(&raw)
+    {
+        return on;
+    }
+    if !terminal_env_advertises_keyboard_enhancement() {
+        return false;
+    }
+    crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
 }
 
 #[cfg(not(unix))]
@@ -9565,8 +9617,22 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn keyboard_enhancement_is_enabled_on_unix() {
-        assert!(terminal_supports_keyboard_enhancement());
+    fn keyboard_enhancement_skips_apple_terminal_unless_forced() {
+        assert!(!terminal_identity_supports_keyboard_enhancement(
+            "xterm-256color",
+            "Apple_Terminal",
+            false
+        ));
+        assert!(terminal_identity_supports_keyboard_enhancement(
+            "xterm-kitty",
+            "",
+            false
+        ));
+        assert!(terminal_identity_supports_keyboard_enhancement(
+            "xterm-256color",
+            "WezTerm",
+            true
+        ));
     }
 
     #[test]
