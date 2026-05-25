@@ -80,12 +80,12 @@ dext auth provider local
 /effort off
 ```
 
-For the installed Qwen model, a known-good server command is:
+For a local Qwen GGUF model, a typical llama.cpp server command looks like:
 
 ```bash
-cd /home/abaka/Documents/Projects/Overload/MoE/llama.cpp
+cd /path/to/llama.cpp
 ./build/bin/llama-server \
-  -m /home/abaka/Documents/Projects/Overload/MoE/models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
+  -m /path/to/models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
   -ngl 11 -c 4096 -np 1 --cache-ram 0 --no-warmup -t 12 \
   --reasoning off --flash-attn on --host 127.0.0.1 --port 8080
 ```
@@ -267,7 +267,7 @@ merge-driver entry point and is not normally run by hand.
 dext --frugal
 dext --context-mode tiny
 dext --context-mode frugal
-dext --tool-profile lean
+dext --tool-profile lean    # default schema verbosity
 dext --toolset full
 DEXT_TOOLSET=full dext
 dext --budget '$2'
@@ -283,9 +283,10 @@ dext --approval ask
 dext --approval never
 dext --approval auto-read
 dext --approval auto-write
-dext --sandbox read-only
-dext --sandbox workspace-write
-dext --sandbox danger-full-access
+dext --sandbox-profile read-only
+dext --sandbox-profile workspace-write
+dext --sandbox-profile danger-full-access
+# --sandbox accepts the same profile names, or a directory as the sandbox root
 ```
 
 Use `--trust` only when you intentionally want all gated tools auto-approved.

@@ -77,8 +77,8 @@ impl ToolProfile {
 
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "full" | "all" | "default" => Some(Self::Full),
-            "lean" | "slim" | "minimal" | "min" | "frugal" => Some(Self::Lean),
+            "full" | "all" => Some(Self::Full),
+            "lean" | "default" | "slim" | "minimal" | "min" | "frugal" => Some(Self::Lean),
             _ => None,
         }
     }

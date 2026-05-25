@@ -39,7 +39,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `src/provider.rs`
   - Provider profile/catalog loading and normalization.
-  - Built-in GLM and ChatGPT/Codex profiles.
+  - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, DeepSeek, and local OpenAI-compatible profiles.
   - API-key and OAuth login flows.
   - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs.
   - Model alias normalization and provider/model switching helpers.
@@ -100,7 +100,7 @@ The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_lo
 
 Bash is intentionally transaction-like: Dext starts tool commands in their own process group and cleans that group after the shell exits or is interrupted, so shell backgrounding (`cmd &`), `nohup`, and `disown` are not a supported way to keep servers alive across tool calls. `setsid`-style detaches are also unsupported because they escape Dext cleanup. If the user explicitly needs a persistent local service, prefer OS supervision without adding a Dext daemon tool. On Linux with systemd, use `systemd-run --user --unit=dext-<name> --same-dir <cmd>`, inspect with `systemctl --user status dext-<name>`/`journalctl --user-unit dext-<name>`, and stop it with `systemctl --user stop dext-<name>` when finished. Keep unit names prefixed with `dext-`; on platforms without systemd, use the platform's native supervisor or avoid a persistent service.
 
-Lean schemas are the default to reduce prompt cost. Full schemas are available with `--tool-profile full` or `/tool-profile full`.
+Lean schemas are the default to reduce prompt cost. Full schemas are available with `--tool-profile full` or `/tool-profile full`; `default` is treated as lean when parsing the env/CLI alias.
 
 Capability-as-filesystem is deliberately parked. Dext does not implement `.dext/cap/` or virtual `/cap/...` today, and it should not become core without a concrete high-value use case and a safe pack/shelf prototype first. The unresolved risks are broad: permission mapping, hidden side effects, lifecycle cleanup, sandbox boundaries, streaming/progress, concurrency, discoverability, secrets/privacy, error semantics, versioning, and plugin-protocol creep.
 

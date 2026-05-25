@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Dext is pre-1.0. Security fixes are handled on `master` unless release branches are introduced later.
+Dext is pre-1.0. Security fixes are handled on `main` unless release branches are introduced later.
 
 ## Reporting a vulnerability
 
@@ -66,7 +66,7 @@ Also scan untracked and ignored files before deciding what to preserve locally v
 
 - `--approval ask` is the conservative default for privileged tools.
 - `--approval never` prevents privileged tool execution.
-- `--sandbox read-only` is recommended for review-only tasks.
+- `--sandbox-profile read-only` (or `--sandbox read-only`) is recommended for review-only tasks.
 - `--trust` and `danger-full-access` are high-trust modes. Use only in controlled environments.
 - Dext Git checkpoints are best-effort local recovery aids. They may include
   file content in hidden refs or `.dext/checkpoints/` sidecars, and they do not

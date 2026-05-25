@@ -33,6 +33,7 @@
 
 ### Fixed
 
+- Fixed `--tool-profile default`/`DEXT_TOOL_PROFILE=default` to select the documented default lean schema profile instead of expanding to full schemas.
 - Recovery setup now no-ops cleanly outside Git repositories.
 - Checkpoint sidecar paths resolve against the sandbox root and restore only the
   intended hinted paths.

@@ -8,7 +8,7 @@ Dext is source-first: prompts, runtime state, tool policies, provider wiring, an
 
 - Interactive terminal agent with an inline ratatui TUI; no alternate-screen takeover.
 - One-shot mode for scripted tasks and JSON/stream-JSON output for automation.
-- Provider catalog with built-in GLM and ChatGPT/Codex profiles plus env/catalog overrides.
+- Provider catalog with built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, DeepSeek, and local OpenAI-compatible profiles plus env/catalog overrides.
 - OAuth/API-key auth flows stored outside the repo under Dext state directories.
 - Lean default tool schemas and smaller default toolset, with optional full schemas/full toolset and frugal context mode.
 - Project-scoped latest sessions, named session export/analyze/grep/failure/verification helpers.
@@ -115,7 +115,7 @@ Interactive slash commands:
 /sandbox-profile read-only|workspace-write|danger-full-access
 /context standard|frugal|tiny
 /tools default|full
-/tool-profile lean|full
+/tool-profile lean|full     # default is lean
 /preview off|simple|git
 /undo --list
 /undo

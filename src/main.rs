@@ -17393,9 +17393,9 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                 i += 1;
                 let value = argv
                     .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--tool-profile requires full|lean"))?;
+                    .ok_or_else(|| anyhow::anyhow!("--tool-profile requires lean|full"))?;
                 tool_profile = Some(ToolProfile::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!("invalid --tool-profile '{value}' (expected full|lean)")
+                    anyhow::anyhow!("invalid --tool-profile '{value}' (expected lean|full)")
                 })?);
             }
             "--preview" => {
@@ -17560,7 +17560,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             _ if arg.starts_with("--tool-profile=") => {
                 let value = arg.trim_start_matches("--tool-profile=");
                 tool_profile = Some(ToolProfile::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!("invalid tool profile '{value}' (expected full|lean)")
+                    anyhow::anyhow!("invalid tool profile '{value}' (expected lean|full)")
                 })?);
             }
             _ if arg.starts_with("--preview=") => {

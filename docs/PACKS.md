@@ -149,6 +149,14 @@ Without `shelf.json`, a shelf is just a pack group discovered by directory struc
           "description": "Start a research cycle"
         },
         {
+          "ability": "tool",
+          "name": "research-helper",
+          "description": "Pack-local helper metadata",
+          "schema": {"type": "object"},
+          "grants": ["read", "process"],
+          "exposure": "on_demand"
+        },
+        {
           "ability": "context",
           "name": "research-state",
           "description": "Current research findings",
@@ -164,7 +172,7 @@ Ability types:
 
 | Type | Purpose |
 |------|---------|
-| `tool` | Declares a named tool with schema and grants |
+| `tool` | Declares tool-like metadata with `schema`, `grants`, and `exposure`; it is registry metadata, not a provider-visible tool implementation. |
 | `command` | Declares a slash command |
 | `hook` | Declares hook signals the pack listens to |
 | `context` | Declares named context the pack provides |
@@ -189,7 +197,7 @@ dext shelves    # CLI
 /shelves        # interactive
 ```
 
-Shelf metadata is injected into the model context as typed ability records, not as new provider tools.
+Shelf metadata is injected into the model context as typed ability records, not as new provider tools. Tool abilities require `schema`, `grants`, and `exposure` (`hidden`, `on_demand`, or `visible`) so the registry can describe capability shape without executing it directly.
 
 ## Reference example
 

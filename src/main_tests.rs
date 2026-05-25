@@ -4264,7 +4264,7 @@ fn compose_system_parts_includes_typed_shelf_registry_summary() {
     "name": "Research",
     "version": "0.1.0",
     "description": "research helpers",
-    "abilities": [{"ability": "context", "name": "notes", "description": "curated notes", "budget": 1024}]
+    "abilities": [{"ability": "tool", "name": "search", "description": "project search", "schema": {"type": "object"}, "grants": ["read"], "exposure": "on_demand"}, {"ability": "context", "name": "notes", "description": "curated notes", "budget": 1024}]
   }]
 }"#,
     )
@@ -4278,7 +4278,11 @@ fn compose_system_parts_includes_typed_shelf_registry_summary() {
     let (_stable, env) = agent.compose_system_parts();
     assert!(env.contains("## Dext shelves"), "{env}");
     assert!(
-        env.contains("Typed shelf registry: 1 shelf(s), 1 resolved ability metadata entry."),
+        env.contains("Typed shelf registry: 1 shelf(s), 2 resolved ability metadata entries."),
+        "{env}"
+    );
+    assert!(
+        env.contains("tool:search (community/research, project search)"),
         "{env}"
     );
     assert!(
@@ -4297,6 +4301,7 @@ fn compose_system_parts_includes_typed_shelf_registry_summary() {
 #[test]
 fn default_tool_profile_is_lean_for_prompt_budget() {
     assert_eq!(ToolProfile::default(), ToolProfile::Lean);
+    assert_eq!(ToolProfile::parse("default"), Some(ToolProfile::Lean));
 }
 
 #[test]
@@ -4819,7 +4824,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--frugal".to_string(),
         "--context-mode=tiny".to_string(),
         "--tool-context-profile=full".to_string(),
-        "--tool-profile=lean".to_string(),
+        "--tool-profile=default".to_string(),
         format!("@{}", task_file.display()),
         "tail".to_string(),
     ])?;

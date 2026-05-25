@@ -51,7 +51,7 @@ When changing Dext itself:
   duplication and prompt-injected historical detail.
 
 ## Provider notes
-- Built-in providers include GLM and ChatGPT/Codex. Custom provider profiles can
+- Built-in providers include GLM, ChatGPT/Codex, OpenAI, Anthropic, DeepSeek, and local OpenAI-compatible. Custom provider profiles can
   be configured through the provider catalog.
 - Auth/model/provider commands exist in CLI and slash-command form
   (`providers`, `provider`, `models`, `login`, `logout`).
