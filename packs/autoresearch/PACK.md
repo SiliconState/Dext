@@ -84,15 +84,16 @@ $PYTHON "$PACK/bin/autoresearch.py" --cwd . scaffold \
 
 ## Setup workflow for Dext
 
-1. **Use agent-browser if web research is needed.** For GitHub/browser tasks, start with `agent-browser skills get core --full`, then inspect pages with `agent-browser open`, `snapshot`, and `get text`.
-2. **Infer or ask once** for goal, benchmark command, primary metric/direction, files in scope, and constraints. If the user already supplied enough context, proceed.
-3. **Inspect the source deeply before changes.** Read the benchmark, hot files, configs, and existing tests. Do not start random edits.
-4. **Create a branch** named `autoresearch/<slug>-<date>` unless the user asks to reuse the current branch.
-5. **Write `autoresearch.md`.** Make it good enough for a fresh Dext session to resume without prior chat.
-6. **Write `autoresearch.sh`.** Use `set -euo pipefail`, keep output compact, and print structured metric lines. For fast/noisy benchmarks, run multiple samples and emit a median. For slow ML training, one run is enough.
-7. **Optionally write `autoresearch.checks.sh`** when correctness must be guarded. Checks time does not count toward the metric.
-8. **Initialize, run baseline, log baseline as `keep`.** Baseline is the first run in a segment.
-9. **Enter the loop immediately.** Never ask whether to continue after setup unless blocked.
+1. **Use the real project root as cwd.** Run helper commands with `--cwd <project-root>` and keep `autoresearch.*` artifacts in that root. If this pack is invoked from inside another pack/skill optimization, do not mix artifact families: `autoresearch.*` belongs to the measured project, while `packopt.*` or other optimizer artifacts belong to their own session.
+2. **Use agent-browser if web research is needed.** For GitHub/browser tasks, start with `agent-browser skills get core --full`, then inspect pages with `agent-browser open`, `snapshot`, and `get text`.
+3. **Infer or ask once** for goal, benchmark command, primary metric/direction, files in scope, and constraints. If the user already supplied enough context, proceed.
+4. **Inspect the source deeply before changes.** Read the benchmark, hot files, configs, and existing tests. Do not start random edits.
+5. **Create a branch** named `autoresearch/<slug>-<date>` unless the user asks to reuse the current branch. If the project is not a git repository, do not block: record that limitation in `autoresearch.md`, avoid destructive edits, and use explicit file backups or patches for rollback.
+6. **Write `autoresearch.md`.** Make it good enough for a fresh Dext session to resume without prior chat.
+7. **Write `autoresearch.sh`.** Use `set -euo pipefail`, keep output compact, and print structured metric lines. For fast/noisy benchmarks, run multiple samples and emit a median. For slow ML training, one run is enough.
+8. **Optionally write `autoresearch.checks.sh`** when correctness must be guarded. Checks time does not count toward the metric.
+9. **Initialize, run baseline, log baseline as `keep`.** Baseline is the first run in a segment.
+10. **Enter the loop immediately.** Never ask whether to continue after setup unless blocked.
 
 ## Loop rules
 
