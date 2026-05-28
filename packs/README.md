@@ -22,4 +22,4 @@ export DEXT_HOOKS_FILE="$DEXT_PACK_<NAME>_DIR/phooks.json"   # optional
 dext --cd /path/to/project "Read $DEXT_PACK_<NAME>_DIR/PACK.md and use that pack."
 ```
 
-For the first true pack, see [`autoresearch/`](autoresearch/).
+For examples, see [`autoresearch/`](autoresearch/) for code/metric loops and [`packopt/`](packopt/) for SkillOpt-style pack/skill document optimization.

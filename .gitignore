@@ -5,6 +5,7 @@
 __pycache__/
 *.py[cod]
 /autoresearch.*
+/packopt.*
 
 # Runtime/project state
 /.dext/

@@ -201,20 +201,24 @@ Shelf metadata is injected into the model context as typed ability records, not 
 
 ## Reference example
 
-The bundled `autoresearch` pack implements an autonomous experiment loop:
+The bundled `autoresearch` pack implements an autonomous experiment loop, and `packopt` applies a SkillOpt-style loop to pack/skill documents:
 
-- `packs/autoresearch/PACK.md` — workflow document
-- `packs/autoresearch/bin/autoresearch.py` — helper script
-- `packs/autoresearch/phooks.json` — steering hooks
+- `packs/autoresearch/PACK.md` — autoresearch workflow document
+- `packs/autoresearch/bin/autoresearch.py` — autoresearch helper script
+- `packs/autoresearch/phooks.json` — autoresearch steering hooks
+- `packs/packopt/PACK.md` — bounded-edit pack/skill optimization workflow
+- `packs/packopt/bin/packopt.py` — validation/log/rejected-memory helper
 
 Run it:
 
 ```bash
 dext pack run autoresearch "optimize the benchmark in this repo"
+dext pack run packopt "improve packs/autoresearch/PACK.md against held-out tasks"
 ```
 
 Inspect it to see a full pack structure:
 
 ```bash
 dext pack inspect autoresearch
+dext pack inspect packopt
 ```

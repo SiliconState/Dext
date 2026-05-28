@@ -98,6 +98,8 @@ dext undo --list
 dext memory check
 dext pack list
 dext pack inspect autoresearch
+# or inspect SkillOpt-style pack/skill optimization
+dext pack inspect packopt
 dext pack run autoresearch "optimize the benchmark in this repo"
 dext --eval
 ```
@@ -122,6 +124,7 @@ Interactive slash commands:
 /compact status
 /pack list
 /pack inspect autoresearch
+/pack inspect packopt
 /pack run autoresearch optimize the benchmark in this repo
 /save name
 /export html path
@@ -219,18 +222,20 @@ See [`docs/PACKS.md`](docs/PACKS.md) for the full packs and shelves reference, i
 
 Packs are source-first workflow bundles with a `PACK.md`. Dext discovers packs from `DEXT_PACK_<NAME>_DIR`, project `.dext/shelves/<shelf>/packs`, `.dext/packs`, `packs`, `DEXT_SHELVES_DIR`, `DEXT_PACKS_DIR`, user `~/.dext/shelves/<shelf>/packs`, `~/.dext/packs`, and bundled repository packs. Shelf packs take precedence over same-named legacy project/user pack directories within the same scope. Typed shelf manifests named `shelf.json` are loaded from the same shelf roots into the runtime `ShelfRegistry` and exposed in prompt context plus `/shelves` / `dext shelves` as provider-neutral ability metadata.
 
-The stable extension contract is intentionally provider-neutral: a pack is files plus instructions that any LLM/provider can read, with optional shell helpers and `phooks.json` steering. Scaffold a pack as `packs/<name>/PACK.md`, keep helper scripts inside that directory, and validate it with `dext pack inspect <name>` plus a real `dext pack run <name> ...` on a disposable task. Shared shelves live at `<shelf>/packs/<pack>` and can be distributed through project, user, or `DEXT_SHELVES_DIR` paths without adding provider-visible tools. `shelf.json` manifests add typed ability metadata for internal registry resolution; the runtime lists and prompt-injects those records without expanding the provider-visible tool list.
+The stable extension contract is intentionally provider-neutral: a pack is files plus instructions that any LLM/provider can read, with optional shell helpers and `phooks.json` steering. Scaffold a pack as `packs/<name>/PACK.md`, keep helper scripts inside that directory, and validate it with `dext pack inspect <name>` plus a real `dext pack run <name> ...` on a disposable task. Use `packopt` for SkillOpt-style improvement of pack/skill documents with bounded edits, strict held-out validation, and rejected-edit memory. Shared shelves live at `<shelf>/packs/<pack>` and can be distributed through project, user, or `DEXT_SHELVES_DIR` paths without adding provider-visible tools. `shelf.json` manifests add typed ability metadata for internal registry resolution; the runtime lists and prompt-injects those records without expanding the provider-visible tool list.
 
 Invoke a pack conversationally:
 
 ```text
 run autoresearch on improving this project benchmark
+run packopt on improving packs/autoresearch/PACK.md against held-out tasks
 ```
 
 Or invoke it explicitly:
 
 ```text
 /pack run autoresearch improve this benchmark
+/pack run packopt improve packs/autoresearch/PACK.md against held-out tasks
 ```
 
 CLI equivalents:
@@ -238,8 +243,11 @@ CLI equivalents:
 ```bash
 dext pack list
 dext pack inspect autoresearch
+dext pack inspect packopt
 dext pack run autoresearch "improve this benchmark"
+dext pack run packopt "improve packs/autoresearch/PACK.md against held-out tasks"
 dext --pack autoresearch "improve this benchmark"
+dext --pack packopt "improve packs/autoresearch/PACK.md against held-out tasks"
 ```
 
 If a pack has `phooks.json`, Dext activates those hook templates for that invocation and passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to hook processes. Shelf packs use the same invocation path and remain regular source directories.
@@ -277,7 +285,7 @@ DEXT_MUTATION_PREVIEW=simple
 DEXT_BUDGET_CAP=$5
 ```
 
-Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored.
+Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `target/`, `.env`, `DEXT.todo.json`, `autoresearch.*`, `packopt.*`, and `dext-session-*` exports are ignored.
 
 ## Development
 
