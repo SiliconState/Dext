@@ -26,10 +26,10 @@ Keep `packopt.*` files untracked unless the user explicitly wants session artifa
 
 ## Helper commands
 
-Set the pack path once:
+Set the pack path once. For reusable installs, prefer the user-global location under `~/.dext/packs/`; if you are editing the bundled repo copy directly, point `PACK` at that checkout instead:
 
 ```bash
-PACK="$PWD/packs/packopt"  # from this repository; adjust if installed elsewhere
+PACK="${DEXT_PACK_PACKOPT_DIR:-$HOME/.dext/packs/packopt}"
 PYTHON=${PYTHON:-python3}
 ```
 
@@ -38,7 +38,7 @@ Initialize a session:
 ```bash
 $PYTHON "$PACK/bin/packopt.py" --cwd . init \
   --name "<goal>" \
-  --target-file packs/<name>/PACK.md \
+  --target-file ~/.dext/packs/<name>/PACK.md \
   --metric-name "<primary_metric>" \
   --direction higher
 ```
@@ -72,7 +72,7 @@ Scaffold starter files:
 ```bash
 $PYTHON "$PACK/bin/packopt.py" --cwd . scaffold \
   --goal "<goal>" \
-  --target-file packs/<name>/PACK.md \
+  --target-file ~/.dext/packs/<name>/PACK.md \
   --command '<validation command that prints METRIC lines>' \
   --metric-name '<primary_metric>' \
   --direction higher

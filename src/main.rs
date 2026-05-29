@@ -27,10 +27,11 @@ use provider::{
     try_complete_oauth_from_callback,
 };
 use session::{
-    ProjectStateLock, atomic_write_bytes, dext_state_dir, latest_log_path, latest_session_path,
-    list_session_records_for_root, named_session_path_for_root, named_sessions_dir_for_root,
-    parse_session_header, project_key, project_state_dir, project_state_lock_path,
-    release_registered_locks, render_limited_csv, restore_terminal_if_tui, unix_timestamp_secs,
+    ProjectStateLock, atomic_write_bytes, canonicalize_tool_path, dext_state_dir, latest_log_path,
+    latest_session_path, list_session_records_for_root, named_session_path_for_root,
+    named_sessions_dir_for_root, parse_session_header, project_key, project_state_dir,
+    project_state_lock_path, release_registered_locks, render_limited_csv, restore_terminal_if_tui,
+    unix_timestamp_secs,
 };
 use tools::{
     Tool, ToolProfile, is_external_process_tool, needs_permission, provider_tool_definitions,
@@ -764,31 +765,7 @@ impl ReadFileCache {
 }
 
 fn canonical_within(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
-    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let candidate = if Path::new(user_path).is_absolute() {
-        PathBuf::from(user_path)
-    } else {
-        root_canon.join(user_path)
-    };
-    let canonical = match std::fs::canonicalize(&candidate) {
-        Ok(p) => p,
-        Err(_) => {
-            // Non-existent target (e.g., write_file creating a new file) — verify parent.
-            let parent = candidate.parent().ok_or("path has no parent")?;
-            let name = candidate.file_name().ok_or("path has no filename")?;
-            let parent_canon = std::fs::canonicalize(parent)
-                .map_err(|e| format!("parent dir does not exist or not accessible: {e}"))?;
-            parent_canon.join(name)
-        }
-    };
-    if !canonical.starts_with(&root_canon) {
-        return Err(format!(
-            "path outside sandbox ({}): {}",
-            root_canon.display(),
-            canonical.display()
-        ));
-    }
-    Ok(canonical)
+    canonicalize_tool_path(root, user_path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -7045,9 +7022,10 @@ Browser: if browser_recipe=agent-browser, invoke agent-browser only when useful;
 Subagents: do not call subagent directly; suggest /subagent if delegation is requested. Review subagent output before acting.
 Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
 Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
-Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.";
+Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.
+Packs: when creating or installing a reusable pack or shelf, default to Dext's user-global scope (`~/.dext/packs` or `~/.dext/shelves/<shelf>/packs`) unless the user explicitly asks for project-local placement.";
 
-const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Inspect before edits. Prefer rg/fd then focused reads. Keep tool output small. Use todo for nontrivial work. Make surgical changes. Bash is atomic; use supervised dext- services only for requested persistence. Verify narrowly. Final: changed, tests, gaps.";
+const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Inspect before edits. Prefer rg/fd then focused reads. Keep tool output small. Use todo for nontrivial work. Make surgical changes. Bash is atomic; use supervised dext- services only for requested persistence. Reusable packs default to user-global Dext scope unless the user asks for project-local placement. Verify narrowly. Final: changed, tests, gaps.";
 
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     let mut sections = Vec::new();

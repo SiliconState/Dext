@@ -665,6 +665,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>User roots: <code>~/.dext/shelves/*/packs</code>, <code>~/.dext/packs</code></li>
 <li>Bundled repository packs (examples/templates)</li>
 </ol>
+<p>Reusable packs should be created and installed in user-global Dext scope by default: <code>~/.dext/packs/&lt;name&gt;/</code> or <code>~/.dext/shelves/&lt;shelf&gt;/packs/&lt;name&gt;/</code>. Use project-local pack roots only when the user explicitly wants repository-scoped behavior.</p>
 <p>The resolver deduplicates by canonicalized path and normalized pack name. Name collisions are resolved by precedence order, not random filesystem order.</p>
 
 <h3>Pack Layout and Front Matter</h3>
@@ -708,6 +709,7 @@ description: One-line workflow summary
 <h3>Operational Guidance for Pack Authors</h3>
 <ul>
 <li>Write reproducible loops: inputs, stop conditions, verification gates.</li>
+<li>Install reusable packs under user-global Dext scope by default; use project-local roots only for intentionally repo-scoped packs.</li>
 <li>Keep shell helpers idempotent; prefer deterministic outputs for agent reuse.</li>
 <li>Use <code>phooks.json</code> only when needed; packs must still function without hooks.</li>
 <li>Treat pack workflows as code: version, test on disposable repos, and review diffs.</li>

@@ -2,10 +2,10 @@
 
 SkillOpt-style optimization workflow for Dext packs and skill documents.
 
-Start Dext with this pack:
+Start Dext with this pack from any project after global install:
 
 ```bash
-dext --cd /path/to/project --pack packopt "optimize packs/autoresearch/PACK.md against the validation tasks"
+dext --cd /path/to/project --pack packopt "optimize ~/.dext/packs/autoresearch/PACK.md against the validation tasks"
 ```
 
 The workflow document is [`PACK.md`](PACK.md). The helper is [`bin/packopt.py`](bin/packopt.py).

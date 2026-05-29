@@ -55,6 +55,8 @@ Dext searches for packs in this precedence order. First match wins:
 8. User `~/.dext/packs/<name>/`
 9. Bundled packs in the Dext repository
 
+For reusable packs, default to user-global Dext scope: `~/.dext/packs/<name>/` for legacy packs or `~/.dext/shelves/<shelf>/packs/<name>/` for shelf packs. Use the project-local entries above only when the user explicitly asks for a repo-specific pack.
+
 ### Running a pack
 
 CLI:
@@ -84,18 +86,22 @@ When a pack runs, Dext reads `PACK.md` as the initial agent context and sets `DE
 
 ### Building a pack
 
-1. Create the directory and `PACK.md` with front matter.
-2. Write clear workflow instructions: setup, loop rules, helper commands, state files.
-3. Add helper scripts in `bin/` — called through `bash` via `$DEXT_PACK_DIR/bin/helper.py`.
-4. Optionally add `phooks.json` for steering/validation hooks.
-5. Test locally:
+1. Default to a user-global install location for reusable packs:
+   - legacy pack: `~/.dext/packs/<name>/`
+   - shelf pack: `~/.dext/shelves/<shelf>/packs/<name>/`
+   Use project-local `packs/<name>/`, `.dext/packs/<name>/`, or `.dext/shelves/<shelf>/packs/<name>/` only when the user explicitly wants repo-scoped behavior.
+2. Create the directory and `PACK.md` with front matter.
+3. Write clear workflow instructions: setup, loop rules, helper commands, state files.
+4. Add helper scripts in `bin/` — called through `bash` via `$DEXT_PACK_DIR/bin/helper.py`.
+5. Optionally add `phooks.json` for steering/validation hooks.
+6. Test locally:
 
 ```bash
 dext pack inspect my-pack   # verify discovery and front matter
 dext pack run my-pack "test task"  # run on a disposable task
 ```
 
-6. Distribute by placing in a shelf, a shared directory, or bundling in a repo.
+7. Distribute by placing in a shelf, a shared directory, or bundling in a repo.
 
 ### Hook templates
 
@@ -201,7 +207,7 @@ Shelf metadata is injected into the model context as typed ability records, not 
 
 ## Reference example
 
-The bundled `autoresearch` pack implements an autonomous experiment loop, and `packopt` applies a SkillOpt-style loop to pack/skill documents:
+The bundled `autoresearch` pack implements an autonomous experiment loop, and `packopt` applies a SkillOpt-style loop to pack/skill documents. They ship in the repository as bundled examples, but reusable installations should normally go into user-global Dext scope (`~/.dext/...`) so they are callable from any project:
 
 - `packs/autoresearch/PACK.md` — autoresearch workflow document
 - `packs/autoresearch/bin/autoresearch.py` — autoresearch helper script
@@ -213,7 +219,7 @@ Run it:
 
 ```bash
 dext pack run autoresearch "optimize the benchmark in this repo"
-dext pack run packopt "improve packs/autoresearch/PACK.md against held-out tasks"
+dext pack run packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
 ```
 
 Inspect it to see a full pack structure:

@@ -2,10 +2,10 @@
 
 Autonomous experiment loop infrastructure for Dext without adding provider-visible tools.
 
-Start Dext with this pack:
+Start Dext with this pack after installing it globally (recommended) or pointing `DEXT_PACK_AUTORESEARCH_DIR` at a local checkout:
 
 ```bash
-export DEXT_PACK_AUTORESEARCH_DIR=/path/to/Dext/packs/autoresearch
+export DEXT_PACK_AUTORESEARCH_DIR="$HOME/.dext/packs/autoresearch"
 # optional hooks:
 export DEXT_HOOKS_FILE="$DEXT_PACK_AUTORESEARCH_DIR/phooks.json"
 dext --cd /path/to/project "Read $DEXT_PACK_AUTORESEARCH_DIR/PACK.md and run autoresearch for <goal>."

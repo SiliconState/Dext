@@ -222,20 +222,22 @@ See [`docs/PACKS.md`](docs/PACKS.md) for the full packs and shelves reference, i
 
 Packs are source-first workflow bundles with a `PACK.md`. Dext discovers packs from `DEXT_PACK_<NAME>_DIR`, project `.dext/shelves/<shelf>/packs`, `.dext/packs`, `packs`, `DEXT_SHELVES_DIR`, `DEXT_PACKS_DIR`, user `~/.dext/shelves/<shelf>/packs`, `~/.dext/packs`, and bundled repository packs. Shelf packs take precedence over same-named legacy project/user pack directories within the same scope. Typed shelf manifests named `shelf.json` are loaded from the same shelf roots into the runtime `ShelfRegistry` and exposed in prompt context plus `/shelves` / `dext shelves` as provider-neutral ability metadata.
 
-The stable extension contract is intentionally provider-neutral: a pack is files plus instructions that any LLM/provider can read, with optional shell helpers and `phooks.json` steering. Scaffold a pack as `packs/<name>/PACK.md`, keep helper scripts inside that directory, and validate it with `dext pack inspect <name>` plus a real `dext pack run <name> ...` on a disposable task. Use `packopt` for SkillOpt-style improvement of pack/skill documents with bounded edits, strict held-out validation, and rejected-edit memory. Shared shelves live at `<shelf>/packs/<pack>` and can be distributed through project, user, or `DEXT_SHELVES_DIR` paths without adding provider-visible tools. `shelf.json` manifests add typed ability metadata for internal registry resolution; the runtime lists and prompt-injects those records without expanding the provider-visible tool list.
+The default installation target for reusable packs is user-global Dext scope: `~/.dext/packs/<name>/` for legacy packs or `~/.dext/shelves/<shelf>/packs/<name>/` for shelf packs. Use project-local `packs/<name>/`, `.dext/packs/<name>/`, or `.dext/shelves/<shelf>/packs/<name>/` only when the user explicitly asks for repo-scoped behavior.
+
+The stable extension contract is intentionally provider-neutral: a pack is files plus instructions that any LLM/provider can read, with optional shell helpers and `phooks.json` steering. Scaffold reusable packs in user-global Dext scope by default (`~/.dext/packs/<name>/PACK.md` or `~/.dext/shelves/<shelf>/packs/<name>/PACK.md`), keep helper scripts inside that directory, and validate with `dext pack inspect <name>` plus a real `dext pack run <name> ...` on a disposable task. Use project-local `packs/<name>/PACK.md` or `.dext/...` variants only when the user explicitly wants the pack tied to one repository. Use `packopt` for SkillOpt-style improvement of pack/skill documents with bounded edits, strict held-out validation, and rejected-edit memory. Shared shelves live at `<shelf>/packs/<pack>` and can be distributed through project, user, or `DEXT_SHELVES_DIR` paths without adding provider-visible tools. `shelf.json` manifests add typed ability metadata for internal registry resolution; the runtime lists and prompt-injects those records without expanding the provider-visible tool list.
 
 Invoke a pack conversationally:
 
 ```text
 run autoresearch on improving this project benchmark
-run packopt on improving packs/autoresearch/PACK.md against held-out tasks
+run packopt on improving ~/.dext/packs/autoresearch/PACK.md against held-out tasks
 ```
 
 Or invoke it explicitly:
 
 ```text
 /pack run autoresearch improve this benchmark
-/pack run packopt improve packs/autoresearch/PACK.md against held-out tasks
+/pack run packopt improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks
 ```
 
 CLI equivalents:
@@ -245,9 +247,9 @@ dext pack list
 dext pack inspect autoresearch
 dext pack inspect packopt
 dext pack run autoresearch "improve this benchmark"
-dext pack run packopt "improve packs/autoresearch/PACK.md against held-out tasks"
+dext pack run packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
 dext --pack autoresearch "improve this benchmark"
-dext --pack packopt "improve packs/autoresearch/PACK.md against held-out tasks"
+dext --pack packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
 ```
 
 If a pack has `phooks.json`, Dext activates those hook templates for that invocation and passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to hook processes. Shelf packs use the same invocation path and remain regular source directories.

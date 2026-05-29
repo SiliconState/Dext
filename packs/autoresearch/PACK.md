@@ -31,10 +31,10 @@ All `autoresearch.*` files are preserved across pack reverts. Keep them untracke
 
 ## Helper commands
 
-Set the pack path once:
+Set the pack path once. For reusable installs, prefer the user-global location under `~/.dext/packs/`; if you are editing the bundled repo copy directly, point `PACK` at that checkout instead:
 
 ```bash
-PACK="$PWD/packs/autoresearch"  # from this repository; adjust if installed elsewhere
+PACK="${DEXT_PACK_AUTORESEARCH_DIR:-$HOME/.dext/packs/autoresearch}"
 PYTHON=${PYTHON:-python3}
 ```
 
@@ -177,7 +177,7 @@ When running against `karpathy/autoresearch` or a close fork:
 Pack hook templates are named `phooks.json`, not `hooks.json`, to avoid confusing them with an active project hook file. Activate with:
 
 ```bash
-export DEXT_PACK_AUTORESEARCH_DIR="/path/to/packs/autoresearch"
+export DEXT_PACK_AUTORESEARCH_DIR="$HOME/.dext/packs/autoresearch"
 export DEXT_HOOKS_FILE="$DEXT_PACK_AUTORESEARCH_DIR/phooks.json"
 dext --cd /path/to/project "Read $DEXT_PACK_AUTORESEARCH_DIR/PACK.md and run autoresearch."
 ```

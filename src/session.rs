@@ -12,14 +12,85 @@ use crate::{
     byte_prefix_at_char_boundary, byte_suffix_at_char_boundary, cap_bytes_with_hint,
 };
 
+pub(crate) fn user_home_dir() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+}
+
+pub(crate) fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return user_home_dir();
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return user_home_dir().join(rest);
+    }
+    PathBuf::from(path)
+}
+
 pub(crate) fn dext_state_dir() -> PathBuf {
     if let Ok(p) = std::env::var("DEXT_HOME") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".dext")
+    user_home_dir().join(".dext")
+}
+
+fn canonicalize_with_missing_ancestors(path: &Path) -> std::result::Result<PathBuf, String> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        let name = current.file_name().ok_or("path has no filename")?;
+        missing.push(name.to_os_string());
+        let parent = current.parent().ok_or("path has no parent")?;
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            let mut resolved = canonical_parent;
+            for segment in missing.iter().rev() {
+                resolved.push(segment);
+            }
+            return Ok(resolved);
+        }
+        current = parent;
+    }
+}
+
+fn dext_global_pack_roots() -> Vec<PathBuf> {
+    let dext_home = dext_state_dir();
+    [dext_home.join("packs"), dext_home.join("shelves")]
+        .into_iter()
+        .map(|path| canonicalize_or_clone(&path))
+        .collect()
+}
+
+pub(crate) fn canonicalize_tool_path(
+    root: &Path,
+    user_path: &str,
+) -> std::result::Result<PathBuf, String> {
+    let root = canonicalize_or_clone(root);
+    let expanded = expand_user_path(user_path);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        root.join(expanded)
+    };
+    let canonical = canonicalize_with_missing_ancestors(&candidate)?;
+    if canonical.starts_with(&root)
+        || dext_global_pack_roots()
+            .into_iter()
+            .any(|allowed| canonical.starts_with(&allowed))
+    {
+        Ok(canonical)
+    } else {
+        Err(format!(
+            "path outside sandbox or Dext global pack roots ({}): {}",
+            root.display(),
+            canonical.display()
+        ))
+    }
 }
 
 pub(crate) fn named_sessions_dir_for_root(root: &Path) -> PathBuf {

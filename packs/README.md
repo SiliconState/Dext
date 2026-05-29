@@ -5,6 +5,7 @@ Packs are source-first bundles that teach Dext a workflow without adding provide
 ## Pack rules
 
 - A pack lives under `packs/<name>/`, `.dext/packs/<name>/`, `~/.dext/packs/<name>/`, or a shelf at `.dext/shelves/<shelf>/packs/<name>/` / `~/.dext/shelves/<shelf>/packs/<name>/`.
+- Reusable packs should normally live in user-global Dext scope (`~/.dext/packs/<name>/` or `~/.dext/shelves/<shelf>/packs/<name>/`). Use project-local pack roots only when the user explicitly wants repo-scoped behavior.
 - Each pack should include `PACK.md` as its canonical agent-facing workflow document.
 - Prefer pack-local CLIs/scripts over new LLM-facing tools. Dext should call them through the existing `bash` tool.
 - Keep persistent session state in project files that are easy to inspect and recover from; prefer JSONL plus a compact Markdown runbook.
@@ -15,7 +16,7 @@ Packs are source-first bundles that teach Dext a workflow without adding provide
 ## Activation pattern
 
 ```bash
-export DEXT_PACK_<NAME>_DIR=/path/to/packs/<name>
+export DEXT_PACK_<NAME>_DIR="$HOME/.dext/packs/<name>"  # default reusable install
 # or: export DEXT_SHELVES_DIR=/path/to/shelf-root
 # where packs live at /path/to/shelf-root/<shelf>/packs/<name>
 export DEXT_HOOKS_FILE="$DEXT_PACK_<NAME>_DIR/phooks.json"   # optional

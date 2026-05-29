@@ -4,6 +4,7 @@
 // is being requested. Computes proposed content in memory without
 // touching disk.
 
+use crate::session::canonicalize_tool_path;
 use std::path::{Path, PathBuf};
 
 const PREVIEW_DIFF_CAP: usize = 4096;
@@ -203,28 +204,5 @@ fn cap_string(s: &str, max: usize) -> String {
 }
 
 fn canonical_within(root: &Path, path_str: &str) -> Result<PathBuf, String> {
-    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let candidate = if Path::new(path_str).is_absolute() {
-        PathBuf::from(path_str)
-    } else {
-        root_canon.join(path_str)
-    };
-    let canonical = match std::fs::canonicalize(&candidate) {
-        Ok(path) => path,
-        Err(_) => {
-            let parent = candidate.parent().ok_or("path has no parent")?;
-            let name = candidate.file_name().ok_or("path has no filename")?;
-            let parent = std::fs::canonicalize(parent)
-                .map_err(|e| format!("parent dir does not exist or is not accessible: {e}"))?;
-            parent.join(name)
-        }
-    };
-    if !canonical.starts_with(&root_canon) {
-        return Err(format!(
-            "path outside sandbox ({}): {}",
-            root_canon.display(),
-            canonical.display()
-        ));
-    }
-    Ok(canonical)
+    canonicalize_tool_path(root, path_str)
 }

@@ -6,7 +6,8 @@ use crate::provider::{
 #[cfg(target_os = "linux")]
 use crate::session::process_exists;
 use crate::session::{
-    append_log_line, cap_latest_log_buffer, render_limited_lines, validate_session_name,
+    append_log_line, canonicalize_tool_path, cap_latest_log_buffer, render_limited_lines,
+    validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
@@ -183,6 +184,66 @@ fn mutation_preview_new_file_does_not_duplicate_added_lines() {
     assert_eq!(preview.added, 2);
     assert_eq!(preview.diff.matches("+a").count(), 1);
     assert_eq!(preview.diff.matches("+b").count(), 1);
+}
+
+#[test]
+fn tool_paths_allow_user_global_pack_roots_outside_project() {
+    let _guard = env_lock();
+    let root = temp_test_dir("tool-path-global-pack-root");
+    let home = temp_test_dir("tool-path-global-pack-home");
+    let pack_dir = home.join("packs/demo");
+    std::fs::create_dir_all(&pack_dir).expect("create global pack dir");
+    let pack_md = pack_dir.join("PACK.md");
+    std::fs::write(&pack_md, "---\nname: demo\n---\n# Demo\n").expect("write PACK.md");
+    let notes = pack_dir.join("notes.md");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let canonical = canonicalize_tool_path(&root, &pack_md.display().to_string())
+        .expect("allow global pack path");
+    assert_eq!(
+        canonical,
+        std::fs::canonicalize(&pack_md).expect("canonical pack path")
+    );
+
+    let preview = mutation_preview::preview_write_file(&root, &notes.display().to_string(), "hi\n")
+        .expect("preview global pack write");
+    assert_eq!(preview.path, notes);
+    assert!(preview.is_new_file);
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn tool_paths_reject_non_project_non_global_pack_roots() {
+    let _guard = env_lock();
+    let root = temp_test_dir("tool-path-reject-root");
+    let home = temp_test_dir("tool-path-reject-home");
+    let outside = temp_test_dir("tool-path-reject-outside");
+    let outside_file = outside.join("deny.txt");
+    std::fs::write(&outside_file, "nope\n").expect("write outside file");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let err = canonicalize_tool_path(&root, &outside_file.display().to_string())
+        .expect_err("reject outside file");
+    assert!(
+        err.contains("outside sandbox or Dext global pack roots"),
+        "{err}"
+    );
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 #[test]
@@ -7799,6 +7860,45 @@ async fn compact_uses_deterministic_evidence_fallback_when_summary_request_error
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn packs_discover_user_global_pack_from_dext_home() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("user-pack-discovery-root");
+    let home = temp_test_dir("user-pack-discovery-home");
+    let pack_dir = home.join("packs/globaldemo");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(
+        pack_dir.join("PACK.md"),
+        "---\nname: globaldemo\ndescription: User-global workflow\n---\n# Global demo\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let pack = packs::find_pack(&root, "globaldemo")?;
+    assert_eq!(pack.name, "globaldemo");
+    assert_eq!(pack.description, "User-global workflow");
+    assert_eq!(pack.source, "user:~/.dext/packs");
+    assert_eq!(pack.path, pack_dir);
+
+    let listing = packs::render_pack_listing(&root);
+    assert!(
+        listing.contains("globaldemo — User-global workflow"),
+        "{listing}"
+    );
+    assert!(listing.contains("source: user:~/.dext/packs"), "{listing}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+    Ok(())
 }
 
 #[test]
