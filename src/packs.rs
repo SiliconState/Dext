@@ -115,7 +115,6 @@ fn load_pack_from_dir(dir: &Path, source: &str, shelf: Option<&str>) -> Result<O
     });
     let description = front.description.unwrap_or_default();
     let path = dir.to_path_buf();
-    let pack_md_path = pack_md_path;
     let phooks = path.join("phooks.json");
     Ok(Some(PackInfo {
         name,

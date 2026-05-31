@@ -15,12 +15,12 @@ mod main_tests;
 
 use anyhow::{Context, Result};
 use provider::{
-    ApiProvider, ProviderProfile, ResolvedProviderConfig, apply_provider_headers, auth_store_path,
-    build_chatgpt_request, build_chatgpt_summary_request, built_in_provider_profiles,
-    cancel_pending_oauth_login, canonical_provider_id, extract_oauth_code_from_callback,
-    handle_auth_cli, list_models_for_available_providers, list_models_for_provider,
-    load_auth_store, load_provider_catalog, login_provider, logout_provider,
-    looks_like_login_secret_input, provider_auth_status, provider_catalog_path,
+    ANTHROPIC_API_VERSION, ApiProvider, ProviderProfile, ResolvedProviderConfig,
+    apply_provider_headers, auth_store_path, build_chatgpt_request, build_chatgpt_summary_request,
+    built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
+    extract_oauth_code_from_callback, handle_auth_cli, list_models_for_available_providers,
+    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
+    logout_provider, looks_like_login_secret_input, provider_auth_status, provider_catalog_path,
     provider_id_from_selector, provider_request_url, render_provider_list, render_provider_picker,
     resolve_active_provider_id, resolve_provider_model_selection, resolve_runtime_provider,
     set_active_provider_in_catalog, set_provider_default_model_in_catalog,
@@ -108,6 +108,11 @@ const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     "__pycache__",
 ];
 const MAX_STREAM_ATTEMPTS: u32 = 4;
+// Inner per-request HTTP retry budget (distinct from the outer stream-restart
+// budget MAX_STREAM_ATTEMPTS, even though they currently share the value).
+const MAX_HTTP_ATTEMPTS: u32 = 4;
+// Consecutive 5xx responses from one provider before it is disabled for the turn.
+const MAX_CONSECUTIVE_SERVER_ERRORS: usize = 3;
 const DEFAULT_INPUT_USD_PER_MTOK: f64 = 1.0;
 const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 5.0;
 const DEFAULT_CACHE_READ_USD_PER_MTOK: f64 = 0.1;
@@ -2726,6 +2731,16 @@ fn anthropic_thinking_budget_tokens(effort: ThinkingEffort) -> Option<u32> {
     }
 }
 
+/// Anthropic rejects a request unless `max_tokens > thinking.budget_tokens`.
+/// Clamp the requested thinking budget so it always leaves output headroom (at
+/// least a quarter of `max_tokens`), preventing an HTTP 400 when a high-effort
+/// budget meets a smaller output cap.
+fn clamp_thinking_budget_below_max(budget_tokens: u32, max_tokens: u32) -> Option<u32> {
+    let strict_max = max_tokens.checked_sub(1).filter(|value| *value > 0)?;
+    let ceiling = max_tokens.saturating_mul(3) / 4;
+    Some(budget_tokens.min(ceiling.max(1)).min(strict_max))
+}
+
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
@@ -5145,7 +5160,7 @@ fn run_cargo_check_diagnostics(root: &Path) -> WorkflowDiagnosticsReport {
         None,
         PROCESS_STREAM_CAPTURE_CAP,
         "cargo check diagnostics",
-        std::time::Duration::from_secs(120),
+        timeout_from_env("DEXT_DIAGNOSTICS_TIMEOUT_SECS", 120),
     );
     match result {
         Ok((stdout, stderr, code)) => {
@@ -7147,12 +7162,18 @@ Open work\n\
 Recent state\n\
 Keep each section concise. Capture the user's overall goal, key decisions and why, file paths, function names, identifiers, unresolved work, and anything the next assistant must remember to continue safely. No preamble, no meta-commentary, no filler.";
 
+// Output cap for the one-shot compaction/summary request (kept small: the
+// summary is intentionally terse).
+const COMPACT_SUMMARY_MAX_TOKENS: u32 = 2_048;
+
 const HISTORY_CHAR_BUDGET_MIN: usize = 24_000;
 const HISTORY_CHAR_BUDGET_END_TURN_PERCENT: u8 = 90;
 const HISTORY_CHAR_BUDGET_ACTIVE_PERCENT: u8 = 80;
 const FRUGAL_HISTORY_CHAR_BUDGET_PERCENT: u8 = 80;
 const FRUGAL_HISTORY_CHAR_BUDGET_MIN: usize = 8_000;
 const FRUGAL_HISTORY_CHAR_BUDGET_MAX: usize = 32_000;
+// Fixed history budget for frugal (non-tiny) context mode.
+const FRUGAL_HISTORY_CHAR_BUDGET: usize = 60_000;
 const COMPACT_KEEP_MESSAGES: usize = 6;
 const COMPACT_USER_BOUNDARY_BACKTRACK: usize = COMPACT_KEEP_MESSAGES * 4;
 const COMPACT_PRESERVE_TOOL_MESSAGES: usize = 10;
@@ -8235,6 +8256,11 @@ fn parse_model_context_hint_tokens(model: &str) -> Option<u64> {
     None
 }
 
+// Last-resort context window when env, name hints, catalog, and family
+// heuristics all miss. New model families should be added to the provider
+// catalog (providers.json) rather than hardcoded here.
+const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
 pub(crate) fn model_context_window(model: &str) -> u64 {
     if let Ok(raw) = std::env::var("DEXT_CONTEXT_WINDOW")
         .or_else(|_| std::env::var("DEXT_CONTEXT_WINDOW_TOKENS"))
@@ -8265,7 +8291,30 @@ pub(crate) fn model_context_window(model: &str) -> u64 {
     if let Some(tokens) = builtin_profile_context_window(model) {
         return tokens;
     }
-    200_000
+    DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
+// Default per-request output token cap for streaming completions. Override with
+// DEXT_MAX_OUTPUT_TOKENS. Kept provider-agnostic; oversized values are safely
+// capped server-side by local llama.cpp, and the Anthropic path additionally
+// clamps the thinking budget below this via clamp_thinking_budget_below_max.
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
+fn max_output_tokens() -> u32 {
+    if let Ok(raw) = std::env::var("DEXT_MAX_OUTPUT_TOKENS")
+        && let Ok(v) = raw.trim().parse::<u32>()
+        && v > 0
+    {
+        return v;
+    }
+    DEFAULT_MAX_OUTPUT_TOKENS
+}
+
+// True for ChatGPT/Codex "codex" implementation models (gpt-5.3-codex,
+// gpt-5-codex, future *-codex variants). Substring match so new codex releases
+// are covered without editing this gate.
+fn model_is_codex_implementation_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("codex")
 }
 
 fn provider_catalog_context_window(model: &str) -> Option<u64> {
@@ -8334,7 +8383,7 @@ fn builtin_family_context_window(model: &str) -> Option<u64> {
         || m.contains("opus")
         || m.contains("glm")
     {
-        return Some(200_000);
+        return Some(DEFAULT_CONTEXT_WINDOW_TOKENS);
     }
     None
 }
@@ -8376,7 +8425,7 @@ fn history_char_budget_with_percent(
             );
     }
     if context_mode.is_frugal() {
-        return 60_000;
+        return FRUGAL_HISTORY_CHAR_BUDGET;
     }
 
     compact_threshold_chars_for_percent(model, percent)
@@ -8869,21 +8918,55 @@ impl Agent {
 
     fn apply_implementation_phase_model_mitigation(&mut self) -> Option<String> {
         if self.api_provider != ApiProvider::ChatGpt
-            || !self.model.starts_with("gpt-5.3-codex")
+            || !model_is_codex_implementation_model(&self.model)
             || self.thinking_effort != ThinkingEffort::XHigh
         {
             return None;
         }
         self.thinking_effort = ThinkingEffort::Medium;
-        Some("runtime model mitigation: gpt-5.3-codex implementation phase uses medium effort to favor concrete tool calls over analysis narration; keep xhigh for review/debug phases.".to_string())
+        Some(format!(
+            "runtime model mitigation: {} implementation phase uses medium effort to favor concrete tool calls over analysis narration; keep xhigh for review/debug phases.",
+            self.model
+        ))
     }
 
     fn maybe_fallback_implementation_model(&mut self) -> Option<String> {
-        if self.api_provider != ApiProvider::ChatGpt || !self.model.starts_with("gpt-5.3-codex") {
+        if self.api_provider != ApiProvider::ChatGpt
+            || !model_is_codex_implementation_model(&self.model)
+        {
             return None;
         }
-        self.note_runtime_model_change("gpt-5.5");
-        Some("runtime model fallback: action contract is still unresolved after repeated no-mutation turns; switched model to gpt-5.5 for the next request.".to_string())
+        let target = self.implementation_fallback_model_target()?;
+        if target.eq_ignore_ascii_case(&self.model) || model_is_codex_implementation_model(&target)
+        {
+            return None;
+        }
+        self.note_runtime_model_change(&target);
+        Some(format!(
+            "runtime model fallback: action contract is still unresolved after repeated no-mutation turns; switched model to {target} for the next request."
+        ))
+    }
+
+    /// Non-codex model to escape to when a codex implementation model stalls.
+    /// Resolution: DEXT_IMPL_FALLBACK_MODEL env override, else the provider's
+    /// built-in default model, else its first advertised non-codex model.
+    fn implementation_fallback_model_target(&self) -> Option<String> {
+        if let Ok(raw) = std::env::var("DEXT_IMPL_FALLBACK_MODEL") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        let profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|p| p.id == self.provider_id)?;
+        if !model_is_codex_implementation_model(&profile.default_model) {
+            return Some(profile.default_model);
+        }
+        profile
+            .models
+            .into_iter()
+            .find(|m| !model_is_codex_implementation_model(m))
     }
 
     fn action_contract_violation_runtime_notes(
@@ -9062,13 +9145,13 @@ impl Agent {
         let client = self.client.get_or_init(reqwest::Client::new).clone();
         let url = provider_request_url(&self.base_url, self.api_provider);
         // Fire-and-forget HEAD request to warm TLS
-        let _ = tokio::spawn(async move {
+        std::mem::drop(tokio::spawn(async move {
             let _ = client
                 .head(&url)
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .await;
-        });
+        }));
     }
 
     fn http_client(&self) -> &reqwest::Client {
@@ -9803,14 +9886,15 @@ impl Agent {
         state.last_error = Some(format!("HTTP {status}: {}", summarize_inline(text, 220)));
         state.retry_after = retry_after;
         state.mode = Some(api_family_label(self.api_provider).to_string());
-        let is_server_error = matches!(status.as_u16(), 502 | 503 | 504);
+        let is_server_error = matches!(status.as_u16(), 502..=504);
         if is_server_error {
             state.consecutive_server_errors = state.consecutive_server_errors.saturating_add(1);
         } else {
             state.consecutive_server_errors = 0;
         }
         state.disabled_for_turn = matches!(status.as_u16(), 401 | 403 | 429)
-            || (is_server_error && state.consecutive_server_errors >= 3);
+            || (is_server_error
+                && state.consecutive_server_errors >= MAX_CONSECUTIVE_SERVER_ERRORS);
     }
 
     fn record_provider_stream_failure(&mut self, text: &str) {
@@ -10089,7 +10173,7 @@ impl Agent {
                 let reasoning_effort = openai_reasoning_effort(self.thinking_effort);
                 let body = OaiRequest {
                     model: &self.model,
-                    max_tokens: 4096,
+                    max_tokens: max_output_tokens(),
                     messages: oai_msgs,
                     tools: oai_tools,
                     stream: true,
@@ -10099,17 +10183,19 @@ impl Agent {
                 Ok((url, bytes))
             }
             ApiProvider::Anthropic => {
-                let thinking =
-                    anthropic_thinking_budget_tokens(self.thinking_effort).map(|budget_tokens| {
-                        AnthropicThinking {
-                            kind: "enabled",
-                            budget_tokens,
-                        }
+                let max_tokens = max_output_tokens();
+                let thinking = anthropic_thinking_budget_tokens(self.thinking_effort)
+                    .and_then(|budget_tokens| {
+                        clamp_thinking_budget_below_max(budget_tokens, max_tokens)
+                    })
+                    .map(|budget_tokens| AnthropicThinking {
+                        kind: "enabled",
+                        budget_tokens,
                     });
                 let messages = strip_tool_result_metadata(&self.history);
                 let body = Request {
                     model: &self.model,
-                    max_tokens: 4096,
+                    max_tokens,
                     system: sys_blocks,
                     messages: &messages,
                     tools: wire_tools,
@@ -10749,7 +10835,7 @@ impl Agent {
                 ];
                 let body = OaiRequest {
                     model: &self.model,
-                    max_tokens: 2048,
+                    max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
                     messages,
                     tools: Vec::new(),
                     stream: false,
@@ -10778,7 +10864,7 @@ impl Agent {
                 }];
                 let body = Request {
                     model: &self.model,
-                    max_tokens: 2048,
+                    max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
                     system: &sys_blocks,
                     messages: &messages,
                     tools: &[],
@@ -10788,7 +10874,7 @@ impl Agent {
                 let mut req = self
                     .http_client()
                     .post(provider_request_url(&self.base_url, self.api_provider))
-                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-version", ANTHROPIC_API_VERSION)
                     .header("content-type", "application/json")
                     .json(&body);
                 if !self.api_key.trim().is_empty() {
@@ -11487,7 +11573,7 @@ impl Agent {
                                 continue;
                             }
 
-                            if !plan.retry || attempt >= 4 {
+                            if !plan.retry || attempt >= MAX_HTTP_ATTEMPTS {
                                 self.append_latest_log(
                                     "http_error",
                                     &format!("kind={} HTTP {status}: {text}", plan.label()),
@@ -11518,7 +11604,7 @@ impl Agent {
                                 e.is_connect(),
                                 e.is_timeout(),
                             );
-                            if plan.retry && attempt < 4 {
+                            if plan.retry && attempt < MAX_HTTP_ATTEMPTS {
                                 let wait = jittered_backoff_secs(1u64 << (attempt - 1));
                                 self.append_latest_log(
                                     "http_retry",
@@ -11945,10 +12031,9 @@ impl Agent {
                         // Show mutation preview for direct file tools before asking permission
                         if self.preview_mode != MutationPreviewMode::Off
                             && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
+                            && let Some(preview) = self.compute_mutation_preview(&name, &input)
                         {
-                            if let Some(preview) = self.compute_mutation_preview(&name, &input) {
-                                self.sink.emit(AgentEvent::Info(preview));
-                            }
+                            self.sink.emit(AgentEvent::Info(preview));
                         }
                         match self.sink.request_permission(&name, &input) {
                             Choice::Once => true,
@@ -16925,7 +17010,7 @@ fn run_eval_shell_command(
         None,
         PROCESS_STREAM_CAPTURE_CAP,
         "eval command",
-        std::time::Duration::from_secs(15),
+        timeout_from_env("DEXT_EVAL_TIMEOUT_SECS", 15),
     )?;
     let duration = started_at.elapsed();
     let stdout = stdout.render("stdout");

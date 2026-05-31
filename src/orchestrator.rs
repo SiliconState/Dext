@@ -171,10 +171,10 @@ impl TurnRuntimeState {
         command: Option<&str>,
     ) -> Option<String> {
         let sim_key = similarity_key?;
-        if let Some(cmd) = command {
-            if is_safe_repeated_validation_command(cmd) {
-                return None;
-            }
+        if let Some(cmd) = command
+            && is_safe_repeated_validation_command(cmd)
+        {
+            return None;
         }
         let is_file_tool = sim_key.contains("write_file:") || sim_key.contains("edit_file:");
         let similar_unproductive = self

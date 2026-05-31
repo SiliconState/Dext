@@ -961,10 +961,10 @@ impl TuiState {
             Err(_) => return,
         };
         use std::io::{Read, Seek, SeekFrom};
-        if let Ok(meta) = file.metadata() {
-            if meta.len() <= ds.file_offset {
-                return;
-            }
+        if let Ok(meta) = file.metadata()
+            && meta.len() <= ds.file_offset
+        {
+            return;
         }
         if file.seek(SeekFrom::Start(ds.file_offset)).is_err() {
             return;
@@ -1964,10 +1964,10 @@ fn derived_busy_status(state: &TuiState) -> String {
     if let Some(retry) = &state.retry_status {
         return retry.clone();
     }
-    if let Some(ds) = &state.detached_subagent {
-        if !ds.completed {
-            return "subagent running".to_string();
-        }
+    if let Some(ds) = &state.detached_subagent
+        && !ds.completed
+    {
+        return "subagent running".to_string();
     }
     let running_tools: Vec<&LiveTool> = state
         .live_tools
@@ -4743,7 +4743,7 @@ fn push_prefixed_text(
             if remaining == 0 {
                 break;
             }
-            let content = strip_markdown_markers(&span.content.into_owned());
+            let content = strip_markdown_markers(span.content.as_ref());
             let width = text_width(&content);
             if width <= remaining {
                 remaining = remaining.saturating_sub(width);
@@ -4849,7 +4849,7 @@ fn clip_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<
             break;
         }
         let style = span.style;
-        let content = strip_markdown_markers(&span.content.into_owned());
+        let content = strip_markdown_markers(span.content.as_ref());
         let width = text_width(&content);
         if width <= remaining {
             remaining = remaining.saturating_sub(width);
@@ -4907,7 +4907,7 @@ fn push_wrapped_spans_with_prefix(
                 break;
             };
             let style = span.style;
-            let content = strip_markdown_markers(&span.content.into_owned());
+            let content = strip_markdown_markers(span.content.as_ref());
             let width = text_width(&content);
             if width <= available {
                 available = available.saturating_sub(width);
@@ -6671,9 +6671,9 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     };
     render_widget_safe(frame, status, status_area);
 
-    let prompt_style = if state.input.is_empty() && state.input_display_override.is_none() {
-        Style::default().fg(Color::DarkGray)
-    } else if state.agent_busy && state.pending_perm.is_none() {
+    let prompt_style = if (state.input.is_empty() && state.input_display_override.is_none())
+        || (state.agent_busy && state.pending_perm.is_none())
+    {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default()

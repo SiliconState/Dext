@@ -221,13 +221,13 @@ pub(crate) fn create_checkpoint_in_repo(
     let id = format!("{ts}-{ordinal}-{tool_sanitized}");
     let ref_name = format!("{REF_PREFIX}/{sess}/{id}");
 
-    let head = head_oid(&git_root)?;
-    let dirty = is_dirty(&git_root)?;
+    let head = head_oid(git_root)?;
+    let dirty = is_dirty(git_root)?;
 
     // For dirty state, use git stash create to capture a snapshot
     // without touching the working tree or reflog.
     let oid = if dirty {
-        let stash_out = run_git(&git_root, &["stash", "create"])?;
+        let stash_out = run_git(git_root, &["stash", "create"])?;
         let stash_oid = stash_out.trim().to_string();
         if stash_oid.is_empty() {
             // Clean after all (race); use HEAD
@@ -240,19 +240,18 @@ pub(crate) fn create_checkpoint_in_repo(
     };
 
     // Store the ref
-    run_git(&git_root, &["update-ref", &ref_name, &oid])?;
+    run_git(git_root, &["update-ref", &ref_name, &oid])?;
 
     // Handle untracked sidecar for direct file tools.
     let mut includes_untracked_sidecar = false;
     let file_tools = ["write_file", "edit_file", "multi_edit"];
     if file_tools.contains(&tool) {
         for path_str in paths_hint {
-            if let Some((abs, rel)) = resolve_existing_repo_path(root, &git_root, path_str) {
-                if !is_tracked(&git_root, &rel)
-                    && save_untracked_sidecar(&git_root, &id, &abs, &rel).is_ok()
-                {
-                    includes_untracked_sidecar = true;
-                }
+            if let Some((abs, rel)) = resolve_existing_repo_path(root, git_root, path_str)
+                && !is_tracked(git_root, &rel)
+                && save_untracked_sidecar(git_root, &id, &abs, &rel).is_ok()
+            {
+                includes_untracked_sidecar = true;
             }
         }
     }
@@ -463,18 +462,18 @@ pub(crate) fn restore_worktree(
 
     // Restore sidecar untracked files
     let sdir = sidecar_dir(&git_root, &cp.id);
-    if sdir.is_dir() {
-        if let Ok(entries) = walk_dir(&sdir) {
-            for entry in entries {
-                if let Ok(rel) = entry.strip_prefix(&sdir) {
-                    let dest = git_root.join(rel);
-                    if let Some(parent) = dest.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    match std::fs::copy(&entry, &dest) {
-                        Ok(_) => restored.push(rel.display().to_string()),
-                        Err(e) => eprintln!("warning: sidecar restore failed: {e}"),
-                    }
+    if sdir.is_dir()
+        && let Ok(entries) = walk_dir(&sdir)
+    {
+        for entry in entries {
+            if let Ok(rel) = entry.strip_prefix(&sdir) {
+                let dest = git_root.join(rel);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::copy(&entry, &dest) {
+                    Ok(_) => restored.push(rel.display().to_string()),
+                    Err(e) => eprintln!("warning: sidecar restore failed: {e}"),
                 }
             }
         }
@@ -552,7 +551,7 @@ pub(crate) fn prune(
     let content: String = remaining
         .iter()
         .rev() // oldest first in file
-        .map(|cp| format_manifest_line(cp))
+        .map(format_manifest_line)
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(

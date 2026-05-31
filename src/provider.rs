@@ -11,6 +11,9 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::session::{atomic_write_bytes, dext_state_dir, unix_timestamp_secs};
 
+/// `anthropic-version` request header value sent on all Anthropic Messages API calls.
+pub(crate) const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ApiProvider {
     #[default]
@@ -1149,7 +1152,7 @@ pub(crate) fn apply_provider_headers(
             req
         }
         ApiProvider::Anthropic => {
-            let req = req.header("anthropic-version", "2023-06-01");
+            let req = req.header("anthropic-version", ANTHROPIC_API_VERSION);
             if api_key.trim().is_empty() {
                 req
             } else {
@@ -2976,7 +2979,7 @@ fn render_provider_models(profile: &ProviderProfile) -> String {
         );
     }
     if let Some(notes) = &profile.notes {
-        out.push_str("\n");
+        out.push('\n');
         out.push_str(notes);
     }
     if profile.api_provider == ApiProvider::ChatGpt {

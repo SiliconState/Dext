@@ -1811,11 +1811,11 @@ fn action_contract_violation_notes_loop_and_fallback_after_repeated_no_mutation(
 
     let notes = agent.action_contract_violation_runtime_notes(2, &mut fallback_emitted);
     assert!(fallback_emitted);
-    assert_eq!(agent.model, "gpt-5.5");
+    assert_eq!(agent.model, "gpt-5.4");
     assert!(
         notes
             .iter()
-            .any(|note| note.contains("switched model to gpt-5.5")),
+            .any(|note| note.contains("switched model to gpt-5.4")),
         "{notes:?}"
     );
 
@@ -3569,7 +3569,7 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
         assert!(url.contains("api.deepseek.com"), "{url}");
         let body_json: Value = serde_json::from_slice(&body)?;
         assert_eq!(body_json["model"], "deepseek-reasoner");
-        assert_eq!(body_json["max_tokens"], 4096);
+        assert_eq!(body_json["max_tokens"], 8192);
         Ok(())
     })();
 
@@ -3650,7 +3650,7 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
     let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
     let body_json: Value = serde_json::from_slice(&body)?;
     assert!(body_json.get("reasoning_effort").is_none(), "{body_json}");
-    assert_eq!(body_json["max_tokens"], 4096);
+    assert_eq!(body_json["max_tokens"], 8192);
 
     let chatgpt = build_chatgpt_request(
         "gpt-5.4",
@@ -3664,6 +3664,10 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
 
     assert!(openai_reasoning_effort(ThinkingEffort::Off).is_none());
     assert!(anthropic_thinking_budget_tokens(ThinkingEffort::Off).is_none());
+    assert_eq!(clamp_thinking_budget_below_max(8_192, 8_192), Some(6_144));
+    assert_eq!(clamp_thinking_budget_below_max(4_096, 4_096), Some(3_072));
+    assert_eq!(clamp_thinking_budget_below_max(1_024, 2), Some(1));
+    assert_eq!(clamp_thinking_budget_below_max(1_024, 1), None);
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -7132,7 +7136,11 @@ fn implementation_model_mitigation_lowers_codex_53_xhigh() {
 }
 
 #[test]
-fn implementation_model_fallback_switches_codex_53_to_55() {
+fn implementation_model_fallback_switches_codex_53_to_default() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_IMPL_FALLBACK_MODEL");
+    }
     let root = temp_test_dir("codex-53-implementation-fallback");
     let root = std::fs::canonicalize(&root).unwrap();
     let mut agent = test_agent(&root);
@@ -7143,11 +7151,11 @@ fn implementation_model_fallback_switches_codex_53_to_55() {
     let mut fallback_emitted = false;
     let notes = agent.action_contract_violation_runtime_notes(2, &mut fallback_emitted);
     assert!(fallback_emitted);
-    assert_eq!(agent.model, "gpt-5.5");
+    assert_eq!(agent.model, "gpt-5.4");
     assert!(
         notes
             .iter()
-            .any(|note| note.contains("switched model to gpt-5.5")),
+            .any(|note| note.contains("switched model to gpt-5.4")),
         "{notes:?}"
     );
     assert!(
@@ -7163,10 +7171,137 @@ fn implementation_model_fallback_switches_codex_53_to_55() {
             .session_model_pins
             .get(&canonical_provider_id("chatgpt"))
             .map(String::as_str),
-        Some("gpt-5.5")
+        Some("gpt-5.4")
     );
 
     let _ = std::fs::remove_dir_all(&root);
+    unsafe {
+        std::env::remove_var("DEXT_IMPL_FALLBACK_MODEL");
+    }
+}
+
+#[test]
+fn implementation_model_fallback_honors_non_codex_env_override() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::set_var("DEXT_IMPL_FALLBACK_MODEL", "gpt-5.5");
+    }
+    let root = temp_test_dir("codex-implementation-fallback-env");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.provider_id = "chatgpt".to_string();
+    agent.model = "gpt-5-codex".to_string();
+
+    let mut fallback_emitted = false;
+    let notes = agent.action_contract_violation_runtime_notes(2, &mut fallback_emitted);
+    assert!(fallback_emitted);
+    assert_eq!(agent.model, "gpt-5.5");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("switched model to gpt-5.5")),
+        "{notes:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    unsafe {
+        std::env::remove_var("DEXT_IMPL_FALLBACK_MODEL");
+    }
+}
+
+#[test]
+fn implementation_model_fallback_ignores_codex_env_override() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::set_var("DEXT_IMPL_FALLBACK_MODEL", "gpt-5-codex");
+    }
+    let root = temp_test_dir("codex-implementation-fallback-codex-env");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.provider_id = "chatgpt".to_string();
+    agent.model = "gpt-5.3-codex-spark".to_string();
+
+    let mut fallback_emitted = false;
+    let notes = agent.action_contract_violation_runtime_notes(2, &mut fallback_emitted);
+    assert!(!fallback_emitted);
+    assert_eq!(agent.model, "gpt-5.3-codex-spark");
+    assert!(
+        !notes.iter().any(|note| note.contains("switched model")),
+        "{notes:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    unsafe {
+        std::env::remove_var("DEXT_IMPL_FALLBACK_MODEL");
+    }
+}
+
+#[test]
+fn anthropic_streaming_request_clamps_thinking_below_max_tokens() -> Result<()> {
+    let _guard = env_lock();
+    unsafe {
+        std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "2");
+    }
+    let root = temp_test_dir("anthropic-thinking-clamp");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-sonnet-4-5".to_string();
+    agent.thinking_effort = ThinkingEffort::XHigh;
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: None,
+    }];
+
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["max_tokens"], 2);
+    assert_eq!(value["thinking"]["budget_tokens"], 1);
+
+    unsafe {
+        std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "1");
+    }
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["max_tokens"], 1);
+    assert!(value.get("thinking").is_none(), "{value}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    unsafe {
+        std::env::remove_var("DEXT_MAX_OUTPUT_TOKENS");
+    }
+    Ok(())
+}
+
+#[test]
+fn max_output_tokens_reads_positive_env_override() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_MAX_OUTPUT_TOKENS");
+    }
+    assert_eq!(max_output_tokens(), 8_192);
+
+    unsafe {
+        std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "1234");
+    }
+    assert_eq!(max_output_tokens(), 1_234);
+
+    unsafe {
+        std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "0");
+    }
+    assert_eq!(max_output_tokens(), 8_192);
+
+    unsafe {
+        std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "not-a-number");
+    }
+    assert_eq!(max_output_tokens(), 8_192);
+
+    unsafe {
+        std::env::remove_var("DEXT_MAX_OUTPUT_TOKENS");
+    }
 }
 
 #[test]

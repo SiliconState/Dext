@@ -325,6 +325,9 @@ DEXT_MODEL=glm-4.6
 DEXT_MODEL_FORCE=1
 DEXT_BASE_URL=https://api.example.test
 DEXT_API_KEY=...
+# ChatGPT/Codex only: model to switch to when a codex implementation model
+# stalls on repeated no-mutation turns (default: the provider's default model).
+DEXT_IMPL_FALLBACK_MODEL=gpt-5.4
 ```
 
 Provider-specific credential fallbacks:
@@ -361,9 +364,16 @@ DEXT_TOOL_PROFILE=lean
 DEXT_MUTATION_PREVIEW=simple
 DEXT_THINKING_EFFORT=off
 DEXT_BUDGET_CAP='$5'
+# Max output tokens requested per streaming completion (default 8192). The
+# Anthropic thinking budget is always clamped below this to satisfy the API.
+DEXT_MAX_OUTPUT_TOKENS=8192
 DEXT_EXTERNAL_TIMEOUT_SECS=60
 DEXT_BASH_TIMEOUT_SECS=60
 DEXT_HOOK_TIMEOUT_SECS=60
+# cargo-check workflow diagnostics timeout (default 120)
+DEXT_DIAGNOSTICS_TIMEOUT_SECS=120
+# eval-harness shell command timeout (default 15)
+DEXT_EVAL_TIMEOUT_SECS=15
 ```
 
 ## Development commands

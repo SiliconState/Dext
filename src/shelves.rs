@@ -134,18 +134,13 @@ impl Default for ShelfOrigin {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ShelfMode {
     Passive,
+    #[default]
     OnDemand,
     Always,
-}
-
-impl Default for ShelfMode {
-    fn default() -> Self {
-        Self::OnDemand
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
