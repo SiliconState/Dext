@@ -96,6 +96,8 @@ fn test_agent(root: &Path) -> Agent {
         budget_exhausted: false,
         builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
         sink: Box::new(NullSink),
+        runtime_control_rx: None,
+        runtime_control_tx: Agent::noop_text_tx(),
         steering_rx: None,
         steering_tx: Agent::noop_steering_tx(),
         read_cache: Arc::new(Mutex::new(ReadFileCache::default())),
@@ -544,6 +546,7 @@ fn sudo_askpass_script_uses_local_tty_and_never_echoes_chat_guidance() {
 #[test]
 fn busy_console_input_withholds_potential_local_secret_from_steering() {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (runtime_control_tx, mut runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
     let busy = AtomicBool::new(true);
 
@@ -551,10 +554,12 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
         "token=abcdefghijklmnopqrstuvwxyz\n".to_string(),
         &busy,
         &input_tx,
+        &runtime_control_tx,
         &steering_tx,
     );
 
     assert_eq!(route, InteractiveInputRoute::Dropped);
+    assert!(runtime_control_rx.try_recv().is_err());
     assert!(steering_rx.try_recv().is_err());
     assert!(input_rx.try_recv().is_err());
 
@@ -562,9 +567,11 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
         "{\"accessToken\":\"secret-token-that-should-go-to-login\"}\n".to_string(),
         &busy,
         &input_tx,
+        &runtime_control_tx,
         &steering_tx,
     );
     assert_eq!(route, InteractiveInputRoute::Dropped);
+    assert!(runtime_control_rx.try_recv().is_err());
     assert!(steering_rx.try_recv().is_err());
     assert!(input_rx.try_recv().is_err());
 
@@ -572,11 +579,49 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
         "/login chatgpt sk-secret-token-that-should-stay-local\n".to_string(),
         &busy,
         &input_tx,
+        &runtime_control_tx,
         &steering_tx,
     );
     assert_eq!(route, InteractiveInputRoute::Dropped);
+    assert!(runtime_control_rx.try_recv().is_err());
     assert!(steering_rx.try_recv().is_err());
     assert!(input_rx.try_recv().is_err());
+
+    let route = route_interactive_input_line(
+        "/model gpt-5.5, /effort high\n".to_string(),
+        &busy,
+        &input_tx,
+        &runtime_control_tx,
+        &steering_tx,
+    );
+    assert_eq!(route, InteractiveInputRoute::RuntimeControlQueued);
+    assert_eq!(
+        runtime_control_rx.try_recv().ok().as_deref(),
+        Some("/model gpt-5.5")
+    );
+    assert_eq!(
+        runtime_control_rx.try_recv().ok().as_deref(),
+        Some("/effort high")
+    );
+    assert!(steering_rx.try_recv().is_err());
+    assert!(input_rx.try_recv().is_err());
+}
+
+#[test]
+fn active_runtime_control_detection_accepts_only_model_and_effort_sequences() {
+    assert!(is_active_runtime_control_command("/model gpt-5.5"));
+    assert!(is_active_runtime_control_command(
+        "/model gpt-5.5, /think high"
+    ));
+    assert!(!is_active_runtime_control_command("/tools full"));
+    assert!(!is_active_runtime_control_command(
+        "/model gpt-5.5, adjust this"
+    ));
+    assert_eq!(
+        parse_active_runtime_control_sequence(" /model chatgpt/gpt-5.4 , /effort xhigh ")
+            .expect("parse sequence"),
+        vec!["/model chatgpt/gpt-5.4", "/effort xhigh"]
+    );
 }
 
 #[test]
@@ -592,8 +637,9 @@ fn steering_received_event_serializes_preview() {
 }
 
 #[test]
-fn non_tui_busy_input_routes_to_steering_channel_immediately() {
+fn non_tui_busy_input_routes_steering_and_runtime_controls_immediately() {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (runtime_control_tx, mut runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
     let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
     let busy = AtomicBool::new(true);
 
@@ -601,6 +647,7 @@ fn non_tui_busy_input_routes_to_steering_channel_immediately() {
         "adjust the current fix\n".to_string(),
         &busy,
         &input_tx,
+        &runtime_control_tx,
         &steering_tx,
     );
 
@@ -609,25 +656,37 @@ fn non_tui_busy_input_routes_to_steering_channel_immediately() {
         steering_rx.try_recv().ok().as_deref(),
         Some("adjust the current fix")
     );
+    assert!(runtime_control_rx.try_recv().is_err());
     assert!(input_rx.try_recv().is_err());
 
-    let route =
-        route_interactive_input_line("/effort high\n".to_string(), &busy, &input_tx, &steering_tx);
-    assert_eq!(route, InteractiveInputRoute::SteeringQueued);
-    assert_eq!(steering_rx.try_recv().ok().as_deref(), Some("/effort high"));
+    let route = route_interactive_input_line(
+        "/effort high\n".to_string(),
+        &busy,
+        &input_tx,
+        &runtime_control_tx,
+        &steering_tx,
+    );
+    assert_eq!(route, InteractiveInputRoute::RuntimeControlQueued);
+    assert_eq!(
+        runtime_control_rx.try_recv().ok().as_deref(),
+        Some("/effort high")
+    );
+    assert!(steering_rx.try_recv().is_err());
     assert!(input_rx.try_recv().is_err());
 
     let route = route_interactive_input_line(
         "/model gpt-5.5\n".to_string(),
         &busy,
         &input_tx,
+        &runtime_control_tx,
         &steering_tx,
     );
-    assert_eq!(route, InteractiveInputRoute::SteeringQueued);
+    assert_eq!(route, InteractiveInputRoute::RuntimeControlQueued);
     assert_eq!(
-        steering_rx.try_recv().ok().as_deref(),
+        runtime_control_rx.try_recv().ok().as_deref(),
         Some("/model gpt-5.5")
     );
+    assert!(steering_rx.try_recv().is_err());
     assert!(input_rx.try_recv().is_err());
 }
 

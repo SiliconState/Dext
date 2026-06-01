@@ -336,6 +336,17 @@ pub(crate) fn record_crash_event(event: &AgentEvent) {
             Some(format!("compact_failed:{}", summarize_inline(message, 80)))
         }
         AgentEvent::Interrupted => Some("interrupted".to_string()),
+        AgentEvent::RuntimeControl(s) => {
+            Some(format!("runtime_control:{}", summarize_inline(s, 80)))
+        }
+        AgentEvent::RuntimeControlApplied {
+            commands,
+            model_changed,
+            effort_changed,
+            stream_aborted,
+        } => Some(format!(
+            "runtime_control_applied:{commands}:model={model_changed}:effort={effort_changed}:abort={stream_aborted}"
+        )),
         AgentEvent::SteeringReceived { messages, preview } => Some(format!(
             "steering:{messages}:{}",
             summarize_inline(preview, 80)
@@ -943,6 +954,7 @@ enum CompactSlash {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InteractiveInputRoute {
     Submitted,
+    RuntimeControlQueued,
     SteeringQueued,
     Dropped,
 }
@@ -951,6 +963,7 @@ fn route_interactive_input_line(
     line: String,
     agent_busy: &AtomicBool,
     input_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    runtime_control_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     steering_tx: &tokio::sync::mpsc::UnboundedSender<String>,
 ) -> InteractiveInputRoute {
     let trimmed = line.trim().to_string();
@@ -958,10 +971,23 @@ fn route_interactive_input_line(
         return InteractiveInputRoute::Dropped;
     }
     if agent_busy.load(Ordering::SeqCst) {
-        if text_is_potential_local_secret(&trimmed) {
-            return InteractiveInputRoute::Dropped;
-        }
-        if steering_tx.send(trimmed).is_ok() {
+        if is_active_runtime_control_command(&trimmed) {
+            let commands = parse_active_runtime_control_sequence(&trimmed)
+                .unwrap_or_else(|| vec![trimmed.clone()]);
+            let mut queued = false;
+            for command in commands {
+                if runtime_control_tx.send(command).is_ok() {
+                    queued = true;
+                }
+            }
+            if queued {
+                InteractiveInputRoute::RuntimeControlQueued
+            } else {
+                InteractiveInputRoute::Dropped
+            }
+        } else if text_is_potential_local_secret(&trimmed) {
+            InteractiveInputRoute::Dropped
+        } else if steering_tx.send(trimmed).is_ok() {
             InteractiveInputRoute::SteeringQueued
         } else {
             InteractiveInputRoute::Dropped
@@ -1105,6 +1131,13 @@ enum AgentEvent {
     ApprovalProfileChanged {
         profile: ApprovalProfile,
     },
+    RuntimeControl(String),
+    RuntimeControlApplied {
+        commands: usize,
+        model_changed: bool,
+        effort_changed: bool,
+        stream_aborted: bool,
+    },
     Info(String),
     Warn(String),
     Error(String),
@@ -1230,6 +1263,14 @@ impl EventSink for ConsoleSink {
             AgentEvent::TurnDiagnostics { .. } => {}
             AgentEvent::ThinkingEffortChanged { .. } => {}
             AgentEvent::ApprovalProfileChanged { .. } => {}
+            AgentEvent::RuntimeControl(s) => println!("{s}"),
+            AgentEvent::RuntimeControlApplied { stream_aborted, .. } => {
+                if stream_aborted {
+                    self.printed_any_text_this_block = false;
+                    self.printed_prefix = false;
+                    self.text_accum.clear();
+                }
+            }
             AgentEvent::Info(s) => println!("{s}"),
             AgentEvent::Warn(s) => eprintln!("{s}"),
             AgentEvent::Error(s) => eprintln!("{s}"),
@@ -1306,6 +1347,10 @@ impl EventSink for JsonSink {
                 match &event {
                     AgentEvent::TextDelta(delta) => self.stream.text.push_str(delta),
                     AgentEvent::TextBlockComplete(full) => self.stream.text = full.clone(),
+                    AgentEvent::RuntimeControlApplied {
+                        stream_aborted: true,
+                        ..
+                    } => self.stream.text.clear(),
                     _ => {}
                 }
                 if let Ok(value) = serde_json::to_value(&event) {
@@ -1321,6 +1366,10 @@ impl EventSink for JsonSink {
                 }
                 AgentEvent::TextDelta(delta) => self.stream.text.push_str(&delta),
                 AgentEvent::TextBlockComplete(full) => self.stream.text = full,
+                AgentEvent::RuntimeControlApplied {
+                    stream_aborted: true,
+                    ..
+                } => self.stream.text.clear(),
                 AgentEvent::TurnEnd { usage } => {
                     Self::emit_json_line(&json!({
                         "event": "final",
@@ -7834,6 +7883,46 @@ fn parse_compact_slash(line: &str) -> Option<Result<CompactSlash, &'static str>>
     Some(Err("usage: /compact [status|auto|<percent>|<percent>%]"))
 }
 
+fn parse_runtime_control_command(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim();
+    runtime_control_command_accepts(cmd).then_some((cmd, arg))
+}
+
+fn runtime_control_command_accepts(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "model" | "effort" | "think" | "thinking" | "tools" | "compact"
+    )
+}
+
+pub(crate) fn parse_active_runtime_control_sequence(text: &str) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut commands = Vec::new();
+    for part in trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        let (cmd, _) = parse_runtime_control_command(part)?;
+        if !matches!(cmd, "model" | "effort" | "think" | "thinking") {
+            return None;
+        }
+        commands.push(part.to_string());
+    }
+    (!commands.is_empty()).then_some(commands)
+}
+
+fn is_active_runtime_control_command(text: &str) -> bool {
+    parse_active_runtime_control_sequence(text).is_some()
+}
+
 fn apply_runtime_model_command(agent: &mut Agent, arg: &str) -> Result<String> {
     if arg.trim().is_empty() {
         return Ok(format!(
@@ -7885,9 +7974,9 @@ fn apply_runtime_control_command(
         return false;
     }
 
-    let mut parts = trimmed[1..].splitn(2, char::is_whitespace);
-    let cmd = parts.next().unwrap_or("");
-    let arg = parts.next().unwrap_or("").trim();
+    let Some((cmd, arg)) = parse_runtime_control_command(trimmed) else {
+        return false;
+    };
     if cmd == "model" {
         match apply_runtime_model_command(agent, arg) {
             Ok(msg) => emit(msg),
@@ -7912,11 +8001,7 @@ fn apply_runtime_control_command(
         return true;
     }
 
-    let effort_arg = trimmed
-        .strip_prefix("/effort")
-        .or_else(|| trimmed.strip_prefix("/think"))
-        .or_else(|| trimmed.strip_prefix("/thinking"))
-        .map(str::trim);
+    let effort_arg = matches!(cmd, "effort" | "think" | "thinking").then_some(arg);
     if let Some(arg) = effort_arg {
         let parsed = match arg.to_ascii_lowercase().as_str() {
             "" | "status" => Some(agent.thinking_effort()),
@@ -7975,6 +8060,122 @@ fn apply_runtime_control_command(
     }
 
     false
+}
+
+#[derive(Debug, Default)]
+struct AppliedRuntimeControls {
+    commands: usize,
+    changed_model: bool,
+    changed_effort: bool,
+    aborted_stream: bool,
+}
+
+fn finish_active_runtime_controls(
+    agent: &mut Agent,
+    messages: Vec<String>,
+    abort_stream: bool,
+) -> AppliedRuntimeControls {
+    let mut applied = AppliedRuntimeControls::default();
+    for message in messages {
+        let before_model = (agent.provider_id.clone(), agent.model.clone());
+        let before_effort = agent.thinking_effort();
+        let mut notes = Vec::new();
+        let handled = apply_runtime_control_command(agent, &message, |msg| notes.push(msg));
+        for note in notes {
+            agent.sink.emit(AgentEvent::RuntimeControl(note));
+        }
+        if handled {
+            applied.commands += 1;
+            if (agent.provider_id.as_str(), agent.model.as_str())
+                != (before_model.0.as_str(), before_model.1.as_str())
+            {
+                applied.changed_model = true;
+            }
+            if agent.thinking_effort() != before_effort {
+                applied.changed_effort = true;
+            }
+        } else {
+            agent.sink.emit(AgentEvent::Warn(format!(
+                "unsupported active runtime control: {}",
+                summarize_inline(&message, 120)
+            )));
+        }
+    }
+    if applied.commands > 0 {
+        agent.sink.emit(AgentEvent::ThinkingEffortChanged {
+            effort: agent.thinking_effort(),
+        });
+        if applied.changed_model {
+            agent.emit_runtime_provider_state();
+        }
+        if abort_stream && (applied.changed_model || applied.changed_effort) {
+            applied.aborted_stream = true;
+            agent.sink.emit(AgentEvent::Warn(
+                "[runtime control] current provider stream stopped; continuing immediately with updated runtime"
+                    .to_string(),
+            ));
+            agent.append_latest_log(
+                "runtime_control_abort_stream",
+                &format!(
+                    "commands={} model_changed={} effort_changed={}",
+                    applied.commands, applied.changed_model, applied.changed_effort
+                ),
+            );
+        } else {
+            agent.append_latest_log(
+                "runtime_control_applied",
+                &format!(
+                    "commands={} model_changed={} effort_changed={}",
+                    applied.commands, applied.changed_model, applied.changed_effort
+                ),
+            );
+        }
+        agent.sink.emit(AgentEvent::RuntimeControlApplied {
+            commands: applied.commands,
+            model_changed: applied.changed_model,
+            effort_changed: applied.changed_effort,
+            stream_aborted: applied.aborted_stream,
+        });
+        agent.checkpoint_latest_session("after_runtime_control");
+    }
+    applied
+}
+
+fn apply_queued_runtime_controls(agent: &mut Agent) -> AppliedRuntimeControls {
+    let messages = agent.drain_runtime_controls();
+    finish_active_runtime_controls(agent, messages, false)
+}
+
+fn queued_runtime_control_waiter(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+) -> impl std::future::Future<Output = Option<String>> + '_ {
+    async move {
+        if let Some(rx) = rx {
+            rx.recv().await
+        } else {
+            std::future::pending::<Option<String>>().await
+        }
+    }
+}
+
+fn apply_runtime_control_for_stream(
+    agent: &mut Agent,
+    first: Option<String>,
+) -> AppliedRuntimeControls {
+    let mut messages = Vec::new();
+    if let Some(first) = first {
+        messages.push(first);
+    }
+    messages.extend(agent.drain_runtime_controls());
+    if messages.is_empty() {
+        AppliedRuntimeControls::default()
+    } else {
+        finish_active_runtime_controls(agent, messages, true)
+    }
+}
+
+fn try_apply_runtime_controls_for_stream(agent: &mut Agent) -> AppliedRuntimeControls {
+    apply_runtime_control_for_stream(agent, None)
 }
 
 fn compaction_user_text_with_evidence(transcript: &str, evidence: &str) -> String {
@@ -8565,6 +8766,8 @@ struct Agent {
     // Default 8; override via DEXT_MAX_CONCURRENT_BUILTINS=N.
     builtin_semaphore: Arc<tokio::sync::Semaphore>,
     sink: Box<dyn EventSink>,
+    runtime_control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    runtime_control_tx: tokio::sync::mpsc::UnboundedSender<String>,
     steering_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     steering_tx: tokio::sync::mpsc::UnboundedSender<String>,
     read_cache: Arc<Mutex<ReadFileCache>>,
@@ -8711,8 +8914,10 @@ impl Agent {
             budget_exhausted: false,
             builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
             sink: Box::new(ConsoleSink::new(pretty, false)),
+            runtime_control_rx: None,
+            runtime_control_tx: Self::noop_text_tx(),
             steering_rx: None,
-            steering_tx: Self::noop_steering_tx(),
+            steering_tx: Self::noop_text_tx(),
             read_cache: Arc::new(Mutex::new(ReadFileCache::default())),
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
@@ -8724,13 +8929,30 @@ impl Agent {
         })
     }
 
-    fn noop_steering_tx() -> tokio::sync::mpsc::UnboundedSender<String> {
+    fn noop_text_tx() -> tokio::sync::mpsc::UnboundedSender<String> {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         tx
     }
 
+    fn noop_steering_tx() -> tokio::sync::mpsc::UnboundedSender<String> {
+        Self::noop_text_tx()
+    }
+
+    fn runtime_control_sender(&self) -> tokio::sync::mpsc::UnboundedSender<String> {
+        self.runtime_control_tx.clone()
+    }
+
     fn steering_sender(&self) -> tokio::sync::mpsc::UnboundedSender<String> {
         self.steering_tx.clone()
+    }
+
+    fn install_runtime_controls(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) {
+        self.runtime_control_rx = Some(rx);
+        self.runtime_control_tx = tx;
     }
 
     fn install_steering(
@@ -8740,6 +8962,16 @@ impl Agent {
     ) {
         self.steering_rx = Some(rx);
         self.steering_tx = tx;
+    }
+
+    fn drain_runtime_controls(&mut self) -> Vec<String> {
+        let mut commands = Vec::new();
+        if let Some(rx) = &mut self.runtime_control_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                commands.push(cmd);
+            }
+        }
+        commands
     }
 
     fn drain_steering(&mut self) -> Vec<String> {
@@ -9158,16 +9390,19 @@ impl Agent {
         self.client.get_or_init(reqwest::Client::new)
     }
 
-    async fn interrupt_aware_sleep(&self, secs: u64) {
+    async fn interrupt_aware_sleep(&mut self, secs: u64) -> AppliedRuntimeControls {
         let sleep = tokio::time::sleep(std::time::Duration::from_secs(secs));
         tokio::pin!(sleep);
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
         loop {
             if self.interrupt.load(Ordering::SeqCst) {
-                return;
+                return AppliedRuntimeControls::default();
             }
             tokio::select! {
-                _ = &mut sleep => return,
+                _ = &mut sleep => return AppliedRuntimeControls::default(),
+                msg = queued_runtime_control_waiter(&mut self.runtime_control_rx) => {
+                    return apply_runtime_control_for_stream(self, msg);
+                }
                 _ = ticker.tick() => {}
             }
         }
@@ -10929,7 +11164,7 @@ impl Agent {
                                 wait_secs: wait,
                                 reason: format!("{} summary stream error", plan.label()),
                             });
-                            self.interrupt_aware_sleep(wait).await;
+                            let _ = self.interrupt_aware_sleep(wait).await;
                             let body = build_chatgpt_summary_request(
                                 &self.model,
                                 COMPACT_SYSTEM,
@@ -11478,6 +11713,10 @@ impl Agent {
                 break;
             }
             iterations += 1;
+            let runtime_controls = apply_queued_runtime_controls(self);
+            if runtime_controls.aborted_stream {
+                continue;
+            }
 
             let chatgpt_session_id = (self.api_provider == ApiProvider::ChatGpt).then(|| {
                 format!(
@@ -11486,6 +11725,7 @@ impl Agent {
                     project_key(&self.sandbox_root)
                 )
             });
+            self.partial_stream_text = None;
             let (sys_stable, sys_env) = self.compose_system_parts();
             let sys_blocks = vec![
                 SystemBlock {
@@ -11499,16 +11739,16 @@ impl Agent {
                     cache_control: None,
                 },
             ];
-            let wire_tools = self.wire_tools();
-            let (url, req_body) = self.build_streaming_request(
-                &sys_stable,
-                &sys_env,
-                &sys_blocks,
-                &wire_tools,
-                chatgpt_session_id.as_deref().unwrap_or("dext"),
-            )?;
             let mut stream_attempt: u32 = 0;
-            let (blocks, _stop_reason, mut usage) = 'stream_retry: loop {
+            let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
+                let wire_tools = self.wire_tools();
+                let (url, req_body) = self.build_streaming_request(
+                    &sys_stable,
+                    &sys_env,
+                    &sys_blocks,
+                    &wire_tools,
+                    chatgpt_session_id.as_deref().unwrap_or("dext"),
+                )?;
                 stream_attempt += 1;
                 let mut attempt: u32 = 0;
                 let mut provider_workaround_used = false;
@@ -11524,6 +11764,14 @@ impl Agent {
                         &self.api_key,
                         chatgpt_session_id.as_deref(),
                     )?;
+                    let applied = try_apply_runtime_controls_for_stream(self);
+                    if applied.aborted_stream {
+                        break 'stream_retry (
+                            Vec::new(),
+                            Some("runtime_control".to_string()),
+                            Usage::default(),
+                        );
+                    }
                     let mut interrupt_ticker =
                         tokio::time::interval(std::time::Duration::from_millis(25));
                     let res = tokio::select! {
@@ -11535,6 +11783,17 @@ impl Agent {
                                 interrupt_ticker.tick().await;
                             }
                         } => anyhow::bail!("interrupted by user before provider response"),
+                        msg = queued_runtime_control_waiter(&mut self.runtime_control_rx) => {
+                            let runtime_control = apply_runtime_control_for_stream(self, msg);
+                            if runtime_control.aborted_stream {
+                                break 'stream_retry (
+                                    Vec::new(),
+                                    Some("runtime_control".to_string()),
+                                    Usage::default(),
+                                );
+                            }
+                            continue;
+                        },
                         res = req.send() => res,
                     };
                     match res {
@@ -11597,7 +11856,14 @@ impl Agent {
                             });
                             turn_state.record_http_retry();
                             emit_external_telemetry(self.sink.as_mut(), &turn_state);
-                            self.interrupt_aware_sleep(wait).await;
+                            let runtime_controls = self.interrupt_aware_sleep(wait).await;
+                            if runtime_controls.aborted_stream {
+                                break 'stream_retry (
+                                    Vec::new(),
+                                    Some("runtime_control".to_string()),
+                                    Usage::default(),
+                                );
+                            }
                         }
                         Err(e) => {
                             let plan = orchestrator::classify_transport_failure(
@@ -11621,7 +11887,14 @@ impl Agent {
                                 });
                                 turn_state.record_http_retry();
                                 emit_external_telemetry(self.sink.as_mut(), &turn_state);
-                                self.interrupt_aware_sleep(wait).await;
+                                let runtime_controls = self.interrupt_aware_sleep(wait).await;
+                                if runtime_controls.aborted_stream {
+                                    break 'stream_retry (
+                                        Vec::new(),
+                                        Some("runtime_control".to_string()),
+                                        Usage::default(),
+                                    );
+                                }
                                 continue;
                             }
                             self.append_latest_log(
@@ -11633,8 +11906,26 @@ impl Agent {
                     }
                 };
 
+                let runtime_control = try_apply_runtime_controls_for_stream(self);
+                if runtime_control.aborted_stream {
+                    break 'stream_retry (
+                        Vec::new(),
+                        Some("runtime_control".to_string()),
+                        Usage::default(),
+                    );
+                }
                 match self.parse_stream_response(resp).await {
                     Ok(result) => break 'stream_retry result,
+                    Err(e)
+                        if stream_error_body(&e)
+                            .contains("runtime control changed active stream") =>
+                    {
+                        break 'stream_retry (
+                            Vec::new(),
+                            Some("runtime_control".to_string()),
+                            Usage::default(),
+                        );
+                    }
                     Err(e) => {
                         let body = stream_error_body(&e);
                         self.record_provider_stream_failure(&body);
@@ -11656,7 +11947,14 @@ impl Agent {
                             });
                             turn_state.record_http_retry();
                             emit_external_telemetry(self.sink.as_mut(), &turn_state);
-                            self.interrupt_aware_sleep(wait).await;
+                            let runtime_controls = self.interrupt_aware_sleep(wait).await;
+                            if runtime_controls.aborted_stream {
+                                break 'stream_retry (
+                                    Vec::new(),
+                                    Some("runtime_control".to_string()),
+                                    Usage::default(),
+                                );
+                            }
                             continue 'stream_retry;
                         }
                         if self.api_provider == ApiProvider::ChatGpt {
@@ -11687,6 +11985,11 @@ impl Agent {
                     }
                 }
             };
+
+            if stop_reason.as_deref() == Some("runtime_control") {
+                self.partial_stream_text = None;
+                continue;
+            }
 
             if usage.input == 0 && usage.output == 0 {
                 let chars = self.history_chars() as u64
@@ -12661,6 +12964,40 @@ impl Agent {
         Ok(())
     }
 
+    async fn read_stream_next_chunk(
+        &mut self,
+        stream: &mut (
+                 impl futures_util::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>
+                 + Unpin
+             ),
+        interrupted_msg: &str,
+    ) -> Result<Option<bytes::Bytes>> {
+        use futures_util::StreamExt;
+
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+        loop {
+            if self.interrupt.load(Ordering::SeqCst) {
+                anyhow::bail!("{interrupted_msg}");
+            }
+            tokio::select! {
+                chunk = stream.next() => {
+                    return match chunk {
+                        Some(Ok(chunk)) => Ok(Some(chunk)),
+                        Some(Err(e)) => Err(stream_chunk_err(e)),
+                        None => Ok(None),
+                    };
+                }
+                msg = queued_runtime_control_waiter(&mut self.runtime_control_rx) => {
+                    let applied = apply_runtime_control_for_stream(self, msg);
+                    if applied.aborted_stream {
+                        anyhow::bail!("runtime control changed active stream");
+                    }
+                }
+                _ = ticker.tick() => {}
+            }
+        }
+    }
+
     async fn read_stream(
         &mut self,
         resp: reqwest::Response,
@@ -12674,8 +13011,9 @@ impl Agent {
         let mut stop_reason: Option<String> = None;
         let mut usage = Usage::default();
 
-        while let Some(chunk) =
-            read_stream_next_chunk(&mut stream, &self.interrupt, "interrupted by user").await?
+        while let Some(chunk) = self
+            .read_stream_next_chunk(&mut stream, "interrupted by user")
+            .await?
         {
             buf.extend_from_slice(&chunk);
 
@@ -12848,8 +13186,9 @@ impl Agent {
         let mut usage = Usage::default();
         let mut finish_reason: Option<String> = None;
 
-        while let Some(chunk) =
-            read_stream_next_chunk(&mut stream, &self.interrupt, "interrupted by user").await?
+        while let Some(chunk) = self
+            .read_stream_next_chunk(&mut stream, "interrupted by user")
+            .await?
         {
             buf.extend_from_slice(&chunk);
 
@@ -12983,8 +13322,9 @@ impl Agent {
             std::collections::BTreeMap::new();
         let mut tool_call_order: Vec<String> = Vec::new();
 
-        while let Some(chunk) =
-            read_stream_next_chunk(&mut stream, &self.interrupt, "interrupted by user").await?
+        while let Some(chunk) = self
+            .read_stream_next_chunk(&mut stream, "interrupted by user")
+            .await?
         {
             buf.extend_from_slice(&chunk);
 
@@ -13439,7 +13779,9 @@ impl Agent {
             budget_exhausted: false,
             builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
             sink: Box::new(ChannelSink { tx: ev_tx }),
-            steering_rx: self.steering_rx.take(),
+            runtime_control_rx: None,
+            runtime_control_tx: Self::noop_text_tx(),
+            steering_rx: None,
             steering_tx: self.steering_tx.clone(),
             read_cache: self.read_cache.clone(),
             work_ledger: self.work_ledger.clone(),
@@ -18173,9 +18515,11 @@ async fn main() -> Result<()> {
         };
     }
 
+    let (runtime_control_tx, runtime_control_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let agent_busy_flag: std::sync::Arc<std::sync::atomic::AtomicBool> =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    agent.install_runtime_controls(runtime_control_rx, runtime_control_tx.clone());
     agent.install_steering(steer_rx, steer_tx.clone());
     if opts.fork {
         println!(
@@ -18185,6 +18529,7 @@ async fn main() -> Result<()> {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     {
         let input_tx = input_tx.clone();
+        let runtime_control_tx = runtime_control_tx.clone();
         let steering_tx = steer_tx.clone();
         let busy = agent_busy_flag.clone();
         std::thread::spawn(move || {
@@ -18194,7 +18539,16 @@ async fn main() -> Result<()> {
                 match stdin.lock().read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        match route_interactive_input_line(line, &busy, &input_tx, &steering_tx) {
+                        match route_interactive_input_line(
+                            line,
+                            &busy,
+                            &input_tx,
+                            &runtime_control_tx,
+                            &steering_tx,
+                        ) {
+                            InteractiveInputRoute::RuntimeControlQueued => {
+                                eprintln!("[runtime control queued]");
+                            }
                             InteractiveInputRoute::SteeringQueued => {
                                 eprintln!("[queued for next response]");
                             }
@@ -18234,7 +18588,13 @@ async fn main() -> Result<()> {
         }
 
         if agent_busy_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            if apply_runtime_control_command(&mut agent, &input, |msg| println!("{msg}")) {
+            if is_active_runtime_control_command(&input) {
+                for command in parse_active_runtime_control_sequence(&input)
+                    .unwrap_or_else(|| vec![input.clone()])
+                {
+                    let _ = agent.runtime_control_sender().send(command);
+                }
+                println!("[runtime control queued]");
                 autosave_latest(&mut agent);
                 continue;
             }

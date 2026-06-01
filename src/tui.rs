@@ -33,7 +33,8 @@ use crate::{
     Agent, AgentEvent, ApprovalProfile, Choice, EventSink, ThinkingEffort, Usage, WorkMapEventKind,
     canonical_provider_id, git_summary, handle_slash, history_char_budget_with_override,
     load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
-    parse_compact_slash, provider_auth_status, resolve_active_provider_id, summarize_call,
+    parse_active_runtime_control_sequence, parse_compact_slash, provider_auth_status,
+    resolve_active_provider_id, summarize_call,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
@@ -1688,6 +1689,31 @@ impl TuiState {
             AgentEvent::ApprovalProfileChanged { profile } => {
                 self.push_debug_event(format!("approval profile changed · {}", profile.as_str()));
                 self.approval_profile = profile;
+            }
+            AgentEvent::RuntimeControl(s) => {
+                self.push_debug_event(format!("runtime control · {}", sanitize_display_text(&s)));
+                self.status = "runtime control applied".into();
+                self.queue(Line_::Info(s));
+            }
+            AgentEvent::RuntimeControlApplied {
+                commands,
+                stream_aborted,
+                ..
+            } => {
+                self.push_debug_event(format!(
+                    "runtime control applied · commands={commands} abort={stream_aborted}"
+                ));
+                if stream_aborted {
+                    self.streaming_text.clear();
+                    self.streaming_thinking.clear();
+                    self.stream_started_at = None;
+                    self.stream_chars = 0;
+                }
+                self.status = if stream_aborted {
+                    "runtime changed; restarting request".into()
+                } else {
+                    "runtime control applied".into()
+                };
             }
             AgentEvent::Info(s) => {
                 self.push_debug_event(format!("info · {}", sanitize_display_text(&s)));
@@ -6010,7 +6036,7 @@ fn input_hint_text(state: &TuiState) -> &'static str {
     } else if state.input_display_override.is_some() {
         "paste preview · Enter sends full input"
     } else if state.agent_busy {
-        "Steering mode · Local auth secrets withheld"
+        "Type /model or /effort for runtime changes; other input steers · secrets withheld"
     } else {
         ""
     }
@@ -6964,6 +6990,7 @@ fn handle_key(
     state: &mut TuiState,
     key: KeyEvent,
     agent_input: &tokio::sync::mpsc::UnboundedSender<FromTui>,
+    runtime_control_input: &tokio::sync::mpsc::UnboundedSender<String>,
     steering_input: &tokio::sync::mpsc::UnboundedSender<String>,
     interrupt: &Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -7147,6 +7174,22 @@ fn handle_key(
                 return;
             }
             if state.agent_busy && state.pending_perm.is_none() {
+                if let Some(commands) = parse_active_runtime_control_sequence(&text) {
+                    let mut queued = false;
+                    for command in commands {
+                        if runtime_control_input.send(command).is_ok() {
+                            queued = true;
+                        }
+                    }
+                    state.status = if queued {
+                        "runtime control queued".to_string()
+                    } else {
+                        "runtime control unavailable".to_string()
+                    };
+                    state.clear_input();
+                    state.clear_slash_completion_selection();
+                    return;
+                }
                 if crate::text_is_potential_local_secret(&text) {
                     state.queue(Line_::Warn(
                         "input withheld: do not enter sudo passwords or local auth secrets in chat; use the local auth prompt".to_string(),
@@ -7487,8 +7530,11 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
 
     // Move agent into a task; communicate via channels
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<FromTui>();
+    let (runtime_control_tx, runtime_control_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let direct_runtime_control_tx = runtime_control_tx.clone();
     let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let direct_steer_tx = steer_tx.clone();
+    agent.install_runtime_controls(runtime_control_rx, runtime_control_tx.clone());
     agent.install_steering(steer_rx, steer_tx);
     let handle = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
@@ -7666,7 +7712,14 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
             maybe_key = key_rx.recv() => {
                 if let Some(ev) = maybe_key {
                     match ev {
-                        Event::Key(k) => handle_key(&mut state, k, &in_tx, &direct_steer_tx, &interrupt),
+                        Event::Key(k) => handle_key(
+                            &mut state,
+                            k,
+                            &in_tx,
+                            &direct_runtime_control_tx,
+                            &direct_steer_tx,
+                            &interrupt,
+                        ),
                         Event::Mouse(mouse) => handle_mouse(&mut state, mouse),
                         Event::Paste(pasted) => handle_paste(&mut state, pasted),
                         _ => {}
@@ -7934,7 +7987,7 @@ mod tests {
 
         assert_eq!(
             input_hint_text(&state),
-            "Steering mode · Local auth secrets withheld"
+            "Type /model or /effort for runtime changes; other input steers · secrets withheld"
         );
     }
 
@@ -8903,10 +8956,12 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -9573,10 +9628,12 @@ mod tests {
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(AtomicBool::new(false));
         for c in " done".chars() {
+            let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
             handle_key(
                 &mut state,
                 KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
                 &tx,
+                &runtime_control_tx,
                 &steering_tx,
                 &interrupt,
             );
@@ -9603,10 +9660,12 @@ mod tests {
             let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
             let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
             let interrupt = Arc::new(AtomicBool::new(false));
+            let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
             handle_key(
                 &mut state,
                 KeyEvent::new(KeyCode::Enter, modifiers),
                 &submit_tx,
+                &runtime_control_tx,
                 &steering_tx,
                 &interrupt,
             );
@@ -9658,10 +9717,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -9676,6 +9737,7 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -9683,12 +9745,26 @@ mod tests {
     }
 
     #[test]
-    fn busy_enter_sends_steering_directly_without_command_queue_delay() {
-        for input in [
-            "please adjust the current fix",
-            "/model chatgpt/gpt-5.3-codex",
-            "/effort high",
-        ] {
+    fn busy_enter_routes_runtime_controls_separately_from_steering() {
+        let cases = [
+            (
+                "please adjust the current fix",
+                false,
+                vec!["please adjust the current fix"],
+            ),
+            (
+                "/model chatgpt/gpt-5.3-codex",
+                true,
+                vec!["/model chatgpt/gpt-5.3-codex"],
+            ),
+            ("/effort high", true, vec!["/effort high"]),
+            (
+                "/model chatgpt/gpt-5.3-codex, /effort xhigh",
+                true,
+                vec!["/model chatgpt/gpt-5.3-codex", "/effort xhigh"],
+            ),
+        ];
+        for (input, runtime_control, expected_messages) in cases {
             let mut state = TuiState::new(
                 "glm-5.1".to_string(),
                 ".".to_string(),
@@ -9700,24 +9776,44 @@ mod tests {
             state.cursor = state.input.len();
 
             let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (runtime_control_tx, mut runtime_control_rx) =
+                tokio::sync::mpsc::unbounded_channel();
             let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
             let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
             handle_key(
                 &mut state,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
                 &submit_tx,
+                &runtime_control_tx,
                 &steering_tx,
                 &interrupt,
             );
 
-            assert_eq!(steering_rx.try_recv().ok().as_deref(), Some(input));
+            if runtime_control {
+                for expected in expected_messages {
+                    assert_eq!(
+                        runtime_control_rx.try_recv().ok().as_deref(),
+                        Some(expected)
+                    );
+                }
+                assert!(runtime_control_rx.try_recv().is_err());
+                assert!(steering_rx.try_recv().is_err());
+                assert_eq!(state.status, "runtime control queued");
+                assert!(state.pending_insert.is_empty());
+            } else {
+                assert_eq!(
+                    steering_rx.try_recv().ok().as_deref(),
+                    expected_messages.first().copied()
+                );
+                assert!(runtime_control_rx.try_recv().is_err());
+                assert_eq!(state.status, "queued for next safe boundary");
+                assert!(matches!(
+                    state.pending_insert.as_slice(),
+                    [Line_::Blank, Line_::Steering(s), Line_::Blank] if s == input
+                ));
+            }
             assert!(submit_rx.try_recv().is_err());
             assert!(state.input.is_empty());
-            assert_eq!(state.status, "queued for next safe boundary");
-            assert!(matches!(
-                state.pending_insert.as_slice(),
-                [Line_::Blank, Line_::Steering(s), Line_::Blank] if s == input
-            ));
         }
     }
 
@@ -9736,10 +9832,12 @@ mod tests {
         let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
             &submit_tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -9787,11 +9885,13 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         for _ in 0..SLASH_COMPLETION_MAX_VISIBLE {
             handle_key(
                 &mut state,
                 KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
                 &tx,
+                &runtime_control_tx,
                 &steering_tx,
                 &interrupt,
             );
@@ -9815,17 +9915,21 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -9850,10 +9954,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -9876,10 +9982,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -9902,10 +10010,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -10516,10 +10626,12 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
@@ -10546,10 +10658,12 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupt = Arc::new(AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL),
             &tx,
+            &runtime_control_tx,
             &steering_tx,
             &interrupt,
         );
