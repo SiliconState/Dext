@@ -30,11 +30,11 @@ use tui_markdown::{
 
 use crate::provider::{curated_provider_models, provider_has_available_credentials};
 use crate::{
-    Agent, AgentEvent, ApprovalProfile, Choice, EventSink, ThinkingEffort, Usage, WorkMapEventKind,
-    canonical_provider_id, git_summary, handle_slash, history_char_budget_with_override,
-    load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
-    parse_active_runtime_control_sequence, parse_compact_slash, provider_auth_status,
-    resolve_active_provider_id, summarize_call,
+    Agent, AgentEvent, ApprovalProfile, Choice, EventSink, HISTORY_CHAR_BUDGET_END_TURN_PERCENT,
+    ThinkingEffort, Usage, WorkMapEventKind, canonical_provider_id, git_summary, handle_slash,
+    history_char_budget_with_window, load_auth_store, load_provider_catalog, model_context_window,
+    orchestrator::ExternalTelemetry, parse_active_runtime_control_sequence, parse_compact_slash,
+    provider_auth_status, resolve_active_provider_id, summarize_call,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
@@ -800,6 +800,7 @@ struct TuiState {
     last_turn_context_tokens: u64,
     history_chars: u64,
     model: String,
+    context_window_tokens: u64,
     sandbox: String,
     streaming_text: String,
     streaming_thinking: String,
@@ -857,6 +858,7 @@ struct TodoProgress {
 impl TuiState {
     fn new(
         model: String,
+        context_window_tokens: u64,
         sandbox: String,
         approval_profile: ApprovalProfile,
         thinking_effort: ThinkingEffort,
@@ -893,6 +895,7 @@ impl TuiState {
             last_turn_context_tokens: 0,
             history_chars: 0,
             model,
+            context_window_tokens,
             sandbox,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
@@ -1668,6 +1671,7 @@ impl TuiState {
                 api_family,
                 auth_source,
                 model,
+                context_window,
                 last_retry_reason,
                 workaround_fired,
                 ..
@@ -1679,6 +1683,9 @@ impl TuiState {
                 self.api_family = api_family;
                 self.auth_source = auth_source;
                 self.model = model;
+                if let Some(context_window) = context_window.filter(|tokens| *tokens > 0) {
+                    self.context_window_tokens = context_window;
+                }
                 self.last_retry_reason = last_retry_reason;
                 self.workaround_fired = workaround_fired;
             }
@@ -2171,7 +2178,11 @@ fn display_busy_status(status: String) -> String {
 }
 
 fn context_usage(state: &TuiState) -> Option<(u64, u64, u64, Color)> {
-    let window = model_context_window(&state.model);
+    let window = if state.context_window_tokens > 0 {
+        state.context_window_tokens
+    } else {
+        model_context_window(&state.model)
+    };
     if window == 0 {
         return None;
     }
@@ -6036,7 +6047,7 @@ fn input_hint_text(state: &TuiState) -> &'static str {
     } else if state.input_display_override.is_some() {
         "paste preview · Enter sends full input"
     } else if state.agent_busy {
-        "Type /model or /effort for runtime changes; other input steers · secrets withheld"
+        "Runtime: /model, /effort, /think; non-slash input steers · secrets withheld"
     } else {
         ""
     }
@@ -7199,6 +7210,13 @@ fn handle_key(
                     state.status = "local secret withheld from provider".to_string();
                     return;
                 }
+                if crate::is_slash_command(&text) {
+                    state.queue(Line_::Warn(crate::unsupported_busy_slash_message(&text)));
+                    state.clear_input();
+                    state.clear_slash_completion_selection();
+                    state.status = "slash command waits until idle".to_string();
+                    return;
+                }
                 state.queue(Line_::Steering(text.clone()));
                 if steering_input.send(text).is_ok() {
                     state.status = "queued for next safe boundary".to_string();
@@ -7465,6 +7483,7 @@ impl Drop for TerminalGuard {
 
 pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let model = agent.model.clone();
+    let context_window_tokens = agent.context_window_tokens();
     let sandbox = agent.sandbox_root.display().to_string();
     let approval_profile = agent.approval_profile();
     let thinking_effort = agent.thinking_effort();
@@ -7503,7 +7522,13 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         }
     });
 
-    let mut state = TuiState::new(model, sandbox, approval_profile, thinking_effort);
+    let mut state = TuiState::new(
+        model,
+        context_window_tokens,
+        sandbox,
+        approval_profile,
+        thinking_effort,
+    );
     let mode_label = match state.approval_profile {
         ApprovalProfile::Always => "trust",
         ApprovalProfile::Ask => "guarded",
@@ -7549,10 +7574,11 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                                 }
                                 Ok(crate::CompactSlash::Status) => {
                                     let current = agent.compact_threshold_chars();
-                                    let base = history_char_budget_with_override(
-                                        &agent.model,
+                                    let base = history_char_budget_with_window(
+                                        agent.context_window_tokens(),
                                         None,
                                         agent.context_mode,
+                                        HISTORY_CHAR_BUDGET_END_TURN_PERCENT,
                                     );
                                     match agent.compact_threshold_override_percent() {
                                         Some(percent) => agent.sink.emit(AgentEvent::Slash(format!(
@@ -7961,6 +7987,7 @@ mod tests {
     fn input_hint_switches_to_permission_response_text() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -7979,6 +8006,7 @@ mod tests {
     fn busy_input_hint_warns_about_local_auth_secrets() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -7987,7 +8015,7 @@ mod tests {
 
         assert_eq!(
             input_hint_text(&state),
-            "Type /model or /effort for runtime changes; other input steers · secrets withheld"
+            "Runtime: /model, /effort, /think; non-slash input steers · secrets withheld"
         );
     }
 
@@ -7995,6 +8023,7 @@ mod tests {
     fn ready_input_hint_is_empty_and_help_lists_keymap() {
         let state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8013,6 +8042,7 @@ mod tests {
     fn pending_permission_does_not_render_live_indicator_or_busy_status() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8037,6 +8067,7 @@ mod tests {
     fn status_spans_do_not_render_trust_indicator() {
         let state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Always,
             ThinkingEffort::Medium,
@@ -8055,6 +8086,7 @@ mod tests {
     fn status_spans_render_branch_between_sandbox_and_model() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8086,6 +8118,7 @@ mod tests {
     fn status_bar_keeps_full_requested_sandbox_and_branch_visible() {
         let mut state = TuiState::new(
             "gpt-5.5".to_string(),
+            model_context_window("gpt-5.5"),
             "/home/abaka/Documents/Projects/Learn/Finance".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8113,6 +8146,7 @@ mod tests {
     fn approval_profile_changed_updates_trust_input_border() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8160,6 +8194,7 @@ mod tests {
     fn transcript_live_indicator_shows_status_elapsed_and_stream_tail() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8181,6 +8216,7 @@ mod tests {
     fn todo_progress_surfaces_active_task_when_idle() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8202,6 +8238,7 @@ mod tests {
     fn live_indicator_prefers_rolling_activity_over_todo_count() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8222,6 +8259,7 @@ mod tests {
     fn transcript_live_indicator_shows_tool_summary_when_no_stream_text() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8296,6 +8334,7 @@ mod tests {
     fn turn_end_uses_same_total_as_displayed_breakdown() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8362,6 +8401,7 @@ mod tests {
     fn completed_thinking_is_visible_by_default_before_next_event() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8391,6 +8431,7 @@ mod tests {
     fn inserts_blank_between_thinking_history_and_next_tool() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8421,6 +8462,7 @@ mod tests {
     fn inserts_blank_between_tool_and_next_completed_thinking() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8447,6 +8489,7 @@ mod tests {
     fn work_map_packet_still_renders_in_transcript() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8474,6 +8517,7 @@ mod tests {
     fn work_map_event_opens_input_drawer_and_keyboard_inserts_commands() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8533,6 +8577,7 @@ mod tests {
     fn completed_thinking_can_be_hidden() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8594,6 +8639,7 @@ mod tests {
     fn live_thinking_indicator_uses_full_width() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8623,6 +8669,7 @@ mod tests {
     fn cached_thinking_render_reserves_terminal_wrap_guard() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8715,6 +8762,7 @@ mod tests {
     fn repeated_assistant_prefix_is_dimmed_after_first_response() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8820,6 +8868,7 @@ mod tests {
     fn compact_end_after_idle_manual_compact_marks_ready() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8843,6 +8892,7 @@ mod tests {
     fn compact_end_during_turn_resumes_busy_status() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8863,6 +8913,7 @@ mod tests {
     fn slash_event_clears_live_preview_state() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -8932,6 +8983,7 @@ mod tests {
     fn collapse_marks_transcript_for_rebuild() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9197,6 +9249,7 @@ mod tests {
     fn transcript_render_cache_tracks_multiple_widths() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9222,6 +9275,7 @@ mod tests {
     fn usage_update_sets_session_usage_without_turn_end_double_counting() {
         let mut state = TuiState::new(
             "gpt-5.4".to_string(),
+            model_context_window("gpt-5.4"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9257,6 +9311,7 @@ mod tests {
         // context. The TUI must reflect only the most recent request.
         let mut state = TuiState::new(
             "gpt-5.4".to_string(),
+            model_context_window("gpt-5.4"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9284,6 +9339,7 @@ mod tests {
     fn status_splits_actual_and_cached_input() {
         let mut state = TuiState::new(
             "gpt-5.4".to_string(),
+            model_context_window("gpt-5.4"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9323,6 +9379,7 @@ mod tests {
         // input, output, cache reads, and cache writes.
         let mut state = TuiState::new(
             "claude-opus-4-6".to_string(),
+            model_context_window("claude-opus-4-6"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9360,6 +9417,7 @@ mod tests {
 
         let mut state = TuiState::new(
             "gpt-5.4".to_string(),
+            model_context_window("gpt-5.4"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9391,6 +9449,7 @@ mod tests {
     fn status_detail_spans_render_external_telemetry_counters() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9417,6 +9476,7 @@ mod tests {
     fn status_detail_spans_render_only_nonzero_external_telemetry_counters() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9498,6 +9558,7 @@ mod tests {
     fn status_spans_render_updated_provider_and_model() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9507,6 +9568,7 @@ mod tests {
             api_family: "chatgpt-responses".to_string(),
             auth_source: "auth:chatgpt".to_string(),
             model: "gpt-4o".to_string(),
+            context_window: Some(128_000),
             last_retry_reason: None,
             workaround_fired: false,
             turn_duration_ms: None,
@@ -9529,6 +9591,7 @@ mod tests {
     fn derived_busy_status_prefers_live_tool_graph() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9551,6 +9614,7 @@ mod tests {
     fn derived_busy_status_shows_retry_when_no_active_tools() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9612,6 +9676,7 @@ mod tests {
     fn paste_preview_survives_typing_after_collapsed_paste() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9651,6 +9716,7 @@ mod tests {
         for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
             let mut state = TuiState::new(
                 "test-model".to_string(),
+                model_context_window("test-model"),
                 ".".to_string(),
                 ApprovalProfile::Ask,
                 ThinkingEffort::Medium,
@@ -9706,6 +9772,7 @@ mod tests {
     fn slash_completion_arrows_select_without_replacing_input_or_history() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9763,10 +9830,12 @@ mod tests {
                 true,
                 vec!["/model chatgpt/gpt-5.3-codex", "/effort xhigh"],
             ),
+            ("/compact status", false, Vec::new()),
         ];
         for (input, runtime_control, expected_messages) in cases {
             let mut state = TuiState::new(
                 "glm-5.1".to_string(),
+                model_context_window("glm-5.1"),
                 ".".to_string(),
                 ApprovalProfile::Ask,
                 ThinkingEffort::Medium,
@@ -9800,6 +9869,14 @@ mod tests {
                 assert!(steering_rx.try_recv().is_err());
                 assert_eq!(state.status, "runtime control queued");
                 assert!(state.pending_insert.is_empty());
+            } else if expected_messages.is_empty() {
+                assert!(steering_rx.try_recv().is_err());
+                assert!(runtime_control_rx.try_recv().is_err());
+                assert_eq!(state.status, "slash command waits until idle");
+                assert!(matches!(
+                    state.pending_insert.as_slice(),
+                    [Line_::Warn(s)] if s.contains("not run while agent is busy")
+                ));
             } else {
                 assert_eq!(
                     steering_rx.try_recv().ok().as_deref(),
@@ -9821,6 +9898,7 @@ mod tests {
     fn busy_input_withholds_potential_local_secret_from_steering() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9856,6 +9934,7 @@ mod tests {
     fn busy_paste_withholds_potential_local_secret() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9875,6 +9954,7 @@ mod tests {
     fn slash_completion_arrows_scroll_past_visible_window() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9905,6 +9985,7 @@ mod tests {
     fn slash_completion_tab_accepts_arrow_selection() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9944,6 +10025,7 @@ mod tests {
     fn tab_cycles_effort_when_not_completing_slash_command() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -9972,6 +10054,7 @@ mod tests {
     fn backtab_cycles_effort_when_not_completing_slash_command() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10000,6 +10083,7 @@ mod tests {
     fn tab_falls_back_to_effort_when_slash_has_no_completion() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10083,6 +10167,7 @@ mod tests {
 
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             "/home/abaka/Documents/Projects/dext".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10120,6 +10205,7 @@ mod tests {
         .expect("terminal");
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10167,6 +10253,7 @@ mod tests {
 
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             "/home/abaka/Documents/Projects/dext".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10190,6 +10277,7 @@ mod tests {
     fn work_map_drawer_expands_input_without_exceeding_half_viewport() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10219,6 +10307,7 @@ mod tests {
     fn sticky_footer_regression_tall_viewport() {
         let state = TuiState::new(
             "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10542,6 +10631,7 @@ mod tests {
     fn draw_empty_composer_is_compact_and_clears_debug_artifacts() {
         let mut state = TuiState::new(
             "gpt-5.4".to_string(),
+            model_context_window("gpt-5.4"),
             "/home/abaka/Documents/Projects/Dext".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10573,6 +10663,7 @@ mod tests {
     fn wide_layout_only_splits_when_inspector_is_visible() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10608,6 +10699,7 @@ mod tests {
     fn empty_input_panel_defaults_to_three_rows() {
         let state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10619,6 +10711,7 @@ mod tests {
     fn status_details_are_expanded_by_ctrl_t() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
@@ -10648,6 +10741,7 @@ mod tests {
     fn inspector_is_toggled_by_ctrl_i_and_renders_debug_events() {
         let mut state = TuiState::new(
             "test-model".to_string(),
+            model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,

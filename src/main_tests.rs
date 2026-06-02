@@ -1,6 +1,8 @@
 use super::*;
 use crate::provider::{
+    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS, clear_cached_local_llama_context_windows,
     list_models_for_available_providers, merge_provider_profile, normalize_chatgpt_model_slug,
+    parse_llama_context_window, refresh_local_llama_context_window,
     resolve_provider_model_selection,
 };
 #[cfg(target_os = "linux")]
@@ -85,6 +87,7 @@ fn test_agent(root: &Path) -> Agent {
         partial_stream_text: None,
         compact_threshold_chars: None,
         compact_threshold_percent: None,
+        context_window_tokens: model_context_window("test-model"),
         approval_profile: ApprovalProfile::default(),
         sandbox_profile: SandboxProfile::default(),
         browser_recipe: BrowserRecipe::default(),
@@ -438,6 +441,51 @@ fn injected_steering_is_ledger_visible_and_final_required() {
 }
 
 #[test]
+fn busy_queued_slash_commands_are_not_injected_as_steering() {
+    let root = temp_test_dir("busy-slash-not-steering");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let (tx_events, mut rx_events) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx: tx_events }));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_steering(rx, tx.clone());
+    tx.send("/compact status".to_string()).expect("queue slash");
+    tx.send("please adjust the current fix".to_string())
+        .expect("queue steering");
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+
+    assert!(agent.inject_queued_steering(&mut turn_state, 1, 0, false));
+    assert!(
+        agent
+            .history
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .any(|text| text.contains("please adjust the current fix"))
+    );
+    assert!(
+        !agent
+            .history
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                Block::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .any(|text| text.contains("/compact status"))
+    );
+    assert!(drain_events(&mut rx_events).iter().any(|event| matches!(
+        event,
+        AgentEvent::Warn(msg) if msg.contains("not run while agent is busy")
+    )));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn channel_sink_emits_local_auth_only_via_explicit_method() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut sink = ChannelSink { tx };
@@ -588,6 +636,24 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
     assert!(input_rx.try_recv().is_err());
 
     let route = route_interactive_input_line(
+        "/compact status\n".to_string(),
+        &busy,
+        &input_tx,
+        &runtime_control_tx,
+        &steering_tx,
+    );
+    let InteractiveInputRoute::UnsupportedBusySlash(warning) = route else {
+        panic!("unexpected route: {route:?}");
+    };
+    assert_eq!(
+        unsupported_busy_slash_message(&warning),
+        "queued slash command /compact not run while agent is busy; only /model and /effort (/think) are active runtime controls"
+    );
+    assert!(runtime_control_rx.try_recv().is_err());
+    assert!(steering_rx.try_recv().is_err());
+    assert!(input_rx.try_recv().is_err());
+
+    let route = route_interactive_input_line(
         "/model gpt-5.5, /effort high\n".to_string(),
         &busy,
         &input_tx,
@@ -613,7 +679,9 @@ fn active_runtime_control_detection_accepts_only_model_and_effort_sequences() {
     assert!(is_active_runtime_control_command(
         "/model gpt-5.5, /think high"
     ));
+    assert!(is_active_runtime_control_command("/think status"));
     assert!(!is_active_runtime_control_command("/tools full"));
+    assert!(!is_active_runtime_control_command("/compact 25%"));
     assert!(!is_active_runtime_control_command(
         "/model gpt-5.5, adjust this"
     ));
@@ -622,6 +690,27 @@ fn active_runtime_control_detection_accepts_only_model_and_effort_sequences() {
             .expect("parse sequence"),
         vec!["/model chatgpt/gpt-5.4", "/effort xhigh"]
     );
+}
+
+#[test]
+fn runtime_control_events_serialize_for_stream_json() {
+    let ev = AgentEvent::RuntimeControl("thinking effort -> high".to_string());
+    let value = serde_json::to_value(ev).expect("serialize event");
+    assert_eq!(value["event"], "runtime_control");
+    assert_eq!(value["data"], "thinking effort -> high");
+
+    let ev = AgentEvent::RuntimeControlApplied {
+        commands: 2,
+        model_changed: true,
+        effort_changed: true,
+        stream_aborted: true,
+    };
+    let value = serde_json::to_value(ev).expect("serialize event");
+    assert_eq!(value["event"], "runtime_control_applied");
+    assert_eq!(value["data"]["commands"], 2);
+    assert_eq!(value["data"]["model_changed"], true);
+    assert_eq!(value["data"]["effort_changed"], true);
+    assert_eq!(value["data"]["stream_aborted"], true);
 }
 
 #[test]
@@ -688,6 +777,24 @@ fn non_tui_busy_input_routes_steering_and_runtime_controls_immediately() {
     );
     assert!(steering_rx.try_recv().is_err());
     assert!(input_rx.try_recv().is_err());
+
+    let route = route_interactive_input_line(
+        "/compact status\n".to_string(),
+        &busy,
+        &input_tx,
+        &runtime_control_tx,
+        &steering_tx,
+    );
+    let InteractiveInputRoute::UnsupportedBusySlash(warning) = route else {
+        panic!("unexpected route: {route:?}");
+    };
+    assert_eq!(
+        unsupported_busy_slash_message(&warning),
+        "queued slash command /compact not run while agent is busy; only /model and /effort (/think) are active runtime controls"
+    );
+    assert!(steering_rx.try_recv().is_err());
+    assert!(runtime_control_rx.try_recv().is_err());
+    assert!(input_rx.try_recv().is_err());
 }
 
 #[test]
@@ -714,13 +821,61 @@ fn steering_acknowledgement_detects_final_that_mentions_steered_scope() {
     }];
     assert!(!steering_item_acknowledged(item, &missing));
 
-    let acknowledged = vec![Message {
+    let acknowledged = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "I fixed the rg border overflow in an earlier turn.".to_string(),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "[queued-user-update] queued during active turn (1 message): fix the rg border overflow and tell me what happened".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "I fixed the rg border overflow and explained what happened.".to_string(),
+            }],
+        },
+    ];
+    assert!(steering_item_acknowledged(item, &acknowledged));
+
+    let stale_ack_only = vec![
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "I fixed the rg border overflow before any queued update.".to_string(),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "[queued-user-update] queued during active turn (1 message): fix the rg border overflow and tell me what happened".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "Done.".to_string(),
+            }],
+        },
+    ];
+    assert!(!steering_item_acknowledged(item, &stale_ack_only));
+
+    let web_recipe_item = "queued during active turn (1 message): i can give you a web recipe";
+    let web_recipe_acknowledged = vec![Message {
         role: "assistant".to_string(),
         content: vec![Block::Text {
-            text: "I fixed the rg border overflow and explained what happened.".to_string(),
+            text: "You mentioned a web recipe; please share it and I will use it next.".to_string(),
         }],
     }];
-    assert!(steering_item_acknowledged(item, &acknowledged));
+    assert!(steering_item_acknowledged(
+        web_recipe_item,
+        &web_recipe_acknowledged
+    ));
 }
 
 #[test]
@@ -781,6 +936,48 @@ fn queued_steering_done_only_after_acknowledged_final() {
     );
     assert!(
         !agent
+            .work_ledger
+            .pending
+            .contains(&"respond to queued user update".to_string())
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn queued_steering_reopens_pending_after_prior_ack_and_dedupes_entry() {
+    let root = temp_test_dir("steering-reopens-pending");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent
+        .work_ledger
+        .done
+        .push("respond to queued user update".to_string());
+
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "I addressed the old queued change.".to_string(),
+        }],
+    });
+    let old_messages = vec!["old queued change".to_string()];
+    agent.note_steering_messages(&old_messages);
+    assert_eq!(agent.work_ledger.steering.len(), 1);
+    agent.mark_work_done("respond to queued user update");
+
+    let messages = vec!["please revisit the queued change".to_string()];
+    agent.note_steering_messages(&messages);
+    agent.note_steering_messages(&messages);
+
+    assert_eq!(agent.work_ledger.steering.len(), 1);
+    assert!(
+        !agent
+            .work_ledger
+            .done
+            .contains(&"respond to queued user update".to_string())
+    );
+    assert!(
+        agent
             .work_ledger
             .pending
             .contains(&"respond to queued user update".to_string())
@@ -1860,7 +2057,9 @@ fn action_contract_violation_notes_loop_and_fallback_after_repeated_no_mutation(
         "{notes:?}"
     );
     assert!(
-        notes.iter().any(|note| note.contains("mutating tool_use")),
+        notes
+            .iter()
+            .any(|note| note.contains("file-mutating tool_use")),
         "{notes:?}"
     );
     assert!(
@@ -3493,6 +3692,7 @@ fn auto_compact_depends_on_history_size_not_cumulative_output_usage() {
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
     agent.model = "demo-128k".to_string();
+    agent.context_window_tokens = model_context_window(&agent.model);
     agent.session_usage.output = 1_000_000;
     assert_eq!(agent.compact_threshold_chars(), 460_800);
     assert_eq!(agent.active_compact_threshold_chars(), 409_600);
@@ -3576,6 +3776,17 @@ fn runtime_control_command_updates_effort_mid_run() {
         "{out:?}"
     );
 
+    out.clear();
+    let handled = apply_runtime_control_command(&mut agent, "/effort status", |msg| out.push(msg));
+    assert!(handled);
+    assert_eq!(agent.thinking_effort(), ThinkingEffort::High);
+    assert!(
+        out.iter().any(
+            |msg| msg.contains("thinking effort: high") && !msg.contains("applies immediately")
+        ),
+        "{out:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3640,58 +3851,27 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
 }
 
 #[test]
-fn runtime_control_command_updates_tools_mid_run() {
-    let root = temp_test_dir("runtime-control-tools");
+fn runtime_control_command_rejects_non_runtime_slash_commands() {
+    let root = temp_test_dir("runtime-control-rejects-non-runtime");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
+    let starting_profile = agent.tool_context_profile();
+    let starting_threshold = agent.compact_threshold_chars();
     let mut out = Vec::new();
 
-    assert!(agent.tools.iter().all(|t| t.name != "jq"));
-    let handled = apply_runtime_control_command(&mut agent, "/tools full", |msg| out.push(msg));
-    assert!(handled);
-    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
-    assert!(agent.tools.iter().any(|t| t.name == "jq"));
-    assert!(
-        out.iter().any(|msg| msg.contains("tools -> full")
-            && msg.contains("applies immediately")
-            && msg.contains("next model request")),
-        "{out:?}"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn runtime_control_command_updates_compact_threshold_by_percent() {
-    let root = temp_test_dir("runtime-control-compact");
-    let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let mut agent = test_agent(&root);
-    let mut out = Vec::new();
-
-    let handled = apply_runtime_control_command(&mut agent, "/compact 25%", |msg| out.push(msg));
-    assert!(handled);
-    assert_eq!(agent.compact_threshold_override_percent(), Some(25));
-    assert_eq!(
-        agent.compact_threshold_chars(),
-        compact_threshold_chars_for_percent(&agent.model, 25)
-    );
-    assert!(
-        out.iter()
-            .any(|msg| msg.contains("compact threshold set to 25% ->")),
-        "{out:?}"
-    );
-    assert_eq!(
-        agent.active_compact_threshold_chars(),
-        agent.compact_threshold_chars()
-    );
-
-    agent.history.push(Message {
-        role: "user".to_string(),
-        content: vec![Block::Text {
-            text: "x".repeat(agent.active_compact_threshold_chars() + 1),
-        }],
-    });
-    assert!(agent.should_active_compact());
+    assert!(!apply_runtime_control_command(
+        &mut agent,
+        "/tools full",
+        |msg| { out.push(msg) }
+    ));
+    assert!(!apply_runtime_control_command(
+        &mut agent,
+        "/compact 25%",
+        |msg| { out.push(msg) }
+    ));
+    assert_eq!(agent.tool_context_profile(), starting_profile);
+    assert_eq!(agent.compact_threshold_chars(), starting_threshold);
+    assert!(out.is_empty(), "{out:?}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3703,7 +3883,7 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
     let mut agent = test_agent(&root);
     agent.api_provider = ApiProvider::OpenAi;
     agent.base_url = "http://127.0.0.1:8080".to_string();
-    agent.model = "qwen-local".to_string();
+    agent.model = "qwen2.5-coder-7b".to_string();
     agent.thinking_effort = ThinkingEffort::Off;
 
     let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
@@ -4538,6 +4718,7 @@ fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
 #[test]
 fn context_window_and_history_budget_are_model_aware_and_overridable() {
     let _guard = env_lock();
+    clear_cached_local_llama_context_windows();
     unsafe {
         std::env::remove_var("DEXT_CONTEXT_WINDOW");
         std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
@@ -4579,12 +4760,13 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
         60_000
     );
     assert_eq!(
-        history_char_budget_with_override("qwen-local", None, ContextMode::Tiny),
-        13_107
+        history_char_budget_with_override("qwen2.5-coder-7b", None, ContextMode::Tiny),
+        32_000
     );
+    assert_eq!(model_context_window("qwen2.5-coder-7b"), 32_000);
     assert_eq!(
-        active_history_char_budget_with_override("qwen-local", None, ContextMode::Tiny),
-        13_107
+        active_history_char_budget_with_override("qwen2.5-coder-7b", None, ContextMode::Tiny),
+        32_000
     );
     assert_eq!(
         history_char_budget_with_override("tiny-1k", None, ContextMode::Tiny),
@@ -4621,10 +4803,11 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
 
 #[test]
 fn context_window_reads_from_provider_catalog() -> Result<()> {
-    // Resolution order: env > catalog override > built-in catalog > family heuristic > 200k fallback.
+    // Resolution order: env > runtime cache > catalog override > built-in catalog > family heuristic > 200k fallback.
     // This test isolates the catalog path: write a providers.json with a custom
     // provider and per-model override, then confirm model_context_window reads it.
     let _guard = env_lock();
+    clear_cached_local_llama_context_windows();
     let root = temp_test_dir("ctx-window-catalog");
     let root = std::fs::canonicalize(&root)?;
     unsafe {
@@ -4712,6 +4895,7 @@ fn builtin_chatgpt_profile_declares_codex_context_window() {
 #[test]
 fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> Result<()> {
     let _guard = env_lock();
+    clear_cached_local_llama_context_windows();
     let root = temp_test_dir("ctx-window-builtin-chatgpt");
     let root = std::fs::canonicalize(&root)?;
     unsafe {
@@ -4732,6 +4916,101 @@ fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> 
     }
     let _ = std::fs::remove_dir_all(&root);
     result
+}
+
+#[test]
+fn llama_context_parser_prefers_runtime_ctx_fields() {
+    assert_eq!(
+        parse_llama_context_window(&json!({
+            "model": {"n_ctx_train": 262144},
+            "default_generation_settings": {"n_ctx": 30000}
+        })),
+        Some(30_000)
+    );
+    assert_eq!(
+        parse_llama_context_window(&json!({
+            "data": [{"id": "qwen", "context_length": 32000}]
+        })),
+        Some(32_000)
+    );
+}
+
+#[test]
+fn local_llama_context_cache_overrides_builtin_local_default() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+    clear_cached_local_llama_context_windows();
+    assert_eq!(
+        model_context_window("qwen3.5-9b"),
+        crate::provider::DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
+    );
+    crate::provider::set_cached_local_llama_context_window("qwen3.5-9b", 30_000);
+    assert_eq!(model_context_window("qwen3.5-9b"), 30_000);
+    unsafe {
+        std::env::set_var("DEXT_CONTEXT_WINDOW", "64000");
+    }
+    assert_eq!(model_context_window("qwen3.5-9b"), 64_000);
+    unsafe {
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+    clear_cached_local_llama_context_windows();
+}
+
+#[test]
+fn local_llama_runtime_probe_updates_model_context_window() -> Result<()> {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+    clear_cached_local_llama_context_windows();
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0u8; 1024];
+            let n = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..n]);
+            let (status, body) = if request.starts_with("GET /props ") {
+                (
+                    "200 OK",
+                    r#"{"default_generation_settings":{"n_ctx":30000},"model":{"n_ctx_train":262144}}"#,
+                )
+            } else {
+                ("404 Not Found", r#"{}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+    });
+
+    let tokens = refresh_local_llama_context_window(
+        "local",
+        ApiProvider::OpenAi,
+        &format!("http://{addr}"),
+        "qwen3.5-9b",
+    );
+    assert_eq!(tokens, Some(30_000));
+    assert_eq!(model_context_window("qwen3.5-9b"), 30_000);
+    let _ = refresh_local_llama_context_window(
+        "local",
+        ApiProvider::OpenAi,
+        &format!("http://{addr}"),
+        "qwen2.5-coder-7b",
+    );
+    server.join().expect("server thread");
+    clear_cached_local_llama_context_windows();
+    Ok(())
 }
 
 #[test]
@@ -4940,6 +5219,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--cd".to_string(),
         root.display().to_string(),
         "--output=stream-json".to_string(),
+        "--no-trust".to_string(),
         "--fork".to_string(),
         "--budget=250k tokens".to_string(),
         "--approval=auto-read".to_string(),
@@ -4954,6 +5234,8 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
     ])?;
 
     assert!(opts.no_session);
+    assert!(opts.no_trust_mode);
+    assert!(!opts.trust_mode);
     assert!(opts.fork);
     assert_eq!(opts.cd, Some(root.clone()));
     assert_eq!(opts.output, OutputMode::StreamJson);
@@ -4970,6 +5252,42 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
     );
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[test]
+fn parse_cli_options_trust_flags_last_one_wins() -> Result<()> {
+    let opts = parse_cli_options(vec!["--no-trust".to_string(), "--trust".to_string()])?;
+    assert!(opts.trust_mode);
+    assert!(!opts.no_trust_mode);
+
+    let opts = parse_cli_options(vec!["--trust".to_string(), "--no-trust".to_string()])?;
+    assert!(!opts.trust_mode);
+    assert!(opts.no_trust_mode);
+    Ok(())
+}
+
+#[test]
+fn env_flag_default_defaults_and_honors_false_values() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_TEST_FLAG_DEFAULT");
+    }
+    assert!(env_flag_default("DEXT_TEST_FLAG_DEFAULT", true));
+    assert!(!env_flag_default("DEXT_TEST_FLAG_DEFAULT", false));
+
+    unsafe {
+        std::env::set_var("DEXT_TEST_FLAG_DEFAULT", "0");
+    }
+    assert!(!env_flag_default("DEXT_TEST_FLAG_DEFAULT", true));
+
+    unsafe {
+        std::env::set_var("DEXT_TEST_FLAG_DEFAULT", "yes");
+    }
+    assert!(env_flag_default("DEXT_TEST_FLAG_DEFAULT", false));
+
+    unsafe {
+        std::env::remove_var("DEXT_TEST_FLAG_DEFAULT");
+    }
 }
 
 #[test]
@@ -5079,6 +5397,7 @@ fn turn_diagnostics_serializes_runtime_observability() {
         api_family: "chatgpt-responses".to_string(),
         auth_source: "auth:chatgpt".to_string(),
         model: "gpt-5".to_string(),
+        context_window: Some(272_000),
         last_retry_reason: Some("429".to_string()),
         workaround_fired: true,
         turn_duration_ms: Some(123),
@@ -5088,6 +5407,7 @@ fn turn_diagnostics_serializes_runtime_observability() {
     };
     let value = serde_json::to_value(ev).expect("serialize event");
     assert_eq!(value["event"], "turn_diagnostics");
+    assert_eq!(value["data"]["context_window"], 272_000);
     assert_eq!(value["data"]["turn_duration_ms"], 123);
     assert_eq!(value["data"]["context_mode"], "Frugal");
     assert_eq!(value["data"]["tool_profile"], "frugal:lean");
@@ -5251,6 +5571,14 @@ fn provider_runtime_and_slash_registries_are_split() {
     assert!(provider_names.contains("read_file"));
     assert!(provider_names.contains("jq"));
     assert!(provider_names.contains("csvkit"));
+    assert!(provider_names.contains("browser"));
+    assert!(tools::is_external_process_tool("browser"));
+    assert_eq!(
+        prepare_external_tool("browser", &json!({"args": ["snapshot"]}), Path::new("."))
+            .expect("prepare browser tool")
+            .0,
+        "agent-browser"
+    );
 
     let default_names: HashSet<&str> = provider_tool_definitions()
         .iter()
@@ -6245,7 +6573,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         let local = find_provider_profile(&catalog, "local").context("local")?;
         assert_eq!(local.api_provider, ApiProvider::OpenAi);
         assert!(!local.requires_api_key);
-        assert_eq!(local.default_model, "qwen-local");
+        assert_eq!(local.default_model, "qwen2.5-coder-7b");
         Ok(())
     })();
 
@@ -6254,6 +6582,91 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&root);
     result
+}
+
+#[test]
+fn local_provider_merge_drops_retired_catalog_artifacts() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|p| p.id == "local")
+        .expect("local profile");
+    let mut stored = builtin.clone();
+    stored.default_model = "qwen-local".to_string();
+    stored.models.push("qwen-local".to_string());
+    stored
+        .models
+        .push("Qwen3.6-35B-A3B-Q4_K_M.gguf".to_string());
+    stored.models.push("custom-local-model".to_string());
+    stored.context_window = Some(4_096);
+    stored
+        .model_context_windows
+        .insert("qwen-local".to_string(), 4_096);
+    stored
+        .model_context_windows
+        .insert("custom-local-model".to_string(), 12_345);
+
+    let merged = merge_provider_profile(builtin, stored);
+    assert_eq!(merged.default_model, "qwen2.5-coder-7b");
+    assert_eq!(
+        merged.context_window,
+        Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
+    );
+    assert!(!merged.models.iter().any(|m| m == "qwen-local"));
+    assert!(merged.models.iter().any(|m| m == "custom-local-model"));
+    assert!(merged.model_context_windows.get("qwen-local").is_none());
+    assert_eq!(
+        merged.model_context_windows.get("custom-local-model"),
+        Some(&12_345)
+    );
+}
+
+#[test]
+fn local_provider_merge_drops_stale_local_4k_context_without_retired_models() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|p| p.id == "local")
+        .expect("local profile");
+    let mut stored = builtin.clone();
+    stored.context_window = Some(4_096);
+
+    let merged = merge_provider_profile(builtin, stored);
+    assert_eq!(
+        merged.context_window,
+        Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
+    );
+}
+
+#[test]
+fn local_provider_merge_drops_stale_local_16k_context_without_retired_models() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|p| p.id == "local")
+        .expect("local profile");
+    let mut stored = builtin.clone();
+    stored.context_window = Some(16_384);
+    stored.models.push("custom-local-model".to_string());
+
+    let merged = merge_provider_profile(builtin, stored);
+    assert_eq!(
+        merged.context_window,
+        Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
+    );
+    assert!(merged.models.iter().any(|m| m == "custom-local-model"));
+}
+
+#[test]
+fn local_provider_merge_preserves_user_local_context_override_without_retired_artifacts() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|p| p.id == "local")
+        .expect("local profile");
+    let mut stored = builtin.clone();
+    stored.context_window = Some(65_536);
+    stored.models.push("custom-local-model".to_string());
+
+    let merged = merge_provider_profile(builtin, stored);
+    assert_eq!(merged.context_window, Some(65_536));
+    assert!(merged.models.iter().any(|m| m == "custom-local-model"));
 }
 
 #[test]
@@ -6399,14 +6812,15 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
         assert_eq!(glm.provider_id, "glm");
         assert_eq!(glm.model, "glm-5.1");
 
-        let local = resolve_provider_model_selection(&catalog, &store, "glm", "local/qwen-local")?;
+        let local =
+            resolve_provider_model_selection(&catalog, &store, "glm", "local/qwen2.5-coder-7b")?;
         assert_eq!(local.provider_id, "local");
-        assert_eq!(local.model, "qwen-local");
+        assert_eq!(local.model, "qwen2.5-coder-7b");
 
         let qwen_alias =
-            resolve_provider_model_selection(&catalog, &store, "glm", "qwen/qwen-local")?;
+            resolve_provider_model_selection(&catalog, &store, "glm", "qwen/qwen3.5-9b")?;
         assert_eq!(qwen_alias.provider_id, "local");
-        assert_eq!(qwen_alias.model, "qwen-local");
+        assert_eq!(qwen_alias.model, "qwen3.5-9b");
 
         let explicit =
             resolve_provider_model_selection(&catalog, &store, "glm", "chatgpt/gpt-5-4")?;
@@ -6448,8 +6862,11 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
             .expect("local provider");
         assert_eq!(local.api_provider, ApiProvider::OpenAi);
         assert!(!local.requires_api_key);
-        assert_eq!(local.default_model, "qwen-local");
-        assert_eq!(local.context_window, Some(4_096));
+        assert_eq!(local.default_model, "qwen2.5-coder-7b");
+        assert_eq!(
+            local.context_window,
+            Some(crate::provider::DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
+        );
         assert_eq!(resolve_active_provider_id(&catalog), "glm");
         Ok(())
     })();
@@ -7218,7 +7635,9 @@ fn implementation_model_fallback_switches_codex_53_to_default() {
         "{notes:?}"
     );
     assert!(
-        notes.iter().any(|note| note.contains("mutating tool_use")),
+        notes
+            .iter()
+            .any(|note| note.contains("file-mutating tool_use")),
         "{notes:?}"
     );
     assert!(
@@ -7380,6 +7799,7 @@ fn pseudo_tool_syntax_detection_marks_plain_text_invalid() {
 fn action_contract_note_requires_mutation_tool_use() {
     let note = action_contract_runtime_note(2);
     assert!(note.contains("edit_file|multi_edit|write_file"), "{note}");
+    assert!(note.contains("bash command that mutates files"), "{note}");
     assert!(!note.contains("git_commit"), "{note}");
     assert!(
         note.contains("Text-only blocked statements do not clear"),
@@ -7882,6 +8302,7 @@ fn active_compaction_checkpoint_runs_when_history_crosses_active_threshold() {
     let root = temp_test_dir("active-compact-checkpoint");
     let mut agent = test_agent(&root);
     agent.model = "demo-128k".to_string();
+    agent.context_window_tokens = model_context_window(&agent.model);
     agent.history.push(Message {
         role: "user".to_string(),
         content: vec![Block::Text {

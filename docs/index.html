@@ -436,7 +436,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>openai</code></td><td>OpenAI API</td><td>OpenAI</td><td>gpt-5</td><td>API Key (<code>OPENAI_API_KEY</code>)</td></tr>
 <tr><td><code>anthropic</code></td><td>Anthropic</td><td>Anthropic</td><td>claude-sonnet-4-5</td><td>API Key (<code>ANTHROPIC_API_KEY</code>)</td></tr>
 <tr><td><code>deepseek</code></td><td>DeepSeek</td><td>OpenAI</td><td>deepseek-chat</td><td>API Key (<code>DEEPSEEK_API_KEY</code>)</td></tr>
-<tr><td><code>local</code></td><td>Local llama.cpp</td><td>OpenAI</td><td>qwen-local</td><td>None</td></tr>
+<tr><td><code>local</code></td><td>Local llama.cpp</td><td>OpenAI</td><td>qwen2.5-coder-7b</td><td>None</td></tr>
 </table>
 <h3>Provider Resolution Chain</h3>
 <ol>
@@ -855,6 +855,7 @@ description: One-line workflow summary
 <tr><td><code>dext --output json|stream-json</code></td><td>Machine-readable output</td></tr>
 <tr><td><code>dext --effort off|low|medium|high|xhigh</code></td><td>Thinking effort</td></tr>
 <tr><td><code>dext --approval ask|auto-read|auto-write|never|always</code></td><td>Approval profile</td></tr>
+<tr><td><code>dext --no-trust</code></td><td>Opt out of default startup trust mode</td></tr>
 <tr><td><code>dext --budget &lt;amount&gt;</code></td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
 </table>
 <h3>Auth Subcommands</h3>
@@ -1012,7 +1013,7 @@ description: One-line workflow summary
 <tr><td><code>DEXT_ALLOW_BREAK_SYSTEM_PACKAGES</code></td><td>false</td><td>Allow the otherwise-blocked pip <code>--break-system-packages</code> flag</td></tr>
 <tr><td><code>DEXT_EXTERNAL_TIMEOUT_SECS</code></td><td>60</td><td>Default timeout for external tools</td></tr>
 <tr><td><code>DEXT_HOOK_TIMEOUT_SECS</code></td><td>60</td><td>Default timeout for hook commands</td></tr>
-<tr><td><code>DEXT_TRUST</code></td><td>false</td><td>Enable trust mode / auto-approval at startup</td></tr>
+<tr><td><code>DEXT_TRUST</code></td><td>true</td><td>Trust mode is enabled by default; set <code>DEXT_TRUST=0</code> to opt out</td></tr>
 <tr><td><code>DEXT_NO_TUI</code></td><td>false</td><td>Disable inline TUI even when a terminal is available</td></tr>
 <tr><td><code>DEXT_SYSTEM</code></td><td>Built-in prompt</td><td>Override the base system prompt</td></tr>
 <tr><td><code>DEXT_SANDBOX</code></td><td><code>.</code></td><td>Override sandbox root path</td></tr>
@@ -1063,7 +1064,7 @@ description: One-line workflow summary
 </ul>
 <h3>Local (llama.cpp)</h3>
 <ul>
-<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — Default model <code>qwen-local</code> with 4,096-token context</li>
+<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — Default model <code>qwen2.5-coder-7b</code>, alternate <code>qwen3.5-9b</code>; Dext probes llama.cpp runtime context and falls back to 32K tokens</li>
 </ul>
 </div>
 </section>

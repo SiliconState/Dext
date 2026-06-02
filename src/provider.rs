@@ -8,6 +8,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::session::{atomic_write_bytes, dext_state_dir, unix_timestamp_secs};
 
@@ -81,6 +82,9 @@ impl ApiProvider {
 
 const PROVIDER_CATALOG_VERSION: u32 = 1;
 const AUTH_STORE_VERSION: u32 = 1;
+pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS: u64 = 32_000;
+const LLAMA_CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(700);
+const LLAMA_CONTEXT_DISCOVERY_PATHS: &[&str] = &["/props", "/slots", "/v1/models", "/models"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OAuthFlow {
@@ -117,7 +121,7 @@ pub(crate) struct ProviderProfile {
     #[serde(default)]
     pub(crate) notes: Option<String>,
     /// Default request context window (in tokens) for this provider's models.
-    /// Editable in ~/.dext/providers.json. Env override: DEXT_CONTEXT_WINDOW[_TOKENS].
+    /// llama.cpp/local may override this at runtime. Env override: DEXT_CONTEXT_WINDOW[_TOKENS].
     #[serde(default)]
     pub(crate) context_window: Option<u64>,
     /// Optional per-model override of context_window. Map key = model id.
@@ -357,20 +361,205 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             display_name: "Local llama.cpp".to_string(),
             api_provider: ApiProvider::OpenAi,
             base_url: "http://127.0.0.1:8080".to_string(),
-            default_model: "qwen-local".to_string(),
+            default_model: "qwen2.5-coder-7b".to_string(),
             models: vec![
-                "qwen-local".to_string(),
-                "Qwen3.6-35B-A3B-Q4_K_M.gguf".to_string(),
+                "qwen2.5-coder-7b".to_string(),
+                "qwen3.5-9b".to_string(),
+                "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf".to_string(),
+                "Qwen3.5-9B-Q4_K_M.gguf".to_string(),
             ],
             env_vars: Vec::new(),
             requires_api_key: false,
             login_url: None,
             oauth_flow: None,
-            notes: Some("Local OpenAI-compatible llama.cpp server. Start llama-server on 127.0.0.1:8080 first; no cloud credentials are used.".to_string()),
-            context_window: Some(4_096),
-            model_context_windows: HashMap::new(),
+            notes: Some("Local OpenAI-compatible llama.cpp server. Start exactly one llama-server on 127.0.0.1:8080 with --alias qwen2.5-coder-7b or --alias qwen3.5-9b; no cloud credentials are used. On startup Dext probes llama.cpp for its runtime context and otherwise budgets 32K tokens.".to_string()),
+            context_window: Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS),
+            model_context_windows: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "qwen2.5-coder-7b".to_string(),
+                    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS,
+                );
+                m.insert("qwen3.5-9b".to_string(), DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS);
+                m.insert(
+                    "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf".to_string(),
+                    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS,
+                );
+                m.insert(
+                    "Qwen3.5-9B-Q4_K_M.gguf".to_string(),
+                    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS,
+                );
+                m
+            },
         },
     ]
+}
+
+fn local_llama_cache() -> &'static Mutex<HashMap<String, u64>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn is_local_llama_provider(
+    provider_id: &str,
+    api_provider: ApiProvider,
+    base_url: &str,
+) -> bool {
+    if api_provider != ApiProvider::OpenAi {
+        return false;
+    }
+    let lower = base_url.trim().to_ascii_lowercase();
+    canonical_provider_id(provider_id) == "local"
+        || lower.contains("127.0.0.1")
+        || lower.contains("localhost")
+}
+
+fn local_llama_cache_key(base_url: &str, model: &str) -> String {
+    format!(
+        "{}|{}",
+        base_url.trim().trim_end_matches('/').to_ascii_lowercase(),
+        model.trim().to_ascii_lowercase()
+    )
+}
+
+fn model_context_cache_key(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
+}
+
+pub(crate) fn cached_local_llama_context_window(model: &str) -> Option<u64> {
+    local_llama_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&model_context_cache_key(model)).copied())
+        .filter(|tokens| *tokens > 0)
+}
+
+#[cfg(test)]
+pub(crate) fn set_cached_local_llama_context_window(model: &str, tokens: u64) {
+    if let Ok(mut cache) = local_llama_cache().lock() {
+        cache.insert(model_context_cache_key(model), tokens);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_cached_local_llama_context_windows() {
+    if let Ok(mut cache) = local_llama_cache().lock() {
+        cache.clear();
+    }
+}
+
+fn llama_endpoint_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.ends_with("/v1") && !path.starts_with("/v1/") {
+        format!("{}{}", base.trim_end_matches("/v1"), path)
+    } else {
+        format!("{base}{path}")
+    }
+}
+
+fn context_field_score(key: &str) -> Option<u8> {
+    let normalized = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "nctx" | "ctxsize" | "contextsize" | "contextlength" | "contextwindow" => Some(0),
+        "maxcontextlength" | "maxcontexttokens" | "contexttokens" => Some(1),
+        "nctxtrain" => Some(3),
+        _ => None,
+    }
+}
+
+fn collect_llama_context_candidates(value: &Value, best: &mut Option<(u8, u64)>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if let Some(score) = context_field_score(key) {
+                    if let Some(tokens) = child
+                        .as_u64()
+                        .or_else(|| child.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                        .filter(|tokens| (512..=10_000_000).contains(tokens))
+                    {
+                        if best.is_none_or(|(best_score, best_tokens)| {
+                            score < best_score || (score == best_score && tokens > best_tokens)
+                        }) {
+                            *best = Some((score, tokens));
+                        }
+                    }
+                }
+                collect_llama_context_candidates(child, best);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_llama_context_candidates(child, best);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn parse_llama_context_window(value: &Value) -> Option<u64> {
+    let mut best = None;
+    collect_llama_context_candidates(value, &mut best);
+    best.map(|(_, tokens)| tokens)
+}
+
+fn fetch_llama_context_window(client: &reqwest::blocking::Client, base_url: &str) -> Option<u64> {
+    for path in LLAMA_CONTEXT_DISCOVERY_PATHS {
+        let Ok(resp) = client.get(llama_endpoint_url(base_url, path)).send() else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(json) = resp.json::<Value>() else {
+            continue;
+        };
+        if let Some(tokens) = parse_llama_context_window(&json) {
+            return Some(tokens);
+        }
+    }
+    None
+}
+
+pub(crate) fn refresh_local_llama_context_window(
+    provider_id: &str,
+    api_provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> Option<u64> {
+    if !is_local_llama_provider(provider_id, api_provider, base_url) {
+        return None;
+    }
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return None;
+    }
+    let endpoint_key = local_llama_cache_key(base_url, model);
+    if let Some(tokens) = local_llama_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&endpoint_key).copied())
+        .filter(|tokens| *tokens > 0)
+    {
+        if let Ok(mut cache) = local_llama_cache().lock() {
+            cache.insert(model_context_cache_key(model), tokens);
+        }
+        return Some(tokens);
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(LLAMA_CONTEXT_DISCOVERY_TIMEOUT)
+        .build()
+        .ok()?;
+    let tokens = fetch_llama_context_window(&client, base_url)?;
+    if let Ok(mut cache) = local_llama_cache().lock() {
+        cache.insert(endpoint_key, tokens);
+        cache.insert(model_context_cache_key(model), tokens);
+    }
+    Some(tokens)
 }
 
 pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option<ProviderProfile> {
@@ -380,7 +569,7 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     }
 
     let fallback_model = if profile.id == "local" {
-        "qwen-local"
+        "qwen2.5-coder-7b"
     } else {
         "glm-4.6"
     };
@@ -426,12 +615,31 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     Some(profile)
 }
 
+const RETIRED_BUNDLED_LOCAL_MODELS: &[&str] = &["qwen-local", "Qwen3.6-35B-A3B-Q4_K_M.gguf"];
+const RETIRED_BUNDLED_LOCAL_CONTEXT_WINDOWS: &[u64] = &[4_096, 16_384];
+
+fn is_retired_bundled_local_model(model: &str) -> bool {
+    let model = model.trim();
+    !model.is_empty()
+        && RETIRED_BUNDLED_LOCAL_MODELS
+            .iter()
+            .any(|retired| model.eq_ignore_ascii_case(retired))
+}
+
+fn is_retired_bundled_local_context_window(tokens: u64) -> bool {
+    RETIRED_BUNDLED_LOCAL_CONTEXT_WINDOWS.contains(&tokens)
+}
+
 pub(crate) fn merge_provider_profile(
     mut builtin: ProviderProfile,
     stored: ProviderProfile,
 ) -> ProviderProfile {
+    let builtin_id = canonical_provider_id(&builtin.id);
+    let local_profile = builtin_id == "local";
     let stored_default = stored.default_model.trim();
-    if !stored_default.is_empty() {
+    if !stored_default.is_empty()
+        && !(local_profile && is_retired_bundled_local_model(stored_default))
+    {
         builtin.default_model = if builtin.api_provider == ApiProvider::ChatGpt {
             normalize_chatgpt_model_slug(stored_default)
         } else {
@@ -440,11 +648,13 @@ pub(crate) fn merge_provider_profile(
     }
 
     if let Some(window) = stored.context_window.filter(|window| *window > 0) {
-        builtin.context_window = Some(window);
+        if !(local_profile && is_retired_bundled_local_context_window(window)) {
+            builtin.context_window = Some(window);
+        }
     }
 
     for (model, window) in stored.model_context_windows {
-        if window == 0 {
+        if window == 0 || (local_profile && is_retired_bundled_local_model(&model)) {
             continue;
         }
         let key = if builtin.api_provider == ApiProvider::ChatGpt {
@@ -473,7 +683,6 @@ pub(crate) fn merge_provider_profile(
         .iter()
         .map(|model| model.to_ascii_lowercase())
         .collect();
-    let builtin_id = canonical_provider_id(&builtin.id);
     let extra_models = stored
         .models
         .into_iter()
@@ -485,6 +694,7 @@ pub(crate) fn merge_provider_profile(
             }
         })
         .filter(|model| !model.is_empty())
+        .filter(|model| !(local_profile && is_retired_bundled_local_model(model)))
         .filter(|model| {
             builtin_id == "chatgpt"
                 || model

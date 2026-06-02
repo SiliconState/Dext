@@ -245,7 +245,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "browser",
-            description: "Optional browser automation via agent-browser. Pass agent-browser CLI args such as ['open','https://example.com'], ['snapshot'], ['click','@ref'], or start with ['skills','get','core','--full'].",
+            description: "Optional browser automation through the browser tool. Pass browser args such as ['open','https://example.com'], ['snapshot'], ['click','@ref'], or start with ['skills','get','core','--full'].",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -369,7 +369,7 @@ pub(crate) fn needs_permission(name: &str) -> bool {
 pub(crate) fn is_external_process_tool(name: &str) -> bool {
     matches!(
         name,
-        "fd" | "rg" | "jq" | "fzf" | "awk" | "csvkit" | "git_diff" | "git_log"
+        "fd" | "rg" | "jq" | "fzf" | "awk" | "csvkit" | "git_diff" | "git_log" | "browser"
     )
 }
 
@@ -405,7 +405,7 @@ fn lean_description(name: &str, fallback: &str) -> String {
         "jq" => "Run jq on JSON text or file.",
         "fzf" => "Rank provided lines by fuzzy query.",
         "http" => "HTTPie-style request; response capped.",
-        "browser" => "Run agent-browser CLI.",
+        "browser" => "Run optional browser automation.",
         "awk" => "Run awk with optional stdin.",
         "git_diff" => "Show capped git diff or stat; prefer stat first.",
         "git_log" => "Show recent git log.",

@@ -64,33 +64,38 @@ Inside the interactive session, the matching slash commands are:
 /models all
 /login chatgpt
 /logout chatgpt
-/model local/qwen-local
+/model local/qwen2.5-coder-7b
 ```
 
 Credentials are stored in Dext state, not in the repository. Do not commit `.env`, `.dext/`, exported sessions, or auth stores.
 
 ## Local Qwen / llama.cpp
 
-Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Start your server first, then select it:
+Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. The curated local model ids are `qwen2.5-coder-7b` (fast coding/default) and `qwen3.5-9b` (chat/reasoning). On startup/provider switch, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) for the live runtime context window; if the probe misses, local context budgeting falls back to 32K tokens. Start exactly one server first, then select it:
 
 ```bash
 dext auth provider local
 # or inside Dext:
-/model local/qwen-local
+/model local/qwen2.5-coder-7b
 /effort off
 ```
 
-For a local Qwen GGUF model, a typical llama.cpp server command looks like:
+Example local GGUF launch commands:
 
 ```bash
 cd /path/to/llama.cpp
 ./build/bin/llama-server \
-  -m /path/to/models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
-  -ngl 11 -c 4096 -np 1 --cache-ram 0 --no-warmup -t 12 \
-  --reasoning off --flash-attn on --host 127.0.0.1 --port 8080
+  -m /path/to/models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf \
+  --alias qwen2.5-coder-7b -ngl 99 -c 32000 -t 8 \
+  --flash-attn on --host 127.0.0.1 --port 8080
+
+./build/bin/llama-server \
+  -m /path/to/models/Qwen3.5-9B-Q4_K_M.gguf \
+  --alias qwen3.5-9b -ngl 99 -c 32000 -t 8 \
+  --flash-attn on --reasoning off --host 127.0.0.1 --port 8080
 ```
 
-Use `--context-mode tiny --effort off` or `/context tiny` plus `/effort off` for the lowest local token/compute pressure.
+For Qwen3.5 thinking mode, omit `--reasoning off` and give Dext enough output budget (`DEXT_MAX_OUTPUT_TOKENS=8192` is the default). Use `--context-mode tiny --effort off` or `/context tiny` plus `/effort off` for the lowest local token/compute pressure.
 
 ## Interactive workflow
 
@@ -285,13 +290,15 @@ dext --approval ask
 dext --approval never
 dext --approval auto-read
 dext --approval auto-write
+dext --trust       # default unless opted out
+dext --no-trust    # opt out of startup trust
 dext --sandbox-profile read-only
 dext --sandbox-profile workspace-write
 dext --sandbox-profile danger-full-access
 # --sandbox accepts the same profile names, or a directory as the sandbox root
 ```
 
-Use `--trust` only when you intentionally want all gated tools auto-approved.
+Trust mode is on by default: all gated tools are auto-approved at startup. Opt out with `--no-trust` or `DEXT_TRUST=0`, then use `/trust on|off|status` or `--trust` to toggle deliberately.
 
 ## Session commands
 
@@ -314,7 +321,7 @@ Provider/model:
 
 ```bash
 DEXT_PROVIDER=local
-DEXT_MODEL=qwen-local
+DEXT_MODEL=qwen2.5-coder-7b
 DEXT_BASE_URL=http://127.0.0.1:8080
 DEXT_THINKING_EFFORT=off
 # cloud examples:
@@ -356,6 +363,7 @@ Runtime controls:
 
 ```bash
 DEXT_NO_TUI=1
+DEXT_TRUST=0  # opt out of default startup trust mode
 DEXT_APPROVAL=ask
 DEXT_SANDBOX_PROFILE=workspace-write
 DEXT_CONTEXT_MODE=standard

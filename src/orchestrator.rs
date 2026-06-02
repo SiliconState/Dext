@@ -429,28 +429,114 @@ struct ObjectiveEvidence {
     commit_count: usize,
 }
 
+fn normalized_words(text: &str) -> Vec<&str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn contains_word_sequence(text: &str, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return false;
+    }
+    normalized_words(text)
+        .windows(sequence.len())
+        .any(|window| window == sequence)
+}
+
+fn any_word_starts_with(words: &[&str], prefixes: &[&str]) -> bool {
+    words
+        .iter()
+        .any(|word| prefixes.iter().any(|prefix| word.starts_with(prefix)))
+}
+
+fn cleanup_requested_as_action(words: &[&str]) -> bool {
+    for (idx, word) in words.iter().enumerate() {
+        let cleanup_len = if *word == "cleanup" {
+            1
+        } else if *word == "clean" && words.get(idx + 1) == Some(&"up") {
+            2
+        } else {
+            continue;
+        };
+        if words.get(idx + cleanup_len).is_none() {
+            continue;
+        }
+        let prev = idx.checked_sub(1).and_then(|i| words.get(i)).copied();
+        let polite = idx >= 2
+            && matches!(words.get(idx - 2).copied(), Some("can" | "could" | "would"))
+            && words.get(idx - 1) == Some(&"you");
+        if idx == 0
+            || polite
+            || matches!(
+                prev,
+                Some(
+                    "and"
+                        | "then"
+                        | "please"
+                        | "also"
+                        | "now"
+                        | "do"
+                        | "handle"
+                        | "fix"
+                        | "go"
+                        | "apply"
+                )
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn commit_requested_as_action(words: &[&str]) -> bool {
+    for (idx, word) in words.iter().enumerate() {
+        if *word != "commit" || words.get(idx + 1).is_none() {
+            continue;
+        }
+        let prev = idx.checked_sub(1).and_then(|i| words.get(i)).copied();
+        let polite = idx >= 2
+            && matches!(words.get(idx - 2).copied(), Some("can" | "could" | "would"))
+            && words.get(idx - 1) == Some(&"you");
+        if idx == 0
+            || polite
+            || matches!(
+                prev,
+                Some("and" | "then" | "please" | "also" | "now" | "do" | "handle" | "go" | "apply")
+            )
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn explicit_apply_fixes_requested(lowered: &str) -> bool {
+    let words = normalized_words(lowered);
+    if cleanup_requested_as_action(&words) || commit_requested_as_action(&words) {
+        return true;
+    }
     [
-        "apply fix",
-        "apply fixes",
-        "fix it",
-        "fix them",
-        "fix this",
-        "fix the",
-        "implement",
-        "patch",
-        "merge",
-        "cleanup",
-        "clean up",
-        "go for it",
-        "handle my todo",
-        "do it",
-        "make changes",
-        "update the code",
-        "commit",
+        &["apply", "fix"][..],
+        &["apply", "fixes"],
+        &["apply", "the", "fix"],
+        &["apply", "the", "fixes"],
+        &["fix", "it"],
+        &["fix", "them"],
+        &["fix", "this"],
+        &["fix", "the"],
+        &["implement"],
+        &["patch"],
+        &["merge"],
+        &["go", "for", "it"],
+        &["handle", "my", "todo"],
+        &["make", "changes"],
+        &["update", "the", "code"],
+        &["do", "it"],
     ]
     .iter()
-    .any(|needle| lowered.contains(needle))
+    .any(|sequence| contains_word_sequence(lowered, sequence))
 }
 
 impl ObjectiveTracker {
@@ -470,22 +556,23 @@ impl ObjectiveTracker {
         }
 
         let lowered = compact.to_ascii_lowercase();
+        let words = normalized_words(&lowered);
         let apply_fixes_requested = explicit_apply_fixes_requested(&lowered);
         let mut checkpoints: Vec<String> = Vec::new();
 
-        if lowered.contains("plan") {
+        if any_word_starts_with(&words, &["plan"]) {
             checkpoints.push("produce execution plan".to_string());
         }
-        if lowered.contains("analy") || lowered.contains("review") {
+        if any_word_starts_with(&words, &["analy", "review"]) {
             checkpoints.push("analyze current behavior and constraints".to_string());
         }
         if apply_fixes_requested {
             checkpoints.push("implement requested changes".to_string());
         }
-        if lowered.contains("test") || lowered.contains("verify") {
+        if any_word_starts_with(&words, &["test", "verif"]) {
             checkpoints.push("run verification checks".to_string());
         }
-        if lowered.contains("log") || lowered.contains("document") {
+        if any_word_starts_with(&words, &["log", "document"]) {
             checkpoints.push("log decisions and follow-up improvements".to_string());
         }
 
@@ -568,8 +655,9 @@ pub(crate) fn objective_runtime_reminder_from_coverage(coverage: &ObjectiveCover
 
 fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
     let mut evidence = ObjectiveEvidence::default();
+    let start = objective_evidence_start(history);
 
-    for msg in history {
+    for msg in &history[start..] {
         let mut assistant_text_for_message = String::new();
         for block in &msg.content {
             match block {
@@ -593,6 +681,9 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
                         }
                         "bash" => {
                             if let Some(cmd) = input["command"].as_str() {
+                                if bash_command_likely_mutates_files(cmd) {
+                                    evidence.mutation_count += 1;
+                                }
                                 evidence.bash_commands.push(cmd.to_string());
                             }
                         }
@@ -614,6 +705,24 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
     evidence.assistant_text = normalize_token(&evidence.assistant_text_raw);
     evidence.tool_result_text = normalize_token(&evidence.tool_result_text);
     evidence
+}
+
+fn objective_evidence_start(history: &[crate::Message]) -> usize {
+    history
+        .iter()
+        .rposition(|msg| {
+            msg.role == "user"
+                && msg.content.iter().any(|block| match block {
+                    crate::Block::Text { text } | crate::Block::PartialStream { text } => {
+                        !text.starts_with("[runtime-note]")
+                            && !text.starts_with("[queued-update]")
+                            && !text.starts_with("[queued-user-update]")
+                            && !text.starts_with("[prior conversation,")
+                    }
+                    _ => false,
+                })
+        })
+        .unwrap_or(0)
 }
 
 fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool {
@@ -718,7 +827,150 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
     }
 }
 
-fn assistant_text_has_blocked_reason(text: &str) -> bool {
+pub(crate) fn bash_command_likely_mutates_files(command: &str) -> bool {
+    shell_command_segments(command)
+        .into_iter()
+        .any(bash_command_segment_likely_mutates_files)
+}
+
+fn bash_command_segment_likely_mutates_files(command: &str) -> bool {
+    let lower = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    if shell_redirection_likely_writes(&lower) {
+        return true;
+    }
+
+    if segment_is_readonly_formatter_check(&lower) {
+        return false;
+    }
+
+    let mutation_needles = [
+        "rm ",
+        "rm -",
+        " rmdir ",
+        "mkdir ",
+        "mkdir -",
+        "mv ",
+        "mv -",
+        "cp ",
+        "cp -",
+        "touch ",
+        "truncate ",
+        "git apply",
+        "git checkout --",
+        "git restore",
+        "git mv",
+        "git rm",
+        "patch -p",
+        "apply_patch",
+        "cargo fmt",
+        "rustfmt ",
+        "gofmt -w",
+        "go fmt",
+        "ruff format",
+        "black ",
+        "prettier --write",
+        "shfmt -w",
+        "terraform fmt",
+        "npm install",
+        "pnpm install",
+        "yarn install",
+        "bun install",
+        "install ",
+        "sed -i",
+        "perl -pi",
+        "tee ",
+        "cat >",
+        "write_text(",
+        "write_bytes(",
+        ".write(",
+        "--output-dir",
+        "--out-dir",
+        "--output ",
+    ];
+    if mutation_needles.iter().any(|needle| lower.contains(needle)) {
+        return true;
+    }
+
+    lower.contains("find ") && (lower.contains(" -delete") || lower.contains(" -exec rm"))
+}
+
+fn shell_command_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            ';' | '\n' if !in_single && !in_double => {
+                segments.push(&command[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            '&' if !in_single && !in_double && chars.peek().is_some_and(|(_, c)| *c == '&') => {
+                segments.push(&command[start..idx]);
+                chars.next();
+                start = idx + 2;
+            }
+            '|' if !in_single && !in_double => {
+                segments.push(&command[start..idx]);
+                if chars.peek().is_some_and(|(_, c)| *c == '|') {
+                    chars.next();
+                    start = idx + 2;
+                } else {
+                    start = idx + ch.len_utf8();
+                }
+            }
+            _ => {}
+        }
+    }
+    segments.push(&command[start..]);
+    segments
+}
+
+fn segment_is_readonly_formatter_check(command: &str) -> bool {
+    (command.starts_with("cargo fmt") && command.contains("--check"))
+        || (command.starts_with("rustfmt") && command.contains("--check"))
+        || (command.starts_with("prettier") && command.contains("--check"))
+        || (command.starts_with("ruff format") && command.contains("--check"))
+        || (command.starts_with("shfmt") && command.contains("-d"))
+}
+
+fn shell_redirection_likely_writes(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_single = false;
+    let mut in_double = false;
+    for (idx, ch) in chars.iter().enumerate() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '>' if !in_single && !in_double => {
+                let rest: String = chars[idx + 1..].iter().collect();
+                let target = rest
+                    .trim_start_matches('>')
+                    .trim_start_matches('|')
+                    .trim_start();
+                if target.starts_with('&') || target.starts_with("/dev/null") {
+                    continue;
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+pub(crate) fn assistant_text_has_blocked_reason(text: &str) -> bool {
     let normalized = normalize_token(text);
     !normalized.is_empty()
         && contains_any(
@@ -758,12 +1010,14 @@ fn is_decision_log_path(path: &str) -> bool {
         || path.ends_with("autoresearch.ideas.md")
 }
 
-pub(crate) fn adaptive_tool_ui_cap(
+fn adaptive_tool_cap_for_pressure(
     session_usage: &crate::Usage,
-    model: &str,
+    window_tokens: u64,
     default_cap: usize,
+    min_cap: usize,
+    severe_divisor: usize,
 ) -> usize {
-    let window = crate::model_context_window(model) as f64;
+    let window = window_tokens as f64;
     let used = session_usage.context_tokens() as f64;
     if window <= 0.0 || used <= 0.0 {
         return default_cap;
@@ -771,19 +1025,33 @@ pub(crate) fn adaptive_tool_ui_cap(
 
     let pressure = (used / window).clamp(0.0, 2.0);
     if pressure >= 0.9 {
-        MIN_DYNAMIC_UI_CAP.max(default_cap / 4)
+        min_cap.max(default_cap / severe_divisor)
     } else if pressure >= 0.75 {
-        MIN_DYNAMIC_UI_CAP.max(default_cap / 2)
-    } else if pressure >= 0.6 {
-        MIN_DYNAMIC_UI_CAP.max((default_cap * 3) / 4)
+        min_cap.max(default_cap / 2)
+    } else if pressure >= 0.6 && severe_divisor == 4 {
+        min_cap.max((default_cap * 3) / 4)
     } else {
         default_cap
     }
 }
 
-pub(crate) fn adaptive_tool_result_cap(
+pub(crate) fn adaptive_tool_ui_cap(
     session_usage: &crate::Usage,
     model: &str,
+    default_cap: usize,
+) -> usize {
+    adaptive_tool_cap_for_pressure(
+        session_usage,
+        crate::model_context_window(model),
+        default_cap,
+        MIN_DYNAMIC_UI_CAP,
+        4,
+    )
+}
+
+pub(crate) fn adaptive_tool_result_cap_for_window(
+    session_usage: &crate::Usage,
+    window_tokens: u64,
     default_cap: usize,
 ) -> usize {
     let min_cap = if crate::ContextMode::from_env().is_frugal() {
@@ -791,20 +1059,19 @@ pub(crate) fn adaptive_tool_result_cap(
     } else {
         MIN_DYNAMIC_TOOL_RESULT_CAP
     };
-    let window = crate::model_context_window(model) as f64;
-    let used = session_usage.context_tokens() as f64;
-    if window <= 0.0 || used <= 0.0 {
-        return default_cap;
-    }
+    adaptive_tool_cap_for_pressure(session_usage, window_tokens, default_cap, min_cap, 3)
+}
 
-    let pressure = (used / window).clamp(0.0, 2.0);
-    if pressure >= 0.9 {
-        min_cap.max(default_cap / 3)
-    } else if pressure >= 0.75 {
-        min_cap.max(default_cap / 2)
-    } else {
-        default_cap
-    }
+pub(crate) fn adaptive_tool_result_cap(
+    session_usage: &crate::Usage,
+    model: &str,
+    default_cap: usize,
+) -> usize {
+    adaptive_tool_result_cap_for_window(
+        session_usage,
+        crate::model_context_window(model),
+        default_cap,
+    )
 }
 
 pub(crate) fn compress_tool_ui_content(content: &str, cap_chars: usize) -> String {
@@ -1289,6 +1556,21 @@ mod tests {
             apply_after_review.checkpoints
         );
 
+        let commitment =
+            ObjectiveTracker::from_user_prompt("summarize the team's commitment risks");
+        assert!(!commitment.apply_fixes_allowed());
+        assert_eq!(
+            commitment.checkpoints,
+            vec!["deliver requested outcome with verifiable steps".to_string()]
+        );
+
+        let cleanup_mention = ObjectiveTracker::from_user_prompt("what cleanup is still pending?");
+        assert!(!cleanup_mention.apply_fixes_allowed());
+
+        let commit_mention =
+            ObjectiveTracker::from_user_prompt("review the last commit for regressions");
+        assert!(!commit_mention.apply_fixes_allowed());
+
         let terse =
             ObjectiveTracker::from_user_prompt("go for it, handle my todo and cleanup master");
         assert!(
@@ -1299,6 +1581,28 @@ mod tests {
             "{:?}",
             terse.checkpoints
         );
+    }
+
+    #[test]
+    fn bash_mutation_detector_recognizes_common_file_mutators() {
+        for command in [
+            "cargo fmt --check",
+            "cargo fmt",
+            "cargo fmt --check && touch out",
+            "git apply fix.patch",
+            "python - <<'PY'\nfrom pathlib import Path\nPath('x').write_text('y')\nPY",
+            "echo ok > out.txt",
+            "printf err >&2",
+            "ruff format src",
+            "npm install",
+        ] {
+            let expected = command != "cargo fmt --check" && command != "printf err >&2";
+            assert_eq!(
+                bash_command_likely_mutates_files(command),
+                expected,
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -1387,6 +1691,24 @@ mod tests {
             coverage
         );
 
+        let bash_mutation_history = vec![crate::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::Block::ToolUse {
+                id: "tool-bash-rm".to_string(),
+                name: "bash".to_string(),
+                input: json!({"command": "rm -f reports/*.json"}),
+            }],
+        }];
+        let coverage = tracker.assess_history(&bash_mutation_history);
+        assert!(
+            coverage
+                .satisfied
+                .iter()
+                .any(|item| item == "implement requested changes"),
+            "{:?}",
+            coverage
+        );
+
         let blocked_history = vec![crate::Message {
             role: "assistant".to_string(),
             content: vec![crate::Block::Text {
@@ -1397,6 +1719,43 @@ mod tests {
         assert!(
             coverage
                 .satisfied
+                .iter()
+                .any(|item| item == "implement requested changes"),
+            "{:?}",
+            coverage
+        );
+    }
+
+    #[test]
+    fn objective_evidence_starts_at_latest_real_user_prompt() {
+        let tracker = ObjectiveTracker::from_user_prompt("cleanup reports");
+        let history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "old-edit".to_string(),
+                    name: "edit_file".to_string(),
+                    input: json!({"path": "old.txt", "old_string": "a", "new_string": "b"}),
+                }],
+            },
+            crate::Message {
+                role: "user".to_string(),
+                content: vec![crate::Block::Text {
+                    text: "cleanup all json files".to_string(),
+                }],
+            },
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::Text {
+                    text: "Done.".to_string(),
+                }],
+            },
+        ];
+
+        let coverage = tracker.assess_history(&history);
+        assert!(
+            coverage
+                .unresolved
                 .iter()
                 .any(|item| item == "implement requested changes"),
             "{:?}",

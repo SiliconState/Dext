@@ -21,10 +21,10 @@ use provider::{
     extract_oauth_code_from_callback, handle_auth_cli, list_models_for_available_providers,
     list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
     logout_provider, looks_like_login_secret_input, provider_auth_status, provider_catalog_path,
-    provider_id_from_selector, provider_request_url, render_provider_list, render_provider_picker,
-    resolve_active_provider_id, resolve_provider_model_selection, resolve_runtime_provider,
-    set_active_provider_in_catalog, set_provider_default_model_in_catalog,
-    try_complete_oauth_from_callback,
+    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
+    render_provider_list, render_provider_picker, resolve_active_provider_id,
+    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
+    set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 use session::{
     ProjectStateLock, atomic_write_bytes, canonicalize_tool_path, dext_state_dir, latest_log_path,
@@ -951,11 +951,12 @@ enum CompactSlash {
     SetPercent(u8),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum InteractiveInputRoute {
     Submitted,
     RuntimeControlQueued,
     SteeringQueued,
+    UnsupportedBusySlash(String),
     Dropped,
 }
 
@@ -987,6 +988,8 @@ fn route_interactive_input_line(
             }
         } else if text_is_potential_local_secret(&trimmed) {
             InteractiveInputRoute::Dropped
+        } else if is_slash_command(&trimmed) {
+            InteractiveInputRoute::UnsupportedBusySlash(trimmed)
         } else if steering_tx.send(trimmed).is_ok() {
             InteractiveInputRoute::SteeringQueued
         } else {
@@ -1114,6 +1117,8 @@ enum AgentEvent {
         api_family: String,
         auth_source: String,
         model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
         last_retry_reason: Option<String>,
         workaround_fired: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -4085,6 +4090,11 @@ fn prepare_external_tool(
             };
             Ok((bin, final_args, stdin))
         }
+        "browser" => {
+            let args = str_array(&input["args"]);
+            let stdin = input["stdin"].as_str().map(String::from);
+            Ok(("agent-browser".to_string(), args, stdin))
+        }
         "git_diff" => {
             let mut args = vec!["diff".to_string()];
             if input["stat"].as_bool().unwrap_or(false) {
@@ -6046,11 +6056,12 @@ fn effective_read_file_explicit_capture_cap() -> usize {
     }
 }
 
-fn tool_result_context_cap(
+fn tool_result_context_cap_with_window(
     name: &str,
     input: &Value,
     usage: &Usage,
     model: &str,
+    context_window: Option<u64>,
     context_mode: ContextMode,
 ) -> usize {
     if context_mode.is_frugal() {
@@ -6070,7 +6081,22 @@ fn tool_result_context_cap(
         "read_symbol" => READ_FILE_EXPLICIT_CAPTURE_CAP,
         _ => TOOL_RESULT_CAP,
     };
-    orchestrator::adaptive_tool_result_cap(usage, model, base_cap)
+    if let Some(window) = context_window.filter(|tokens| *tokens > 0) {
+        orchestrator::adaptive_tool_result_cap_for_window(usage, window, base_cap)
+    } else {
+        orchestrator::adaptive_tool_result_cap(usage, model, base_cap)
+    }
+}
+
+#[cfg(test)]
+fn tool_result_context_cap(
+    name: &str,
+    input: &Value,
+    usage: &Usage,
+    model: &str,
+    context_mode: ContextMode,
+) -> usize {
+    tool_result_context_cap_with_window(name, input, usage, model, None, context_mode)
 }
 
 #[cfg(test)]
@@ -6763,7 +6789,7 @@ async fn execute_external_async(
 }
 
 fn should_retry_external_tool_with_fallback(name: &str, bin: &str, err: &str) -> bool {
-    if bin == "grep" || bin == "find" {
+    if name == "browser" || bin == "grep" || bin == "find" {
         return false;
     }
     if err.contains("failed to spawn") {
@@ -7082,7 +7108,7 @@ Discovery: prefer fd for files, rg for content. Use rg first for symbols, then r
 Editing: always read before editing. Use edit_file for small changes, multi_edit for batches, write_file for new files. Checkpoint before large edits.
 Git: inspect status/diff before editing tracked files. Use git_commit (not raw git) for commits. Use bash git log only when history is needed.
 Shell: preserve pipefail in bash. Treat bash calls as atomic: Dext cleans the tool process group after each call, so do not use shell backgrounding, nohup, or disown for persistence; setsid-style detaches are unsupported because they escape Dext cleanup. For user-requested persistent local services, use an OS supervisor when available (Linux: systemd-run --user with dext- unit, check status/logs, stop it when done). Dext rg/fd/http are direct tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Validate external sources before scaling. On auth failures, ask for credentials.
-Browser: if browser_recipe=agent-browser, invoke agent-browser only when useful; start with agent-browser skills get core.
+Browser: if browser_recipe=agent-browser, use the browser tool only when useful; start with browser args ['skills','get','core','--full'].
 Subagents: do not call subagent directly; suggest /subagent if delegation is requested. Review subagent output before acting.
 Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
 Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
@@ -7216,7 +7242,7 @@ Keep each section concise. Capture the user's overall goal, key decisions and wh
 const COMPACT_SUMMARY_MAX_TOKENS: u32 = 2_048;
 
 const HISTORY_CHAR_BUDGET_MIN: usize = 24_000;
-const HISTORY_CHAR_BUDGET_END_TURN_PERCENT: u8 = 90;
+pub(crate) const HISTORY_CHAR_BUDGET_END_TURN_PERCENT: u8 = 90;
 const HISTORY_CHAR_BUDGET_ACTIVE_PERCENT: u8 = 80;
 const FRUGAL_HISTORY_CHAR_BUDGET_PERCENT: u8 = 80;
 const FRUGAL_HISTORY_CHAR_BUDGET_MIN: usize = 8_000;
@@ -7461,7 +7487,6 @@ fn tool_name_allowed_in_profile(name: &str, profile: ToolContextProfile) -> bool
 
 struct ToolsCommandResult {
     output: String,
-    changed: bool,
 }
 
 fn render_tools_status(agent: &Agent) -> String {
@@ -7539,7 +7564,6 @@ fn handle_tools_command(agent: &mut Agent, arg: &str) -> ToolsCommandResult {
     match normalized.as_str() {
         "" | "status" | "list" | "ls" => ToolsCommandResult {
             output: render_tools_status(agent),
-            changed: false,
         },
         "default" | "standard" | "core" | "full" | "all" => {
             if agent.context_mode.is_frugal() {
@@ -7549,12 +7573,10 @@ fn handle_tools_command(agent: &mut Agent, arg: &str) -> ToolsCommandResult {
                         agent.context_mode.as_str(),
                         agent.tool_context_profile().as_str()
                     ),
-                    changed: false,
                 };
             }
             let profile =
                 ToolContextProfile::parse_selectable(raw).unwrap_or(ToolContextProfile::Default);
-            let before = agent.tool_context_profile();
             agent.tool_context_profile = profile.effective(agent.context_mode);
             agent.refresh_tools_for_context();
             let browser_note = if agent.browser_recipe() == BrowserRecipe::Disabled {
@@ -7570,12 +7592,10 @@ fn handle_tools_command(agent: &mut Agent, arg: &str) -> ToolsCommandResult {
                     agent.wire_tool_profile().as_str(),
                     browser_note
                 ),
-                changed: before != agent.tool_context_profile(),
             }
         }
         _ => ToolsCommandResult {
             output: "usage: /tools [status|default|full]".to_string(),
-            changed: false,
         },
     }
 }
@@ -7751,7 +7771,7 @@ impl Default for SessionHeader {
             browser_recipe: BrowserRecipe::default(),
             context_mode: ContextMode::default(),
             tool_context_profile: ToolContextProfile::default(),
-            tool_profile: ToolProfile::Full,
+            tool_profile: ToolProfile::default(),
             provenance: SessionProvenance::default(),
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
@@ -7893,10 +7913,7 @@ fn parse_runtime_control_command(text: &str) -> Option<(&str, &str)> {
 }
 
 fn runtime_control_command_accepts(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "model" | "effort" | "think" | "thinking" | "tools" | "compact"
-    )
+    matches!(cmd, "model" | "effort" | "think" | "thinking")
 }
 
 pub(crate) fn parse_active_runtime_control_sequence(text: &str) -> Option<Vec<String>> {
@@ -7910,10 +7927,7 @@ pub(crate) fn parse_active_runtime_control_sequence(text: &str) -> Option<Vec<St
         .map(str::trim)
         .filter(|part| !part.is_empty())
     {
-        let (cmd, _) = parse_runtime_control_command(part)?;
-        if !matches!(cmd, "model" | "effort" | "think" | "thinking") {
-            return None;
-        }
+        parse_runtime_control_command(part)?;
         commands.push(part.to_string());
     }
     (!commands.is_empty()).then_some(commands)
@@ -7921,6 +7935,22 @@ pub(crate) fn parse_active_runtime_control_sequence(text: &str) -> Option<Vec<St
 
 fn is_active_runtime_control_command(text: &str) -> bool {
     parse_active_runtime_control_sequence(text).is_some()
+}
+
+fn is_slash_command(text: &str) -> bool {
+    text.trim_start().starts_with('/')
+}
+
+fn unsupported_busy_slash_message(text: &str) -> String {
+    let cmd = text
+        .trim_start()
+        .strip_prefix('/')
+        .and_then(|rest| rest.split_whitespace().next())
+        .filter(|cmd| !cmd.is_empty())
+        .unwrap_or("command");
+    format!(
+        "queued slash command /{cmd} not run while agent is busy; only /model and /effort (/think) are active runtime controls"
+    )
 }
 
 fn apply_runtime_model_command(agent: &mut Agent, arg: &str) -> Result<String> {
@@ -7943,22 +7973,26 @@ fn apply_runtime_model_command(agent: &mut Agent, arg: &str) -> Result<String> {
         agent.reload_provider(Some(&target_provider), false)?;
     }
     agent.model = target_model.clone();
+    let detected_window = agent.refresh_context_window();
     agent.pin_model_for_provider(&target_provider, &target_model);
+    let context_note = detected_window
+        .map(|tokens| format!("; detected llama.cpp context {tokens} tokens"))
+        .unwrap_or_default();
     match set_provider_default_model_in_catalog(&target_provider, &target_model) {
         Ok(()) if provider_changed => Ok(format!(
-            "model -> {} (provider -> {}; saved as default; applies immediately to the next model request)",
+            "model -> {} (provider -> {}; saved as default; applies immediately to the next model request{context_note})",
             agent.model, agent.provider_id
         )),
         Ok(()) => Ok(format!(
-            "model -> {} (saved as default for provider {}; applies immediately to the next model request)",
+            "model -> {} (saved as default for provider {}; applies immediately to the next model request{context_note})",
             agent.model, agent.provider_id
         )),
         Err(e) if provider_changed => Ok(format!(
-            "model -> {} (provider -> {}; applies immediately; session-only model change; failed to persist default: {e:#})",
+            "model -> {} (provider -> {}; applies immediately; session-only model change; failed to persist default: {e:#}{context_note})",
             agent.model, agent.provider_id
         )),
         Err(e) => Ok(format!(
-            "model -> {} (applies immediately; session-only; failed to persist default: {e:#})",
+            "model -> {} (applies immediately; session-only; failed to persist default: {e:#}{context_note})",
             agent.model
         )),
     }
@@ -7985,76 +8019,50 @@ fn apply_runtime_control_command(
         return true;
     }
 
-    if cmd == "tools" {
-        let result = handle_tools_command(agent, arg);
-        emit(format!(
-            "{}{}",
-            result.output,
-            if result.changed {
-                " (applies immediately to the next model request)"
-            } else if arg.trim().is_empty() || arg.trim().eq_ignore_ascii_case("status") {
-                ""
-            } else {
-                " (no tool visibility change)"
-            }
-        ));
-        return true;
-    }
-
     let effort_arg = matches!(cmd, "effort" | "think" | "thinking").then_some(arg);
     if let Some(arg) = effort_arg {
-        let parsed = match arg.to_ascii_lowercase().as_str() {
-            "" | "status" => Some(agent.thinking_effort()),
-            "next" | "+" => Some(agent.cycle_thinking_effort(1)),
-            "prev" | "previous" | "-" => Some(agent.cycle_thinking_effort(-1)),
-            _ => ThinkingEffort::parse(arg).map(|level| {
-                agent.set_thinking_effort(level);
-                agent.thinking_effort()
-            }),
-        };
-        match parsed {
-            Some(effort) => emit(format!(
-                "thinking effort -> {} (applies immediately to the next model request in this run)",
-                effort.as_str()
-            )),
-            None => emit("usage: /effort [off|low|medium|high|xhigh|next|prev|status]".to_string()),
-        }
-        return true;
-    }
-
-    if let Some(parsed) = parse_compact_slash(trimmed) {
-        match parsed {
-            Ok(CompactSlash::RunNow) => emit(
-                "/compact runs only when the agent is idle; use /compact status or /compact N% during a run"
-                    .to_string(),
-            ),
-            Ok(CompactSlash::Status) => {
-                let current = agent.compact_threshold_chars();
-                let active = agent.active_compact_threshold_chars();
-                let base = history_char_budget_with_override(&agent.model, None, agent.context_mode);
-                match agent.compact_threshold_override_percent() {
-                    Some(percent) => emit(format!(
-                        "compact threshold: {current} chars ({percent}% of model context window; active-run trigger {active}; auto baseline {base})"
-                    )),
-                    None => emit(format!(
-                        "compact threshold: {current} chars (auto: {} mode; active-run trigger {active})",
-                        agent.context_mode.as_str()
-                    )),
-                }
-            }
-            Ok(CompactSlash::Auto) => {
-                agent.set_compact_threshold_auto();
+        match arg.to_ascii_lowercase().as_str() {
+            "" | "status" => {
+                let effort = agent.thinking_effort();
                 emit(format!(
-                    "compact threshold reset to auto {} ({})",
-                    agent.context_mode.as_str(),
-                    agent.compact_threshold_chars()
+                    "thinking effort: {} (model reasoning depth/tool persistence)",
+                    effort.as_str()
                 ));
             }
-            Ok(CompactSlash::SetPercent(percent)) => {
-                let chars = agent.set_compact_threshold_percent(percent);
-                emit(format!("compact threshold set to {percent}% -> {chars} chars"));
+            "next" | "+" => {
+                let effort = agent.cycle_thinking_effort(1);
+                emit(format!(
+                    "thinking effort -> {} (applies immediately to the next model request in this run)",
+                    effort.as_str()
+                ));
             }
-            Err(msg) => emit(msg.to_string()),
+            "prev" | "previous" | "-" => {
+                let effort = agent.cycle_thinking_effort(-1);
+                emit(format!(
+                    "thinking effort -> {} (applies immediately to the next model request in this run)",
+                    effort.as_str()
+                ));
+            }
+            _ => match ThinkingEffort::parse(arg) {
+                Some(level) => {
+                    let changed = agent.set_thinking_effort(level);
+                    let effort = agent.thinking_effort();
+                    if changed {
+                        emit(format!(
+                            "thinking effort -> {} (applies immediately to the next model request in this run)",
+                            effort.as_str()
+                        ));
+                    } else {
+                        emit(format!(
+                            "thinking effort: {} (already active)",
+                            effort.as_str()
+                        ));
+                    }
+                }
+                None => {
+                    emit("usage: /effort [off|low|medium|high|xhigh|next|prev|status]".to_string())
+                }
+            },
         }
         return true;
     }
@@ -8471,18 +8479,23 @@ pub(crate) fn model_context_window(model: &str) -> u64 {
         return v;
     }
 
+    if let Some(tokens) = provider::cached_local_llama_context_window(model) {
+        return tokens;
+    }
+
     if let Some(hint) = parse_model_context_hint_tokens(model) {
         return hint;
     }
 
     // Resolution order (first match wins):
     //   1. DEXT_CONTEXT_WINDOW / DEXT_CONTEXT_WINDOW_TOKENS env var (handled above).
-    //   2. Model-name suffix hint ("-128k", "-1m", etc).
-    //   3. Provider-catalog override: providers.json → profile.context_window
+    //   2. llama.cpp runtime context cached from startup/provider switch.
+    //   3. Model-name suffix hint ("-128k", "-1m", etc).
+    //   4. Provider-catalog override: providers.json → profile.context_window
     //      OR profile.model_context_windows[model].
-    //   4. Built-in family heuristics keyed by substring match.
-    //   5. Hard fallback (200_000).
-    // All of 3-5 are overridable by the user without a rebuild.
+    //   5. Built-in family heuristics keyed by substring match.
+    //   6. Hard fallback (200_000).
+    // All of 4-6 are overridable by the user without a rebuild.
     if let Some(tokens) = provider_catalog_context_window(model) {
         return tokens;
     }
@@ -8589,8 +8602,8 @@ fn builtin_family_context_window(model: &str) -> Option<u64> {
     None
 }
 
-fn compact_threshold_chars_for_percent(model: &str, percent: u8) -> usize {
-    let window_tokens = usize::try_from(model_context_window(model)).unwrap_or(usize::MAX / 4);
+fn compact_threshold_chars_for_window(window_tokens: u64, percent: u8) -> usize {
+    let window_tokens = usize::try_from(window_tokens).unwrap_or(usize::MAX / 4);
     window_tokens
         .saturating_mul(4)
         .saturating_mul(percent.clamp(1, 100) as usize)
@@ -8598,8 +8611,13 @@ fn compact_threshold_chars_for_percent(model: &str, percent: u8) -> usize {
         .max(HISTORY_CHAR_BUDGET_MIN)
 }
 
-fn history_char_budget_with_percent(
-    model: &str,
+#[cfg(test)]
+fn compact_threshold_chars_for_percent(model: &str, percent: u8) -> usize {
+    compact_threshold_chars_for_window(model_context_window(model), percent)
+}
+
+pub(crate) fn history_char_budget_with_window(
+    window_tokens: u64,
     override_chars: Option<usize>,
     context_mode: ContextMode,
     percent: u8,
@@ -8614,7 +8632,7 @@ fn history_char_budget_with_percent(
         return v;
     }
     if context_mode.is_tiny() {
-        let window_chars = usize::try_from(model_context_window(model))
+        let window_chars = usize::try_from(window_tokens)
             .unwrap_or(usize::MAX / 4)
             .saturating_mul(4);
         return window_chars
@@ -8629,9 +8647,25 @@ fn history_char_budget_with_percent(
         return FRUGAL_HISTORY_CHAR_BUDGET;
     }
 
-    compact_threshold_chars_for_percent(model, percent)
+    compact_threshold_chars_for_window(window_tokens, percent)
 }
 
+#[cfg(test)]
+fn history_char_budget_with_percent(
+    model: &str,
+    override_chars: Option<usize>,
+    context_mode: ContextMode,
+    percent: u8,
+) -> usize {
+    history_char_budget_with_window(
+        model_context_window(model),
+        override_chars,
+        context_mode,
+        percent,
+    )
+}
+
+#[cfg(test)]
 fn history_char_budget_with_override(
     model: &str,
     override_chars: Option<usize>,
@@ -8645,6 +8679,20 @@ fn history_char_budget_with_override(
     )
 }
 
+fn active_history_char_budget_with_window(
+    window_tokens: u64,
+    override_chars: Option<usize>,
+    context_mode: ContextMode,
+) -> usize {
+    history_char_budget_with_window(
+        window_tokens,
+        override_chars,
+        context_mode,
+        HISTORY_CHAR_BUDGET_ACTIVE_PERCENT,
+    )
+}
+
+#[cfg(test)]
 fn active_history_char_budget_with_override(
     model: &str,
     override_chars: Option<usize>,
@@ -8752,6 +8800,7 @@ struct Agent {
     partial_stream_text: Option<String>,
     compact_threshold_chars: Option<usize>,
     compact_threshold_percent: Option<u8>,
+    context_window_tokens: u64,
     approval_profile: ApprovalProfile,
     sandbox_profile: SandboxProfile,
     browser_recipe: BrowserRecipe,
@@ -8797,6 +8846,8 @@ impl Agent {
         let api_provider = resolved.profile.api_provider;
         let base_url = resolved.base_url;
         let model = resolved.model;
+        let _ = refresh_local_llama_context_window(&provider_id, api_provider, &base_url, &model);
+        let context_window_tokens = model_context_window(&model);
 
         // If resolve_runtime_provider auto-rerouted away from a stale active
         // provider (e.g. chatgpt whose stored default_model actually belongs to
@@ -8865,8 +8916,6 @@ impl Agent {
             .filter(|t| tool_name_allowed_in_profile(t.name, tool_context_profile))
             .collect();
         let compact_threshold_percent = load_compact_threshold_percent_setting();
-        let compact_threshold_chars = compact_threshold_percent
-            .map(|percent| compact_threshold_chars_for_percent(&model, percent));
         Ok(Self {
             client: Arc::new(OnceLock::new()),
             provider_id,
@@ -8901,8 +8950,10 @@ impl Agent {
             last_checkpoint_at: None,
             session_model_pins: HashMap::new(),
             partial_stream_text: None,
-            compact_threshold_chars,
+            compact_threshold_chars: compact_threshold_percent
+                .map(|percent| compact_threshold_chars_for_window(context_window_tokens, percent)),
             compact_threshold_percent,
+            context_window_tokens,
             approval_profile: ApprovalProfile::default(),
             sandbox_profile: SandboxProfile::default(),
             browser_recipe,
@@ -9002,6 +9053,32 @@ impl Agent {
         {
             self.model = pinned.clone();
         }
+        self.refresh_context_window();
+    }
+
+    pub(crate) fn context_window_tokens(&self) -> u64 {
+        if self.context_window_tokens > 0 {
+            self.context_window_tokens
+        } else {
+            model_context_window(&self.model)
+        }
+    }
+
+    fn refresh_context_window(&mut self) -> Option<u64> {
+        let updated = refresh_local_llama_context_window(
+            &self.provider_id,
+            self.api_provider,
+            &self.base_url,
+            &self.model,
+        );
+        self.context_window_tokens = model_context_window(&self.model);
+        if let Some(percent) = self.compact_threshold_percent {
+            self.compact_threshold_chars = Some(compact_threshold_chars_for_window(
+                self.context_window_tokens,
+                percent,
+            ));
+        }
+        updated
     }
 
     fn pin_model_for_provider(&mut self, provider_id: &str, model: &str) {
@@ -9027,6 +9104,7 @@ impl Agent {
             api_family: api_family_label(self.api_provider).to_string(),
             auth_source: self.key_source.clone(),
             model: self.model.clone(),
+            context_window: Some(self.context_window_tokens()),
             last_retry_reason: None,
             workaround_fired: false,
             turn_duration_ms: None,
@@ -9320,16 +9398,17 @@ impl Agent {
     }
 
     fn compact_threshold_chars(&self) -> usize {
-        history_char_budget_with_override(
-            &self.model,
+        history_char_budget_with_window(
+            self.context_window_tokens(),
             self.compact_threshold_chars,
             self.context_mode,
+            HISTORY_CHAR_BUDGET_END_TURN_PERCENT,
         )
     }
 
     fn active_compact_threshold_chars(&self) -> usize {
-        active_history_char_budget_with_override(
-            &self.model,
+        active_history_char_budget_with_window(
+            self.context_window_tokens(),
             self.compact_threshold_chars,
             self.context_mode,
         )
@@ -9351,8 +9430,10 @@ impl Agent {
 
     fn set_compact_threshold_percent(&mut self, percent: u8) -> usize {
         let percent = percent.clamp(1, 100);
-        self.compact_threshold_chars =
-            Some(compact_threshold_chars_for_percent(&self.model, percent));
+        self.compact_threshold_chars = Some(compact_threshold_chars_for_window(
+            self.context_window_tokens(),
+            percent,
+        ));
         self.compact_threshold_percent = Some(percent);
         let _ = save_compact_threshold_percent_setting(Some(percent));
         self.compact_threshold_chars()
@@ -9475,7 +9556,7 @@ impl Agent {
             return None;
         }
         if binary_on_path("agent-browser") {
-            Some("browser recipe enabled: use bash with agent-browser (start with `agent-browser skills get core --full`) for browser automation when useful.".to_string())
+            Some("browser recipe enabled: use the browser tool with args like ['skills','get','core','--full'] or ['open','https://example.com'] when useful.".to_string())
         } else {
             Some("browser recipe requested, but agent-browser is not on PATH; install it or disable with /browser off.".to_string())
         }
@@ -9566,7 +9647,7 @@ impl Agent {
     fn sandbox_policy_denial(&self, name: &str, input: &Value) -> Option<String> {
         if name == "browser" {
             if self.browser_recipe != BrowserRecipe::AgentBrowser {
-                return Some("browser tool is disabled. Enable with /browser agent-browser or --browser agent-browser, or use bash with explicit agent-browser commands.".to_string());
+                return Some("browser tool is disabled. Enable with /browser agent-browser or --browser agent-browser before using browser automation.".to_string());
             }
             if !binary_on_path("agent-browser") {
                 return Some("agent-browser is not on PATH; install it or disable browser recipe with /browser off.".to_string());
@@ -9986,6 +10067,9 @@ impl Agent {
         if messages.is_empty() {
             return String::new();
         }
+        self.work_ledger
+            .steering
+            .retain(|item| !steering_item_acknowledged(item, &self.history));
         let combined = messages.join("\n\n");
         let preview = summarize_inline(&combined, 180);
         let entry = format!(
@@ -10001,16 +10085,14 @@ impl Agent {
             let excess = self.work_ledger.steering.len() - 8;
             self.work_ledger.steering.drain(0..excess);
         }
+        self.work_ledger
+            .done
+            .retain(|item| item != "respond to queued user update");
         if !self
             .work_ledger
             .pending
             .iter()
             .any(|item| item == "respond to queued user update")
-            && !self
-                .work_ledger
-                .done
-                .iter()
-                .any(|item| item == "respond to queued user update")
         {
             self.work_ledger
                 .pending
@@ -10039,6 +10121,11 @@ impl Agent {
                 self.sink.emit(AgentEvent::Warn(
                     "queued input withheld: use the local auth prompt or run /login again when the agent is idle".to_string(),
                 ));
+                continue;
+            }
+            if is_slash_command(&message) {
+                self.sink
+                    .emit(AgentEvent::Warn(unsupported_busy_slash_message(&message)));
                 continue;
             }
             pending_steering.push(message);
@@ -10680,7 +10767,9 @@ impl Agent {
             compact_threshold_percent.filter(|v| (1..=100).contains(v));
         self.compact_threshold_chars = self
             .compact_threshold_percent
-            .map(|percent| compact_threshold_chars_for_percent(&self.model, percent))
+            .map(|percent| {
+                compact_threshold_chars_for_window(self.context_window_tokens(), percent)
+            })
             .or_else(|| compact_threshold_chars.filter(|v| *v > 0));
         self.approval_profile = approval_profile;
         self.sandbox_profile = sandbox_profile;
@@ -12067,6 +12156,16 @@ impl Agent {
             if tool_calls.is_empty() {
                 let coverage = objective.assess_history(&self.history);
                 self.sync_work_ledger_with_objective_coverage(&coverage);
+                if objective.apply_fixes_allowed()
+                    && objective_warning_emitted
+                    && coverage
+                        .unresolved
+                        .iter()
+                        .any(|item| item == "implement requested changes")
+                    && !orchestrator::assistant_text_has_blocked_reason(&assistant_response_text)
+                {
+                    action_contract_must_mutate = true;
+                }
                 if response_has_pseudo_tool {
                     let note = pseudo_tool_runtime_note();
                     self.sink.emit(AgentEvent::Warn(note.clone()));
@@ -12643,7 +12742,13 @@ impl Agent {
                 }
 
                 let ok = !is_error.unwrap_or(false);
-                if ok && ran_builtin && ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
+                if ok
+                    && ran_builtin
+                    && (ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
+                        || name == "bash"
+                            && input["command"]
+                                .as_str()
+                                .is_some_and(orchestrator::bash_command_likely_mutates_files))
                 {
                     mutation_succeeded = true;
                     turn_state.mark_mutation_succeeded();
@@ -12759,11 +12864,12 @@ impl Agent {
                         );
                     }
                 }
-                let dynamic_result_cap = tool_result_context_cap(
+                let dynamic_result_cap = tool_result_context_cap_with_window(
                     &name,
                     &input,
                     &self.session_usage,
                     &self.model,
+                    Some(self.context_window_tokens()),
                     self.context_mode,
                 );
                 let result_status = verification_status
@@ -12949,6 +13055,7 @@ impl Agent {
             api_family: api_family_label(self.api_provider).to_string(),
             auth_source: self.key_source.clone(),
             model: self.model.clone(),
+            context_window: Some(self.context_window_tokens()),
             last_retry_reason,
             workaround_fired: workaround_fired_this_turn,
             turn_duration_ms: Some(millis_u64(turn_started_at.elapsed())),
@@ -13768,6 +13875,7 @@ impl Agent {
             partial_stream_text: None,
             compact_threshold_chars: self.compact_threshold_chars,
             compact_threshold_percent: self.compact_threshold_percent,
+            context_window_tokens: self.context_window_tokens(),
             approval_profile: request.approval_profile,
             sandbox_profile: request.sandbox_profile,
             browser_recipe: request.browser_recipe,
@@ -16458,8 +16566,12 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             "status" => {
                 let current = agent.compact_threshold_chars();
                 let active = agent.active_compact_threshold_chars();
-                let base =
-                    history_char_budget_with_override(&agent.model, None, agent.context_mode);
+                let base = history_char_budget_with_window(
+                    agent.context_window_tokens(),
+                    None,
+                    agent.context_mode,
+                    HISTORY_CHAR_BUDGET_END_TURN_PERCENT,
+                );
                 match agent.compact_threshold_override_percent() {
                     Some(percent) => {
                         let _ = writeln!(
@@ -17195,6 +17307,7 @@ fn steering_item_keywords(item: &str) -> Vec<String> {
         if matches!(
             word,
             "queued"
+                | "give"
                 | "during"
                 | "active"
                 | "turn"
@@ -17223,12 +17336,32 @@ fn steering_item_keywords(item: &str) -> Vec<String> {
     keywords
 }
 
+fn message_has_queued_update_marker(message: &Message) -> bool {
+    message.role == "user"
+        && message.content.iter().any(|block| {
+            block_text(block).is_some_and(|text| {
+                let text = text.trim_start();
+                text.starts_with("[queued-user-update]") || text.starts_with("[queued-update]")
+            })
+        })
+}
+
+fn assistant_text_after_latest_queued_update(history: &[Message]) -> Option<String> {
+    let start = history.iter().rposition(message_has_queued_update_marker)?;
+    Some(assistant_text(&history[start + 1..]))
+}
+
 fn steering_item_acknowledged(item: &str, history: &[Message]) -> bool {
-    let assistant = assistant_text(history).to_ascii_lowercase();
+    let assistant = assistant_text_after_latest_queued_update(history)
+        .unwrap_or_else(|| assistant_text(history))
+        .to_ascii_lowercase();
     if assistant.trim().is_empty() {
         return false;
     }
     let keywords = steering_item_keywords(item);
+    if item.to_ascii_lowercase().contains("web recipe") && assistant.contains("web recipe") {
+        return true;
+    }
     if keywords.is_empty() {
         return assistant.contains("steer") || assistant.contains("queued guidance");
     }
@@ -17324,7 +17457,7 @@ fn blocks_contain_pseudo_tool_syntax(blocks: &[Block]) -> bool {
 
 fn action_contract_runtime_note(no_mutation_turns: u32) -> String {
     format!(
-        "runtime guidance: action contract active because the assistant committed to implement/apply changes. This is invalid progress after {no_mutation_turns} assistant response(s) without a successful file mutation. Keep looping; next assistant message must use a real mutating tool_use ({}). Text-only blocked statements do not clear this contract.",
+        "runtime guidance: action contract active because the assistant committed to implement/apply changes. This is invalid progress after {no_mutation_turns} assistant response(s) without a successful file mutation. Keep looping; next assistant message must use a real file-mutating tool_use ({} or a bash command that mutates files). Text-only blocked statements do not clear this contract.",
         ACTION_CONTRACT_MUTATING_TOOL_NAMES.join("|")
     )
 }
@@ -17721,6 +17854,7 @@ pub(crate) struct CliOptions {
     pub(crate) no_session: bool,
     pub(crate) no_tui: bool,
     pub(crate) trust_mode: bool,
+    pub(crate) no_trust_mode: bool,
     pub(crate) output: OutputMode,
     pub(crate) cd: Option<PathBuf>,
     pub(crate) fork: bool,
@@ -17743,6 +17877,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut no_session = false;
     let mut no_tui = false;
     let mut trust_mode = false;
+    let mut no_trust_mode = false;
     let mut output = OutputMode::Text;
     let mut cd: Option<PathBuf> = None;
     let mut fork = false;
@@ -17764,7 +17899,14 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--resume" => resume_latest = true,
             "--no-session" => no_session = true,
             "--no-tui" => no_tui = true,
-            "--trust" => trust_mode = true,
+            "--trust" => {
+                trust_mode = true;
+                no_trust_mode = false;
+            }
+            "--no-trust" => {
+                no_trust_mode = true;
+                trust_mode = false;
+            }
             "--fork" => fork = true,
             "--frugal" => {
                 context_mode = Some(ContextMode::Frugal);
@@ -18049,6 +18191,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         no_session,
         no_tui,
         trust_mode,
+        no_trust_mode,
         output,
         cd,
         fork,
@@ -18065,11 +18208,14 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     })
 }
 
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|v| {
-        let t = v.trim().to_ascii_lowercase();
-        !(t.is_empty() || t == "0" || t == "false" || t == "off" || t == "no")
-    })
+fn env_flag_default(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !(t.is_empty() || t == "0" || t == "false" || t == "off" || t == "no")
+        }
+        Err(_) => default,
+    }
 }
 
 fn autosave_latest(agent: &mut Agent) {
@@ -18269,6 +18415,7 @@ async fn main() -> Result<()> {
         );
         println!("       dext --eval [NAME]    run eval harness (optionally a single case)");
         println!("       dext --trust          auto-approve gated tools");
+        println!("       dext --no-trust       opt out of default trust mode");
         println!("       dext auth ...         provider/model/auth management commands");
         println!("       dext undo --list      list recent Dext checkpoints");
         println!("       dext undo --preview <id>  non-interactive preview");
@@ -18278,7 +18425,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=1, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }
@@ -18289,7 +18436,8 @@ async fn main() -> Result<()> {
         std::process::exit(if ok { 0 } else { 1 });
     }
     let opts = parse_cli_options(argv.clone())?;
-    let trust_mode = opts.trust_mode || env_flag("DEXT_TRUST");
+    let trust_mode =
+        opts.trust_mode || (!opts.no_trust_mode && env_flag_default("DEXT_TRUST", true));
 
     let one_shot_task: Option<String> = if !opts.positional.is_empty() {
         Some(opts.positional.join(" "))
@@ -18552,6 +18700,9 @@ async fn main() -> Result<()> {
                             InteractiveInputRoute::SteeringQueued => {
                                 eprintln!("[queued for next response]");
                             }
+                            InteractiveInputRoute::UnsupportedBusySlash(text) => {
+                                eprintln!("{}", unsupported_busy_slash_message(&text));
+                            }
                             InteractiveInputRoute::Dropped if busy.load(Ordering::SeqCst) => {
                                 eprintln!(
                                     "[input withheld: use the local auth prompt for sudo/auth secrets]"
@@ -18603,6 +18754,11 @@ async fn main() -> Result<()> {
                 autosave_latest(&mut agent);
                 continue;
             }
+            if is_slash_command(&input) {
+                eprintln!("{}", unsupported_busy_slash_message(&input));
+                autosave_latest(&mut agent);
+                continue;
+            }
             let _ = agent.steering_sender().send(input.clone());
             println!("[queued for next response]");
             autosave_latest(&mut agent);
@@ -18619,8 +18775,12 @@ async fn main() -> Result<()> {
                 Ok(CompactSlash::Status) => {
                     let current = agent.compact_threshold_chars();
                     let active = agent.active_compact_threshold_chars();
-                    let base =
-                        history_char_budget_with_override(&agent.model, None, agent.context_mode);
+                    let base = history_char_budget_with_window(
+                        agent.context_window_tokens(),
+                        None,
+                        agent.context_mode,
+                        HISTORY_CHAR_BUDGET_END_TURN_PERCENT,
+                    );
                     match agent.compact_threshold_override_percent() {
                         Some(percent) => {
                             println!(
