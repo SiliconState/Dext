@@ -2298,10 +2298,11 @@ fn status_detail_spans(state: &TuiState) -> Vec<Span<'_>> {
     )];
     spans.push(Span::styled(
         format!(
-            "in {} · cached {} · out {}",
+            "in {} · cached {} · out {} · ${:.4}",
             format_count(usage.actual_input_tokens()),
             format_count(usage.cached_input_tokens()),
             format_count(usage.output),
+            usage.estimated_cost_usd(),
         ),
         Style::default().fg(Color::Gray),
     ));
@@ -9285,12 +9286,14 @@ mod tests {
             output: 5_400,
             cache_create: 0,
             cache_read: 40_000,
+            cost_usd: None,
         };
         let session = Usage {
             input: 828_300,
             output: 5_400,
             cache_create: 0,
             cache_read: 40_000,
+            cost_usd: None,
         };
 
         state.apply_event(AgentEvent::UsageUpdate { turn, session });
@@ -9322,6 +9325,7 @@ mod tests {
             output: 400,
             cache_create: 0,
             cache_read: 60_000,
+            cost_usd: None,
         };
         for _ in 0..10 {
             session.add(per_iter);
@@ -9349,6 +9353,7 @@ mod tests {
             output: 5_300,
             cache_create: 0,
             cache_read: 268_000,
+            cost_usd: None,
         };
         let line = status_detail_spans(&state)
             .into_iter()
@@ -9363,6 +9368,7 @@ mod tests {
             output: 5_300,
             cache_create: 0,
             cache_read: 0,
+            cost_usd: None,
         };
         let line = status_detail_spans(&state)
             .into_iter()
@@ -9389,6 +9395,7 @@ mod tests {
             output: 500,
             cache_create: 12_000,
             cache_read: 40_000,
+            cost_usd: None,
         };
         state.apply_event(AgentEvent::UsageUpdate {
             turn,

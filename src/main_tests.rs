@@ -797,6 +797,90 @@ fn non_tui_busy_input_routes_steering_and_runtime_controls_immediately() {
     assert!(input_rx.try_recv().is_err());
 }
 
+#[tokio::test]
+async fn non_aborting_runtime_control_keeps_pending_provider_response() {
+    let root = temp_test_dir("runtime-control-pending-response");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let server = std::thread::spawn(move || {
+        fn respond(stream: &mut std::net::TcpStream) {
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(stream, response.as_bytes());
+        }
+
+        let (mut stream, _) = listener.accept().expect("accept first request");
+        server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        respond(&mut stream);
+
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    server_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    respond(&mut stream);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.provider_id = "local".to_string();
+    agent.provider_requires_api_key = false;
+    agent.api_key.clear();
+    agent.base_url = format!("http://{addr}");
+    agent.model = "qwen2.5-coder-7b".to_string();
+    let (runtime_control_tx, runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_runtime_controls(runtime_control_rx, runtime_control_tx.clone());
+
+    let control_count = request_count.clone();
+    let control = tokio::spawn(async move {
+        for _ in 0..50 {
+            if control_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                let _ = runtime_control_tx.send("/effort status".to_string());
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+
+    agent
+        .chat("hello".to_string())
+        .await
+        .expect("chat completes");
+    control.await.expect("control task");
+    server.join().expect("server thread");
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "non-aborting runtime controls must not drop and restart the pending HTTP request"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn steering_delivery_line_includes_preview_and_queue_status() {
     let text = crate::tui::steering_delivered_text_for_test(1, "fix rg border overflow", 80);
@@ -1351,6 +1435,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
             output: 7,
             cache_create: 3,
             cache_read: 5,
+            cost_usd: None,
         };
         saved.history = vec![
             Message {
@@ -3840,6 +3925,7 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
         let body_json: Value = serde_json::from_slice(&body)?;
         assert_eq!(body_json["model"], "deepseek-reasoner");
         assert_eq!(body_json["max_tokens"], 8192);
+        assert_eq!(body_json["stream_options"]["include_usage"], true);
         Ok(())
     })();
 
@@ -3889,6 +3975,7 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
     let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
     let body_json: Value = serde_json::from_slice(&body)?;
     assert!(body_json.get("reasoning_effort").is_none(), "{body_json}");
+    assert!(body_json.get("stream_options").is_none(), "{body_json}");
     assert_eq!(body_json["max_tokens"], 8192);
 
     let chatgpt = build_chatgpt_request(
@@ -5452,6 +5539,7 @@ fn usage_total_and_input_tokens_match_status_semantics() {
         output: 5_400,
         cache_create: 2_000,
         cache_read: 40_000,
+        cost_usd: None,
     };
 
     assert_eq!(usage.actual_input_tokens(), 120_000);
@@ -5464,10 +5552,24 @@ fn usage_total_and_input_tokens_match_status_semantics() {
 }
 
 #[test]
-fn anthropic_usage_parse_subtracts_cache_from_actual_input() {
+fn anthropic_usage_parse_keeps_native_uncached_input() {
     let usage = Usage::parse(&json!({
         "input_tokens": 1000,
         "output_tokens": 50,
+        "cache_creation_input_tokens": 100,
+        "cache_read_input_tokens": 300
+    }));
+
+    assert_eq!(usage.actual_input_tokens(), 1000);
+    assert_eq!(usage.cached_input_tokens(), 400);
+    assert_eq!(usage.context_tokens(), 1450);
+}
+
+#[test]
+fn anthropic_compatible_prompt_usage_subtracts_cache_from_total_prompt() {
+    let usage = Usage::parse(&json!({
+        "prompt_tokens": 1000,
+        "completion_tokens": 50,
         "cache_creation_input_tokens": 100,
         "cache_read_input_tokens": 300
     }));
@@ -5488,6 +5590,145 @@ fn openai_usage_parse_splits_cached_prompt_tokens() {
     assert_eq!(usage.actual_input_tokens(), 700);
     assert_eq!(usage.cache_read, 300);
     assert_eq!(usage.context_tokens(), 1050);
+}
+
+#[test]
+fn openai_usage_parse_splits_prompt_cache_hit_and_miss_tokens() {
+    let usage = Usage::parse_openai(&json!({
+        "prompt_cache_hit_tokens": 300,
+        "prompt_cache_miss_tokens": 700,
+        "completion_tokens": 50
+    }));
+
+    assert_eq!(usage.actual_input_tokens(), 700);
+    assert_eq!(usage.cache_read, 300);
+    assert_eq!(usage.context_tokens(), 1050);
+}
+
+#[test]
+fn openai_usage_parse_accepts_direct_cost_and_cache_create() {
+    let usage = Usage::parse_openai(&json!({
+        "input_tokens": 1000,
+        "output_tokens": 50,
+        "cache_creation_input_tokens": 100,
+        "cache_read_input_tokens": 300,
+        "cost_usd": 0.0123
+    }));
+
+    assert_eq!(usage.actual_input_tokens(), 600);
+    assert_eq!(usage.cache_create, 100);
+    assert_eq!(usage.cache_read, 300);
+    assert_eq!(usage.cost_usd, Some(0.0123));
+    assert_eq!(usage.estimated_cost_usd(), 0.0123);
+}
+
+#[test]
+fn local_llama_timings_parse_cached_prefix_and_delta_prompt() {
+    let usage = Usage::parse_openai_timings(&json!({
+        "cache_n": 25869,
+        "prompt_n": 32,
+        "predicted_n": 64
+    }))
+    .expect("timings usage");
+
+    assert_eq!(usage.actual_input_tokens(), 32);
+    assert_eq!(usage.cache_read, 25_869);
+    assert_eq!(usage.output, 64);
+    assert_eq!(usage.context_tokens(), 25_965);
+}
+
+#[test]
+fn usage_pricing_for_local_provider_is_zero_cost() {
+    let pricing = usage_pricing_for(
+        "local",
+        ApiProvider::OpenAi,
+        "http://127.0.0.1:8080",
+        "qwen3.5-9b",
+    );
+    let usage = Usage {
+        input: 32,
+        output: 64,
+        cache_create: 0,
+        cache_read: 25_869,
+        cost_usd: None,
+    };
+
+    assert_eq!(pricing.estimate(usage), 0.0);
+}
+
+#[test]
+fn usage_pricing_env_override_controls_budget_estimate() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::set_var("DEXT_INPUT_USD_PER_MTOK", "2");
+        std::env::set_var("DEXT_OUTPUT_USD_PER_MTOK", "4");
+        std::env::set_var("DEXT_CACHE_READ_USD_PER_MTOK", "0.5");
+        std::env::set_var("DEXT_CACHE_CREATE_USD_PER_MTOK", "1");
+    }
+    let pricing = usage_pricing_for(
+        "openai",
+        ApiProvider::OpenAi,
+        "https://api.openai.com",
+        "unknown",
+    );
+    let usage = Usage {
+        input: 1_000_000,
+        output: 2_000_000,
+        cache_create: 3_000_000,
+        cache_read: 4_000_000,
+        cost_usd: None,
+    };
+    assert_eq!(pricing.estimate(usage), 15.0);
+
+    unsafe {
+        std::env::remove_var("DEXT_INPUT_USD_PER_MTOK");
+        std::env::remove_var("DEXT_OUTPUT_USD_PER_MTOK");
+        std::env::remove_var("DEXT_CACHE_READ_USD_PER_MTOK");
+        std::env::remove_var("DEXT_CACHE_CREATE_USD_PER_MTOK");
+    }
+}
+
+#[test]
+fn usage_add_drops_exact_cost_when_mixing_unpriced_nonzero_usage() {
+    let mut usage = Usage {
+        input: 1_000,
+        output: 100,
+        cache_create: 0,
+        cache_read: 0,
+        cost_usd: Some(0.01),
+    };
+    usage.add(Usage {
+        input: 1_000,
+        output: 100,
+        cache_create: 0,
+        cache_read: 0,
+        cost_usd: None,
+    });
+
+    assert_eq!(usage.cost_usd, None);
+}
+
+#[test]
+fn usage_fallback_estimates_missing_output_when_input_usage_is_present() {
+    let root = temp_test_dir("usage-fallback-output");
+    let agent = test_agent(&root);
+    let blocks = vec![Block::Text {
+        text: "abcdefgh".to_string(),
+    }];
+    let mut usage = Usage {
+        input: 10,
+        output: 0,
+        cache_create: 0,
+        cache_read: 0,
+        cost_usd: None,
+    };
+
+    agent.finalize_turn_usage_metrics(&mut usage, &blocks);
+
+    assert_eq!(usage.actual_input_tokens(), 10);
+    assert_eq!(usage.output, 2);
+    assert!(usage.cost_usd.is_some());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

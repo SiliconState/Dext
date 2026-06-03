@@ -2189,9 +2189,8 @@ fn strip_tool_result_metadata(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-fn message_approx_tokens(message: &Message) -> u64 {
-    let chars = message
-        .content
+fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
+    let chars = blocks
         .iter()
         .map(|block| match block {
             Block::Text { text } | Block::PartialStream { text } => text.len(),
@@ -2200,7 +2199,15 @@ fn message_approx_tokens(message: &Message) -> u64 {
             Block::ToolResult { content, .. } => content.len(),
         })
         .sum::<usize>() as u64;
-    ((chars.saturating_add(3)) / 4).max(1)
+    if chars == 0 {
+        0
+    } else {
+        ((chars.saturating_add(3)) / 4).max(1)
+    }
+}
+
+fn message_approx_tokens(message: &Message) -> u64 {
+    blocks_approx_tokens(&message.content).max(1)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -2815,12 +2822,19 @@ struct AnthropicThinking {
 }
 
 #[derive(Serialize)]
+struct OaiStreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Serialize)]
 struct OaiRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     messages: Vec<OaiMessage>,
     tools: Vec<OaiTool>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OaiStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
 }
@@ -2863,24 +2877,43 @@ pub(crate) struct OaiFunctionDef {
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 struct Usage {
-    // Billable/non-cached input tokens. Providers like ChatGPT report total
-    // input plus cached_tokens; normalize by subtracting cached_tokens here.
+    // Billable/non-cached input tokens.
     input: u64,
     output: u64,
     cache_create: u64,
     cache_read: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
 }
 
 impl Usage {
     fn add(&mut self, o: Usage) {
+        let lhs_cost = self.cost_usd;
+        let rhs_cost = o.cost_usd;
+        let lhs_tokens = self.total_tokens();
+        let rhs_tokens = o.total_tokens();
         self.input += o.input;
         self.output += o.output;
         self.cache_create += o.cache_create;
         self.cache_read += o.cache_read;
+        self.cost_usd = match (lhs_cost, rhs_cost) {
+            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), None) if rhs_tokens == 0 => Some(a),
+            (None, Some(b)) if lhs_tokens == 0 => Some(b),
+            (None, None) if lhs_tokens == 0 && rhs_tokens == 0 => None,
+            _ => None,
+        };
     }
 
     fn actual_input_tokens(&self) -> u64 {
         self.input
+    }
+
+    fn with_priced_estimate(mut self, pricing: UsagePricing) -> Self {
+        if self.cost_usd.is_none() {
+            self.cost_usd = Some(pricing.estimate(self));
+        }
+        self
     }
 
     fn cached_input_tokens(&self) -> u64 {
@@ -2903,6 +2936,9 @@ impl Usage {
     }
 
     fn estimated_cost_usd(&self) -> f64 {
+        if let Some(cost) = self.cost_usd {
+            return cost;
+        }
         let per_mtok = 1_000_000.0;
         (self.input as f64 / per_mtok) * DEFAULT_INPUT_USD_PER_MTOK
             + (self.output as f64 / per_mtok) * DEFAULT_OUTPUT_USD_PER_MTOK
@@ -2913,15 +2949,15 @@ impl Usage {
     fn parse(v: &Value) -> Self {
         let cache_create = v["cache_creation_input_tokens"].as_u64().unwrap_or(0);
         let cache_read = v["cache_read_input_tokens"].as_u64().unwrap_or(0);
-        // Anthropic-style input_tokens; fall back to prompt_tokens for
-        // Anthropic-compatible proxies (GLM/z.ai) that use OpenAI field names.
-        let raw_input = v["input_tokens"]
-            .as_u64()
-            .or_else(|| v["prompt_tokens"].as_u64())
-            .unwrap_or(0);
-        let input = raw_input
-            .saturating_sub(cache_create)
-            .saturating_sub(cache_read);
+        let input = if let Some(input) = v["input_tokens"].as_u64() {
+            input
+        } else {
+            v["prompt_tokens"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(cache_create)
+                .saturating_sub(cache_read)
+        };
         let output = v["output_tokens"]
             .as_u64()
             .or_else(|| v["completion_tokens"].as_u64())
@@ -2931,17 +2967,22 @@ impl Usage {
             output,
             cache_create,
             cache_read,
+            cost_usd: parse_usage_cost(v),
         }
     }
 
     fn parse_openai(v: &Value) -> Self {
+        let prompt_cache_hit = v["prompt_cache_hit_tokens"].as_u64().unwrap_or(0);
+        let prompt_cache_miss = v["prompt_cache_miss_tokens"].as_u64();
         let total_input = v["prompt_tokens"]
             .as_u64()
             .or_else(|| v["input_tokens"].as_u64())
+            .or_else(|| prompt_cache_miss.map(|miss| miss.saturating_add(prompt_cache_hit)))
             .unwrap_or(0);
         let output = v["completion_tokens"]
             .as_u64()
             .or_else(|| v["output_tokens"].as_u64())
+            .or_else(|| v["completion_tokens_details"]["accepted_prediction_tokens"].as_u64())
             .unwrap_or(0);
         let cache_read = v
             .get("prompt_tokens_details")
@@ -2952,13 +2993,34 @@ impl Usage {
                     .and_then(|d| d.get("cached_tokens"))
                     .and_then(Value::as_u64)
             })
+            .or_else(|| v["cache_read_input_tokens"].as_u64())
+            .or_else(|| v["cached_tokens"].as_u64())
+            .or(Some(prompt_cache_hit).filter(|tokens| *tokens > 0))
             .unwrap_or(0);
+        let cache_create = v["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let cost_usd = parse_usage_cost(v);
         Self {
-            input: total_input.saturating_sub(cache_read),
+            input: total_input
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_create),
+            output,
+            cache_create,
+            cache_read,
+            cost_usd,
+        }
+    }
+
+    fn parse_openai_timings(v: &Value) -> Option<Self> {
+        let cache_read = v["cache_n"].as_u64().unwrap_or(0);
+        let input = v["prompt_n"].as_u64().unwrap_or(0);
+        let output = v["predicted_n"].as_u64().unwrap_or(0);
+        (cache_read > 0 || input > 0 || output > 0).then_some(Self {
+            input,
             output,
             cache_create: 0,
             cache_read,
-        }
+            cost_usd: None,
+        })
     }
 
     fn line(&self) -> String {
@@ -2973,6 +3035,159 @@ impl Usage {
             self.estimated_cost_usd()
         )
     }
+}
+
+fn parse_usage_cost(v: &Value) -> Option<f64> {
+    v["cost"]
+        .as_f64()
+        .or_else(|| v["cost_usd"].as_f64())
+        .or_else(|| v["total_cost"].as_f64())
+        .or_else(|| v["total_cost_usd"].as_f64())
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+
+#[derive(Clone, Copy)]
+struct UsagePricing {
+    input: f64,
+    output: f64,
+    cache_read: f64,
+    cache_create: f64,
+}
+
+impl UsagePricing {
+    const fn new(input: f64, output: f64, cache_read: f64, cache_create: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_read,
+            cache_create,
+        }
+    }
+
+    const fn zero() -> Self {
+        Self::new(0.0, 0.0, 0.0, 0.0)
+    }
+
+    fn estimate(self, usage: Usage) -> f64 {
+        let per_mtok = 1_000_000.0;
+        (usage.input as f64 / per_mtok) * self.input
+            + (usage.output as f64 / per_mtok) * self.output
+            + (usage.cache_read as f64 / per_mtok) * self.cache_read
+            + (usage.cache_create as f64 / per_mtok) * self.cache_create
+    }
+}
+
+impl Default for UsagePricing {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_INPUT_USD_PER_MTOK,
+            DEFAULT_OUTPUT_USD_PER_MTOK,
+            DEFAULT_CACHE_READ_USD_PER_MTOK,
+            DEFAULT_CACHE_CREATE_USD_PER_MTOK,
+        )
+    }
+}
+
+fn usage_pricing_for(
+    provider_id: &str,
+    api_provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> UsagePricing {
+    let base = if provider::is_local_llama_provider(provider_id, api_provider, base_url) {
+        UsagePricing::zero()
+    } else {
+        let provider = canonical_provider_id(provider_id);
+        let model = normalize_price_model(model);
+        match provider.as_str() {
+            "openai" | "chatgpt" => openai_pricing(&model).unwrap_or_default(),
+            "anthropic" | "glm" => anthropic_pricing(&model).unwrap_or_default(),
+            "deepseek" => deepseek_pricing(&model).unwrap_or_default(),
+            _ => UsagePricing::default(),
+        }
+    };
+    usage_pricing_from_env(base)
+}
+
+fn normalize_price_model(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
+}
+
+fn openai_pricing(model: &str) -> Option<UsagePricing> {
+    if model.starts_with("gpt-5.4-mini") {
+        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
+    } else if model.starts_with("gpt-5.4") {
+        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
+    } else if model.starts_with("gpt-5.3-codex-spark") {
+        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
+    } else if model.starts_with("gpt-5.3-codex") {
+        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
+    } else if model.starts_with("gpt-5-mini") {
+        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
+    } else if model.starts_with("gpt-5-nano") {
+        Some(UsagePricing::new(0.05, 0.4, 0.005, 0.05))
+    } else if model.starts_with("gpt-5") {
+        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
+    } else if model.starts_with("gpt-4.1-mini") {
+        Some(UsagePricing::new(0.4, 1.6, 0.1, 0.4))
+    } else if model.starts_with("gpt-4.1-nano") {
+        Some(UsagePricing::new(0.1, 0.4, 0.025, 0.1))
+    } else if model.starts_with("gpt-4.1") {
+        Some(UsagePricing::new(2.0, 8.0, 0.5, 2.0))
+    } else if model.starts_with("gpt-4o-mini") {
+        Some(UsagePricing::new(0.15, 0.6, 0.075, 0.15))
+    } else if model.starts_with("gpt-4o") {
+        Some(UsagePricing::new(2.5, 10.0, 1.25, 2.5))
+    } else if model.starts_with("o3-mini") || model.starts_with("o4-mini") {
+        Some(UsagePricing::new(1.1, 4.4, 0.55, 1.1))
+    } else if model.starts_with("o3") {
+        Some(UsagePricing::new(2.0, 8.0, 0.5, 2.0))
+    } else {
+        None
+    }
+}
+
+fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
+    if model.starts_with("glm-") {
+        return Some(UsagePricing::default());
+    }
+    if model.contains("opus") {
+        Some(UsagePricing::new(15.0, 75.0, 1.5, 18.75))
+    } else if model.contains("sonnet") {
+        Some(UsagePricing::new(3.0, 15.0, 0.3, 3.75))
+    } else if model.contains("haiku-4-5") || model.contains("haiku-4.5") {
+        Some(UsagePricing::new(1.0, 5.0, 0.1, 1.25))
+    } else if model.contains("haiku") {
+        Some(UsagePricing::new(0.8, 4.0, 0.08, 1.0))
+    } else {
+        None
+    }
+}
+
+fn deepseek_pricing(model: &str) -> Option<UsagePricing> {
+    if model.contains("reasoner") {
+        Some(UsagePricing::new(0.55, 2.19, 0.14, 0.55))
+    } else if model.contains("chat") {
+        Some(UsagePricing::new(0.27, 1.1, 0.07, 0.27))
+    } else {
+        None
+    }
+}
+
+fn usage_pricing_from_env(default: UsagePricing) -> UsagePricing {
+    UsagePricing {
+        input: env_f64("DEXT_INPUT_USD_PER_MTOK").unwrap_or(default.input),
+        output: env_f64("DEXT_OUTPUT_USD_PER_MTOK").unwrap_or(default.output),
+        cache_read: env_f64("DEXT_CACHE_READ_USD_PER_MTOK").unwrap_or(default.cache_read),
+        cache_create: env_f64("DEXT_CACHE_CREATE_USD_PER_MTOK").unwrap_or(default.cache_create),
+    }
+}
+
+fn env_f64(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -9064,6 +9279,51 @@ impl Agent {
         }
     }
 
+    fn current_usage_pricing(&self) -> UsagePricing {
+        usage_pricing_for(
+            &self.provider_id,
+            self.api_provider,
+            &self.base_url,
+            &self.model,
+        )
+    }
+
+    fn finalize_usage_metrics(&self, usage: &mut Usage) {
+        *usage = usage.with_priced_estimate(self.current_usage_pricing());
+    }
+
+    fn finalize_turn_usage_metrics(&self, usage: &mut Usage, blocks: &[Block]) {
+        Self::fill_missing_usage_metrics(
+            usage,
+            self.estimated_context_tokens_from_history().max(1),
+            blocks,
+        );
+        self.finalize_usage_metrics(usage);
+    }
+
+    fn fill_missing_usage_metrics(usage: &mut Usage, fallback_input_tokens: u64, blocks: &[Block]) {
+        if usage.input == 0 && usage.cache_create == 0 && usage.cache_read == 0 {
+            usage.input = fallback_input_tokens.max(1);
+        }
+        if usage.output == 0 {
+            usage.output = blocks_approx_tokens(blocks);
+        }
+    }
+
+    fn ensure_session_usage_cost(&mut self) {
+        if self.session_usage.cost_usd.is_none() && self.session_usage.total_tokens() > 0 {
+            self.session_usage.cost_usd = self.priced_session_usage().cost_usd;
+        }
+    }
+
+    fn priced_session_usage(&self) -> Usage {
+        let mut usage = self.session_usage;
+        if usage.cost_usd.is_none() && usage.total_tokens() > 0 {
+            usage.cost_usd = Some(self.current_usage_pricing().estimate(usage));
+        }
+        usage
+    }
+
     fn refresh_context_window(&mut self) -> Option<u64> {
         let updated = refresh_local_llama_context_window(
             &self.provider_id,
@@ -9669,12 +9929,13 @@ impl Agent {
     }
 
     fn budget_cap_denial(&mut self) -> Option<String> {
+        self.ensure_session_usage_cost();
         let cap = self.budget_cap?;
         let msg = cap.exceeded(self.session_usage)?;
         self.budget_exhausted = true;
         Some(format!(
             "{msg}; refusing another model request. Raise/clear with /budget <cap|off> or restart with --budget. Current usage: {}",
-            self.session_usage.line()
+            self.priced_session_usage().line()
         ))
     }
 
@@ -9687,7 +9948,7 @@ impl Agent {
         self.budget_exhausted = true;
         Some(format!(
             "{msg}; this turn will stop before another model request. Current usage: {}",
-            self.session_usage.line()
+            self.priced_session_usage().line()
         ))
     }
 
@@ -9893,14 +10154,26 @@ impl Agent {
             }
             if let Some(pack_summary) = packs::pack_summary_for_prompt(&self.sandbox_root) {
                 env.push_str("\n## Dext packs\n");
-                env.push_str(&pack_summary);
-                env.push('\n');
+                env.push_str(&cap_bytes_with_hint(
+                    pack_summary,
+                    600,
+                    "pack summary trimmed for frugal context.",
+                ));
+                if !env.ends_with('\n') {
+                    env.push('\n');
+                }
             }
             if let Some(shelf_summary) = shelves::registry_summary_for_prompt(&self.shelf_registry)
             {
                 env.push_str("\n## Dext shelves\n");
-                env.push_str(&shelf_summary);
-                env.push('\n');
+                env.push_str(&cap_bytes_with_hint(
+                    shelf_summary,
+                    700,
+                    "shelf registry summary trimmed for frugal context.",
+                ));
+                if !env.ends_with('\n') {
+                    env.push('\n');
+                }
             }
             env.push_str(&self.privacy.prompt_status_line());
             env.push('\n');
@@ -9963,7 +10236,7 @@ impl Agent {
             env.push_str("\n## Work ledger\n");
             env.push_str(&cap_bytes_with_hint(
                 ledger,
-                2_500,
+                2_000,
                 "work ledger trimmed for prompt budget.",
             ));
             if !env.ends_with('\n') {
@@ -9993,13 +10266,25 @@ impl Agent {
         }
         if let Some(pack_summary) = packs::pack_summary_for_prompt(&self.sandbox_root) {
             env.push_str("\n## Dext packs\n");
-            env.push_str(&pack_summary);
-            env.push('\n');
+            env.push_str(&cap_bytes_with_hint(
+                pack_summary,
+                600,
+                "pack summary trimmed for prompt budget.",
+            ));
+            if !env.ends_with('\n') {
+                env.push('\n');
+            }
         }
         if let Some(shelf_summary) = shelves::registry_summary_for_prompt(&self.shelf_registry) {
             env.push_str("\n## Dext shelves\n");
-            env.push_str(&shelf_summary);
-            env.push('\n');
+            env.push_str(&cap_bytes_with_hint(
+                shelf_summary,
+                700,
+                "shelf registry summary trimmed for prompt budget.",
+            ));
+            if !env.ends_with('\n') {
+                env.push('\n');
+            }
         }
         env.push_str(&self.privacy.prompt_status_line());
         env.push('\n');
@@ -10493,12 +10778,21 @@ impl Agent {
                 let oai_msgs = self.history_to_oai_messages(&sys_text);
                 let oai_tools = self.wire_tools_oai();
                 let reasoning_effort = openai_reasoning_effort(self.thinking_effort);
+                let stream_options = (!provider::is_local_llama_provider(
+                    &self.provider_id,
+                    self.api_provider,
+                    &self.base_url,
+                ))
+                .then_some(OaiStreamOptions {
+                    include_usage: true,
+                });
                 let body = OaiRequest {
                     model: &self.model,
                     max_tokens: max_output_tokens(),
                     messages: oai_msgs,
                     tools: oai_tools,
                     stream: true,
+                    stream_options,
                     reasoning_effort,
                 };
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
@@ -10581,7 +10875,7 @@ impl Agent {
             approval_required_tools,
             auto_approved_tools,
             sandbox: Some(self.sandbox_root.display().to_string()),
-            usage: self.session_usage,
+            usage: self.priced_session_usage(),
             thinking_effort: self.thinking_effort,
             compact_threshold_chars: self.compact_threshold_override(),
             compact_threshold_percent: self.compact_threshold_override_percent(),
@@ -11163,6 +11457,7 @@ impl Agent {
                     messages,
                     tools: Vec::new(),
                     stream: false,
+                    stream_options: None,
                     reasoning_effort,
                 };
                 let mut req = self
@@ -11222,7 +11517,11 @@ impl Agent {
             loop {
                 attempt += 1;
                 match self.read_stream_chatgpt(resp).await {
-                    Ok((blocks, _finish_reason, usage)) => {
+                    Ok((blocks, _finish_reason, mut usage)) => {
+                        let fallback_input =
+                            ((user_text.len() as u64).saturating_add(3) / 4).max(1);
+                        Self::fill_missing_usage_metrics(&mut usage, fallback_input, &blocks);
+                        self.finalize_usage_metrics(&mut usage);
                         let text = blocks
                             .into_iter()
                             .filter_map(|b| match b {
@@ -11304,7 +11603,8 @@ impl Agent {
                 if text.trim().is_empty() {
                     anyhow::bail!("summary response had no text: {json}");
                 }
-                let usage = Usage::parse_openai(&json["usage"]);
+                let mut usage = Usage::parse_openai(&json["usage"]);
+                self.finalize_usage_metrics(&mut usage);
                 Ok((text, usage))
             }
             SummaryParse::Anthropic => {
@@ -11323,7 +11623,8 @@ impl Agent {
                 if text.trim().is_empty() {
                     anyhow::bail!("summary response had no text: {json}");
                 }
-                let usage = Usage::parse(&json["usage"]);
+                let mut usage = Usage::parse(&json["usage"]);
+                self.finalize_usage_metrics(&mut usage);
                 Ok((text, usage))
             }
         }
@@ -11412,6 +11713,7 @@ impl Agent {
             }
         };
         self.session_usage.add(usage);
+        self.ensure_session_usage_cost();
 
         self.history =
             build_compacted_history(&summary, preserved_tool_msgs, &self.history[split..]);
@@ -11863,27 +12165,31 @@ impl Agent {
                     }
                     let mut interrupt_ticker =
                         tokio::time::interval(std::time::Duration::from_millis(25));
-                    let res = tokio::select! {
-                        _ = async {
-                            loop {
-                                if self.interrupt.load(Ordering::SeqCst) {
-                                    break;
+                    let send = req.send();
+                    tokio::pin!(send);
+                    let res = loop {
+                        tokio::select! {
+                            _ = async {
+                                loop {
+                                    if self.interrupt.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+                                    interrupt_ticker.tick().await;
                                 }
-                                interrupt_ticker.tick().await;
-                            }
-                        } => anyhow::bail!("interrupted by user before provider response"),
-                        msg = queued_runtime_control_waiter(&mut self.runtime_control_rx) => {
-                            let runtime_control = apply_runtime_control_for_stream(self, msg);
-                            if runtime_control.aborted_stream {
-                                break 'stream_retry (
-                                    Vec::new(),
-                                    Some("runtime_control".to_string()),
-                                    Usage::default(),
-                                );
-                            }
-                            continue;
-                        },
-                        res = req.send() => res,
+                            } => anyhow::bail!("interrupted by user before provider response"),
+                            msg = queued_runtime_control_waiter(&mut self.runtime_control_rx) => {
+                                let runtime_control = apply_runtime_control_for_stream(self, msg);
+                                if runtime_control.aborted_stream {
+                                    break 'stream_retry (
+                                        Vec::new(),
+                                        Some("runtime_control".to_string()),
+                                        Usage::default(),
+                                    );
+                                }
+                                continue;
+                            },
+                            res = &mut send => break res,
+                        }
                     };
                     match res {
                         Ok(r) if r.status().is_success() => break r,
@@ -12080,23 +12386,11 @@ impl Agent {
                 continue;
             }
 
-            if usage.input == 0 && usage.output == 0 {
-                let chars = self.history_chars() as u64
-                    + blocks
-                        .iter()
-                        .map(|b| match b {
-                            Block::Text { text } | Block::PartialStream { text } => text.len(),
-                            Block::Thinking { text } => text.len(),
-                            Block::ToolUse { input, .. } => json_byte_len(input),
-                            Block::ToolResult { content, .. } => content.len(),
-                        })
-                        .sum::<usize>() as u64;
-                let estimated = (chars / 4).max(1);
-                usage.input = estimated;
-            }
+            self.finalize_turn_usage_metrics(&mut usage, &blocks);
 
             self.session_usage.add(usage);
             turn_usage.add(usage);
+            self.ensure_session_usage_cost();
             // `turn` carries the single request that just completed, so the
             // TUI context meter reflects the last request's actual size
             // instead of the running sum of every iteration in this turn.
@@ -13240,20 +13534,18 @@ impl Agent {
                             stop_reason = Some(sr.to_string());
                         }
                         if let Some(u) = data.get("usage") {
-                            // Some Anthropic-compatible proxies (GLM/z.ai)
-                            // include full usage in message_delta rather than
-                            // just output_tokens.
-                            if let Some(o) = u["output_tokens"].as_u64() {
-                                usage.output = o;
+                            let parsed = Usage::parse(u);
+                            if parsed.output > 0 {
+                                usage.output = parsed.output;
                             }
-                            if let Some(i) = u["input_tokens"].as_u64() {
-                                usage.input = i
-                                    .saturating_sub(usage.cache_create)
-                                    .saturating_sub(usage.cache_read);
-                            } else if let Some(i) = u["prompt_tokens"].as_u64() {
-                                usage.input = i
-                                    .saturating_sub(usage.cache_create)
-                                    .saturating_sub(usage.cache_read);
+                            if parsed.input > 0 || parsed.cache_create > 0 || parsed.cache_read > 0
+                            {
+                                usage.input = parsed.input;
+                                usage.cache_create = parsed.cache_create;
+                                usage.cache_read = parsed.cache_read;
+                            }
+                            if parsed.cost_usd.is_some() {
+                                usage.cost_usd = parsed.cost_usd;
                             }
                         }
                     }
@@ -13365,8 +13657,21 @@ impl Agent {
                     }
                 }
 
-                if let Some(u) = data.get("usage") {
-                    usage = Usage::parse_openai(u);
+                if let Some(timings_usage) =
+                    data.get("timings").and_then(Usage::parse_openai_timings)
+                {
+                    usage = timings_usage;
+                } else if let Some(u) = data.get("usage") {
+                    let parsed = Usage::parse_openai(u);
+                    let keep_local_timings = provider::is_local_llama_provider(
+                        &self.provider_id,
+                        self.api_provider,
+                        &self.base_url,
+                    ) && usage.cache_read > 0
+                        && parsed.cache_read == 0;
+                    if !keep_local_timings {
+                        usage = parsed;
+                    }
                 }
             }
 
@@ -13578,6 +13883,10 @@ impl Agent {
                         }
                         if let Some(u) = data["response"].get("usage") {
                             usage = Usage::parse_openai(u);
+                        } else if let Some(timings_usage) =
+                            data.get("timings").and_then(Usage::parse_openai_timings)
+                        {
+                            usage = timings_usage;
                         }
                         for output in data["response"]["output"].as_array().into_iter().flatten() {
                             if output["type"].as_str() == Some("function_call") {
@@ -13931,6 +14240,7 @@ impl Agent {
         }
 
         self.session_usage.add(sub.session_usage);
+        self.ensure_session_usage_cost();
 
         let iterations = sub.history.iter().filter(|m| m.role == "assistant").count() as u32;
         let final_text = sub
@@ -16273,7 +16583,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         let _ = writeln!(w, "budget cap: off");
                     }
                 }
-                let _ = writeln!(w, "session usage: {}", agent.session_usage.line());
+                let _ = writeln!(w, "session usage: {}", agent.priced_session_usage().line());
             } else if matches!(arg, "off" | "none" | "disabled" | "0") {
                 agent.set_budget_cap(None);
                 let _ = writeln!(w, "budget cap: off");
@@ -16611,7 +16921,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
         },
         "usage" => {
-            let _ = writeln!(w, "session: {}", agent.session_usage.line());
+            let _ = writeln!(w, "session: {}", agent.priced_session_usage().line());
         }
         "status" => {
             let family = agent.api_family_label();
@@ -16622,7 +16932,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "base url: {}", agent.base_url);
             let _ = writeln!(w, "sandbox: {}", agent.sandbox_root.display());
             let _ = writeln!(w, "history: {} messages", agent.history.len());
-            let _ = writeln!(w, "session usage: {}", agent.session_usage.line());
+            let _ = writeln!(w, "session usage: {}", agent.priced_session_usage().line());
             match agent.budget_cap {
                 Some(cap) => {
                     let _ = writeln!(w, "budget cap: {}", cap.line());

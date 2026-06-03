@@ -1825,6 +1825,7 @@ mod tests {
             output: 8_000,
             cache_create: 0,
             cache_read: 0,
+            cost_usd: None,
         };
 
         assert_eq!(adaptive_tool_result_cap(&usage, "demo-200k", 12_000), 6_000);
@@ -2264,6 +2265,7 @@ mod tests {
             output: 8_000,
             cache_create: 0,
             cache_read: 0,
+            cost_usd: None,
         };
         let ui_cap = adaptive_tool_ui_cap(&usage, "demo-200k", 8_000);
         let result_cap = adaptive_tool_result_cap(&usage, "demo-200k", 12_000);

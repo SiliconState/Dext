@@ -283,6 +283,8 @@ dext --budget 200000t
 
 Frugal mode uses lean schemas, a smaller toolset, smaller caps, and more aggressive context reduction. Tiny mode keeps frugal's lean tools, uses a condensed prompt only for tiny, and caps history around 80% of the local model window (bounded 8k–32k chars). Standard mode and frugal mode keep the regular main-agent prompt. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
 
+`/usage`, `/status`, JSON output, and session headers report provider token usage after each completed model request. Anthropic-family responses use input/output/cache counters, OpenAI-compatible streaming requests ask for usage chunks, and local llama.cpp uses streamed `timings.cache_n/prompt_n/predicted_n` so cached-prefix reuse is counted separately from new prompt tokens. Dollar estimates use provider/model price tables or the `DEXT_*_USD_PER_MTOK` environment overrides listed below; local defaults to zero dollar cost.
+
 ## Permission and sandbox controls
 
 ```bash
@@ -372,6 +374,12 @@ DEXT_TOOL_PROFILE=lean
 DEXT_MUTATION_PREVIEW=simple
 DEXT_THINKING_EFFORT=off
 DEXT_BUDGET_CAP='$5'
+# Optional pricing overrides in USD per million tokens (local defaults to zero
+# cost unless these are set):
+DEXT_INPUT_USD_PER_MTOK=1
+DEXT_OUTPUT_USD_PER_MTOK=5
+DEXT_CACHE_READ_USD_PER_MTOK=0.1
+DEXT_CACHE_CREATE_USD_PER_MTOK=1.25
 # Max output tokens requested per streaming completion (default 8192). The
 # Anthropic thinking budget is always clamped below this to satisfy the API.
 DEXT_MAX_OUTPUT_TOKENS=8192

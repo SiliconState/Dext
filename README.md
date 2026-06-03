@@ -289,9 +289,16 @@ DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean
 DEXT_MUTATION_PREVIEW=simple
 DEXT_BUDGET_CAP=$5
+# Optional pricing overrides in USD per million tokens:
+DEXT_INPUT_USD_PER_MTOK=1
+DEXT_OUTPUT_USD_PER_MTOK=5
+DEXT_CACHE_READ_USD_PER_MTOK=0.1
+DEXT_CACHE_CREATE_USD_PER_MTOK=1.25
 ```
 
 Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `target/`, `.env`, `DEXT.todo.json`, `autoresearch.*`, `packopt.*`, and `dext-session-*` exports are ignored.
+
+Usage metrics are recorded in session headers and `/usage` after provider turns. Cloud providers use returned usage objects when available; OpenAI-compatible streaming requests ask for usage chunks, while local llama.cpp derives exact prompt/cache/output counts from streamed `timings` and records zero dollar cost unless pricing env overrides are set.
 
 ## Development
 
