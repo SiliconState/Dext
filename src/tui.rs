@@ -6047,8 +6047,6 @@ fn input_hint_text(state: &TuiState) -> &'static str {
         "Enter focus · p packet · t track · Esc close"
     } else if state.input_display_override.is_some() {
         "paste preview · Enter sends full input"
-    } else if state.agent_busy {
-        "Runtime: /model, /effort, /think; non-slash input steers · secrets withheld"
     } else {
         ""
     }
@@ -6998,6 +6996,23 @@ fn handle_work_map_key(state: &mut TuiState, key: KeyEvent) -> bool {
     }
 }
 
+fn queue_runtime_effort_control(
+    state: &mut TuiState,
+    runtime_control_input: &tokio::sync::mpsc::UnboundedSender<String>,
+    step: i8,
+) {
+    let command = if step < 0 {
+        "/effort prev"
+    } else {
+        "/effort next"
+    };
+    state.status = if runtime_control_input.send(command.to_string()).is_ok() {
+        "runtime control queued".to_string()
+    } else {
+        "runtime control unavailable".to_string()
+    };
+}
+
 fn handle_key(
     state: &mut TuiState,
     key: KeyEvent,
@@ -7080,7 +7095,11 @@ fn handle_key(
             let _ = agent_input.send(FromTui::Quit);
         }
         (KeyCode::Char('e'), m) if is_ctrl(m) => {
-            let _ = agent_input.send(FromTui::CycleEffort(1));
+            if state.agent_busy {
+                queue_runtime_effort_control(state, runtime_control_input, 1);
+            } else {
+                let _ = agent_input.send(FromTui::CycleEffort(1));
+            }
         }
         (KeyCode::Char('?'), m)
             if !m.contains(KeyModifiers::CONTROL)
@@ -7163,14 +7182,20 @@ fn handle_key(
                 state.status = "input cleared".to_string();
             }
         }
-        (KeyCode::Tab, _) if !state.agent_busy => {
+        (KeyCode::Tab, _) => {
             if !state.accept_slash_completion() {
-                let _ = agent_input.send(FromTui::CycleEffort(1));
+                if state.agent_busy {
+                    queue_runtime_effort_control(state, runtime_control_input, 1);
+                } else {
+                    let _ = agent_input.send(FromTui::CycleEffort(1));
+                }
             }
         }
-        (KeyCode::BackTab, _) if !state.agent_busy => {
+        (KeyCode::BackTab, _) => {
             if state.move_slash_completion_selection(-1) {
                 let _ = state.accept_slash_completion();
+            } else if state.agent_busy {
+                queue_runtime_effort_control(state, runtime_control_input, -1);
             } else {
                 let _ = agent_input.send(FromTui::CycleEffort(-1));
             }
@@ -8004,7 +8029,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_input_hint_warns_about_local_auth_secrets() {
+    fn busy_input_hint_is_empty() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -8014,10 +8039,7 @@ mod tests {
         );
         state.agent_busy = true;
 
-        assert_eq!(
-            input_hint_text(&state),
-            "Runtime: /model, /effort, /think; non-slash input steers · secrets withheld"
-        );
+        assert_eq!(input_hint_text(&state), "");
     }
 
     #[test]
@@ -10058,6 +10080,41 @@ mod tests {
     }
 
     #[test]
+    fn tab_queues_runtime_effort_when_busy_and_not_completing_slash_command() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.input = "regular prompt".to_string();
+        state.cursor = state.input.len();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, mut runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            runtime_control_rx.try_recv().ok().as_deref(),
+            Some("/effort next")
+        );
+        assert_eq!(state.status, "runtime control queued");
+        assert_eq!(state.input, "regular prompt");
+    }
+
+    #[test]
     fn backtab_cycles_effort_when_not_completing_slash_command() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
@@ -10084,6 +10141,73 @@ mod tests {
 
         assert!(matches!(rx.try_recv(), Ok(FromTui::CycleEffort(-1))));
         assert_eq!(state.input, "regular prompt");
+    }
+
+    #[test]
+    fn backtab_queues_runtime_effort_when_busy_and_not_completing_slash_command() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.input = "regular prompt".to_string();
+        state.cursor = state.input.len();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, mut runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            runtime_control_rx.try_recv().ok().as_deref(),
+            Some("/effort prev")
+        );
+        assert_eq!(state.status, "runtime control queued");
+        assert_eq!(state.input, "regular prompt");
+    }
+
+    #[test]
+    fn ctrl_e_queues_runtime_effort_when_busy() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (runtime_control_tx, mut runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            &tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            runtime_control_rx.try_recv().ok().as_deref(),
+            Some("/effort next")
+        );
+        assert_eq!(state.status, "runtime control queued");
     }
 
     #[test]
