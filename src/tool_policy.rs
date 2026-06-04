@@ -257,6 +257,9 @@ fn bash_command_advisory(command: &str) -> Option<String> {
                 .to_string(),
         );
     }
+    if let Some(msg) = avoidable_shell_tool_advisory(command) {
+        return Some(msg);
+    }
     None
 }
 
@@ -360,6 +363,130 @@ fn slow_shell_search_advisory(command: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn avoidable_shell_tool_advisory(command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    if command.trim().is_empty() || command.contains('>') || lower.contains("<<") {
+        return None;
+    }
+    for segment in command_segments(&lower) {
+        let segment = segment.trim();
+        if segment.is_empty() || shell_probe_segment(segment) {
+            continue;
+        }
+        if let Some((label, replacement)) = avoidable_shell_segment_replacement(segment) {
+            return Some(format!(
+                "bash advisory: `{label}` is avoidable shell usage here. Prefer native {replacement}; reserve bash for shell-only orchestration, build/test/install commands, or true tool-catalog gaps."
+            ));
+        }
+    }
+    None
+}
+
+fn shell_probe_segment(segment: &str) -> bool {
+    let words = shell_words(segment);
+    match words.as_slice() {
+        [first, second, ..] if first == "command" && second == "-v" => true,
+        [first, ..] if first == "which" => true,
+        _ => false,
+    }
+}
+
+fn avoidable_shell_segment_replacement(segment: &str) -> Option<(String, &'static str)> {
+    let words = shell_words(segment);
+    let mut idx = first_command_word_index(&words)?;
+    let command = words.get(idx)?.as_str();
+    if command == "git" {
+        let subcommand_idx = git_subcommand_index(&words, idx)?;
+        let subcommand = words.get(subcommand_idx)?.as_str();
+        return match subcommand {
+            "diff" if git_diff_args_have_native_equivalent(&words[subcommand_idx + 1..]) => {
+                Some(("git diff".to_string(), "git_diff"))
+            }
+            _ => None,
+        };
+    }
+    if command == "env" || command == "time" || command == "command" {
+        idx = idx.saturating_add(1);
+    }
+    let command = words.get(idx)?.as_str();
+    let replacement = match command {
+        "cat" | "head" | "tail" | "less" | "more" | "nl" => "read_file/read_symbol",
+        "sed"
+            if !words
+                .iter()
+                .any(|word| word == "-i" || word.starts_with("-i")) =>
+        {
+            "read_file/read_symbol or rg"
+        }
+        "grep" | "egrep" | "fgrep" => "rg",
+        "ls" | "tree" => "fd",
+        "curl" | "wget" | "http" | "xh" => "http when exposed",
+        _ => return None,
+    };
+    Some((command.to_string(), replacement))
+}
+
+fn first_command_word_index(words: &[String]) -> Option<usize> {
+    let mut idx = 0usize;
+    while idx < words.len() {
+        let word = words[idx].as_str();
+        if shell_assignment_word(word) || matches!(word, "env" | "time" | "command") {
+            idx += 1;
+            continue;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+fn git_subcommand_index(words: &[String], git_idx: usize) -> Option<usize> {
+    let mut idx = git_idx.saturating_add(1);
+    while idx < words.len() {
+        let word = words[idx].as_str();
+        if matches!(word, "-c" | "-C" | "--git-dir" | "--work-tree") {
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if word.starts_with("--git-dir=") || word.starts_with("--work-tree=") {
+            idx += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+fn git_diff_args_have_native_equivalent(args: &[String]) -> bool {
+    let mut after_pathspec_separator = false;
+    let mut revisions_or_paths = 0usize;
+    let mut pathspecs = 0usize;
+    for arg in args {
+        if after_pathspec_separator {
+            pathspecs = pathspecs.saturating_add(1);
+            if pathspecs > 1 {
+                return false;
+            }
+            continue;
+        }
+        match arg.as_str() {
+            "--" => after_pathspec_separator = true,
+            "--stat" | "--cached" | "--staged" => {}
+            _ if !arg.starts_with('-') => {
+                revisions_or_paths = revisions_or_paths.saturating_add(1);
+                if revisions_or_paths > 1 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn bare_python_without_probe(command: &str) -> bool {
@@ -801,6 +928,36 @@ mod tests {
         let find = tool_input_advisory("bash", &json!({"command": "find . -name '*.rs'"}))
             .expect("find should warn");
         assert!(find.contains("native fd tool"), "{find}");
+
+        let cat = tool_input_advisory("bash", &json!({"command": "cat src/main.rs"}))
+            .expect("plain cat should warn");
+        assert!(cat.contains("read_file/read_symbol"), "{cat}");
+
+        let git_diff = tool_input_advisory(
+            "bash",
+            &json!({"command": "git diff --stat -- src/main.rs"}),
+        )
+        .expect("native git_diff should be preferred");
+        assert!(git_diff.contains("git_diff"), "{git_diff}");
+
+        assert!(
+            tool_input_advisory(
+                "bash",
+                &json!({"command": "git diff -- src/main.rs src/tools.rs"}),
+            )
+            .is_none(),
+            "multi-path git diff is not exactly representable by git_diff"
+        );
+
+        let curl = tool_input_advisory("bash", &json!({"command": "curl https://example.com"}))
+            .expect("curl should prefer native http when exposed");
+        assert!(curl.contains("avoidable shell usage"), "{curl}");
+        assert!(!curl.contains("read-only shell"), "{curl}");
+
+        assert!(
+            tool_input_advisory("bash", &json!({"command": "git diff --check"})).is_none(),
+            "git diff --check has no native equivalent and is useful verification"
+        );
 
         assert!(
             tool_input_advisory(

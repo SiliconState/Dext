@@ -95,7 +95,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
     vec![
         Tool {
             name: "read_file",
-            description: "Read a file from disk. Output is line-numbered (1-indexed) and capped for safety. Explicit offset+limit reads get a larger cap and are cached for overlapping follow-up reads; still prefer rg first and focused windows.",
+            description: "Read a file from disk. Output is line-numbered (1-indexed) and capped for safety. May inspect absolute paths outside the sandbox read-only; writes remain confined. Explicit offset+limit reads get a larger cap and are cached for overlapping follow-up reads; still prefer rg first and focused windows.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -108,7 +108,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "read_symbol",
-            description: "Read a source symbol by name, or the enclosing block around a 1-indexed line number. Returns a line-numbered block plus context. Lightweight fast text/range heuristic; use rg first for exact symbols or line hits.",
+            description: "Read a source symbol by name, or the enclosing block around a 1-indexed line number. Returns a line-numbered block plus context. May inspect absolute paths outside the sandbox read-only; writes remain confined. Lightweight fast text/range heuristic; use rg first for exact symbols or line hits.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -170,7 +170,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "bash",
-            description: "Execute a shell command via bash -c and return exit code, stdout, and stderr. Commands run with pipefail enabled. Stdout/stderr are capped, and the process is timed out if it runs too long; set timeout for legitimate long tasks. Bash calls are atomic: Dext cleans the tool process group after the shell exits, so shell backgrounding, nohup, or disown are not persistent; setsid-style detaches are unsupported because they escape Dext cleanup. For user-requested persistent local services, prefer an OS supervisor (on Linux with systemd: systemd-run --user with a dext- unit, then inspect/stop it with systemctl --user). Prefer heredocs/arrays for complex quoting, and treat unexpected stderr on exit 0 as suspicious. The unsafe pip flag '--break-system-packages' is blocked unless explicitly overridden.",
+            description: "Execute a shell command via bash -c and return exit code, stdout, and stderr. Last-resort tool: do not use for ordinary file reads/search/discovery, git diff/log, JSON filtering, or HTTP when the corresponding native tool is exposed and fits (read_file/read_symbol/fd/rg/git_diff/git_log/jq/http). Use bash for shell-only orchestration, build/test/install commands, and tool-catalog gaps. Commands run with pipefail enabled. Stdout/stderr are capped, and the process is timed out if it runs too long; set timeout for legitimate long tasks. Bash calls are atomic: Dext cleans the tool process group after the shell exits, so shell backgrounding, nohup, or disown are not persistent; setsid-style detaches are unsupported because they escape Dext cleanup. For user-requested persistent local services, prefer an OS supervisor (on Linux with systemd: systemd-run --user with a dext- unit, then inspect/stop it with systemctl --user). Prefer heredocs/arrays for complex quoting, and treat unexpected stderr on exit 0 as suspicious. The unsafe pip flag '--break-system-packages' is blocked unless explicitly overridden.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -182,7 +182,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "fd",
-            description: "Fast file finder (fd). Pattern is a regex by default. Stdout/stderr are capped; add a path or flags to narrow results.",
+            description: "Fast file finder (fd). Pattern is a regex by default. Path may be absolute for read-only outside-sandbox inspection. Stdout/stderr are capped; add a path or flags to narrow results.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -195,7 +195,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "rg",
-            description: "ripgrep: fast regex content search for files and code. Stdout/stderr are capped; narrow the pattern or scope if needed.",
+            description: "ripgrep: fast regex content search for files and code. Path may be absolute for read-only outside-sandbox inspection. Stdout/stderr are capped; narrow the pattern or scope if needed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -394,14 +394,14 @@ pub(crate) fn should_parallelize_builtin_tools(names: &[&str]) -> bool {
 
 fn lean_description(name: &str, fallback: &str) -> String {
     match name {
-        "read_file" => "Read capped line-numbered file window. Prefer offset+limit.",
-        "read_symbol" => "Read source symbol or block around line.",
+        "read_file" => "Read capped line-numbered file window. Absolute paths ok read-only; prefer offset+limit.",
+        "read_symbol" => "Read source symbol or block around line. Absolute paths ok read-only.",
         "write_file" => "Write file content.",
         "edit_file" => "Replace one exact string in a file.",
         "multi_edit" => "Apply atomic exact-string edits to one file.",
-        "bash" => "Run atomic bash command; pipefail; stdout/stderr capped. Use supervised dext- service for persistence.",
-        "fd" => "Find files by regex pattern.",
-        "rg" => "Search text with ripgrep.",
+        "bash" => "Run atomic bash last-resort; not for reads/search/diff/http when an exposed native tool fits. Pipefail; capped. Use supervised dext- service for persistence.",
+        "fd" => "Find files by regex pattern. Absolute paths ok read-only.",
+        "rg" => "Search text with ripgrep. Absolute paths ok read-only.",
         "jq" => "Run jq on JSON text or file.",
         "fzf" => "Rank provided lines by fuzzy query.",
         "http" => "HTTPie-style request; response capped.",

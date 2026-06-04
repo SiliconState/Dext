@@ -27,11 +27,11 @@ use provider::{
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 use session::{
-    ProjectStateLock, atomic_write_bytes, canonicalize_tool_path, dext_state_dir, latest_log_path,
-    latest_session_path, list_session_records_for_root, named_session_path_for_root,
-    named_sessions_dir_for_root, parse_session_header, project_key, project_state_dir,
-    project_state_lock_path, release_registered_locks, render_limited_csv, restore_terminal_if_tui,
-    unix_timestamp_secs,
+    ProjectStateLock, atomic_write_bytes, canonicalize_read_tool_path, canonicalize_tool_path,
+    dext_state_dir, latest_log_path, latest_session_path, list_session_records_for_root,
+    named_session_path_for_root, named_sessions_dir_for_root, parse_session_header, project_key,
+    project_state_dir, project_state_lock_path, release_registered_locks, render_limited_csv,
+    restore_terminal_if_tui, unix_timestamp_secs,
 };
 use tools::{
     Tool, ToolProfile, is_external_process_tool, needs_permission, provider_tool_definitions,
@@ -622,6 +622,33 @@ fn cap_tool_output(s: String) -> String {
     cap_tool_output_with_cap(s, TOOL_RESULT_CAP)
 }
 
+fn insert_runtime_notes(content: &mut String, notes: &[String]) {
+    if notes.is_empty() {
+        return;
+    }
+    let notes_block = notes
+        .iter()
+        .map(|note| format!("[runtime-note] {note}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let updated = if content.starts_with("exit:") {
+        if let Some((first, tail)) = content.split_once('\n') {
+            if tail.is_empty() {
+                format!("{first}\n\n{notes_block}")
+            } else {
+                format!("{first}\n\n{notes_block}\n{tail}")
+            }
+        } else {
+            format!("{content}\n\n{notes_block}")
+        }
+    } else if content.is_empty() {
+        notes_block
+    } else {
+        format!("{notes_block}\n{content}")
+    };
+    *content = updated;
+}
+
 /// Squash repeated identical error text while preserving one ToolResult block
 /// per tool call.  Providers require every tool_use id to receive a matching
 /// result, so this must not remove blocks.
@@ -782,6 +809,18 @@ impl ReadFileCache {
 
 fn canonical_within(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
     canonicalize_tool_path(root, user_path)
+}
+
+fn canonical_read_path(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
+    canonicalize_read_tool_path(root, user_path)
+}
+
+fn regular_file_metadata(path: &Path) -> std::result::Result<std::fs::Metadata, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| format!("{e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    Ok(metadata)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -4225,7 +4264,7 @@ fn prepare_external_tool(
                 );
             }
             let user_path = input["path"].as_str().unwrap_or(".");
-            let search_root = canonical_within(root, user_path)?;
+            let search_root = canonical_read_path(root, user_path)?;
             let extra = str_array(&input["extra_args"]);
             if binary_on_path("fd") {
                 let mut args: Vec<String> = extra;
@@ -4241,7 +4280,7 @@ fn prepare_external_tool(
         "rg" => {
             let pattern = input["pattern"].as_str().ok_or("missing pattern")?;
             let user_path = input["path"].as_str().unwrap_or(".");
-            let search_root = canonical_within(root, user_path)?;
+            let search_root = canonical_read_path(root, user_path)?;
             let extra = str_array(&input["extra_args"]);
             if binary_on_path("rg") {
                 let mut args: Vec<String> = vec!["--line-number".into(), "--no-heading".into()];
@@ -4262,7 +4301,8 @@ fn prepare_external_tool(
         "jq" => {
             let filter = input["filter"].as_str().ok_or("missing filter")?;
             if let Some(user_path) = input["path"].as_str() {
-                let path = canonical_within(root, user_path)?;
+                let path = canonical_read_path(root, user_path)?;
+                let _metadata = regular_file_metadata(&path)?;
                 Ok((
                     "jq".to_string(),
                     vec![filter.to_string(), path.to_string_lossy().to_string()],
@@ -4355,7 +4395,7 @@ fn prepare_external_tool_fallback(
             let pattern = input["pattern"].as_str().unwrap_or("");
             let user_path = input["path"].as_str().unwrap_or(".");
             let search_root =
-                canonical_within(root, user_path).unwrap_or_else(|_| root.to_path_buf());
+                canonical_read_path(root, user_path).unwrap_or_else(|_| root.to_path_buf());
             let extra = str_array(&input["extra_args"]);
             let mut args: Vec<String> = vec!["-rn".into(), "-E".into(), "--color=never".into()];
             add_default_grep_excludes(&mut args, &extra);
@@ -4368,7 +4408,7 @@ fn prepare_external_tool_fallback(
             let pattern = input["pattern"].as_str().unwrap_or("");
             let user_path = input["path"].as_str().unwrap_or(".");
             let search_root =
-                canonical_within(root, user_path).unwrap_or_else(|_| root.to_path_buf());
+                canonical_read_path(root, user_path).unwrap_or_else(|_| root.to_path_buf());
             let extra = str_array(&input["extra_args"]);
             let args = build_fd_find_fallback_args(&search_root, pattern, &extra);
             ("find".to_string(), args, None)
@@ -6396,7 +6436,7 @@ fn execute_tool_with_cache(
     match name {
         "read_file" => {
             let path = input["path"].as_str().ok_or("missing path")?;
-            let path = canonical_within(root, path)?;
+            let path = canonical_read_path(root, path)?;
             let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
             let limit = input["limit"].as_u64().map(|v| v as usize);
             let explicit_window = input["offset"].is_u64() && limit.is_some();
@@ -6405,7 +6445,7 @@ fn execute_tool_with_cache(
             } else {
                 effective_text_tool_capture_cap()
             };
-            let metadata = std::fs::metadata(&path).map_err(|e| format!("{e}"))?;
+            let metadata = regular_file_metadata(&path)?;
             let signature = file_signature_from_metadata(&metadata);
 
             if let (Some(limit), Some(cache)) = (limit, read_cache)
@@ -6483,7 +6523,8 @@ fn execute_tool_with_cache(
                 return Err("provide exactly one of symbol or line".to_string());
             }
             let context = input["context"].as_u64().unwrap_or(5).min(50) as usize;
-            let path = canonical_within(root, path_str)?;
+            let path = canonical_read_path(root, path_str)?;
+            let _metadata = regular_file_metadata(&path)?;
             let content = std::fs::read_to_string(&path).map_err(|e| format!("{e}"))?;
             let starts = source_line_starts(&content);
             if starts.is_empty() {
@@ -7319,10 +7360,11 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding assistant running as 
 Use only tools exposed in the current API tool list. Do not assume unavailable tools exist.
 Runtime: privileged ops are auto-approved; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested. Avoid mutating external state stores directly.
 Project state: use todo_read/todo_write for nontrivial work. Treat DEXT.md/recall.md as guidance; update recall.md only for durable decisions.
-Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Avoid broad reads; paginate. Use read-only tools in parallel.
+Tool hierarchy: use exposed native Dext tools before bash. Use fd/rg/read_file/read_symbol/git_diff/todo/edit tools, and http when exposed, for their domains; bash is last resort for shell-only orchestration, build/test/install, or catalog gaps.
+Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Read-only tools may inspect absolute paths outside the sandbox; writes stay confined. Avoid broad reads; paginate. Use read-only tools in parallel. Do not use bash for ordinary file reads, recursive search, file discovery, git diff, or HTTP when an exposed native tool fits.
 Editing: always read before editing. Use edit_file for small changes, multi_edit for batches, write_file for new files. Checkpoint before large edits.
-Git: inspect status/diff before editing tracked files. Use git_commit (not raw git) for commits. Use bash git log only when history is needed.
-Shell: preserve pipefail in bash. Treat bash calls as atomic: Dext cleans the tool process group after each call, so do not use shell backgrounding, nohup, or disown for persistence; setsid-style detaches are unsupported because they escape Dext cleanup. For user-requested persistent local services, use an OS supervisor when available (Linux: systemd-run --user with dext- unit, check status/logs, stop it when done). Dext rg/fd/http are direct tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Validate external sources before scaling. On auth failures, ask for credentials.
+Git: inspect status/diff before editing tracked files. Use git_diff for diffs and git_commit (not raw git) for commits. Use bash git log only when history is needed and no git_log tool is exposed.
+Shell: preserve pipefail in bash. Treat bash calls as atomic: Dext cleans the tool process group after each call, so do not use shell backgrounding, nohup, or disown for persistence; setsid-style detaches are unsupported because they escape Dext cleanup. For requested persistent local services, use an OS supervisor when available (Linux: systemd-run --user with dext- unit, inspect/stop via systemctl --user). Exposed Dext tools like rg/fd/http/git_diff are API tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Obey [runtime-note] advisories in tool results before choosing the next tool. Validate external sources before scaling. On auth failures, ask for credentials.
 Browser: if browser_recipe=agent-browser, use the browser tool only when useful; start with browser args ['skills','get','core','--full'].
 Subagents: do not call subagent directly; suggest /subagent if delegation is requested. Review subagent output before acting.
 Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
@@ -7330,7 +7372,7 @@ Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid 
 Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.
 Packs: when creating or installing a reusable pack or shelf, default to Dext's user-global scope (`~/.dext/packs` or `~/.dext/shelves/<shelf>/packs`) unless the user explicitly asks for project-local placement.";
 
-const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Inspect before edits. Prefer rg/fd then focused reads. Keep tool output small. Use todo for nontrivial work. Make surgical changes. Bash is atomic; use supervised dext- services only for requested persistence. Reusable packs default to user-global Dext scope unless the user asks for project-local placement. Verify narrowly. Final: changed, tests, gaps.";
+const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit, and http when exposed; read-only absolute paths are allowed, writes stay confined; bash only for shell-only orchestration, build/test/install, or gaps. Inspect before edits. Keep output small. Use todo for nontrivial work. Bash is atomic; use supervised dext- services only for requested persistence. Obey [runtime-note] tool-result advisories. Reusable packs default user-global unless asked otherwise. Verify narrowly. Final: changed, tests, gaps.";
 
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     let mut sections = Vec::new();
@@ -12998,8 +13040,10 @@ impl Agent {
                 let ran_builtin = matches!(plan, Plan::Builtin);
                 let ui_summary = summary.clone();
                 let mut followup_warnings: Vec<String> = Vec::new();
+                let mut provider_runtime_notes: Vec<String> = Vec::new();
                 if let Some(advisory) = tool_policy::tool_input_advisory(&name, &input) {
-                    followup_warnings.push(advisory);
+                    followup_warnings.push(advisory.clone());
+                    provider_runtime_notes.push(advisory);
                 }
 
                 let (mut content, is_error) = match plan {
@@ -13070,6 +13114,7 @@ impl Agent {
                 round_external_failures =
                     round_external_failures.saturating_add(observation.round_external_failures);
                 followup_warnings.extend(observation.followup_warnings);
+                insert_runtime_notes(&mut content, &provider_runtime_notes);
 
                 if runnable_set.contains(&idx) {
                     if !ok {

@@ -8,8 +8,8 @@ use crate::provider::{
 #[cfg(target_os = "linux")]
 use crate::session::process_exists;
 use crate::session::{
-    append_log_line, canonicalize_tool_path, cap_latest_log_buffer, render_limited_lines,
-    validate_session_name,
+    append_log_line, canonicalize_read_tool_path, canonicalize_tool_path, cap_latest_log_buffer,
+    render_limited_lines, validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
@@ -225,7 +225,7 @@ fn tool_paths_allow_user_global_pack_roots_outside_project() {
 }
 
 #[test]
-fn tool_paths_reject_non_project_non_global_pack_roots() {
+fn tool_paths_allow_external_reads_but_reject_external_writes() {
     let _guard = env_lock();
     let root = temp_test_dir("tool-path-reject-root");
     let home = temp_test_dir("tool-path-reject-home");
@@ -236,11 +236,28 @@ fn tool_paths_reject_non_project_non_global_pack_roots() {
         std::env::set_var("DEXT_HOME", &home);
     }
 
+    let read_canonical = canonicalize_read_tool_path(&root, &outside_file.display().to_string())
+        .expect("read tools may inspect outside sandbox");
+    assert_eq!(read_canonical, std::fs::canonicalize(&outside_file).unwrap());
+    let read_output = execute_tool("read_file", &json!({"path": outside_file}), &root)
+        .expect("read_file may inspect outside sandbox");
+    assert!(read_output.contains("1\tnope"), "{read_output}");
+
     let err = canonicalize_tool_path(&root, &outside_file.display().to_string())
-        .expect_err("reject outside file");
+        .expect_err("reject outside write path");
     assert!(
         err.contains("outside sandbox or Dext global pack roots"),
         "{err}"
+    );
+    let write_err = execute_tool(
+        "write_file",
+        &json!({"path": outside_file, "content": "write\n"}),
+        &root,
+    )
+    .expect_err("write_file must stay confined");
+    assert!(
+        write_err.contains("outside sandbox or Dext global pack roots"),
+        "{write_err}"
     );
 
     unsafe {
@@ -2613,6 +2630,14 @@ fn tool_result_metadata_parses_status_and_artifact_hints() {
     assert_eq!(parse_tool_exit_code("rg", true, "match\n"), None);
     assert!(looks_like_verification_command("cargo nextest run ui"));
 
+    let mut noted = failed.to_string();
+    insert_runtime_notes(&mut noted, &["prefer native rg".to_string()]);
+    assert_eq!(parse_tool_exit_code("bash", false, &noted), Some(101));
+    assert!(
+        noted.starts_with("exit: 101\n\n[runtime-note] prefer native rg"),
+        "{noted}"
+    );
+
     let capped = cap_bytes_with_hint(
         "x".repeat(128),
         8,
@@ -4579,7 +4604,8 @@ fn tiny_mode_uses_condensed_prompt_and_slim_env() {
 
     let (stable, env) = agent.compose_system_parts();
     assert!(stable.starts_with(TINY_SYSTEM), "{stable}");
-    assert!(stable.len() < 2_200, "{}", stable.len());
+    assert!(stable.contains("Native tools before bash"), "{stable}");
+    assert!(stable.len() < 2_500, "{}", stable.len());
     assert!(env.contains("context=tiny"), "{env}");
     assert!(env.contains("compact="), "{env}");
     assert!(!env.contains("## Project todos"), "{env}");
@@ -8336,7 +8362,7 @@ fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
     let wired = tools::wire_tools(&[read_file], ToolProfile::Lean);
     assert_eq!(
         wired[0].description,
-        "Read capped line-numbered file window. Prefer offset+limit."
+        "Read capped line-numbered file window. Absolute paths ok read-only; prefer offset+limit."
     );
     assert!(
         wired[0].input_schema.to_string().contains("\"offset\""),
@@ -8348,6 +8374,14 @@ fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
         "{}",
         wired[0].input_schema
     );
+
+    let bash = provider_tool_definitions()
+        .into_iter()
+        .find(|tool| tool.name == "bash")
+        .expect("bash tool");
+    let wired = tools::wire_tools(&[bash], ToolProfile::Lean);
+    assert!(wired[0].description.contains("last-resort"));
+    assert!(wired[0].description.contains("native tool"));
 }
 
 #[test]

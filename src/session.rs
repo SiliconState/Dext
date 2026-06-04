@@ -66,6 +66,20 @@ fn dext_global_pack_roots() -> Vec<PathBuf> {
         .collect()
 }
 
+pub(crate) fn canonicalize_read_tool_path(
+    root: &Path,
+    user_path: &str,
+) -> std::result::Result<PathBuf, String> {
+    let root = canonicalize_or_clone(root);
+    let expanded = expand_user_path(user_path);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        root.join(expanded)
+    };
+    canonicalize_with_missing_ancestors(&candidate)
+}
+
 pub(crate) fn canonicalize_tool_path(
     root: &Path,
     user_path: &str,
