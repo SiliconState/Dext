@@ -2034,10 +2034,7 @@ async fn run_subagent_runtime(input_path: &Path, output_path: &Path) -> Result<(
     agent.set_sandbox_profile(request.sandbox_profile);
     agent.set_browser_recipe(request.browser_recipe);
     agent.set_thinking_effort(request.thinking_effort);
-    agent.context_mode = request.context_mode;
-    if request.context_mode.is_tiny() && request.system.as_deref().unwrap_or("").trim().is_empty() {
-        agent.system = TINY_SYSTEM.to_string();
-    }
+    agent.set_context_mode(request.context_mode);
     agent.tool_context_profile = request.tool_context_profile.effective(request.context_mode);
     agent.tool_profile = request.tool_profile;
     agent.set_budget_cap(request.budget_cap);
@@ -2258,6 +2255,15 @@ struct TrackOrigin {
     created_at: u64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+struct WorkMapFocusState {
+    source_session: String,
+    selection: String,
+    mode: String,
+    packet_hash: String,
+    created_at: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkMapKind {
     Intent,
@@ -2288,6 +2294,7 @@ impl WorkMapKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkMapWaypoint {
     id: String,
+    anchor: String,
     kind: WorkMapKind,
     message_start: usize,
     message_end: usize,
@@ -2332,6 +2339,13 @@ impl FocusMode {
         match self {
             Self::Carry(_) => "carry",
             Self::Exact => "exact",
+        }
+    }
+
+    fn carries(&self, item: &str) -> bool {
+        match self {
+            Self::Exact => false,
+            Self::Carry(items) => items.iter().any(|i| i.eq_ignore_ascii_case(item)),
         }
     }
 }
@@ -7615,6 +7629,18 @@ pub(crate) enum ContextMode {
     Tiny,
 }
 
+fn context_mode_startup_line(mode: ContextMode) -> Option<&'static str> {
+    match mode {
+        ContextMode::Standard => None,
+        ContextMode::Frugal => Some(
+            "[context] frugal mode — lean schemas, smaller toolset, smaller caps, deterministic compaction",
+        ),
+        ContextMode::Tiny => Some(
+            "[context] tiny mode — lean schemas, tiny prompt/env, smallest caps, deterministic compaction",
+        ),
+    }
+}
+
 impl ContextMode {
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -7875,6 +7901,7 @@ struct WorkLedger {
     verification: Vec<VerificationRecord>,
     diagnostics: Vec<WorkflowDiagnosticRecord>,
     next_actions: Vec<String>,
+    active_focus: Option<WorkMapFocusState>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -10567,6 +10594,22 @@ impl Agent {
         state.disabled_for_turn = tool_policy::output_has_auth_failure_markers(text);
     }
 
+    fn set_context_mode(&mut self, mode: ContextMode) {
+        let switching_to_tiny = mode.is_tiny();
+        self.context_mode = mode;
+        self.tool_context_profile = self.tool_context_profile.effective(mode);
+        if mode.is_frugal() {
+            self.tool_profile = ToolProfile::Lean;
+        }
+        if switching_to_tiny {
+            if self.system == DEFAULT_SYSTEM {
+                self.system = TINY_SYSTEM.to_string();
+            }
+        } else if self.system == TINY_SYSTEM {
+            self.system = DEFAULT_SYSTEM.to_string();
+        }
+    }
+
     fn tool_context_profile(&self) -> ToolContextProfile {
         self.tool_context_profile.effective(self.context_mode)
     }
@@ -10600,9 +10643,9 @@ impl Agent {
         tools::wire_tools_oai(&self.tools, self.wire_tool_profile())
     }
 
-    fn tool_use_ids_in_history(&self) -> HashSet<String> {
+    fn tool_use_ids_in_messages(messages: &[Message]) -> HashSet<String> {
         let mut ids = HashSet::new();
-        for m in &self.history {
+        for m in messages {
             for b in &m.content {
                 if let Block::ToolUse { id, .. } = b {
                     ids.insert(id.clone());
@@ -10612,15 +10655,34 @@ impl Agent {
         ids
     }
 
+    fn provider_context_history(&self) -> &[Message] {
+        if self.work_ledger.active_focus.is_none() {
+            return &self.history;
+        }
+        let Some(start) = self.history.iter().rposition(|m| {
+            m.role == "user"
+                && m.content.iter().any(|b| match b {
+                    Block::Text { text } | Block::PartialStream { text } => {
+                        text.starts_with("[dext focus packet loaded]")
+                    }
+                    _ => false,
+                })
+        }) else {
+            return &self.history;
+        };
+        &self.history[start..]
+    }
+
     fn history_to_oai_messages(&self, system_text: &str) -> Vec<OaiMessage> {
-        let valid_ids = self.tool_use_ids_in_history();
+        let history = self.provider_context_history();
+        let valid_ids = Self::tool_use_ids_in_messages(history);
         let mut msgs = vec![OaiMessage {
             role: "system".to_string(),
             content: Some(system_text.to_string()),
             tool_calls: None,
             tool_call_id: None,
         }];
-        for m in &self.history {
+        for m in history {
             match m.role.as_str() {
                 "user" => {
                     let texts: Vec<&str> = m
@@ -10730,11 +10792,12 @@ impl Agent {
     }
 
     fn history_to_chatgpt_input(&self) -> Vec<Value> {
-        let valid_ids = self.tool_use_ids_in_history();
+        let history = self.provider_context_history();
+        let valid_ids = Self::tool_use_ids_in_messages(history);
         let mut items = Vec::new();
         let mut msg_counter = 0usize;
 
-        for msg in &self.history {
+        for msg in history {
             for block in &msg.content {
                 match block {
                     Block::Text { text } if text.trim().is_empty() => continue,
@@ -10859,7 +10922,8 @@ impl Agent {
                         kind: "enabled",
                         budget_tokens,
                     });
-                let messages = strip_tool_result_metadata(&self.history);
+                let history = self.provider_context_history();
+                let messages = strip_tool_result_metadata(history);
                 let body = Request {
                     model: &self.model,
                     max_tokens,
@@ -11053,6 +11117,7 @@ impl Agent {
             "after_user_message" | "after_compact" | "outer_loop_autosave"
         );
         if !critical
+            && !matches!(reason, "after_focus" | "after_focus_clear")
             && let Some(last) = self.last_checkpoint_at
             && last.elapsed() < checkpoint_debounce()
         {
@@ -11205,7 +11270,10 @@ impl Agent {
     }
 
     fn estimated_context_tokens_from_history(&self) -> u64 {
-        self.history.iter().map(message_approx_tokens).sum()
+        self.provider_context_history()
+            .iter()
+            .map(message_approx_tokens)
+            .sum()
     }
 
     fn history_chars(&self) -> usize {
@@ -14889,6 +14957,7 @@ fn add_work_map_waypoint(
     }
     waypoints.push(WorkMapWaypoint {
         id: String::new(),
+        anchor: String::new(),
         kind,
         message_start,
         message_end,
@@ -14897,6 +14966,20 @@ fn add_work_map_waypoint(
         commands: commands_out,
         status,
     });
+}
+
+fn work_map_anchor_for(waypoint: &WorkMapWaypoint) -> String {
+    let raw = format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        waypoint.kind.as_str(),
+        waypoint.message_start,
+        waypoint.message_end,
+        waypoint.summary,
+        waypoint.files.join("\u{1f}"),
+        waypoint.commands.join("\u{1f}"),
+        waypoint.status.as_deref().unwrap_or_default()
+    );
+    format!("@{}", &sha256_hex_str(&raw)[..8])
 }
 
 fn assign_work_map_ids(waypoints: &mut [WorkMapWaypoint]) {
@@ -14910,6 +14993,7 @@ fn assign_work_map_ids(waypoints: &mut [WorkMapWaypoint]) {
     });
     for (idx, waypoint) in waypoints.iter_mut().enumerate() {
         waypoint.id = format!("@w{:02}", idx + 1);
+        waypoint.anchor = work_map_anchor_for(waypoint);
     }
 }
 
@@ -15103,15 +15187,30 @@ fn parse_waypoint_number(raw: &str) -> Option<usize> {
     number.parse::<usize>().ok()?.checked_sub(1)
 }
 
+fn resolve_work_map_token(raw: &str, map: &WorkMap) -> Option<usize> {
+    if let Some(idx) = parse_waypoint_number(raw) {
+        return Some(idx);
+    }
+    let needle = raw.trim().trim_start_matches('@');
+    if needle.is_empty() {
+        return None;
+    }
+    map.waypoints.iter().position(|wp| {
+        wp.anchor.trim_start_matches('@') == needle
+            || wp.anchor == raw.trim()
+            || wp.id == raw.trim()
+    })
+}
+
 fn parse_work_map_selection(raw: &str, map: &WorkMap) -> Result<WorkMapSelection> {
     let raw = raw.trim();
     if raw.is_empty() {
-        anyhow::bail!("missing waypoint id (example: @w03 or @w03..@w08)");
+        anyhow::bail!("missing waypoint id (example: @w03, @a1b2c3d4, or @w03..@w08)");
     }
     let (start_raw, end_raw) = raw.split_once("..").unwrap_or((raw, raw));
-    let start = parse_waypoint_number(start_raw)
+    let start = resolve_work_map_token(start_raw, map)
         .ok_or_else(|| anyhow::anyhow!("invalid waypoint id '{start_raw}'"))?;
-    let end = parse_waypoint_number(end_raw)
+    let end = resolve_work_map_token(end_raw, map)
         .ok_or_else(|| anyhow::anyhow!("invalid waypoint id '{end_raw}'"))?;
     if start >= map.waypoints.len() || end >= map.waypoints.len() {
         anyhow::bail!(
@@ -15129,7 +15228,175 @@ fn work_map_waypoint_ids(map: &WorkMap) -> Vec<String> {
     map.waypoints.iter().map(|wp| wp.id.clone()).collect()
 }
 
-fn render_work_map(map: &WorkMap) -> String {
+fn work_map_waypoint_ids_for_view(map: &WorkMap, filters: &[WorkMapFilter]) -> Vec<String> {
+    map.waypoints
+        .iter()
+        .filter(|wp| work_map_filter_matches(map, wp, filters))
+        .map(|wp| wp.id.clone())
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorkMapFilter {
+    Kind(WorkMapKind),
+    File(String),
+    Query(String),
+}
+
+fn parse_work_map_filter_args_with_default(
+    args: &[String],
+    default_selector: &str,
+) -> Result<(String, Vec<WorkMapFilter>)> {
+    let mut selector: Option<String> = None;
+    let mut filters = Vec::new();
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        match arg {
+            "current" | "this" | "memory" | "latest" if selector.is_none() => {
+                selector = Some(arg.to_string());
+                idx += 1;
+            }
+            "all" => {
+                idx += 1;
+            }
+            "intent" | "intents" => {
+                filters.push(WorkMapFilter::Kind(WorkMapKind::Intent));
+                idx += 1;
+            }
+            "evidence" | "read" | "reads" => {
+                filters.push(WorkMapFilter::Kind(WorkMapKind::Evidence));
+                idx += 1;
+            }
+            "change" | "changes" | "write" | "writes" => {
+                filters.push(WorkMapFilter::Kind(WorkMapKind::Change));
+                idx += 1;
+            }
+            "failure" | "failures" | "blocked" | "errors" => {
+                filters.push(WorkMapFilter::Kind(WorkMapKind::Failure));
+                idx += 1;
+            }
+            "verify" | "verification" | "tests" => {
+                filters.push(WorkMapFilter::Kind(WorkMapKind::Verify));
+                idx += 1;
+            }
+            "decision" | "decisions" => {
+                filters.push(WorkMapFilter::Kind(WorkMapKind::Decision));
+                idx += 1;
+            }
+            "compact" | "compactions" => {
+                filters.push(WorkMapFilter::Kind(WorkMapKind::Compact));
+                idx += 1;
+            }
+            "result" | "results" => {
+                filters.push(WorkMapFilter::Kind(WorkMapKind::Result));
+                idx += 1;
+            }
+            "file" => {
+                let Some(path) = args.get(idx + 1) else {
+                    anyhow::bail!("usage: /map file <path-fragment>");
+                };
+                filters.push(WorkMapFilter::File(path.clone()));
+                idx += 2;
+            }
+            "query" | "search" | "grep" => {
+                let rest = args[idx + 1..].join(" ");
+                if rest.trim().is_empty() {
+                    anyhow::bail!("usage: /map query <text>");
+                }
+                filters.push(WorkMapFilter::Query(rest));
+                break;
+            }
+            other if selector.is_none() => {
+                selector = Some(other.to_string());
+                idx += 1;
+            }
+            other => {
+                filters.push(WorkMapFilter::Query(other.to_string()));
+                idx += 1;
+            }
+        }
+    }
+    Ok((
+        selector.unwrap_or_else(|| default_selector.to_string()),
+        filters,
+    ))
+}
+
+fn parse_work_map_filter_args(args: &[String]) -> Result<(String, Vec<WorkMapFilter>)> {
+    parse_work_map_filter_args_with_default(args, "current")
+}
+
+fn work_map_filter_matches(
+    map: &WorkMap,
+    waypoint: &WorkMapWaypoint,
+    filters: &[WorkMapFilter],
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let kind_filters = filters
+        .iter()
+        .filter_map(|filter| match filter {
+            WorkMapFilter::Kind(kind) => Some(*kind),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !kind_filters.is_empty() && !kind_filters.contains(&waypoint.kind) {
+        return false;
+    }
+    filters.iter().all(|filter| match filter {
+        WorkMapFilter::Kind(_) => true,
+        WorkMapFilter::File(needle) => {
+            let needle = needle.to_ascii_lowercase();
+            waypoint
+                .files
+                .iter()
+                .any(|file| file.to_ascii_lowercase().contains(&needle))
+                || waypoint.summary.to_ascii_lowercase().contains(&needle)
+        }
+        WorkMapFilter::Query(needle) => {
+            let needle = needle.to_ascii_lowercase();
+            waypoint.id.to_ascii_lowercase().contains(&needle)
+                || waypoint.anchor.to_ascii_lowercase().contains(&needle)
+                || waypoint.kind.as_str().contains(&needle)
+                || waypoint.summary.to_ascii_lowercase().contains(&needle)
+                || waypoint
+                    .files
+                    .iter()
+                    .any(|file| file.to_ascii_lowercase().contains(&needle))
+                || waypoint
+                    .commands
+                    .iter()
+                    .any(|cmd| cmd.to_ascii_lowercase().contains(&needle))
+                || map
+                    .header
+                    .work_ledger
+                    .objective
+                    .to_ascii_lowercase()
+                    .contains(&needle)
+        }
+    })
+}
+
+fn work_map_filter_label(filters: &[WorkMapFilter]) -> Option<String> {
+    if filters.is_empty() {
+        return None;
+    }
+    Some(
+        filters
+            .iter()
+            .map(|filter| match filter {
+                WorkMapFilter::Kind(kind) => kind.as_str().to_string(),
+                WorkMapFilter::File(path) => format!("file={path}"),
+                WorkMapFilter::Query(query) => format!("query={query}"),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+fn render_work_map(map: &WorkMap, filters: &[WorkMapFilter]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let provider = if map.header.provenance.provider.is_empty() {
@@ -15156,10 +15423,35 @@ fn render_work_map(map: &WorkMap) -> String {
             summarize_inline(&origin.packet_hash, 16)
         );
     }
+    let visible = map
+        .waypoints
+        .iter()
+        .filter(|wp| work_map_filter_matches(map, wp, filters))
+        .collect::<Vec<_>>();
+    if let Some(label) = work_map_filter_label(filters) {
+        let _ = writeln!(
+            out,
+            "filter {label} · showing {}/{}",
+            visible.len(),
+            map.waypoints.len()
+        );
+    }
+    if let Some(focus) = &map.header.work_ledger.active_focus {
+        let _ = writeln!(
+            out,
+            "active focus: {} {} mode={} packet={}",
+            focus.source_session,
+            focus.selection,
+            focus.mode,
+            summarize_inline(&focus.packet_hash, 16)
+        );
+    }
     if map.waypoints.is_empty() {
         let _ = writeln!(out, "(no waypoints found yet)");
+    } else if visible.is_empty() {
+        let _ = writeln!(out, "(no waypoints match filter)");
     } else {
-        for wp in map.waypoints.iter().take(SLASH_LIST_LIMIT) {
+        for wp in visible {
             let status = wp
                 .status
                 .as_deref()
@@ -15172,11 +15464,8 @@ fn render_work_map(map: &WorkMap) -> String {
             if let Some(command) = wp.commands.first() {
                 extra.push(format!("cmd {command}"));
             }
-            let extra = if extra.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", extra.join(" · "))
-            };
+            extra.push(format!("anchor {}", wp.anchor));
+            let extra = format!(" · {}", extra.join(" · "));
             let _ = writeln!(
                 out,
                 "{} {:8} {:>10}{}  {}{}",
@@ -15188,17 +15477,10 @@ fn render_work_map(map: &WorkMap) -> String {
                 extra
             );
         }
-        if map.waypoints.len() > SLASH_LIST_LIMIT {
-            let _ = writeln!(
-                out,
-                "… [{} more waypoints omitted]",
-                map.waypoints.len() - SLASH_LIST_LIMIT
-            );
-        }
     }
     let _ = write!(
         out,
-        "commands: /packet @wNN · /focus @wNN · /track open @wNN [name]"
+        "commands: ↑/↓ or PgUp/PgDn navigate · Enter focus now · f insert focus · p packet · t track · z zoom/filter (/map failures|changes|verify|file <path>|query <text>)"
     );
     out
 }
@@ -15239,6 +15521,14 @@ fn render_bullets(out: &mut String, title: &str, items: &[String], limit: usize)
 }
 
 fn render_work_map_packet(map: &WorkMap, selection: &WorkMapSelection) -> String {
+    render_work_map_packet_with_mode(map, selection, None)
+}
+
+fn render_work_map_packet_with_mode(
+    map: &WorkMap,
+    selection: &WorkMapSelection,
+    mode: Option<&FocusMode>,
+) -> String {
     use std::fmt::Write as _;
     let waypoints = selected_waypoints(map, selection);
     let mut out = String::new();
@@ -15259,7 +15549,27 @@ fn render_work_map_packet(map: &WorkMap, selection: &WorkMapSelection) -> String
             origin.source_session, origin.source_waypoint, origin.mode
         );
     }
-    if !map.header.work_ledger.objective.trim().is_empty() {
+
+    let broad_packet = mode.is_none();
+    let carry_mode = matches!(mode, Some(FocusMode::Carry(_)));
+    let include_objective = broad_packet || carry_mode;
+    let include_decisions =
+        broad_packet || mode.is_some_and(|m| m.carries("decisions") || m.carries("decision"));
+    let include_failures = broad_packet
+        || mode
+            .is_some_and(|m| m.carries("failures") || m.carries("failure") || m.carries("blocked"));
+    let include_files =
+        broad_packet || mode.is_some_and(|m| m.carries("files") || m.carries("file"));
+    let include_commands =
+        broad_packet || mode.is_some_and(|m| m.carries("commands") || m.carries("cmd"));
+    let include_verification = broad_packet
+        || mode.is_some_and(|m| {
+            m.carries("verify") || m.carries("verification") || m.carries("tests")
+        });
+    let include_constraints =
+        broad_packet || mode.is_some_and(|m| m.carries("constraints") || m.carries("constraint"));
+
+    if include_objective && !map.header.work_ledger.objective.trim().is_empty() {
         let _ = writeln!(out, "Intent:");
         let _ = writeln!(out, "- {}", map.header.work_ledger.objective.trim());
     }
@@ -15273,47 +15583,72 @@ fn render_work_map_packet(map: &WorkMap, selection: &WorkMapSelection) -> String
                 .unwrap_or_default();
             let _ = writeln!(
                 out,
-                "- {} {} {}{}: {}",
+                "- {} {} {}{} anchor={}: {}",
                 wp.id,
                 wp.kind.as_str(),
                 wp.display_range(),
                 status,
+                wp.anchor,
                 wp.summary
             );
         }
     }
-    let files = collect_waypoint_items(waypoints, |wp| &wp.files);
-    let commands = collect_waypoint_items(waypoints, |wp| &wp.commands);
-    let decisions = map
-        .header
-        .work_ledger
-        .decisions
-        .iter()
-        .map(|s| summarize_inline(s, 220))
-        .collect::<Vec<_>>();
-    let failures = waypoints
+
+    let mut files = collect_waypoint_items(waypoints, |wp| &wp.files);
+    if include_files {
+        for file in &map.header.work_ledger.files_changed {
+            push_unique_limited(&mut files, file.clone(), 24);
+        }
+    }
+    let mut commands = collect_waypoint_items(waypoints, |wp| &wp.commands);
+    if include_commands {
+        for record in &map.header.work_ledger.verification {
+            push_unique_limited(&mut commands, record.command.clone(), 24);
+        }
+    }
+    let decisions = if include_decisions {
+        map.header
+            .work_ledger
+            .decisions
+            .iter()
+            .map(|s| summarize_inline(s, 220))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut failures = waypoints
         .iter()
         .filter(|wp| wp.kind == WorkMapKind::Failure)
         .map(|wp| wp.summary.clone())
-        .chain(map.header.work_ledger.blocked.iter().cloned())
         .collect::<Vec<_>>();
-    let verification = waypoints
+    if include_failures {
+        for blocked in &map.header.work_ledger.blocked {
+            push_unique_limited(&mut failures, blocked.clone(), 24);
+        }
+    }
+    let mut verification = waypoints
         .iter()
         .filter(|wp| wp.kind == WorkMapKind::Verify)
         .map(|wp| {
             let status = wp.status.as_deref().unwrap_or("unknown");
             format!("{}: {status}", wp.summary)
         })
-        .chain(map.header.work_ledger.verification.iter().map(|v| {
-            format!(
-                "{}: {} exit={:?} artifact={}",
-                v.name,
-                v.status,
-                v.exit_code,
-                v.artifact.clone().unwrap_or_else(|| "(none)".to_string())
-            )
-        }))
         .collect::<Vec<_>>();
+    if include_verification {
+        for v in &map.header.work_ledger.verification {
+            push_unique_limited(
+                &mut verification,
+                format!(
+                    "{}: {} exit={:?} artifact={}",
+                    v.name,
+                    v.status,
+                    v.exit_code,
+                    v.artifact.clone().unwrap_or_else(|| "(none)".to_string())
+                ),
+                24,
+            );
+        }
+    }
     let evidence = waypoints
         .iter()
         .filter(|wp| wp.kind == WorkMapKind::Evidence)
@@ -15325,11 +15660,30 @@ fn render_work_map_packet(map: &WorkMap, selection: &WorkMapSelection) -> String
     render_bullets(&mut out, "Verification", &verification, 12);
     render_bullets(&mut out, "Decisions", &decisions, 12);
     render_bullets(&mut out, "Failures/blockers", &failures, 12);
+    if include_constraints && !map.header.work_ledger.constraints.is_empty() {
+        render_bullets(
+            &mut out,
+            "Session constraints",
+            &map.header.work_ledger.constraints,
+            12,
+        );
+    }
     let _ = writeln!(out, "Constraints:");
     let _ = writeln!(
         out,
         "- Focus changes model context only; it does not rewind files, git state, or later logs."
     );
+    if matches!(mode, Some(FocusMode::Exact)) {
+        let _ = writeln!(
+            out,
+            "- Exact focus withholds prior session history from model context after activation; only this packet and later messages are sent."
+        );
+    } else if carry_mode {
+        let _ = writeln!(
+            out,
+            "- Carry focus withholds prior raw history and carries only the requested ledger categories plus selected waypoints."
+        );
+    }
     if map.header.browser_recipe == BrowserRecipe::AgentBrowser {
         let _ = writeln!(
             out,
@@ -15342,7 +15696,7 @@ fn render_work_map_packet(map: &WorkMap, selection: &WorkMapSelection) -> String
 fn parse_focus_mode(args: &[String]) -> FocusMode {
     let mut carry: Vec<String> = vec!["failures".into(), "decisions".into(), "files".into()];
     for arg in args {
-        if arg == "--exact" || arg == "exact" {
+        if arg == "--exact" || arg == "exact" || arg == "--isolate" || arg == "isolate" {
             return FocusMode::Exact;
         }
         if let Some(raw) = arg
@@ -15377,17 +15731,55 @@ fn render_work_map_focus(map: &WorkMap, selection: &WorkMapSelection, mode: &Foc
         out,
         "Safety: focus changes model context only; it does not rewind files, git state, or later logs."
     );
-    if let FocusMode::Carry(items) = mode {
-        let carry = if items.is_empty() {
-            "(none)".to_string()
-        } else {
-            items.join(",")
-        };
-        let _ = writeln!(out, "Carry-forward: {carry}");
+    match mode {
+        FocusMode::Exact => {
+            let _ = writeln!(
+                out,
+                "Scope: exact focus isolates future provider context to this packet and later turns."
+            );
+        }
+        FocusMode::Carry(items) => {
+            let carry = if items.is_empty() {
+                "(none)".to_string()
+            } else {
+                items.join(",")
+            };
+            let _ = writeln!(out, "Carry-forward: {carry}");
+        }
     }
     out.push('\n');
-    out.push_str(&render_work_map_packet(map, selection));
+    out.push_str(&render_work_map_packet_with_mode(
+        map,
+        selection,
+        Some(mode),
+    ));
     out
+}
+
+fn activate_work_map_focus(
+    agent: &mut Agent,
+    map: &WorkMap,
+    selection: &WorkMapSelection,
+    mode: &FocusMode,
+) -> String {
+    let text = render_work_map_focus(map, selection, mode);
+    let selected = selected_waypoints(map, selection);
+    let selection_label = work_map_selection_label(selected);
+    agent.work_ledger.active_focus = Some(WorkMapFocusState {
+        source_session: map.source.clone(),
+        selection: selection_label,
+        mode: mode.label().to_string(),
+        packet_hash: sha256_hex_str(&text),
+        created_at: unix_timestamp_secs(),
+    });
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: format!("[dext focus packet loaded]\n{text}"),
+        }],
+    });
+    agent.checkpoint_latest_session("after_focus");
+    text
 }
 
 fn parse_work_map_command_args(raw: &str) -> Vec<String> {
@@ -15417,6 +15809,10 @@ fn current_work_map(agent: &Agent, label: &str) -> WorkMap {
 
 fn looks_like_waypoint_token(raw: &str) -> bool {
     parse_waypoint_number(raw).is_some()
+        || raw
+            .trim()
+            .strip_prefix('@')
+            .is_some_and(|rest| rest.len() >= 6 && rest.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn parse_work_map_operation_args<'a>(
@@ -15434,11 +15830,18 @@ fn parse_work_map_operation_args<'a>(
     if args[..id_pos].len() > 1 {
         anyhow::bail!("expected at most one session selector before waypoint id");
     }
-    let mode_args = args[id_pos + 1..]
-        .iter()
-        .filter(|arg| arg.starts_with("--") || matches!(arg.as_str(), "exact"))
-        .cloned()
-        .collect();
+    let mut selector = selector;
+    let selector_from_before = id_pos > 0;
+    let mut mode_args = Vec::new();
+    for arg in &args[id_pos + 1..] {
+        if arg.starts_with("--") || matches!(arg.as_str(), "exact" | "isolate") {
+            mode_args.push(arg.clone());
+        } else if !selector_from_before && selector == default_selector {
+            selector = arg.as_str();
+        } else {
+            anyhow::bail!("unexpected argument after waypoint id: {arg}");
+        }
+    }
     Ok((id, selector, mode_args))
 }
 
@@ -15460,7 +15863,7 @@ fn parse_track_open_args<'a>(
     let mut name: Option<&str> = None;
     let mut mode_args = Vec::new();
     for arg in &args[id_pos + 1..] {
-        if arg.starts_with("--") || matches!(arg.as_str(), "exact") {
+        if arg.starts_with("--") || matches!(arg.as_str(), "exact" | "isolate") {
             mode_args.push(arg.clone());
         } else if name.is_none() {
             name = Some(arg.as_str());
@@ -16121,9 +16524,11 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                     Ok(Some(0))
                 }
                 "map" => {
-                    let selector = argv.get(2).map(|s| s.as_str()).unwrap_or("latest");
-                    let (_, map) = load_work_map_for_selector(&root, selector)?;
-                    println!("{}", render_work_map(&map));
+                    let args = parse_work_map_command_args(&argv[2..].join(" "));
+                    let (selector, filters) =
+                        parse_work_map_filter_args_with_default(&args, "latest")?;
+                    let (_, map) = load_work_map_for_selector(&root, &selector)?;
+                    println!("{}", render_work_map(&map, &filters));
                     Ok(Some(0))
                 }
                 "packet" => {
@@ -16179,7 +16584,7 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                 },
                 _ => {
                     eprintln!(
-                        "usage: dext session [list|map [session]|packet [session] @wNN|focus [session] @wNN [--exact]|tracks|track open [session] @wNN [name]|export [latest|NAME|PATH] [html|jsonl] [OUT]|analyze [latest|NAME|PATH]|grep <text> [session]|failures [session]|verify-log [session]|decisions [session]]"
+                        "usage: dext session [list|map [session] [failures|changes|verify|file PATH|query TEXT]|packet [session] @wNN|focus [session] @wNN [--exact]|tracks|track open [session] @wNN [name]|export [latest|NAME|PATH] [html|jsonl] [OUT]|analyze [latest|NAME|PATH]|grep <text> [session]|failures [session]|verify-log [session]|decisions [session]]"
                     );
                     Ok(Some(2))
                 }
@@ -16384,18 +16789,25 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 w,
                 "  /resume [name]            load the project latest or a named session"
             );
-            let _ = writeln!(w, "  /map [session]            show Work Map waypoints");
             let _ = writeln!(
                 w,
-                "  /packet @wNN [session]    show evidence packet for waypoint/range"
+                "  /map [session] [filter]    open full Work Map drawer; filters: failures|changes|verify|file <path>|query <text>"
             );
             let _ = writeln!(
                 w,
-                "  /focus @wNN [--exact]     seed context from waypoint with safety notice"
+                "  /packet @wNN [session]    show evidence packet for waypoint/range (also accepts session before id)"
+            );
+            let _ = writeln!(
+                w,
+                "  /focus @wNN [--exact]     activate focus; exact isolates future model context; /focus clear restores full context"
             );
             let _ = writeln!(
                 w,
                 "  /track open @wNN [name]   create continuation session; /tracks lists them"
+            );
+            let _ = writeln!(
+                w,
+                "    Work Map drawer keys: ↑/↓/PgUp/PgDn/Home/End navigate · Enter focus now · f insert focus · p packet · t track · z filter · Esc close"
             );
             let _ = writeln!(
                 w,
@@ -16445,6 +16857,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "reset" => {
             let n = agent.history.len();
             agent.history.clear();
+            agent.work_ledger.active_focus = None;
             agent.clear_pending_login();
             let _ = std::fs::remove_file(&agent.latest_session_path);
             let _ = writeln!(w, "cleared {n} messages");
@@ -16879,11 +17292,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
                 let _ = writeln!(w, "context mode: {}", agent.context_mode.as_str());
             } else if let Some(mode) = ContextMode::parse(arg) {
-                agent.context_mode = mode;
-                agent.tool_context_profile = agent.tool_context_profile.effective(mode);
-                if mode.is_frugal() {
-                    agent.tool_profile = ToolProfile::Lean;
-                }
+                agent.set_context_mode(mode);
                 agent.refresh_tools_for_context();
                 let _ = writeln!(
                     w,
@@ -17094,18 +17503,17 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
         }
         "map" => {
-            let selector = if arg.trim().is_empty() {
-                "current"
-            } else {
-                arg.trim()
-            };
-            match choose_work_map_source(&agent.sandbox_root, selector, Some(agent)) {
-                Ok((_source, map)) => emit_work_map_event(
+            let args = parse_work_map_command_args(arg);
+            match parse_work_map_filter_args(&args).and_then(|(selector, filters)| {
+                let (_, map) = choose_work_map_source(&agent.sandbox_root, &selector, Some(agent))?;
+                Ok((selector, filters, map))
+            }) {
+                Ok((selector, filters, map)) => emit_work_map_event(
                     agent.sink.as_mut(),
                     WorkMapEventKind::Map,
-                    render_work_map(&map),
-                    work_map_waypoint_ids(&map),
-                    work_map_event_selector(selector),
+                    render_work_map(&map, &filters),
+                    work_map_waypoint_ids_for_view(&map, &filters),
+                    work_map_event_selector(&selector),
                 ),
                 Err(e) => {
                     let _ = writeln!(w, "[err] {e:#}");
@@ -17132,33 +17540,36 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
         }
         "focus" => {
-            let args = parse_work_map_command_args(arg);
-            match parse_work_map_operation_args(&args, "current").and_then(
-                |(id, selector, mode_args)| {
-                    let (_, map) =
-                        choose_work_map_source(&agent.sandbox_root, selector, Some(agent))?;
-                    let selection = parse_work_map_selection(id, &map)?;
-                    Ok((map, selection, parse_focus_mode(&mode_args), selector))
-                },
-            ) {
-                Ok((map, selection, mode, selector)) => {
-                    let text = render_work_map_focus(&map, &selection, &mode);
-                    agent.history.push(Message {
-                        role: "user".to_string(),
-                        content: vec![Block::Text {
-                            text: format!("[dext focus packet loaded]\n{text}"),
-                        }],
-                    });
-                    emit_work_map_event(
-                        agent.sink.as_mut(),
-                        WorkMapEventKind::Focus,
-                        text,
-                        work_map_waypoint_ids(&map),
-                        work_map_event_selector(selector),
-                    );
-                }
-                Err(e) => {
-                    let _ = writeln!(w, "[err] {e:#}\nusage: /focus @wNN [--exact]");
+            if matches!(arg.trim(), "clear" | "off" | "reset") {
+                agent.work_ledger.active_focus = None;
+                agent.checkpoint_latest_session("after_focus_clear");
+                let _ = writeln!(w, "focus cleared; full session history is active again");
+            } else {
+                let args = parse_work_map_command_args(arg);
+                match parse_work_map_operation_args(&args, "current").and_then(
+                    |(id, selector, mode_args)| {
+                        let (_, map) =
+                            choose_work_map_source(&agent.sandbox_root, selector, Some(agent))?;
+                        let selection = parse_work_map_selection(id, &map)?;
+                        Ok((map, selection, parse_focus_mode(&mode_args), selector))
+                    },
+                ) {
+                    Ok((map, selection, mode, selector)) => {
+                        let text = activate_work_map_focus(agent, &map, &selection, &mode);
+                        emit_work_map_event(
+                            agent.sink.as_mut(),
+                            WorkMapEventKind::Focus,
+                            text,
+                            work_map_waypoint_ids(&map),
+                            work_map_event_selector(selector),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            w,
+                            "[err] {e:#}\nusage: /focus @wNN [session] [--exact|--carry=failures,decisions,files] or /focus clear"
+                        );
+                    }
                 }
             }
         }
@@ -17248,14 +17659,18 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     let _ = write!(w, "{}", render_session_listing(&agent.sandbox_root));
                 }
                 "map" => {
-                    let selector = if rest.is_empty() { "current" } else { rest };
-                    match choose_work_map_source(&agent.sandbox_root, selector, Some(agent)) {
-                        Ok((_source, map)) => emit_work_map_event(
+                    let args = parse_work_map_command_args(rest);
+                    match parse_work_map_filter_args(&args).and_then(|(selector, filters)| {
+                        let (_, map) =
+                            choose_work_map_source(&agent.sandbox_root, &selector, Some(agent))?;
+                        Ok((selector, filters, map))
+                    }) {
+                        Ok((selector, filters, map)) => emit_work_map_event(
                             agent.sink.as_mut(),
                             WorkMapEventKind::Map,
-                            render_work_map(&map),
-                            work_map_waypoint_ids(&map),
-                            work_map_event_selector(selector),
+                            render_work_map(&map, &filters),
+                            work_map_waypoint_ids_for_view(&map, &filters),
+                            work_map_event_selector(&selector),
                         ),
                         Err(e) => {
                             let _ = writeln!(w, "[err] {e:#}");
@@ -17295,16 +17710,21 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                             Ok((map, selection, parse_focus_mode(&mode_args), selector))
                         },
                     ) {
-                        Ok((map, selection, mode, selector)) => emit_work_map_event(
-                            agent.sink.as_mut(),
-                            WorkMapEventKind::Focus,
-                            render_work_map_focus(&map, &selection, &mode),
-                            work_map_waypoint_ids(&map),
-                            work_map_event_selector(selector),
-                        ),
+                        Ok((map, selection, mode, selector)) => {
+                            let text = activate_work_map_focus(agent, &map, &selection, &mode);
+                            emit_work_map_event(
+                                agent.sink.as_mut(),
+                                WorkMapEventKind::Focus,
+                                text,
+                                work_map_waypoint_ids(&map),
+                                work_map_event_selector(selector),
+                            )
+                        }
                         Err(e) => {
-                            let _ =
-                                writeln!(w, "[err] {e:#}\nusage: /sessions focus @wNN [--exact]");
+                            let _ = writeln!(
+                                w,
+                                "[err] {e:#}\nusage: /sessions focus @wNN [session] [--exact]"
+                            );
                         }
                     }
                 }
@@ -18300,6 +18720,13 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     thinking_effort = Some(ThinkingEffort::Medium);
                 }
             }
+            "--tiny" => {
+                context_mode = Some(ContextMode::Tiny);
+                tool_profile = Some(ToolProfile::Lean);
+                if thinking_effort.is_none() {
+                    thinking_effort = Some(ThinkingEffort::Medium);
+                }
+            }
             "--context-mode" => {
                 i += 1;
                 let value = argv.get(i).ok_or_else(|| {
@@ -18791,7 +19218,7 @@ async fn main() -> Result<()> {
         println!(
             "       dext --frugal        minimize prompt/tool/history context for lower token cost"
         );
-        println!("       dext --context-mode tiny      skinny local mode with condensed prompt");
+        println!("       dext --tiny          extra-light context mode with condensed prompt");
         println!("       dext --context-mode standard|frugal|tiny");
         println!("       dext --toolset default|full  choose provider-visible tool count profile");
         println!("       dext --tool-context-profile default|full  alias for --toolset");
@@ -18869,11 +19296,7 @@ async fn main() -> Result<()> {
         agent.set_thinking_effort(effort);
     }
     if let Some(mode) = opts.context_mode {
-        agent.context_mode = mode;
-        agent.tool_context_profile = agent.tool_context_profile.effective(mode);
-        if mode.is_frugal() {
-            agent.tool_profile = ToolProfile::Lean;
-        }
+        agent.set_context_mode(mode);
     }
     if let Some(profile) = opts.tool_context_profile {
         agent.tool_context_profile = profile.effective(agent.context_mode);
@@ -18901,11 +19324,7 @@ async fn main() -> Result<()> {
         match agent.load_latest_session() {
             Ok(path) => {
                 if let Some(mode) = opts.context_mode {
-                    agent.context_mode = mode;
-                    agent.tool_context_profile = agent.tool_context_profile.effective(mode);
-                    if mode.is_frugal() {
-                        agent.tool_profile = ToolProfile::Lean;
-                    }
+                    agent.set_context_mode(mode);
                 }
                 if let Some(profile) = opts.tool_context_profile {
                     agent.tool_context_profile = profile.effective(agent.context_mode);
@@ -18961,10 +19380,8 @@ async fn main() -> Result<()> {
         if agent.sandbox_profile() != SandboxProfile::WorkspaceWrite {
             eprintln!("[sandbox] profile {}", agent.sandbox_profile().as_str());
         }
-        if agent.context_mode.is_frugal() {
-            eprintln!(
-                "[context] frugal mode — lean schemas, smaller toolset, smaller caps, deterministic compaction"
-            );
+        if let Some(line) = context_mode_startup_line(agent.context_mode) {
+            eprintln!("{line}");
         } else if agent.tool_context_profile() != ToolContextProfile::Default {
             eprintln!("[tools] toolset {}", agent.tool_context_profile().as_str());
         }

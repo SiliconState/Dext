@@ -30,12 +30,12 @@ use tui_markdown::{
 
 use crate::provider::{curated_provider_models, provider_has_available_credentials};
 use crate::{
-    Agent, AgentEvent, ApprovalProfile, Choice, EventSink, HISTORY_CHAR_BUDGET_END_TURN_PERCENT,
-    ThinkingEffort, Usage, WorkMapEventKind, canonical_provider_id, git_summary, handle_slash,
-    history_char_budget_with_window, load_auth_store, load_provider_catalog, model_context_window,
-    orchestrator::ExternalTelemetry, parse_active_runtime_control_sequence, parse_compact_slash,
-    provider_auth_status, resolve_active_provider_id, summarize_call,
-    text_line_looks_like_pseudo_tool_syntax,
+    Agent, AgentEvent, ApprovalProfile, Choice, ContextMode, EventSink,
+    HISTORY_CHAR_BUDGET_END_TURN_PERCENT, ThinkingEffort, Usage, WorkMapEventKind,
+    canonical_provider_id, git_summary, handle_slash, history_char_budget_with_window,
+    load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
+    parse_active_runtime_control_sequence, parse_compact_slash, provider_auth_status,
+    resolve_active_provider_id, summarize_call, text_line_looks_like_pseudo_tool_syntax,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
@@ -44,11 +44,11 @@ const COLLAPSED_PREVIEW_LINES: usize = 4;
 const TOOL_DENSITY_SEPARATOR_EVERY: usize = 10;
 const RG_LINE_TRUNCATE_CELLS: usize = 220;
 const TRANSCRIPT_WRAP_GUARD_COLS: u16 = 1;
-const INPUT_MAX_PANEL_ROWS: u16 = 12;
+const INPUT_MAX_PANEL_ROWS: u16 = 24;
 const PASTE_WORD_THRESHOLD: usize = 50;
 const CONTEXT_BAR_CELLS: usize = 10;
-const WORK_MAP_DRAWER_MAX_ROWS: usize = 10;
-const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 8;
+const WORK_MAP_DRAWER_MAX_ROWS: usize = 20;
+const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 18;
 const WORK_MAP_DRAWER_MIN_EDITOR_ROWS: usize = 1;
 const THINKING_BG: Color = Color::Indexed(235);
 const STEERING_BG: Color = Color::Indexed(236);
@@ -148,6 +148,13 @@ struct WorkMapDrawer {
     selector: Option<String>,
     selected: usize,
     scroll: usize,
+    filter_input: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ActiveFocusLabel {
+    selection: String,
+    mode: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -836,6 +843,7 @@ struct TuiState {
     provider_label: String,
     api_family: String,
     auth_source: String,
+    context_mode: ContextMode,
     last_retry_reason: Option<String>,
     workaround_fired: bool,
     assistant_prefix_seen: bool,
@@ -844,6 +852,7 @@ struct TuiState {
     turn_start_at: Option<Instant>,
     todo_progress: Option<TodoProgress>,
     work_map: Option<WorkMapDrawer>,
+    active_focus: Option<ActiveFocusLabel>,
     detached_subagent: Option<DetachedSubagent>,
     debug_events: VecDeque<String>,
 }
@@ -908,6 +917,7 @@ impl TuiState {
             frame_count: 0,
             approval_profile,
             thinking_effort,
+            context_mode: ContextMode::Standard,
             last_expandable: None,
             show_help: false,
             show_status_details: false,
@@ -939,6 +949,7 @@ impl TuiState {
             turn_start_at: None,
             todo_progress: None,
             work_map: None,
+            active_focus: None,
             detached_subagent: None,
             debug_events: VecDeque::new(),
         }
@@ -1678,6 +1689,9 @@ impl TuiState {
                 context_window,
                 last_retry_reason,
                 workaround_fired,
+                context_mode,
+                tool_profile: _,
+                compacted: _,
                 ..
             } => {
                 self.push_debug_event(format!(
@@ -1691,6 +1705,9 @@ impl TuiState {
                     self.context_window_tokens = context_window;
                 }
                 self.last_retry_reason = last_retry_reason;
+                if let Some(context_mode) = context_mode {
+                    self.context_mode = context_mode;
+                }
                 self.workaround_fired = workaround_fired;
             }
             AgentEvent::ThinkingEffortChanged { effort } => {
@@ -1752,6 +1769,9 @@ impl TuiState {
                 self.live_tools.clear();
                 self.sub_batch = None;
                 self.agent_busy = false;
+                if s.starts_with("focus cleared;") || s.starts_with("cleared ") {
+                    self.active_focus = None;
+                }
                 self.status = phase_status_text(&s).unwrap_or_else(|| "ready".into());
                 if let Some(ds) = parse_detached_subagent_launch(&s) {
                     self.detached_subagent = Some(ds);
@@ -1777,6 +1797,9 @@ impl TuiState {
                 self.live_tools.clear();
                 self.sub_batch = None;
                 self.agent_busy = false;
+                if matches!(kind, WorkMapEventKind::Focus) {
+                    self.active_focus = parse_work_map_focus_label(&text);
+                }
                 let visible_ids = visible_work_map_ids(&text, &waypoint_ids);
                 if matches!(kind, WorkMapEventKind::Map) && !visible_ids.is_empty() {
                     self.work_map = Some(WorkMapDrawer {
@@ -1785,8 +1808,9 @@ impl TuiState {
                         selector,
                         selected: 0,
                         scroll: 0,
+                        filter_input: false,
                     });
-                    self.status = "work map open in composer: ↑/↓ select · Enter focus · p packet · t track · Esc close"
+                    self.status = "work map open: ↑/↓/PgUp/PgDn navigate · Enter focus now · f insert · p packet · t track · z filter · Esc close"
                         .into();
                 } else {
                     self.work_map = None;
@@ -2284,6 +2308,16 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
         Style::default().fg(Color::Magenta),
     ));
 
+    if state.context_mode.is_frugal() {
+        spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
+        let (label, color) = if state.context_mode.is_tiny() {
+            ("tiny", Color::LightYellow)
+        } else {
+            ("frugal", Color::Yellow)
+        };
+        spans.push(Span::styled(label, Style::default().fg(color)));
+    }
+
     match state.approval_profile {
         ApprovalProfile::Ask | ApprovalProfile::Always => {}
         profile => {
@@ -2296,6 +2330,17 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
                 Style::default().fg(Color::Yellow),
             ));
         }
+    }
+
+    if let Some(focus) = &state.active_focus {
+        spans.push(Span::styled(
+            " │ focus ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("{} {}", clamp_chars(&focus.selection, 18), focus.mode),
+            Style::default().fg(Color::Yellow),
+        ));
     }
 
     if let Some((_, _, pct, color)) = context_usage(state) {
@@ -2672,6 +2717,16 @@ fn replace_last_permission_entry(items: &mut [Line_], replacement: Line_) -> boo
     } else {
         false
     }
+}
+
+fn parse_work_map_focus_label(text: &str) -> Option<ActiveFocusLabel> {
+    let first = text.lines().next()?.trim();
+    let body = first.strip_prefix("[dext focus ")?.strip_suffix(']')?;
+    let (selection, mode) = body.split_once(" mode=")?;
+    Some(ActiveFocusLabel {
+        selection: selection.trim().to_string(),
+        mode: mode.trim().to_string(),
+    })
 }
 
 fn visible_work_map_ids(text: &str, waypoint_ids: &[String]) -> Vec<String> {
@@ -5701,7 +5756,7 @@ fn push_work_map_lines(
             if waypoint_ids.is_empty() {
                 "printed in transcript".to_string()
             } else {
-                "↑/↓ select · Enter focus · p packet · t track · Esc close".to_string()
+                "↑/↓/PgUp/PgDn navigate · Enter focus now · f insert · p packet · t track · z filter · Esc close".to_string()
             },
             Style::default().fg(Color::DarkGray),
         ),
@@ -6082,7 +6137,15 @@ fn input_hint_text(state: &TuiState) -> &'static str {
     if state.pending_perm.is_some() {
         "y once · a always · n deny"
     } else if state.work_map_is_active() {
-        "Enter focus · p packet · t track · Esc close"
+        if state
+            .work_map
+            .as_ref()
+            .is_some_and(|drawer| drawer.filter_input)
+        {
+            "type filter · Enter opens filtered map · Esc cancel"
+        } else {
+            "Enter focus now · f insert · p packet · t track · z filter · Esc close"
+        }
     } else if state.input_display_override.is_some() {
         "paste preview · Enter sends full input"
     } else {
@@ -6568,7 +6631,7 @@ fn work_map_drawer_lines(state: &mut TuiState, width: u16, height: usize) -> Vec
     };
     lines.push(Line::from(Span::styled(
         clamp_chars(
-            &format!("  {scroll_hint}Enter focus · p packet · t track · Esc close"),
+            &format!("  {scroll_hint}Enter focus now · f insert · p packet · t track · z filter · Esc close"),
             inner_width,
         ),
         Style::default().fg(Color::DarkGray),
@@ -6591,6 +6654,18 @@ fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
             Style::default().fg(Color::Cyan),
         ),
     ]));
+    if let Some(focus) = &state.active_focus {
+        lines.push(Line::from(vec![
+            Span::styled("Focus  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                clamp_chars(
+                    &format!("{} {}", focus.selection, focus.mode),
+                    inner.saturating_sub(7),
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
     if let Some((ctx_used, window, pct, color)) = context_usage(state) {
         lines.push(Line::from(vec![
             Span::styled("Context ", Style::default().fg(Color::DarkGray)),
@@ -6954,83 +7029,149 @@ fn insert_command_into_input(state: &mut TuiState, command: String) {
     state.clear_slash_completion_selection();
 }
 
-fn handle_work_map_key(state: &mut TuiState, key: KeyEvent) -> bool {
+fn work_map_command_prefix(drawer: &WorkMapDrawer) -> String {
+    if let Some(selector) = drawer.selector.as_deref().filter(|s| !s.trim().is_empty()) {
+        format!("/map {} ", selector.trim())
+    } else {
+        "/map ".to_string()
+    }
+}
+
+fn handle_work_map_key(
+    state: &mut TuiState,
+    key: KeyEvent,
+    agent_input: &tokio::sync::mpsc::UnboundedSender<FromTui>,
+) -> bool {
     if !state.work_map_is_active() {
         return false;
     }
-    match key.code {
-        KeyCode::Esc => {
-            state.work_map = None;
-            state.status = "work map drawer closed".to_string();
-            true
-        }
-        KeyCode::Up => {
-            if state.move_work_map_selection(-1) {
-                state.status = "work map selection moved".to_string();
+    if state
+        .work_map
+        .as_ref()
+        .is_some_and(|drawer| drawer.filter_input)
+    {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(drawer) = state.work_map.as_mut() {
+                    drawer.filter_input = false;
+                }
+                state.status = "work map filter canceled".to_string();
+                true
             }
-            true
-        }
-        KeyCode::Down => {
-            if state.move_work_map_selection(1) {
-                state.status = "work map selection moved".to_string();
-            }
-            true
-        }
-        KeyCode::PageUp => {
-            let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
-            if state.move_work_map_selection_for_rows(-step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
-                state.status = "work map selection moved".to_string();
-            }
-            true
-        }
-        KeyCode::PageDown => {
-            let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
-            if state.move_work_map_selection_for_rows(step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
-                state.status = "work map selection moved".to_string();
-            }
-            true
-        }
-        KeyCode::Home => {
-            state.set_work_map_selection(0);
-            state.status = "work map selection moved".to_string();
-            true
-        }
-        KeyCode::End => {
-            if let Some(last) = state
-                .work_map
-                .as_ref()
-                .map(|drawer| drawer.waypoint_ids.len().saturating_sub(1))
-            {
-                state.set_work_map_selection(last);
-                state.status = "work map selection moved".to_string();
-            }
-            true
-        }
-        KeyCode::Enter | KeyCode::Char('f') | KeyCode::Char('F') => {
-            if let Some(arg) = state.selected_work_map_command_arg() {
-                insert_command_into_input(state, format!("/focus {arg}"));
+            KeyCode::Enter => {
+                let command = state.input.trim().to_string();
+                if command.is_empty() {
+                    return true;
+                }
                 state.work_map = None;
-                state.status = "inserted /focus command".to_string();
+                state.clear_slash_completion_selection();
+                state.status = "opening filtered work map".to_string();
+                let _ = agent_input.send(FromTui::Submit(command));
+                state.clear_input();
+                true
             }
-            true
+            _ => false,
         }
-        KeyCode::Char('p') | KeyCode::Char('P') => {
-            if let Some(arg) = state.selected_work_map_command_arg() {
-                insert_command_into_input(state, format!("/packet {arg}"));
+    } else {
+        match key.code {
+            KeyCode::Esc => {
                 state.work_map = None;
-                state.status = "inserted /packet command".to_string();
+                state.status = "work map drawer closed".to_string();
+                true
             }
-            true
-        }
-        KeyCode::Char('t') | KeyCode::Char('T') => {
-            if let Some(arg) = state.selected_work_map_command_arg() {
-                insert_command_into_input(state, format!("/track open {arg}"));
-                state.work_map = None;
-                state.status = "inserted /track command".to_string();
+            KeyCode::Up => {
+                if state.move_work_map_selection(-1) {
+                    state.status = "work map selection moved".to_string();
+                }
+                true
             }
-            true
+            KeyCode::Down => {
+                if state.move_work_map_selection(1) {
+                    state.status = "work map selection moved".to_string();
+                }
+                true
+            }
+            KeyCode::PageUp => {
+                let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
+                if state.move_work_map_selection_for_rows(-step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
+                    state.status = "work map selection moved".to_string();
+                }
+                true
+            }
+            KeyCode::PageDown => {
+                let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
+                if state.move_work_map_selection_for_rows(step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
+                    state.status = "work map selection moved".to_string();
+                }
+                true
+            }
+            KeyCode::Home => {
+                state.set_work_map_selection(0);
+                state.status = "work map selection moved".to_string();
+                true
+            }
+            KeyCode::End => {
+                if let Some(last) = state
+                    .work_map
+                    .as_ref()
+                    .map(|drawer| drawer.waypoint_ids.len().saturating_sub(1))
+                {
+                    state.set_work_map_selection(last);
+                    state.status = "work map selection moved".to_string();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if let Some(arg) = state.selected_work_map_command_arg() {
+                    state.work_map = None;
+                    state.clear_slash_completion_selection();
+                    state.status = "activating work map focus".to_string();
+                    let _ = agent_input.send(FromTui::Submit(format!("/focus {arg}")));
+                }
+                true
+            }
+            KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('i') | KeyCode::Char('I') => {
+                if let Some(arg) = state.selected_work_map_command_arg() {
+                    insert_command_into_input(state, format!("/focus {arg}"));
+                    state.work_map = None;
+                    state.status = "inserted /focus command".to_string();
+                }
+                true
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                if let Some(arg) = state.selected_work_map_command_arg() {
+                    state.work_map = None;
+                    state.clear_slash_completion_selection();
+                    state.status = "opening work map packet".to_string();
+                    let _ = agent_input.send(FromTui::Submit(format!("/packet {arg}")));
+                }
+                true
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                if let Some(arg) = state.selected_work_map_command_arg() {
+                    insert_command_into_input(state, format!("/track open {arg}"));
+                    state.work_map = None;
+                    state.status = "inserted /track command".to_string();
+                }
+                true
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('/') => {
+                let prefix = state
+                    .work_map
+                    .as_ref()
+                    .map(work_map_command_prefix)
+                    .unwrap_or_else(|| "/map ".to_string());
+                if let Some(drawer) = state.work_map.as_mut() {
+                    drawer.filter_input = true;
+                }
+                state.replace_input(prefix);
+                state.status =
+                    "work map filter: type failures|changes|verify|file <path>|query <text>"
+                        .to_string();
+                true
+            }
+            _ => false,
         }
-        _ => false,
     }
 }
 
@@ -7062,7 +7203,7 @@ fn handle_key(
     if key.kind != KeyEventKind::Press {
         return;
     }
-    if state.work_map_is_active() && handle_work_map_key(state, key) {
+    if state.work_map_is_active() && handle_work_map_key(state, key, agent_input) {
         return;
     }
     if state.pending_perm.is_some() {
@@ -7551,6 +7692,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let sandbox = agent.sandbox_root.display().to_string();
     let approval_profile = agent.approval_profile();
     let thinking_effort = agent.thinking_effort();
+    let context_mode = agent.context_mode;
     let _guard = TerminalGuard::new()?;
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
@@ -7593,17 +7735,25 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         approval_profile,
         thinking_effort,
     );
+    state.context_mode = context_mode;
     let mode_label = match state.approval_profile {
         ApprovalProfile::Always => "trust",
         ApprovalProfile::Ask => "guarded",
         profile => profile.as_str(),
     };
     let banner = format!(
-        "🐺  Dext v{}\nsandbox  {}\nmodel    {}\nmode     {}\nreason   {}\nkeys     Ctrl+C/Esc interrupt · Ctrl+D quit · ? help",
+        "🐺  Dext v{}\nsandbox  {}\nmodel    {}\nmode     {}{}\nreason   {}\nkeys     Ctrl+C/Esc interrupt · Ctrl+D quit · ? help",
         env!("CARGO_PKG_VERSION"),
         clamp_chars(&state.sandbox, 96),
         clamp_chars(&state.model, 40),
         mode_label,
+        if context_mode.is_tiny() {
+            " · context tiny"
+        } else if context_mode.is_frugal() {
+            " · context frugal"
+        } else {
+            ""
+        },
         state.thinking_effort.as_str(),
     );
     state.queue(Line_::Banner(banner));
@@ -8647,9 +8797,11 @@ mod tests {
             "{lines:?}"
         );
 
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FromTui>();
         handle_work_map_key(
             &mut state,
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &tx,
         );
         let lines = flatten_lines(&Text::from(work_map_drawer_lines(&mut state, 80, 4)));
         assert!(
@@ -8659,10 +8811,39 @@ mod tests {
         handle_work_map_key(
             &mut state,
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty()),
+            &tx,
         );
 
-        assert_eq!(state.input, "/packet @w02");
+        assert_eq!(state.input, "");
         assert!(!state.work_map_is_active());
+        match rx.try_recv() {
+            Ok(FromTui::Submit(text)) => assert_eq!(text, "/packet @w02"),
+            _ => panic!("expected packet submit"),
+        }
+
+        state.apply_event(AgentEvent::WorkMap {
+            kind: WorkMapEventKind::Focus,
+            text: "[dext focus @w02 mode=exact]\nSafety: focus changes model context only"
+                .to_string(),
+            waypoint_ids: vec!["@w02".to_string()],
+            selector: None,
+        });
+        assert_eq!(
+            state
+                .active_focus
+                .as_ref()
+                .map(|focus| (focus.selection.as_str(), focus.mode.as_str())),
+            Some(("@w02", "exact"))
+        );
+        let rendered = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+        assert!(rendered.contains("focus @w02 exact"), "{rendered}");
+        state.apply_event(AgentEvent::Slash(
+            "focus cleared; full session history is active again".to_string(),
+        ));
+        assert!(state.active_focus.is_none());
 
         state.input.clear();
         state.cursor = 0;
@@ -8674,9 +8855,45 @@ mod tests {
         });
         handle_work_map_key(
             &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::empty()),
+            &tx,
         );
-        assert_eq!(state.input, "/focus old-session @w01");
+        assert_eq!(state.input, "/map old-session ");
+        assert!(
+            state
+                .work_map
+                .as_ref()
+                .is_some_and(|drawer| drawer.filter_input)
+        );
+        state.insert_input_str("failures");
+        handle_work_map_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        );
+        assert!(!state.work_map_is_active());
+        assert_eq!(state.input, "");
+        match rx.try_recv() {
+            Ok(FromTui::Submit(text)) => assert_eq!(text, "/map old-session failures"),
+            _ => panic!("expected filtered map submit"),
+        }
+
+        state.apply_event(AgentEvent::WorkMap {
+            kind: WorkMapEventKind::Map,
+            text: "Work map — old-session\n@w01 intent #1  first".to_string(),
+            waypoint_ids: vec!["@w01".to_string()],
+            selector: Some("old-session".to_string()),
+        });
+        handle_work_map_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+        );
+        assert_eq!(state.input, "");
+        match rx.try_recv() {
+            Ok(FromTui::Submit(text)) => assert_eq!(text, "/focus old-session @w01"),
+            _ => panic!("expected focus submit"),
+        }
     }
 
     #[test]
@@ -9697,6 +9914,58 @@ mod tests {
         assert!(!rendered.contains("chatgpt:chatgpt"), "{rendered}");
         assert!(!rendered.contains("chatgpt-responses"), "{rendered}");
         assert!(rendered.contains("GPT-4o"), "{rendered}");
+    }
+
+    #[test]
+    fn status_spans_render_distinct_tiny_context_label() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.context_mode = ContextMode::Tiny;
+
+        let rendered = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+
+        assert!(rendered.contains(" tiny"), "{rendered}");
+        assert!(!rendered.contains("frugal"), "{rendered}");
+    }
+
+    #[test]
+    fn turn_diagnostics_updates_tui_context_label() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+
+        state.apply_event(AgentEvent::TurnDiagnostics {
+            provider: "test".to_string(),
+            api_family: "test".to_string(),
+            auth_source: "test".to_string(),
+            model: "test-model".to_string(),
+            context_window: None,
+            last_retry_reason: None,
+            workaround_fired: false,
+            turn_duration_ms: None,
+            context_mode: Some(ContextMode::Tiny),
+            tool_profile: None,
+            compacted: None,
+        });
+
+        assert_eq!(state.context_mode, ContextMode::Tiny);
+        let rendered = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+        assert!(rendered.contains("tiny"), "{rendered}");
     }
 
     #[test]

@@ -1169,7 +1169,7 @@ fn build_test_work_map() -> WorkMap {
 #[test]
 fn work_map_derives_waypoints_and_packets() {
     let map = build_test_work_map();
-    let rendered = render_work_map(&map);
+    let rendered = render_work_map(&map, &[]);
     assert!(rendered.contains("Work map"), "{rendered}");
     assert!(rendered.contains("@w"), "{rendered}");
     assert!(
@@ -1211,8 +1211,14 @@ fn work_map_args_accept_waypoint_before_or_after_selector() -> Result<()> {
     let args = parse_work_map_command_args("@w02 latest --exact");
     let (id, selector, mode_args) = parse_work_map_operation_args(&args, "current")?;
     assert_eq!(id, "@w02");
-    assert_eq!(selector, "current");
+    assert_eq!(selector, "latest");
     assert_eq!(mode_args, vec!["--exact".to_string()]);
+
+    let args = parse_work_map_command_args("@w02 --carry=failures,files latest");
+    let (id, selector, mode_args) = parse_work_map_operation_args(&args, "current")?;
+    assert_eq!(id, "@w02");
+    assert_eq!(selector, "latest");
+    assert_eq!(mode_args, vec!["--carry=failures,files".to_string()]);
 
     let args = parse_work_map_command_args("latest @w03 exact");
     let (id, selector, mode_args) = parse_work_map_operation_args(&args, "current")?;
@@ -1226,6 +1232,100 @@ fn work_map_args_accept_waypoint_before_or_after_selector() -> Result<()> {
     assert_eq!(selector, "latest");
     assert_eq!(name, Some("track-name"));
     assert_eq!(mode_args, vec!["--exact".to_string()]);
+    Ok(())
+}
+
+#[test]
+fn work_map_filters_multiple_kinds_as_union_and_narrow_by_query() -> Result<()> {
+    let map = build_test_work_map();
+    let args = parse_work_map_command_args("changes failures");
+    let (selector, filters) = parse_work_map_filter_args(&args)?;
+    assert_eq!(selector, "current");
+
+    let visible = map
+        .waypoints
+        .iter()
+        .filter(|wp| work_map_filter_matches(&map, wp, &filters))
+        .collect::<Vec<_>>();
+    assert!(
+        visible.iter().any(|wp| wp.kind == WorkMapKind::Change),
+        "{visible:?}"
+    );
+    assert!(
+        visible.iter().any(|wp| wp.kind == WorkMapKind::Failure),
+        "{visible:?}"
+    );
+    assert!(
+        visible
+            .iter()
+            .all(|wp| matches!(wp.kind, WorkMapKind::Change | WorkMapKind::Failure)),
+        "{visible:?}"
+    );
+    let rendered = render_work_map(&map, &filters);
+    assert!(rendered.contains("filter change,failure"), "{rendered}");
+
+    let args = parse_work_map_command_args("failures query cargo");
+    let (_, filters) = parse_work_map_filter_args(&args)?;
+    let visible = map
+        .waypoints
+        .iter()
+        .filter(|wp| work_map_filter_matches(&map, wp, &filters))
+        .collect::<Vec<_>>();
+    assert!(!visible.is_empty(), "expected cargo failure waypoint");
+    assert!(
+        visible.iter().all(|wp| wp.kind == WorkMapKind::Failure),
+        "{visible:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn work_map_active_focus_limits_future_provider_context() -> Result<()> {
+    let root = temp_test_dir("work-map-active-focus");
+    let mut agent = test_agent(&root);
+    agent.suppress_checkpoints = true;
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "older request outside focus".to_string(),
+        }],
+    });
+    agent.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "older answer outside focus".to_string(),
+        }],
+    });
+
+    let map = build_test_work_map();
+    let selection = parse_work_map_selection("@w01", &map)?;
+    let focus = activate_work_map_focus(&mut agent, &map, &selection, &FocusMode::Exact);
+    assert!(focus.contains("mode=exact"), "{focus}");
+    assert!(agent.work_ledger.active_focus.is_some());
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "new request inside focus".to_string(),
+        }],
+    });
+
+    let context = agent.provider_context_history();
+    assert_eq!(context.len(), 2);
+    let first = match &context[0].content[0] {
+        Block::Text { text } => text,
+        other => panic!("unexpected focus context block: {other:?}"),
+    };
+    assert!(first.starts_with("[dext focus packet loaded]"), "{first}");
+    let rendered = agent
+        .history_to_chatgpt_input()
+        .into_iter()
+        .map(|item| item.to_string())
+        .collect::<String>();
+    assert!(
+        !rendered.contains("older request outside focus"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("new request inside focus"), "{rendered}");
     Ok(())
 }
 
@@ -5373,7 +5473,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--sandbox-profile=read-only".to_string(),
         "--browser=agent-browser".to_string(),
         "--frugal".to_string(),
-        "--context-mode=tiny".to_string(),
+        "--tiny".to_string(),
         "--tool-context-profile=full".to_string(),
         "--tool-profile=default".to_string(),
         format!("@{}", task_file.display()),
@@ -5398,6 +5498,49 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         vec!["from file".to_string(), "tail".to_string()]
     );
     let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn tiny_context_mode_sets_distinct_banner_and_system_prompt() {
+    let root = temp_test_dir("tiny-mode-banner");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.system = DEFAULT_SYSTEM.to_string();
+
+    agent.set_context_mode(ContextMode::Tiny);
+
+    assert!(agent.context_mode.is_tiny());
+    assert_eq!(agent.system, TINY_SYSTEM);
+    let tiny_line = context_mode_startup_line(agent.context_mode).expect("tiny context line");
+    assert!(tiny_line.contains("tiny mode"), "{tiny_line}");
+    assert!(!tiny_line.contains("frugal mode"), "{tiny_line}");
+
+    agent.set_context_mode(ContextMode::Frugal);
+    let frugal_line = context_mode_startup_line(agent.context_mode).expect("frugal context line");
+    assert!(frugal_line.contains("frugal mode"), "{frugal_line}");
+    assert!(!frugal_line.contains("tiny mode"), "{frugal_line}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn parse_cli_options_accepts_tiny_alias_without_positional_leak() -> Result<()> {
+    let opts = parse_cli_options(vec!["--tiny".to_string(), "do task".to_string()])?;
+
+    assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
+    assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
+    assert_eq!(opts.thinking_effort, Some(ThinkingEffort::Medium));
+    assert_eq!(opts.positional, vec!["do task".to_string()]);
+    Ok(())
+}
+
+#[test]
+fn parse_cli_options_still_accepts_context_mode_tiny() -> Result<()> {
+    let opts = parse_cli_options(vec!["--context-mode=tiny".to_string()])?;
+
+    assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
+    assert!(opts.positional.is_empty());
     Ok(())
 }
 
