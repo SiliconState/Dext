@@ -238,7 +238,10 @@ fn tool_paths_allow_external_reads_but_reject_external_writes() {
 
     let read_canonical = canonicalize_read_tool_path(&root, &outside_file.display().to_string())
         .expect("read tools may inspect outside sandbox");
-    assert_eq!(read_canonical, std::fs::canonicalize(&outside_file).unwrap());
+    assert_eq!(
+        read_canonical,
+        std::fs::canonicalize(&outside_file).unwrap()
+    );
     let read_output = execute_tool("read_file", &json!({"path": outside_file}), &root)
         .expect("read_file may inspect outside sandbox");
     assert!(read_output.contains("1\tnope"), "{read_output}");
@@ -4829,6 +4832,37 @@ fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
 }
 
 #[test]
+fn tiny_and_frugal_systems_preserve_tool_protocol_guardrails_without_standard_prompt_change() {
+    assert!(
+        !DEFAULT_SYSTEM.contains("Never print raw tool syntax"),
+        "standard prompt should stay unchanged: {DEFAULT_SYSTEM}"
+    );
+
+    let root = temp_test_dir("frugal-tool-protocol-note");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.context_mode = ContextMode::Frugal;
+    let (frugal_stable, _env) = agent.compose_system_parts();
+    assert!(
+        frugal_stable.contains("actual provider tool calls"),
+        "{frugal_stable}"
+    );
+    assert!(
+        frugal_stable.contains("Never print raw tool syntax"),
+        "{frugal_stable}"
+    );
+    assert!(
+        TINY_SYSTEM.contains("real tool calls only"),
+        "{TINY_SYSTEM}"
+    );
+    assert!(
+        TINY_SYSTEM.contains("prefill the TUI input"),
+        "{TINY_SYSTEM}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn context_window_and_history_budget_are_model_aware_and_overridable() {
     let _guard = env_lock();
     clear_cached_local_llama_context_windows();
@@ -8053,6 +8087,12 @@ fn max_output_tokens_reads_positive_env_override() {
 fn pseudo_tool_syntax_detection_marks_plain_text_invalid() {
     assert!(text_contains_pseudo_tool_syntax(
         "I will run this now:\nto=functions.edit_file {\"path\":\"src/main.rs\"}"
+    ));
+    assert!(text_contains_pseudo_tool_syntax(
+        r#"{"recipient_name":"functions.bash","parameters":{"command":"cargo test"}}"#
+    ));
+    assert!(text_contains_pseudo_tool_syntax(
+        r#"{"type":"function_call","name":"bash","arguments":{"command":"cargo test"}}"#
     ));
     assert!(blocks_contain_pseudo_tool_syntax(&[Block::Text {
         text: "tool call: functions.write_file".to_string(),

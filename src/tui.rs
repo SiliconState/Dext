@@ -35,6 +35,7 @@ use crate::{
     history_char_budget_with_window, load_auth_store, load_provider_catalog, model_context_window,
     orchestrator::ExternalTelemetry, parse_active_runtime_control_sequence, parse_compact_slash,
     provider_auth_status, resolve_active_provider_id, summarize_call,
+    text_line_looks_like_pseudo_tool_syntax,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
@@ -1370,21 +1371,23 @@ impl TuiState {
                         self.status = "scroll: live".into();
                     }
                 }
-                let char_count = t.chars().count() as u64;
+                let visible = redact_pseudo_tool_protocol_lines(&t);
+                let char_count = visible.chars().count() as u64;
                 self.stream_chars = self.stream_chars.saturating_add(char_count);
                 self.history_chars = self.history_chars.saturating_add(char_count);
-                self.streaming_text.push_str(&t);
+                self.streaming_text.push_str(&visible);
             }
             AgentEvent::TextBlockComplete(full) => {
                 self.push_debug_event(format!(
                     "assistant block complete · {} chars",
                     full.chars().count()
                 ));
-                if !full.is_empty() {
+                let rendered = redact_pseudo_tool_protocol_lines(&full);
+                if !rendered.is_empty() {
                     let dim_prefix = self.assistant_prefix_seen;
                     self.assistant_prefix_seen = true;
                     self.queue(Line_::Assistant {
-                        text: full,
+                        text: rendered,
                         dim_prefix,
                     });
                 }
@@ -1395,7 +1398,8 @@ impl TuiState {
             AgentEvent::ThinkingDelta(t) => {
                 self.push_debug_event(format!("thinking delta · {} chars", t.chars().count()));
                 self.retry_status = None;
-                self.streaming_thinking.push_str(&t);
+                let visible = redact_pseudo_tool_protocol_lines(&t);
+                self.streaming_thinking.push_str(&visible);
                 if self.streaming_text.is_empty() && self.stream_started_at.is_none() {
                     self.status = "scroll: live".into();
                 }
@@ -2057,10 +2061,38 @@ fn live_indicator_elapsed(state: &TuiState) -> Option<String> {
     started.map(|started| format_elapsed(started.elapsed()))
 }
 
+fn redact_pseudo_tool_protocol_lines(text: &str) -> String {
+    let mut redacted = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if text_line_looks_like_pseudo_tool_syntax(line) {
+            redacted = true;
+            lines.push("[tool call redacted; waiting for structured tool event]".to_string());
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !redacted {
+        return text.to_string();
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn sanitize_live_indicator_detail(detail: &str) -> String {
+    redact_pseudo_tool_protocol_lines(&sanitize_display_text(detail))
+}
+
 fn live_detail_line(detail: String, color: Color, max_cells: usize) -> Line<'static> {
     Line::from(vec![
         Span::styled("  ↳ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(clamp_chars(&detail, max_cells), Style::default().fg(color)),
+        Span::styled(
+            clamp_chars(&sanitize_live_indicator_detail(&detail), max_cells),
+            Style::default().fg(color),
+        ),
     ])
 }
 
@@ -2071,7 +2103,10 @@ fn live_thinking_detail_line(detail: String, max_cells: usize) -> Line<'static> 
             "│ ",
             Style::default().fg(Color::Indexed(244)).bg(THINKING_BG),
         ),
-        Span::styled(clamp_chars(&detail, max_cells), style),
+        Span::styled(
+            clamp_chars(&sanitize_live_indicator_detail(&detail), max_cells),
+            style,
+        ),
     ])
 }
 
@@ -2098,7 +2133,10 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
         if !tail.is_empty() {
             return Some(Line::from(vec![
                 Span::styled("  ▸ ", Style::default().fg(Color::Blue)),
-                Span::styled(clamp_chars(tail, max_cells), Style::default()),
+                Span::styled(
+                    clamp_chars(&sanitize_live_indicator_detail(tail), max_cells),
+                    Style::default(),
+                ),
             ]));
         }
     }
@@ -8233,6 +8271,51 @@ mod tests {
         assert!(lines[0].contains("Responding"));
         assert!(lines[0].contains("12s"));
         assert!(lines[1].contains("final streamed line"));
+    }
+
+    #[test]
+    fn live_indicator_redacts_raw_tool_protocol_text() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.streaming_text = "to=functions.bash {\"command\":\"cargo test\"}".to_string();
+
+        let text = transcript_live_indicator_text(&state, 80).expect("live indicator");
+        let lines = flatten_lines(&text);
+        assert!(
+            lines[1].contains("tool call redacted"),
+            "raw protocol should be hidden from live UI: {lines:?}"
+        );
+        assert!(!lines[1].contains("to=functions"), "{lines:?}");
+        assert!(!lines[1].contains("cargo test"), "{lines:?}");
+    }
+
+    #[test]
+    fn assistant_text_block_redacts_raw_tool_protocol_card() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+
+        state.apply_event(AgentEvent::TextBlockComplete(
+            "to=functions.bash {\"command\":\"cargo test\"}".to_string(),
+        ));
+
+        let Line_::Assistant { text, .. } = state.pending_insert.last().expect("assistant line")
+        else {
+            panic!("expected assistant line");
+        };
+        assert!(text.contains("tool call redacted"), "{text}");
+        assert!(!text.contains("to=functions"), "{text}");
+        assert!(!text.contains("cargo test"), "{text}");
     }
 
     #[test]

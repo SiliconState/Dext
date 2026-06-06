@@ -7372,7 +7372,9 @@ Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid 
 Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.
 Packs: when creating or installing a reusable pack or shelf, default to Dext's user-global scope (`~/.dext/packs` or `~/.dext/shelves/<shelf>/packs`) unless the user explicitly asks for project-local placement.";
 
-const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit, and http when exposed; read-only absolute paths are allowed, writes stay confined; bash only for shell-only orchestration, build/test/install, or gaps. Inspect before edits. Keep output small. Use todo for nontrivial work. Bash is atomic; use supervised dext- services only for requested persistence. Obey [runtime-note] tool-result advisories. Reusable packs default user-global unless asked otherwise. Verify narrowly. Final: changed, tests, gaps.";
+const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Tool protocol: real tool calls only; never print raw to=functions/tool_use/function-call JSON/bash command envelopes or prefill the TUI input. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit, and http when exposed; read-only absolute paths are allowed, writes stay confined; bash only for shell-only orchestration, build/test/install, or gaps. Inspect before edits. Keep output small. Use todo for nontrivial work. Bash is atomic; use supervised dext- services only for requested persistence. Obey [runtime-note] tool-result advisories. Reusable packs default user-global unless asked otherwise. Verify narrowly. Final: changed, tests, gaps.";
+
+const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Tool protocol: invoke tools only through actual provider tool calls. Never print raw tool syntax (`to=functions.*`, `tool_use`, function-call JSON, or bash command envelopes) as assistant text, and never try to prefill the TUI input/composer.";
 
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     let mut sections = Vec::new();
@@ -10004,6 +10006,13 @@ impl Agent {
 
     fn compose_system_details(&self) -> SystemParts {
         let mut stable = self.system.clone();
+        if self.context_mode.is_frugal()
+            && !self.context_mode.is_tiny()
+            && !stable.contains(FRUGAL_TOOL_PROTOCOL_NOTE)
+        {
+            stable.push_str("\n");
+            stable.push_str(FRUGAL_TOOL_PROTOCOL_NOTE);
+        }
         let mut context_budget = if self.context_mode.is_tiny() {
             1_500
         } else if self.context_mode.is_frugal() {
@@ -17790,17 +17799,38 @@ fn assistant_text_has_implementation_commitment(text: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
-fn text_contains_pseudo_tool_syntax(text: &str) -> bool {
-    text.lines().any(|line| {
-        let trimmed = line.trim_start();
-        let lower = trimmed.to_ascii_lowercase();
-        lower.starts_with("to=functions")
-            || lower.starts_with("to = functions")
-            || lower.starts_with("<|tool")
-            || lower.starts_with("tool_use:")
-            || lower.starts_with("tool call:") && lower.contains("functions.")
-            || (lower.contains("to=functions.") || lower.contains("to = functions."))
-    })
+pub(crate) fn text_line_looks_like_pseudo_tool_syntax(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    lower.starts_with("to=functions")
+        || lower.starts_with("to = functions")
+        || lower.starts_with("to=multi_tool_use")
+        || lower.starts_with("to = multi_tool_use")
+        || lower.starts_with("functions.")
+        || lower.starts_with("multi_tool_use.")
+        || lower.starts_with("<|tool")
+        || lower.starts_with("<tool")
+        || lower.starts_with("tool_use")
+        || lower.starts_with("tool call:") && lower.contains("functions.")
+        || lower.starts_with("function_call")
+        || lower.contains("to=functions.")
+        || lower.contains("to = functions.")
+        || lower.contains("to=multi_tool_use.")
+        || lower.contains("to = multi_tool_use.")
+        || compact.contains("\"recipient_name\":\"functions.")
+        || compact.contains("\"recipient_name\":\"multi_tool_use.")
+        || compact.contains("\"parameters\":{\"command\"")
+        || compact.contains("\"input\":{\"command\"")
+        || compact.starts_with("{\"command\":")
+        || compact.contains("\"type\":\"function_call\"")
+        || (compact.contains("\"name\":\"bash\"")
+            && compact.contains("\"arguments\"")
+            && compact.contains("\"command\""))
+}
+
+pub(crate) fn text_contains_pseudo_tool_syntax(text: &str) -> bool {
+    text.lines().any(text_line_looks_like_pseudo_tool_syntax)
 }
 
 fn blocks_contain_pseudo_tool_syntax(blocks: &[Block]) -> bool {
