@@ -348,7 +348,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/trust",
         args: "[on|off|status]",
-        help: "auto-approve all gated tools",
+        help: "auto-approve all privileged tools",
     },
     SlashCmd {
         name: "/approval",
@@ -5195,39 +5195,107 @@ fn push_thinking_body_lines(
     }
 }
 
+fn welcome_context_description(mode: ContextMode) -> &'static str {
+    match mode {
+        ContextMode::Standard => "default schemas and caps",
+        ContextMode::Frugal => {
+            "lean schemas, smaller toolset, smaller caps, deterministic compaction"
+        }
+        ContextMode::Tiny => "lean schemas, smallest caps, deterministic compaction",
+    }
+}
+
+fn welcome_approval_value(profile: ApprovalProfile, auto_approved_count: usize) -> String {
+    let label = match profile {
+        ApprovalProfile::Always => "trust mode",
+        ApprovalProfile::Ask => "ask",
+        ApprovalProfile::AutoRead => "auto-read",
+        ApprovalProfile::AutoWrite => "auto-write",
+        ApprovalProfile::Never => "never",
+    };
+    let suffix = if auto_approved_count == 1 {
+        "privileged tool runs without confirmation"
+    } else {
+        "privileged tools run without confirmation"
+    };
+    if profile == ApprovalProfile::Always {
+        format!("⚠ {label} · {auto_approved_count} {suffix}")
+    } else if auto_approved_count == 0 {
+        label.to_string()
+    } else {
+        format!("{label} · {auto_approved_count} {suffix}")
+    }
+}
+
+fn welcome_banner(
+    sandbox: &str,
+    model: &str,
+    thinking_effort: ThinkingEffort,
+    context_mode: ContextMode,
+    approval_profile: ApprovalProfile,
+    auto_approved_count: usize,
+) -> String {
+    format!(
+        "🐺 Dext v{}\nsandbox\t{}\nmodel\t{} · {} reasoning\ncontext\t{} · {}\napproval\t{}\nkeys\tCtrl+C/Esc interrupt · Ctrl+D quit · ? help",
+        env!("CARGO_PKG_VERSION"),
+        clamp_chars(&home_tilde(sandbox), 96),
+        clamp_chars(model, 40),
+        thinking_effort.as_str(),
+        context_mode.as_str(),
+        welcome_context_description(context_mode),
+        welcome_approval_value(approval_profile, auto_approved_count),
+    )
+}
+
+fn push_welcome_banner_lines(lines: &mut Vec<Line<'static>>, banner: &str) {
+    const LABEL_WIDTH: usize = 10;
+    let mut raw_lines = banner.split('\n');
+    let title = raw_lines.next().unwrap_or("🐺 Dext");
+    let rows: Vec<(&str, &str)> = raw_lines.filter_map(|raw| raw.split_once('\t')).collect();
+    let row_width = rows
+        .iter()
+        .map(|(label, value)| text_width(&format!("{label:<LABEL_WIDTH$}{value}")))
+        .max()
+        .unwrap_or(0)
+        .max(68);
+    let top_static_width = text_width("── ") + text_width(title) + 1;
+    let rule_width = row_width.max(top_static_width + 12);
+    let rule_style = Style::default().fg(Color::DarkGray);
+    let title_style = Style::default();
+    let top_fill = "─".repeat(rule_width.saturating_sub(top_static_width));
+    lines.push(Line::from(vec![
+        Span::styled("── ".to_string(), rule_style),
+        Span::styled(title.to_string(), title_style),
+        Span::styled(format!(" {top_fill}"), rule_style),
+    ]));
+    for (label, value) in rows {
+        let warning = label == "approval" && value.contains('⚠');
+        let row_style = if warning {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let label_style = if warning {
+            row_style
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label:<LABEL_WIDTH$}"), label_style),
+            Span::styled(value.to_string(), row_style),
+        ]));
+    }
+    lines.push(Line::from(vec![Span::styled(
+        "─".repeat(rule_width),
+        rule_style,
+    )]));
+}
+
 fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     match item {
         Line_::Banner(s) => {
-            let rule = "─".repeat(62);
-            lines.push(Line::from(Span::styled(
-                rule.clone(),
-                Style::default().fg(Color::DarkGray),
-            )));
-            for raw in s.split('\n') {
-                if raw.starts_with("🐺") {
-                    lines.push(Line::from(Span::styled(
-                        raw.to_string(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                } else if let Some((label, value)) = raw.split_once("  ") {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{label:<9}"), Style::default().fg(Color::Green)),
-                        Span::styled(value.trim_start().to_string(), Style::default()),
-                    ]));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        raw.to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-            lines.push(Line::from(Span::styled(
-                rule,
-                Style::default().fg(Color::DarkGray),
-            )));
+            push_welcome_banner_lines(&mut lines, s);
         }
         Line_::TurnSep => {
             let sep: String = "─".repeat(60);
@@ -7750,6 +7818,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let approval_profile = agent.approval_profile();
     let thinking_effort = agent.thinking_effort();
     let context_mode = agent.context_mode;
+    let auto_approved_count = agent.auto_approved_privileged_tool_count();
     let _guard = TerminalGuard::new()?;
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
@@ -7793,32 +7862,15 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         thinking_effort,
     );
     state.context_mode = context_mode;
-    let mode_label = match state.approval_profile {
-        ApprovalProfile::Always => "trust",
-        ApprovalProfile::Ask => "guarded",
-        profile => profile.as_str(),
-    };
-    let banner = format!(
-        "🐺  Dext v{}\nsandbox  {}\nmodel    {}\nmode     {}{}\nreason   {}\nkeys     Ctrl+C/Esc interrupt · Ctrl+D quit · ? help",
-        env!("CARGO_PKG_VERSION"),
-        clamp_chars(&state.sandbox, 96),
-        clamp_chars(&state.model, 40),
-        mode_label,
-        if context_mode.is_tiny() {
-            " · context tiny"
-        } else if context_mode.is_frugal() {
-            " · context frugal"
-        } else {
-            ""
-        },
-        state.thinking_effort.as_str(),
+    let banner = welcome_banner(
+        &state.sandbox,
+        &state.model,
+        state.thinking_effort,
+        context_mode,
+        state.approval_profile,
+        auto_approved_count,
     );
     state.queue(Line_::Banner(banner));
-    if state.approval_profile == ApprovalProfile::Always {
-        state.queue(Line_::Warn(
-            "trust mode is active: privileged tools skip confirmation prompts".to_string(),
-        ));
-    }
     if let Some(task) = initial_task {
         state.queue(Line_::User(task.clone()));
         let _ = in_tx.send(FromTui::Submit(task));
@@ -8146,6 +8198,65 @@ mod tests {
             density_rank: 1,
             expanded: false,
         }
+    }
+
+    #[test]
+    fn welcome_banner_renders_titled_card_with_inline_warning() {
+        let banner = welcome_banner(
+            "~/Documents/Projects/Screener",
+            "gpt-5.5",
+            ThinkingEffort::Medium,
+            ContextMode::Tiny,
+            ApprovalProfile::Always,
+            5,
+        );
+        let text = line_to_text(&Line_::Banner(banner), 120);
+        let lines = flatten_lines(&text);
+
+        assert_eq!(lines.len(), 7);
+        assert!(lines[0].starts_with("── 🐺 Dext v"));
+        assert!(!lines.iter().any(|line| line == "🐺 Dext"));
+        assert_eq!(
+            text_width(lines[0].trim_start()),
+            text_width(lines[6].trim_start())
+        );
+        assert!(lines[1].starts_with("sandbox   ~/Documents/Projects/Screener"));
+        assert_eq!(lines[2], "model     gpt-5.5 · medium reasoning");
+        assert_eq!(
+            lines[3],
+            "context   tiny · lean schemas, smallest caps, deterministic compaction"
+        );
+        assert_eq!(
+            lines[4],
+            "approval  ⚠ trust mode · 5 privileged tools run without confirmation"
+        );
+        assert_eq!(
+            lines[5],
+            "keys      Ctrl+C/Esc interrupt · Ctrl+D quit · ? help"
+        );
+        let approval_style = span_style_for(&text, "⚠ trust mode").expect("approval style");
+        assert_eq!(approval_style.fg, Some(Color::Yellow));
+        let title_style = span_style_for(&text, "🐺 Dext").expect("title style");
+        assert_ne!(title_style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn welcome_banner_renders_frugal_context_description() {
+        let banner = welcome_banner(
+            "~/Documents/Projects/Screener",
+            "gpt-5.5",
+            ThinkingEffort::Medium,
+            ContextMode::Frugal,
+            ApprovalProfile::Always,
+            5,
+        );
+        let lines = flatten_lines(&line_to_text(&Line_::Banner(banner), 120));
+
+        assert_eq!(
+            lines[3],
+            "context   frugal · lean schemas, smaller toolset, smaller caps, deterministic compaction"
+        );
+        assert!(!lines.iter().any(|line| line.starts_with("[context]")));
     }
 
     fn flatten_lines(text: &Text<'_>) -> Vec<String> {
@@ -10875,7 +10986,15 @@ mod tests {
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        state.queue(Line_::Banner("🐺  Dext vtest".to_string()));
+        let banner = welcome_banner(
+            "/home/abaka/Documents/Projects/dext",
+            "test-model",
+            ThinkingEffort::Medium,
+            ContextMode::Tiny,
+            ApprovalProfile::Always,
+            5,
+        );
+        state.queue(Line_::Banner(banner));
         flush_pending_insert(&mut terminal, &mut state).expect("flush banner");
 
         let mut first = vec![tool_line(

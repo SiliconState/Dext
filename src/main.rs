@@ -7810,18 +7810,6 @@ pub(crate) enum ContextMode {
     Tiny,
 }
 
-fn context_mode_startup_line(mode: ContextMode) -> Option<&'static str> {
-    match mode {
-        ContextMode::Standard => None,
-        ContextMode::Frugal => Some(
-            "[context] frugal mode — lean schemas, smaller toolset, smaller caps, deterministic compaction",
-        ),
-        ContextMode::Tiny => Some(
-            "[context] tiny mode — lean schemas, tiny prompt/env, smallest caps, deterministic compaction",
-        ),
-    }
-}
-
 impl ContextMode {
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
@@ -9703,14 +9691,14 @@ impl Agent {
 
     fn set_approval_profile(&mut self, profile: ApprovalProfile) -> usize {
         self.approval_profile = profile;
-        let gated: Vec<String> = self
+        let privileged: Vec<String> = self
             .tools
             .iter()
             .filter(|t| needs_permission(t.name))
             .map(|t| t.name.to_string())
             .collect();
         let mut changed = 0usize;
-        for tool in gated {
+        for tool in privileged {
             let did_change = match profile {
                 ApprovalProfile::Always => self.allowed.insert(tool),
                 _ => self.allowed.remove(&tool),
@@ -9891,6 +9879,15 @@ impl Agent {
 
     pub(crate) fn trust_mode_active(&self) -> bool {
         self.approval_profile == ApprovalProfile::Always
+    }
+
+    pub(crate) fn auto_approved_privileged_tool_count(&self) -> usize {
+        self.tools
+            .iter()
+            .filter(|tool| {
+                needs_permission(tool.name) && self.tool_auto_approved(tool.name, &Value::Null)
+            })
+            .count()
     }
 
     pub(crate) fn approval_profile(&self) -> ApprovalProfile {
@@ -13822,9 +13819,9 @@ impl Agent {
                                 self.sink
                                     .emit(AgentEvent::ThinkingBlockComplete(pb.text.clone()));
                             } else if pb.kind == "tool_use" {
-                                let gated =
+                                let privileged =
                                     needs_permission(&pb.name) && !self.allowed.contains(&pb.name);
-                                if !gated {
+                                if !privileged {
                                     let preview_input = parse_tool_input_json(&pb.input_json);
                                     let summary = summarize_call(&pb.name, &preview_input);
                                     let call_id = normalize_tool_call_id(&pb.id, 0, idx);
@@ -16866,7 +16863,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(w, "  /revoke <tool>            remove auto-approval");
             let _ = writeln!(w, "  /allowed                  list auto-approved tools");
-            let _ = writeln!(w, "  /trust [on|off|status]   auto-approve all gated tools");
+            let _ = writeln!(
+                w,
+                "  /trust [on|off|status]   auto-approve all privileged tools"
+            );
             let _ = writeln!(
                 w,
                 "  /privacy [on|off|status]  redact sensitive tool output before model context"
@@ -17139,14 +17139,17 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             "on" => {
                 let changed = agent.set_trust_mode(true);
                 ui_update = SlashUiUpdate::ApprovalProfile;
-                let _ = writeln!(w, "trust ON: {changed} gated tools now auto-approving");
+                let _ = writeln!(
+                    w,
+                    "trust mode on: {changed} privileged tools now auto-approving"
+                );
             }
             "off" => {
                 let changed = agent.set_trust_mode(false);
                 ui_update = SlashUiUpdate::ApprovalProfile;
                 let _ = writeln!(
                     w,
-                    "trust off: {changed} gated tools returned to per-call prompts"
+                    "trust mode off: {changed} privileged tools returned to per-call prompts"
                 );
             }
             _ => {
@@ -19458,7 +19461,7 @@ async fn main() -> Result<()> {
             "       dext --tool-profile lean|full  choose provider tool schema verbosity (default lean)"
         );
         println!("       dext --eval [NAME]    run eval harness (optionally a single case)");
-        println!("       dext --trust          auto-approve gated tools");
+        println!("       dext --trust          auto-approve privileged tools");
         println!("       dext --no-trust       opt out of default trust mode");
         println!("       dext auth ...         provider/model/auth management commands");
         println!("       dext undo --list      list recent Dext checkpoints");
@@ -19597,24 +19600,18 @@ async fn main() -> Result<()> {
         }
     }
     if trust_mode {
-        let changed = agent.set_trust_mode(true);
-        if !opts.output.is_json() {
-            eprintln!("[trust] enabled — {changed} gated tools now auto-approving");
-        }
+        let _ = agent.set_trust_mode(true);
     }
     if !opts.output.is_json() {
         if let Some(cap) = agent.budget_cap {
             eprintln!("[budget] cap {}", cap.line());
         }
-        if agent.approval_profile() != ApprovalProfile::Ask {
-            eprintln!("[approval] profile {}", agent.approval_profile().as_str());
-        }
         if agent.sandbox_profile() != SandboxProfile::WorkspaceWrite {
             eprintln!("[sandbox] profile {}", agent.sandbox_profile().as_str());
         }
-        if let Some(line) = context_mode_startup_line(agent.context_mode) {
-            eprintln!("{line}");
-        } else if agent.tool_context_profile() != ToolContextProfile::Default {
+        if agent.tool_context_profile() != ToolContextProfile::Default
+            && !agent.context_mode.is_frugal()
+        {
             eprintln!("[tools] toolset {}", agent.tool_context_profile().as_str());
         }
         if agent.browser_recipe() != BrowserRecipe::Disabled {

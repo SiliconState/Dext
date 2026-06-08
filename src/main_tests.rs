@@ -2036,18 +2036,18 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
 }
 
 #[test]
-fn trust_mode_toggle_controls_gated_allowlist() {
+fn trust_mode_toggle_controls_privileged_allowlist() {
     let root = temp_test_dir("trust-toggle");
     let mut agent = test_agent(&root);
     assert!(!agent.trust_mode_active());
 
     let enabled = agent.set_trust_mode(true);
-    assert!(enabled > 0, "expected gated tools to be added");
+    assert!(enabled > 0, "expected privileged tools to be added");
     assert!(agent.trust_mode_active());
     assert_eq!(agent.approval_profile(), ApprovalProfile::Always);
 
     let disabled = agent.set_trust_mode(false);
-    assert!(disabled > 0, "expected gated tools to be removed");
+    assert!(disabled > 0, "expected privileged tools to be removed");
     assert!(!agent.trust_mode_active());
     assert_eq!(agent.approval_profile(), ApprovalProfile::Ask);
 
@@ -5579,7 +5579,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
 }
 
 #[test]
-fn tiny_context_mode_sets_distinct_banner_and_system_prompt() {
+fn tiny_context_mode_sets_distinct_system_prompt() {
     let root = temp_test_dir("tiny-mode-banner");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
@@ -5589,14 +5589,10 @@ fn tiny_context_mode_sets_distinct_banner_and_system_prompt() {
 
     assert!(agent.context_mode.is_tiny());
     assert_eq!(agent.system, TINY_SYSTEM);
-    let tiny_line = context_mode_startup_line(agent.context_mode).expect("tiny context line");
-    assert!(tiny_line.contains("tiny mode"), "{tiny_line}");
-    assert!(!tiny_line.contains("frugal mode"), "{tiny_line}");
 
     agent.set_context_mode(ContextMode::Frugal);
-    let frugal_line = context_mode_startup_line(agent.context_mode).expect("frugal context line");
-    assert!(frugal_line.contains("frugal mode"), "{frugal_line}");
-    assert!(!frugal_line.contains("tiny mode"), "{frugal_line}");
+    assert_eq!(agent.context_mode, ContextMode::Frugal);
+    assert_eq!(agent.system, DEFAULT_SYSTEM);
 
     let _ = std::fs::remove_dir_all(&root);
 }
