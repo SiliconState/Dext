@@ -35,7 +35,8 @@ use crate::{
     canonical_provider_id, git_summary, handle_slash, history_char_budget_with_window,
     load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
     parse_active_runtime_control_sequence, parse_compact_slash, provider_auth_status,
-    resolve_active_provider_id, summarize_call, text_line_looks_like_pseudo_tool_syntax,
+    pseudo_tool_redaction_marker, redact_pseudo_tool_protocol_text, resolve_active_provider_id,
+    summarize_call, text_line_looks_like_pseudo_tool_syntax,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
@@ -1345,6 +1346,10 @@ impl TuiState {
         tag
     }
 
+    fn pseudo_tool_display_text(&self, text: &str) -> String {
+        pseudo_tool_protocol_text_for_context(text, self.context_mode)
+    }
+
     fn apply_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::TurnStart => {
@@ -1382,7 +1387,11 @@ impl TuiState {
                         self.status = "scroll: live".into();
                     }
                 }
-                let visible = redact_pseudo_tool_protocol_lines(&t);
+                let visible = if self.context_mode.is_frugal() {
+                    t
+                } else {
+                    legacy_pseudo_tool_protocol_redact_lines(&t)
+                };
                 let char_count = visible.chars().count() as u64;
                 self.stream_chars = self.stream_chars.saturating_add(char_count);
                 self.history_chars = self.history_chars.saturating_add(char_count);
@@ -1393,7 +1402,7 @@ impl TuiState {
                     "assistant block complete · {} chars",
                     full.chars().count()
                 ));
-                let rendered = redact_pseudo_tool_protocol_lines(&full);
+                let rendered = self.pseudo_tool_display_text(&full);
                 if !rendered.is_empty() {
                     let dim_prefix = self.assistant_prefix_seen;
                     self.assistant_prefix_seen = true;
@@ -1409,7 +1418,11 @@ impl TuiState {
             AgentEvent::ThinkingDelta(t) => {
                 self.push_debug_event(format!("thinking delta · {} chars", t.chars().count()));
                 self.retry_status = None;
-                let visible = redact_pseudo_tool_protocol_lines(&t);
+                let visible = if self.context_mode.is_frugal() {
+                    t
+                } else {
+                    legacy_pseudo_tool_protocol_redact_lines(&t)
+                };
                 self.streaming_thinking.push_str(&visible);
                 if self.streaming_text.is_empty() && self.stream_started_at.is_none() {
                     self.status = "scroll: live".into();
@@ -1420,10 +1433,15 @@ impl TuiState {
                     "thinking block complete · {} words",
                     full.split_whitespace().count()
                 ));
-                if !full.is_empty() {
-                    let word_count = full.split_whitespace().count();
+                let rendered = if self.context_mode.is_frugal() {
+                    self.pseudo_tool_display_text(&full)
+                } else {
+                    full
+                };
+                if !rendered.is_empty() {
+                    let word_count = rendered.split_whitespace().count();
                     if self.verbose {
-                        self.queue(Line_::Thinking(full));
+                        self.queue(Line_::Thinking(rendered));
                     }
                     self.status = if self.verbose {
                         format!("thinking visible ({} words)", word_count)
@@ -2085,13 +2103,13 @@ fn live_indicator_elapsed(state: &TuiState) -> Option<String> {
     started.map(|started| format_elapsed(started.elapsed()))
 }
 
-fn redact_pseudo_tool_protocol_lines(text: &str) -> String {
+fn legacy_pseudo_tool_protocol_redact_lines(text: &str) -> String {
     let mut redacted = false;
     let mut lines = Vec::new();
     for line in text.lines() {
         if text_line_looks_like_pseudo_tool_syntax(line) {
             redacted = true;
-            lines.push("[tool call redacted; waiting for structured tool event]".to_string());
+            lines.push(pseudo_tool_redaction_marker().to_string());
         } else {
             lines.push(line.to_string());
         }
@@ -2106,21 +2124,42 @@ fn redact_pseudo_tool_protocol_lines(text: &str) -> String {
     out
 }
 
-fn sanitize_live_indicator_detail(detail: &str) -> String {
-    redact_pseudo_tool_protocol_lines(&sanitize_display_text(detail))
+fn pseudo_tool_protocol_text_for_context(text: &str, context_mode: ContextMode) -> String {
+    if context_mode.is_frugal() {
+        redact_pseudo_tool_protocol_text(text)
+    } else {
+        legacy_pseudo_tool_protocol_redact_lines(text)
+    }
 }
 
-fn live_detail_line(detail: String, color: Color, max_cells: usize) -> Line<'static> {
+fn sanitize_live_indicator_detail(detail: &str, context_mode: ContextMode) -> String {
+    let sanitized = sanitize_display_text(detail);
+    pseudo_tool_protocol_text_for_context(&sanitized, context_mode)
+}
+
+fn live_detail_line(
+    detail: String,
+    color: Color,
+    max_cells: usize,
+    context_mode: ContextMode,
+) -> Line<'static> {
     Line::from(vec![
         Span::styled("  ↳ ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            clamp_chars(&sanitize_live_indicator_detail(&detail), max_cells),
+            clamp_chars(
+                &sanitize_live_indicator_detail(&detail, context_mode),
+                max_cells,
+            ),
             Style::default().fg(color),
         ),
     ])
 }
 
-fn live_thinking_detail_line(detail: String, max_cells: usize) -> Line<'static> {
+fn live_thinking_detail_line(
+    detail: String,
+    max_cells: usize,
+    context_mode: ContextMode,
+) -> Line<'static> {
     let style = Style::default().fg(Color::Gray).bg(THINKING_BG);
     Line::from(vec![
         Span::styled(
@@ -2128,7 +2167,10 @@ fn live_thinking_detail_line(detail: String, max_cells: usize) -> Line<'static> 
             Style::default().fg(Color::Indexed(244)).bg(THINKING_BG),
         ),
         Span::styled(
-            clamp_chars(&sanitize_live_indicator_detail(&detail), max_cells),
+            clamp_chars(
+                &sanitize_live_indicator_detail(&detail, context_mode),
+                max_cells,
+            ),
             style,
         ),
     ])
@@ -2139,7 +2181,7 @@ fn live_indicator_todo_detail(state: &TuiState, max_cells: usize) -> Option<Line
         .todo_progress
         .as_ref()
         .map(todo_progress_label)
-        .map(|detail| live_detail_line(detail, Color::Green, max_cells))
+        .map(|detail| live_detail_line(detail, Color::Green, max_cells, state.context_mode))
 }
 
 fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> {
@@ -2148,17 +2190,21 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
     }
     let max_cells = width.saturating_sub(4) as usize;
     if !state.streaming_text.is_empty() {
-        let tail = state
-            .streaming_text
+        let rendered_text =
+            pseudo_tool_protocol_text_for_context(&state.streaming_text, state.context_mode);
+        let tail = rendered_text
             .lines()
             .last()
-            .unwrap_or(&state.streaming_text)
+            .unwrap_or(rendered_text.as_str())
             .trim();
         if !tail.is_empty() {
             return Some(Line::from(vec![
                 Span::styled("  ▸ ", Style::default().fg(Color::Blue)),
                 Span::styled(
-                    clamp_chars(&sanitize_live_indicator_detail(tail), max_cells),
+                    clamp_chars(
+                        &sanitize_live_indicator_detail(tail, state.context_mode),
+                        max_cells,
+                    ),
                     Style::default(),
                 ),
             ]));
@@ -2176,12 +2222,18 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
                 let task_head = ds.task.chars().take(30).collect::<String>();
                 format!("⟨sub⟩ {task_head}")
             };
-            return Some(live_detail_line(label, Color::Cyan, max_cells));
+            return Some(live_detail_line(
+                label,
+                Color::Cyan,
+                max_cells,
+                state.context_mode,
+            ));
         } else {
             return Some(live_detail_line(
                 "⟨sub⟩ complete".to_string(),
                 Color::Green,
                 max_cells,
+                state.context_mode,
             ));
         }
     }
@@ -2195,6 +2247,7 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
             tool.summary.clone(),
             Color::Reset,
             max_cells,
+            state.context_mode,
         ));
     }
     if let Some(batch) = state
@@ -2211,18 +2264,28 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
         } else {
             format!("batch active · {} entries", batch.entries.len())
         };
-        return Some(live_detail_line(detail, Color::Reset, max_cells));
+        return Some(live_detail_line(
+            detail,
+            Color::Reset,
+            max_cells,
+            state.context_mode,
+        ));
     }
     if state.verbose && !state.streaming_thinking.is_empty() {
-        let tail = state
-            .streaming_thinking
+        let rendered_thinking =
+            pseudo_tool_protocol_text_for_context(&state.streaming_thinking, state.context_mode);
+        let tail = rendered_thinking
             .lines()
             .last()
-            .unwrap_or(&state.streaming_thinking)
+            .unwrap_or(rendered_thinking.as_str())
             .trim();
         if !tail.is_empty() {
             let max_cells = width.saturating_sub(2) as usize;
-            return Some(live_thinking_detail_line(tail.to_string(), max_cells));
+            return Some(live_thinking_detail_line(
+                tail.to_string(),
+                max_cells,
+                state.context_mode,
+            ));
         }
     }
     live_indicator_todo_detail(state, max_cells)
@@ -2307,16 +2370,6 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
         state.thinking_effort.as_str().to_string(),
         Style::default().fg(Color::Magenta),
     ));
-
-    if state.context_mode.is_frugal() {
-        spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
-        let (label, color) = if state.context_mode.is_tiny() {
-            ("tiny", Color::LightYellow)
-        } else {
-            ("frugal", Color::Yellow)
-        };
-        spans.push(Span::styled(label, Style::default().fg(color)));
-    }
 
     match state.approval_profile {
         ApprovalProfile::Ask | ApprovalProfile::Always => {}
@@ -6698,6 +6751,11 @@ fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
         ]));
     }
     if !state.streaming_thinking.is_empty() {
+        let rendered_thinking = if state.context_mode.is_frugal() {
+            pseudo_tool_protocol_text_for_context(&state.streaming_thinking, state.context_mode)
+        } else {
+            state.streaming_thinking.clone()
+        };
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Thinking",
@@ -6705,8 +6763,7 @@ fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         )));
-        let tail = state
-            .streaming_thinking
+        let tail = rendered_thinking
             .lines()
             .rev()
             .take(3)
@@ -8424,30 +8481,53 @@ mod tests {
     }
 
     #[test]
-    fn live_indicator_redacts_raw_tool_protocol_text() {
-        let mut state = TuiState::new(
+    fn live_indicator_keeps_standard_legacy_redaction_and_enhances_frugal() {
+        let mut standard = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        state.agent_busy = true;
-        state.streaming_text = "to=functions.bash {\"command\":\"cargo test\"}".to_string();
+        standard.agent_busy = true;
+        standard.apply_event(AgentEvent::TextDelta("to=".to_string()));
+        standard.apply_event(AgentEvent::TextDelta(
+            "functions.bash {\"command\":\"cargo test\"}".to_string(),
+        ));
+        let text = transcript_live_indicator_text(&standard, 80).expect("live indicator");
+        let lines = flatten_lines(&text);
+        assert!(lines[1].contains("to="), "{lines:?}");
+        assert!(lines[1].contains("tool call redacted"), "{lines:?}");
+        assert!(!lines[1].contains("functions.bash"), "{lines:?}");
+        assert!(!lines[1].contains("cargo test"), "{lines:?}");
 
-        let text = transcript_live_indicator_text(&state, 80).expect("live indicator");
+        let mut frugal = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        frugal.agent_busy = true;
+        frugal.context_mode = ContextMode::Frugal;
+        frugal.apply_event(AgentEvent::TextDelta("to=".to_string()));
+        frugal.apply_event(AgentEvent::TextDelta(
+            "functions.bash {\"command\":\"cargo test\"}".to_string(),
+        ));
+        let text = transcript_live_indicator_text(&frugal, 80).expect("live indicator");
         let lines = flatten_lines(&text);
         assert!(
             lines[1].contains("tool call redacted"),
-            "raw protocol should be hidden from live UI: {lines:?}"
+            "raw protocol should be hidden from frugal live UI: {lines:?}"
         );
-        assert!(!lines[1].contains("to=functions"), "{lines:?}");
+        assert!(!lines[1].contains("to="), "{lines:?}");
+        assert!(!lines[1].contains("functions.bash"), "{lines:?}");
         assert!(!lines[1].contains("cargo test"), "{lines:?}");
     }
 
     #[test]
-    fn assistant_text_block_redacts_raw_tool_protocol_card() {
-        let mut state = TuiState::new(
+    fn assistant_text_block_keeps_standard_legacy_payload_and_redacts_frugal_payload() {
+        let mut standard = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
             ".".to_string(),
@@ -8455,8 +8535,54 @@ mod tests {
             ThinkingEffort::Medium,
         );
 
+        standard.apply_event(AgentEvent::TextBlockComplete(
+            "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}\nDone".to_string(),
+        ));
+
+        let Line_::Assistant { text, .. } = standard.pending_insert.last().expect("assistant line")
+        else {
+            panic!("expected assistant line");
+        };
+        assert!(text.contains("tool call redacted"), "{text}");
+        assert!(text.contains("\"command\""), "{text}");
+        assert!(text.contains("cargo test"), "{text}");
+
+        let mut frugal = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        frugal.context_mode = ContextMode::Frugal;
+        frugal.apply_event(AgentEvent::TextBlockComplete(
+            "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}\nDone".to_string(),
+        ));
+
+        let Line_::Assistant { text, .. } = frugal.pending_insert.last().expect("assistant line")
+        else {
+            panic!("expected assistant line");
+        };
+        assert!(text.contains("tool call redacted"), "{text}");
+        assert!(text.contains("Done"), "{text}");
+        assert!(!text.contains("to=functions"), "{text}");
+        assert!(!text.contains("\"command\""), "{text}");
+        assert!(!text.contains("cargo test"), "{text}");
+    }
+
+    #[test]
+    fn assistant_text_block_redacts_multiline_raw_tool_protocol_payload_in_tiny() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.context_mode = ContextMode::Tiny;
+
         state.apply_event(AgentEvent::TextBlockComplete(
-            "to=functions.bash {\"command\":\"cargo test\"}".to_string(),
+            "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}\nDone".to_string(),
         ));
 
         let Line_::Assistant { text, .. } = state.pending_insert.last().expect("assistant line")
@@ -8464,8 +8590,63 @@ mod tests {
             panic!("expected assistant line");
         };
         assert!(text.contains("tool call redacted"), "{text}");
+        assert!(text.contains("Done"), "{text}");
         assert!(!text.contains("to=functions"), "{text}");
+        assert!(!text.contains("\"command\""), "{text}");
         assert!(!text.contains("cargo test"), "{text}");
+    }
+
+    #[test]
+    fn inspector_keeps_standard_legacy_payload_and_redacts_tiny_payload() {
+        let mut standard = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        standard.streaming_thinking =
+            "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}".to_string();
+
+        let text = inspector_lines(&standard, 100, 20);
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains("command"), "{joined}");
+        assert!(joined.contains("cargo test"), "{joined}");
+
+        let mut tiny = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        tiny.context_mode = ContextMode::Tiny;
+        tiny.streaming_thinking =
+            "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}".to_string();
+        let text = inspector_lines(&tiny, 100, 20);
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains("tool call redacted"), "{joined}");
+        assert!(!joined.contains("to=functions"), "{joined}");
+        assert!(!joined.contains("cargo test"), "{joined}");
+    }
+
+    #[test]
+    fn status_spans_hide_frugal_and_tiny_context_mode_labels() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+
+        state.context_mode = ContextMode::Frugal;
+        let joined = flatten_lines(&Text::from(Line::from(status_spans(&state)))).join("\n");
+        assert!(!joined.contains("frugal"), "{joined}");
+
+        state.context_mode = ContextMode::Tiny;
+        let joined = flatten_lines(&Text::from(Line::from(status_spans(&state)))).join("\n");
+        assert!(!joined.contains("tiny"), "{joined}");
     }
 
     #[test]
@@ -9917,7 +10098,7 @@ mod tests {
     }
 
     #[test]
-    fn status_spans_render_distinct_tiny_context_label() {
+    fn status_spans_do_not_render_context_mode_label() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -9932,12 +10113,12 @@ mod tests {
             .map(|span| span.content)
             .collect::<String>();
 
-        assert!(rendered.contains(" tiny"), "{rendered}");
+        assert!(!rendered.contains("tiny"), "{rendered}");
         assert!(!rendered.contains("frugal"), "{rendered}");
     }
 
     #[test]
-    fn turn_diagnostics_updates_tui_context_label() {
+    fn turn_diagnostics_updates_context_mode_without_status_label() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -9965,7 +10146,8 @@ mod tests {
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(rendered.contains("tiny"), "{rendered}");
+        assert!(!rendered.contains("tiny"), "{rendered}");
+        assert!(!rendered.contains("frugal"), "{rendered}");
     }
 
     #[test]

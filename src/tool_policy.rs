@@ -297,23 +297,37 @@ fn command_has_background_ampersand(command: &str) -> bool {
 }
 
 fn cargo_test_multi_filter_advisory(command: &str) -> Option<String> {
-    let words = shell_words(command);
-    for (idx, word) in words.iter().enumerate() {
-        if word == "cargo" && words.get(idx + 1).is_some_and(|next| next == "test") {
-            let mut filters = 0usize;
-            for arg in words.iter().skip(idx + 2) {
-                if arg == "--" || matches!(arg.as_str(), "&&" | ";" | "|") {
-                    break;
+    for segment in command_segments(command) {
+        let words = shell_words(&segment);
+        for (idx, word) in words.iter().enumerate() {
+            if word == "cargo" && words.get(idx + 1).is_some_and(|next| next == "test") {
+                let mut filters = 0usize;
+                let mut skip_next = false;
+                for arg in words.iter().skip(idx + 2) {
+                    if skip_next {
+                        skip_next = false;
+                        continue;
+                    }
+                    if arg == "--" || matches!(arg.as_str(), "&&" | ";" | "|") {
+                        break;
+                    }
+                    if matches!(arg.as_str(), "--release" | "--debug") {
+                        continue;
+                    }
+                    if matches!(arg.as_str(), "--test" | "--package" | "-p") {
+                        skip_next = true;
+                        continue;
+                    }
+                    if arg.starts_with('-') {
+                        continue;
+                    }
+                    filters += 1;
                 }
-                if arg.starts_with('-') {
-                    continue;
+                if filters > 1 {
+                    return Some(
+                        "bash advisory: `cargo test` accepts one test filter before `--`; run separate tests or use one broader filter.".to_string(),
+                    );
                 }
-                filters += 1;
-            }
-            if filters > 1 {
-                return Some(
-                    "bash advisory: `cargo test` accepts one test filter before `--`; run separate tests or use one broader filter.".to_string(),
-                );
             }
         }
     }
@@ -494,7 +508,9 @@ fn bare_python_without_probe(command: &str) -> bool {
     if lower.contains("command -v python") || lower.contains("which python") {
         return false;
     }
-    command_segments(command).any(|segment| segment.split_whitespace().next() == Some("python"))
+    command_segments(command)
+        .iter()
+        .any(|segment| segment.split_whitespace().next() == Some("python"))
 }
 
 fn api_tool_used_as_shell_filter(command: &str) -> Option<&'static str> {
@@ -521,8 +537,70 @@ fn api_tool_used_as_shell_filter(command: &str) -> Option<&'static str> {
     None
 }
 
-fn command_segments(command: &str) -> impl Iterator<Item = &str> {
-    command.split(['|', ';', '\n', '&']).map(str::trim)
+const SHELL_PRELUDE_LINES: &[&str] = &[
+    "set -euo pipefail",
+    "set -eo pipefail",
+    "set -o pipefail",
+    "set -eu",
+    "set -e",
+];
+
+fn strip_shell_prelude_prefix(mut line: &str) -> Option<&str> {
+    let mut stripped = false;
+    loop {
+        let trimmed = line.trim_start();
+        let mut matched = false;
+        for prelude in SHELL_PRELUDE_LINES {
+            let Some(suffix) = trimmed.strip_prefix(prelude) else {
+                continue;
+            };
+            if !suffix.is_empty()
+                && !suffix.chars().next().is_some_and(char::is_whitespace)
+                && !suffix.starts_with("&&")
+                && !suffix.starts_with(';')
+            {
+                continue;
+            }
+            let suffix = suffix.trim_start();
+            if suffix.starts_with('#') {
+                line = "";
+                stripped = true;
+                matched = true;
+                break;
+            }
+            let rest = suffix
+                .strip_prefix("&&")
+                .or_else(|| suffix.strip_prefix(';'))
+                .unwrap_or(suffix);
+            line = rest;
+            stripped = true;
+            matched = true;
+            break;
+        }
+        if !matched {
+            break;
+        }
+    }
+    stripped.then(|| line.trim_start())
+}
+
+fn command_segments(command: &str) -> Vec<String> {
+    let mut segments: Vec<String> = command
+        .split(['|', ';', '\n', '&'])
+        .map(str::trim)
+        .map(str::to_string)
+        .collect();
+    while let Some(rest) = segments
+        .first()
+        .and_then(|first| strip_shell_prelude_prefix(first).map(str::to_string))
+    {
+        segments.remove(0);
+        if !rest.is_empty() {
+            segments.insert(0, rest);
+            break;
+        }
+    }
+    segments
 }
 
 fn shell_words(command: &str) -> Vec<String> {
@@ -912,6 +990,10 @@ mod tests {
         )
         .expect("cargo multi-filter should warn");
         assert!(cargo.contains("one test filter"), "{cargo}");
+        assert!(
+            tool_input_advisory("bash", &json!({"command": "cargo test --release"})).is_none(),
+            "cargo test --release has no test filter"
+        );
 
         let python =
             tool_input_advisory("bash", &json!({"command": "python - <<'PY'\nprint(1)\nPY"}))
@@ -953,6 +1035,22 @@ mod tests {
             .expect("curl should prefer native http when exposed");
         assert!(curl.contains("avoidable shell usage"), "{curl}");
         assert!(!curl.contains("read-only shell"), "{curl}");
+
+        let sed_after_prelude = tool_input_advisory(
+            "bash",
+            &json!({"command": "set -euo pipefail\ngit show HEAD:src/main.rs | sed -n '1,10p'"}),
+        )
+        .expect("sed pipe should warn after ignoring shell prelude");
+        assert!(sed_after_prelude.contains("`sed`"), "{sed_after_prelude}");
+        assert!(!sed_after_prelude.contains("`set`"), "{sed_after_prelude}");
+
+        let inline_prelude = tool_input_advisory(
+            "bash",
+            &json!({"command": "set -euo pipefail git show HEAD:src/main.rs | sed -n '1,10p'"}),
+        )
+        .expect("inline prelude should not be advised as set");
+        assert!(inline_prelude.contains("`sed`"), "{inline_prelude}");
+        assert!(!inline_prelude.contains("`set`"), "{inline_prelude}");
 
         assert!(
             tool_input_advisory("bash", &json!({"command": "git diff --check"})).is_none(),

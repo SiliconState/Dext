@@ -3850,17 +3850,71 @@ fn partial_stream_preserve_only_text_blocks() {
         text: "partial".to_string(),
     }];
     let mut history = Vec::new();
-    assert!(maybe_preserve_partial_stream(&blocks, &mut history));
+    assert!(maybe_preserve_partial_stream(
+        &blocks,
+        &mut history,
+        ContextMode::Standard
+    ));
     assert_eq!(history.len(), 1);
-    assert!(!maybe_preserve_partial_stream(&blocks, &mut history));
+    assert!(!maybe_preserve_partial_stream(
+        &blocks,
+        &mut history,
+        ContextMode::Standard
+    ));
     assert_eq!(history.len(), 1);
+
+    let raw_tool_text = vec![Block::Text {
+        text: "to=functions.bash {\"command\":\"cargo test\"}".to_string(),
+    }];
+    let mut history = Vec::new();
+    assert!(maybe_preserve_partial_stream(
+        &raw_tool_text,
+        &mut history,
+        ContextMode::Standard
+    ));
+    assert_eq!(history.len(), 1);
+    assert!(matches!(
+        &history[0].content[0],
+        Block::Text { text } if text.contains("to=functions.bash") && text.contains("cargo test")
+    ));
+
+    let mut history = Vec::new();
+    assert!(maybe_preserve_partial_stream(
+        &raw_tool_text,
+        &mut history,
+        ContextMode::Frugal
+    ));
+    assert_eq!(history.len(), 1);
+    assert!(matches!(
+        &history[0].content[0],
+        Block::Text { text } if text.contains("tool call redacted") && !text.contains("cargo test")
+    ));
+
+    let multiline_raw_tool_text = vec![Block::Text {
+        text: "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}".to_string(),
+    }];
+    let mut history = Vec::new();
+    assert!(maybe_preserve_partial_stream(
+        &multiline_raw_tool_text,
+        &mut history,
+        ContextMode::Tiny
+    ));
+    assert_eq!(history.len(), 1);
+    assert!(matches!(
+        &history[0].content[0],
+        Block::Text { text } if text.contains("tool call redacted") && !text.contains("command") && !text.contains("cargo test")
+    ));
 
     let tool_only = vec![Block::ToolUse {
         id: "call_1".to_string(),
         name: "todo_read".to_string(),
         input: json!({}),
     }];
-    assert!(!maybe_preserve_partial_stream(&tool_only, &mut history));
+    assert!(!maybe_preserve_partial_stream(
+        &tool_only,
+        &mut history,
+        ContextMode::Tiny
+    ));
 }
 
 #[test]
@@ -4386,6 +4440,29 @@ fn summarize_call_bash_collapses_newlines() {
         summary.starts_with("bash: echo one && echo two"),
         "{summary}"
     );
+
+    let summary = summarize_call(
+        "bash",
+        &json!({"command": "set -euo pipefail\ngit show --no-ext-diff --unified=80 e896250 -- src/tui.rs | sed -n '260,620p'"}),
+    );
+    assert!(
+        summary.starts_with("bash: git show --no-ext-diff"),
+        "{summary}"
+    );
+    assert!(!summary.contains("set -euo pipefail"), "{summary}");
+
+    let summary = summarize_call(
+        "bash",
+        &json!({"command": "set -euo pipefail git show --no-ext-diff --unified=80 e896250 -- src/tui.rs | sed -n '260,620p'"}),
+    );
+    assert!(
+        summary.starts_with("bash: git show --no-ext-diff"),
+        "{summary}"
+    );
+    assert!(!summary.contains("set -euo pipefail"), "{summary}");
+
+    let summary = summarize_call("bash", &json!({"command": "set -euo pipefail"}));
+    assert!(summary.starts_with("bash: set -euo pipefail"), "{summary}");
 }
 
 #[test]
@@ -8243,6 +8320,20 @@ fn pseudo_tool_syntax_detection_marks_plain_text_invalid() {
     assert!(!text_contains_pseudo_tool_syntax(
         "I will use the edit_file tool if needed."
     ));
+    assert!(!text_contains_pseudo_tool_syntax("to="));
+    assert!(text_contains_pseudo_tool_syntax_for_context(
+        "to=",
+        ContextMode::Frugal
+    ));
+    assert!(text_line_looks_like_pseudo_tool_start("to="));
+    assert!(text_line_looks_like_pseudo_tool_start(
+        r#"{"recipient_name":"#
+    ));
+    assert!(!text_contains_pseudo_tool_syntax("today=functions maybe"));
+    assert!(!text_line_looks_like_pseudo_tool_start(
+        "today=functions maybe"
+    ));
+    assert!(!text_line_looks_like_pseudo_tool_start("to=day plan"));
 }
 
 #[test]

@@ -261,7 +261,126 @@ async fn read_stream_next_chunk(
     }
 }
 
-fn maybe_preserve_partial_stream(blocks: &[Block], history: &mut Vec<Message>) -> bool {
+pub(crate) fn pseudo_tool_redaction_marker() -> &'static str {
+    "[tool call redacted; waiting for structured tool event]"
+}
+
+fn text_line_looks_like_pseudo_tool_payload(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed.starts_with('{')
+        || trimmed.starts_with('}')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with(']')
+        || trimmed.starts_with('"')
+        || lower.starts_with("recipient_name")
+        || lower.starts_with("parameters")
+        || lower.starts_with("arguments")
+        || lower.starts_with("command")
+        || lower.starts_with("input")
+        || lower.starts_with("name")
+        || lower.starts_with("type")
+}
+
+fn pseudo_tool_line_opens_payload_block(line: &str) -> bool {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "to=" || lower == "to =" {
+        return true;
+    }
+    if lower.starts_with("to=")
+        || lower.starts_with("to =")
+        || lower.starts_with("functions.")
+        || lower.starts_with("multi_tool_use.")
+        || lower.starts_with("tool_use")
+        || lower.starts_with("function_call")
+        || lower.starts_with("<|tool")
+        || lower.starts_with("<tool")
+    {
+        return !trimmed.contains('}');
+    }
+    if trimmed.starts_with('{') {
+        return !trimmed.ends_with('}');
+    }
+    text_line_looks_like_pseudo_tool_payload(trimmed)
+}
+
+pub(crate) fn redact_pseudo_tool_protocol_text(text: &str) -> String {
+    let mut redacted = false;
+    let mut redacting_payload = false;
+    let mut lines = Vec::new();
+    let marker = pseudo_tool_redaction_marker();
+    for line in text.lines() {
+        if redacting_payload {
+            if line.trim().is_empty() {
+                redacting_payload = false;
+                lines.push(line.to_string());
+                continue;
+            }
+            if text_line_looks_like_pseudo_tool_payload(line) {
+                continue;
+            }
+            redacting_payload = false;
+        }
+        if text_line_looks_like_pseudo_tool_syntax(line)
+            || text_line_looks_like_pseudo_tool_start(line)
+        {
+            redacted = true;
+            while lines
+                .last()
+                .is_some_and(|previous| matches!(previous.trim(), "{" | "["))
+            {
+                lines.pop();
+            }
+            if !lines.last().is_some_and(|previous| previous == marker) {
+                lines.push(marker.to_string());
+            }
+            redacting_payload = pseudo_tool_line_opens_payload_block(line);
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !redacted {
+        return text.to_string();
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn redact_pseudo_tool_protocol_blocks(blocks: &[Block]) -> Vec<Block> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::Text { text } => Block::Text {
+                text: redact_pseudo_tool_protocol_text(text),
+            },
+            Block::PartialStream { text } => Block::PartialStream {
+                text: redact_pseudo_tool_protocol_text(text),
+            },
+            Block::Thinking { text } => Block::Thinking {
+                text: redact_pseudo_tool_protocol_text(text),
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+fn assistant_blocks_for_context(blocks: &[Block], context_mode: ContextMode) -> Vec<Block> {
+    if context_mode.is_frugal() {
+        redact_pseudo_tool_protocol_blocks(blocks)
+    } else {
+        blocks.to_vec()
+    }
+}
+
+fn maybe_preserve_partial_stream(
+    blocks: &[Block],
+    history: &mut Vec<Message>,
+    context_mode: ContextMode,
+) -> bool {
     if blocks.is_empty()
         || !blocks
             .iter()
@@ -269,15 +388,16 @@ fn maybe_preserve_partial_stream(blocks: &[Block], history: &mut Vec<Message>) -
     {
         return false;
     }
+    let visible_blocks = assistant_blocks_for_context(blocks, context_mode);
     if let Some(last) = history.last()
         && last.role == "assistant"
-        && last.content == blocks
+        && last.content == visible_blocks
     {
         return false;
     }
     history.push(Message {
         role: "assistant".to_string(),
-        content: blocks.to_vec(),
+        content: visible_blocks,
     });
     true
 }
@@ -7190,8 +7310,74 @@ fn summarize_args(args: &Value, max_chars: usize) -> String {
     summarize_inline(&joined, max_chars)
 }
 
+const SHELL_PRELUDE_LINES: &[&str] = &[
+    "set -euo pipefail",
+    "set -eo pipefail",
+    "set -o pipefail",
+    "set -eu",
+    "set -e",
+];
+
+fn strip_shell_prelude_prefix(mut line: &str) -> Option<&str> {
+    let mut stripped = false;
+    loop {
+        let trimmed = line.trim_start();
+        let mut matched = false;
+        for prelude in SHELL_PRELUDE_LINES {
+            let Some(suffix) = trimmed.strip_prefix(prelude) else {
+                continue;
+            };
+            if !suffix.is_empty()
+                && !suffix.chars().next().is_some_and(char::is_whitespace)
+                && !suffix.starts_with("&&")
+                && !suffix.starts_with(';')
+            {
+                continue;
+            }
+            let suffix = suffix.trim_start();
+            if suffix.starts_with('#') {
+                line = "";
+                stripped = true;
+                matched = true;
+                break;
+            }
+            let rest = suffix
+                .strip_prefix("&&")
+                .or_else(|| suffix.strip_prefix(';'))
+                .unwrap_or(suffix);
+            line = rest;
+            stripped = true;
+            matched = true;
+            break;
+        }
+        if !matched {
+            break;
+        }
+    }
+    stripped.then(|| line.trim_start())
+}
+
 fn summarize_bash_command(command: &str, max_chars: usize) -> String {
-    let collapsed_full = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let raw_lines: Vec<&str> = command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut lines = raw_lines.clone();
+    while let Some(first) = lines.first().copied() {
+        let Some(rest) = strip_shell_prelude_prefix(first) else {
+            break;
+        };
+        lines.remove(0);
+        if !rest.is_empty() {
+            lines.insert(0, rest);
+            break;
+        }
+    }
+    if lines.is_empty() {
+        lines = raw_lines;
+    }
+    let collapsed_full = lines.join(" ");
     if collapsed_full.is_empty() {
         return "?".to_string();
     }
@@ -7199,11 +7385,6 @@ fn summarize_bash_command(command: &str, max_chars: usize) -> String {
         return collapsed_full;
     }
 
-    let lines: Vec<&str> = command
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
     if lines.len() <= 1 {
         return cap_chars(&collapsed_full, max_chars);
     }
@@ -12473,7 +12654,11 @@ impl Agent {
                         }
                         if self.api_provider == ApiProvider::ChatGpt {
                             let partial_blocks = self.partial_chatgpt_stream_blocks();
-                            if maybe_preserve_partial_stream(&partial_blocks, &mut self.history) {
+                            if maybe_preserve_partial_stream(
+                                &partial_blocks,
+                                &mut self.history,
+                                self.context_mode,
+                            ) {
                                 self.checkpoint_latest_session("after_partial_stream_preserve");
                                 self.sink.emit(AgentEvent::Warn(
                                     "provider closed the stream after partial text; preserved partial response instead of replaying the same turn".to_string(),
@@ -12523,14 +12708,15 @@ impl Agent {
             }
 
             let assistant_response_text = assistant_blocks_text(&blocks);
-            let response_has_pseudo_tool = blocks_contain_pseudo_tool_syntax(&blocks);
+            let response_has_pseudo_tool =
+                blocks_contain_pseudo_tool_syntax_for_context(&blocks, self.context_mode);
             if objective.apply_fixes_allowed()
                 && assistant_text_has_implementation_commitment(&assistant_response_text)
             {
                 action_contract_must_mutate = true;
             }
 
-            if maybe_preserve_partial_stream(&blocks, &mut self.history) {
+            if maybe_preserve_partial_stream(&blocks, &mut self.history, self.context_mode) {
                 self.checkpoint_latest_session("after_assistant_message");
             } else {
                 // maybe_preserve_partial_stream skips messages that lack Text/PartialStream
@@ -12543,7 +12729,7 @@ impl Agent {
                 if has_tool_use {
                     self.history.push(Message {
                         role: "assistant".to_string(),
-                        content: blocks.clone(),
+                        content: assistant_blocks_for_context(&blocks, self.context_mode),
                     });
                     self.checkpoint_latest_session("after_assistant_message");
                 }
@@ -18219,6 +18405,27 @@ fn assistant_text_has_implementation_commitment(text: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
+pub(crate) fn text_line_looks_like_pseudo_tool_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    lower.trim_end() == "to="
+        || lower.trim_end() == "to ="
+        || lower.starts_with("to=functions")
+        || lower.starts_with("to = functions")
+        || lower.starts_with("to=multi_tool_use")
+        || lower.starts_with("to = multi_tool_use")
+        || lower.starts_with("functions.")
+        || lower.starts_with("multi_tool_use.")
+        || lower.starts_with("<|tool")
+        || lower.starts_with("<tool")
+        || lower.starts_with("tool_use")
+        || lower.starts_with("function_call")
+        || compact.starts_with("{\"recipient")
+        || compact.starts_with("{\"type\":\"function")
+        || compact.starts_with("{\"command")
+}
+
 pub(crate) fn text_line_looks_like_pseudo_tool_syntax(line: &str) -> bool {
     let trimmed = line.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -18253,11 +18460,36 @@ pub(crate) fn text_contains_pseudo_tool_syntax(text: &str) -> bool {
     text.lines().any(text_line_looks_like_pseudo_tool_syntax)
 }
 
+fn text_contains_pseudo_tool_syntax_for_context(text: &str, context_mode: ContextMode) -> bool {
+    if context_mode.is_frugal() {
+        text.lines().any(|line| {
+            text_line_looks_like_pseudo_tool_syntax(line)
+                || text_line_looks_like_pseudo_tool_start(line)
+        })
+    } else {
+        text_contains_pseudo_tool_syntax(text)
+    }
+}
+
 fn blocks_contain_pseudo_tool_syntax(blocks: &[Block]) -> bool {
     blocks
         .iter()
         .filter_map(block_text)
         .any(text_contains_pseudo_tool_syntax)
+}
+
+fn blocks_contain_pseudo_tool_syntax_for_context(
+    blocks: &[Block],
+    context_mode: ContextMode,
+) -> bool {
+    if context_mode.is_frugal() {
+        blocks
+            .iter()
+            .filter_map(block_text)
+            .any(|text| text_contains_pseudo_tool_syntax_for_context(text, context_mode))
+    } else {
+        blocks_contain_pseudo_tool_syntax(blocks)
+    }
 }
 
 fn action_contract_runtime_note(no_mutation_turns: u32) -> String {
