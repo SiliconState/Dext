@@ -473,7 +473,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/sessions",
         args: "",
-        help: "list project latest + named",
+        help: "list latest + autosaved/named",
     },
     SlashCmd {
         name: "/session",

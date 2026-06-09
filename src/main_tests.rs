@@ -9,12 +9,11 @@ use crate::provider::{
 use crate::session::process_exists;
 use crate::session::{
     append_log_line, canonicalize_read_tool_path, canonicalize_tool_path, cap_latest_log_buffer,
-    render_limited_lines, validate_session_name,
+    latest_log_path, render_limited_lines, validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
 use std::net::TcpListener;
-#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -47,6 +46,7 @@ fn prepend_env_path(path: &Path) -> String {
 }
 
 fn test_agent(root: &Path) -> Agent {
+    let session_id = new_session_id();
     Agent {
         client: Arc::new(OnceLock::new()),
         provider_id: "test".to_string(),
@@ -78,8 +78,9 @@ fn test_agent(root: &Path) -> Agent {
         pack_hook_env: Vec::new(),
         state_lock: None,
         session_enabled: true,
-        latest_session_path: latest_session_path(root),
-        latest_log_path: latest_log_path(root),
+        session_id: session_id.clone(),
+        latest_session_path: session_latest_session_path(root, &session_id),
+        latest_log_path: session_latest_log_path(root, &session_id),
         pending_login_provider: None,
         suppress_checkpoints: false,
         last_checkpoint_at: None,
@@ -1572,7 +1573,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
             },
         ];
         saved.save_latest_session()?;
-        let saved_header_line = std::fs::read_to_string(latest_session_path(&sandbox))?
+        let saved_header_line = std::fs::read_to_string(&saved.latest_session_path)?
             .lines()
             .next()
             .unwrap_or_default()
@@ -1779,7 +1780,7 @@ fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<(
         agent.save_latest_session()?;
 
         let listing = render_session_listing(&project);
-        assert!(listing.contains("project latest:"), "{listing}");
+        assert!(listing.contains("latest session:"), "{listing}");
         assert!(listing.contains("latest: 1 messages"), "{listing}");
         assert!(listing.contains("named sessions:"), "{listing}");
         let project_named_dir = named_sessions_dir_for_root(&project);
@@ -1907,7 +1908,7 @@ fn session_jsonl_reads_tool_metadata_duration() -> Result<()> {
 }
 
 #[test]
-fn latest_state_defaults_are_project_scoped() -> Result<()> {
+fn latest_state_defaults_are_project_scoped_with_session_overlays() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("project-scoped-state");
     let dext_home = root.join("dext-home");
@@ -1930,10 +1931,20 @@ fn latest_state_defaults_are_project_scoped() -> Result<()> {
         let alpha_log = latest_log_path(&alpha);
         let beta_log = latest_log_path(&beta);
 
+        let alpha_session_scoped = session_latest_session_path(&alpha, "s1");
+        let beta_session_scoped = session_latest_session_path(&beta, "s1");
+        let alpha_log_scoped = session_latest_log_path(&alpha, "s1");
+        let beta_log_scoped = session_latest_log_path(&beta, "s1");
+
         assert_ne!(alpha_session, beta_session);
         assert_ne!(alpha_log, beta_log);
+        assert_ne!(alpha_session_scoped, beta_session_scoped);
+        assert_ne!(alpha_log_scoped, beta_log_scoped);
         assert!(alpha_session.starts_with(dext_home.join("projects")));
         assert!(alpha_log.starts_with(dext_home.join("projects")));
+        assert!(alpha_session_scoped.starts_with(dext_home.join("projects")));
+        assert!(alpha_session_scoped.ends_with("sessions/s1/_latest.jsonl"));
+        assert!(alpha_log_scoped.ends_with("sessions/s1/latest.log"));
         Ok(())
     })();
 
@@ -1948,50 +1959,54 @@ fn latest_state_defaults_are_project_scoped() -> Result<()> {
 }
 
 #[test]
-fn project_state_lock_blocks_second_owner_until_release() -> Result<()> {
+fn session_state_dirs_are_session_scoped_and_concurrent() -> Result<()> {
     let _guard = env_lock();
-    let root = temp_test_dir("state-lock-owner");
-    let root = std::fs::canonicalize(&root)?;
-    let first = ProjectStateLock::acquire(&root)?;
-    let err = ProjectStateLock::acquire(&root).expect_err("second owner should fail");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("another dext process already owns project state"),
-        "{msg}"
-    );
-    drop(first);
-    let second = ProjectStateLock::acquire(&root)?;
-    drop(second);
-    let _ = std::fs::remove_dir_all(&root);
-    Ok(())
-}
+    let root = temp_test_dir("session-scoped-state");
+    let dext_home = root.join("dext-home");
 
-#[test]
-#[cfg(target_os = "linux")]
-fn process_exists_treats_zombies_as_dead_for_stale_lock_recovery() -> Result<()> {
-    let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn()?;
-    let pid = child.id();
-    for _ in 0..100 {
-        if std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_string()))
-            .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
-            .is_some_and(|state| state == "Z")
-        {
-            assert!(!process_exists(pid));
-            let _ = child.wait();
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::set_var("DEXT_HOME", &dext_home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
     }
-    let _ = child.wait();
-    anyhow::bail!("child did not become zombie before wait")
+    let result = (|| -> Result<()> {
+        let root = std::fs::canonicalize(&root)?;
+        let sid1 = "s1";
+        let sid2 = "s2";
+        let first = SessionStateLock::acquire(&root, sid1)?;
+        let second = SessionStateLock::acquire(&root, sid2)?;
+        assert_ne!(first.path, second.path);
+        assert!(first.path.starts_with(dext_home.join("projects")));
+        assert!(first.path.ends_with("sessions/s1/session.lock.json"));
+        assert!(second.path.ends_with("sessions/s2/session.lock.json"));
+        let err =
+            SessionStateLock::acquire(&root, sid1).expect_err("same session id should be locked");
+        assert!(
+            format!("{err:#}").contains("dext session s1 is already open"),
+            "{err:#}"
+        );
+        drop(first);
+        let reacquired = SessionStateLock::acquire(&root, sid1)?;
+        drop(reacquired);
+        drop(second);
+        Ok(())
+    })();
+
+    // Safe: test holds a global lock around env mutation.
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 #[test]
-fn set_sandbox_root_rejects_locked_project() -> Result<()> {
+fn set_sandbox_root_allows_other_live_sessions() -> Result<()> {
     let _guard = env_lock();
-    let root = temp_test_dir("sandbox-lock-switch");
+    let root = temp_test_dir("sandbox-session-switch");
     let alpha = std::fs::canonicalize(
         std::fs::create_dir_all(root.join("alpha")).map(|_| root.join("alpha"))?,
     )?;
@@ -2000,20 +2015,68 @@ fn set_sandbox_root_rejects_locked_project() -> Result<()> {
     )?;
 
     let mut agent = test_agent(&alpha);
-    let held = ProjectStateLock::acquire(&beta)?;
-    let before = agent.sandbox_root.clone();
-    let err = agent
-        .set_sandbox_root(beta.clone())
-        .expect_err("locked target project should fail");
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("another dext process already owns project state"),
-        "{msg}"
-    );
-    assert_eq!(agent.sandbox_root, before);
-    drop(held);
+    let other = SessionStateLock::acquire(&beta, "other-session")?;
+    agent.set_sandbox_root(beta.clone())?;
+    assert_eq!(agent.sandbox_root, beta);
+    assert!(agent.state_lock.as_ref().is_some_and(|lock| {
+        lock.path
+            .ends_with(format!("sessions/{}/session.lock.json", agent.session_id))
+    }));
+    drop(other);
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[test]
+fn same_session_id_lock_blocks_double_open() -> Result<()> {
+    let root = temp_test_dir("same-session-lock");
+    let root = std::fs::canonicalize(&root)?;
+    let first = SessionStateLock::acquire(&root, "same")?;
+    let err = SessionStateLock::acquire(&root, "same").expect_err("same session should fail");
+    assert!(
+        format!("{err:#}").contains("dext session same is already open"),
+        "{err:#}"
+    );
+    drop(first);
+    let second = SessionStateLock::acquire(&root, "same")?;
+    drop(second);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn session_latest_prefers_newest_session_dir_but_supports_legacy_latest() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("latest-session-selector");
+    let dext_home = root.join("dext-home");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &dext_home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+    }
+    let result = (|| -> Result<()> {
+        let root = std::fs::canonicalize(&root)?;
+        let legacy = project_latest_session_path(&root);
+        atomic_write_bytes(&legacy, b"{}\n")?;
+        assert_eq!(latest_session_path(&root), legacy);
+        let session_latest = session_latest_session_path(&root, "newer-session");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        atomic_write_bytes(&session_latest, b"{}\n")?;
+        assert_eq!(latest_session_path(&root), session_latest);
+        let listing = render_session_listing(&root);
+        assert!(listing.contains("autosaved session dirs:"), "{listing}");
+        assert_eq!(
+            resolve_session_selector(&root, "newer-session")?,
+            session_latest
+        );
+        assert!(listing.contains("latest session:"), "{listing}");
+        Ok(())
+    })();
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 #[test]
@@ -2768,6 +2831,7 @@ fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
         &json!({"path": "big.txt", "offset": 1, "limit": 110}),
         &root,
         Some(&cache),
+        None,
     )
     .expect("explicit read should succeed");
     assert!(
@@ -2811,6 +2875,7 @@ fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
         &json!({"path": "big.txt", "offset": 10, "limit": 10}),
         &root,
         Some(&cache),
+        None,
     );
     assert!(
         cached.is_err(),
@@ -3346,6 +3411,7 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
         }),
         root.clone(),
         Arc::new(AtomicBool::new(false)),
+        None,
         None,
         None,
     )
@@ -4568,7 +4634,7 @@ fn subagent_request_inherits_parent_capability_profile() {
 }
 
 #[test]
-fn subagent_detached_artifacts_are_project_scoped() {
+fn subagent_detached_artifacts_are_session_scoped() {
     let _guard = env_lock();
     let root = temp_test_dir("subagent-artifacts");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -4582,14 +4648,14 @@ fn subagent_detached_artifacts_are_project_scoped() {
         ..SubagentRequest::default()
     };
     let (input_path, output_path, steer_path) =
-        write_subagent_input(&root, &request).expect("write subagent input");
+        write_subagent_input(&root, "sub-session", &request).expect("write subagent input");
     assert!(
-        input_path.starts_with(project_state_dir(&root)),
+        input_path.starts_with(session_subagents_dir(&root, "sub-session")),
         "{}",
         input_path.display()
     );
     assert!(
-        output_path.starts_with(project_state_dir(&root)),
+        output_path.starts_with(session_subagents_dir(&root, "sub-session")),
         "{}",
         output_path.display()
     );
@@ -4614,6 +4680,7 @@ fn subagent_detached_artifacts_are_project_scoped() {
             .and_then(|e: &std::ffi::OsStr| e.to_str()),
         Some("steer")
     );
+    assert_eq!(subagent_steer_path_for_output(&output_path), steer_path);
     let parsed: SubagentRequest =
         serde_json::from_slice(&std::fs::read(&input_path).unwrap()).unwrap();
     assert_eq!(parsed.task, "noop");
@@ -4622,7 +4689,7 @@ fn subagent_detached_artifacts_are_project_scoped() {
     assert!(output.contains("## Logs"), "{output}");
 
     let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(subagent_requests_dir(&root));
+    let _ = std::fs::remove_dir_all(session_subagents_dir(&root, "sub-session"));
     unsafe {
         std::env::remove_var("DEXT_HOME");
     }
@@ -5381,7 +5448,7 @@ fn release_registered_locks_drops_files_and_registry() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("lock-cleanup-registry");
     let root = std::fs::canonicalize(&root)?;
-    let lock = ProjectStateLock::acquire(&root)?;
+    let lock = SessionStateLock::acquire(&root, "registry")?;
     let lock_path = lock.path.clone();
     assert!(lock_path.exists());
 
@@ -5392,7 +5459,7 @@ fn release_registered_locks_drops_files_and_registry() -> Result<()> {
         "lock file should be removed by registry"
     );
 
-    let fresh = ProjectStateLock::acquire(&root)?;
+    let fresh = SessionStateLock::acquire(&root, "registry")?;
     drop(fresh);
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -5464,13 +5531,15 @@ fn checkpoint_latest_session_writes_session_and_log() {
         });
         agent.checkpoint_latest_session("test_reason");
 
-        let session_path = sessions.join("_latest.jsonl");
-        let log_path = logs.join("latest.log");
+        let session_path = agent.latest_session_path.clone();
+        let log_path = agent.latest_log_path.clone();
         assert!(session_path.exists(), "missing {}", session_path.display());
         assert!(log_path.exists(), "missing {}", log_path.display());
         let log = std::fs::read_to_string(&log_path)?;
         assert!(log.contains("session_checkpoint"), "{log}");
 
+        assert!(session_path.starts_with(sessions.join(&agent.session_id)));
+        assert!(log_path.starts_with(logs.join(&agent.session_id)));
         let mut session_entries: Vec<String> = std::fs::read_dir(&sessions)?
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -5481,8 +5550,8 @@ fn checkpoint_latest_session_writes_session_and_log() {
             .collect();
         session_entries.sort();
         log_entries.sort();
-        assert_eq!(session_entries, vec!["_latest.jsonl"]);
-        assert_eq!(log_entries, vec!["latest.log"]);
+        assert_eq!(session_entries, vec![agent.session_id.clone()]);
+        assert_eq!(log_entries, vec![agent.session_id.clone()]);
         Ok(())
     })();
 
@@ -5584,6 +5653,8 @@ fn tiny_context_mode_sets_distinct_system_prompt() {
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
     agent.system = DEFAULT_SYSTEM.to_string();
+
+    assert!(agent.session_dir().ends_with(&agent.session_id));
 
     agent.set_context_mode(ContextMode::Tiny);
 
@@ -6185,7 +6256,7 @@ fn checkpoint_debounce_skips_rapid_non_critical_writes() {
         });
         agent.checkpoint_latest_session("after_tool_results");
 
-        let session_path = sessions.join("_latest.jsonl");
+        let session_path = agent.latest_session_path.clone();
         let after_first = std::fs::read_to_string(&session_path)?;
         assert!(after_first.contains("first"), "{after_first}");
 
@@ -6231,9 +6302,9 @@ fn suppressed_checkpoints_do_not_clobber_parent_session() {
 
     let result = (|| -> Result<()> {
         let root_canon = std::fs::canonicalize(&root)?;
-        let session_path = sessions.join("_latest.jsonl");
 
         let mut parent = test_agent(&root_canon);
+        let session_path = parent.latest_session_path.clone();
         parent.history.push(Message {
             role: "user".to_string(),
             content: vec![Block::Text {
@@ -6313,6 +6384,7 @@ async fn bash_tool_honors_input_timeout() {
         Arc::new(AtomicBool::new(false)),
         None,
         None,
+        None,
     )
     .await
     .expect_err("expected input timeout");
@@ -6331,12 +6403,13 @@ async fn model_side_subagent_tool_call_does_not_launch_runtime() {
         Arc::new(AtomicBool::new(false)),
         None,
         None,
+        None,
     )
     .await
     .expect("model-side subagent guidance");
     assert!(out.contains("not a provider-visible tool"), "{out}");
     assert!(
-        !subagent_requests_dir(&root).exists(),
+        !session_subagents_dir(&root, "blocked").exists(),
         "model-side subagent tool call must not create artifacts"
     );
     let _ = std::fs::remove_dir_all(&root);

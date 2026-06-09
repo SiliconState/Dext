@@ -27,11 +27,13 @@ use provider::{
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 use session::{
-    ProjectStateLock, atomic_write_bytes, canonicalize_read_tool_path, canonicalize_tool_path,
-    dext_state_dir, latest_log_path, latest_session_path, list_session_records_for_root,
-    named_session_path_for_root, named_sessions_dir_for_root, parse_session_header, project_key,
-    project_state_dir, project_state_lock_path, release_registered_locks, render_limited_csv,
-    restore_terminal_if_tui, unix_timestamp_secs,
+    SessionStateLock, append_log_event, atomic_write_bytes, canonicalize_read_tool_path,
+    canonicalize_tool_path, dext_state_dir, latest_session_path, list_session_records_for_root,
+    named_session_path_for_root, named_sessions_dir_for_root, new_session_id, parse_session_header,
+    project_key, project_latest_session_path, release_registered_locks, render_limited_csv,
+    restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
+    session_latest_session_path, session_state_lock_path, session_subagents_dir, session_sudo_dir,
+    session_todo_path, unix_timestamp_secs,
 };
 use tools::{
     Tool, ToolProfile, is_external_process_tool, needs_permission, provider_tool_definitions,
@@ -79,8 +81,7 @@ const LATEST_LOG_CAP: usize = 64_000;
 const LATEST_LOG_ARCHIVE_MAX: u32 = 16;
 const SLASH_LIST_LIMIT: usize = 50;
 const SLASH_TEXT_CAP: usize = 8_000;
-const PROJECT_STATE_LOCK_NAME: &str = "owner.lock.json";
-const PROJECT_STATE_LOCK_STALE_SECS: u64 = 86_400;
+const SESSION_STATE_LOCK_NAME: &str = "session.lock.json";
 const STREAM_EVENT_BUFFER_CAP: usize = 256_000;
 const TOOL_SUMMARY_CHAR_CAP: usize = 180;
 const TOOL_UI_CONTENT_CAP: usize = 8_000;
@@ -1746,8 +1747,8 @@ fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
-fn subagent_requests_dir(root: &Path) -> PathBuf {
-    project_state_dir(root).join("subagents")
+fn subagent_requests_dir(root: &Path, session_id: &str) -> PathBuf {
+    session_subagents_dir(root, session_id)
 }
 
 fn next_subagent_artifact_stem() -> String {
@@ -1759,16 +1760,27 @@ fn next_subagent_artifact_stem() -> String {
     format!("subagent-{nanos}-{}-{seq}", std::process::id())
 }
 
+fn subagent_steer_path_for_output(output_path: &Path) -> PathBuf {
+    let Some(file_name) = output_path.file_name().and_then(|s| s.to_str()) else {
+        return output_path.with_extension("steer");
+    };
+    if let Some(stem) = file_name.strip_suffix(".output.md") {
+        return output_path.with_file_name(format!("{stem}.steer"));
+    }
+    output_path.with_extension("steer")
+}
+
 fn write_subagent_input(
     root: &Path,
+    session_id: &str,
     request: &SubagentRequest,
 ) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let dir = subagent_requests_dir(root);
+    let dir = subagent_requests_dir(root, session_id);
     std::fs::create_dir_all(&dir)?;
     let stem = next_subagent_artifact_stem();
     let input_path = dir.join(format!("{stem}.input.json"));
     let output_path = dir.join(format!("{stem}.output.md"));
-    let steer_path = dir.join(format!("{stem}.steer"));
+    let steer_path = subagent_steer_path_for_output(&output_path);
     let bytes = serde_json::to_vec_pretty(request)?;
     atomic_write_bytes(&input_path, &bytes)?;
     atomic_write_bytes(&steer_path, b"\n")?;
@@ -2109,8 +2121,7 @@ async fn run_subagent_runtime(input_path: &Path, output_path: &Path) -> Result<(
         &format!("[subagent-runtime] started task: {}\n", request.task),
     )?;
 
-    // Set up file-based steering: derive .steer path from output path.
-    let steer_path = output_path.with_extension("steer");
+    let steer_path = subagent_steer_path_for_output(output_path);
     let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     {
         let _guard = tokio::spawn(async move {
@@ -5134,6 +5145,7 @@ fn artifact_safe_name(raw: &str) -> String {
 
 fn write_verification_artifact(
     root: &Path,
+    session_id: &str,
     name: &str,
     command: &str,
     output: &str,
@@ -5143,7 +5155,7 @@ fn write_verification_artifact(
 ) -> Option<PathBuf> {
     let hash = sha256_hex_str(&format!("{command}\n{output}"));
     let short_hash = &hash[..12.min(hash.len())];
-    let dir = project_state_dir(root).join("artifacts");
+    let dir = session_artifacts_dir(root, session_id);
     let path = dir.join(format!(
         "verify-{}-{}-{short_hash}.json",
         unix_timestamp_secs(),
@@ -6490,7 +6502,7 @@ fn tool_result_context_cap(
 
 #[cfg(test)]
 fn execute_tool(name: &str, input: &Value, root: &Path) -> std::result::Result<String, String> {
-    execute_tool_with_cache(name, input, root, None)
+    execute_tool_with_cache(name, input, root, None, None)
 }
 
 fn todo_status_counts(items: &[Value]) -> (usize, usize, usize) {
@@ -6566,6 +6578,7 @@ fn execute_tool_with_cache(
     input: &Value,
     root: &Path,
     read_cache: Option<&Arc<Mutex<ReadFileCache>>>,
+    session_id: Option<&str>,
 ) -> std::result::Result<String, String> {
     match name {
         "read_file" => {
@@ -6804,12 +6817,17 @@ fn execute_tool_with_cache(
             run_external("git", &commit_args, None, root)
         }
         "todo_read" => {
-            let todo_path = root.join("DEXT.todo.json");
+            let project_todo_path = root.join("DEXT.todo.json");
+            let session_todo_path = session_id.map(|id| session_todo_path(root, id));
+            let todo_path = session_todo_path
+                .as_ref()
+                .filter(|path| path.exists())
+                .unwrap_or(&project_todo_path);
             if !todo_path.exists() {
                 return Ok("(no todos — use todo_write to create a task list)".to_string());
             }
             let content =
-                std::fs::read_to_string(&todo_path).map_err(|e| format!("read todo: {e}"))?;
+                std::fs::read_to_string(todo_path).map_err(|e| format!("read todo: {e}"))?;
             let todos: Value =
                 serde_json::from_str(&content).map_err(|e| format!("parse todo: {e}"))?;
             let items = todos.as_array().ok_or("todo: expected array")?;
@@ -6831,11 +6849,17 @@ fn execute_tool_with_cache(
                     Ok(json!({"text": text, "status": status}))
                 })
                 .collect::<std::result::Result<_, String>>()?;
-            let todo_path = root.join("DEXT.todo.json");
-            let before = read_todo_counts(&todo_path);
+            let project_todo_path = root.join("DEXT.todo.json");
+            let todo_path = session_id
+                .map(|id| session_todo_path(root, id))
+                .unwrap_or_else(|| project_todo_path.clone());
+            let before =
+                read_todo_counts(&todo_path).or_else(|| read_todo_counts(&project_todo_path));
             let content = serde_json::to_string_pretty(&json!(validated))
                 .map_err(|e| format!("serialize todo: {e}"))?;
-            std::fs::write(&todo_path, content).map_err(|e| format!("write todo: {e}"))?;
+            atomic_write_bytes(&todo_path, content.as_bytes())
+                .map_err(|e| format!("write todo: {e}"))?;
+
             let after = todo_status_counts(&validated);
             Ok(format!(
                 "{}\n\n{}",
@@ -6864,6 +6888,7 @@ struct LocalSudoAuth {
 
 async fn prepare_local_sudo_auth(
     root: &Path,
+    session_id: &str,
 ) -> std::result::Result<Option<LocalSudoAuth>, String> {
     if std::env::var_os(SUDO_ASKPASS_ENV).is_some() {
         return Ok(None);
@@ -6889,14 +6914,17 @@ async fn prepare_local_sudo_auth(
     if cached {
         return Ok(None);
     }
-    let askpass = write_sudo_askpass_script(root)?;
+    let askpass = write_sudo_askpass_script(root, session_id)?;
     Ok(Some(LocalSudoAuth { askpass }))
 }
 
 #[cfg(unix)]
-fn write_sudo_askpass_script(root: &Path) -> std::result::Result<PathBuf, String> {
+fn write_sudo_askpass_script(
+    root: &Path,
+    session_id: &str,
+) -> std::result::Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
-    let dir = project_state_dir(root).join("sudo");
+    let dir = session_sudo_dir(root, session_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("prepare local sudo prompt dir: {e}"))?;
     let path = dir.join("askpass.sh");
     let content = sudo_askpass_script_content();
@@ -6966,7 +6994,10 @@ fn sudo_askpass_script_content() -> String {
 }
 
 #[cfg(not(unix))]
-fn write_sudo_askpass_script(_root: &Path) -> std::result::Result<PathBuf, String> {
+fn write_sudo_askpass_script(
+    _root: &Path,
+    _session_id: &str,
+) -> std::result::Result<PathBuf, String> {
     Err("local sudo prompts are only supported on Unix".to_string())
 }
 
@@ -7201,6 +7232,7 @@ async fn execute_builtin_call(
     root: PathBuf,
     interrupt: Arc<AtomicBool>,
     read_cache: Option<Arc<Mutex<ReadFileCache>>>,
+    session_id: Option<String>,
     local_sudo_auth: Option<LocalSudoAuth>,
 ) -> std::result::Result<String, String> {
     if name == "subagent" {
@@ -7249,7 +7281,13 @@ async fn execute_builtin_call(
         }
     } else {
         tokio::task::spawn_blocking(move || {
-            execute_tool_with_cache(&name, &input, &root, read_cache.as_ref())
+            execute_tool_with_cache(
+                &name,
+                &input,
+                &root,
+                read_cache.as_ref(),
+                session_id.as_deref(),
+            )
         })
         .await
         .map_err(|e| format!("task panic: {e}"))?
@@ -7632,8 +7670,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "todo_read",
 ];
 
-fn read_project_todo_summary(root: &Path, max_items: usize) -> Option<String> {
-    let content = std::fs::read_to_string(root.join("DEXT.todo.json")).ok()?;
+fn todo_summary_from_path(path: &Path, max_items: usize) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
     let todos = serde_json::from_str::<Value>(&content).ok()?;
     let items = todos.as_array()?;
     if items.is_empty() {
@@ -7668,6 +7706,15 @@ fn read_project_todo_summary(root: &Path, max_items: usize) -> Option<String> {
         ));
     }
     Some(out)
+}
+
+fn read_project_todo_summary(root: &Path, max_items: usize) -> Option<String> {
+    todo_summary_from_path(&root.join("DEXT.todo.json"), max_items)
+}
+
+fn read_session_todo_summary(root: &Path, session_id: &str, max_items: usize) -> Option<String> {
+    todo_summary_from_path(&session_todo_path(root, session_id), max_items)
+        .or_else(|| read_project_todo_summary(root, max_items))
 }
 
 const PLAN_SYSTEM: &str = "\
@@ -9241,8 +9288,9 @@ struct Agent {
     shelf_registry: shelves::ShelfRegistry,
     hooks: Hooks,
     pack_hook_env: Vec<(String, String)>,
-    state_lock: Option<Arc<ProjectStateLock>>,
+    state_lock: Option<Arc<SessionStateLock>>,
     session_enabled: bool,
+    session_id: String,
     latest_session_path: PathBuf,
     latest_log_path: PathBuf,
     pending_login_provider: Option<String>,
@@ -9343,11 +9391,19 @@ impl Agent {
             PathBuf::from(std::env::var("DEXT_SANDBOX").unwrap_or_else(|_| ".".to_string()))
         }))
         .context("could not canonicalize sandbox root")?;
-        let latest_session = latest_session_path(&sandbox_root);
-        let latest_log = latest_log_path(&sandbox_root);
+        let session_id = new_session_id();
+        let latest_session = if session_enabled {
+            session_latest_session_path(&sandbox_root, &session_id)
+        } else {
+            project_latest_session_path(&sandbox_root)
+        };
+        let latest_log = session_latest_log_path(&sandbox_root, &session_id);
         record_crash_session_id(&latest_session);
         let state_lock = if session_enabled {
-            Some(Arc::new(ProjectStateLock::acquire(&sandbox_root)?))
+            Some(Arc::new(SessionStateLock::acquire(
+                &sandbox_root,
+                &session_id,
+            )?))
         } else {
             None
         };
@@ -9398,6 +9454,7 @@ impl Agent {
             interrupt: Arc::new(AtomicBool::new(false)),
             state_lock,
             session_enabled,
+            session_id,
             latest_session_path: latest_session,
             latest_log_path: latest_log,
             pending_login_provider: None,
@@ -9999,21 +10056,30 @@ impl Agent {
     }
 
     fn refresh_state_paths(&mut self) {
-        self.latest_session_path = latest_session_path(&self.sandbox_root);
-        self.latest_log_path = latest_log_path(&self.sandbox_root);
+        if self.session_enabled {
+            self.latest_session_path =
+                session_latest_session_path(&self.sandbox_root, &self.session_id);
+            self.latest_log_path = session_latest_log_path(&self.sandbox_root, &self.session_id);
+        } else {
+            self.latest_session_path = project_latest_session_path(&self.sandbox_root);
+            self.latest_log_path = session_latest_log_path(&self.sandbox_root, &self.session_id);
+        }
     }
 
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
         self.pack_hook_env.clear();
-        let next_lock_path = project_state_lock_path(&root);
-        let same_project = self
+        let next_lock_path = session_state_lock_path(&root, &self.session_id);
+        let same_session = self
             .state_lock
             .as_ref()
             .is_some_and(|lock| lock.path == next_lock_path);
-        let next_lock = if !self.session_enabled || same_project {
-            None
+        let next_lock = if self.session_enabled && !same_session {
+            Some(Arc::new(SessionStateLock::acquire(
+                &root,
+                &self.session_id,
+            )?))
         } else {
-            Some(Arc::new(ProjectStateLock::acquire(&root)?))
+            None
         };
 
         self.sandbox_root = root;
@@ -10201,12 +10267,17 @@ impl Agent {
         ))
     }
 
+    #[cfg(test)]
+    fn session_dir(&self) -> PathBuf {
+        crate::session::session_state_dir(&self.sandbox_root, &self.session_id)
+    }
+
     fn append_latest_log(&self, event: &str, detail: &str) {
         if !self.session_enabled {
             return;
         }
         let detail = self.privacy.redact_log_detail(detail);
-        session::append_latest_log(&self.sandbox_root, event, &detail);
+        append_log_event(&self.latest_log_path, event, &detail);
     }
 
     fn compose_system_details(&self) -> SystemParts {
@@ -10364,7 +10435,7 @@ impl Agent {
                 self.compact_threshold_chars(),
                 self.active_compact_threshold_chars()
             ));
-            if let Some(todo) = read_project_todo_summary(&self.sandbox_root, 3) {
+            if let Some(todo) = read_session_todo_summary(&self.sandbox_root, &self.session_id, 3) {
                 env.push_str("\n## Project todos\n");
                 env.push_str(&cap_bytes_with_hint(
                     todo,
@@ -10476,7 +10547,7 @@ impl Agent {
             self.compact_threshold_chars(),
             self.active_compact_threshold_chars()
         ));
-        if let Some(todo) = read_project_todo_summary(&self.sandbox_root, 5) {
+        if let Some(todo) = read_session_todo_summary(&self.sandbox_root, &self.session_id, 5) {
             env.push_str("\n## Project todos\n");
             env.push_str(&cap_bytes_with_hint(
                 todo,
@@ -11402,7 +11473,7 @@ impl Agent {
     }
 
     fn load_latest_session(&mut self) -> Result<PathBuf> {
-        let path = self.latest_session_path.clone();
+        let path = latest_session_path(&self.sandbox_root);
         self.load_session_from_path(&path)
     }
 
@@ -12178,7 +12249,7 @@ impl Agent {
         let request = SubagentRequest::from_input(self, &input).map_err(anyhow::Error::msg)?;
         if mode == SubagentMode::Detached {
             let (input_path, output_path, steer_path) =
-                write_subagent_input(&self.sandbox_root, &request)?;
+                write_subagent_input(&self.sandbox_root, &self.session_id, &request)?;
             let launch = spawn_detached_subagent_process(
                 &self.sandbox_root,
                 &input_path,
@@ -13214,13 +13285,22 @@ impl Agent {
                         let interrupt = self.interrupt.clone();
                         let sem = self.builtin_semaphore.clone();
                         let read_cache = read_cache.clone();
+                        let session_id = self.session_id.clone();
                         let handle = tokio::spawn(async move {
                             let _permit = match sem.acquire_owned().await {
                                 Ok(p) => p,
                                 Err(e) => return Err(format!("builtin semaphore closed: {e}")),
                             };
-                            execute_builtin_call(n, inp, root, interrupt, Some(read_cache), None)
-                                .await
+                            execute_builtin_call(
+                                n,
+                                inp,
+                                root,
+                                interrupt,
+                                Some(read_cache),
+                                Some(session_id),
+                                None,
+                            )
+                            .await
                         });
                         (*idx, handle)
                     })
@@ -13239,6 +13319,7 @@ impl Agent {
                     let n = plans[idx].name.clone();
                     let inp = plans[idx].input.clone();
                     let summary = plans[idx].summary.clone();
+                    let session_id = self.session_id.clone();
                     let local_sudo_auth_needed = plans[idx].local_sudo_auth_needed;
                     self.sink.emit(AgentEvent::ToolCallStart {
                         call_id: plans[idx].event_call_id.clone(),
@@ -13248,7 +13329,7 @@ impl Agent {
                     self.append_latest_log("tool_start", &summary);
                     builtin_started_at.insert(idx, std::time::Instant::now());
                     let local_sudo_auth = if local_sudo_auth_needed {
-                        match prepare_local_sudo_auth(&root).await {
+                        match prepare_local_sudo_auth(&root, &session_id).await {
                             Ok(auth) => auth,
                             Err(e) => {
                                 builtin_outputs.insert(idx, Err(e));
@@ -13267,6 +13348,7 @@ impl Agent {
                         root,
                         self.interrupt.clone(),
                         Some(read_cache.clone()),
+                        Some(session_id),
                         local_sudo_auth,
                     )
                     .await;
@@ -13434,6 +13516,7 @@ impl Agent {
                     };
                     let artifact = write_verification_artifact(
                         &self.sandbox_root,
+                        &self.session_id,
                         &ui_summary,
                         &command,
                         &content,
@@ -14480,6 +14563,7 @@ impl Agent {
             pack_hook_env: self.pack_hook_env.clone(),
             state_lock: self.state_lock.clone(),
             session_enabled: self.session_enabled,
+            session_id: self.session_id.clone(),
             latest_session_path: self.latest_session_path.clone(),
             latest_log_path: self.latest_log_path.clone(),
             pending_login_provider: None,
@@ -14737,7 +14821,7 @@ fn render_session_listing(root: &Path) -> String {
 
     let latest_path = latest_session_path(root);
     let mut out = String::new();
-    let _ = writeln!(out, "project latest:");
+    let _ = writeln!(out, "latest session:");
     if latest_path.exists() {
         let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
         let _ = writeln!(
@@ -14751,6 +14835,39 @@ fn render_session_listing(root: &Path) -> String {
             "  (none yet; send a message to create {})",
             latest_path.display()
         );
+    }
+
+    let sessions_root = named_sessions_dir_for_root(root);
+    let _ = writeln!(out, "autosaved session dirs:");
+    let mut autosaved_sessions: Vec<(String, PathBuf, Option<std::time::SystemTime>)> =
+        std::fs::read_dir(&sessions_root)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(|e| e.ok()))
+            .filter_map(|entry| {
+                let path = entry.path().join(format!("{LATEST_SESSION_NAME}.jsonl"));
+                if !path.exists() {
+                    return None;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let modified = path.metadata().ok().and_then(|m| m.modified().ok());
+                Some((name, path, modified))
+            })
+            .collect();
+    autosaved_sessions.sort_by(|a, b| b.2.cmp(&a.2));
+    if autosaved_sessions.is_empty() {
+        let _ = writeln!(out, "  (none in {})", sessions_root.display());
+    } else {
+        for (name, path, modified) in autosaved_sessions.iter().take(SLASH_LIST_LIMIT) {
+            let _ = writeln!(out, "  {}", session_file_line(path, name, *modified));
+        }
+        if autosaved_sessions.len() > SLASH_LIST_LIMIT {
+            let _ = writeln!(
+                out,
+                "  … [{} more session dirs omitted]",
+                autosaved_sessions.len() - SLASH_LIST_LIMIT
+            );
+        }
     }
 
     let _ = writeln!(out, "named sessions:");
@@ -16349,10 +16466,24 @@ fn resolve_session_selector(root: &Path, selector: &str) -> Result<PathBuf> {
         return Ok(latest_session_path(root));
     }
     let path = PathBuf::from(trimmed);
+    if path.is_dir() {
+        let latest = path.join(format!("{LATEST_SESSION_NAME}.jsonl"));
+        if latest.exists() {
+            return Ok(latest);
+        }
+    }
     if path.exists() || path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
         return Ok(path);
     }
-    named_session_path_for_root(root, trimmed)
+    let named_path = named_session_path_for_root(root, trimmed)?;
+    if named_path.exists() {
+        return Ok(named_path);
+    }
+    let session_latest = session_latest_session_path(root, trimmed);
+    if session_latest.exists() {
+        return Ok(session_latest);
+    }
+    Ok(named_path)
 }
 
 fn format_preview(p: &mutation_preview::MutationPreview) -> String {
@@ -16973,7 +17104,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /resume [name]            load the project latest or a named session"
+                "  /resume [name]            load the latest autosaved or a named session"
             );
             let _ = writeln!(
                 w,
@@ -16997,7 +17128,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /sessions                 list project latest + named sessions; /sessions analyze|map|packet|focus|tracks|grep|failures|verify-log|decisions"
+                "  /sessions                 list latest + autosaved/named sessions; /sessions analyze|map|packet|focus|tracks|grep|failures|verify-log|decisions"
             );
             let _ = writeln!(w, "  /session                  alias for /sessions");
             let _ = writeln!(
@@ -17045,7 +17176,9 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             agent.history.clear();
             agent.work_ledger.active_focus = None;
             agent.clear_pending_login();
-            let _ = std::fs::remove_file(&agent.latest_session_path);
+            if agent.session_enabled {
+                let _ = std::fs::remove_file(&agent.latest_session_path);
+            }
             let _ = writeln!(w, "cleared {n} messages");
         }
         "tools" => {
@@ -18533,6 +18666,7 @@ fn run_eval_shell_command(
     let combined = format!("--- stdout ---\n{stdout}--- stderr ---\n{stderr}");
     let _ = write_verification_artifact(
         root,
+        "eval",
         "eval-command",
         command,
         &combined,
@@ -19415,9 +19549,9 @@ async fn main() -> Result<()> {
         println!("usage: dext [TASK...]        run one-shot with TASK (joined with spaces)");
         println!("       dext -p               read task from stdin, run one-shot");
         println!(
-            "       dext --resume         resume the project-scoped auto-saved latest session"
+            "       dext --resume         resume the newest auto-saved session for this project"
         );
-        println!("       dext sessions         list project latest + named sessions");
+        println!("       dext sessions         list latest + autosaved/named sessions");
         println!("       dext session map [latest|NAME|PATH]");
         println!("       dext session packet [latest|NAME|PATH] @wNN");
         println!("       dext session focus [latest|NAME|PATH] @wNN [--exact]");
@@ -19436,9 +19570,7 @@ async fn main() -> Result<()> {
         );
         println!("       dext --pack NAME TASK  invoke a pack in one-shot mode");
         println!("       dext session analyze|grep|failures|verify-log|decisions [session]");
-        println!(
-            "       dext --no-session     run without project state lock, latest session, or log writes"
-        );
+        println!("       dext --no-session     run without autosaved session/log writes");
         println!("       dext --fork           resume latest into an isolated, unsaved branch");
         println!("       dext --cd DIR         use DIR as sandbox/cwd");
         println!("       dext --output json|stream-json  emit machine-readable output");
@@ -19550,6 +19682,7 @@ async fn main() -> Result<()> {
         agent.suppress_checkpoints = true;
         agent.session_enabled = false;
         agent.state_lock = None;
+        agent.latest_session_path = project_latest_session_path(&agent.sandbox_root);
     }
     if opts.output.is_json() {
         agent.pretty = false;
@@ -19575,6 +19708,7 @@ async fn main() -> Result<()> {
                     agent.suppress_checkpoints = true;
                     agent.session_enabled = false;
                     agent.state_lock = None;
+                    agent.latest_session_path = project_latest_session_path(&agent.sandbox_root);
                 }
                 if !opts.output.is_json() {
                     if opts.fork {

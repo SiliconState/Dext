@@ -8,8 +8,8 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::{
     DEFAULT_SYSTEM, LATEST_LOG_ARCHIVE_MAX, LATEST_LOG_CAP, LATEST_SESSION_NAME, LOG_DETAIL_CAP,
-    PROJECT_STATE_LOCK_NAME, PROJECT_STATE_LOCK_STALE_SECS, SessionHeader, ThinkingEffort,
-    byte_prefix_at_char_boundary, byte_suffix_at_char_boundary, cap_bytes_with_hint,
+    SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort, byte_prefix_at_char_boundary,
+    byte_suffix_at_char_boundary, cap_bytes_with_hint,
 };
 
 pub(crate) fn user_home_dir() -> PathBuf {
@@ -114,6 +114,10 @@ pub(crate) fn named_sessions_dir_for_root(root: &Path) -> PathBuf {
     project_state_dir(root).join("sessions")
 }
 
+pub(crate) fn session_state_dir(root: &Path, session_id: &str) -> PathBuf {
+    latest_sessions_dir(root).join(session_id)
+}
+
 pub(crate) fn canonicalize_or_clone(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -200,6 +204,7 @@ pub(crate) fn latest_sessions_dir(root: &Path) -> PathBuf {
     project_state_dir(root).join("sessions")
 }
 
+#[cfg(test)]
 pub(crate) fn logs_dir(root: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("DEXT_LOGS_DIR") {
         return PathBuf::from(p);
@@ -207,12 +212,66 @@ pub(crate) fn logs_dir(root: &Path) -> PathBuf {
     project_state_dir(root).join("logs")
 }
 
+#[cfg(test)]
 pub(crate) fn latest_log_path(root: &Path) -> PathBuf {
     logs_dir(root).join("latest.log")
 }
 
-pub(crate) fn latest_session_path(root: &Path) -> PathBuf {
+pub(crate) fn project_latest_session_path(root: &Path) -> PathBuf {
     latest_sessions_dir(root).join(format!("{LATEST_SESSION_NAME}.jsonl"))
+}
+
+pub(crate) fn latest_session_path(root: &Path) -> PathBuf {
+    let legacy = project_latest_session_path(root);
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = legacy
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|modified| (modified, legacy.clone()));
+
+    if let Ok(entries) = std::fs::read_dir(latest_sessions_dir(root)) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path().join(format!("{LATEST_SESSION_NAME}.jsonl"));
+            let Some(modified) = path.metadata().ok().and_then(|m| m.modified().ok()) else {
+                continue;
+            };
+            if newest
+                .as_ref()
+                .is_none_or(|(current, _)| modified >= *current)
+            {
+                newest = Some((modified, path));
+            }
+        }
+    }
+
+    newest.map(|(_, path)| path).unwrap_or(legacy)
+}
+
+pub(crate) fn session_latest_session_path(root: &Path, session_id: &str) -> PathBuf {
+    session_state_dir(root, session_id).join(format!("{LATEST_SESSION_NAME}.jsonl"))
+}
+
+pub(crate) fn session_latest_log_path(root: &Path, session_id: &str) -> PathBuf {
+    if let Ok(p) = std::env::var("DEXT_LOGS_DIR") {
+        return PathBuf::from(p).join(session_id).join("latest.log");
+    }
+    session_state_dir(root, session_id).join("latest.log")
+}
+
+pub(crate) fn session_artifacts_dir(root: &Path, session_id: &str) -> PathBuf {
+    session_state_dir(root, session_id).join("artifacts")
+}
+
+pub(crate) fn session_subagents_dir(root: &Path, session_id: &str) -> PathBuf {
+    session_state_dir(root, session_id).join("subagents")
+}
+
+pub(crate) fn session_sudo_dir(root: &Path, session_id: &str) -> PathBuf {
+    session_state_dir(root, session_id).join("sudo")
+}
+
+pub(crate) fn session_todo_path(root: &Path, session_id: &str) -> PathBuf {
+    session_state_dir(root, session_id).join("DEXT.todo.json")
 }
 
 fn temp_swap_path(path: &Path) -> PathBuf {
@@ -400,9 +459,9 @@ pub(crate) fn append_log_line(path: &Path, line: &str) {
     let _ = atomic_write_bytes(path, data.as_bytes());
 }
 
-pub(crate) fn append_latest_log(root: &Path, event: &str, detail: &str) {
+pub(crate) fn append_log_event(path: &Path, event: &str, detail: &str) {
     append_log_line(
-        &latest_log_path(root),
+        path,
         &format!(
             "[{}] {} {}",
             unix_timestamp_secs(),
@@ -412,8 +471,8 @@ pub(crate) fn append_latest_log(root: &Path, event: &str, detail: &str) {
     );
 }
 
-pub(crate) fn project_state_lock_path(root: &Path) -> PathBuf {
-    project_state_dir(root).join(PROJECT_STATE_LOCK_NAME)
+pub(crate) fn session_state_lock_path(root: &Path, session_id: &str) -> PathBuf {
+    session_state_dir(root, session_id).join(SESSION_STATE_LOCK_NAME)
 }
 
 fn unix_timestamp_nanos() -> u128 {
@@ -427,81 +486,30 @@ fn current_pid() -> u32 {
     std::process::id()
 }
 
-#[cfg(windows)]
-pub(crate) fn process_exists(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-
-    unsafe extern "system" {
-        fn OpenProcess(
-            desired_access: u32,
-            inherit_handle: i32,
-            process_id: u32,
-        ) -> *mut std::ffi::c_void;
-        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-    }
-
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        false
-    } else {
-        unsafe {
-            CloseHandle(handle);
-        }
-        true
-    }
+fn random_hex<const N: usize>() -> Option<String> {
+    let mut bytes = [0u8; N];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-#[cfg(unix)]
-pub(crate) fn process_exists(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-
-    let rc = unsafe { kill(pid as i32, 0) };
-    if rc != 0 && matches!(io::Error::last_os_error().raw_os_error(), Some(3)) {
-        return false;
-    }
-
-    !linux_process_is_zombie(pid)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_process_is_zombie(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_string()))
-        .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
-        .is_some_and(|state| state == "Z")
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn linux_process_is_zombie(_pid: u32) -> bool {
-    false
-}
-
-#[cfg(not(any(windows, unix)))]
-pub(crate) fn process_exists(pid: u32) -> bool {
-    pid != 0
+pub(crate) fn new_session_id() -> String {
+    let random = random_hex::<6>()
+        .unwrap_or_else(|| format!("{:012x}", unix_timestamp_nanos() & 0xffff_ffff_ffff));
+    format!("{}-{}-{random}", unix_timestamp_secs(), current_pid())
 }
 
 #[derive(Serialize, Deserialize)]
-struct ProjectStateLockRecord {
+struct SessionStateLockRecord {
     token: String,
     pid: u32,
     acquired_at: u64,
     project_key: String,
     sandbox_root: String,
+    session_id: String,
 }
 
 #[derive(Debug)]
-pub(crate) struct ProjectStateLock {
+pub(crate) struct SessionStateLock {
     pub(crate) path: PathBuf,
     token: String,
 }
@@ -533,16 +541,23 @@ pub(crate) fn restore_terminal_if_tui() {
     }
 }
 
+fn remove_lock_file_and_empty_parent(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
 pub(crate) fn release_registered_locks() {
     let Ok(mut entries) = lock_cleanup_registry().lock() else {
         return;
     };
     for (path, token) in entries.drain(..) {
-        let Ok(existing) = ProjectStateLock::read_record(&path) else {
+        let Ok(existing) = SessionStateLock::read_record(&path) else {
             continue;
         };
         if existing.token == token && existing.pid == current_pid() {
-            let _ = std::fs::remove_file(&path);
+            remove_lock_file_and_empty_parent(&path);
         }
     }
 }
@@ -559,15 +574,15 @@ fn unregister_lock_cleanup(path: &Path, token: &str) {
     }
 }
 
-impl ProjectStateLock {
-    fn read_record(path: &Path) -> Result<ProjectStateLockRecord> {
+impl SessionStateLock {
+    fn read_record(path: &Path) -> Result<SessionStateLockRecord> {
         let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading project state lock {}", path.display()))?;
+            .with_context(|| format!("reading session state lock {}", path.display()))?;
         serde_json::from_str(&content)
-            .with_context(|| format!("parsing project state lock {}", path.display()))
+            .with_context(|| format!("parsing session state lock {}", path.display()))
     }
 
-    fn write_record(path: &Path, record: &ProjectStateLockRecord) -> Result<()> {
+    fn write_record(path: &Path, record: &SessionStateLockRecord) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -576,82 +591,69 @@ impl ProjectStateLock {
             .write(true)
             .create_new(true)
             .open(path)
-            .with_context(|| format!("creating project state lock {}", path.display()))?;
-        file.write_all(&data)?;
-        file.sync_all()?;
+            .with_context(|| format!("creating session state lock {}", path.display()))?;
+        let write_result = file.write_all(&data).and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(path);
+            return Err(e)
+                .with_context(|| format!("writing session state lock {}", path.display()));
+        }
         Ok(())
     }
 
-    pub(crate) fn acquire(root: &Path) -> Result<Self> {
-        let path = project_state_lock_path(root);
-        let record = ProjectStateLockRecord {
+    pub(crate) fn acquire(root: &Path, session_id: &str) -> Result<Self> {
+        let path = session_state_lock_path(root, session_id);
+        let record = SessionStateLockRecord {
             token: format!("{}-{:x}", current_pid(), unix_timestamp_nanos()),
             pid: current_pid(),
             acquired_at: unix_timestamp_secs(),
             project_key: project_key(root),
             sandbox_root: root.display().to_string(),
+            session_id: session_id.to_string(),
         };
 
-        loop {
-            match Self::write_record(&path, &record) {
-                Ok(()) => {
-                    register_lock_cleanup(&path, &record.token);
-                    return Ok(Self {
-                        path,
-                        token: record.token.clone(),
-                    });
-                }
-                Err(e) => {
-                    let already_exists = e
-                        .downcast_ref::<io::Error>()
-                        .is_some_and(|ioe| ioe.kind() == io::ErrorKind::AlreadyExists);
-                    if !already_exists {
-                        return Err(e);
-                    }
-                }
+        match Self::write_record(&path, &record) {
+            Ok(()) => {
+                register_lock_cleanup(&path, &record.token);
+                Ok(Self {
+                    path,
+                    token: record.token,
+                })
             }
-
-            match Self::read_record(&path) {
-                Ok(existing) => {
-                    if !process_exists(existing.pid) {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    anyhow::bail!(
-                        "another dext process already owns project state for {} (pid {}, lock {}). Close that process or remove the stale lock if it is no longer running.",
+            Err(e) => {
+                let already_exists = e
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|ioe| ioe.kind() == io::ErrorKind::AlreadyExists);
+                if !already_exists {
+                    return Err(e);
+                }
+                match Self::read_record(&path) {
+                    Ok(existing) => anyhow::bail!(
+                        "dext session {} is already open for {} (pid {}, lock {})",
+                        existing.session_id,
                         existing.sandbox_root,
                         existing.pid,
                         path.display(),
-                    );
-                }
-                Err(_) => {
-                    let stale = std::fs::metadata(&path)
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age.as_secs() >= PROJECT_STATE_LOCK_STALE_SECS);
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    anyhow::bail!(
-                        "project state lock exists but could not be read: {}",
+                    ),
+                    Err(_) => anyhow::bail!(
+                        "session state lock exists but could not be read: {}",
                         path.display()
-                    );
+                    ),
                 }
             }
         }
     }
 }
 
-impl Drop for ProjectStateLock {
+impl Drop for SessionStateLock {
     fn drop(&mut self) {
         unregister_lock_cleanup(&self.path, &self.token);
         let Ok(existing) = Self::read_record(&self.path) else {
             return;
         };
         if existing.token == self.token && existing.pid == current_pid() {
-            let _ = std::fs::remove_file(&self.path);
+            remove_lock_file_and_empty_parent(&self.path);
         }
     }
 }

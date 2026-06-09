@@ -10,7 +10,6 @@ const CHECKPOINTS_DIR: &str = ".dext/checkpoints";
 const REF_PREFIX: &str = "refs/dext/checkpoints";
 const DEFAULT_PRUNE_KEEP: usize = 20;
 const DEFAULT_PRUNE_MAX_AGE_HOURS: u64 = 168; // 7 days
-const MANIFEST_CAP: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct Checkpoint {
@@ -277,21 +276,13 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("manifest mkdir: {e}"))?;
     let line = format_manifest_line(cp);
     let manifest_path = dir.join("manifest.txt");
-    let mut content = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-    let lines: Vec<&str> = content.lines().collect();
-    if lines.len() >= MANIFEST_CAP {
-        // Keep only the newest MANIFEST_CAP entries
-        let keep: Vec<&str> = lines
-            .iter()
-            .skip(lines.len() - MANIFEST_CAP + 1)
-            .copied()
-            .collect();
-        content = format!("{}\n{line}\n", keep.join("\n"));
-    } else {
-        content.push_str(&line);
-        content.push('\n');
-    }
-    std::fs::write(&manifest_path, content).map_err(|e| format!("manifest write: {e}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&manifest_path)
+        .map_err(|e| format!("manifest open: {e}"))?;
+    use std::io::Write as _;
+    writeln!(file, "{line}").map_err(|e| format!("manifest write: {e}"))?;
     Ok(())
 }
 
@@ -524,7 +515,7 @@ pub(crate) fn prune(
     let now = now_ms();
     let max_age_ms = (max_age as u128) * 3_600_000;
 
-    let cps = list_checkpoints(root, 1000)?;
+    let cps = list_checkpoints(root, usize::MAX)?;
     let mut removed = 0usize;
 
     // Keep newest `keep` entries; remove expired ones
@@ -547,6 +538,7 @@ pub(crate) fn prune(
         .collect();
 
     let dir = checkpoints_manifest_dir(&git_root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("manifest mkdir: {e}"))?;
     let manifest_path = dir.join("manifest.txt");
     let content: String = remaining
         .iter()
@@ -571,7 +563,7 @@ pub(crate) fn prune(
 }
 
 pub(crate) fn find_checkpoint(root: &Path, id_or_ref: &str) -> Result<Option<Checkpoint>, String> {
-    let cps = list_checkpoints(root, 100)?;
+    let cps = list_checkpoints(root, usize::MAX)?;
     // Try exact id match
     if let Some(cp) = cps.iter().find(|cp| cp.id == id_or_ref) {
         return Ok(Some(cp.clone()));
