@@ -399,9 +399,10 @@ impl SessionReplayFixture {
 
 fn block_contains_marker(block: &Block, marker: &str) -> bool {
     match block {
-        Block::Text { text } | Block::PartialStream { text } | Block::Thinking { text } => {
+        Block::Text { text } | Block::PartialStream { text } | Block::Thinking { text, .. } => {
             text.contains(marker)
         }
+        Block::RedactedThinking { data } => data.contains(marker),
         Block::ToolUse { name, input, .. } => {
             name.contains(marker) || input.to_string().contains(marker)
         }
@@ -4232,6 +4233,7 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
     let body_json: Value = serde_json::from_slice(&body)?;
     assert!(body_json.get("reasoning_effort").is_none(), "{body_json}");
     assert!(body_json.get("stream_options").is_none(), "{body_json}");
+    assert!(body_json.get("prompt_cache_key").is_none(), "{body_json}");
     assert_eq!(body_json["max_tokens"], 8192);
 
     let chatgpt = build_chatgpt_request(
@@ -5899,10 +5901,13 @@ fn usage_total_and_input_tokens_match_status_semantics() {
 
     assert_eq!(usage.actual_input_tokens(), 120_000);
     assert_eq!(usage.cached_input_tokens(), 42_000);
+    assert_eq!(usage.total_input_tokens(), 162_000);
     assert_eq!(usage.context_tokens(), 167_400);
     assert_eq!(usage.total_tokens(), 167_400);
-    assert!(usage.line().contains("in=120000"));
-    assert!(usage.line().contains("cached=42000"));
+    assert!(usage.line().contains("input=162000"));
+    assert!(usage.line().contains("new_in=120000"));
+    assert!(usage.line().contains("cache_r=40000"));
+    assert!(usage.line().contains("cache_w=2000"));
     assert!(usage.line().contains("total=167400"));
 }
 
@@ -5917,6 +5922,7 @@ fn anthropic_usage_parse_keeps_native_uncached_input() {
 
     assert_eq!(usage.actual_input_tokens(), 1000);
     assert_eq!(usage.cached_input_tokens(), 400);
+    assert_eq!(usage.total_input_tokens(), 1_400);
     assert_eq!(usage.context_tokens(), 1450);
 }
 
@@ -5931,6 +5937,7 @@ fn anthropic_compatible_prompt_usage_subtracts_cache_from_total_prompt() {
 
     assert_eq!(usage.actual_input_tokens(), 600);
     assert_eq!(usage.cached_input_tokens(), 400);
+    assert_eq!(usage.total_input_tokens(), 1_000);
     assert_eq!(usage.context_tokens(), 1050);
 }
 
@@ -5944,6 +5951,7 @@ fn openai_usage_parse_splits_cached_prompt_tokens() {
 
     assert_eq!(usage.actual_input_tokens(), 700);
     assert_eq!(usage.cache_read, 300);
+    assert_eq!(usage.total_input_tokens(), 1000);
     assert_eq!(usage.context_tokens(), 1050);
 }
 
@@ -5957,6 +5965,7 @@ fn openai_usage_parse_splits_prompt_cache_hit_and_miss_tokens() {
 
     assert_eq!(usage.actual_input_tokens(), 700);
     assert_eq!(usage.cache_read, 300);
+    assert_eq!(usage.total_input_tokens(), 1000);
     assert_eq!(usage.context_tokens(), 1050);
 }
 
@@ -5973,6 +5982,7 @@ fn openai_usage_parse_accepts_direct_cost_and_cache_create() {
     assert_eq!(usage.actual_input_tokens(), 600);
     assert_eq!(usage.cache_create, 100);
     assert_eq!(usage.cache_read, 300);
+    assert_eq!(usage.total_input_tokens(), 1000);
     assert_eq!(usage.cost_usd, Some(0.0123));
     assert_eq!(usage.estimated_cost_usd(), 0.0123);
 }
@@ -6009,6 +6019,105 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
     };
 
     assert_eq!(pricing.estimate(usage), 0.0);
+}
+
+#[test]
+fn anthropic_fable_pricing_matches_console_session_cost() {
+    let pricing = usage_pricing_for(
+        "anthropic",
+        ApiProvider::Anthropic,
+        "https://api.anthropic.com",
+        "claude-fable-5",
+    );
+    let usage = Usage {
+        input: 267_523,
+        output: 7_024,
+        cache_create: 134_837,
+        cache_read: 261_781,
+        cost_usd: None,
+    };
+    let estimate = pricing.estimate(usage);
+
+    assert!(
+        (estimate - 5.83).abs() < 0.0001,
+        "expected $5.83, got ${estimate:.8}"
+    );
+    assert!((pricing.output / pricing.input - 5.0).abs() < 0.000001);
+    assert!((pricing.cache_read / pricing.input - 0.1).abs() < 0.000001);
+    assert!((pricing.cache_create / pricing.input - 1.25).abs() < 0.000001);
+}
+
+#[test]
+fn anthropic_wire_cost_is_repriced_for_supported_claude_models() {
+    let root = temp_test_dir("anthropic-reprice-wire-cost");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "anthropic".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-fable-5".to_string();
+    let mut usage = Usage {
+        input: 267_523,
+        output: 7_024,
+        cache_create: 134_837,
+        cache_read: 261_781,
+        cost_usd: Some(0.49736735),
+    };
+
+    agent.finalize_usage_metrics(&mut usage);
+
+    assert!(
+        (usage.estimated_cost_usd() - 5.83).abs() < 0.0001,
+        "expected Anthropic model pricing to override stale wire/default cost, got ${:.8}",
+        usage.estimated_cost_usd()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn glm_wire_cost_is_preserved_when_provider_reports_it() {
+    let root = temp_test_dir("glm-preserve-wire-cost");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "glm".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "glm-5.1".to_string();
+    let mut usage = Usage {
+        input: 1_000,
+        output: 100,
+        cache_create: 0,
+        cache_read: 0,
+        cost_usd: Some(0.123),
+    };
+
+    agent.finalize_usage_metrics(&mut usage);
+
+    assert_eq!(usage.cost_usd, Some(0.123));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn anthropic_api_provider_uses_anthropic_model_pricing_for_custom_profiles() {
+    let direct = usage_pricing_for(
+        "anthropic",
+        ApiProvider::Anthropic,
+        "https://api.anthropic.com",
+        "claude-fable-5",
+    );
+    let custom = usage_pricing_for(
+        "custom-claude",
+        ApiProvider::Anthropic,
+        "https://api.anthropic.com",
+        "claude-fable-5",
+    );
+    let usage = Usage {
+        input: 1_000_000,
+        output: 0,
+        cache_create: 0,
+        cache_read: 0,
+        cost_usd: None,
+    };
+
+    assert_eq!(custom.estimate(usage), direct.estimate(usage));
 }
 
 #[test]
@@ -8341,6 +8450,80 @@ fn glm_streaming_request_keeps_enabled_thinking_payload() -> Result<()> {
 }
 
 #[test]
+fn claude_streaming_request_marks_stable_system_and_tools_cacheable() -> Result<()> {
+    let root = temp_test_dir("claude-prompt-cache-controls");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = "anthropic".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-sonnet-4-6".to_string();
+    let sys_blocks = [
+        SystemBlock {
+            kind: "text",
+            text: "stable prompt",
+            cache_control: Some(CacheControl::EPHEMERAL),
+        },
+        SystemBlock {
+            kind: "text",
+            text: "volatile env",
+            cache_control: None,
+        },
+    ];
+    let wire_tools = vec![WireTool {
+        name: "read_file".to_string(),
+        description: "read".to_string(),
+        input_schema: json!({"type":"object","properties":{}}),
+        cache_control: Some(CacheControl::EPHEMERAL),
+    }];
+
+    let (_, body) = agent.build_streaming_request(
+        "stable prompt",
+        "volatile env",
+        &sys_blocks,
+        &wire_tools,
+        "unused",
+    )?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert!(value.get("cache_control").is_none(), "{value}");
+    assert_eq!(value["system"][0]["cache_control"]["type"], "ephemeral");
+    assert!(value["system"][1].get("cache_control").is_none(), "{value}");
+    assert_eq!(value["tools"][0]["cache_control"]["type"], "ephemeral");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn anthropic_compatible_non_claude_request_strips_cache_controls() -> Result<()> {
+    let root = temp_test_dir("anthropic-compatible-cache-strip");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = "glm".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "glm-5.1".to_string();
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: Some(CacheControl::EPHEMERAL),
+    }];
+    let wire_tools = vec![WireTool {
+        name: "read_file".to_string(),
+        description: "read".to_string(),
+        input_schema: json!({"type":"object","properties":{}}),
+        cache_control: Some(CacheControl::EPHEMERAL),
+    }];
+
+    let (_, body) =
+        agent.build_streaming_request("sys", "env", &sys_blocks, &wire_tools, "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert!(value["system"][0].get("cache_control").is_none(), "{value}");
+    assert!(value["tools"][0].get("cache_control").is_none(), "{value}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> Result<()> {
     let root = temp_test_dir("claude-adaptive-thinking");
     let root = std::fs::canonicalize(&root)?;
@@ -8354,25 +8537,35 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
         text: "sys",
         cache_control: None,
     }];
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["thinking"]["type"], "enabled");
+    assert_eq!(value["thinking"]["budget_tokens"], 6_144);
+    assert!(value.get("output_config").is_none(), "{value}");
 
+    agent.model = "claude-sonnet-4-6".to_string();
+    agent.thinking_effort = ThinkingEffort::Medium;
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
     assert_eq!(value["thinking"]["type"], "adaptive");
+    assert!(value["thinking"].get("display").is_none(), "{value}");
     assert!(value["thinking"].get("budget_tokens").is_none(), "{value}");
-    assert_eq!(value["output_config"]["effort"], "high");
+    assert_eq!(value["output_config"]["effort"], "medium");
 
     agent.model = "claude-opus-4-8".to_string();
     agent.thinking_effort = ThinkingEffort::XHigh;
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
     assert_eq!(value["thinking"]["type"], "adaptive");
+    assert_eq!(value["thinking"]["display"], "omitted");
     assert_eq!(value["output_config"]["effort"], "xhigh");
 
-    agent.model = "claude-fable".to_string();
+    agent.model = "claude-fable-5".to_string();
     agent.thinking_effort = ThinkingEffort::Max;
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
     assert_eq!(value["thinking"]["type"], "adaptive");
+    assert_eq!(value["thinking"]["display"], "omitted");
     assert_eq!(value["output_config"]["effort"], "max");
 
     agent.model = "claude-opus-4-1".to_string();
@@ -8466,6 +8659,63 @@ fn action_contract_note_requires_mutation_tool_use() {
     assert!(!assistant_text_has_implementation_commitment(
         "I found the root cause."
     ));
+}
+
+#[test]
+fn anthropic_request_roundtrips_signed_and_redacted_thinking_blocks() -> Result<()> {
+    let root = temp_test_dir("anthropic-thinking-roundtrip");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = "anthropic".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-sonnet-4-6".to_string();
+    agent.thinking_effort = ThinkingEffort::High;
+    agent.history = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![
+            Block::Thinking {
+                text: String::new(),
+                signature: Some("sig-full".to_string()),
+            },
+            Block::RedactedThinking {
+                data: "opaque-redacted".to_string(),
+            },
+            Block::Thinking {
+                text: "legacy unsigned should be stripped".to_string(),
+                signature: None,
+            },
+            Block::Text {
+                text: "answer".to_string(),
+            },
+        ],
+    }];
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: None,
+    }];
+
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["thinking"]["type"], "adaptive");
+    let content = value["messages"][0]["content"]
+        .as_array()
+        .context("content")?;
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "");
+    assert_eq!(content[0]["signature"], "sig-full");
+    assert!(content[0].get("text").is_none(), "{}", content[0]);
+    assert_eq!(content[1]["type"], "redacted_thinking");
+    assert_eq!(content[1]["data"], "opaque-redacted");
+    assert_eq!(content[2]["type"], "text");
+    assert_eq!(
+        content.len(),
+        3,
+        "unsigned legacy thinking must be stripped: {content:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 #[test]
@@ -8696,6 +8946,50 @@ fn chatgpt_request_body_maps_xhigh_to_actual_reasoning_effort_and_summary() {
 }
 
 #[tokio::test]
+async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
+    let root = temp_test_dir("anthropic-omitted-thinking-stream");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-full\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+    });
+
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::Anthropic;
+    let resp = reqwest::get(format!("http://{addr}/stream"))
+        .await
+        .expect("response");
+    let (blocks, _stop, _usage) = agent.read_stream(resp).await.expect("parse stream");
+    assert!(
+        matches!(
+            blocks.first(),
+            Some(Block::Thinking { text, signature: Some(signature) }) if text.is_empty() && signature == "sig-full"
+        ),
+        "{blocks:?}"
+    );
+    assert!(
+        matches!(
+            blocks.get(1),
+            Some(Block::RedactedThinking { data }) if data == "opaque-redacted"
+        ),
+        "{blocks:?}"
+    );
+    assert!(matches!(blocks.get(2), Some(Block::Text { text }) if text == "answer"));
+    server.join().expect("server thread");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
     let root = temp_test_dir("chatgpt-reasoning-stream");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
@@ -8723,7 +9017,7 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
     assert!(
         matches!(
             blocks.first(),
-            Some(Block::Thinking { text }) if text == "thinking "
+            Some(Block::Thinking { text, .. }) if text == "thinking "
         ),
         "{blocks:?}"
     );

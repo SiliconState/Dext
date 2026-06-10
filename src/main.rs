@@ -374,8 +374,9 @@ fn redact_pseudo_tool_protocol_blocks(blocks: &[Block]) -> Vec<Block> {
             Block::PartialStream { text } => Block::PartialStream {
                 text: redact_pseudo_tool_protocol_text(text),
             },
-            Block::Thinking { text } => Block::Thinking {
+            Block::Thinking { text, signature } => Block::Thinking {
                 text: redact_pseudo_tool_protocol_text(text),
+                signature: signature.clone(),
             },
             other => other.clone(),
         })
@@ -2297,7 +2298,13 @@ enum Block {
         text: String,
     },
     Thinking {
+        #[serde(rename = "thinking", alias = "text", default)]
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: String,
     },
     ToolUse {
         id: String,
@@ -2342,7 +2349,7 @@ fn empty_tool_result_metadata() -> ToolResultMetadata {
     ToolResultMetadata::default()
 }
 
-fn strip_tool_result_metadata(messages: &[Message]) -> Vec<Message> {
+fn sanitize_anthropic_messages(messages: &[Message], preserve_thinking: bool) -> Vec<Message> {
     messages
         .iter()
         .map(|message| Message {
@@ -2350,19 +2357,28 @@ fn strip_tool_result_metadata(messages: &[Message]) -> Vec<Message> {
             content: message
                 .content
                 .iter()
-                .map(|block| match block {
+                .filter_map(|block| match block {
                     Block::ToolResult {
                         tool_use_id,
                         content,
                         is_error,
                         ..
-                    } => Block::ToolResult {
+                    } => Some(Block::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: content.clone(),
                         is_error: *is_error,
                         metadata: ToolResultMetadata::default(),
-                    },
-                    other => other.clone(),
+                    }),
+                    Block::Thinking { text, signature } => {
+                        let signature = signature.as_ref().filter(|sig| !sig.is_empty())?;
+                        preserve_thinking.then_some(Block::Thinking {
+                            text: text.clone(),
+                            signature: Some(signature.clone()),
+                        })
+                    }
+                    Block::RedactedThinking { data } => (preserve_thinking && !data.is_empty())
+                        .then_some(Block::RedactedThinking { data: data.clone() }),
+                    other => Some(other.clone()),
                 })
                 .collect(),
         })
@@ -2374,7 +2390,8 @@ fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
         .iter()
         .map(|block| match block {
             Block::Text { text } | Block::PartialStream { text } => text.len(),
-            Block::Thinking { text } => text.len(),
+            Block::Thinking { text, .. } => text.len(),
+            Block::RedactedThinking { data } => data.len(),
             Block::ToolUse { input, .. } => json_byte_len(input),
             Block::ToolResult { content, .. } => content.len(),
         })
@@ -2952,7 +2969,7 @@ impl CacheControl {
     pub(crate) const EPHEMERAL: Self = Self { kind: "ephemeral" };
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 struct SystemBlock<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
@@ -2961,7 +2978,7 @@ struct SystemBlock<'a> {
     cache_control: Option<CacheControl>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct WireTool {
     name: String,
     description: String,
@@ -3008,13 +3025,34 @@ fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option
     }
 }
 
-fn anthropic_model_supports_extended_effort(model: &str) -> bool {
+fn anthropic_model_is_always_adaptive(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
     model.contains("opus-4-7")
         || model.contains("opus-4.7")
         || model.contains("opus-4-8")
         || model.contains("opus-4.8")
-        || model.contains("fable")
+        || model.contains("fable-5")
+        || model.contains("fable5")
+        || model.contains("mythos")
+}
+
+fn anthropic_model_supports_extended_effort(model: &str) -> bool {
+    anthropic_model_is_always_adaptive(model)
+}
+
+fn anthropic_model_supports_adaptive_thinking(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.contains("opus-4-6")
+        || model.contains("opus-4.6")
+        || model.contains("opus-4-7")
+        || model.contains("opus-4.7")
+        || model.contains("opus-4-8")
+        || model.contains("opus-4.8")
+        || model.contains("sonnet-4-6")
+        || model.contains("sonnet-4.6")
+        || model.contains("fable-5")
+        || model.contains("fable5")
+        || model.contains("mythos")
 }
 
 fn uses_anthropic_adaptive_thinking(provider_id: &str, model: &str) -> bool {
@@ -3022,7 +3060,38 @@ fn uses_anthropic_adaptive_thinking(provider_id: &str, model: &str) -> bool {
     if provider_id == "glm" {
         return false;
     }
+    let is_anthropic =
+        provider_id == "anthropic" || model.trim().to_ascii_lowercase().starts_with("claude-");
+    is_anthropic && anthropic_model_supports_adaptive_thinking(model)
+}
+
+fn anthropic_prompt_cache_supported(provider_id: &str, model: &str) -> bool {
+    let provider_id = canonical_provider_id(provider_id);
     provider_id == "anthropic" || model.trim().to_ascii_lowercase().starts_with("claude-")
+}
+
+fn system_blocks_with_cache_control<'a>(
+    blocks: &[SystemBlock<'a>],
+    enabled: bool,
+) -> Vec<SystemBlock<'a>> {
+    blocks
+        .iter()
+        .map(|block| SystemBlock {
+            kind: block.kind,
+            text: block.text,
+            cache_control: enabled.then_some(block.cache_control).flatten(),
+        })
+        .collect()
+}
+
+fn wire_tools_with_cache_control(tools: &[WireTool], enabled: bool) -> Vec<WireTool> {
+    let mut tools = tools.to_vec();
+    if !enabled {
+        for tool in &mut tools {
+            tool.cache_control = None;
+        }
+    }
+    tools
 }
 
 /// Anthropic rejects a request unless `max_tokens > thinking.budget_tokens`.
@@ -3055,6 +3124,8 @@ struct AnthropicThinking {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<&'static str>,
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -3118,7 +3189,11 @@ pub(crate) struct OaiFunctionDef {
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 struct Usage {
-    // Billable/non-cached input tokens.
+    // Provider usage is normalized into disjoint input buckets:
+    // - Anthropic: input_tokens plus cache_creation/read_input_tokens.
+    // - OpenAI/ChatGPT: prompt/input tokens minus cached_tokens, with cached_tokens as cache_read.
+    // - Z.ai/GLM: Anthropic-compatible fields when present; otherwise no cache buckets.
+    // - local llama.cpp: timings.prompt_n as new prompt input and timings.cache_n as cache_read.
     input: u64,
     output: u64,
     cache_create: u64,
@@ -3150,22 +3225,16 @@ impl Usage {
         self.input
     }
 
-    fn with_priced_estimate(mut self, pricing: UsagePricing) -> Self {
-        if self.cost_usd.is_none() {
-            self.cost_usd = Some(pricing.estimate(self));
-        }
-        self
-    }
-
     fn cached_input_tokens(&self) -> u64 {
         self.cache_create.saturating_add(self.cache_read)
     }
 
+    fn total_input_tokens(&self) -> u64 {
+        self.input.saturating_add(self.cached_input_tokens())
+    }
+
     fn billed_tokens(&self) -> u64 {
-        self.input
-            .saturating_add(self.output)
-            .saturating_add(self.cache_create)
-            .saturating_add(self.cache_read)
+        self.total_input_tokens().saturating_add(self.output)
     }
 
     fn context_tokens(&self) -> u64 {
@@ -3265,13 +3334,19 @@ impl Usage {
     }
 
     fn line(&self) -> String {
+        let mut input = format!("input={}", self.total_input_tokens());
+        if self.cached_input_tokens() > 0 {
+            input.push_str(&format!(
+                " new_in={} cache_r={} cache_w={}",
+                self.actual_input_tokens(),
+                self.cache_read,
+                self.cache_create
+            ));
+        }
         format!(
-            "in={} out={} cache_r={} cache_w={} cached={} total={} est=${:.4}",
-            self.actual_input_tokens(),
+            "{} out={} total={} est=${:.4}",
+            input,
             self.output,
-            self.cache_read,
-            self.cache_create,
-            self.cached_input_tokens(),
             self.total_tokens(),
             self.estimated_cost_usd()
         )
@@ -3329,6 +3404,14 @@ impl Default for UsagePricing {
     }
 }
 
+fn provider_cost_estimate_overrides_wire_cost(
+    provider_id: &str,
+    api_provider: ApiProvider,
+    model: &str,
+) -> bool {
+    api_provider == ApiProvider::Anthropic && anthropic_prompt_cache_supported(provider_id, model)
+}
+
 fn usage_pricing_for(
     provider_id: &str,
     api_provider: ApiProvider,
@@ -3344,10 +3427,30 @@ fn usage_pricing_for(
             "openai" | "chatgpt" => openai_pricing(&model).unwrap_or_default(),
             "anthropic" | "glm" => anthropic_pricing(&model).unwrap_or_default(),
             "deepseek" => deepseek_pricing(&model).unwrap_or_default(),
+            _ if api_provider == ApiProvider::Anthropic => {
+                anthropic_pricing(&model).unwrap_or_default()
+            }
             _ => UsagePricing::default(),
         }
     };
     usage_pricing_from_env(base)
+}
+
+fn usage_with_current_pricing(
+    mut usage: Usage,
+    provider_id: &str,
+    api_provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> Usage {
+    if usage.total_tokens() > 0
+        && (provider_cost_estimate_overrides_wire_cost(provider_id, api_provider, model)
+            || usage.cost_usd.is_none())
+    {
+        usage.cost_usd =
+            Some(usage_pricing_for(provider_id, api_provider, base_url, model).estimate(usage));
+    }
+    usage
 }
 
 fn normalize_price_model(model: &str) -> String {
@@ -3392,7 +3495,15 @@ fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
     if model.starts_with("glm-") {
         return Some(UsagePricing::default());
     }
-    if model.contains("opus") {
+    if model.contains("fable") {
+        // Inferred from Anthropic Console billing for claude-fable-5 until public rates are listed.
+        Some(UsagePricing::new(
+            11.721718363700392,
+            58.60859181850196,
+            1.1721718363700393,
+            14.65214795462549,
+        ))
+    } else if model.contains("opus") {
         Some(UsagePricing::new(15.0, 75.0, 1.5, 18.75))
     } else if model.contains("sonnet") {
         Some(UsagePricing::new(3.0, 15.0, 0.3, 3.75))
@@ -3567,6 +3678,7 @@ struct PartialBlock {
     name: String,
     input_json: String,
     thinking_signature: Option<String>,
+    redacted_data: String,
 }
 
 impl PartialBlock {
@@ -3574,14 +3686,16 @@ impl PartialBlock {
         match self.kind.as_str() {
             "text" => Some(Block::Text { text: self.text }),
             "thinking" => {
-                let text = if self.text.is_empty() {
-                    self.thinking_signature
-                        .map(|sig| format!("[encrypted reasoning signature: {sig}]"))
-                        .unwrap_or_default()
-                } else {
-                    self.text
-                };
-                (!text.is_empty()).then_some(Block::Thinking { text })
+                let signature = self.thinking_signature.filter(|sig| !sig.is_empty());
+                (!self.text.is_empty() || signature.is_some()).then_some(Block::Thinking {
+                    text: self.text,
+                    signature,
+                })
+            }
+            "redacted_thinking" => {
+                (!self.redacted_data.is_empty()).then_some(Block::RedactedThinking {
+                    data: self.redacted_data,
+                })
             }
             "tool_use" => Some(Block::ToolUse {
                 id: self.id,
@@ -8973,7 +9087,7 @@ fn render_transcript_for_summary(msgs: &[Message], context_mode: ContextMode) ->
                         out.push_str(&format!("[{}→partial_stream] {t}\n", m.role));
                     }
                 }
-                Block::Thinking { .. } => {}
+                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
                 Block::ToolUse { name, input, .. } => {
                     let s = input.to_string();
                     let truncated: String = s.chars().take(tool_use_cap).collect();
@@ -9633,17 +9747,14 @@ impl Agent {
         }
     }
 
-    fn current_usage_pricing(&self) -> UsagePricing {
-        usage_pricing_for(
+    fn finalize_usage_metrics(&self, usage: &mut Usage) {
+        *usage = usage_with_current_pricing(
+            *usage,
             &self.provider_id,
             self.api_provider,
             &self.base_url,
             &self.model,
-        )
-    }
-
-    fn finalize_usage_metrics(&self, usage: &mut Usage) {
-        *usage = usage.with_priced_estimate(self.current_usage_pricing());
+        );
     }
 
     fn finalize_turn_usage_metrics(&self, usage: &mut Usage, blocks: &[Block]) {
@@ -9671,11 +9782,13 @@ impl Agent {
     }
 
     fn priced_session_usage(&self) -> Usage {
-        let mut usage = self.session_usage;
-        if usage.cost_usd.is_none() && usage.total_tokens() > 0 {
-            usage.cost_usd = Some(self.current_usage_pricing().estimate(usage));
-        }
-        usage
+        usage_with_current_pricing(
+            self.session_usage,
+            &self.provider_id,
+            self.api_provider,
+            &self.base_url,
+            &self.model,
+        )
     }
 
     fn refresh_context_window(&mut self) -> Option<u64> {
@@ -10303,24 +10416,26 @@ impl Agent {
     fn budget_cap_denial(&mut self) -> Option<String> {
         self.ensure_session_usage_cost();
         let cap = self.budget_cap?;
-        let msg = cap.exceeded(self.session_usage)?;
+        let priced = self.priced_session_usage();
+        let msg = cap.exceeded(priced)?;
         self.budget_exhausted = true;
         Some(format!(
             "{msg}; refusing another model request. Raise/clear with /budget <cap|off> or restart with --budget. Current usage: {}",
-            self.priced_session_usage().line()
+            priced.line()
         ))
     }
 
     fn update_budget_state_after_usage(&mut self) -> Option<String> {
         let cap = self.budget_cap?;
-        let msg = cap.exceeded(self.session_usage)?;
+        let priced = self.priced_session_usage();
+        let msg = cap.exceeded(priced)?;
         if self.budget_exhausted {
             return None;
         }
         self.budget_exhausted = true;
         Some(format!(
             "{msg}; this turn will stop before another model request. Current usage: {}",
-            self.priced_session_usage().line()
+            priced.line()
         ))
     }
 
@@ -11224,10 +11339,12 @@ impl Agent {
                     if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
                         let effort =
                             anthropic_output_config_effort(&self.model, self.thinking_effort);
+                        let always_adaptive = anthropic_model_is_always_adaptive(&self.model);
                         (
                             effort.map(|_| AnthropicThinking {
                                 kind: "adaptive",
                                 budget_tokens: None,
+                                display: always_adaptive.then_some("omitted"),
                             }),
                             effort.map(|effort| AnthropicOutputConfig { effort }),
                         )
@@ -11240,18 +11357,23 @@ impl Agent {
                                 .map(|budget_tokens| AnthropicThinking {
                                     kind: "enabled",
                                     budget_tokens: Some(budget_tokens),
+                                    display: None,
                                 }),
                             None,
                         )
                     };
                 let history = self.provider_context_history();
-                let messages = strip_tool_result_metadata(history);
+                let messages = sanitize_anthropic_messages(history, thinking.is_some());
+                let prompt_cache_enabled =
+                    anthropic_prompt_cache_supported(&self.provider_id, &self.model);
+                let system = system_blocks_with_cache_control(sys_blocks, prompt_cache_enabled);
+                let tools = wire_tools_with_cache_control(wire_tools, prompt_cache_enabled);
                 let body = Request {
                     model: &self.model,
                     max_tokens,
-                    system: sys_blocks,
+                    system: &system,
                     messages: &messages,
-                    tools: wire_tools,
+                    tools: &tools,
                     stream: true,
                     thinking,
                     output_config,
@@ -11607,7 +11729,8 @@ impl Agent {
                     .iter()
                     .map(|b| match b {
                         Block::Text { text } | Block::PartialStream { text } => text.len(),
-                        Block::Thinking { text } => text.len(),
+                        Block::Thinking { text, .. } => text.len(),
+                        Block::RedactedThinking { data } => data.len(),
                         Block::ToolUse { input, .. } => json_byte_len(input),
                         Block::ToolResult { content, .. } => content.len(),
                     })
@@ -11704,7 +11827,8 @@ impl Agent {
                 .iter()
                 .map(|b| match b {
                     Block::Text { text } | Block::PartialStream { text } => text.len(),
-                    Block::Thinking { text } => text.len(),
+                    Block::Thinking { text, .. } => text.len(),
+                    Block::RedactedThinking { data } => data.len(),
                     Block::ToolUse { id, name, input } => {
                         id.len() + name.len() + json_byte_len(input)
                     }
@@ -11822,7 +11946,7 @@ impl Agent {
                         is_error: *is_error,
                         metadata: metadata.clone(),
                     }),
-                    Block::Thinking { .. } => None,
+                    Block::Thinking { .. } | Block::RedactedThinking { .. } => None,
                 })
                 .collect();
 
@@ -13932,6 +14056,17 @@ impl Agent {
                             if let Some(input) = cb.get("input") {
                                 set_tool_input_json_if_meaningful(&mut pb.input_json, input);
                             }
+                        } else if kind == "thinking" {
+                            if let Some(t) = cb["thinking"].as_str() {
+                                pb.text.push_str(t);
+                            }
+                            if let Some(sig) = cb["signature"].as_str() {
+                                pb.thinking_signature = Some(sig.to_string());
+                            }
+                        } else if kind == "redacted_thinking"
+                            && let Some(data) = cb["data"].as_str()
+                        {
+                            pb.redacted_data.push_str(data);
                         }
                         blocks.insert(idx, pb);
                     }
@@ -13955,7 +14090,12 @@ impl Agent {
                                 }
                                 "signature_delta" => {
                                     if let Some(sig) = delta["signature"].as_str() {
-                                        pb.thinking_signature = Some(summarize_inline(sig, 96));
+                                        pb.thinking_signature = Some(sig.to_string());
+                                    }
+                                }
+                                "redacted_thinking_delta" | "data_delta" => {
+                                    if let Some(data) = delta["data"].as_str() {
+                                        pb.redacted_data.push_str(data);
                                     }
                                 }
                                 "input_json_delta" => {
@@ -14396,6 +14536,7 @@ impl Agent {
                 .emit(AgentEvent::ThinkingBlockComplete(reasoning_buf.clone()));
             blocks.push(Block::Thinking {
                 text: reasoning_buf,
+                signature: None,
             });
         }
         if !text_buf.is_empty() {
@@ -15012,11 +15153,24 @@ fn render_session_block_html(out: &mut String, block: &Block) {
                 html_escape(text)
             );
         }
-        Block::Thinking { text } => {
+        Block::Thinking { text, signature } => {
+            let label = if signature.is_some() {
+                "thinking (encrypted)"
+            } else {
+                "thinking"
+            };
             let _ = write!(
                 out,
-                "<details class=\"thinking\"><summary>thinking</summary><pre>{}</pre></details>",
+                "<details class=\"thinking\"><summary>{}</summary><pre>{}</pre></details>",
+                label,
                 html_escape(text)
+            );
+        }
+        Block::RedactedThinking { data } => {
+            let _ = write!(
+                out,
+                "<details class=\"thinking\"><summary>redacted thinking</summary><pre>{}</pre></details>",
+                html_escape(&summarize_inline(data, 160))
             );
         }
         Block::ToolUse { id, name, input } => {
@@ -15129,11 +15283,42 @@ struct SessionAnalysis {
 }
 
 fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> SessionAnalysis {
+    let provider_id = if header.provenance.provider.is_empty() {
+        if matches!(header.provenance.api_provider, ApiProvider::Anthropic)
+            && header
+                .model
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("claude-")
+        {
+            "anthropic"
+        } else {
+            ""
+        }
+    } else {
+        &header.provenance.provider
+    };
+    let base_url = match header.provenance.api_provider {
+        ApiProvider::Anthropic => "https://api.anthropic.com",
+        ApiProvider::OpenAi | ApiProvider::ChatGpt => "",
+    };
+    let model = if header.provenance.model.is_empty() {
+        &header.model
+    } else {
+        &header.provenance.model
+    };
+    let usage = usage_with_current_pricing(
+        header.usage,
+        provider_id,
+        header.provenance.api_provider,
+        base_url,
+        model,
+    );
     let mut analysis = SessionAnalysis {
         messages: history.len(),
         provider: header.provenance.provider.clone(),
         model: header.model.clone(),
-        usage: header.usage,
+        usage,
         verification: header.work_ledger.verification.clone(),
         ..Default::default()
     };
@@ -15180,7 +15365,7 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
                         analysis.failures.push(summarize_inline(content, 180));
                     }
                 }
-                Block::Thinking { .. } => {}
+                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
             }
         }
     }
@@ -15532,7 +15717,7 @@ fn build_session_work_map(source: &Path, header: &SessionHeader, history: &[Mess
                         }),
                     );
                 }
-                Block::Thinking { .. } => {}
+                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
             }
         }
     }
@@ -16487,7 +16672,7 @@ fn grep_session_history(history: &[Message], needle: &str) -> Vec<String> {
             match block {
                 Block::Text { text }
                 | Block::PartialStream { text }
-                | Block::Thinking { text }
+                | Block::Thinking { text, .. }
                 | Block::ToolResult { content: text, .. } => {
                     if text.to_ascii_lowercase().contains(&needle_lower) {
                         hits.push(format!(
@@ -16495,6 +16680,16 @@ fn grep_session_history(history: &[Message], needle: &str) -> Vec<String> {
                             idx + 1,
                             msg.role,
                             summarize_inline(text, 220)
+                        ));
+                    }
+                }
+                Block::RedactedThinking { data } => {
+                    if data.to_ascii_lowercase().contains(&needle_lower) {
+                        hits.push(format!(
+                            "#{} {} redacted_thinking: {}",
+                            idx + 1,
+                            msg.role,
+                            summarize_inline(data, 220)
                         ));
                     }
                 }
@@ -17270,6 +17465,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     .map(|b| match b {
                         Block::Text { .. } => "text",
                         Block::Thinking { .. } => "thinking",
+                        Block::RedactedThinking { .. } => "redacted_thinking",
                         Block::ToolUse { .. } => "tool_use",
                         Block::ToolResult { .. } => "tool_result",
                         Block::PartialStream { .. } => "partial_stream",
@@ -18397,7 +18593,8 @@ fn approx_tokens_for_message(m: &Message) -> usize {
         .iter()
         .map(|b| match b {
             Block::Text { text } | Block::PartialStream { text } => text.len(),
-            Block::Thinking { text } => text.len(),
+            Block::Thinking { text, .. } => text.len(),
+            Block::RedactedThinking { data } => data.len(),
             Block::ToolUse { input, name, .. } => json_byte_len(input) + name.len(),
             Block::ToolResult { content, .. } => content.len(),
         })
@@ -18431,6 +18628,7 @@ fn render_tokens_report(history: &[Message]) -> String {
             .map(|b| match b {
                 Block::Text { .. } => "text",
                 Block::Thinking { .. } => "thinking",
+                Block::RedactedThinking { .. } => "redacted_thinking",
                 Block::ToolUse { .. } => "tool_use",
                 Block::ToolResult { .. } => "tool_result",
                 Block::PartialStream { .. } => "partial_stream",

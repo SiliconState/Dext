@@ -2432,16 +2432,25 @@ fn status_detail_spans(state: &TuiState) -> Vec<Span<'_>> {
         "Tokens: ",
         Style::default().fg(Color::DarkGray),
     )];
-    spans.push(Span::styled(
+    let detail = if usage.cached_input_tokens() > 0 {
         format!(
-            "in {} · cached {} · out {} · ${:.4}",
+            "input {} (new {} · cache r {} w {}) · out {} · ${:.4}",
+            format_count(usage.total_input_tokens()),
             format_count(usage.actual_input_tokens()),
-            format_count(usage.cached_input_tokens()),
+            format_count(usage.cache_read),
+            format_count(usage.cache_create),
             format_count(usage.output),
             usage.estimated_cost_usd(),
-        ),
-        Style::default().fg(Color::Gray),
-    ));
+        )
+    } else {
+        format!(
+            "input {} · out {} · ${:.4}",
+            format_count(usage.total_input_tokens()),
+            format_count(usage.output),
+            usage.estimated_cost_usd(),
+        )
+    };
+    spans.push(Span::styled(detail, Style::default().fg(Color::Gray)));
 
     if let Some((ctx_used, window, pct, color)) = context_usage(state) {
         spans.push(Span::styled(
@@ -6452,7 +6461,7 @@ fn help_overlay_text() -> Text<'static> {
         ("?", "toggle this help"),
     ];
     let legend_rows: &[(&str, &str)] = &[
-        ("↑N ↻ N ↓N", "actual input / cached input / output tokens"),
+        ("input/new/cache/out", "exact token counters in details"),
         ("Ctx [████░░░░░░]", "last request context window usage"),
         ("Ctrl+T", "show exact token counters"),
         ("● / ⠋", "ready / busy spinner"),
@@ -9973,8 +9982,9 @@ mod tests {
             .into_iter()
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(line.contains("in 47.0k"), "{line}");
-        assert!(line.contains("cached 268.0k"), "{line}");
+        assert!(line.contains("input 315.0k"), "{line}");
+        assert!(line.contains("new 47.0k"), "{line}");
+        assert!(line.contains("cache r 268.0k w 0"), "{line}");
         assert!(line.contains("out 5.3k"), "{line}");
 
         state.usage = Usage {
@@ -9988,8 +9998,8 @@ mod tests {
             .into_iter()
             .map(|span| span.content.into_owned())
             .collect::<String>();
-        assert!(line.contains("in 47.0k"), "{line}");
-        assert!(line.contains("cached 0"), "{line}");
+        assert!(line.contains("input 47.0k"), "{line}");
+        assert!(!line.contains("cache r"), "{line}");
         assert!(line.contains("out 5.3k"), "{line}");
     }
 
