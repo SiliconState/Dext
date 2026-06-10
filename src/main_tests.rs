@@ -72,6 +72,7 @@ fn test_agent(root: &Path) -> Agent {
         pretty: false,
         max_iterations: Some(1),
         session_usage: Usage::default(),
+        last_request_usage: Usage::default(),
         interrupt: Arc::new(AtomicBool::new(false)),
         shelf_registry: shelves::ShelfRegistry::discover(root),
         hooks: Hooks::default(),

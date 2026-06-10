@@ -9695,6 +9695,11 @@ struct Agent {
     pretty: bool,
     max_iterations: Option<u32>,
     session_usage: Usage,
+    // Usage of the most recent provider request. This is the context-pressure
+    // signal for adaptive tool-result caps: session_usage is a running bill
+    // across requests (it re-counts the prompt every round), so comparing it
+    // against the context window would saturate within a few rounds.
+    last_request_usage: Usage,
     interrupt: Arc<AtomicBool>,
     shelf_registry: shelves::ShelfRegistry,
     hooks: Hooks,
@@ -9862,6 +9867,7 @@ impl Agent {
             pretty,
             max_iterations: None,
             session_usage: Usage::default(),
+            last_request_usage: Usage::default(),
             interrupt: Arc::new(AtomicBool::new(false)),
             state_lock,
             session_enabled,
@@ -13264,6 +13270,7 @@ impl Agent {
 
             self.finalize_turn_usage_metrics(&mut usage, &blocks);
 
+            self.last_request_usage = usage;
             self.session_usage.add(usage);
             turn_usage.add(usage);
             self.ensure_session_usage_cost();
@@ -13983,7 +13990,7 @@ impl Agent {
                 }
 
                 let ui_cap = orchestrator::adaptive_tool_ui_cap(
-                    &self.session_usage,
+                    &self.last_request_usage,
                     &self.model,
                     TOOL_UI_CONTENT_CAP,
                 );
@@ -14067,7 +14074,7 @@ impl Agent {
                 let dynamic_result_cap = tool_result_context_cap_with_window(
                     &name,
                     &input,
-                    &self.session_usage,
+                    &self.last_request_usage,
                     &self.model,
                     Some(self.context_window_tokens()),
                     self.context_mode,
@@ -15092,6 +15099,7 @@ impl Agent {
             pretty: false,
             max_iterations: max_iter,
             session_usage: Usage::default(),
+            last_request_usage: Usage::default(),
             interrupt: self.interrupt.clone(),
             shelf_registry: shelves::ShelfRegistry::discover(&self.sandbox_root),
             hooks: self.hooks.clone(),
