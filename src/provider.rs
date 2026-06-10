@@ -923,9 +923,9 @@ pub(crate) fn resolve_secret_reference(spec: &str) -> Option<String> {
             .lock()
             .ok()
             .and_then(|m| m.get(&key).cloned())
-            .flatten()
         {
-            return Some(cached);
+            // A cached None records a prior failure; don't re-run the command.
+            return cached;
         }
 
         let output = Command::new("bash").arg("-lc").arg(&key).output().ok()?;
@@ -2707,8 +2707,8 @@ pub(crate) fn try_complete_oauth_from_callback(input: &str) -> Result<Option<Str
 
     eprintln!(
         "[oauth] extracted code from callback input: {}...{}",
-        &parsed.code[..parsed.code.len().min(12)],
-        &parsed.code[parsed.code.len().saturating_sub(8)..]
+        crate::byte_prefix_at_char_boundary(&parsed.code, 12),
+        crate::byte_suffix_at_char_boundary(&parsed.code, 8)
     );
 
     let pending = match load_pending_oauth() {

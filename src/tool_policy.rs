@@ -807,10 +807,33 @@ fn shell_chunk_is_read_only(chunk: &str) -> bool {
             ) || w.starts_with("-fprint")
         }),
         "awk" => !chunk.contains("system("),
-        "git" => matches!(
-            words.next().unwrap_or(""),
-            "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
-        ),
+        "git" => match words.next().unwrap_or("") {
+            "status" | "diff" | "log" | "show" | "rev-parse" => true,
+            // `git branch` only lists when every remaining arg is a list-style
+            // flag; positional args create branches and -d/-D/-m/-M/-c/-C/-f
+            // mutate them.
+            "branch" => words.all(|w| {
+                w.starts_with('-')
+                    && !matches!(
+                        w,
+                        "-d" | "-D"
+                            | "-m"
+                            | "-M"
+                            | "-c"
+                            | "-C"
+                            | "-f"
+                            | "-u"
+                            | "--force"
+                            | "--delete"
+                            | "--move"
+                            | "--copy"
+                            | "--edit-description"
+                            | "--unset-upstream"
+                    )
+                    && !w.starts_with("--set-upstream-to")
+            }),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -843,7 +866,7 @@ fn shell_command_is_dangerous(command: &str) -> bool {
         "sudo ",
         "rm -",
         " rm ",
-        "\nr m ",
+        "\nrm ",
         "rmdir ",
         "mkfs",
         "dd if=",
@@ -856,6 +879,14 @@ fn shell_command_is_dangerous(command: &str) -> bool {
     if dangerous_needles
         .iter()
         .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    // Catch rm/rmdir in command position (e.g. `rm file` at the start of the
+    // command or after a separator), which the substring needles above miss.
+    if command_segments(&lower)
+        .iter()
+        .any(|segment| matches!(segment.split_whitespace().next(), Some("rm" | "rmdir")))
     {
         return true;
     }
@@ -1150,6 +1181,43 @@ mod tests {
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "sudo rm -rf /tmp/demo"})),
             CommandRisk::Danger
+        );
+        // rm in command position is dangerous even without flags or a leading space.
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "rm stale.txt"})),
+            CommandRisk::Danger
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "echo ok\nrm stale.txt"})),
+            CommandRisk::Danger
+        );
+        // git branch listing is read-only; branch mutation/creation is not.
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "git branch"})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "git branch -a -v"})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "git branch --show-current"})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "git branch -D feature"})),
+            CommandRisk::Write
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "git branch new-feature"})),
+            CommandRisk::Write
+        );
+        assert_eq!(
+            classify_command_risk(
+                "bash",
+                &json!({"command": "git branch --set-upstream-to=origin/main"})
+            ),
+            CommandRisk::Write
         );
         assert!(command_requests_sudo_password("sudo apt update"));
         assert!(command_requests_sudo_password("sudo -v"));

@@ -2021,7 +2021,7 @@ struct SubagentRunReport {
 
 fn compact_call_id(call_id: &str) -> String {
     let tail = call_id.rsplit('.').next().unwrap_or(call_id);
-    let compact = if tail.len() > 12 { &tail[..12] } else { tail };
+    let compact = byte_prefix_at_char_boundary(tail, 12);
     format!("#{compact}")
 }
 
@@ -5080,12 +5080,11 @@ async fn read_http_response_limited(
 
 fn html_entity_decode_minimal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
     let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] != b'&' {
-            out.push(bytes[i] as char);
-            i += 1;
+    while let Some(ch) = s[i..].chars().next() {
+        if ch != '&' {
+            out.push(ch);
+            i += ch.len_utf8();
             continue;
         }
         let Some(rel_end) = s[i..].find(';') else {

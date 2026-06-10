@@ -2592,7 +2592,7 @@ fn full_toolset_env_exposes_specialized_tools_without_browser_by_default() -> Re
     let root = temp_test_dir("toolset-full-env");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     unsafe { std::env::set_var("DEXT_TOOLSET", "full") };
-    let result = (|| -> Result<()> {
+    let check = || -> Result<()> {
         let mut agent = test_agent(&root);
         agent.tool_context_profile = ToolContextProfile::from_env();
         agent.refresh_tools_for_context();
@@ -2603,7 +2603,8 @@ fn full_toolset_env_exposes_specialized_tools_without_browser_by_default() -> Re
         assert!(!names.contains("browser"));
         assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
         Ok(())
-    })();
+    };
+    let result = check();
     unsafe { std::env::remove_var("DEXT_TOOLSET") };
     let _ = std::fs::remove_dir_all(&root);
     result
@@ -7801,7 +7802,7 @@ fn local_provider_merge_drops_retired_catalog_artifacts() {
     );
     assert!(!merged.models.iter().any(|m| m == "qwen-local"));
     assert!(merged.models.iter().any(|m| m == "custom-local-model"));
-    assert!(merged.model_context_windows.get("qwen-local").is_none());
+    assert!(!merged.model_context_windows.contains_key("qwen-local"));
     assert_eq!(
         merged.model_context_windows.get("custom-local-model"),
         Some(&12_345)
@@ -10407,4 +10408,27 @@ fn squash_small_batches_unchanged() {
     // len <= 2: returned as-is
     let squashed = squash_identical_error_result_content(results);
     assert_eq!(squashed.len(), 2);
+}
+
+#[test]
+fn html_entity_decode_preserves_multibyte_utf8() {
+    assert_eq!(
+        html_entity_decode_minimal("caf\u{e9} \u{2014} r\u{e9}sum\u{e9} &amp; t\u{e9}l\u{e9}"),
+        "caf\u{e9} \u{2014} r\u{e9}sum\u{e9} & t\u{e9}l\u{e9}"
+    );
+    assert_eq!(html_entity_decode_minimal("&lt;a&gt;&quot;&#39;"), "<a>\"'");
+    assert_eq!(html_entity_decode_minimal("&#x2014;&#8212;"), "\u{2014}\u{2014}");
+    // Unterminated/unknown entities pass through without panicking.
+    assert_eq!(html_entity_decode_minimal("a&b &unknown; &"), "a&b &unknown; &");
+
+    let text = extract_html_text("<p>caf\u{e9} &amp; cr\u{e8}me</p>");
+    assert!(text.contains("caf\u{e9} & cr\u{e8}me"), "{text}");
+}
+
+#[test]
+fn compact_call_id_is_multibyte_safe() {
+    assert_eq!(compact_call_id("call_0123456789abcdef"), "#call_0123456");
+    assert_eq!(compact_call_id("sub.7.call_42"), "#call_42");
+    // 12 bytes lands mid-codepoint; must clamp to a char boundary, not panic.
+    assert_eq!(compact_call_id("toolcall\u{e9}\u{e9}\u{e9}\u{e9}"), "#toolcall\u{e9}\u{e9}");
 }
