@@ -408,7 +408,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/effort",
         args: "[level]",
-        help: "off|low|medium|high|xhigh",
+        help: "off|low|medium|high|xhigh|max",
     },
     SlashCmd {
         name: "/compact",
@@ -509,7 +509,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
 
 static TRUST_ARGS: &[&str] = &["on", "off", "status"];
 static TOOLS_ARGS: &[&str] = &["default", "full", "status"];
-static EFFORT_ARGS: &[&str] = &["off", "low", "medium", "high", "xhigh"];
+static EFFORT_ARGS: &[&str] = &["off", "low", "medium", "high", "xhigh", "max"];
 static WORK_MAP_SESSION_ARGS: &[&str] = &["current", "latest"];
 static TRACK_ARGS: &[&str] = &["open", "list"];
 const SLASH_COMPLETION_MAX_VISIBLE: usize = 7;

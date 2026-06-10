@@ -147,6 +147,7 @@ pub(crate) enum ThinkingEffort {
     Medium,
     High,
     XHigh,
+    Max,
 }
 
 impl ThinkingEffort {
@@ -157,6 +158,7 @@ impl ThinkingEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 
@@ -171,6 +173,9 @@ impl ThinkingEffort {
             Self::XHigh => {
                 "Use deep, methodical reasoning with explicit verification before answering."
             }
+            Self::Max => {
+                "Use maximum supported reasoning depth with explicit verification before answering."
+            }
         }
     }
 
@@ -181,12 +186,20 @@ impl ThinkingEffort {
             "medium" | "med" | "m" | "default" => Some(Self::Medium),
             "high" | "h" => Some(Self::High),
             "xhigh" | "x-high" | "veryhigh" | "very-high" | "xh" => Some(Self::XHigh),
+            "max" | "maximum" => Some(Self::Max),
             _ => None,
         }
     }
 
     fn cycle(self, step: i8) -> Self {
-        let levels = [Self::Off, Self::Low, Self::Medium, Self::High, Self::XHigh];
+        let levels = [
+            Self::Off,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+            Self::XHigh,
+            Self::Max,
+        ];
         let idx = levels.iter().position(|v| *v == self).unwrap_or(2) as i32;
         let len = levels.len() as i32;
         let next = (idx + i32::from(step)).rem_euclid(len) as usize;
@@ -2962,7 +2975,7 @@ fn openai_reasoning_effort(effort: ThinkingEffort) -> Option<&'static str> {
         ThinkingEffort::Off => None,
         ThinkingEffort::Low => Some("low"),
         ThinkingEffort::Medium => Some("medium"),
-        ThinkingEffort::High | ThinkingEffort::XHigh => Some("high"),
+        ThinkingEffort::High | ThinkingEffort::XHigh | ThinkingEffort::Max => Some("high"),
     }
 }
 
@@ -2972,8 +2985,44 @@ fn anthropic_thinking_budget_tokens(effort: ThinkingEffort) -> Option<u32> {
         ThinkingEffort::Low => Some(1_024),
         ThinkingEffort::Medium => Some(2_048),
         ThinkingEffort::High => Some(4_096),
-        ThinkingEffort::XHigh => Some(8_192),
+        ThinkingEffort::XHigh | ThinkingEffort::Max => Some(8_192),
     }
+}
+
+fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option<&'static str> {
+    match effort {
+        ThinkingEffort::Off => None,
+        ThinkingEffort::Low => Some("low"),
+        ThinkingEffort::Medium => Some("medium"),
+        ThinkingEffort::High => Some("high"),
+        ThinkingEffort::XHigh => Some(if anthropic_model_supports_extended_effort(model) {
+            "xhigh"
+        } else {
+            "high"
+        }),
+        ThinkingEffort::Max => Some(if anthropic_model_supports_extended_effort(model) {
+            "max"
+        } else {
+            "high"
+        }),
+    }
+}
+
+fn anthropic_model_supports_extended_effort(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.contains("opus-4-7")
+        || model.contains("opus-4.7")
+        || model.contains("opus-4-8")
+        || model.contains("opus-4.8")
+        || model.contains("fable")
+}
+
+fn uses_anthropic_adaptive_thinking(provider_id: &str, model: &str) -> bool {
+    let provider_id = canonical_provider_id(provider_id);
+    if provider_id == "glm" {
+        return false;
+    }
+    provider_id == "anthropic" || model.trim().to_ascii_lowercase().starts_with("claude-")
 }
 
 /// Anthropic rejects a request unless `max_tokens > thinking.budget_tokens`.
@@ -2996,13 +3045,21 @@ struct Request<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
 }
 
 #[derive(Serialize, Clone, Copy)]
 struct AnthropicThinking {
     #[serde(rename = "type")]
     kind: &'static str,
-    budget_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+}
+
+#[derive(Serialize, Clone, Copy)]
+struct AnthropicOutputConfig {
+    effort: &'static str,
 }
 
 #[derive(Serialize)]
@@ -8561,9 +8618,9 @@ fn apply_runtime_control_command(
                         ));
                     }
                 }
-                None => {
-                    emit("usage: /effort [off|low|medium|high|xhigh|next|prev|status]".to_string())
-                }
+                None => emit(
+                    "usage: /effort [off|low|medium|high|xhigh|max|next|prev|status]".to_string(),
+                ),
             },
         }
         return true;
@@ -11163,14 +11220,30 @@ impl Agent {
             }
             ApiProvider::Anthropic => {
                 let max_tokens = max_output_tokens();
-                let thinking = anthropic_thinking_budget_tokens(self.thinking_effort)
-                    .and_then(|budget_tokens| {
-                        clamp_thinking_budget_below_max(budget_tokens, max_tokens)
-                    })
-                    .map(|budget_tokens| AnthropicThinking {
-                        kind: "enabled",
-                        budget_tokens,
-                    });
+                let (thinking, output_config) =
+                    if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
+                        let effort =
+                            anthropic_output_config_effort(&self.model, self.thinking_effort);
+                        (
+                            effort.map(|_| AnthropicThinking {
+                                kind: "adaptive",
+                                budget_tokens: None,
+                            }),
+                            effort.map(|effort| AnthropicOutputConfig { effort }),
+                        )
+                    } else {
+                        (
+                            anthropic_thinking_budget_tokens(self.thinking_effort)
+                                .and_then(|budget_tokens| {
+                                    clamp_thinking_budget_below_max(budget_tokens, max_tokens)
+                                })
+                                .map(|budget_tokens| AnthropicThinking {
+                                    kind: "enabled",
+                                    budget_tokens: Some(budget_tokens),
+                                }),
+                            None,
+                        )
+                    };
                 let history = self.provider_context_history();
                 let messages = strip_tool_result_metadata(history);
                 let body = Request {
@@ -11181,6 +11254,7 @@ impl Agent {
                     tools: wire_tools,
                     stream: true,
                     thinking,
+                    output_config,
                 };
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                 Ok((url, bytes))
@@ -11857,6 +11931,7 @@ impl Agent {
                     tools: &[],
                     stream: false,
                     thinking: None,
+                    output_config: None,
                 };
                 let mut req = self
                     .http_client()
@@ -17064,7 +17139,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /effort [level]           set model reasoning depth/tool persistence: off|low|medium|high|xhigh"
+                "  /effort [level]           set model reasoning depth/tool persistence: off|low|medium|high|xhigh|max"
             );
             let _ = writeln!(
                 w,
@@ -17592,7 +17667,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     None => {
                         let _ = writeln!(
                             w,
-                            "usage: /effort [off|low|medium|high|xhigh|next|prev|status]"
+                            "usage: /effort [off|low|medium|high|xhigh|max|next|prev|status]"
                         );
                         None
                     }
@@ -19216,11 +19291,11 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--effort" | "--thinking-effort" => {
                 i += 1;
                 let value = argv.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--effort requires off|low|medium|high|xhigh")
+                    anyhow::anyhow!("--effort requires off|low|medium|high|xhigh|max")
                 })?;
                 thinking_effort = Some(ThinkingEffort::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh)"
+                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh|max)"
                     )
                 })?);
             }
@@ -19256,7 +19331,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .unwrap_or_default();
                 thinking_effort = Some(ThinkingEffort::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh)"
+                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh|max)"
                     )
                 })?);
             }
@@ -19581,7 +19656,9 @@ async fn main() -> Result<()> {
         println!("       dext --preview off|simple|git  mutation preview mode");
         println!("       dext --sandbox read-only|workspace-write|danger-full-access");
         println!("       dext --browser agent-browser    add optional browser automation recipe");
-        println!("       dext --effort off|low|medium|high|xhigh  set provider reasoning effort");
+        println!(
+            "       dext --effort off|low|medium|high|xhigh|max  set provider reasoning effort"
+        );
         println!(
             "       dext --frugal        minimize prompt/tool/history context for lower token cost"
         );
@@ -19604,7 +19681,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }

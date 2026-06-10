@@ -2029,6 +2029,12 @@ fn set_sandbox_root_allows_other_live_sessions() -> Result<()> {
 
 #[test]
 fn same_session_id_lock_blocks_double_open() -> Result<()> {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
     let root = temp_test_dir("same-session-lock");
     let root = std::fs::canonicalize(&root)?;
     let first = SessionStateLock::acquire(&root, "same")?;
@@ -2591,10 +2597,12 @@ fn thinking_effort_parse_and_cycle() {
     assert_eq!(ThinkingEffort::parse("low"), Some(ThinkingEffort::Low));
     assert_eq!(ThinkingEffort::parse("MED"), Some(ThinkingEffort::Medium));
     assert_eq!(ThinkingEffort::parse("x-high"), Some(ThinkingEffort::XHigh));
+    assert_eq!(ThinkingEffort::parse("maximum"), Some(ThinkingEffort::Max));
     assert_eq!(ThinkingEffort::parse("unknown"), None);
-    assert_eq!(ThinkingEffort::Off.cycle(-1), ThinkingEffort::XHigh);
+    assert_eq!(ThinkingEffort::Off.cycle(-1), ThinkingEffort::Max);
     assert_eq!(ThinkingEffort::Low.cycle(-1), ThinkingEffort::Off);
-    assert_eq!(ThinkingEffort::XHigh.cycle(1), ThinkingEffort::Off);
+    assert_eq!(ThinkingEffort::XHigh.cycle(1), ThinkingEffort::Max);
+    assert_eq!(ThinkingEffort::Max.cycle(1), ThinkingEffort::Off);
 }
 
 #[test]
@@ -8307,16 +8315,13 @@ fn implementation_model_fallback_ignores_codex_env_override() {
 }
 
 #[test]
-fn anthropic_streaming_request_clamps_thinking_below_max_tokens() -> Result<()> {
-    let _guard = env_lock();
-    unsafe {
-        std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "2");
-    }
-    let root = temp_test_dir("anthropic-thinking-clamp");
+fn glm_streaming_request_keeps_enabled_thinking_payload() -> Result<()> {
+    let root = temp_test_dir("glm-thinking-enabled");
     let root = std::fs::canonicalize(&root)?;
     let mut agent = test_agent(&root);
+    agent.provider_id = "glm".to_string();
     agent.api_provider = ApiProvider::Anthropic;
-    agent.model = "claude-sonnet-4-5".to_string();
+    agent.model = "glm-5.1".to_string();
     agent.thinking_effort = ThinkingEffort::XHigh;
     let sys_blocks = [SystemBlock {
         kind: "text",
@@ -8326,21 +8331,58 @@ fn anthropic_streaming_request_clamps_thinking_below_max_tokens() -> Result<()> 
 
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["max_tokens"], 2);
-    assert_eq!(value["thinking"]["budget_tokens"], 1);
-
-    unsafe {
-        std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "1");
-    }
-    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
-    let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["max_tokens"], 1);
-    assert!(value.get("thinking").is_none(), "{value}");
+    assert_eq!(value["max_tokens"], 8_192);
+    assert_eq!(value["thinking"]["type"], "enabled");
+    assert_eq!(value["thinking"]["budget_tokens"], 6_144);
+    assert!(value.get("output_config").is_none(), "{value}");
 
     let _ = std::fs::remove_dir_all(&root);
-    unsafe {
-        std::env::remove_var("DEXT_MAX_OUTPUT_TOKENS");
-    }
+    Ok(())
+}
+
+#[test]
+fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> Result<()> {
+    let root = temp_test_dir("claude-adaptive-thinking");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = "anthropic".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-opus-4-1".to_string();
+    agent.thinking_effort = ThinkingEffort::Max;
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: None,
+    }];
+
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["thinking"]["type"], "adaptive");
+    assert!(value["thinking"].get("budget_tokens").is_none(), "{value}");
+    assert_eq!(value["output_config"]["effort"], "high");
+
+    agent.model = "claude-opus-4-8".to_string();
+    agent.thinking_effort = ThinkingEffort::XHigh;
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["thinking"]["type"], "adaptive");
+    assert_eq!(value["output_config"]["effort"], "xhigh");
+
+    agent.model = "claude-fable".to_string();
+    agent.thinking_effort = ThinkingEffort::Max;
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["thinking"]["type"], "adaptive");
+    assert_eq!(value["output_config"]["effort"], "max");
+
+    agent.model = "claude-opus-4-1".to_string();
+    agent.thinking_effort = ThinkingEffort::Off;
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert!(value.get("thinking").is_none(), "{value}");
+    assert!(value.get("output_config").is_none(), "{value}");
+
+    let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
 

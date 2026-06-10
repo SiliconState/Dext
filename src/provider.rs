@@ -1248,19 +1248,19 @@ pub(crate) fn chatgpt_reasoning_effort(
             "low" => "low",
             "medium" => "medium",
             "high" => "high",
-            "xhigh" => "xhigh",
+            "xhigh" | "max" => "xhigh",
             _ => "medium",
         });
     }
     if model == "gpt-5.1-codex-mini" {
         return Some(match raw {
-            "high" | "xhigh" => "high",
+            "high" | "xhigh" | "max" => "high",
             _ => "medium",
         });
     }
     if model.starts_with("gpt-5.1") {
         return Some(match raw {
-            "xhigh" => "high",
+            "xhigh" | "max" => "high",
             other => other,
         });
     }
