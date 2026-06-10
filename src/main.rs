@@ -2386,6 +2386,102 @@ fn sanitize_anthropic_messages(messages: &[Message], preserve_thinking: bool) ->
         .collect()
 }
 
+/// Serialize sanitized history to Anthropic wire JSON. With prompt caching
+/// enabled, a sliding breakpoint is set on the final content block of the last
+/// message so the whole conversation prefix (tools → system → history) is
+/// reused across tool rounds instead of being re-billed as fresh input on
+/// every request. Tools and the stable system block hold the other two
+/// breakpoints (3 of the 4 allowed).
+fn anthropic_wire_messages(messages: &[Message], cache_enabled: bool) -> Result<Vec<Value>> {
+    let mut wire: Vec<Value> = messages
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("serialize messages: {e}"))?;
+    if cache_enabled {
+        set_sliding_message_cache_breakpoint(&mut wire);
+    }
+    Ok(wire)
+}
+
+fn set_sliding_message_cache_breakpoint(wire: &mut [Value]) {
+    let Ok(cache_control) = serde_json::to_value(CacheControl::for_prompt()) else {
+        return;
+    };
+    for message in wire.iter_mut().rev() {
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in blocks.iter_mut().rev() {
+            let Some(obj) = block.as_object_mut() else {
+                continue;
+            };
+            // Thinking blocks cannot carry cache_control breakpoints.
+            let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+            if matches!(kind, "thinking" | "redacted_thinking") {
+                continue;
+            }
+            obj.insert("cache_control".to_string(), cache_control);
+            return;
+        }
+    }
+}
+
+/// Volatile runtime state (work ledger, todos, provider health) is delivered
+/// as a transient block at the tail of the message list — after the sliding
+/// cache breakpoint and never persisted to history — so the conversation
+/// prefix stays byte-stable for prompt caching even while this state changes
+/// between tool rounds.
+fn runtime_env_wire_text(env: &str) -> String {
+    format!("[dext runtime status — auto-refreshed each request; not user input]\n{env}")
+}
+
+fn append_runtime_env_block(wire: &mut Vec<Value>, env: &str) {
+    let env = env.trim();
+    if env.is_empty() {
+        return;
+    }
+    let text_block = json!({"type": "text", "text": runtime_env_wire_text(env)});
+    // Tool results must lead a user message, so the status text rides at the
+    // end of the existing trailing user message when there is one.
+    if let Some(last) = wire.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut)
+    {
+        blocks.push(text_block);
+        return;
+    }
+    wire.push(json!({"role": "user", "content": [text_block]}));
+}
+
+fn push_runtime_env_oai_message(msgs: &mut Vec<OaiMessage>, env: &str) {
+    let env = env.trim();
+    if env.is_empty() {
+        return;
+    }
+    msgs.push(OaiMessage {
+        role: "user".to_string(),
+        content: Some(runtime_env_wire_text(env)),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+}
+
+fn append_runtime_env_chatgpt_item(items: &mut Vec<Value>, env: &str) {
+    let env = env.trim();
+    if env.is_empty() {
+        return;
+    }
+    items.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": runtime_env_wire_text(env),
+        }],
+    }));
+}
+
 fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
     let chars = blocks
         .iter()
@@ -2964,10 +3060,38 @@ struct Message {
 pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
 impl CacheControl {
-    pub(crate) const EPHEMERAL: Self = Self { kind: "ephemeral" };
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const EPHEMERAL: Self = Self {
+        kind: "ephemeral",
+        ttl: None,
+    };
+
+    /// Cache control for prompt breakpoints. Honors DEXT_PROMPT_CACHE_TTL=1h
+    /// for the extended-TTL cache (useful when the user pauses >5min between
+    /// turns); the default 5-minute TTL omits the field entirely.
+    pub(crate) fn for_prompt() -> Self {
+        Self {
+            kind: "ephemeral",
+            ttl: extended_prompt_cache_ttl(),
+        }
+    }
+}
+
+pub(crate) fn extended_prompt_cache_ttl() -> Option<&'static str> {
+    match std::env::var("DEXT_PROMPT_CACHE_TTL")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "1h" | "1hr" | "hour" | "60m" => Some("1h"),
+        _ => None,
+    }
 }
 
 #[derive(Serialize, Clone, Copy)]
@@ -3119,6 +3243,19 @@ fn uses_anthropic_adaptive_thinking(provider_id: &str, model: &str) -> bool {
 }
 
 fn anthropic_prompt_cache_supported(provider_id: &str, model: &str) -> bool {
+    // DEXT_PROMPT_CACHE=off strips every cache_control breakpoint; =on sends
+    // breakpoints on any Anthropic-style provider (e.g. to test whether ZAI
+    // GLM honors them). Default: Anthropic itself or claude-* models only.
+    match std::env::var("DEXT_PROMPT_CACHE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "0" | "false" | "no" => return false,
+        "on" | "1" | "true" | "all" | "yes" => return true,
+        _ => {}
+    }
     let provider_id = canonical_provider_id(provider_id);
     provider_id == "anthropic" || model.trim().to_ascii_lowercase().starts_with("claude-")
 }
@@ -3162,7 +3299,9 @@ struct Request<'a> {
     model: &'a str,
     max_tokens: u32,
     system: &'a [SystemBlock<'a>],
-    messages: &'a [Message],
+    // Pre-serialized message JSON: cache breakpoints and the transient runtime
+    // env block are injected at wire level so they never touch stored history.
+    messages: &'a [Value],
     tools: &'a [WireTool],
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11439,21 +11578,28 @@ impl Agent {
         let url = provider_request_url(&self.base_url, self.api_provider);
         match self.api_provider {
             ApiProvider::ChatGpt => {
-                let system_text = format!("{sys_stable}\n\n{sys_env}");
+                // Instructions carry only the stable system text; volatile env
+                // state rides as a transient trailing input item so the prefix
+                // stays byte-stable for the Responses API's implicit caching.
+                let mut input = self.history_to_chatgpt_input();
+                append_runtime_env_chatgpt_item(&mut input, sys_env);
                 let body = build_chatgpt_request(
                     &self.model,
                     self.thinking_effort,
-                    &system_text,
+                    sys_stable,
                     chatgpt_session_id,
-                    self.history_to_chatgpt_input(),
+                    input,
                     self.wire_tools_chatgpt(),
                 );
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                 Ok((url, bytes))
             }
             ApiProvider::OpenAi => {
-                let sys_text = format!("{sys_stable}\n\n{sys_env}");
-                let oai_msgs = self.history_to_oai_messages(&sys_text);
+                // Same split for OpenAI-compatible providers (DeepSeek, local
+                // llama.cpp, OpenAI): a changing system message would invalidate
+                // their implicit prefix caches on every tool round.
+                let mut oai_msgs = self.history_to_oai_messages(sys_stable);
+                push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
                 let reasoning_effort = openai_reasoning_effort(self.thinking_effort);
                 let stream_options = (!provider::is_local_llama_provider(
@@ -11519,6 +11665,8 @@ impl Agent {
                 let messages = sanitize_anthropic_messages(history, thinking.is_some());
                 let prompt_cache_enabled =
                     anthropic_prompt_cache_supported(&self.provider_id, &self.model);
+                let mut messages = anthropic_wire_messages(&messages, prompt_cache_enabled)?;
+                append_runtime_env_block(&mut messages, sys_env);
                 let system = system_blocks_with_cache_control(sys_blocks, prompt_cache_enabled);
                 let tools = wire_tools_with_cache_control(wire_tools, prompt_cache_enabled);
                 let body = Request {
@@ -12190,12 +12338,10 @@ impl Agent {
                 }
                 (req.send().await?, SummaryParse::OpenAi)
             } else {
-                let messages = vec![Message {
-                    role: "user".to_string(),
-                    content: vec![Block::Text {
-                        text: user_text.clone(),
-                    }],
-                }];
+                let messages = vec![json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": user_text.clone()}],
+                })];
                 let sys_blocks = [SystemBlock {
                     kind: "text",
                     text: COMPACT_SYSTEM,
@@ -12839,18 +12985,15 @@ impl Agent {
             });
             self.partial_stream_text = None;
             let (sys_stable, sys_env) = self.compose_system_parts();
-            let sys_blocks = vec![
-                SystemBlock {
-                    kind: "text",
-                    text: &sys_stable,
-                    cache_control: Some(CacheControl::EPHEMERAL),
-                },
-                SystemBlock {
-                    kind: "text",
-                    text: &sys_env,
-                    cache_control: None,
-                },
-            ];
+            // Only the stable text lives in the system prompt (with a cache
+            // breakpoint); the volatile env section is appended per request at
+            // the tail of the message list so it never invalidates the cached
+            // tools → system → history prefix.
+            let sys_blocks = vec![SystemBlock {
+                kind: "text",
+                text: &sys_stable,
+                cache_control: Some(CacheControl::for_prompt()),
+            }];
             let mut stream_attempt: u32 = 0;
             let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
@@ -12866,12 +13009,20 @@ impl Agent {
                 let mut provider_workaround_used = false;
                 let resp = loop {
                     attempt += 1;
+                    let mut builder = self
+                        .http_client()
+                        .post(&url)
+                        .header("content-type", "application/json")
+                        .header("accept", "text/event-stream");
+                    if self.api_provider == ApiProvider::Anthropic
+                        && extended_prompt_cache_ttl().is_some()
+                        && anthropic_prompt_cache_supported(&self.provider_id, &self.model)
+                    {
+                        builder =
+                            builder.header("anthropic-beta", "extended-cache-ttl-2025-04-11");
+                    }
                     let req = apply_provider_headers(
-                        self.http_client()
-                            .post(&url)
-                            .header("content-type", "application/json")
-                            .header("accept", "text/event-stream")
-                            .body(req_body.clone()),
+                        builder.body(req_body.clone()),
                         self.api_provider,
                         &self.api_key,
                         chatgpt_session_id.as_deref(),

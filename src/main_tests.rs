@@ -8969,6 +8969,7 @@ fn glm_streaming_request_keeps_enabled_thinking_payload() -> Result<()> {
 
 #[test]
 fn claude_streaming_request_marks_stable_system_and_tools_cacheable() -> Result<()> {
+    let _guard = env_lock();
     let root = temp_test_dir("claude-prompt-cache-controls");
     let root = std::fs::canonicalize(&root)?;
     let mut agent = test_agent(&root);
@@ -9012,7 +9013,190 @@ fn claude_streaming_request_marks_stable_system_and_tools_cacheable() -> Result<
 }
 
 #[test]
+fn claude_request_sets_sliding_message_breakpoint_and_tail_env() -> Result<()> {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_PROMPT_CACHE");
+        std::env::remove_var("DEXT_PROMPT_CACHE_TTL");
+    }
+    let root = temp_test_dir("claude-sliding-breakpoint");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = "anthropic".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-sonnet-4-6".to_string();
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "find the bug".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({"path": "src/main.rs"}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "1\tfn main() {}".to_string(),
+                is_error: Some(false),
+                metadata: ToolResultMetadata::default(),
+            }],
+        },
+    ];
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "stable prompt",
+        cache_control: Some(CacheControl::for_prompt()),
+    }];
+
+    let (_, body) = agent.build_streaming_request(
+        "stable prompt",
+        "## Environment\ncwd=/x model=demo",
+        &sys_blocks,
+        &[],
+        "unused",
+    )?;
+    let value: Value = serde_json::from_slice(&body)?;
+    let msgs = value["messages"].as_array().expect("messages");
+    assert_eq!(msgs.len(), 3, "{value}");
+
+    // The sliding breakpoint lands on the last persisted block (the tool
+    // result), so the whole conversation prefix is cacheable.
+    let last_blocks = msgs[2]["content"].as_array().expect("blocks");
+    assert_eq!(last_blocks[0]["type"], "tool_result");
+    assert_eq!(last_blocks[0]["cache_control"]["type"], "ephemeral");
+    assert!(
+        last_blocks[0]["cache_control"].get("ttl").is_none(),
+        "{value}"
+    );
+
+    // The volatile env section rides after the breakpoint as a transient text
+    // block — outside every cached prefix, never persisted.
+    let env_block = &last_blocks[1];
+    assert_eq!(env_block["type"], "text");
+    let env_text = env_block["text"].as_str().expect("env text");
+    assert!(env_text.starts_with("[dext runtime status"), "{env_text}");
+    assert!(env_text.contains("## Environment"), "{env_text}");
+    assert!(env_block.get("cache_control").is_none(), "{value}");
+
+    // System carries only the stable block; earlier messages stay untouched.
+    assert_eq!(value["system"].as_array().map(Vec::len), Some(1), "{value}");
+    assert!(msgs[0]["content"][0].get("cache_control").is_none());
+    assert!(msgs[1]["content"][0].get("cache_control").is_none());
+
+    // Stored history is never mutated by wire-level injection.
+    assert_eq!(agent.history.len(), 3);
+    assert_eq!(agent.history[2].content.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn sliding_breakpoint_skips_thinking_blocks_and_cache_gate_env_works() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_PROMPT_CACHE");
+        std::env::remove_var("DEXT_PROMPT_CACHE_TTL");
+    }
+
+    // A trailing thinking block cannot carry a breakpoint; the text before it
+    // takes the marker instead.
+    let messages = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![
+            Block::Text {
+                text: "answer".to_string(),
+            },
+            Block::Thinking {
+                text: "chain".to_string(),
+                signature: Some("sig".to_string()),
+            },
+        ],
+    }];
+    let wire = anthropic_wire_messages(&messages, true).expect("wire");
+    assert!(wire[0]["content"][1].get("cache_control").is_none());
+    assert_eq!(wire[0]["content"][0]["cache_control"]["type"], "ephemeral");
+
+    // DEXT_PROMPT_CACHE=on opts a non-claude Anthropic-style provider in;
+    // =off strips even claude defaults.
+    unsafe { std::env::set_var("DEXT_PROMPT_CACHE", "on") };
+    assert!(anthropic_prompt_cache_supported("glm", "glm-5.1"));
+    unsafe { std::env::set_var("DEXT_PROMPT_CACHE", "off") };
+    assert!(!anthropic_prompt_cache_supported(
+        "anthropic",
+        "claude-sonnet-4-6"
+    ));
+    unsafe { std::env::remove_var("DEXT_PROMPT_CACHE") };
+    assert!(anthropic_prompt_cache_supported(
+        "anthropic",
+        "claude-sonnet-4-6"
+    ));
+    assert!(!anthropic_prompt_cache_supported("glm", "glm-5.1"));
+
+    // DEXT_PROMPT_CACHE_TTL=1h flows into the serialized breakpoint.
+    unsafe { std::env::set_var("DEXT_PROMPT_CACHE_TTL", "1h") };
+    let cc = serde_json::to_value(CacheControl::for_prompt()).expect("cc");
+    assert_eq!(cc["ttl"], "1h");
+    unsafe { std::env::remove_var("DEXT_PROMPT_CACHE_TTL") };
+    let cc = serde_json::to_value(CacheControl::for_prompt()).expect("cc");
+    assert!(cc.get("ttl").is_none());
+}
+
+#[test]
+fn openai_and_chatgpt_requests_keep_system_stable_and_append_tail_env() -> Result<()> {
+    let root = temp_test_dir("oai-stable-system");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.model = "deepseek-chat".to_string();
+    agent.history = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "hello".to_string(),
+        }],
+    }];
+
+    let (_, body) =
+        agent.build_streaming_request("stable sys", "## Environment\nx=1", &[], &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    let msgs = value["messages"].as_array().expect("messages");
+    // System message carries only the stable text so implicit provider prefix
+    // caching survives env churn between tool rounds.
+    assert_eq!(msgs[0]["role"], "system");
+    assert_eq!(msgs[0]["content"], "stable sys");
+    let last = msgs.last().expect("tail env");
+    assert_eq!(last["role"], "user");
+    let tail = last["content"].as_str().expect("tail content");
+    assert!(tail.starts_with("[dext runtime status"), "{tail}");
+    assert!(tail.contains("## Environment"), "{tail}");
+
+    agent.api_provider = ApiProvider::ChatGpt;
+    agent.model = "gpt-5.4".to_string();
+    let (_, body) =
+        agent.build_streaming_request("stable sys", "## Environment\nx=1", &[], &[], "sess")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["instructions"], "stable sys");
+    let input = value["input"].as_array().expect("input");
+    let last = input.last().expect("tail env item");
+    assert_eq!(last["role"], "user");
+    let tail = last["content"][0]["text"].as_str().expect("tail text");
+    assert!(tail.starts_with("[dext runtime status"), "{tail}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn anthropic_compatible_non_claude_request_strips_cache_controls() -> Result<()> {
+    let _guard = env_lock();
     let root = temp_test_dir("anthropic-compatible-cache-strip");
     let root = std::fs::canonicalize(&root)?;
     let mut agent = test_agent(&root);

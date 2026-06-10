@@ -460,7 +460,7 @@ pub(crate) fn wire_tools(tools: &[Tool], profile: ToolProfile) -> Vec<WireTool> 
         })
         .collect();
     if let Some(last) = wt.last_mut() {
-        last.cache_control = Some(CacheControl::EPHEMERAL);
+        last.cache_control = Some(CacheControl::for_prompt());
     }
     wt
 }
