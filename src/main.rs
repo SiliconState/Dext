@@ -17262,6 +17262,79 @@ fn doctor_report(root: &Path) -> (String, usize) {
     (out.into_inner(), warnings)
 }
 
+/// A compact, safe continuation packet for handing work to another agent or a
+/// fresh session. Built from the curated work ledger (header) plus distilled
+/// analysis facts — deliberately not the raw prompts/tool output, which the
+/// full jsonl carries and which may contain sensitive content.
+fn render_session_brief(
+    source: &Path,
+    header: &SessionHeader,
+    analysis: &SessionAnalysis,
+) -> String {
+    let mut out = String::from("# Dext session brief\n");
+    out.push_str(&format!("source: {}\n", source.display()));
+    let provider = if analysis.provider.is_empty() {
+        header.model.clone()
+    } else {
+        format!("{}/{}", analysis.provider, analysis.model)
+    };
+    out.push_str(&format!(
+        "model: {}   messages: {}   usage: {}\n",
+        provider,
+        analysis.messages,
+        analysis.usage.line()
+    ));
+    if analysis.compactions > 0 || analysis.subagents > 0 {
+        out.push_str(&format!(
+            "compactions: {}   subagents: {}\n",
+            analysis.compactions, analysis.subagents
+        ));
+    }
+
+    let ledger = render_work_ledger_prompt(&header.work_ledger)
+        .trim()
+        .to_string();
+    out.push_str("\n## Work ledger\n");
+    if ledger.is_empty() {
+        out.push_str("(no work ledger recorded for this session)\n");
+    } else {
+        out.push_str(&ledger);
+        out.push('\n');
+    }
+
+    // Supplement with distilled facts the ledger may not carry.
+    if header.work_ledger.files_changed.is_empty() && !analysis.files_touched.is_empty() {
+        out.push_str("\n## Files touched\n");
+        let mut files: Vec<(&String, &usize)> = analysis.files_touched.iter().collect();
+        files.sort_by(|a, b| b.1.cmp(a.1));
+        for (path, count) in files.into_iter().take(12) {
+            out.push_str(&format!("- {path} ({count} edits)\n"));
+        }
+    }
+    if !analysis.failures.is_empty() {
+        out.push_str("\n## Recent failures\n");
+        for item in analysis.failures.iter().rev().take(6).rev() {
+            out.push_str(&format!("- {item}\n"));
+        }
+    }
+    if header.work_ledger.verification.is_empty() && !analysis.verification.is_empty() {
+        out.push_str("\n## Verification\n");
+        for v in analysis.verification.iter().rev().take(6).rev() {
+            out.push_str(&format!(
+                "- {}: {} exit={}\n",
+                v.name,
+                v.status,
+                v.exit_code.map(|c| c.to_string()).unwrap_or_default()
+            ));
+        }
+    }
+
+    out.push_str(
+        "\n## Continue\nDistilled continuation packet, not the full transcript. Resume the live session with `dext --resume`, inspect detail with `dext session analyze`, or hand this brief to another agent to pick up the pending/next-action items above.\n",
+    );
+    out
+}
+
 fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
     if argv.is_empty() {
         return Ok(None);
@@ -17401,6 +17474,14 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                     for item in analysis.decisions {
                         println!("- {item}");
                     }
+                    Ok(Some(0))
+                }
+                "brief" => {
+                    let selector = argv.get(2).map(|s| s.as_str()).unwrap_or("latest");
+                    let source = resolve_session_selector(&root, selector)?;
+                    let (header, history) = read_session_jsonl(&source)?;
+                    let analysis = analyze_session_history(&header, &history);
+                    print!("{}", render_session_brief(&source, &header, &analysis));
                     Ok(Some(0))
                 }
                 "map" => {
@@ -17694,7 +17775,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /sessions                 list latest + autosaved/named sessions; /sessions analyze|map|packet|focus|tracks|grep|failures|verify-log|decisions"
+                "  /sessions                 list latest + autosaved/named sessions; /sessions analyze|brief|map|packet|focus|tracks|grep|failures|verify-log|decisions"
             );
             let _ = writeln!(w, "  /session                  alias for /sessions");
             let _ = writeln!(
@@ -18642,6 +18723,21 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         }
                     }
                 }
+                "brief" => {
+                    let selector = if rest.is_empty() { "latest" } else { rest };
+                    match resolve_session_selector(&agent.sandbox_root, selector)
+                        .and_then(|source| read_session_jsonl(&source).map(|pair| (source, pair)))
+                    {
+                        Ok((source, (header, history))) => {
+                            let analysis = analyze_session_history(&header, &history);
+                            let _ =
+                                write!(w, "{}", render_session_brief(&source, &header, &analysis));
+                        }
+                        Err(e) => {
+                            let _ = writeln!(w, "[err] {e:#}");
+                        }
+                    }
+                }
                 "grep" => {
                     let mut grep_parts = rest.splitn(2, char::is_whitespace);
                     let needle = grep_parts.next().unwrap_or("");
@@ -18706,7 +18802,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 _ => {
                     let _ = writeln!(
                         w,
-                        "usage: /sessions [list|analyze|map|packet|focus|tracks|grep|failures|verify-log|decisions]"
+                        "usage: /sessions [list|analyze|brief|map|packet|focus|tracks|grep|failures|verify-log|decisions]"
                     );
                 }
             }
@@ -20132,6 +20228,7 @@ async fn main() -> Result<()> {
             "       dext --resume         resume the newest auto-saved session for this project"
         );
         println!("       dext sessions         list latest + autosaved/named sessions");
+        println!("       dext session brief [latest|NAME|PATH]  distilled continuation packet");
         println!("       dext session map [latest|NAME|PATH]");
         println!("       dext session packet [latest|NAME|PATH] @wNN");
         println!("       dext session focus [latest|NAME|PATH] @wNN [--exact]");

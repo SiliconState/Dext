@@ -5188,6 +5188,46 @@ fn shelf_context_ability_injects_into_prompt_when_hook_opts_in() {
 }
 
 #[test]
+fn session_brief_renders_safe_continuation_packet() {
+    let mut header = SessionHeader {
+        model: "glm-4.6".to_string(),
+        ..SessionHeader::default()
+    };
+    header.work_ledger.objective = "fix the parser bug".to_string();
+    header.work_ledger.done = vec!["located root cause".to_string()];
+    header.work_ledger.pending = vec!["add regression test".to_string()];
+    header.work_ledger.next_actions = vec!["run cargo test".to_string()];
+
+    let history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "fix the parser bug".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "t1".to_string(),
+                name: "edit_file".to_string(),
+                input: json!({"path": "src/parser.rs", "old_string": "a", "new_string": "b"}),
+            }],
+        },
+    ];
+
+    let analysis = analyze_session_history(&header, &history);
+    let brief = render_session_brief(std::path::Path::new("/tmp/s.jsonl"), &header, &analysis);
+
+    assert!(brief.contains("# Dext session brief"), "{brief}");
+    assert!(brief.contains("objective: fix the parser bug"), "{brief}");
+    assert!(brief.contains("add regression test"), "{brief}");
+    assert!(brief.contains("run cargo test"), "{brief}");
+    assert!(brief.contains("## Continue"), "{brief}");
+    // The brief is a distilled packet: it must not embed raw prompt transcript.
+    assert!(!brief.contains("## Transcript"), "{brief}");
+}
+
+#[test]
 fn default_tool_profile_is_lean_for_prompt_budget() {
     assert_eq!(ToolProfile::default(), ToolProfile::Lean);
     assert_eq!(ToolProfile::parse("default"), Some(ToolProfile::Lean));
