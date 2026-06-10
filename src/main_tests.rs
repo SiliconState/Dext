@@ -170,6 +170,44 @@ fn git_checkpoint_sidecar_restores_untracked_file() {
 }
 
 #[test]
+fn checkpoint_snapshots_untracked_and_preview_names_created_files() {
+    let root = temp_test_dir("checkpoint-untracked-delta");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    // A pre-existing untracked file is part of the snapshot.
+    std::fs::write(root.join("existing.txt"), "x\n").expect("write existing untracked");
+
+    // bash is write-risk → checkpointed, with an untracked snapshot.
+    let cp = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    assert!(
+        cp.untracked_snapshot.iter().any(|p| p == "existing.txt"),
+        "snapshot should record pre-existing untracked file: {:?}",
+        cp.untracked_snapshot
+    );
+
+    // Simulate the command creating a new untracked file and removing the old one.
+    std::fs::write(root.join("created.txt"), "new\n").expect("write created untracked");
+    std::fs::remove_file(root.join("existing.txt")).expect("remove existing untracked");
+
+    let preview = git_checkpoints::preview_restore(&root, &cp).expect("preview");
+    assert!(
+        preview.contains("created.txt"),
+        "preview should name created untracked file:\n{preview}"
+    );
+    assert!(
+        preview.contains("existing.txt"),
+        "preview should name removed untracked file:\n{preview}"
+    );
+}
+
+#[test]
 fn memory_merge_recall_prefers_ours_and_dedupes_theirs() {
     let base = "# Dext recall\n- keep\n- remove\n";
     let ours = "# Dext recall\n- keep\n- ours\n";

@@ -21,6 +21,29 @@ pub(crate) struct Checkpoint {
     pub head: String,
     pub paths_hint: Vec<String>,
     pub includes_untracked_sidecar: bool,
+    /// Untracked (not-ignored) repo paths present when the checkpoint was
+    /// taken. Lets undo/preview name untracked files a write-risk command
+    /// created or removed afterwards, even though `git stash create` does not
+    /// capture untracked content.
+    pub untracked_snapshot: Vec<String>,
+}
+
+const UNTRACKED_SNAPSHOT_CAP: usize = 500;
+
+/// List untracked, not-ignored repo paths via porcelain status.
+fn untracked_files(git_root: &Path) -> Vec<String> {
+    let Ok(out) = run_git(
+        git_root,
+        &["status", "--porcelain", "--untracked-files=all"],
+    ) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| line.strip_prefix("?? "))
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .take(UNTRACKED_SNAPSHOT_CAP)
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +287,7 @@ pub(crate) fn create_checkpoint_in_repo(
         head,
         paths_hint: paths_hint.to_vec(),
         includes_untracked_sidecar,
+        untracked_snapshot: untracked_files(git_root),
     };
 
     append_manifest(git_root, &cp)?;
@@ -288,8 +312,11 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
 
 fn format_manifest_line(cp: &Checkpoint) -> String {
     let paths = cp.paths_hint.join(",");
+    // Untracked paths may contain commas, so join them with a unit separator
+    // that cannot appear in a path. The field stays within its tab column.
+    let untracked = cp.untracked_snapshot.join("\u{1f}");
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         cp.id,
         cp.ref_name,
         cp.oid,
@@ -298,11 +325,12 @@ fn format_manifest_line(cp: &Checkpoint) -> String {
         cp.head,
         cp.includes_untracked_sidecar,
         paths,
+        untracked,
     )
 }
 
 fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
-    let parts: Vec<&str> = line.splitn(8, '\t').collect();
+    let parts: Vec<&str> = line.splitn(9, '\t').collect();
     if parts.len() < 7 {
         return None;
     }
@@ -310,6 +338,16 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
         .get(7)
         .map(|s| {
             s.split(',')
+                .map(String::from)
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    // Field 8 is absent in manifests written before untracked snapshots existed.
+    let untracked_snapshot = parts
+        .get(8)
+        .map(|s| {
+            s.split('\u{1f}')
                 .map(String::from)
                 .filter(|p| !p.is_empty())
                 .collect()
@@ -324,6 +362,7 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
         head: parts[5].to_string(),
         paths_hint,
         includes_untracked_sidecar: parts[6] == "true",
+        untracked_snapshot,
     })
 }
 
@@ -382,6 +421,40 @@ pub(crate) fn preview_restore(root: &Path, cp: &Checkpoint) -> Result<String, St
     if sdir.is_dir() {
         out.push_str("\nUntracked sidecar files present; ");
         out.push_str("restore will copy them back.\n");
+    }
+
+    // Untracked-file delta since the checkpoint. `git stash create` does not
+    // capture untracked content, so name what changed instead of restoring it.
+    let before: std::collections::HashSet<&str> =
+        cp.untracked_snapshot.iter().map(String::as_str).collect();
+    let now = untracked_files(&git_root);
+    let now_set: std::collections::HashSet<&str> = now.iter().map(String::as_str).collect();
+    let created: Vec<&str> = now
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !before.contains(p))
+        .collect();
+    let removed: Vec<&str> = cp
+        .untracked_snapshot
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !now_set.contains(p))
+        .collect();
+    if !created.is_empty() {
+        out.push_str(
+            "\nUntracked files created since checkpoint (restore will NOT remove them):\n",
+        );
+        for p in created.iter().take(50) {
+            out.push_str(&format!("  + {p}\n"));
+        }
+    }
+    if !removed.is_empty() {
+        out.push_str(
+            "\nUntracked files present at checkpoint but gone now (content not recoverable):\n",
+        );
+        for p in removed.iter().take(50) {
+            out.push_str(&format!("  - {p}\n"));
+        }
     }
 
     out.push_str("\nUse --apply or /undo --apply to restore.\n");
