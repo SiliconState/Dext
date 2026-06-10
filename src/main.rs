@@ -746,11 +746,35 @@ fn cap_bytes_with_hint(s: String, cap: usize, hint: &str) -> String {
     )
 }
 
+const TOOL_OUTPUT_NARROW_HINT: &str =
+    "Narrow/paginate; prefer symbol-scoped reads or targeted diff/stat before retrying.";
+
 fn cap_tool_output_with_cap(s: String, cap: usize) -> String {
-    cap_bytes_with_hint(
-        s,
-        cap,
-        "Narrow/paginate; prefer symbol-scoped reads or targeted diff/stat before retrying.",
+    cap_bytes_with_hint(s, cap, TOOL_OUTPUT_NARROW_HINT)
+}
+
+/// Head+tail cap for process-style output: build/test runs put the verdict at
+/// the end, so the tail must survive capping (head-only capping made the model
+/// re-run commands just to see the failure summary).
+fn cap_bytes_head_tail_with_hint(s: String, cap: usize, hint: &str) -> String {
+    if s.len() <= cap {
+        return s;
+    }
+    let head_cap = cap.saturating_mul(2) / 3;
+    let tail_cap = cap.saturating_sub(head_cap);
+    let head = byte_prefix_at_char_boundary(&s, head_cap);
+    let tail = byte_suffix_at_char_boundary(&s, tail_cap);
+    let suffix = if hint.is_empty() {
+        String::new()
+    } else {
+        format!(" {hint}")
+    };
+    format!(
+        "{head}\n\n…[truncated {} bytes total; kept first {} and last {}.{}]\n\n{tail}",
+        s.len(),
+        head.len(),
+        tail.len(),
+        suffix
     )
 }
 
@@ -12212,6 +12236,17 @@ impl Agent {
         }
     }
 
+    /// Model used for the one-shot compaction summary. DEXT_COMPACT_MODEL
+    /// points it at a cheaper slug on the same provider (e.g. claude-haiku-4-5,
+    /// glm-4.6) so compaction doesn't pay flagship rates for a terse digest.
+    fn compact_summary_model(&self) -> String {
+        std::env::var("DEXT_COMPACT_MODEL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.model.clone())
+    }
+
     fn split_compaction_inputs(&self, old: &[Message]) -> (Vec<Message>, Vec<Message>) {
         let mut keep_indices: Vec<usize> = Vec::new();
         let mut keep_bytes = 0usize;
@@ -12323,6 +12358,7 @@ impl Agent {
 
         let transcript = render_transcript_for_summary(old, self.context_mode);
         let user_text = compaction_user_text_with_evidence(&transcript, evidence);
+        let summary_model = self.compact_summary_model();
 
         #[derive(PartialEq, Eq)]
         enum SummaryParse {
@@ -12333,7 +12369,8 @@ impl Agent {
 
         let (mut resp, parse_mode): (reqwest::Response, SummaryParse) =
             if self.api_provider == ApiProvider::ChatGpt {
-                let body = build_chatgpt_summary_request(&self.model, COMPACT_SYSTEM, &user_text);
+                let body =
+                    build_chatgpt_summary_request(&summary_model, COMPACT_SYSTEM, &user_text);
                 let url = provider_request_url(&self.base_url, self.api_provider);
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                 let req = apply_provider_headers(
@@ -12364,7 +12401,7 @@ impl Agent {
                     },
                 ];
                 let body = OaiRequest {
-                    model: &self.model,
+                    model: &summary_model,
                     max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
                     messages,
                     tools: Vec::new(),
@@ -12393,7 +12430,7 @@ impl Agent {
                     cache_control: None,
                 }];
                 let body = Request {
-                    model: &self.model,
+                    model: &summary_model,
                     max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
                     system: &sys_blocks,
                     messages: &messages,
@@ -14131,7 +14168,13 @@ impl Agent {
                 results.push(Block::ToolResult {
                     tool_use_id,
                     content: if is_verification_result {
-                        cap_bytes_with_hint(content, dynamic_result_cap, &result_hint)
+                        cap_bytes_head_tail_with_hint(content, dynamic_result_cap, &result_hint)
+                    } else if matches!(name.as_str(), "bash" | "awk" | "csvkit") {
+                        cap_bytes_head_tail_with_hint(
+                            content,
+                            dynamic_result_cap,
+                            TOOL_OUTPUT_NARROW_HINT,
+                        )
                     } else {
                         cap_tool_output_with_cap(content, dynamic_result_cap)
                     },

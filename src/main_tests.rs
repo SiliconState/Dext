@@ -10692,3 +10692,40 @@ fn sanitize_strips_prior_turn_thinking_but_keeps_current_tool_loop() {
             .any(|b| matches!(b, Block::Thinking { .. }))
     );
 }
+
+#[test]
+fn head_tail_cap_preserves_process_output_verdict() {
+    let mut output = String::new();
+    output.push_str("compiling step one\n");
+    for i in 0..2000 {
+        output.push_str(&format!("warning line {i}\n"));
+    }
+    output.push_str("test result: FAILED. 3 passed; 2 failed\n");
+    let capped = cap_bytes_head_tail_with_hint(output.clone(), 2_000, "see artifact");
+    assert!(capped.len() < output.len());
+    assert!(capped.starts_with("compiling step one"), "{capped}");
+    assert!(
+        capped.contains("test result: FAILED. 3 passed; 2 failed"),
+        "tail verdict must survive capping"
+    );
+    assert!(capped.contains("see artifact"), "{capped}");
+
+    // Under-cap content passes through untouched.
+    let short = "all good".to_string();
+    assert_eq!(cap_bytes_head_tail_with_hint(short.clone(), 2_000, "x"), short);
+}
+
+#[test]
+fn compact_summary_model_env_override() {
+    let _guard = env_lock();
+    let root = temp_test_dir("compact-model-override");
+    let agent = test_agent(&root);
+    unsafe { std::env::remove_var("DEXT_COMPACT_MODEL") };
+    assert_eq!(agent.compact_summary_model(), agent.model);
+    unsafe { std::env::set_var("DEXT_COMPACT_MODEL", "claude-haiku-4-5") };
+    assert_eq!(agent.compact_summary_model(), "claude-haiku-4-5");
+    unsafe { std::env::set_var("DEXT_COMPACT_MODEL", "   ") };
+    assert_eq!(agent.compact_summary_model(), agent.model);
+    unsafe { std::env::remove_var("DEXT_COMPACT_MODEL") };
+    let _ = std::fs::remove_dir_all(&root);
+}
