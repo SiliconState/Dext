@@ -790,9 +790,19 @@ fn shell_chunk_is_read_only(chunk: &str) -> bool {
     let first = words.next().unwrap_or("");
     match first {
         "echo" | "ls" | "cat" | "pwd" | "whoami" | "id" | "env" | "printenv" | "rg" | "fd"
-        | "find" | "grep" | "head" | "tail" | "stat" | "which" | "basename" | "dirname"
-        | "realpath" | "readlink" | "wc" | "sort" | "uniq" | "cut" | "tr" | "sed" | "awk"
-        | "jq" => true,
+        | "grep" | "head" | "tail" | "stat" | "which" | "basename" | "dirname" | "realpath"
+        | "readlink" | "wc" | "sort" | "uniq" | "cut" | "tr" | "jq" => true,
+        // These are read-only as filters but have in-place/exec escape hatches.
+        "sed" => {
+            !words.any(|w| w == "--in-place" || w.starts_with("--in-place=") || w.starts_with("-i"))
+        }
+        "find" => !words.any(|w| {
+            matches!(
+                w,
+                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls"
+            ) || w.starts_with("-fprint")
+        }),
+        "awk" => !chunk.contains("system("),
         "git" => matches!(
             words.next().unwrap_or(""),
             "status" | "diff" | "log" | "show" | "branch" | "rev-parse"
@@ -1152,6 +1162,47 @@ mod tests {
         assert!(!command_requests_sudo_password(
             "sudo --non-interactive true"
         ));
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "sed -n '1,10p' src/main.rs"})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "sed -i 's/a/b/' src/main.rs"})),
+            CommandRisk::Write
+        );
+        assert_eq!(
+            classify_command_risk(
+                "bash",
+                &json!({"command": "sed --in-place 's/a/b/' src/main.rs"})
+            ),
+            CommandRisk::Write
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "find . -name '*.rs'"})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "find . -name '*.tmp' -delete"})),
+            CommandRisk::Write
+        );
+        assert_eq!(
+            classify_command_risk(
+                "bash",
+                &json!({"command": "find . -name '*.tmp' -exec touch {} +"})
+            ),
+            CommandRisk::Write
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "awk '{print $1}' data.txt"})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk(
+                "bash",
+                &json!({"command": "awk '{system(\"touch pwned\")}' data.txt"})
+            ),
+            CommandRisk::Write
+        );
         assert_eq!(
             classify_command_risk("read_file", &json!({"path": "/outside"})),
             CommandRisk::Read

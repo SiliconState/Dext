@@ -3099,7 +3099,14 @@ pub(crate) fn login_provider(
         }
     }
 
-    if let Some(msg) = try_complete_oauth_from_callback(&key)? {
+    // Only treat pasted input as an OAuth artifact when this provider actually
+    // uses OAuth, or the input is unambiguously a callback (URL / `ac_` code).
+    // Plain API keys for non-OAuth providers (e.g. ZAI GLM `id.secret` keys)
+    // would otherwise match the plain-code fallback and fail login with a
+    // bogus "no pending OAuth session" error instead of being stored.
+    if (profile.oauth_flow.is_some() || extract_oauth_code_from_callback(&key).is_some())
+        && let Some(msg) = try_complete_oauth_from_callback(&key)?
+    {
         catalog.active_provider = profile.id.clone();
         save_provider_catalog(&catalog)?;
         return Ok(LoginResult {

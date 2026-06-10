@@ -7459,6 +7459,42 @@ fn login_imports_env_key_and_reuses_stored_key() -> Result<()> {
 }
 
 #[test]
+fn login_stores_plain_api_key_for_non_oauth_provider() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("login-glm-plain-key");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("ZAI_API_KEY");
+        std::env::remove_var("DEXT_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        // ZAI-style `id.secret` key: no sk-/eyJ prefix, >12 chars, no whitespace.
+        // Must be stored as an API key, not misrouted to OAuth callback completion.
+        let key = "4f8a0e8c2d6b894fdeadbeef.AbCdEfGh123";
+        let msg = login_provider_with_key(Some("glm"), Some(key), false)?;
+        assert!(msg.contains("stored credentials"), "{msg}");
+
+        let store = load_auth_store()?;
+        let entry = store
+            .providers
+            .get("glm")
+            .context("missing glm credentials in auth store")?;
+        let resolved = entry
+            .resolve_secret()
+            .context("unresolved glm credential")?;
+        assert_eq!(resolved, key);
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn provider_selector_accepts_index_and_id() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-selector");
