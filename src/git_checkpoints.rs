@@ -278,6 +278,15 @@ pub(crate) fn create_checkpoint_in_repo(
         }
     }
 
+    // Direct file tools already capture their exact target via the sidecar
+    // above, so skip the broad (and per-call costly) untracked scan for them;
+    // it is the value-add for arbitrary commands like bash.
+    let untracked_snapshot = if file_tools.contains(&tool) {
+        Vec::new()
+    } else {
+        untracked_files(git_root)
+    };
+
     let cp = Checkpoint {
         id,
         ref_name,
@@ -287,7 +296,7 @@ pub(crate) fn create_checkpoint_in_repo(
         head,
         paths_hint: paths_hint.to_vec(),
         includes_untracked_sidecar,
-        untracked_snapshot: untracked_files(git_root),
+        untracked_snapshot,
     };
 
     append_manifest(git_root, &cp)?;

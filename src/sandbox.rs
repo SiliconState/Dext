@@ -16,22 +16,29 @@
 //              the path-validation layer. Use WSL for kernel-enforced bash.
 //
 // Profiles:
-//   - ReadOnly:        deny writes to the workspace and system; scratch
-//                      writes to temp dirs and /dev are still permitted so
-//                      heredocs and well-behaved tools keep working.
-//   - WorkspaceWrite:  additionally permit writes under the sandbox root.
+//   - ReadOnly:        deny writes to the workspace, home, and system; only
+//                      scratch (temp dirs) and device nodes (/dev) stay
+//                      writable so heredocs and well-behaved filters work.
+//   - WorkspaceWrite:  additionally permit writes under the sandbox root and
+//                      the user's home directory. Home is allowed because
+//                      toolchains (cargo, npm, pip, go, ...) write per-user
+//                      caches outside the workspace; the boundary that matters
+//                      in write-mode is the system directories (/etc, /usr,
+//                      /bin, ...), which stay denied.
 //   - DangerFullAccess: no confinement.
 
 use std::path::{Path, PathBuf};
 
 use crate::SandboxProfile;
 
-/// Directories that must stay writable even under the read-only profile so
-/// that shells and tools can use scratch space (heredocs, lock files, etc.).
+/// Paths that must stay writable under every profile: scratch space (heredocs,
+/// lock files) and the device nodes virtually all commands need — `/dev/null`,
+/// `/dev/tty`, the controlling terminal, etc. Denying `/dev/null` writes alone
+/// breaks `2>/dev/null`, git, and most build tools.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn scratch_write_roots() -> Vec<PathBuf> {
     let mut roots = vec![std::env::temp_dir()];
-    for p in ["/tmp", "/var/tmp", "/dev/shm"] {
+    for p in ["/tmp", "/var/tmp", "/dev/shm", "/dev"] {
         let path = PathBuf::from(p);
         if path.is_dir() {
             roots.push(path);
@@ -45,6 +52,13 @@ fn writable_roots(profile: SandboxProfile, root: &Path) -> Vec<PathBuf> {
     let mut roots = scratch_write_roots();
     if profile == SandboxProfile::WorkspaceWrite {
         roots.push(root.to_path_buf());
+        // Toolchains (cargo, npm, pip, go, ...) write to per-user caches and
+        // config outside the workspace; without the home directory, common
+        // verification commands like `cargo test` fail to take their package
+        // cache lock. System directories (/etc, /usr, /bin, ...) stay denied —
+        // that is the boundary that matters for write-mode. The strict
+        // read-only profile excludes the home directory by design.
+        roots.push(crate::session::user_home_dir());
     }
     roots
 }

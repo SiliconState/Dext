@@ -2797,6 +2797,65 @@ async fn sandbox_never_breaks_benign_commands() {
 }
 
 #[tokio::test]
+async fn read_only_sandbox_does_not_break_git_inspection() {
+    // git_diff/git_log are read-only inspection, but git writes .git/index as
+    // bookkeeping, which would intermittently fail under the read-only profile
+    // for a repo outside the writable roots — so those tools run unconfined.
+    // The repo is placed under HOME (outside the scratch roots) to exercise that
+    // path where the kernel enforces; git inspection must still work.
+    // Read HOME and create the repo under the env lock: other tests transiently
+    // point HOME at a temp dir they later delete, which would otherwise pull the
+    // repo out from under us. git below uses absolute paths / current_dir, so it
+    // is unaffected by HOME changes once set up.
+    let (repo, setup) = {
+        let _guard = env_lock();
+        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let repo =
+            std::path::PathBuf::from(home).join(format!("dext-sbx-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        let setup = (|| -> std::result::Result<(), String> {
+            std::fs::create_dir_all(&repo).map_err(|e| e.to_string())?;
+            git_ok(&repo, &["init", "-q"]);
+            git_ok(&repo, &["config", "user.email", "t@e.invalid"]);
+            git_ok(&repo, &["config", "user.name", "T"]);
+            std::fs::write(repo.join("f.txt"), "one\n").map_err(|e| e.to_string())?;
+            git_ok(&repo, &["add", "f.txt"]);
+            git_ok(&repo, &["commit", "-q", "-m", "base"]);
+            std::fs::write(repo.join("f.txt"), "two\n").map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        (repo, setup)
+    };
+
+    let outcome = match setup {
+        Ok(()) => {
+            execute_builtin_call(
+                "git_diff".to_string(),
+                json!({}),
+                repo.clone(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                None,
+                None,
+                SandboxProfile::ReadOnly,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let body = outcome.expect("git_diff must run under the read-only sandbox");
+    assert!(
+        body.contains("f.txt") || body.contains("-one") || body.contains("+two"),
+        "git_diff should still produce a diff under read-only sandbox: {body}"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
     // Only meaningful where the OS actually enforces (Linux Landlock / macOS
     // Seatbelt); elsewhere this asserts the no-break invariant only.
@@ -2824,23 +2883,35 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
 
     if crate::sandbox::is_enforced() {
         // Target a HOME-based path: normally writable by this user, but outside
-        // both the workspace root and the scratch roots (temp dirs). The
-        // workspace root here lives under the system temp dir, so it would be a
-        // confounded target — HOME is not. Under WorkspaceWrite this write must
-        // still be denied by the kernel.
-        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
-        if let Ok(home) = home {
-            let escape_dir = std::path::PathBuf::from(home)
-                .join(format!(".dext-sbx-test-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&escape_dir);
+        // the workspace root and the scratch roots. The read-only profile must
+        // deny it; the workspace-write profile must ALLOW it, because toolchains
+        // (cargo, npm, ...) write per-user caches under HOME and would otherwise
+        // break. (The workspace root here lives under the system temp dir, so it
+        // would be a confounded target — HOME is not.)
+        // Read HOME + create the dir under the env lock; other tests transiently
+        // repoint HOME at a temp dir they delete. The bash writes below use the
+        // absolute escape path, so they are unaffected by later HOME changes.
+        let escape = {
+            let _guard = env_lock();
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .ok()
+                .map(|home| {
+                    let escape_dir = std::path::PathBuf::from(home)
+                        .join(format!(".dext-sbx-test-{}", std::process::id()));
+                    let _ = std::fs::create_dir_all(&escape_dir);
+                    escape_dir
+                })
+        };
+        if let Some(escape_dir) = escape {
             let escape_file = escape_dir.join("escape.txt");
             let escape_cmd = format!(
                 "echo pwned > {} 2>&1",
                 shell_single_quote(&escape_file.to_string_lossy())
             );
 
-            // Self-validation: the same write must succeed unsandboxed, proving
-            // the path is genuinely writable and only the sandbox blocks it.
+            // Control: the write succeeds unsandboxed, proving the path is
+            // genuinely writable and only the sandbox affects it.
             let _ = std::fs::remove_file(&escape_file);
             let _ = execute_bash_async_with_timeout(
                 &escape_cmd,
@@ -2856,8 +2927,25 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 "control: HOME-based path must be writable without a sandbox"
             );
 
+            // Read-only denies the HOME write.
             let _ = std::fs::remove_file(&escape_file);
             let blocked = execute_bash_async_with_timeout(
+                &escape_cmd,
+                &root,
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_secs(5),
+                SandboxProfile::ReadOnly,
+            )
+            .await
+            .expect("command runs even when its write is denied");
+            assert!(
+                !escape_file.exists(),
+                "read-only sandbox must block writes outside scratch roots: {blocked}"
+            );
+
+            // Workspace-write allows the HOME write (toolchain caches).
+            let _ = std::fs::remove_file(&escape_file);
+            let _ = execute_bash_async_with_timeout(
                 &escape_cmd,
                 &root,
                 Arc::new(AtomicBool::new(false)),
@@ -2865,10 +2953,10 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 SandboxProfile::WorkspaceWrite,
             )
             .await
-            .expect("command runs even when its write is denied");
+            .expect("workspace-write HOME write should run");
             assert!(
-                !escape_file.exists(),
-                "sandbox must block writes outside workspace+scratch roots: {blocked}"
+                escape_file.exists(),
+                "workspace-write must allow HOME writes so toolchains work"
             );
             let _ = std::fs::remove_dir_all(&escape_dir);
         }

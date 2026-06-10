@@ -793,9 +793,13 @@ fn shell_chunk_is_read_only(chunk: &str) -> bool {
         | "grep" | "head" | "tail" | "stat" | "which" | "basename" | "dirname" | "realpath"
         | "readlink" | "wc" | "sort" | "uniq" | "cut" | "tr" | "jq" => true,
         // These are read-only as filters but have in-place/exec escape hatches.
-        "sed" => {
-            !words.any(|w| w == "--in-place" || w.starts_with("--in-place=") || w.starts_with("-i"))
-        }
+        // `-i` is the only short sed flag containing 'i', so any short-flag
+        // cluster with 'i' (e.g. -i, -i.bak, -ni) means an in-place edit.
+        "sed" => !words.any(|w| {
+            w == "--in-place"
+                || w.starts_with("--in-place=")
+                || (w.starts_with('-') && !w.starts_with("--") && w.contains('i'))
+        }),
         "find" => !words.any(|w| {
             matches!(
                 w,
@@ -1168,6 +1172,14 @@ mod tests {
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "sed -i 's/a/b/' src/main.rs"})),
+            CommandRisk::Write
+        );
+        // Combined short-flag cluster with 'i' is still an in-place edit.
+        assert_eq!(
+            classify_command_risk(
+                "bash",
+                &json!({"command": "sed -ni 's/a/b/w out' src/main.rs"})
+            ),
             CommandRisk::Write
         );
         assert_eq!(

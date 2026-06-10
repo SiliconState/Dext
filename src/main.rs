@@ -7515,9 +7515,14 @@ async fn execute_builtin_call(
     } else if name == "http" {
         execute_http_tool_async(&input, interrupt, external_tool_timeout()).await
     } else if is_external_process_tool(&name) {
-        // The browser recipe manages its own profile/cache dirs and needs
-        // network + broad filesystem access, so it runs unconfined.
-        let ext_profile = if name == "browser" {
+        // Run unconfined: the browser recipe manages its own profile/cache dirs
+        // and needs network + broad access; git_diff/git_log are read-only
+        // inspection but git writes its index (.git/index) as bookkeeping, which
+        // would intermittently fail under the read-only profile for a repo
+        // outside the writable roots. Neither mutates the working tree, so this
+        // is security-neutral. The write-capable externals (awk, csvkit) and the
+        // rest stay confined.
+        let ext_profile = if matches!(name.as_str(), "browser" | "git_diff" | "git_log") {
             SandboxProfile::DangerFullAccess
         } else {
             sandbox_profile
