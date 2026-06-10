@@ -268,6 +268,11 @@ DEXT_PROVIDER=local
 DEXT_MODEL=qwen2.5-coder-7b
 DEXT_BASE_URL=http://127.0.0.1:8080
 DEXT_THINKING_EFFORT=off
+# Experimental: force well-formed tool calls on local llama.cpp (opt-in).
+# Constrains generation with a GBNF grammar so small models cannot emit a
+# tool call with empty/dropped arguments. Off by default; validate against
+# your llama.cpp build before relying on it, as it forces a tool call.
+DEXT_LLAMA_TOOL_GRAMMAR=1
 # or cloud:
 DEXT_PROVIDER=chatgpt
 DEXT_MODEL=gpt-5.3-codex

@@ -5303,6 +5303,54 @@ fn memory_distill_dedupes_and_flags_unbacked_bullets() {
 }
 
 #[test]
+fn llama_tool_grammar_is_gated_to_local_and_opt_in() {
+    use crate::provider::ApiProvider;
+    let tools = ["read_file", "bash"];
+
+    // Cloud OpenAI: never attach a grammar (it rejects unknown fields).
+    assert!(
+        llama_tool_grammar_for(
+            "openai",
+            ApiProvider::OpenAi,
+            "https://api.openai.com",
+            &tools,
+            true
+        )
+        .is_none()
+    );
+    // Local llama.cpp but opt-in disabled: no grammar (default experience).
+    assert!(
+        llama_tool_grammar_for(
+            "local",
+            ApiProvider::OpenAi,
+            "http://127.0.0.1:8080",
+            &tools,
+            false
+        )
+        .is_none()
+    );
+    // Local llama.cpp + opt-in: a grammar naming the tools that forces a
+    // non-empty arguments object.
+    let grammar = llama_tool_grammar_for(
+        "local",
+        ApiProvider::OpenAi,
+        "http://127.0.0.1:8080",
+        &tools,
+        true,
+    )
+    .expect("local + opt-in should produce a grammar");
+    assert!(grammar.contains("root"), "{grammar}");
+    assert!(grammar.contains(r#""\"read_file\"""#), "{grammar}");
+    assert!(grammar.contains(r#""\"bash\"""#), "{grammar}");
+    // The arguments object requires at least one member, so dropped/empty
+    // arguments cannot satisfy the grammar.
+    assert!(
+        grammar.contains(r#"object ::= "{" ws string ws ":" ws value"#),
+        "{grammar}"
+    );
+}
+
+#[test]
 fn default_tool_profile_is_lean_for_prompt_budget() {
     assert_eq!(ToolProfile::default(), ToolProfile::Lean);
     assert_eq!(ToolProfile::parse("default"), Some(ToolProfile::Lean));

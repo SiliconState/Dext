@@ -2997,6 +2997,58 @@ fn openai_reasoning_effort(effort: ThinkingEffort) -> Option<&'static str> {
     }
 }
 
+const LLAMA_TOOL_GRAMMAR_ENV: &str = "DEXT_LLAMA_TOOL_GRAMMAR";
+
+/// Build a llama.cpp GBNF grammar that constrains the completion to a single
+/// well-formed tool call: an object with `name` (one of the exposed tools) and
+/// a NON-empty `arguments` object. This targets the local llama.cpp failure
+/// mode where small models emit a tool call with empty/dropped arguments — the
+/// empty-tool-call loop the orchestrator otherwise only breaks after the fact.
+fn llama_tool_call_grammar(tool_names: &[&str]) -> Option<String> {
+    if tool_names.is_empty() {
+        return None;
+    }
+    let names = tool_names
+        .iter()
+        .map(|n| {
+            format!(
+                "\"\\\"{}\\\"\"",
+                n.replace('\\', "\\\\").replace('"', "\\\"")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let grammar = r#"root   ::= "{" ws "\"name\"" ws ":" ws name ws "," ws "\"arguments\"" ws ":" ws object ws "}"
+name   ::= __NAMES__
+object ::= "{" ws string ws ":" ws value (ws "," ws string ws ":" ws value)* ws "}"
+value  ::= object | array | string | number | "true" | "false" | "null"
+array  ::= "[" ws (value (ws "," ws value)*)? ws "]"
+string ::= "\"" ([^"\\] | "\\" .)* "\""
+number ::= "-"? [0-9]+ ("." [0-9]+)? ([eE] [-+]? [0-9]+)?
+ws     ::= [ \t\n]*
+"#;
+    Some(grammar.replace("__NAMES__", &names))
+}
+
+/// Decide whether to attach the tool-call grammar to a request. Gated to the
+/// local llama.cpp provider (cloud OpenAI rejects unknown fields) and opt-in
+/// via DEXT_LLAMA_TOOL_GRAMMAR, because forcing a tool call means the model
+/// cannot answer in plain text, and the grammar's effect depends on the
+/// llama.cpp server build. Off by default so it never changes the default
+/// local experience; enable it to escape an empty-tool-call loop.
+fn llama_tool_grammar_for(
+    provider_id: &str,
+    api_provider: provider::ApiProvider,
+    base_url: &str,
+    tool_names: &[&str],
+    enabled: bool,
+) -> Option<String> {
+    if !enabled || !provider::is_local_llama_provider(provider_id, api_provider, base_url) {
+        return None;
+    }
+    llama_tool_call_grammar(tool_names)
+}
+
 fn anthropic_thinking_budget_tokens(effort: ThinkingEffort) -> Option<u32> {
     match effort {
         ThinkingEffort::Off => None,
@@ -3150,6 +3202,11 @@ struct OaiRequest<'a> {
     stream_options: Option<OaiStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
+    /// llama.cpp GBNF extension. Only ever set for the local llama.cpp
+    /// provider (cloud OpenAI rejects unknown fields), and only when the
+    /// user opts in — see `llama_tool_call_grammar`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grammar: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -11403,6 +11460,15 @@ impl Agent {
                 .then_some(OaiStreamOptions {
                     include_usage: true,
                 });
+                let tool_names: Vec<&str> =
+                    oai_tools.iter().map(|t| t.function.name.as_str()).collect();
+                let grammar = llama_tool_grammar_for(
+                    &self.provider_id,
+                    self.api_provider,
+                    &self.base_url,
+                    &tool_names,
+                    env_flag_default(LLAMA_TOOL_GRAMMAR_ENV, false),
+                );
                 let body = OaiRequest {
                     model: &self.model,
                     max_tokens: max_output_tokens(),
@@ -11411,6 +11477,7 @@ impl Agent {
                     stream: true,
                     stream_options,
                     reasoning_effort,
+                    grammar,
                 };
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                 Ok((url, bytes))
@@ -12107,6 +12174,7 @@ impl Agent {
                     stream: false,
                     stream_options: None,
                     reasoning_effort,
+                    grammar: None,
                 };
                 let mut req = self
                     .http_client()
