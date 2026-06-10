@@ -5139,6 +5139,55 @@ fn compose_system_parts_includes_typed_shelf_registry_summary() {
 }
 
 #[test]
+fn shelf_context_ability_injects_into_prompt_when_hook_opts_in() {
+    let _guard = env_lock();
+    let root = temp_test_dir("shelf-context-injection");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let shelf_dir = root.join(".dext/shelves/house");
+    std::fs::create_dir_all(&shelf_dir).expect("create shelf dir");
+    // A Context ability plus a load-signal Hook: the live signal→effect loop
+    // must inject the context text into the system prompt.
+    std::fs::write(
+        shelf_dir.join("shelf.json"),
+        r#"{
+  "id": "house",
+  "name": "House",
+  "description": "house rules",
+  "mode": "always",
+  "packs": [{
+    "id": "rules",
+    "name": "Rules",
+    "version": "0.1.0",
+    "description": "house rules",
+    "abilities": [
+      {"ability": "context", "name": "house-rules", "description": "ALWAYS prefer rg over grep in this repo", "budget": 256},
+      {"ability": "hook", "name": "loader", "signals": ["load"]}
+    ]
+  }]
+}"#,
+    )
+    .expect("write shelf manifest");
+    unsafe {
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let agent = test_agent(&root);
+    let (_stable, env) = agent.compose_system_parts();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(env.contains("## Shelf context"), "{env}");
+    assert!(
+        env.contains("ALWAYS prefer rg over grep in this repo"),
+        "{env}"
+    );
+}
+
+#[test]
 fn default_tool_profile_is_lean_for_prompt_budget() {
     assert_eq!(ToolProfile::default(), ToolProfile::Lean);
     assert_eq!(ToolProfile::parse("default"), Some(ToolProfile::Lean));

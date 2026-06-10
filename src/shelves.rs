@@ -426,6 +426,78 @@ impl ShelfRegistry {
         }
         Ok(effects)
     }
+
+    /// Cheap check: does any registered shelf opt into this signal kind via a
+    /// Hook ability? Lets callers skip emitting entirely when nothing listens.
+    pub(crate) fn wants_any(&self, kind: SignalKind) -> bool {
+        self.shelves
+            .iter()
+            .any(|shelf| wants_signal(shelf.manifest(), kind))
+    }
+
+    /// Collect Context/Note effects produced for a load/prompt signal into a
+    /// single priority-ordered block bounded by `total_budget` bytes. Returns
+    /// None when no shelf opts into the signal or produces context.
+    pub(crate) fn collect_context(
+        &self,
+        signal: &Signal,
+        frame: &ShelfFrame,
+        total_budget: usize,
+    ) -> Option<String> {
+        if !self.wants_any(signal.kind()) {
+            return None;
+        }
+        let effects = self.emit(signal, frame).ok()?;
+        let mut items: Vec<(i16, String)> = effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Context { text, priority } => Some((priority, text)),
+                Effect::Note { text } => Some((0, text)),
+                _ => None,
+            })
+            .filter(|(_, text)| !text.trim().is_empty())
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut out = String::new();
+        for (_, text) in items {
+            if !out.is_empty() && out.len() + text.len() + 1 > total_budget {
+                break;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&text);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Emit a tool "before" signal and return the first Block reason, if any.
+    /// Lets behavioral shelves veto a tool call before it runs.
+    pub(crate) fn tool_block_reason(
+        &self,
+        frame: &ShelfFrame,
+        name: &str,
+        input: &Value,
+    ) -> Option<String> {
+        if !self.wants_any(SignalKind::Tool) {
+            return None;
+        }
+        let signal = Signal::Tool {
+            phase: ToolPhase::Before,
+            name: name.to_string(),
+            input: input.clone(),
+            output: None,
+        };
+        let effects = self.emit(&signal, frame).ok()?;
+        effects.into_iter().find_map(|effect| match effect {
+            Effect::Block { reason } => Some(reason),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -471,6 +543,45 @@ impl Shelf for StaticShelf {
     fn manifest(&self) -> &ShelfManifest {
         &self.manifest
     }
+
+    /// A manifest-only shelf contributes its declared Context abilities as
+    /// prompt context when a load/prompt signal fires. It carries no logic, so
+    /// it never blocks or rewrites tools. Higher-scope shelves (project/run)
+    /// inject at higher priority than core/user.
+    fn on_signal(&self, signal: &Signal, _frame: &ShelfFrame) -> Result<Vec<Effect>> {
+        match signal {
+            Signal::Load | Signal::Prompt { .. } => {
+                let priority = self.manifest.origin.scope.rank() as i16;
+                let mut effects = Vec::new();
+                for pack in &self.manifest.packs {
+                    for ability in &pack.abilities {
+                        if let Ability::Context(ctx) = ability {
+                            let text = format!("{}: {}", ctx.name, empty_label(&ctx.description));
+                            // budget is a token hint; cap injected bytes to ~4x.
+                            let cap = ctx.budget.saturating_mul(4).clamp(64, 8_192);
+                            effects.push(Effect::Context {
+                                text: cap_chars_on_boundary(&text, cap),
+                                priority,
+                            });
+                        }
+                    }
+                }
+                Ok(effects)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+}
+
+fn cap_chars_on_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 struct ShelfManifestCandidate {
@@ -925,6 +1036,81 @@ mod tests {
             )
             .unwrap();
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn tool_block_reason_surfaces_guard_veto() {
+        let mut registry = ShelfRegistry::new();
+        registry.register(GuardShelf::new());
+        let reason = registry.tool_block_reason(
+            &ShelfFrame::new("."),
+            "bash",
+            &json!({"command": "rm -rf target"}),
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some("destructive command blocked by pack")
+        );
+        // A benign command is not vetoed.
+        assert!(
+            registry
+                .tool_block_reason(&ShelfFrame::new("."), "bash", &json!({"command": "ls"}))
+                .is_none()
+        );
+    }
+
+    fn context_shelf(with_load_hook: bool) -> StaticShelf {
+        let mut abilities = vec![Ability::Context(ContextAbility {
+            name: "house-rules".to_string(),
+            description: "always prefer rg over grep".to_string(),
+            budget: 256,
+        })];
+        if with_load_hook {
+            abilities.push(Ability::Hook(HookAbility {
+                name: "loader".to_string(),
+                signals: vec![SignalKind::Load],
+            }));
+        }
+        StaticShelf::new(ShelfManifest {
+            id: ShelfId::new("proj").unwrap(),
+            name: "proj".to_string(),
+            description: "project shelf".to_string(),
+            origin: ShelfOrigin {
+                scope: ShelfScope::Project,
+                path: None,
+            },
+            mode: ShelfMode::Always,
+            packs: vec![PackManifest {
+                id: PackId::new("rules").unwrap(),
+                name: "rules".to_string(),
+                version: "0.0.0".to_string(),
+                description: "house rules".to_string(),
+                abilities,
+            }],
+        })
+    }
+
+    #[test]
+    fn collect_context_injects_only_when_a_load_hook_opts_in() {
+        // Context ability + a load-signal hook → injected.
+        let mut registry = ShelfRegistry::new();
+        registry.register(context_shelf(true));
+        let block = registry.collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000);
+        assert!(
+            block
+                .as_deref()
+                .is_some_and(|b| b.contains("always prefer rg over grep")),
+            "{block:?}"
+        );
+
+        // Same Context ability but no hook → the loop stays silent.
+        let mut registry = ShelfRegistry::new();
+        registry.register(context_shelf(false));
+        assert!(
+            registry
+                .collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000)
+                .is_none()
+        );
     }
 
     #[test]

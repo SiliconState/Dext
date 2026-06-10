@@ -10453,6 +10453,26 @@ impl Agent {
         }
     }
 
+    fn shelf_frame(&self) -> shelves::ShelfFrame {
+        let mut frame = shelves::ShelfFrame::new(self.sandbox_root.clone());
+        frame.session_id = Some(self.session_id.clone());
+        frame
+    }
+
+    /// Prompt context contributed by the typed shelf signal→effect loop
+    /// (Context abilities of shelves that opt in via a load-signal Hook).
+    fn shelf_context_section(&self) -> Option<String> {
+        self.shelf_registry
+            .collect_context(&shelves::Signal::Load, &self.shelf_frame(), 1_200)
+    }
+
+    /// A shelf veto for a tool call, if any behavioral shelf opts into tool
+    /// signals and returns a Block effect. No-op for manifest-only shelves.
+    fn shelf_tool_denial(&self, name: &str, input: &Value) -> Option<String> {
+        self.shelf_registry
+            .tool_block_reason(&self.shelf_frame(), name, input)
+    }
+
     fn budget_cap_denial(&mut self) -> Option<String> {
         self.ensure_session_usage_cost();
         let cap = self.budget_cap?;
@@ -10714,6 +10734,17 @@ impl Agent {
                     env.push('\n');
                 }
             }
+            if let Some(shelf_context) = self.shelf_context_section() {
+                env.push_str("\n## Shelf context\n");
+                env.push_str(&cap_bytes_with_hint(
+                    shelf_context,
+                    600,
+                    "shelf context trimmed for frugal budget.",
+                ));
+                if !env.ends_with('\n') {
+                    env.push('\n');
+                }
+            }
             env.push_str(&self.privacy.prompt_status_line());
             env.push('\n');
             return SystemParts {
@@ -10820,6 +10851,17 @@ impl Agent {
                 shelf_summary,
                 700,
                 "shelf registry summary trimmed for prompt budget.",
+            ));
+            if !env.ends_with('\n') {
+                env.push('\n');
+            }
+        }
+        if let Some(shelf_context) = self.shelf_context_section() {
+            env.push_str("\n## Shelf context\n");
+            env.push_str(&cap_bytes_with_hint(
+                shelf_context,
+                1_200,
+                "shelf context trimmed for prompt budget.",
             ));
             if !env.ends_with('\n') {
                 env.push('\n');
@@ -13315,6 +13357,15 @@ impl Agent {
                 {
                     plan = Some(Plan::Immediate {
                         content: msg,
+                        is_error: Some(true),
+                    });
+                }
+
+                if plan.is_none()
+                    && let Some(reason) = self.shelf_tool_denial(&name, &input)
+                {
+                    plan = Some(Plan::Immediate {
+                        content: format!("shelf policy blocked {name}: {reason}"),
                         is_error: Some(true),
                     });
                 }
