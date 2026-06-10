@@ -17055,8 +17055,64 @@ fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
             }
             if outcome.clean { 0 } else { 1 }
         }
+        "distill" => {
+            let memory_path = root.join("MEMORY.md");
+            let recall_path = root.join("recall.md");
+            let recall = match std::fs::read_to_string(&recall_path) {
+                Ok(text) => text,
+                Err(e) => {
+                    eprintln!("error reading {}: {e}", recall_path.display());
+                    return 1;
+                }
+            };
+            let memory = std::fs::read_to_string(&memory_path).unwrap_or_default();
+            let distill = memory_merge::distill_recall(&memory, &recall);
+
+            println!(
+                "recall.md: {} bullet(s) -> {} after dedupe ({} exact duplicate(s) removed)",
+                distill.original_bullets,
+                distill.kept_bullets,
+                distill.removed_duplicates.len()
+            );
+            for dup in &distill.removed_duplicates {
+                println!("  - duplicate: {dup}");
+            }
+            if !distill.near_duplicates.is_empty() {
+                println!("near-duplicate bullets (kept; review manually):");
+                for item in &distill.near_duplicates {
+                    println!("  ~ {item}");
+                }
+            }
+            if !distill.unbacked.is_empty() {
+                println!(
+                    "bullets not reflected in MEMORY.md (possibly stale, or promote to MEMORY.md):"
+                );
+                for item in &distill.unbacked {
+                    println!("  ? {item}");
+                }
+            }
+
+            let apply = args.iter().any(|a| a == "--apply");
+            if apply {
+                if distill.content == recall {
+                    println!("recall.md already distilled; nothing to write");
+                } else if let Err(e) =
+                    crate::session::atomic_write_bytes(&recall_path, distill.content.as_bytes())
+                {
+                    eprintln!("error writing {}: {e}", recall_path.display());
+                    return 1;
+                } else {
+                    println!("applied: rewrote {}", recall_path.display());
+                }
+            } else if distill.content != recall {
+                println!("\n(dry run; re-run with --apply to rewrite recall.md)");
+            } else {
+                println!("\nrecall.md already distilled; no changes needed");
+            }
+            0
+        }
         _ => {
-            eprintln!("usage: dext memory [check|register|unregister|merge]");
+            eprintln!("usage: dext memory [check|register|unregister|merge|distill]");
             2
         }
     }
@@ -20281,6 +20337,7 @@ async fn main() -> Result<()> {
         println!("       dext undo --apply <id>   non-interactive apply");
         println!("       dext memory check    check memory merge registration");
         println!("       dext memory register register merge drivers (local)");
+        println!("       dext memory distill [--apply]  dedupe recall.md, flag stale bullets");
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(

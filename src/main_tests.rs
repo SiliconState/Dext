@@ -5228,6 +5228,43 @@ fn session_brief_renders_safe_continuation_packet() {
 }
 
 #[test]
+fn memory_distill_dedupes_and_flags_unbacked_bullets() {
+    let memory = "# Dext durable memory\n\n## Decisions\n- bash is intentionally atomic and the process group is cleaned per call\n";
+    let recall = "# Dext recall\n- Bash is atomic: process group cleaned per call\n- Bash is atomic: process group cleaned per call\n- Unrelated note about foobars widget calibration\n";
+
+    let distill = crate::memory_merge::distill_recall(memory, recall);
+
+    assert_eq!(distill.original_bullets, 3);
+    assert_eq!(distill.kept_bullets, 2);
+    assert_eq!(
+        distill.removed_duplicates.len(),
+        1,
+        "{:?}",
+        distill.removed_duplicates
+    );
+    // The bash bullet is backed by MEMORY; the foobars note is not.
+    assert_eq!(distill.unbacked.len(), 1, "{:?}", distill.unbacked);
+    assert!(
+        distill.unbacked[0].contains("foobars"),
+        "{:?}",
+        distill.unbacked
+    );
+    // The surviving content keeps the bash bullet exactly once.
+    assert_eq!(
+        distill.content.matches("Bash is atomic").count(),
+        1,
+        "{}",
+        distill.content
+    );
+    // Structure (heading) is preserved.
+    assert!(
+        distill.content.starts_with("# Dext recall"),
+        "{}",
+        distill.content
+    );
+}
+
+#[test]
 fn default_tool_profile_is_lean_for_prompt_budget() {
     assert_eq!(ToolProfile::default(), ToolProfile::Lean);
     assert_eq!(ToolProfile::parse("default"), Some(ToolProfile::Lean));

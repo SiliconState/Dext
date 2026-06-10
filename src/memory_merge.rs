@@ -358,9 +358,111 @@ pub(crate) fn merge_recall(base: &str, ours: &str, theirs: &str) -> MergeOutcome
 fn normalize_recall_line(line: &str) -> String {
     line.trim()
         .trim_start_matches("- ")
+        .trim_start_matches("* ")
+        .trim_start_matches("+ ")
         .trim_start_matches("- ")
         .trim()
         .to_ascii_lowercase()
+}
+
+/// Result of deterministically distilling recall.md against MEMORY.md.
+pub(crate) struct RecallDistill {
+    /// Proposed recall.md content (exact-duplicate bullets removed; structure
+    /// and ordering otherwise preserved).
+    pub content: String,
+    /// Bullets dropped because an earlier bullet normalizes identically.
+    pub removed_duplicates: Vec<String>,
+    /// Kept bullets that are near-duplicates of an earlier kept bullet
+    /// (flagged for human review, not removed automatically).
+    pub near_duplicates: Vec<String>,
+    /// Kept bullets whose content is not reflected in MEMORY.md — possibly
+    /// stale, or worth promoting into durable memory.
+    pub unbacked: Vec<String>,
+    pub original_bullets: usize,
+    pub kept_bullets: usize,
+}
+
+fn significant_tokens(s: &str) -> std::collections::HashSet<String> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() > 3)
+        .map(|t| t.to_ascii_lowercase())
+        .collect()
+}
+
+fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f32;
+    let union = a.union(b).count() as f32;
+    if union <= 0.0 { 0.0 } else { inter / union }
+}
+
+fn is_bullet(trimmed: &str) -> bool {
+    trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ")
+}
+
+/// Deterministically distil recall.md: drop exact-duplicate bullets, flag
+/// near-duplicates, and flag bullets not reflected in MEMORY.md. Never reorders
+/// or rewrites surviving content, so it is safe to apply.
+pub(crate) fn distill_recall(memory: &str, recall: &str) -> RecallDistill {
+    let memory_lower = memory.to_ascii_lowercase();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut kept_token_sets: Vec<std::collections::HashSet<String>> = Vec::new();
+    let mut kept_lines: Vec<String> = Vec::new();
+    let mut removed_duplicates = Vec::new();
+    let mut near_duplicates = Vec::new();
+    let mut unbacked = Vec::new();
+    let mut original_bullets = 0usize;
+
+    for line in recall.lines() {
+        if !is_bullet(line.trim_start()) {
+            kept_lines.push(line.to_string());
+            continue;
+        }
+        original_bullets += 1;
+        let norm = normalize_recall_line(line);
+        if norm.is_empty() {
+            kept_lines.push(line.to_string());
+            continue;
+        }
+        if !seen.insert(norm.clone()) {
+            removed_duplicates.push(line.trim().to_string());
+            continue;
+        }
+        let tokens = significant_tokens(&norm);
+        if kept_token_sets
+            .iter()
+            .any(|prev| jaccard(prev, &tokens) >= 0.85)
+        {
+            near_duplicates.push(line.trim().to_string());
+        }
+        // "Backed" = at least half of the bullet's significant tokens appear in
+        // MEMORY.md. Bullets with no significant tokens are treated as backed.
+        let backed = tokens.is_empty() || {
+            let present = tokens.iter().filter(|t| memory_lower.contains(*t)).count();
+            present * 2 >= tokens.len()
+        };
+        if !backed {
+            unbacked.push(line.trim().to_string());
+        }
+        kept_token_sets.push(tokens);
+        kept_lines.push(line.to_string());
+    }
+
+    let mut content = kept_lines.join("\n");
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    RecallDistill {
+        content,
+        removed_duplicates,
+        near_duplicates,
+        unbacked,
+        original_bullets,
+        kept_bullets: kept_token_sets.len(),
+    }
 }
 
 pub(crate) fn register(
