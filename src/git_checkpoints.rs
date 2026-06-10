@@ -5,6 +5,7 @@
 // to preview and restore the latest checkpoint.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const CHECKPOINTS_DIR: &str = ".dext/checkpoints";
 const REF_PREFIX: &str = "refs/dext/checkpoints";
@@ -29,6 +30,16 @@ pub(crate) struct Checkpoint {
 }
 
 const UNTRACKED_SNAPSHOT_CAP: usize = 500;
+
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
 
 /// List untracked, not-ignored repo paths via porcelain status.
 fn untracked_files(git_root: &Path) -> Vec<String> {
@@ -55,9 +66,7 @@ pub(crate) enum RestoreMode {
 }
 
 pub(crate) fn repo_root(root: &Path) -> Result<Option<PathBuf>, String> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(root)
+    let output = git_command(root, &["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|e| format!("git spawn: {e}"))?;
     if output.status.success() {
@@ -75,9 +84,7 @@ pub(crate) fn repo_root(root: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    let output = git_command(cwd, args)
         .output()
         .map_err(|e| format!("git spawn: {e}"))?;
     if !output.status.success() {
@@ -88,8 +95,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(args).current_dir(cwd);
+    let mut cmd = git_command(cwd, args);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -139,9 +145,21 @@ fn is_dirty(git_root: &Path) -> Result<bool, String> {
     Ok(!out.trim().is_empty())
 }
 
-fn head_oid(git_root: &Path) -> Result<String, String> {
-    let out = run_git(git_root, &["rev-parse", "HEAD"])?;
-    Ok(out.trim().to_string())
+fn head_oid(git_root: &Path) -> Result<Option<String>, String> {
+    let output = git_command(git_root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .map_err(|e| format!("git spawn: {e}"))?;
+    if output.status.success() {
+        let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((!oid.is_empty()).then_some(oid));
+    }
+    if output.stderr.is_empty() {
+        return Ok(None);
+    }
+    Err(format!(
+        "git rev-parse --verify --quiet HEAD: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 /// Save untracked file content as a sidecar before direct file tools
@@ -215,7 +233,7 @@ fn remove_worktree_path(path: &Path) -> Result<bool, String> {
 }
 
 /// Create a recovery checkpoint before a workspace mutation.
-/// Returns None if not in a Git repo. Returns error only on unexpected
+/// Returns None if not in a Git repo or if HEAD is unborn. Returns error only on unexpected
 /// failures; checkpoint errors should warn but not block tool execution.
 #[cfg(test)]
 pub(crate) fn create_checkpoint(
@@ -227,7 +245,7 @@ pub(crate) fn create_checkpoint(
     let Some(git_root) = repo_root(root)? else {
         return Ok(None);
     };
-    create_checkpoint_in_repo(root, &git_root, tool, paths_hint, ordinal).map(Some)
+    create_checkpoint_in_repo(root, &git_root, tool, paths_hint, ordinal)
 }
 
 pub(crate) fn create_checkpoint_in_repo(
@@ -236,14 +254,16 @@ pub(crate) fn create_checkpoint_in_repo(
     tool: &str,
     paths_hint: &[String],
     ordinal: usize,
-) -> Result<Checkpoint, String> {
+) -> Result<Option<Checkpoint>, String> {
     let ts = now_ms();
     let sess = session_tag();
     let tool_sanitized = sanitize_ref_component(tool);
     let id = format!("{ts}-{ordinal}-{tool_sanitized}");
     let ref_name = format!("{REF_PREFIX}/{sess}/{id}");
 
-    let head = head_oid(git_root)?;
+    let Some(head) = head_oid(git_root)? else {
+        return Ok(None);
+    };
     let dirty = is_dirty(git_root)?;
 
     // For dirty state, use git stash create to capture a snapshot
@@ -301,7 +321,7 @@ pub(crate) fn create_checkpoint_in_repo(
 
     append_manifest(git_root, &cp)?;
 
-    Ok(cp)
+    Ok(Some(cp))
 }
 
 fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
@@ -505,6 +525,7 @@ pub(crate) fn restore_worktree(
 
     // Worktree restore: checkout paths from checkpoint OID
     let mut restored: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     if !cp.paths_hint.is_empty() {
         for path_str in &cp.paths_hint {
@@ -522,7 +543,7 @@ pub(crate) fn restore_worktree(
                 })
             };
             if let Err(e) = result {
-                eprintln!("warning: could not restore {path_str}: {e}");
+                warnings.push(format!("could not restore {path_str}: {e}"));
             }
         }
     }
@@ -546,16 +567,22 @@ pub(crate) fn restore_worktree(
                 }
                 match std::fs::copy(&entry, &dest) {
                     Ok(_) => restored.push(rel.display().to_string()),
-                    Err(e) => eprintln!("warning: sidecar restore failed: {e}"),
+                    Err(e) => warnings.push(format!("sidecar restore failed: {e}")),
                 }
             }
         }
     }
 
+    let warning_text = if warnings.is_empty() {
+        String::new()
+    } else {
+        format!("\nWarnings:\n  {}", warnings.join("\n  "))
+    };
     Ok(format!(
-        "Restored from checkpoint {}:\n  {}\nRef preserved for further inspection.",
+        "Restored from checkpoint {}:\n  {}\nRef preserved for further inspection.{}",
         cp.id,
         restored.join("\n  "),
+        warning_text,
     ))
 }
 

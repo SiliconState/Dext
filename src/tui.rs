@@ -6380,12 +6380,10 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
         return;
     }
 
-    let live_height = live_indicator_lines.min(transcript_area.height as usize) as u16;
+    let live_height = live_indicator_lines.min(content_area.height as usize) as u16;
     let live_area = Rect::new(
         content_area.x,
-        content_area
-            .y
-            .saturating_add(transcript_area.height.saturating_sub(live_height)),
+        content_area.y,
         content_area.width,
         live_height,
     );
@@ -6396,7 +6394,7 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
         live_area,
     );
 
-    let live_start = transcript_area.height.saturating_sub(live_height) as usize;
+    let live_start = 0usize;
     state.set_transcript_layout(TranscriptLayoutState {
         transcript_area: content_area,
         input_area: state.input_area,
@@ -11044,7 +11042,7 @@ mod tests {
     }
 
     #[test]
-    fn render_transcript_bottom_aligns_live_indicator() {
+    fn live_indicator_top_anchors_so_unused_inline_rows_stay_below() {
         use ratatui::backend::TestBackend;
         use ratatui::{Terminal, TerminalOptions, Viewport};
 
@@ -11075,8 +11073,8 @@ mod tests {
             .expect("draw transcript");
 
         assert!(state.live_indicator_visible);
-        assert_eq!(state.live_indicator_top_padding, 5);
-        assert_eq!(state.live_indicator_line_layout, Some((5, 6)));
+        assert_eq!(state.live_indicator_top_padding, 0);
+        assert_eq!(state.live_indicator_line_layout, Some((0, 1)));
     }
 
     #[test]

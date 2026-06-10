@@ -174,6 +174,29 @@ fn git_checkpoint_sidecar_restores_untracked_file() {
 }
 
 #[test]
+fn git_checkpoint_unborn_head_is_noop_before_and_after_mutation() {
+    let root = temp_test_dir("checkpoint-unborn-head");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+
+    let before = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("checkpoint before mutation");
+    assert!(before.is_none());
+
+    std::fs::write(root.join("created.txt"), "new\n").expect("write created");
+    let after = git_checkpoints::create_checkpoint(
+        &root,
+        "write_file",
+        &["created.txt".to_string()],
+        2,
+    )
+    .expect("checkpoint after mutation");
+    assert!(after.is_none());
+    assert!(!root.join(".dext/checkpoints/manifest.txt").exists());
+}
+
+#[test]
 fn checkpoint_snapshots_untracked_and_preview_names_created_files() {
     let root = temp_test_dir("checkpoint-untracked-delta");
     git_ok(&root, &["init", "-q"]);

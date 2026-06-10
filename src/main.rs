@@ -10698,8 +10698,9 @@ impl Agent {
             &paths_hint,
             self.checkpoint_ordinal,
         ) {
-            Ok(cp) => self.append_latest_log("checkpoint", &format!("created {}", cp.id)),
-            Err(e) => eprintln!("[checkpoint warning: {e}]"),
+            Ok(Some(cp)) => self.append_latest_log("checkpoint", &format!("created {}", cp.id)),
+            Ok(None) => self.append_latest_log("checkpoint", "skipped unborn HEAD"),
+            Err(e) => self.append_latest_log("checkpoint", &format!("warning: {e}")),
         }
     }
 
