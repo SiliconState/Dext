@@ -4,6 +4,7 @@ mod mutation_preview;
 mod orchestrator;
 mod packs;
 mod provider;
+mod sandbox;
 mod session;
 mod shelves;
 mod tool_policy;
@@ -7181,8 +7182,9 @@ async fn execute_bash_async_with_timeout(
     root: &Path,
     interrupt: Arc<AtomicBool>,
     timeout: std::time::Duration,
+    sandbox_profile: SandboxProfile,
 ) -> std::result::Result<String, String> {
-    execute_bash_async_prepared(cmd, root, interrupt, timeout, None).await
+    execute_bash_async_prepared(cmd, root, interrupt, timeout, None, sandbox_profile).await
 }
 
 async fn execute_bash_async_prepared(
@@ -7191,15 +7193,21 @@ async fn execute_bash_async_prepared(
     interrupt: Arc<AtomicBool>,
     timeout: std::time::Duration,
     local_sudo_auth: Option<LocalSudoAuth>,
+    sandbox_profile: SandboxProfile,
 ) -> std::result::Result<String, String> {
-    use tokio::process::Command as TokioCommand;
-
     let bash_cmd = if local_sudo_auth.is_some() {
         format!("sudo() {{ command sudo -A \"$@\"; }}\n{cmd}")
     } else {
         cmd.to_string()
     };
-    let mut command = TokioCommand::new("bash");
+    // A sudo command is an intentional privilege escalation the user approved;
+    // OS sandboxing it is incoherent, so it runs unconfined.
+    let effective_profile = if local_sudo_auth.is_some() {
+        SandboxProfile::DangerFullAccess
+    } else {
+        sandbox_profile
+    };
+    let mut command = sandbox::tokio_command("bash", effective_profile, root);
     command
         .arg("-c")
         .arg(&bash_cmd)
@@ -7296,11 +7304,11 @@ async fn execute_external_async(
     cwd: &Path,
     interrupt: Arc<AtomicBool>,
     timeout: std::time::Duration,
+    sandbox_profile: SandboxProfile,
 ) -> std::result::Result<String, String> {
     use tokio::io::AsyncWriteExt;
-    use tokio::process::Command as TokioCommand;
 
-    let mut cmd = TokioCommand::new(bin);
+    let mut cmd = sandbox::tokio_command(bin, sandbox_profile, cwd);
     cmd.args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
@@ -7401,6 +7409,9 @@ fn should_retry_external_tool_with_fallback(name: &str, bin: &str, err: &str) ->
             || lower.contains("invalid option"))
 }
 
+// Per-call execution context; args are distinct types passed straight through
+// from the agent loop, so a struct adds indirection without preventing misuse.
+#[allow(clippy::too_many_arguments)]
 async fn execute_builtin_call(
     name: String,
     input: Value,
@@ -7409,6 +7420,7 @@ async fn execute_builtin_call(
     read_cache: Option<Arc<Mutex<ReadFileCache>>>,
     session_id: Option<String>,
     local_sudo_auth: Option<LocalSudoAuth>,
+    sandbox_profile: SandboxProfile,
 ) -> std::result::Result<String, String> {
     if name == "subagent" {
         return Ok(
@@ -7422,13 +7434,37 @@ async fn execute_builtin_call(
         let timeout = timeout_from_tool_input(&input, bash_tool_timeout());
         match local_sudo_auth {
             Some(auth) => {
-                execute_bash_async_prepared(&guarded, &root, interrupt, timeout, Some(auth)).await
+                execute_bash_async_prepared(
+                    &guarded,
+                    &root,
+                    interrupt,
+                    timeout,
+                    Some(auth),
+                    sandbox_profile,
+                )
+                .await
             }
-            None => execute_bash_async_with_timeout(&guarded, &root, interrupt, timeout).await,
+            None => {
+                execute_bash_async_with_timeout(
+                    &guarded,
+                    &root,
+                    interrupt,
+                    timeout,
+                    sandbox_profile,
+                )
+                .await
+            }
         }
     } else if name == "http" {
         execute_http_tool_async(&input, interrupt, external_tool_timeout()).await
     } else if is_external_process_tool(&name) {
+        // The browser recipe manages its own profile/cache dirs and needs
+        // network + broad filesystem access, so it runs unconfined.
+        let ext_profile = if name == "browser" {
+            SandboxProfile::DangerFullAccess
+        } else {
+            sandbox_profile
+        };
         let (bin, args, stdin) = prepare_external_tool(&name, &input, &root)?;
         let result = execute_external_async(
             &bin,
@@ -7437,6 +7473,7 @@ async fn execute_builtin_call(
             &root,
             interrupt.clone(),
             external_tool_timeout(),
+            ext_profile,
         )
         .await;
         match result {
@@ -7449,6 +7486,7 @@ async fn execute_builtin_call(
                     &root,
                     interrupt,
                     external_tool_timeout(),
+                    ext_profile,
                 )
                 .await
             }
@@ -13487,6 +13525,7 @@ impl Agent {
                         let sem = self.builtin_semaphore.clone();
                         let read_cache = read_cache.clone();
                         let session_id = self.session_id.clone();
+                        let sandbox_profile = self.sandbox_profile;
                         let handle = tokio::spawn(async move {
                             let _permit = match sem.acquire_owned().await {
                                 Ok(p) => p,
@@ -13500,6 +13539,7 @@ impl Agent {
                                 Some(read_cache),
                                 Some(session_id),
                                 None,
+                                sandbox_profile,
                             )
                             .await
                         });
@@ -13551,6 +13591,7 @@ impl Agent {
                         Some(read_cache.clone()),
                         Some(session_id),
                         local_sudo_auth,
+                        self.sandbox_profile,
                     )
                     .await;
                     builtin_outputs.insert(idx, r);

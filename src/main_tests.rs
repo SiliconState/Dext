@@ -2667,6 +2667,7 @@ async fn external_runner_times_out() {
         &root,
         Arc::new(AtomicBool::new(false)),
         std::time::Duration::from_millis(150),
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect_err("expected timeout");
@@ -2692,10 +2693,139 @@ async fn external_runner_honors_interrupts() {
         &root,
         interrupt,
         std::time::Duration::from_secs(10),
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect_err("expected interrupt");
     assert!(err.contains("killed by interrupt"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn sandbox_never_breaks_benign_commands() {
+    // Regardless of platform/enforcement, a read-only command must still run
+    // under every profile (graceful degradation, no false failures).
+    let root = temp_test_dir("sandbox-benign");
+    for profile in [
+        SandboxProfile::ReadOnly,
+        SandboxProfile::WorkspaceWrite,
+        SandboxProfile::DangerFullAccess,
+    ] {
+        let out = execute_bash_async_with_timeout(
+            "echo hello",
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            profile,
+        )
+        .await
+        .expect("benign command must succeed under every profile");
+        assert!(out.contains("exit: 0"), "profile {profile:?}: {out}");
+        assert!(out.contains("hello"), "profile {profile:?}: {out}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
+    // Only meaningful where the OS actually enforces (Linux Landlock / macOS
+    // Seatbelt); elsewhere this asserts the no-break invariant only.
+    let root = temp_test_dir("sandbox-confine");
+
+    // A path under the workspace root is always writable under WorkspaceWrite.
+    let inside = root.join("inside.txt");
+    let out = execute_bash_async_with_timeout(
+        &format!(
+            "echo ok > {}",
+            shell_single_quote(&inside.to_string_lossy())
+        ),
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        SandboxProfile::WorkspaceWrite,
+    )
+    .await
+    .expect("workspace write should run");
+    assert!(
+        out.contains("exit: 0"),
+        "workspace write inside root: {out}"
+    );
+    assert!(inside.exists(), "expected inside-root write to succeed");
+
+    if crate::sandbox::is_enforced() {
+        // Target a HOME-based path: normally writable by this user, but outside
+        // both the workspace root and the scratch roots (temp dirs). The
+        // workspace root here lives under the system temp dir, so it would be a
+        // confounded target — HOME is not. Under WorkspaceWrite this write must
+        // still be denied by the kernel.
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+        if let Ok(home) = home {
+            let escape_dir = std::path::PathBuf::from(home)
+                .join(format!(".dext-sbx-test-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&escape_dir);
+            let escape_file = escape_dir.join("escape.txt");
+            let escape_cmd = format!(
+                "echo pwned > {} 2>&1",
+                shell_single_quote(&escape_file.to_string_lossy())
+            );
+
+            // Self-validation: the same write must succeed unsandboxed, proving
+            // the path is genuinely writable and only the sandbox blocks it.
+            let _ = std::fs::remove_file(&escape_file);
+            let _ = execute_bash_async_with_timeout(
+                &escape_cmd,
+                &root,
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_secs(5),
+                SandboxProfile::DangerFullAccess,
+            )
+            .await
+            .expect("unsandboxed write should run");
+            assert!(
+                escape_file.exists(),
+                "control: HOME-based path must be writable without a sandbox"
+            );
+
+            let _ = std::fs::remove_file(&escape_file);
+            let blocked = execute_bash_async_with_timeout(
+                &escape_cmd,
+                &root,
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_secs(5),
+                SandboxProfile::WorkspaceWrite,
+            )
+            .await
+            .expect("command runs even when its write is denied");
+            assert!(
+                !escape_file.exists(),
+                "sandbox must block writes outside workspace+scratch roots: {blocked}"
+            );
+            let _ = std::fs::remove_dir_all(&escape_dir);
+        }
+
+        // Scratch writes (temp dir) must still succeed even under ReadOnly.
+        let scratch =
+            std::env::temp_dir().join(format!("dext-sbx-scratch-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&scratch);
+        let out = execute_bash_async_with_timeout(
+            &format!(
+                "echo ok > {}",
+                shell_single_quote(&scratch.to_string_lossy())
+            ),
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            SandboxProfile::ReadOnly,
+        )
+        .await
+        .expect("read-only scratch write should run");
+        assert!(
+            scratch.exists(),
+            "read-only sandbox must still allow scratch temp writes: {out}"
+        );
+        let _ = std::fs::remove_file(&scratch);
+    }
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2708,6 +2838,7 @@ async fn fast_bash_command_returns_without_100ms_poll_tail() {
         &root,
         Arc::new(AtomicBool::new(false)),
         std::time::Duration::from_secs(5),
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect("expected success");
@@ -2728,6 +2859,7 @@ async fn bash_runner_times_out() {
         &root,
         Arc::new(AtomicBool::new(false)),
         std::time::Duration::from_millis(150),
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect_err("expected timeout");
@@ -2761,6 +2893,7 @@ async fn bash_runner_reaps_background_children_after_shell_exit() {
         &root,
         Arc::new(AtomicBool::new(false)),
         std::time::Duration::from_secs(5),
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect("expected success");
@@ -3423,6 +3556,7 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
         None,
         None,
         None,
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect("http request should succeed without xh installed");
@@ -6502,6 +6636,7 @@ async fn bash_tool_honors_input_timeout() {
         None,
         None,
         None,
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect_err("expected input timeout");
@@ -6521,6 +6656,7 @@ async fn model_side_subagent_tool_call_does_not_launch_runtime() {
         None,
         None,
         None,
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect("model-side subagent guidance");
@@ -6652,6 +6788,7 @@ async fn bash_prepends_cargo_json_diagnostics_summary() {
         &root,
         Arc::new(AtomicBool::new(false)),
         std::time::Duration::from_secs(5),
+        SandboxProfile::WorkspaceWrite,
     )
     .await
     .expect("bash should succeed");

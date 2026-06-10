@@ -22,6 +22,9 @@ ratatui-core = "0.1.0"
 tui-markdown = { version = "0.3.7", default-features = false }
 crossterm = { version = "0.28", features = ["event-stream"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
