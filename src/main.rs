@@ -2350,38 +2350,74 @@ fn empty_tool_result_metadata() -> ToolResultMetadata {
     ToolResultMetadata::default()
 }
 
+/// A user message that represents a fresh prompt (not tool results and not a
+/// runtime-injected note). Used as the current-turn boundary when deciding
+/// which thinking blocks must still be sent back to the provider.
+fn is_fresh_user_prompt_message(msg: &Message) -> bool {
+    if msg.role != "user"
+        || msg
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::ToolResult { .. }))
+    {
+        return false;
+    }
+    msg.content.iter().any(|block| match block {
+        Block::Text { text } | Block::PartialStream { text } => {
+            !text.starts_with("[runtime-note]")
+                && !text.starts_with("[queued-update]")
+                && !text.starts_with("[queued-user-update]")
+                && !text.starts_with("[prior conversation,")
+        }
+        _ => false,
+    })
+}
+
 fn sanitize_anthropic_messages(messages: &[Message], preserve_thinking: bool) -> Vec<Message> {
+    // Providers only require thinking blocks for the tool loop of the current
+    // turn. Older turns' thinking is dead weight in every subsequent request,
+    // so it is dropped at serialization time (history keeps the full record).
+    // The one-time prefix change this causes at a turn boundary costs a single
+    // partial cache re-write; carrying the blocks forever costs more.
+    let current_turn_start = messages
+        .iter()
+        .rposition(is_fresh_user_prompt_message)
+        .unwrap_or(0);
     messages
         .iter()
-        .map(|message| Message {
-            role: message.role.clone(),
-            content: message
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    Block::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                        ..
-                    } => Some(Block::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: content.clone(),
-                        is_error: *is_error,
-                        metadata: ToolResultMetadata::default(),
-                    }),
-                    Block::Thinking { text, signature } => {
-                        let signature = signature.as_ref().filter(|sig| !sig.is_empty())?;
-                        preserve_thinking.then_some(Block::Thinking {
-                            text: text.clone(),
-                            signature: Some(signature.clone()),
-                        })
-                    }
-                    Block::RedactedThinking { data } => (preserve_thinking && !data.is_empty())
-                        .then_some(Block::RedactedThinking { data: data.clone() }),
-                    other => Some(other.clone()),
-                })
-                .collect(),
+        .enumerate()
+        .map(|(idx, message)| {
+            let preserve_thinking = preserve_thinking && idx >= current_turn_start;
+            Message {
+                role: message.role.clone(),
+                content: message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                            ..
+                        } => Some(Block::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: content.clone(),
+                            is_error: *is_error,
+                            metadata: ToolResultMetadata::default(),
+                        }),
+                        Block::Thinking { text, signature } => {
+                            let signature = signature.as_ref().filter(|sig| !sig.is_empty())?;
+                            preserve_thinking.then_some(Block::Thinking {
+                                text: text.clone(),
+                                signature: Some(signature.clone()),
+                            })
+                        }
+                        Block::RedactedThinking { data } => (preserve_thinking && !data.is_empty())
+                            .then_some(Block::RedactedThinking { data: data.clone() }),
+                        other => Some(other.clone()),
+                    })
+                    .collect(),
+            }
         })
         .collect()
 }
@@ -12036,8 +12072,11 @@ impl Agent {
                     .iter()
                     .map(|b| match b {
                         Block::Text { text } | Block::PartialStream { text } => text.len(),
-                        Block::Thinking { text, .. } => text.len(),
-                        Block::RedactedThinking { data } => data.len(),
+                        // Thinking is stripped from prior turns at serialization
+                        // time, so it must not count toward the compaction
+                        // trigger — otherwise stored reasoning would force
+                        // compaction of context that is never actually sent.
+                        Block::Thinking { .. } | Block::RedactedThinking { .. } => 0,
                         Block::ToolUse { input, .. } => json_byte_len(input),
                         Block::ToolResult { content, .. } => content.len(),
                     })

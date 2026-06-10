@@ -10617,3 +10617,78 @@ fn compact_call_id_is_multibyte_safe() {
     // 12 bytes lands mid-codepoint; must clamp to a char boundary, not panic.
     assert_eq!(compact_call_id("toolcall\u{e9}\u{e9}\u{e9}\u{e9}"), "#toolcall\u{e9}\u{e9}");
 }
+
+#[test]
+fn sanitize_strips_prior_turn_thinking_but_keeps_current_tool_loop() {
+    let thinking = |text: &str| Block::Thinking {
+        text: text.to_string(),
+        signature: Some("sig".to_string()),
+    };
+    let user_text = |text: &str| Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: text.to_string(),
+        }],
+    };
+    let history = vec![
+        user_text("first task"),
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                thinking("old reasoning"),
+                Block::Text {
+                    text: "done".to_string(),
+                },
+            ],
+        },
+        user_text("second task"),
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                thinking("current reasoning"),
+                Block::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path": "x"}),
+                },
+            ],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "ok".to_string(),
+                is_error: Some(false),
+                metadata: ToolResultMetadata::default(),
+            }],
+        },
+        // Runtime notes do not start a new turn; the tool loop above must keep
+        // its thinking block even with a note in between.
+        user_text("[runtime-note] keep output small"),
+    ];
+
+    let sanitized = sanitize_anthropic_messages(&history, true);
+    assert!(
+        !sanitized[1]
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { .. })),
+        "prior-turn thinking should be stripped"
+    );
+    assert!(
+        sanitized[3]
+            .content
+            .iter()
+            .any(|b| matches!(b, Block::Thinking { .. })),
+        "current-turn tool-loop thinking must be preserved"
+    );
+
+    // With thinking disabled everything is stripped, as before.
+    let sanitized = sanitize_anthropic_messages(&history, false);
+    assert!(
+        !sanitized
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|b| matches!(b, Block::Thinking { .. }))
+    );
+}
