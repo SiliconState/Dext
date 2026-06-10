@@ -113,6 +113,9 @@ fn test_agent(root: &Path) -> Agent {
         detached_subagent_steer_path: None,
         checkpoint_cache: git_checkpoints::RepoRootCache::new(),
         checkpoint_ordinal: 0,
+        prompt_scan_cache: Mutex::new(None),
+        prompt_scan_epoch: 0,
+        last_checkpoint_signature: None,
     }
 }
 
@@ -10728,4 +10731,41 @@ fn compact_summary_model_env_override() {
     assert_eq!(agent.compact_summary_model(), agent.model);
     unsafe { std::env::remove_var("DEXT_COMPACT_MODEL") };
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn prompt_scan_cache_revalidates_on_file_change() -> Result<()> {
+    let root = temp_test_dir("prompt-scan-cache");
+    let root = std::fs::canonicalize(&root)?;
+    std::fs::write(root.join("recall.md"), "- first fact")?;
+    let agent = test_agent(&root);
+
+    let (_, recall, _) = agent.prompt_scans();
+    assert!(
+        recall.iter().any(|(_, _, c)| c.contains("first fact")),
+        "{recall:?}"
+    );
+
+    // Same epoch, unchanged files: served from cache with identical content.
+    let (_, recall_again, _) = agent.prompt_scans();
+    assert_eq!(recall, recall_again);
+
+    // A mid-turn write (the agent updating its own recall.md) must be picked
+    // up through the stat signature without waiting for the next user turn.
+    std::fs::write(root.join("recall.md"), "- second fact with longer text")?;
+    let (_, recall_updated, _) = agent.prompt_scans();
+    assert!(
+        recall_updated
+            .iter()
+            .any(|(_, _, c)| c.contains("second fact")),
+        "{recall_updated:?}"
+    );
+
+    // A newly created DEXT.md at the project root must also invalidate.
+    std::fs::write(root.join("DEXT.md"), "## Rules\nuse rg")?;
+    let (dext, _, _) = agent.prompt_scans();
+    assert!(dext.iter().any(|(_, _, c)| c.contains("use rg")), "{dext:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }

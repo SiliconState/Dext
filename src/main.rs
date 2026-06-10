@@ -8083,10 +8083,35 @@ const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Us
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Tool protocol: invoke tools only through actual provider tool calls. Never print raw tool syntax (`to=functions.*`, `tool_use`, function-call JSON, or bash command envelopes) as assistant text, and never try to prefill the TUI input/composer.";
 
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
-    let mut sections = Vec::new();
+    scan_prompt_context_files(root, filename).sections
+}
+
+/// One ancestor-walk scan for a prompt context file, with a stat signature for
+/// every candidate path it checked. The signature lets per-request callers
+/// revalidate the scan with a handful of stats instead of repeating the walk
+/// and re-reading the files, while still catching mid-turn writes (the agent
+/// itself updates recall.md) and newly created files at any ancestor level.
+#[derive(Clone, Default)]
+struct PromptContextScan {
+    sections: Vec<(String, PathBuf, String)>,
+    signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+}
+
+fn prompt_file_signature(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+fn scan_prompt_context_files(root: &Path, filename: &str) -> PromptContextScan {
+    let mut scan = PromptContextScan::default();
     let mut dir = root;
     loop {
         let candidate = dir.join(filename);
+        scan.signature
+            .push((candidate.clone(), prompt_file_signature(&candidate)));
         if candidate.exists()
             && let Ok(content) = std::fs::read_to_string(&candidate)
         {
@@ -8098,7 +8123,7 @@ fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, St
                 } else {
                     format!("/{display}")
                 };
-                sections.push((label, candidate, trimmed.to_string()));
+                scan.sections.push((label, candidate, trimmed.to_string()));
             }
         }
         match dir.parent() {
@@ -8106,8 +8131,27 @@ fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, St
             _ => break,
         }
     }
-    sections.reverse();
-    sections
+    scan.sections.reverse();
+    scan
+}
+
+fn prompt_context_scan_is_current(scan: &PromptContextScan) -> bool {
+    scan.signature
+        .iter()
+        .all(|(path, sig)| prompt_file_signature(path) == *sig)
+}
+
+/// Labeled prompt context sections: (ancestor label, file path, content).
+type PromptContextSections = Vec<(String, PathBuf, String)>;
+
+/// Cached prompt filesystem scans (DEXT.md/recall.md ancestor walks and pack
+/// discovery), shared across the many provider requests of a single turn.
+/// Refreshed when the epoch (user turn) changes or a stat signature drifts.
+struct PromptScanCache {
+    epoch: u64,
+    dext_md: PromptContextScan,
+    recall: PromptContextScan,
+    pack_summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -9806,6 +9850,11 @@ struct Agent {
     detached_subagent_steer_path: Option<PathBuf>,
     checkpoint_cache: git_checkpoints::RepoRootCache,
     checkpoint_ordinal: usize,
+    prompt_scan_cache: Mutex<Option<PromptScanCache>>,
+    prompt_scan_epoch: u64,
+    // (history len, history chars) at the last session autosave; lets
+    // non-critical checkpoints skip rewriting an unchanged transcript.
+    last_checkpoint_signature: Option<(usize, usize)>,
 }
 
 impl Agent {
@@ -9966,6 +10015,9 @@ impl Agent {
             detached_subagent_steer_path: None,
             checkpoint_cache: git_checkpoints::RepoRootCache::new(),
             checkpoint_ordinal: 0,
+            prompt_scan_cache: Mutex::new(None),
+            prompt_scan_epoch: 0,
+            last_checkpoint_signature: None,
         })
     }
 
@@ -10778,6 +10830,46 @@ impl Agent {
         append_log_event(&self.latest_log_path, event, &detail);
     }
 
+    /// Filesystem scans behind the stable system prompt, cached per user turn
+    /// and revalidated with cheap stats between tool rounds. compose runs once
+    /// per provider request; without the cache it would repeat the ancestor
+    /// walks and pack-directory reads on every round of a turn.
+    fn prompt_scans(&self) -> (PromptContextSections, PromptContextSections, Option<String>) {
+        let Ok(mut guard) = self.prompt_scan_cache.lock() else {
+            return (
+                prompt_context_files(&self.sandbox_root, "DEXT.md"),
+                prompt_context_files(&self.sandbox_root, "recall.md"),
+                packs::pack_summary_for_prompt(&self.sandbox_root),
+            );
+        };
+        if let Some(cache) = guard.as_ref()
+            && cache.epoch == self.prompt_scan_epoch
+            && prompt_context_scan_is_current(&cache.dext_md)
+            && prompt_context_scan_is_current(&cache.recall)
+        {
+            return (
+                cache.dext_md.sections.clone(),
+                cache.recall.sections.clone(),
+                cache.pack_summary.clone(),
+            );
+        }
+        let dext_md = scan_prompt_context_files(&self.sandbox_root, "DEXT.md");
+        let recall = scan_prompt_context_files(&self.sandbox_root, "recall.md");
+        let pack_summary = packs::pack_summary_for_prompt(&self.sandbox_root);
+        let result = (
+            dext_md.sections.clone(),
+            recall.sections.clone(),
+            pack_summary.clone(),
+        );
+        *guard = Some(PromptScanCache {
+            epoch: self.prompt_scan_epoch,
+            dext_md,
+            recall,
+            pack_summary,
+        });
+        result
+    }
+
     fn compose_system_details(&self) -> SystemParts {
         let mut stable = self.system.clone();
         if self.context_mode.is_frugal()
@@ -10795,7 +10887,7 @@ impl Agent {
             PROJECT_CONTEXT_CAP
         };
         let mut prompt_sources = Vec::new();
-        let dext_md_sections = prompt_context_files(&self.sandbox_root, "DEXT.md");
+        let (dext_md_sections, recall_sections, cached_pack_summary) = self.prompt_scans();
         for (label, path, content) in &dext_md_sections {
             if context_budget == 0 {
                 break;
@@ -10819,7 +10911,6 @@ impl Agent {
             }
         }
 
-        let recall_sections = prompt_context_files(&self.sandbox_root, "recall.md");
         for (label, path, content) in &recall_sections {
             if context_budget == 0 {
                 break;
@@ -10977,7 +11068,7 @@ impl Agent {
                     self.browser_recipe.as_str()
                 ));
             }
-            if let Some(pack_summary) = packs::pack_summary_for_prompt(&self.sandbox_root) {
+            if let Some(pack_summary) = cached_pack_summary.clone() {
                 env.push_str("\n## Dext packs\n");
                 env.push_str(&cap_bytes_with_hint(
                     pack_summary,
@@ -11100,7 +11191,7 @@ impl Agent {
                 self.browser_recipe.as_str()
             ));
         }
-        if let Some(pack_summary) = packs::pack_summary_for_prompt(&self.sandbox_root) {
+        if let Some(pack_summary) = cached_pack_summary {
             env.push_str("\n## Dext packs\n");
             env.push_str(&cap_bytes_with_hint(
                 pack_summary,
@@ -11935,9 +12026,23 @@ impl Agent {
         {
             return;
         }
+        // Skip rewriting the session file when the transcript hasn't changed
+        // since the last save; the full-file rewrite is the costly part. Only
+        // the high-frequency transcript-driven reasons are eligible — settings
+        // checkpoints (runtime control, privacy, …) must write even with an
+        // unchanged transcript because they persist header state.
+        let signature = (self.history.len(), self.history_chars());
+        let transcript_driven = matches!(
+            reason,
+            "after_assistant_message" | "after_tool_results" | "after_partial_stream_preserve"
+        );
+        if transcript_driven && self.last_checkpoint_signature == Some(signature) {
+            return;
+        }
         match self.save_latest_session() {
             Ok(path) => {
                 self.last_checkpoint_at = Some(std::time::Instant::now());
+                self.last_checkpoint_signature = Some(signature);
                 self.append_latest_log(
                     "session_checkpoint",
                     &format!("{reason} -> {}", path.display()),
@@ -12927,6 +13032,9 @@ impl Agent {
 
     async fn chat_inner(&mut self, mut user_input: String) -> Result<()> {
         let mut compacted_this_turn = false;
+        // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
+        // walks, pack discovery) on the first request of the turn.
+        self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         if let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input) {
             self.activate_pack_hooks(&invocation.pack);
             self.sink.emit(AgentEvent::Info(format!(
@@ -15222,6 +15330,9 @@ impl Agent {
             detached_subagent_steer_path: None,
             checkpoint_cache: git_checkpoints::RepoRootCache::new(),
             checkpoint_ordinal: 0,
+            prompt_scan_cache: Mutex::new(None),
+            prompt_scan_epoch: 0,
+            last_checkpoint_signature: None,
         };
 
         if !request.privacy_enabled {
