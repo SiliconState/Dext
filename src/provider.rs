@@ -480,18 +480,16 @@ fn collect_llama_context_candidates(value: &Value, best: &mut Option<(u8, u64)>)
     match value {
         Value::Object(map) => {
             for (key, child) in map {
-                if let Some(score) = context_field_score(key) {
-                    if let Some(tokens) = child
+                if let Some(score) = context_field_score(key)
+                    && let Some(tokens) = child
                         .as_u64()
                         .or_else(|| child.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
                         .filter(|tokens| (512..=10_000_000).contains(tokens))
-                    {
-                        if best.is_none_or(|(best_score, best_tokens)| {
-                            score < best_score || (score == best_score && tokens > best_tokens)
-                        }) {
-                            *best = Some((score, tokens));
-                        }
-                    }
+                    && best.is_none_or(|(best_score, best_tokens)| {
+                        score < best_score || (score == best_score && tokens > best_tokens)
+                    })
+                {
+                    *best = Some((score, tokens));
                 }
                 collect_llama_context_candidates(child, best);
             }
@@ -642,8 +640,8 @@ pub(crate) fn merge_provider_profile(
     let builtin_id = canonical_provider_id(&builtin.id);
     let local_profile = builtin_id == "local";
     let stored_default = stored.default_model.trim();
-    if !stored_default.is_empty()
-        && !(local_profile && is_retired_bundled_local_model(stored_default))
+    if !(stored_default.is_empty()
+        || (local_profile && is_retired_bundled_local_model(stored_default)))
     {
         builtin.default_model = if builtin.api_provider == ApiProvider::ChatGpt {
             normalize_chatgpt_model_slug(stored_default)
@@ -652,10 +650,10 @@ pub(crate) fn merge_provider_profile(
         };
     }
 
-    if let Some(window) = stored.context_window.filter(|window| *window > 0) {
-        if !(local_profile && is_retired_bundled_local_context_window(window)) {
-            builtin.context_window = Some(window);
-        }
+    if let Some(window) = stored.context_window.filter(|window| *window > 0)
+        && !(local_profile && is_retired_bundled_local_context_window(window))
+    {
+        builtin.context_window = Some(window);
     }
 
     for (model, window) in stored.model_context_windows {

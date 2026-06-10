@@ -346,7 +346,7 @@ pub(crate) fn redact_pseudo_tool_protocol_text(text: &str) -> String {
             {
                 lines.pop();
             }
-            if !lines.last().is_some_and(|previous| previous == marker) {
+            if lines.last().is_none_or(|previous| previous != marker) {
                 lines.push(marker.to_string());
             }
             redacting_payload = pseudo_tool_line_opens_payload_block(line);
@@ -5314,34 +5314,38 @@ fn artifact_safe_name(raw: &str) -> String {
     }
 }
 
+struct VerificationArtifactSpec<'a> {
+    name: &'a str,
+    command: &'a str,
+    output: &'a str,
+    exit_code: Option<i32>,
+    duration: std::time::Duration,
+    status: &'a str,
+}
+
 fn write_verification_artifact(
     root: &Path,
     session_id: &str,
-    name: &str,
-    command: &str,
-    output: &str,
-    exit_code: Option<i32>,
-    duration: std::time::Duration,
-    status: &str,
+    spec: VerificationArtifactSpec<'_>,
 ) -> Option<PathBuf> {
-    let hash = sha256_hex_str(&format!("{command}\n{output}"));
+    let hash = sha256_hex_str(&format!("{}\n{}", spec.command, spec.output));
     let short_hash = &hash[..12.min(hash.len())];
     let dir = session_artifacts_dir(root, session_id);
     let path = dir.join(format!(
         "verify-{}-{}-{short_hash}.json",
         unix_timestamp_secs(),
-        artifact_safe_name(name)
+        artifact_safe_name(spec.name)
     ));
     let body = json!({
         "type": "verification",
-        "name": name,
-        "command": command,
+        "name": spec.name,
+        "command": spec.command,
         "cwd": root.display().to_string(),
-        "status": status,
-        "exit_code": exit_code,
-        "duration_ms": millis_u64(duration),
-        "output_tail": byte_suffix_at_char_boundary(output, VERIFICATION_ARTIFACT_TAIL_CAP),
-        "output": output,
+        "status": spec.status,
+        "exit_code": spec.exit_code,
+        "duration_ms": millis_u64(spec.duration),
+        "output_tail": byte_suffix_at_char_boundary(spec.output, VERIFICATION_ARTIFACT_TAIL_CAP),
+        "output": spec.output,
         "git": git_summary(root),
     });
     let bytes = serde_json::to_vec_pretty(&body).ok()?;
@@ -8827,15 +8831,13 @@ fn apply_queued_runtime_controls(agent: &mut Agent) -> AppliedRuntimeControls {
     finish_active_runtime_controls(agent, messages, false)
 }
 
-fn queued_runtime_control_waiter(
+async fn queued_runtime_control_waiter(
     rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
-) -> impl std::future::Future<Output = Option<String>> + '_ {
-    async move {
-        if let Some(rx) = rx {
-            rx.recv().await
-        } else {
-            std::future::pending::<Option<String>>().await
-        }
+) -> Option<String> {
+    if let Some(rx) = rx {
+        rx.recv().await
+    } else {
+        std::future::pending::<Option<String>>().await
     }
 }
 
@@ -10458,7 +10460,7 @@ impl Agent {
             && !self.context_mode.is_tiny()
             && !stable.contains(FRUGAL_TOOL_PROTOCOL_NOTE)
         {
-            stable.push_str("\n");
+            stable.push('\n');
             stable.push_str(FRUGAL_TOOL_PROTOCOL_NOTE);
         }
         let mut context_budget = if self.context_mode.is_tiny() {
@@ -13716,12 +13718,14 @@ impl Agent {
                     let artifact = write_verification_artifact(
                         &self.sandbox_root,
                         &self.session_id,
-                        &ui_summary,
-                        &command,
-                        &content,
-                        exit_code,
-                        duration,
-                        status,
+                        VerificationArtifactSpec {
+                            name: &ui_summary,
+                            command: &command,
+                            output: &content,
+                            exit_code,
+                            duration,
+                            status,
+                        },
                     );
                     artifact_display = artifact.as_ref().map(|p| p.display().to_string());
                     verification_status = Some(status.to_string());
@@ -18940,12 +18944,14 @@ fn run_eval_shell_command(
     let _ = write_verification_artifact(
         root,
         "eval",
-        "eval-command",
-        command,
-        &combined,
-        Some(code),
-        duration,
-        if code == 0 { "passed" } else { "failed" },
+        VerificationArtifactSpec {
+            name: "eval-command",
+            command,
+            output: &combined,
+            exit_code: Some(code),
+            duration,
+            status: if code == 0 { "passed" } else { "failed" },
+        },
     );
     Ok((code, stdout, stderr))
 }

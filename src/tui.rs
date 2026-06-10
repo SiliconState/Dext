@@ -40,6 +40,7 @@ use crate::{
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
+const RENDER_CACHE_MAX_ENTRIES: usize = 2048;
 const VIEWPORT_HEIGHT: u16 = 10;
 const COLLAPSED_PREVIEW_LINES: usize = 4;
 const TOOL_DENSITY_SEPARATOR_EVERY: usize = 10;
@@ -6068,6 +6069,14 @@ fn cached_transcript_render(
     }
 
     let key = line_cache_key(item);
+    // The cache is keyed by content hash and the transcript only grows, so without a cap it
+    // retains a rendered copy of every line ever inserted. A full clear is safe: this is pure
+    // memoization and rebuilds repopulate lazily, touching each item at most once per pass.
+    if state.render_cache.len() >= RENDER_CACHE_MAX_ENTRIES
+        && !state.render_cache.contains_key(&key)
+    {
+        state.render_cache.clear();
+    }
     let entry = state
         .render_cache
         .entry(key)
@@ -6173,12 +6182,15 @@ fn rebuild_transcript<B: Backend>(
 ) -> io::Result<()> {
     terminal.clear()?;
     let width = terminal.size()?.width;
-    let items = state.transcript.clone();
+    // mem::take instead of clone: rebuilds fire on resize/expand and the transcript can be
+    // large. Nothing in the insert path reads state.transcript, so loaning it out is safe.
+    let items = std::mem::take(&mut state.transcript);
     sync_last_expandable(state, &items);
     let mut tool_tint_parity = false;
     for item in &items {
         insert_transcript_item(terminal, state, item, width, &mut tool_tint_parity)?;
     }
+    state.transcript = items;
     state.tool_tint_parity = tool_tint_parity;
     state.transcript_needs_rebuild = false;
     Ok(())
