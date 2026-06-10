@@ -89,7 +89,6 @@ pub(crate) fn tokio_command(
 
 /// Human-readable description of the active enforcement mechanism, for
 /// `dext doctor` and startup diagnostics.
-#[allow(dead_code)] // consumed by `dext doctor`
 pub(crate) fn describe() -> String {
     #[cfg(target_os = "linux")]
     {
@@ -117,7 +116,6 @@ pub(crate) fn describe() -> String {
 }
 
 /// Whether kernel-level enforcement is actually active right now.
-#[allow(dead_code)] // consumed by `dext doctor` and sandbox tests
 pub(crate) fn is_enforced() -> bool {
     #[cfg(target_os = "linux")]
     {

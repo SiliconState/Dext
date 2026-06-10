@@ -17011,6 +17011,206 @@ fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
     }
 }
 
+fn handle_doctor_cli(root: &Path) -> i32 {
+    let (report, _warnings) = doctor_report(root);
+    print!("{report}");
+    0
+}
+
+/// Build the `dext doctor` report text and the count of warnings it contains.
+/// Kept separate from printing so it can be asserted in tests.
+fn doctor_report(root: &Path) -> (String, usize) {
+    let out = std::cell::RefCell::new(String::new());
+    let warnings = std::cell::Cell::new(0usize);
+    let line = |ok: bool, label: &str, detail: String| {
+        let mark = if ok { "ok  " } else { "warn" };
+        if !ok {
+            warnings.set(warnings.get() + 1);
+        }
+        out.borrow_mut()
+            .push_str(&format!("[{mark}] {label}: {detail}\n"));
+    };
+
+    out.borrow_mut()
+        .push_str("dext doctor — environment and capability check\n\n");
+
+    line(
+        true,
+        "version",
+        format!(
+            "dext {} ({} {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+    );
+    line(true, "cwd", root.display().to_string());
+
+    // OS-level sandbox enforcement.
+    line(
+        sandbox::is_enforced(),
+        "sandbox",
+        if sandbox::is_enforced() {
+            sandbox::describe()
+        } else {
+            format!("{} (path-validation still applies)", sandbox::describe())
+        },
+    );
+
+    // Terminal.
+    line(
+        true,
+        "terminal",
+        if io::stdout().is_terminal() {
+            "interactive tty".to_string()
+        } else {
+            "non-tty (piped/redirected)".to_string()
+        },
+    );
+
+    // Git repo.
+    let in_git = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    line(
+        true,
+        "git repo",
+        if in_git {
+            "yes (checkpoints/undo available)".to_string()
+        } else {
+            "no (Git checkpoints disabled)".to_string()
+        },
+    );
+
+    // Tool binaries. bash/git are required; the rest are optional native tools.
+    for (name, required) in [
+        ("bash", true),
+        ("git", true),
+        ("rg", false),
+        ("fd", false),
+        ("jq", false),
+        ("awk", false),
+        ("fzf", false),
+        ("in2csv", false),
+    ] {
+        let present = binary_on_path(name);
+        let detail = if present {
+            "on PATH".to_string()
+        } else if required {
+            "MISSING (required)".to_string()
+        } else {
+            "not found (native tool falls back to bash where possible)".to_string()
+        };
+        line(present || !required, &format!("tool {name}"), detail);
+    }
+
+    // Providers and auth.
+    match (
+        provider::load_provider_catalog(),
+        provider::load_auth_store(),
+    ) {
+        (Ok(catalog), Ok(store)) => {
+            let active = provider::resolve_active_provider_id(&catalog);
+            line(true, "active provider", active.clone());
+            let mut any_auth = false;
+            for profile in &catalog.providers {
+                let status = provider::provider_auth_status(profile, &store);
+                let authed = status.starts_with("auth")
+                    || status.starts_with("env:")
+                    || status == "not-required";
+                if authed {
+                    any_auth = true;
+                }
+                let marker = if provider::canonical_provider_id(&profile.id)
+                    == provider::canonical_provider_id(&active)
+                {
+                    "* "
+                } else {
+                    "  "
+                };
+                out.borrow_mut()
+                    .push_str(&format!("       {marker}{:<10} {}\n", profile.id, status));
+            }
+            if !any_auth {
+                warnings.set(warnings.get() + 1);
+                out.borrow_mut().push_str(
+                    "[warn] no provider has resolvable credentials; run `dext auth login <provider>`\n",
+                );
+            }
+
+            // Local llama reachability probe for any local provider.
+            if let Some(local) = catalog.providers.iter().find(|p| {
+                provider::is_local_llama_provider(
+                    &p.id,
+                    p.api_provider,
+                    &provider::resolve_provider_base_url(p),
+                )
+            }) {
+                let base = provider::resolve_provider_base_url(local);
+                let model = provider::resolve_provider_model(local);
+                match provider::refresh_local_llama_context_window(
+                    &local.id,
+                    local.api_provider,
+                    &base,
+                    &model,
+                ) {
+                    Some(ctx) => line(
+                        true,
+                        "local llama",
+                        format!("reachable at {base} (context {ctx} tokens)"),
+                    ),
+                    None => line(
+                        false,
+                        "local llama",
+                        format!(
+                            "configured ({base}) but not reachable; start llama-server if you use the local provider"
+                        ),
+                    ),
+                }
+            }
+        }
+        _ => {
+            line(
+                false,
+                "providers",
+                "could not load provider catalog/auth store".to_string(),
+            );
+        }
+    }
+
+    // Active session locks under this project.
+    let lock_count = std::fs::read_dir(session::latest_sessions_dir(root))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().join(SESSION_STATE_LOCK_NAME).exists())
+                .count()
+        })
+        .unwrap_or(0);
+    line(
+        true,
+        "session locks",
+        if lock_count == 0 {
+            "none".to_string()
+        } else {
+            format!("{lock_count} held (stale ones clear on next clean start)")
+        },
+    );
+
+    let warnings = warnings.get();
+    let summary = if warnings == 0 {
+        "\nall checks passed\n".to_string()
+    } else {
+        format!("\n{warnings} warning(s); see [warn] lines above\n")
+    };
+    out.borrow_mut().push_str(&summary);
+    (out.into_inner(), warnings)
+}
+
 fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
     if argv.is_empty() {
         return Ok(None);
@@ -19865,6 +20065,15 @@ async fn main() -> Result<()> {
         release_registered_locks();
         std::process::exit(code);
     }
+    if argv.first().is_some_and(|a| a == "doctor") {
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let code = handle_doctor_cli(&root);
+        release_registered_locks();
+        std::process::exit(code);
+    }
     if argv.iter().any(|a| a == "-h" || a == "--help") {
         println!("usage: dext [TASK...]        run one-shot with TASK (joined with spaces)");
         println!("       dext -p               read task from stdin, run one-shot");
@@ -19884,6 +20093,7 @@ async fn main() -> Result<()> {
                 runtime_tool.name, runtime_tool.description
             );
         }
+        println!("       dext doctor           check environment, sandbox, providers, and tools");
         println!("       dext pack list|inspect|run ...  discover or invoke Dext packs");
         println!(
             "       dext shelves                      list typed shelf manifests and ability metadata"

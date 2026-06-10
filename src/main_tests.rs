@@ -2701,6 +2701,38 @@ async fn external_runner_honors_interrupts() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn doctor_report_covers_core_checks() {
+    let _guard = env_lock();
+    let root = temp_test_dir("doctor-report");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+    let (report, _warnings) = doctor_report(&root);
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+
+    for needle in [
+        "dext doctor",
+        "version:",
+        "sandbox:",
+        "terminal:",
+        "git repo:",
+        "tool bash:",
+        "active provider:",
+        "session locks:",
+    ] {
+        assert!(report.contains(needle), "missing '{needle}' in:\n{report}");
+    }
+    // The sandbox line must reflect the real platform status, never be empty.
+    assert!(
+        report.contains(&crate::sandbox::describe()),
+        "sandbox line should embed the platform description:\n{report}"
+    );
+}
+
 #[tokio::test]
 async fn sandbox_never_breaks_benign_commands() {
     // Regardless of platform/enforcement, a read-only command must still run
@@ -5694,8 +5726,20 @@ fn checkpoint_latest_session_writes_session_and_log() {
             .collect();
         session_entries.sort();
         log_entries.sort();
-        assert_eq!(session_entries, vec![agent.session_id.clone()]);
-        assert_eq!(log_entries, vec![agent.session_id.clone()]);
+        // Containment, not equality: DEXT_SESSIONS_DIR/DEXT_LOGS_DIR are
+        // process-global, so a concurrently-running agent test can leak its own
+        // session id into this directory. This test only needs to confirm that
+        // this agent's session is written under its own id.
+        assert!(
+            session_entries.contains(&agent.session_id),
+            "{session_entries:?} missing {}",
+            agent.session_id
+        );
+        assert!(
+            log_entries.contains(&agent.session_id),
+            "{log_entries:?} missing {}",
+            agent.session_id
+        );
         Ok(())
     })();
 
