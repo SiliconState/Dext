@@ -2939,6 +2939,12 @@ pub(crate) fn login_provider(
     key_from_arg: Option<&str>,
     allow_prompt: bool,
 ) -> Result<LoginResult> {
+    // A login is an explicit retry signal: drop cached `!command` secret
+    // results (including cached failures) so a fixed external store —
+    // e.g. an unlocked keychain — is picked up without restarting dext.
+    if let Ok(mut cache) = command_secret_cache().lock() {
+        cache.clear();
+    }
     let mut catalog = load_provider_catalog()?;
     let provider_id = match selected {
         Some(sel) => provider_id_from_selector(&catalog, sel)?,

@@ -2458,6 +2458,17 @@ fn anthropic_wire_messages(messages: &[Message], cache_enabled: bool) -> Result<
         .map(serde_json::to_value)
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("serialize messages: {e}"))?;
+    // Sanitization can empty a message out entirely — e.g. an assistant
+    // message that carried only thinking blocks once prior-turn thinking is
+    // stripped, or a session resumed with thinking disabled. The API rejects
+    // empty content arrays, so drop such messages from the wire (they carry no
+    // tool pairing, history keeps the full record).
+    wire.retain(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_none_or(|blocks| !blocks.is_empty())
+    });
     if cache_enabled {
         set_sliding_message_cache_breakpoint(&mut wire);
     }
@@ -2532,6 +2543,8 @@ fn append_runtime_env_chatgpt_item(items: &mut Vec<Value>, env: &str) {
     if env.is_empty() {
         return;
     }
+    // Message items carry an id like the rest of history_to_chatgpt_input;
+    // a fixed one is fine because the item is rebuilt fresh every request.
     items.push(json!({
         "type": "message",
         "role": "user",
@@ -2539,6 +2552,7 @@ fn append_runtime_env_chatgpt_item(items: &mut Vec<Value>, env: &str) {
             "type": "input_text",
             "text": runtime_env_wire_text(env),
         }],
+        "id": "msg_runtime_env",
     }));
 }
 
@@ -11634,6 +11648,13 @@ impl Agent {
                     } else {
                         Some(texts.join("\n"))
                     };
+                    // An assistant message with neither text nor tool calls
+                    // (e.g. one that only carried thinking blocks, which this
+                    // path never sends) would serialize as content:null and
+                    // trip strict providers — skip it.
+                    if content.is_none() && oai_tool_calls.is_none() {
+                        continue;
+                    }
                     msgs.push(OaiMessage {
                         role: "assistant".to_string(),
                         content,

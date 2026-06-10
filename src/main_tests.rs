@@ -10769,3 +10769,51 @@ fn prompt_scan_cache_revalidates_on_file_change() -> Result<()> {
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
+
+#[test]
+fn wire_messages_drop_content_emptied_by_sanitization() {
+    // An assistant message that carried only thinking blocks empties out once
+    // sanitization strips them (prior-turn trim, or thinking disabled on
+    // resume); it must not reach the wire as an empty content array.
+    let history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "first task".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Thinking {
+                text: "only reasoning".to_string(),
+                signature: Some("sig".to_string()),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "second task".to_string(),
+            }],
+        },
+    ];
+    let sanitized = sanitize_anthropic_messages(&history, true);
+    assert!(
+        sanitized[1].content.is_empty(),
+        "prior-turn thinking-only message should sanitize to empty"
+    );
+    let wire = anthropic_wire_messages(&sanitized, true).expect("wire");
+    assert_eq!(wire.len(), 2, "{wire:?}");
+    assert!(
+        wire.iter().all(|m| !m["content"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(true)),
+        "{wire:?}"
+    );
+    // Breakpoint still lands on the last surviving message.
+    let last_blocks = wire[1]["content"].as_array().expect("blocks");
+    assert_eq!(
+        last_blocks.last().and_then(|b| b["cache_control"]["type"].as_str()),
+        Some("ephemeral")
+    );
+}

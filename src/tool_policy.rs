@@ -813,24 +813,28 @@ fn shell_chunk_is_read_only(chunk: &str) -> bool {
             // flag; positional args create branches and -d/-D/-m/-M/-c/-C/-f
             // mutate them.
             "branch" => words.all(|w| {
-                w.starts_with('-')
-                    && !matches!(
-                        w,
-                        "-d" | "-D"
-                            | "-m"
-                            | "-M"
-                            | "-c"
-                            | "-C"
-                            | "-f"
-                            | "-u"
-                            | "--force"
-                            | "--delete"
-                            | "--move"
-                            | "--copy"
-                            | "--edit-description"
-                            | "--unset-upstream"
-                    )
-                    && !w.starts_with("--set-upstream-to")
+                if !w.starts_with('-') {
+                    return false;
+                }
+                if let Some(flags) = w.strip_prefix('-')
+                    && !flags.starts_with('-')
+                {
+                    // Short flags may combine (-dr deletes a remote-tracking
+                    // branch), so any cluster containing a mutating letter is
+                    // a write; -a/-r/-v style listing flags stay read-only.
+                    return !flags
+                        .chars()
+                        .any(|ch| matches!(ch, 'd' | 'D' | 'm' | 'M' | 'c' | 'C' | 'f' | 'u'));
+                }
+                !matches!(
+                    w,
+                    "--force"
+                        | "--delete"
+                        | "--move"
+                        | "--copy"
+                        | "--edit-description"
+                        | "--unset-upstream"
+                ) && !w.starts_with("--set-upstream-to")
             }),
             _ => false,
         },
@@ -1206,6 +1210,11 @@ mod tests {
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git branch -D feature"})),
+            CommandRisk::Write
+        );
+        // Combined short flags still mutate (-dr deletes a remote-tracking branch).
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "git branch -dr origin/x"})),
             CommandRisk::Write
         );
         assert_eq!(
