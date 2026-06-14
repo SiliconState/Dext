@@ -5,8 +5,6 @@ use crate::provider::{
     parse_llama_context_window, refresh_local_llama_context_window,
     resolve_provider_model_selection,
 };
-#[cfg(target_os = "linux")]
-use crate::session::process_exists;
 use crate::session::{
     append_log_line, canonicalize_read_tool_path, canonicalize_tool_path, cap_latest_log_buffer,
     latest_log_path, render_limited_lines, validate_session_name,
@@ -5731,6 +5729,7 @@ fn context_window_reads_from_provider_catalog() -> Result<()> {
                 notes: None,
                 context_window: Some(333_000),
                 model_context_windows: per_model,
+                model_effort_levels: HashMap::new(),
             }],
         };
         save_provider_catalog(&catalog)?;
@@ -5785,6 +5784,40 @@ fn builtin_chatgpt_profile_declares_codex_context_window() {
         profile.model_context_windows.get("gpt-4.1").copied(),
         Some(1_000_000)
     );
+}
+
+#[test]
+fn builtin_glm_profile_declares_5_2_context_and_effort_levels() -> Result<()> {
+    let _guard = env_lock();
+    clear_cached_local_llama_context_windows();
+    let root = temp_test_dir("glm-52-profile");
+    let root = std::fs::canonicalize(&root)?;
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let profile = find_provider_profile(&catalog, "glm").context("glm profile")?;
+        assert_eq!(profile.default_model, "glm-5.2[1m]");
+        assert_eq!(model_context_window("glm-5.2"), 1_000_000);
+        assert_eq!(model_context_window("glm-5.2[1m]"), 1_000_000);
+        assert_eq!(
+            profile.model_effort_levels.get("glm-5.2[1m]"),
+            Some(&vec!["high".to_string(), "max".to_string()])
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 #[test]
@@ -7913,6 +7946,7 @@ fn auth_store_reads_legacy_provider_map() -> Result<()> {
             notes: None,
             context_window: None,
             model_context_windows: HashMap::new(),
+            model_effort_levels: HashMap::new(),
         };
         let (key, source) = resolve_provider_api_key(&profile, &store).context("resolve key")?;
         assert_eq!(key, "legacy-key");

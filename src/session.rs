@@ -773,7 +773,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
     let meta: serde_json::Value = serde_json::from_str(line).context("bad session header")?;
     Ok(SessionHeader {
         version: meta["version"].as_u64().unwrap_or(1) as u32,
-        model: meta["model"].as_str().unwrap_or("glm-4.6").to_string(),
+        model: meta["model"].as_str().unwrap_or("glm-5.2[1m]").to_string(),
         system: meta["system"]
             .as_str()
             .unwrap_or(DEFAULT_SYSTEM)

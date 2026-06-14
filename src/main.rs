@@ -19,9 +19,10 @@ use provider::{
     ANTHROPIC_API_VERSION, ApiProvider, ProviderProfile, ResolvedProviderConfig,
     apply_provider_headers, auth_store_path, build_chatgpt_request, build_chatgpt_summary_request,
     built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
-    extract_oauth_code_from_callback, handle_auth_cli, list_models_for_available_providers,
-    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
-    logout_provider, looks_like_login_secret_input, provider_auth_status, provider_catalog_path,
+    extract_oauth_code_from_callback, find_provider_profile, handle_auth_cli,
+    list_models_for_available_providers, list_models_for_provider, load_auth_store,
+    load_provider_catalog, login_provider, logout_provider, looks_like_login_secret_input,
+    normalize_provider_model_value, provider_auth_status, provider_catalog_path,
     provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
     render_provider_list, render_provider_picker, resolve_active_provider_id,
     resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
@@ -43,9 +44,9 @@ use tools::{
 
 #[cfg(test)]
 use provider::{
-    ProviderCatalog, StoredCredential, find_provider_profile, login_provider_with_key,
-    normalize_login_secret, oauth_exchange_failure_result_message, resolve_provider_api_key,
-    save_auth_store, save_provider_catalog,
+    ProviderCatalog, StoredCredential, login_provider_with_key, normalize_login_secret,
+    oauth_exchange_failure_result_message, resolve_provider_api_key, save_auth_store,
+    save_provider_catalog,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -187,7 +188,7 @@ impl ThinkingEffort {
             "medium" | "med" | "m" | "default" => Some(Self::Medium),
             "high" | "h" => Some(Self::High),
             "xhigh" | "x-high" | "veryhigh" | "very-high" | "xh" => Some(Self::XHigh),
-            "max" | "maximum" => Some(Self::Max),
+            "max" | "maximum" | "ultra" | "ultracode" => Some(Self::Max),
             _ => None,
         }
     }
@@ -3257,23 +3258,69 @@ fn anthropic_thinking_budget_tokens(effort: ThinkingEffort) -> Option<u32> {
     }
 }
 
-fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option<&'static str> {
+fn provider_model_effort_levels(provider_id: &str, model: &str) -> Option<Vec<String>> {
+    let catalog = load_provider_catalog().ok()?;
+    let profile = find_provider_profile(&catalog, provider_id)?;
+    let normalized = normalize_provider_model_value(&profile, model).to_ascii_lowercase();
+    profile.model_effort_levels.get(&normalized).cloned()
+}
+
+fn map_effort_to_provider_levels(levels: &[String], effort: ThinkingEffort) -> Option<String> {
+    if effort == ThinkingEffort::Off || levels.is_empty() {
+        return None;
+    }
+    let has = |needle: &str| levels.iter().any(|level| level == needle);
+    let pick = |candidates: &[&str]| {
+        candidates
+            .iter()
+            .find(|candidate| has(candidate))
+            .map(|candidate| (*candidate).to_string())
+    };
     match effort {
         ThinkingEffort::Off => None,
-        ThinkingEffort::Low => Some("low"),
-        ThinkingEffort::Medium => Some("medium"),
-        ThinkingEffort::High => Some("high"),
-        ThinkingEffort::XHigh => Some(if anthropic_model_supports_extended_effort(model) {
-            "xhigh"
-        } else {
-            "high"
-        }),
-        ThinkingEffort::Max => Some(if anthropic_model_supports_extended_effort(model) {
-            "max"
-        } else {
-            "high"
-        }),
+        ThinkingEffort::Low | ThinkingEffort::Medium | ThinkingEffort::High => pick(&[
+            "high",
+            effort.as_str(),
+            "medium",
+            "low",
+        ])
+        .or_else(|| levels.first().cloned()),
+        ThinkingEffort::XHigh | ThinkingEffort::Max => pick(&["max", "xhigh", "high"])
+            .or_else(|| levels.last().cloned()),
     }
+}
+
+fn provider_model_output_config_effort(
+    provider_id: &str,
+    model: &str,
+    effort: ThinkingEffort,
+) -> Option<String> {
+    provider_model_effort_levels(provider_id, model)
+        .and_then(|levels| map_effort_to_provider_levels(&levels, effort))
+}
+
+fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option<String> {
+    let effort = match effort {
+        ThinkingEffort::Off => return None,
+        ThinkingEffort::Low => "low",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::XHigh => {
+            if anthropic_model_supports_extended_effort(model) {
+                "xhigh"
+            } else {
+                "high"
+            }
+        }
+        ThinkingEffort::Max => {
+            if anthropic_model_supports_extended_effort(model) {
+                "max"
+            } else {
+                "high"
+            }
+        }
+    };
+    Some(effort.to_string())
 }
 
 fn anthropic_model_is_always_adaptive(model: &str) -> bool {
@@ -3394,9 +3441,9 @@ struct AnthropicThinking {
     display: Option<&'static str>,
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone)]
 struct AnthropicOutputConfig {
-    effort: &'static str,
+    effort: String,
 }
 
 #[derive(Serialize)]
@@ -11814,18 +11861,29 @@ impl Agent {
             ApiProvider::Anthropic => {
                 let max_tokens = max_output_tokens();
                 let (thinking, output_config) =
-                    if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
+                    if let Some(effort) = provider_model_output_config_effort(
+                        &self.provider_id,
+                        &self.model,
+                        self.thinking_effort,
+                    ) {
+                        (
+                            Some(AnthropicThinking {
+                                kind: "enabled",
+                                budget_tokens: None,
+                                display: None,
+                            }),
+                            Some(AnthropicOutputConfig { effort }),
+                        )
+                    } else if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
                         let effort =
                             anthropic_output_config_effort(&self.model, self.thinking_effort);
                         let always_adaptive = anthropic_model_is_always_adaptive(&self.model);
-                        (
-                            effort.map(|_| AnthropicThinking {
-                                kind: "adaptive",
-                                budget_tokens: None,
-                                display: always_adaptive.then_some("omitted"),
-                            }),
-                            effort.map(|effort| AnthropicOutputConfig { effort }),
-                        )
+                        let thinking = effort.as_ref().map(|_| AnthropicThinking {
+                            kind: "adaptive",
+                            budget_tokens: None,
+                            display: always_adaptive.then_some("omitted"),
+                        });
+                        (thinking, effort.map(|effort| AnthropicOutputConfig { effort }))
                     } else {
                         (
                             anthropic_thinking_budget_tokens(self.thinking_effort)

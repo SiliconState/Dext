@@ -127,6 +127,10 @@ pub(crate) struct ProviderProfile {
     /// Optional per-model override of context_window. Map key = model id.
     #[serde(default)]
     pub(crate) model_context_windows: HashMap<String, u64>,
+    /// Optional per-model provider-native reasoning effort levels.
+    /// Map key = model id; values are strings such as "high"/"max".
+    #[serde(default)]
+    pub(crate) model_effort_levels: HashMap<String, Vec<String>>,
 }
 
 pub(crate) fn default_provider_requires_api_key() -> bool {
@@ -224,22 +228,38 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             display_name: "ZAI GLM".to_string(),
             api_provider: ApiProvider::Anthropic,
             base_url: "https://api.z.ai/api/anthropic".to_string(),
-            default_model: "glm-4.6".to_string(),
+            default_model: "glm-5.2[1m]".to_string(),
             models: vec![
-                "glm-4.6".to_string(),
-                "glm-5.0".to_string(),
+                "glm-5.2[1m]".to_string(),
+                "glm-5.2".to_string(),
                 "glm-5.1".to_string(),
+                "glm-5.0".to_string(),
+                "glm-4.6".to_string(),
             ],
             env_vars: vec!["ZAI_API_KEY".to_string()],
             requires_api_key: true,
             login_url: Some("https://open.bigmodel.cn/usercenter/apikeys".to_string()),
             oauth_flow: None,
             notes: Some(
-                "Use your ZAI key. If your key unlocks newer GLM models, set /model directly."
+                "Use your ZAI key. GLM model-name context hints such as [1m] are honored; if your key unlocks newer GLM models, set /model directly."
                     .to_string(),
             ),
             context_window: Some(200_000),
-            model_context_windows: HashMap::new(),
+            model_context_windows: {
+                let mut m = HashMap::new();
+                m.insert("glm-5.2".to_string(), 1_000_000);
+                m.insert("glm-5.2[1m]".to_string(), 1_000_000);
+                m
+            },
+            model_effort_levels: {
+                let mut m = HashMap::new();
+                m.insert("glm-5.2".to_string(), vec!["high".to_string(), "max".to_string()]);
+                m.insert(
+                    "glm-5.2[1m]".to_string(),
+                    vec!["high".to_string(), "max".to_string()],
+                );
+                m
+            },
         },
         ProviderProfile {
             id: "chatgpt".to_string(),
@@ -287,6 +307,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 m.insert("gpt-4o-mini".to_string(), 128_000);
                 m
             },
+            model_effort_levels: HashMap::new(),
         },
         ProviderProfile {
             id: "openai".to_string(),
@@ -319,6 +340,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 m.insert("gpt-4o-mini".to_string(), 128_000);
                 m
             },
+            model_effort_levels: HashMap::new(),
         },
         ProviderProfile {
             id: "anthropic".to_string(),
@@ -345,6 +367,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             notes: Some("Use an Anthropic Console API key.".to_string()),
             context_window: Some(200_000),
             model_context_windows: HashMap::new(),
+            model_effort_levels: HashMap::new(),
         },
         ProviderProfile {
             id: "deepseek".to_string(),
@@ -360,6 +383,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             notes: Some("Uses DeepSeek's OpenAI-compatible API.".to_string()),
             context_window: Some(128_000),
             model_context_windows: HashMap::new(),
+            model_effort_levels: HashMap::new(),
         },
         ProviderProfile {
             id: "local".to_string(),
@@ -396,6 +420,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 );
                 m
             },
+            model_effort_levels: HashMap::new(),
         },
     ]
 }
@@ -574,7 +599,7 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     let fallback_model = if profile.id == "local" {
         "qwen2.5-coder-7b"
     } else {
-        "glm-4.6"
+        "glm-5.2[1m]"
     };
     profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
     if profile.display_name.trim().is_empty() {
@@ -605,6 +630,37 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
         models.insert(0, profile.default_model.clone());
     }
     profile.models = models;
+
+    let mut normalized_context_windows = HashMap::new();
+    for (model, window) in std::mem::take(&mut profile.model_context_windows) {
+        if window == 0 {
+            continue;
+        }
+        let key = normalize_provider_model_value(&profile, &model).to_ascii_lowercase();
+        if !key.is_empty() {
+            normalized_context_windows.insert(key, window);
+        }
+    }
+    profile.model_context_windows = normalized_context_windows;
+
+    let mut normalized_effort_levels = HashMap::new();
+    for (model, levels) in std::mem::take(&mut profile.model_effort_levels) {
+        let key = normalize_provider_model_value(&profile, &model).to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let mut seen_levels = HashSet::new();
+        let levels = levels
+            .into_iter()
+            .map(|level| level.trim().to_ascii_lowercase())
+            .filter(|level| !level.is_empty())
+            .filter(|level| seen_levels.insert(level.clone()))
+            .collect::<Vec<_>>();
+        if !levels.is_empty() {
+            normalized_effort_levels.insert(key, levels);
+        }
+    }
+    profile.model_effort_levels = normalized_effort_levels;
 
     let mut seen_env = HashSet::new();
     profile.env_vars = profile
@@ -660,15 +716,28 @@ pub(crate) fn merge_provider_profile(
         if window == 0 || (local_profile && is_retired_bundled_local_model(&model)) {
             continue;
         }
-        let key = if builtin.api_provider == ApiProvider::ChatGpt {
-            normalize_chatgpt_model_slug(&model)
-        } else {
-            model.trim().to_string()
-        };
+        let key = normalize_provider_model_value(&builtin, &model).to_ascii_lowercase();
         if key.is_empty() {
             continue;
         }
         builtin.model_context_windows.insert(key, window);
+    }
+
+    for (model, levels) in stored.model_effort_levels {
+        let key = normalize_provider_model_value(&builtin, &model).to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let mut seen_levels = HashSet::new();
+        let levels = levels
+            .into_iter()
+            .map(|level| level.trim().to_ascii_lowercase())
+            .filter(|level| !level.is_empty())
+            .filter(|level| seen_levels.insert(level.clone()))
+            .collect::<Vec<_>>();
+        if !levels.is_empty() {
+            builtin.model_effort_levels.insert(key, levels);
+        }
     }
 
     let builtin_owned: HashSet<String> = built_in_provider_profiles()
