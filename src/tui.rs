@@ -10,7 +10,7 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
 use ratatui_core::layout::Alignment as MdAlignment;
 use ratatui_core::style::{Color as MdColor, Modifier as MdModifier, Style as MdStyle};
@@ -780,6 +780,7 @@ struct TuiState {
     pending_insert: Vec<Line_>,
     transcript: Vec<Line_>,
     render_cache: HashMap<u64, CachedTranscriptRender>,
+    transcript_rendered_width: u16,
     transcript_scroll_offset: usize,
     transcript_hover_expandable: Option<usize>,
     transcript_area: Rect,
@@ -879,6 +880,7 @@ impl TuiState {
             pending_insert: Vec::new(),
             transcript: Vec::new(),
             render_cache: HashMap::new(),
+            transcript_rendered_width: 0,
             transcript_scroll_offset: 0,
             transcript_hover_expandable: None,
             transcript_area: Rect::default(),
@@ -4091,23 +4093,61 @@ fn parse_table_lines(lines: &[&str]) -> Option<ParsedTable> {
         })
 }
 
-fn clean_status_cell(cell: &str) -> String {
-    let trimmed = strip_markdown_markers(cell).trim().to_string();
-    let without_yes = trimmed
-        .strip_prefix("✅")
-        .or_else(|| trimmed.strip_prefix('✓'))
-        .map(str::trim_start)
-        .unwrap_or(trimmed.as_str());
-    if without_yes.eq_ignore_ascii_case("yes") {
-        "PASS".to_string()
-    } else if without_yes.eq_ignore_ascii_case("no") {
-        "FAIL".to_string()
-    } else {
-        without_yes.to_string()
+fn normalized_table_cell_text(cell: &str) -> String {
+    let no_ansi = strip_ansi_escapes(cell);
+    strip_markdown_markers(&no_ansi)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn status_word_value(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" | "true" | "pass" | "passed" | "ok" | "success" | "succeeded" => Some(true),
+        "no" | "n" | "false" | "fail" | "failed" | "error" | "errored" => Some(false),
+        _ => None,
     }
 }
 
+fn status_icon_value(text: &str) -> Option<(bool, &str)> {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed
+        .strip_prefix("✅")
+        .or_else(|| trimmed.strip_prefix('✓'))
+        .or_else(|| trimmed.strip_prefix('✔'))
+    {
+        Some((true, rest.trim_start()))
+    } else if let Some(rest) = trimmed
+        .strip_prefix("❌")
+        .or_else(|| trimmed.strip_prefix('✗'))
+        .or_else(|| trimmed.strip_prefix('✘'))
+        .or_else(|| trimmed.strip_prefix('×'))
+    {
+        Some((false, rest.trim_start()))
+    } else {
+        None
+    }
+}
+
+fn status_token(value: bool) -> String {
+    if value { "PASS" } else { "FAIL" }.to_string()
+}
+
+fn clean_table_status_cell(cell: &str) -> String {
+    let text = normalized_table_cell_text(cell);
+    if let Some(value) = status_word_value(&text) {
+        return status_token(value);
+    }
+    if let Some((icon_value, rest)) = status_icon_value(&text) {
+        return status_token(status_word_value(rest).unwrap_or(icon_value));
+    }
+    text
+}
+
 fn normalize_table_status_cells(table: &mut ParsedTable) {
+    if table.header_rows == 0 {
+        return;
+    }
     let Some(header) = table.rows.first() else {
         return;
     };
@@ -4115,486 +4155,15 @@ fn normalize_table_status_cells(table: &mut ParsedTable) {
         .iter()
         .enumerate()
         .filter_map(|(idx, cell)| {
-            let lower = cell.trim().to_ascii_lowercase();
+            let lower = normalized_table_cell_text(cell).to_ascii_lowercase();
             matches!(lower.as_str(), "result" | "status" | "pass" | "ok").then_some(idx)
         })
         .collect::<Vec<_>>();
     for row in table.rows.iter_mut().skip(table.header_rows) {
         for idx in &status_cols {
             if let Some(cell) = row.get_mut(*idx) {
-                *cell = clean_status_cell(cell);
+                *cell = clean_table_status_cell(cell);
             }
-        }
-    }
-}
-
-fn semantic_clean_cell(cell: &str) -> String {
-    clean_status_cell(&sanitize_display_text(cell))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn semantic_lower(cell: &str) -> String {
-    semantic_clean_cell(cell).to_ascii_lowercase()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SemanticTableKind {
-    Checks,
-    Performance,
-    Constraint,
-    NextStep,
-}
-
-#[derive(Clone, Debug)]
-struct SemanticTableItem {
-    kind: SemanticTableKind,
-    label: String,
-    value: String,
-    passed: Option<bool>,
-}
-
-fn semantic_kind_from_text(text: &str) -> Option<SemanticTableKind> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("next")
-        || lower.contains("recommend")
-        || lower.contains("action")
-        || lower.contains("step")
-    {
-        Some(SemanticTableKind::NextStep)
-    } else if lower.contains("check")
-        || lower.contains("validation")
-        || lower.contains("verified")
-        || lower.contains("test")
-    {
-        Some(SemanticTableKind::Checks)
-    } else if lower.contains("constraint")
-        || lower.contains("bottleneck")
-        || lower.contains("limit")
-        || lower.contains("cap")
-        || lower.contains("physical ram")
-        || lower.contains("system ram")
-        || lower.contains("wsl")
-        || lower.contains("memory allocation")
-    {
-        Some(SemanticTableKind::Constraint)
-    } else if lower.contains("performance")
-        || lower.contains("speed")
-        || lower.contains("throughput")
-        || lower.contains("tok/s")
-        || lower.contains("wpm")
-        || lower.contains("vram")
-        || lower.contains("generation")
-        || lower.contains("latency")
-    {
-        Some(SemanticTableKind::Performance)
-    } else {
-        None
-    }
-}
-
-fn semantic_status_value(cell: &str) -> Option<bool> {
-    let lower = semantic_lower(cell);
-    if matches!(lower.as_str(), "pass" | "ok" | "yes" | "true" | "✓" | "✅") {
-        Some(true)
-    } else if matches!(lower.as_str(), "fail" | "no" | "false" | "✗" | "x" | "❌") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn semantic_status_is_explicit(cell: &str) -> bool {
-    let raw = strip_markdown_markers(&sanitize_display_text(cell)).to_ascii_lowercase();
-    raw.contains('✓')
-        || raw.contains('✅')
-        || raw.contains('✗')
-        || raw.contains('❌')
-        || matches!(
-            raw.trim(),
-            "pass" | "fail" | "ok" | "yes" | "no" | "true" | "false"
-        )
-}
-
-fn semantic_metric_value(cell: &str) -> bool {
-    let lower = semantic_lower(cell);
-    lower.chars().any(|c| c.is_ascii_digit())
-        && (lower.contains("tok/s")
-            || lower.contains("wpm")
-            || lower.contains("gb")
-            || lower.contains("gib")
-            || lower.contains("mb")
-            || lower.contains('%')
-            || lower.contains('/')
-            || lower.contains('~')
-            || lower.contains('–')
-            || lower.contains('-'))
-}
-
-fn semantic_find_col(headers: &[String], needles: &[&str]) -> Option<usize> {
-    headers.iter().position(|header| {
-        needles
-            .iter()
-            .any(|needle| header == needle || header.contains(needle))
-    })
-}
-
-fn semantic_row_extra(row: &[String], excluded: &[usize]) -> String {
-    row.iter()
-        .enumerate()
-        .filter(|(idx, _)| !excluded.contains(idx))
-        .map(|(_, cell)| semantic_clean_cell(cell))
-        .filter(|cell| !cell.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-fn semantic_row_value(row: &[String], preferred: Option<usize>, excluded: &[usize]) -> String {
-    preferred
-        .and_then(|idx| row.get(idx))
-        .map(|cell| semantic_clean_cell(cell))
-        .filter(|cell| !cell.is_empty())
-        .unwrap_or_else(|| semantic_row_extra(row, excluded))
-}
-
-fn semantic_table_item(
-    row: &[String],
-    headers: &[String],
-    category_col: Option<usize>,
-    label_col: usize,
-    value_col: Option<usize>,
-    status_col: Option<usize>,
-    next_col: Option<usize>,
-) -> Option<SemanticTableItem> {
-    let whole_row = row
-        .iter()
-        .map(|cell| semantic_clean_cell(cell))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let category_kind = category_col
-        .and_then(|idx| row.get(idx))
-        .and_then(|cell| semantic_kind_from_text(cell));
-    let label = row
-        .get(label_col)
-        .map(|cell| semantic_clean_cell(cell))
-        .unwrap_or_default();
-    let label_kind =
-        semantic_kind_from_text(&label).or_else(|| semantic_kind_from_text(&whole_row));
-    let status = status_col
-        .and_then(|idx| row.get(idx))
-        .and_then(|cell| semantic_status_value(cell));
-    let label_header = headers.get(label_col).map(String::as_str).unwrap_or("");
-    let status_header = status_col
-        .and_then(|idx| headers.get(idx))
-        .map(String::as_str);
-    let status_is_explicit = status_col
-        .and_then(|idx| row.get(idx))
-        .is_some_and(|cell| semantic_status_is_explicit(cell));
-
-    let kind = category_kind.or(label_kind).or_else(|| {
-        if next_col.is_some() {
-            Some(SemanticTableKind::NextStep)
-        } else if status.is_some()
-            && (status_is_explicit
-                || label_header.contains("check")
-                || status_header
-                    .is_some_and(|header| matches!(header, "result" | "status" | "pass" | "ok")))
-        {
-            Some(SemanticTableKind::Checks)
-        } else if value_col
-            .and_then(|idx| row.get(idx))
-            .is_some_and(|cell| semantic_metric_value(cell))
-        {
-            Some(SemanticTableKind::Performance)
-        } else {
-            None
-        }
-    })?;
-
-    let excluded = [
-        Some(label_col),
-        category_col,
-        status_col,
-        next_col,
-        value_col,
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-
-    let value = match kind {
-        SemanticTableKind::Checks => status_col
-            .and_then(|idx| row.get(idx))
-            .map(|cell| semantic_clean_cell(cell))
-            .unwrap_or_default(),
-        SemanticTableKind::NextStep => semantic_row_value(row, next_col.or(value_col), &excluded),
-        SemanticTableKind::Performance | SemanticTableKind::Constraint => {
-            semantic_row_value(row, value_col, &excluded)
-        }
-    };
-
-    if label.is_empty() && value.is_empty() {
-        return None;
-    }
-
-    Some(SemanticTableItem {
-        kind,
-        label,
-        value,
-        passed: status,
-    })
-}
-
-fn semantic_section_title(kind: SemanticTableKind) -> &'static str {
-    match kind {
-        SemanticTableKind::Checks => "Checks",
-        SemanticTableKind::Performance => "Performance",
-        SemanticTableKind::Constraint => "Constraint",
-        SemanticTableKind::NextStep => "Next step",
-    }
-}
-
-fn push_semantic_pair_line(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    value: &str,
-    label_width: usize,
-    width: u16,
-    base_style: Style,
-) {
-    let label = if label.is_empty() { "item" } else { label };
-    let value = value.trim();
-    let prefix_style = Style::default().fg(Color::DarkGray);
-    let label_style = base_style.patch(Style::default().fg(Color::Gray));
-    let value_style = base_style;
-    let available = width.saturating_sub(2).max(1) as usize;
-    let label_cells = text_width(label);
-    let pad = label_width.saturating_sub(label_cells).saturating_add(2);
-    if !value.is_empty() && label_cells + pad + text_width(value) <= available {
-        lines.push(Line::from(vec![
-            Span::styled("  ".to_string(), prefix_style),
-            Span::styled(label.to_string(), label_style),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(value.to_string(), value_style),
-        ]));
-    } else if value.is_empty() {
-        push_prefixed_wrapped_line(lines, "  ", prefix_style, label, label_style, width);
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("  ".to_string(), prefix_style),
-            Span::styled(label.to_string(), label_style),
-        ]));
-        push_prefixed_wrapped_line(lines, "    ", prefix_style, value, value_style, width);
-    }
-}
-
-fn push_semantic_check_line(
-    lines: &mut Vec<Line<'static>>,
-    item: &SemanticTableItem,
-    width: u16,
-    base_style: Style,
-) {
-    let (marker, color) = match item.passed {
-        Some(true) => ("✓ ", Color::Green),
-        Some(false) => ("✗ ", Color::Red),
-        None => ("• ", Color::DarkGray),
-    };
-    let label = if item.label.is_empty() {
-        item.value.as_str()
-    } else {
-        item.label.as_str()
-    };
-    let detail = if !item.value.is_empty() && !matches!(item.value.as_str(), "PASS" | "FAIL") {
-        format!("{label} — {}", item.value)
-    } else {
-        label.to_string()
-    };
-    push_prefixed_wrapped_line(
-        lines,
-        marker,
-        Style::default().fg(color),
-        &detail,
-        base_style,
-        width,
-    );
-}
-
-fn render_semantic_table_lines(
-    table: &ParsedTable,
-    base_style: Style,
-    max_total_width: usize,
-) -> Option<Vec<Line<'static>>> {
-    if table.header_rows == 0 || table.rows.len() <= table.header_rows {
-        return None;
-    }
-    let header = table.rows.first()?;
-    let headers = header
-        .iter()
-        .map(|cell| semantic_lower(cell))
-        .collect::<Vec<_>>();
-    let category_col = semantic_find_col(&headers, &["section", "category", "type", "area"]);
-    let status_col = semantic_find_col(&headers, &["result", "status", "pass", "ok"]);
-    let next_col = semantic_find_col(&headers, &["next", "recommend", "action", "step"]);
-    let value_col = semantic_find_col(
-        &headers,
-        &[
-            "value",
-            "metric",
-            "speed",
-            "rate",
-            "observed",
-            "expected",
-            "throughput",
-            "usage",
-        ],
-    )
-    .or(status_col);
-    let label_col = semantic_find_col(
-        &headers,
-        &[
-            "check",
-            "item",
-            "name",
-            "metric",
-            "constraint",
-            "setting",
-            "field",
-            "parameter",
-        ],
-    )
-    .filter(|idx| Some(*idx) != status_col)
-    .unwrap_or_else(|| {
-        (0..headers.len())
-            .find(|idx| {
-                Some(*idx) != category_col
-                    && Some(*idx) != status_col
-                    && Some(*idx) != value_col
-                    && Some(*idx) != next_col
-            })
-            .unwrap_or(0)
-    });
-
-    let mut items = Vec::new();
-    for row in table.rows.iter().skip(table.header_rows) {
-        let item = semantic_table_item(
-            row,
-            &headers,
-            category_col,
-            label_col,
-            value_col,
-            status_col,
-            next_col,
-        )?;
-        items.push(item);
-    }
-    if items.is_empty() {
-        return None;
-    }
-
-    let kinds = [
-        SemanticTableKind::Checks,
-        SemanticTableKind::Performance,
-        SemanticTableKind::Constraint,
-        SemanticTableKind::NextStep,
-    ];
-    let width = (max_total_width as u16).max(1);
-    let mut lines = Vec::new();
-    let mut wrote_section = false;
-    for kind in kinds {
-        let section_items = items
-            .iter()
-            .filter(|item| item.kind == kind)
-            .collect::<Vec<_>>();
-        if section_items.is_empty() {
-            continue;
-        }
-        if wrote_section {
-            lines.push(Line::from(""));
-        }
-        wrote_section = true;
-        lines.push(Line::from(Span::styled(
-            semantic_section_title(kind),
-            base_style.patch(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        )));
-        let label_width = section_items
-            .iter()
-            .map(|item| text_width(&item.label))
-            .max()
-            .unwrap_or(0)
-            .clamp(14, (max_total_width / 2).clamp(14, 34));
-        for item in section_items {
-            match kind {
-                SemanticTableKind::Checks => {
-                    push_semantic_check_line(&mut lines, item, width, base_style)
-                }
-                SemanticTableKind::NextStep => {
-                    let text = if item.value.is_empty() {
-                        item.label.clone()
-                    } else if item.label.is_empty()
-                        || semantic_kind_from_text(&item.label) == Some(SemanticTableKind::NextStep)
-                    {
-                        item.value.clone()
-                    } else {
-                        format!("{}: {}", item.label, item.value)
-                    };
-                    push_prefixed_wrapped_line(
-                        &mut lines,
-                        "  ",
-                        Style::default().fg(Color::DarkGray),
-                        &text,
-                        base_style,
-                        width,
-                    );
-                }
-                SemanticTableKind::Performance | SemanticTableKind::Constraint => {
-                    push_semantic_pair_line(
-                        &mut lines,
-                        &item.label,
-                        &item.value,
-                        label_width,
-                        width,
-                        base_style,
-                    );
-                }
-            }
-        }
-    }
-
-    (!lines.is_empty()).then_some(lines)
-}
-
-fn table_area_width(widths: &[usize], spacing: usize) -> usize {
-    if widths.is_empty() {
-        return 0;
-    }
-    widths.iter().sum::<usize>() + widths.len().saturating_sub(1) * spacing
-}
-
-fn shrink_table_widths(widths: &mut [usize], spacing: usize, max_total: usize) {
-    if widths.is_empty() {
-        return;
-    }
-
-    let mut total = table_area_width(widths, spacing);
-    while total > max_total {
-        let mut changed = false;
-        for width in widths.iter_mut() {
-            if total <= max_total {
-                break;
-            }
-            if *width > 1 {
-                *width -= 1;
-                total = total.saturating_sub(1);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
         }
     }
 }
@@ -4609,42 +4178,8 @@ fn table_column_count(table: &ParsedTable) -> usize {
         .max(table.alignments.len())
 }
 
-fn table_spacing(table: &ParsedTable, max_total: usize) -> usize {
-    let col_count = table_column_count(table);
-    if col_count <= 1 {
-        return 0;
-    }
-    let min_with_spacing = col_count + (col_count - 1) + 2;
-    if max_total < min_with_spacing { 0 } else { 1 }
-}
-
 fn table_header_style(base_style: Style) -> Style {
     base_style.patch(Style::default().add_modifier(Modifier::BOLD))
-}
-
-fn table_column_widths(table: &ParsedTable, spacing: usize, max_total: usize) -> Vec<usize> {
-    let col_count = table_column_count(table);
-    if col_count == 0 {
-        return Vec::new();
-    }
-
-    let mut widths = vec![1usize; col_count];
-    for row in &table.rows {
-        for (ci, cell) in row.iter().enumerate() {
-            widths[ci] = widths[ci].max(text_width(cell));
-        }
-    }
-
-    shrink_table_widths(&mut widths, spacing, max_total);
-    widths
-}
-
-fn table_alignment(alignment: TableColumnAlignment) -> Alignment {
-    match alignment {
-        TableColumnAlignment::Left => Alignment::Left,
-        TableColumnAlignment::Center => Alignment::Center,
-        TableColumnAlignment::Right => Alignment::Right,
-    }
 }
 
 fn buffer_to_lines(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<Line<'static>> {
@@ -4685,15 +4220,302 @@ fn buffer_to_lines(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<Line<'st
     out
 }
 
-fn table_visual_height(table: &ParsedTable, max_total_width: usize) -> u16 {
-    let spacing = table_spacing(table, max_total_width);
-    let widths = table_column_widths(table, spacing, max_total_width);
+const TABLE_CELL_PADDING: usize = 1;
+const TABLE_CELL_MIN_WIDTH: usize = 3;
+const TABLE_CELL_SOFT_MAX_WIDTH: usize = 42;
+const TABLE_RECORD_FALLBACK_MIN_WIDTH: usize = 8;
+
+fn table_cell_text(cell: &str) -> String {
+    normalized_table_cell_text(cell)
+}
+
+fn table_grid_total_width(widths: &[usize]) -> usize {
     if widths.is_empty() {
         return 0;
     }
+    widths.iter().sum::<usize>() + widths.len() * (TABLE_CELL_PADDING * 2 + 1) + 1
+}
+
+fn table_uncapped_widths(table: &ParsedTable) -> Vec<usize> {
+    let col_count = table_column_count(table);
+    let mut widths = vec![TABLE_CELL_MIN_WIDTH; col_count];
+    for row in &table.rows {
+        for (ci, cell) in row.iter().enumerate().take(col_count) {
+            widths[ci] = widths[ci].max(text_width(&table_cell_text(cell)));
+        }
+    }
+    widths
+}
+
+fn table_grid_widths(
+    table: &ParsedTable,
+    max_total_width: usize,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    let col_count = table_column_count(table);
+    if col_count == 0 {
+        return None;
+    }
+    let min_total = table_grid_total_width(&vec![TABLE_CELL_MIN_WIDTH; col_count]);
+    if max_total_width < min_total {
+        return None;
+    }
+
+    let uncapped = table_uncapped_widths(table);
+    let content_budget =
+        max_total_width.saturating_sub(col_count * (TABLE_CELL_PADDING * 2 + 1) + 1);
+    let soft_max = match col_count {
+        0 => TABLE_CELL_MIN_WIDTH,
+        1 => content_budget.max(TABLE_CELL_MIN_WIDTH),
+        2 => TABLE_CELL_SOFT_MAX_WIDTH
+            .max(24)
+            .min(content_budget.max(TABLE_CELL_MIN_WIDTH)),
+        _ => TABLE_CELL_SOFT_MAX_WIDTH.min(content_budget.max(TABLE_CELL_MIN_WIDTH)),
+    };
+    let mut widths = uncapped
+        .iter()
+        .map(|width| (*width).clamp(TABLE_CELL_MIN_WIDTH, soft_max))
+        .collect::<Vec<_>>();
+
+    while widths.iter().sum::<usize>() > content_budget {
+        let Some((idx, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > TABLE_CELL_MIN_WIDTH)
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        widths[idx] -= 1;
+    }
+
+    (widths.iter().sum::<usize>() <= content_budget).then_some((widths, uncapped))
+}
+
+fn table_should_render_records(
+    table: &ParsedTable,
+    widths: &[usize],
+    uncapped: &[usize],
+    max_total_width: usize,
+) -> bool {
+    let col_count = widths.len();
+    let body_rows = table
+        .rows
+        .len()
+        .saturating_sub(table.header_rows.min(table.rows.len()));
+    if body_rows == 0 {
+        return false;
+    }
+    if col_count >= 5 && max_total_width < 96 {
+        return true;
+    }
+    if col_count >= 3 && max_total_width < 40 {
+        return true;
+    }
+    widths
+        .iter()
+        .zip(uncapped.iter())
+        .any(|(width, natural)| *width <= 6 && *natural > width.saturating_mul(3))
+}
+
+fn table_border_line(
+    widths: &[usize],
+    left: char,
+    join: char,
+    right: char,
+    border_style: Style,
+) -> Line<'static> {
+    let mut text = String::new();
+    text.push(left);
+    for (idx, width) in widths.iter().enumerate() {
+        text.push_str(&"─".repeat(width.saturating_add(TABLE_CELL_PADDING * 2)));
+        text.push(if idx + 1 == widths.len() { right } else { join });
+    }
+    Line::from(Span::styled(text, border_style))
+}
+
+fn table_wrap_cell(cell: &str, width: usize) -> Vec<String> {
+    let text = table_cell_text(cell);
+    if text.is_empty() {
+        vec![String::new()]
+    } else {
+        wrap_plain_words_visual(&text, width.max(1))
+    }
+}
+
+fn table_alignment_padding(
+    alignment: TableColumnAlignment,
+    content_width: usize,
+    target_width: usize,
+) -> (usize, usize) {
+    let remaining = target_width.saturating_sub(content_width);
+    match alignment {
+        TableColumnAlignment::Left => (0, remaining),
+        TableColumnAlignment::Center => (remaining / 2, remaining.saturating_sub(remaining / 2)),
+        TableColumnAlignment::Right => (remaining, 0),
+    }
+}
+
+fn render_table_grid_row(
+    row: &[String],
+    widths: &[usize],
+    alignments: &[TableColumnAlignment],
+    row_style: Style,
+    border_style: Style,
+) -> Vec<Line<'static>> {
+    let wrapped = widths
+        .iter()
+        .enumerate()
+        .map(|(ci, width)| table_wrap_cell(row.get(ci).map(String::as_str).unwrap_or(""), *width))
+        .collect::<Vec<_>>();
+    let row_height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let mut lines = Vec::with_capacity(row_height);
+
+    for line_idx in 0..row_height {
+        let mut spans = vec![Span::styled("│".to_string(), border_style)];
+        for (ci, width) in widths.iter().enumerate() {
+            let content = wrapped[ci].get(line_idx).map(String::as_str).unwrap_or("");
+            let alignment = alignments
+                .get(ci)
+                .copied()
+                .unwrap_or(TableColumnAlignment::Left);
+            let (left_pad, right_pad) =
+                table_alignment_padding(alignment, text_width(content), *width);
+            spans.push(Span::raw(" ".repeat(TABLE_CELL_PADDING + left_pad)));
+            if !content.is_empty() {
+                spans.push(Span::styled(content.to_string(), row_style));
+            }
+            spans.push(Span::raw(" ".repeat(right_pad + TABLE_CELL_PADDING)));
+            spans.push(Span::styled("│".to_string(), border_style));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines
+}
+
+fn table_record_rule(width: usize, left: char, right: char, border_style: Style) -> Line<'static> {
+    let inner = width.saturating_sub(2);
+    Line::from(Span::styled(
+        format!("{left}{}{right}", "─".repeat(inner)),
+        border_style,
+    ))
+}
+
+fn table_record_line(
+    content: &str,
+    content_style: Style,
+    width: usize,
+    border_style: Style,
+) -> Line<'static> {
+    let inner = width.saturating_sub(4).max(1);
+    let content_width = text_width(content).min(inner);
+    let right_pad = inner.saturating_sub(content_width);
+    Line::from(vec![
+        Span::styled("│ ".to_string(), border_style),
+        Span::styled(content.to_string(), content_style),
+        Span::raw(" ".repeat(right_pad)),
+        Span::styled(" │".to_string(), border_style),
+    ])
+}
+
+fn render_table_records(
+    table: &ParsedTable,
+    base_style: Style,
+    max_total_width: usize,
+) -> Vec<Line<'static>> {
+    let col_count = table_column_count(table);
+    if col_count == 0 {
+        return Vec::new();
+    }
+    if max_total_width < TABLE_RECORD_FALLBACK_MIN_WIDTH {
+        return table
+            .rows
+            .iter()
+            .flat_map(|row| {
+                row.iter()
+                    .map(|cell| Line::from(Span::styled(table_cell_text(cell), base_style)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
+
     let header_rows = table.header_rows.min(table.rows.len());
-    let body_rows = table.rows.len().saturating_sub(header_rows);
-    header_rows.saturating_add(body_rows).min(u16::MAX as usize) as u16
+    let labels = if header_rows > 0 {
+        (0..col_count)
+            .map(|ci| {
+                let label =
+                    table_cell_text(table.rows[0].get(ci).map(String::as_str).unwrap_or(""));
+                if label.is_empty() {
+                    format!("Column {}", ci + 1)
+                } else {
+                    label
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        (0..col_count)
+            .map(|ci| format!("Column {}", ci + 1))
+            .collect::<Vec<_>>()
+    };
+
+    let width = max_total_width;
+    let inner = width.saturating_sub(4).max(1);
+    let border_style = Style::default().fg(Color::DarkGray);
+    let label_style = base_style.patch(Style::default().fg(Color::Gray));
+    let mut lines = vec![table_record_rule(width, '┌', '┐', border_style)];
+    let mut wrote_record = false;
+
+    for row in table.rows.iter().skip(header_rows) {
+        if wrote_record {
+            lines.push(table_record_rule(width, '├', '┤', border_style));
+        }
+        wrote_record = true;
+        let mut wrote_field = false;
+        for ci in 0..col_count {
+            let value = table_cell_text(row.get(ci).map(String::as_str).unwrap_or(""));
+            if value.is_empty() {
+                continue;
+            }
+            let label = labels.get(ci).map(String::as_str).unwrap_or("item");
+            let text = format!("{label}: {value}");
+            for (line_idx, wrapped) in wrap_plain_words_visual(&text, inner)
+                .into_iter()
+                .enumerate()
+            {
+                let style = if line_idx == 0 {
+                    label_style
+                } else {
+                    base_style
+                };
+                lines.push(table_record_line(&wrapped, style, width, border_style));
+            }
+            wrote_field = true;
+        }
+        if !wrote_field {
+            lines.push(table_record_line("—", base_style, width, border_style));
+        }
+    }
+
+    if !wrote_record {
+        let header = table
+            .rows
+            .first()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| table_cell_text(cell))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+            .unwrap_or_default();
+        lines.push(table_record_line(
+            &header,
+            table_header_style(base_style),
+            width,
+            border_style,
+        ));
+    }
+    lines.push(table_record_rule(width, '└', '┘', border_style));
+    lines
 }
 
 fn render_table_lines(
@@ -4701,99 +4523,37 @@ fn render_table_lines(
     base_style: Style,
     max_total_width: usize,
 ) -> Vec<Line<'static>> {
-    let spacing = table_spacing(table, max_total_width);
-    let widths = table_column_widths(table, spacing, max_total_width);
-    if widths.is_empty() {
-        return Vec::new();
-    }
-
-    let col_count = widths.len();
-    let header_rows = table.header_rows.min(table.rows.len());
-    let make_cells = |row: &[String], is_header: bool| {
-        (0..col_count)
-            .map(|ci| {
-                let raw = row.get(ci).map(String::as_str).unwrap_or("");
-                let truncated = truncate_cell(raw, widths[ci]);
-                let align = table
-                    .alignments
-                    .get(ci)
-                    .copied()
-                    .unwrap_or(TableColumnAlignment::Left);
-                let text = Text::from(truncated).alignment(table_alignment(align));
-                let style = if is_header {
-                    table_header_style(base_style)
-                } else {
-                    base_style
-                };
-                Cell::from(text).style(style)
-            })
-            .collect::<Vec<Cell<'static>>>()
+    let Some((widths, uncapped)) = table_grid_widths(table, max_total_width) else {
+        return render_table_records(table, base_style, max_total_width.max(1));
     };
-
-    let rows = table
-        .rows
-        .iter()
-        .enumerate()
-        .skip(header_rows)
-        .map(|(_, row)| Row::new(make_cells(row, false)).style(base_style))
-        .collect::<Vec<Row<'static>>>();
-
-    let width_constraints = widths
-        .iter()
-        .map(|w| Constraint::Length((*w).min(u16::MAX as usize) as u16))
-        .collect::<Vec<Constraint>>();
-
-    let mut widget = Table::new(rows, width_constraints)
-        .column_spacing(spacing as u16)
-        .style(base_style)
-        .block(
-            Block::default()
-                .borders(Borders::NONE)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
-
-    if header_rows > 0 {
-        let header =
-            Row::new(make_cells(&table.rows[0], true)).style(table_header_style(base_style));
-        widget = widget.header(header);
+    if table_should_render_records(table, &widths, &uncapped, max_total_width) {
+        return render_table_records(table, base_style, max_total_width.max(1));
     }
 
-    let area_width = table_area_width(&widths, spacing)
-        .max(1)
-        .min(u16::MAX as usize) as u16;
-    let area_height = table_visual_height(table, max_total_width).max(1);
-    let area = Rect::new(0, 0, area_width, area_height);
-    let mut buffer = ratatui::buffer::Buffer::empty(area);
-    Widget::render(widget, area, &mut buffer);
-    buffer_to_lines(&buffer, area)
-}
+    let border_style = Style::default().fg(Color::DarkGray);
+    let header_rows = table.header_rows.min(table.rows.len());
+    let mut lines = vec![table_border_line(&widths, '┌', '┬', '┐', border_style)];
 
-fn truncate_cell(cell: &str, max_width: usize) -> String {
-    let sanitized = strip_ansi_escapes(cell);
-    let cell = clean_status_cell(&sanitized);
-    if max_width == 0 {
-        return String::new();
-    }
-
-    if text_width(&cell) <= max_width {
-        return cell.to_string();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-
-    let mut out = String::new();
-    let mut cells = 0usize;
-    for ch in cell.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cells + w + 1 > max_width {
-            break;
+    for (row_idx, row) in table.rows.iter().enumerate() {
+        let row_style = if row_idx < header_rows {
+            table_header_style(base_style)
+        } else {
+            base_style
+        };
+        lines.extend(render_table_grid_row(
+            row,
+            &widths,
+            &table.alignments,
+            row_style,
+            border_style,
+        ));
+        if row_idx + 1 < table.rows.len() {
+            lines.push(table_border_line(&widths, '├', '┼', '┤', border_style));
         }
-        out.push(ch);
-        cells += w;
     }
-    out.push('…');
-    out
+
+    lines.push(table_border_line(&widths, '└', '┴', '┘', border_style));
+    lines
 }
 
 fn text_width(s: &str) -> usize {
@@ -4814,7 +4574,6 @@ fn is_table_separator_line(line: &str) -> bool {
 
 fn has_table_marker(text: &str) -> bool {
     text.lines()
-        .take(256)
         .any(|line| line.contains('|') || is_ascii_border_row(line))
 }
 
@@ -4826,6 +4585,80 @@ fn fence_delimiter(line: &str) -> Option<char> {
         Some('~')
     } else {
         None
+    }
+}
+
+fn fence_info(line: &str) -> Option<(char, &str)> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        Some(('`', rest.trim()))
+    } else {
+        trimmed.strip_prefix("~~~").map(|rest| ('~', rest.trim()))
+    }
+}
+
+fn markdown_table_fence_delimiter(line: &str) -> Option<char> {
+    let (delimiter, info) = fence_info(line)?;
+    let lower = info.to_ascii_lowercase();
+    let lang = lower
+        .trim_start_matches('{')
+        .trim_start_matches('.')
+        .split(|ch: char| ch.is_whitespace() || ch == '}' || ch == ',')
+        .next()
+        .unwrap_or_default();
+    matches!(lang, "md" | "markdown").then_some(delimiter)
+}
+
+fn find_fence_close(lines: &[&str], start: usize, delimiter: char) -> Option<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .skip(start.saturating_add(1))
+        .find_map(|(idx, line)| (fence_delimiter(line) == Some(delimiter)).then_some(idx))
+}
+
+fn has_parseable_table(lines: &[&str], start: usize, end: usize) -> bool {
+    let body = &lines[start..end];
+    let mut i = 0usize;
+    while i < body.len() {
+        if parse_markdown_table_block(body, i)
+            .or_else(|| parse_ascii_table_block(body, i))
+            .is_some()
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn push_table_blocks<'a>(
+    blocks: &mut Vec<EitherBlock<'a>>,
+    raw_lines: &'a [&'a str],
+    start: usize,
+    end: usize,
+) {
+    let mut markdown_start = start;
+    let mut i = start;
+    while i < end {
+        let parsed = parse_markdown_table_block(raw_lines, i)
+            .or_else(|| parse_ascii_table_block(raw_lines, i));
+        if let Some((mut table, consumed)) = parsed
+            && i + consumed <= end
+        {
+            normalize_table_status_cells(&mut table);
+            if markdown_start < i {
+                blocks.push(EitherBlock::Markdown(&raw_lines[markdown_start..i]));
+            }
+            blocks.push(EitherBlock::Table(table));
+            i += consumed;
+            markdown_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if markdown_start < end {
+        blocks.push(EitherBlock::Markdown(&raw_lines[markdown_start..end]));
     }
 }
 
@@ -4842,44 +4675,33 @@ fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'s
     let mut blocks: Vec<EitherBlock> = Vec::new();
     let mut markdown_start = 0usize;
     let mut i = 0usize;
-    let mut open_fence: Option<char> = None;
 
     while i < raw_lines.len() {
         if let Some(delim) = fence_delimiter(raw_lines[i]) {
-            match open_fence {
-                Some(open) if open == delim => open_fence = None,
-                None => open_fence = Some(delim),
-                _ => {}
+            if let Some(close) = find_fence_close(&raw_lines, i, delim) {
+                if markdown_table_fence_delimiter(raw_lines[i]).is_some()
+                    && has_parseable_table(&raw_lines, i + 1, close)
+                {
+                    push_table_blocks(&mut blocks, &raw_lines, markdown_start, i);
+                    push_table_blocks(&mut blocks, &raw_lines, i + 1, close);
+                } else {
+                    push_table_blocks(&mut blocks, &raw_lines, markdown_start, i);
+                    blocks.push(EitherBlock::Markdown(&raw_lines[i..=close]));
+                }
+                i = close + 1;
+                markdown_start = i;
+                continue;
             }
-            i += 1;
-            continue;
-        }
-
-        if open_fence.is_some() {
-            i += 1;
-            continue;
-        }
-
-        let parsed = parse_markdown_table_block(&raw_lines, i)
-            .or_else(|| parse_ascii_table_block(&raw_lines, i));
-
-        if let Some((mut table, consumed)) = parsed {
-            normalize_table_status_cells(&mut table);
-            if markdown_start < i {
-                blocks.push(EitherBlock::Markdown(&raw_lines[markdown_start..i]));
-            }
-            blocks.push(EitherBlock::Table(table));
-            i += consumed;
-            markdown_start = i;
-            continue;
+            push_table_blocks(&mut blocks, &raw_lines, markdown_start, i);
+            blocks.push(EitherBlock::Markdown(&raw_lines[i..]));
+            markdown_start = raw_lines.len();
+            break;
         }
 
         i += 1;
     }
 
-    if markdown_start < raw_lines.len() {
-        blocks.push(EitherBlock::Markdown(&raw_lines[markdown_start..]));
-    }
+    push_table_blocks(&mut blocks, &raw_lines, markdown_start, raw_lines.len());
 
     let mut result_lines: Vec<Line<'static>> = Vec::new();
     for block in blocks {
@@ -4890,17 +4712,11 @@ fn markdown_text(body: &str, base_style: Style, max_total_width: u16) -> Text<'s
                 result_lines.extend(rendered.style(base_style).lines);
             }
             EitherBlock::Table(table) => {
-                if let Some(lines) =
-                    render_semantic_table_lines(&table, base_style, max_total_width as usize)
-                {
-                    result_lines.extend(lines);
-                } else {
-                    result_lines.extend(render_table_lines(
-                        &table,
-                        base_style,
-                        max_total_width as usize,
-                    ));
-                }
+                result_lines.extend(render_table_lines(
+                    &table,
+                    base_style,
+                    max_total_width as usize,
+                ));
             }
         }
     }
@@ -5389,7 +5205,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 Span::styled(name.clone(), name_style),
             ];
 
-            let summary_body = clean_status_cell(tool_summary_body(name, summary));
+            let summary_body = normalized_table_cell_text(tool_summary_body(name, summary));
             let mut body_spans = Vec::new();
             if !summary_body.is_empty() {
                 body_spans.push(Span::raw(": "));
@@ -6056,6 +5872,7 @@ fn cached_transcript_render(
     item: &Line_,
     width: u16,
 ) -> (Text<'static>, u16) {
+    let render_width = transcript_render_width(width);
     if let Line_::PermissionPrompt {
         tool,
         command,
@@ -6063,8 +5880,8 @@ fn cached_transcript_render(
         ..
     } = item
     {
-        let text = permission_prompt_text(tool, command, *risk, width);
-        let height = text.lines.len().max(1).min(u16::MAX as usize) as u16;
+        let text = permission_prompt_text(tool, command, *risk, render_width);
+        let height = text_visual_height(&text, render_width);
         return (text, height);
     }
 
@@ -6085,7 +5902,6 @@ fn cached_transcript_render(
             heights: HashMap::new(),
         });
 
-    let render_width = transcript_render_width(width);
     let text = entry
         .renders
         .entry(render_width)
@@ -6151,18 +5967,21 @@ fn insert_transcript_item<B: Backend>(
     width: u16,
     tool_tint_parity: &mut bool,
 ) -> io::Result<()> {
-    let content_width = transcript_render_width(width);
-    let (text, height) = cached_transcript_render(state, item, content_width);
+    let render_width = transcript_render_width(width);
+    let (text, height) = cached_transcript_render(state, item, width);
     let tint_bg = match item {
         Line_::Thinking(_) => Some(THINKING_BG),
         Line_::Steering(_) => Some(STEERING_BG),
         _ => next_transcript_tint(item, tool_tint_parity),
     };
     terminal.insert_before(height, |buf| {
+        let area = Rect {
+            width: render_width.min(buf.area.width),
+            ..buf.area
+        };
         let para = Paragraph::new(text).wrap(Wrap { trim: false });
-        Widget::render(para, buf.area, buf);
+        Widget::render(para, area, buf);
         if let Some(bg) = tint_bg {
-            let area = buf.area;
             for y in area.top()..area.bottom() {
                 for x in area.left()..area.right() {
                     let cell = &mut buf[(x, y)];
@@ -6179,9 +5998,9 @@ fn insert_transcript_item<B: Backend>(
 fn rebuild_transcript<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &mut TuiState,
+    width: u16,
 ) -> io::Result<()> {
     terminal.clear()?;
-    let width = terminal.size()?.width;
     // mem::take instead of clone: rebuilds fire on resize/expand and the transcript can be
     // large. Nothing in the insert path reads state.transcript, so loaning it out is safe.
     let items = std::mem::take(&mut state.transcript);
@@ -6192,27 +6011,48 @@ fn rebuild_transcript<B: Backend>(
     }
     state.transcript = items;
     state.tool_tint_parity = tool_tint_parity;
+    state.transcript_rendered_width = width;
     state.transcript_needs_rebuild = false;
     Ok(())
+}
+
+fn transcript_pane_width(area_width: u16, area_height: u16, state: &TuiState) -> u16 {
+    compute_layout(Rect::new(0, 0, area_width, area_height), state)
+        .transcript_area
+        .width
+}
+
+fn current_transcript_pane_width<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &TuiState,
+) -> io::Result<u16> {
+    terminal.autoresize()?;
+    let size = terminal.size()?;
+    Ok(transcript_pane_width(size.width, size.height, state))
 }
 
 fn flush_pending_insert<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &mut TuiState,
+    width: u16,
 ) -> io::Result<()> {
+    if state.transcript_rendered_width != width && !state.transcript.is_empty() {
+        state.transcript_needs_rebuild = true;
+    }
     if state.transcript_needs_rebuild {
-        rebuild_transcript(terminal, state)?;
+        rebuild_transcript(terminal, state, width)?;
     }
 
     let raw: Vec<Line_> = std::mem::take(&mut state.pending_insert);
     let mut items: Vec<Line_> = merge_consecutive_tools(raw);
-    flush_prepared_items(terminal, state, &mut items)
+    flush_prepared_items(terminal, state, &mut items, width)
 }
 
 fn flush_prepared_items<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &mut TuiState,
     items: &mut Vec<Line_>,
+    width: u16,
 ) -> io::Result<()> {
     mark_retry_cycles(items);
     // Inline viewport output is real terminal scrollback: already-inserted lines cannot be
@@ -6241,13 +6081,13 @@ fn flush_prepared_items<B: Backend>(
         return Ok(());
     }
 
-    let width = terminal.size()?.width;
     let mut tool_tint_parity = state.tool_tint_parity;
     for item in items.iter() {
         insert_transcript_item(terminal, state, item, width, &mut tool_tint_parity)?;
     }
     state.tool_tint_parity = tool_tint_parity;
     state.transcript.append(items);
+    state.transcript_rendered_width = width;
     Ok(())
 }
 
@@ -8061,7 +7901,8 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
 
     while !state.quit {
         state.refresh_git_branch();
-        flush_pending_insert(&mut terminal, &mut state)?;
+        let width = current_transcript_pane_width(&mut terminal, &state)?;
+        flush_pending_insert(&mut terminal, &mut state, width)?;
         terminal.draw(|f| draw(f, &mut state))?;
         state.frame_count = state.frame_count.wrapping_add(1);
         let timeout = tick
@@ -8138,7 +7979,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
             state.apply_event(e);
         }
     }
-    let _ = flush_pending_insert(&mut terminal, &mut state);
+    if let Ok(width) = current_transcript_pane_width(&mut terminal, &state) {
+        let _ = flush_pending_insert(&mut terminal, &mut state, width);
+    }
     let _ = terminal.draw(|f| draw(f, &mut state));
 
     drop(key_rx);
@@ -11017,7 +10860,9 @@ mod tests {
             5,
         );
         state.queue(Line_::Banner(banner));
-        flush_pending_insert(&mut terminal, &mut state).expect("flush banner");
+        let size = terminal.size().expect("terminal size");
+        let width = transcript_pane_width(size.width, size.height, &state);
+        flush_pending_insert(&mut terminal, &mut state, width).expect("flush banner");
 
         let mut first = vec![tool_line(
             "#1.44",
@@ -11026,7 +10871,7 @@ mod tests {
             Some(true),
             "6410\talpha\n6411\tbravo\n",
         )];
-        flush_prepared_items(&mut terminal, &mut state, &mut first).expect("flush first");
+        flush_prepared_items(&mut terminal, &mut state, &mut first, width).expect("flush first");
         let mut second = vec![tool_line(
             "#1.45",
             "read_file",
@@ -11034,13 +10879,75 @@ mod tests {
             Some(true),
             "6412\tcharlie\n6413\tdelta\n",
         )];
-        flush_prepared_items(&mut terminal, &mut state, &mut second).expect("flush second");
+        flush_prepared_items(&mut terminal, &mut state, &mut second, width).expect("flush second");
 
         assert_eq!(state.transcript.len(), 3);
         assert!(matches!(state.transcript[0], Line_::Banner(_)));
         assert!(matches!(state.transcript[1], Line_::Tool { .. }));
         assert!(matches!(state.transcript[2], Line_::Tool { .. }));
         assert!(!state.transcript_needs_rebuild);
+    }
+
+    #[test]
+    fn resize_rebuilds_existing_transcript_for_current_pane_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::Assistant {
+            text: "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(5),
+            dim_prefix: false,
+        });
+
+        let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
+        flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript_rendered_width, wide);
+
+        terminal.backend_mut().resize(38, 20);
+        let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
+        assert!(narrow < wide);
+        flush_pending_insert(&mut terminal, &mut state, narrow).expect("narrow flush");
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript_rendered_width, narrow);
+        assert!(!state.transcript_needs_rebuild);
+
+        let item = state.transcript[0].clone();
+        let key = line_cache_key(&item);
+        let wide_render_width = transcript_render_width(wide);
+        let narrow_render_width = transcript_render_width(narrow);
+        {
+            let entry = state.render_cache.get(&key).expect("cache entry");
+            assert!(entry.renders.contains_key(&wide_render_width));
+            assert!(entry.renders.contains_key(&narrow_render_width));
+            assert!(entry.heights[&narrow_render_width] >= entry.heights[&wide_render_width]);
+        }
+
+        terminal.backend_mut().resize(110, 20);
+        let wider = current_transcript_pane_width(&mut terminal, &state).expect("wider width");
+        assert!(wider > narrow);
+        flush_pending_insert(&mut terminal, &mut state, wider).expect("wider flush");
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript_rendered_width, wider);
+        assert!(!state.transcript_needs_rebuild);
+
+        let wider_render_width = transcript_render_width(wider);
+        let entry = state.render_cache.get(&key).expect("cache entry");
+        assert!(entry.renders.contains_key(&wider_render_width));
     }
 
     #[test]
@@ -11198,7 +11105,7 @@ mod tests {
     }
 
     #[test]
-    fn table_spacing_adapts_on_narrow_width() {
+    fn table_grid_widths_require_room_for_true_borders() {
         let table = ParsedTable {
             rows: vec![vec!["a".into(), "b".into(), "c".into()]],
             header_rows: 0,
@@ -11208,12 +11115,12 @@ mod tests {
                 TableColumnAlignment::Left,
             ],
         };
-        assert_eq!(table_spacing(&table, 20), 1);
-        assert_eq!(table_spacing(&table, 6), 0);
+        assert!(table_grid_widths(&table, 20).is_some());
+        assert!(table_grid_widths(&table, 18).is_none());
     }
 
     #[test]
-    fn render_table_text_produces_bold_header_without_borders() {
+    fn render_table_text_produces_bold_header_with_borders() {
         let table = ParsedTable {
             rows: vec![
                 vec!["Key".into(), "Value".into()],
@@ -11234,19 +11141,21 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!flat.is_empty(), "should have rows");
         assert!(
-            flat[0].contains("Key"),
-            "header row should contain Key: {:?}",
-            flat[0]
+            flat[0].starts_with('┌') && flat[0].ends_with('┐'),
+            "table should start with a top border: {flat:?}"
         );
         assert!(
-            flat[0].contains("Value"),
-            "header row should contain Value: {:?}",
-            flat[0]
+            flat.last()
+                .is_some_and(|line| line.starts_with('└') && line.ends_with('┘')),
+            "table should end with a bottom border: {flat:?}"
         );
+        let header_line = flat
+            .iter()
+            .find(|line| line.contains("Key") && line.contains("Value"))
+            .expect("header row");
         assert!(
-            flat.iter()
-                .all(|line| !line.contains('┌') && !line.contains('└') && !line.contains('│')),
-            "borderless table should not contain box-drawing chars: {flat:?}"
+            header_line.starts_with('│') && header_line.ends_with('│'),
+            "header row should be inside side borders: {flat:?}"
         );
         assert!(
             flat.iter()
@@ -11254,11 +11163,15 @@ mod tests {
             "data row should contain name/dext: {flat:?}"
         );
 
-        let header_style = rendered[0]
-            .spans
+        let header_style = rendered
             .iter()
-            .find(|span| span.content.contains("Key"))
-            .map(|span| span.style)
+            .find(|line| line.spans.iter().any(|span| span.content.contains("Key")))
+            .and_then(|line| {
+                line.spans
+                    .iter()
+                    .find(|span| span.content.contains("Key"))
+                    .map(|span| span.style)
+            })
             .expect("header span");
         assert!(
             header_style.fg.is_none() || header_style.fg == Some(Color::Reset),
@@ -11268,23 +11181,31 @@ mod tests {
     }
 
     #[test]
-    fn markdown_text_renders_generic_status_table_with_surrounding_prose() {
+    fn markdown_text_renders_generic_status_table_with_borders_and_surrounding_prose() {
         let input =
             "## Results\n\n| Tool | Status |\n| --- | ------ |\n| rg | ok |\n| fd | ok |\n\nDone.";
         let text = markdown_text(input, Style::default(), 120);
         let flat = flatten_lines(&text);
         let joined = flat.join("\n");
         assert!(
-            joined.contains("Checks"),
-            "should rewrite status table semantically: {joined}"
+            flat.iter()
+                .any(|line| line.starts_with('┌') && line.ends_with('┐')),
+            "should render table with a top border: {joined}"
         );
         assert!(
-            joined.contains("✓ rg"),
-            "should have semantic check row: {joined}"
+            flat.iter()
+                .any(|line| line.contains("Tool") && line.contains("Status")),
+            "should keep table header: {joined}"
         );
         assert!(
-            joined.contains("✓ fd"),
-            "should have semantic check row: {joined}"
+            flat.iter()
+                .any(|line| line.contains("rg") && line.contains("PASS")),
+            "{joined}"
+        );
+        assert!(
+            flat.iter()
+                .any(|line| line.contains("fd") && line.contains("PASS")),
+            "{joined}"
         );
         assert!(joined.contains("Done"), "should have trailing text");
     }
@@ -11297,27 +11218,36 @@ mod tests {
         let joined = flat.join("\n");
         assert!(joined.contains("line one"));
         assert!(joined.contains("line two"));
-        assert!(joined.contains("Checks"));
+        assert!(flat.iter().any(|line| line.starts_with('┌')), "{joined}");
+        assert!(
+            flat.iter()
+                .any(|line| line.contains("rg") && line.contains("PASS")),
+            "{joined}"
+        );
         assert!(!joined.contains('\r'));
     }
 
     #[test]
-    fn markdown_text_skips_tables_inside_fenced_code_blocks() {
+    fn markdown_text_unwraps_markdown_fenced_tables() {
         let input = "```md\n| A | B |\n| --- | --- |\n| 1 | 2 |\n```";
         let text = markdown_text(input, Style::default(), 120);
         let flat = flatten_lines(&text);
-        assert!(
-            !flat.iter().any(|line| line.starts_with('┌')),
-            "fenced code should stay code, not table"
-        );
-        assert!(
-            flat.iter().any(|line| line.trim().contains("A | B")),
-            "{flat:?}"
-        );
-        assert!(
-            flat.iter().any(|line| line.trim().contains("1 | 2")),
-            "{flat:?}"
-        );
+        let joined = flat.join("\n");
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains("A") && joined.contains("B"), "{joined}");
+        assert!(joined.contains("1") && joined.contains("2"), "{joined}");
+        assert!(!joined.contains("```"), "{joined}");
+    }
+
+    #[test]
+    fn markdown_text_unwraps_markdown_fenced_tables_with_attributes() {
+        let input = "```{.markdown}\n| A | B |\n| --- | --- |\n| 1 | 2 |\n```";
+        let text = markdown_text(input, Style::default(), 120);
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains("A") && joined.contains("B"), "{joined}");
+        assert!(joined.contains("1") && joined.contains("2"), "{joined}");
+        assert!(!joined.contains("```"), "{joined}");
     }
 
     #[test]
@@ -11359,35 +11289,62 @@ mod tests {
     }
 
     #[test]
+    fn status_normalization_respects_header_and_preserves_regular_yes_no() {
+        let input = "| Question | Answer |\n| --- | --- |\n| Enabled | Yes |\n| Disabled | No |";
+        let text = markdown_text(input, Style::default(), 120);
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains("Enabled"), "{joined}");
+        assert!(joined.contains("Yes"), "{joined}");
+        assert!(joined.contains("Disabled"), "{joined}");
+        assert!(joined.contains("No"), "{joined}");
+        assert!(!joined.contains("PASS"), "{joined}");
+        assert!(!joined.contains("FAIL"), "{joined}");
+    }
+
+    #[test]
+    fn status_normalization_handles_marked_up_status_header() {
+        let input = "| Check | **Status** |\n| --- | --- |\n| Server | yes |\n| Cache | no |";
+        let text = markdown_text(input, Style::default(), 120);
+        let joined = flatten_lines(&text).join("\n");
+        assert!(joined.contains("Server"), "{joined}");
+        assert!(joined.contains("PASS"), "{joined}");
+        assert!(joined.contains("Cache"), "{joined}");
+        assert!(joined.contains("FAIL"), "{joined}");
+        assert!(!joined.contains("yes"), "{joined}");
+        assert!(!joined.contains("no"), "{joined}");
+    }
+
+    #[test]
     fn status_cells_use_single_terminal_safe_token() {
         let input = "| Check | Result |\n| --- | --- |\n| Server | ✅ Yes |\n| Cache | ✓ No |";
         let text = markdown_text(input, Style::default(), 120);
         let joined = flatten_lines(&text).join("\n");
-        assert!(joined.contains("Checks"), "{joined}");
-        assert!(joined.contains("✓ Server"), "{joined}");
-        assert!(joined.contains("✗ Cache"), "{joined}");
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains("Server"), "{joined}");
+        assert!(joined.contains("PASS"), "{joined}");
+        assert!(joined.contains("Cache"), "{joined}");
+        assert!(joined.contains("FAIL"), "{joined}");
         assert!(!joined.contains("✅"), "{joined}");
         assert!(!joined.contains("Yes"), "{joined}");
+        assert!(!joined.contains("No"), "{joined}");
     }
 
     #[test]
-    fn overloaded_table_rewrites_to_semantic_sections() {
+    fn overloaded_table_renders_as_bordered_table() {
         let input = "| Area | Item | Result | Value | Recommendation |\n| --- | --- | --- | --- | --- |\n| Check | Model installed | ✅ Yes | | |\n| Performance | Best observed generation | | 10.87 tok/s | |\n| Constraint | WSL currently exposes | | ~15 GiB | |\n| Next step | Increase WSL memory | | | edit ~/.wslconfig and restart WSL |";
         let text = markdown_text(input, Style::default(), 120);
         let joined = flatten_lines(&text).join("\n");
-        assert!(joined.contains("Checks"), "{joined}");
-        assert!(joined.contains("Performance"), "{joined}");
-        assert!(joined.contains("Constraint"), "{joined}");
-        assert!(joined.contains("Next step"), "{joined}");
-        assert!(joined.contains("✓ Model installed"), "{joined}");
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains("Area"), "{joined}");
+        assert!(joined.contains("Item"), "{joined}");
+        assert!(joined.contains("Result"), "{joined}");
+        assert!(joined.contains("Recommendation"), "{joined}");
+        assert!(joined.contains("Model installed"), "{joined}");
+        assert!(joined.contains("PASS"), "{joined}");
         assert!(joined.contains("Best observed generation"), "{joined}");
         assert!(joined.contains("10.87 tok/s"), "{joined}");
         assert!(joined.contains("~15 GiB"), "{joined}");
         assert!(joined.contains("edit ~/.wslconfig"), "{joined}");
-        assert!(
-            !joined.contains('┌'),
-            "semantic rewrite should not render as bordered table: {joined}"
-        );
     }
 
     #[test]
@@ -11496,9 +11453,10 @@ mod tests {
     }
 
     #[test]
-    fn truncate_cell_drops_duplicate_boolean_marker() {
-        assert_eq!(truncate_cell("✅ Yes", 10), "PASS");
-        assert_eq!(truncate_cell("✓ No", 10), "FAIL");
+    fn clean_table_status_cell_drops_duplicate_boolean_marker() {
+        assert_eq!(clean_table_status_cell("✅ Yes"), "PASS");
+        assert_eq!(clean_table_status_cell("✓ No"), "FAIL");
+        assert_eq!(clean_table_status_cell("❌ Yes"), "PASS");
     }
 
     #[test]
@@ -11584,11 +11542,10 @@ mod tests {
     }
 
     #[test]
-    fn truncate_cell_respects_width() {
-        assert_eq!(truncate_cell("hello", 3), "he…");
-        assert_eq!(truncate_cell("hi", 5), "hi");
-        assert_eq!(truncate_cell("abc", 0), "");
-        assert_eq!(truncate_cell("abcdef", 1), "…");
+    fn table_wrap_cell_respects_width() {
+        assert_eq!(table_wrap_cell("hello world", 5), vec!["hello", "world"]);
+        assert_eq!(table_wrap_cell("hi", 5), vec!["hi"]);
+        assert_eq!(table_wrap_cell("", 5), vec![""]);
     }
 
     #[test]
