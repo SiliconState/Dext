@@ -5578,10 +5578,26 @@ fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
 }
 
 #[test]
-fn tiny_and_frugal_systems_preserve_tool_protocol_guardrails_without_standard_prompt_change() {
+fn systems_preserve_tool_protocol_guardrails_and_table_guidance() {
     assert!(
         !DEFAULT_SYSTEM.contains("Never print raw tool syntax"),
-        "standard prompt should stay unchanged: {DEFAULT_SYSTEM}"
+        "standard prompt should not carry frugal-only tool syntax guardrails: {DEFAULT_SYSTEM}"
+    );
+    assert!(
+        DEFAULT_SYSTEM.contains("consolidate them into one grouped table"),
+        "standard prompt should steer related table groups: {DEFAULT_SYSTEM}"
+    );
+    assert!(
+        DEFAULT_SYSTEM.contains("one physical line per row"),
+        "standard prompt should avoid renderer-hostile row wrapping: {DEFAULT_SYSTEM}"
+    );
+    assert!(
+        DEFAULT_SYSTEM.contains("emoji verdict icons") && DEFAULT_SYSTEM.contains("unescaped `|`"),
+        "standard prompt should call out fragile table-cell content: {DEFAULT_SYSTEM}"
+    );
+    assert!(
+        DEFAULT_SYSTEM.contains("Avoid stacked heading+table blocks"),
+        "standard prompt should avoid renderer-hostile table stacks: {DEFAULT_SYSTEM}"
     );
 
     let root = temp_test_dir("frugal-tool-protocol-note");
@@ -5603,6 +5619,14 @@ fn tiny_and_frugal_systems_preserve_tool_protocol_guardrails_without_standard_pr
     );
     assert!(
         TINY_SYSTEM.contains("prefill the TUI input"),
+        "{TINY_SYSTEM}"
+    );
+    assert!(
+        TINY_SYSTEM.contains("related data -> one grouped table"),
+        "{TINY_SYSTEM}"
+    );
+    assert!(
+        TINY_SYSTEM.contains("one row/line") && TINY_SYSTEM.contains("no emoji"),
         "{TINY_SYSTEM}"
     );
     let _ = std::fs::remove_dir_all(&root);
