@@ -4139,7 +4139,11 @@ fn clean_table_status_cell(cell: &str) -> String {
         return status_token(value);
     }
     if let Some((icon_value, rest)) = status_icon_value(&text) {
-        return status_token(status_word_value(rest).unwrap_or(icon_value));
+        let value = status_word_value(rest).unwrap_or(icon_value);
+        if value != icon_value {
+            return status_token(false);
+        }
+        return status_token(value);
     }
     text
 }
@@ -11453,10 +11457,11 @@ mod tests {
     }
 
     #[test]
-    fn clean_table_status_cell_drops_duplicate_boolean_marker() {
+    fn clean_table_status_cell_normalizes_status_signals_safely() {
         assert_eq!(clean_table_status_cell("✅ Yes"), "PASS");
         assert_eq!(clean_table_status_cell("✓ No"), "FAIL");
-        assert_eq!(clean_table_status_cell("❌ Yes"), "PASS");
+        assert_eq!(clean_table_status_cell("❌ Yes"), "FAIL");
+        assert_eq!(clean_table_status_cell("✅ No"), "FAIL");
     }
 
     #[test]
