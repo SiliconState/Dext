@@ -482,7 +482,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li><code>wire_tools_oai()</code> — OpenAI <code>function</code> type format</li>
 <li><code>wire_tools_chatgpt()</code> — ChatGPT flattened format with <code>strict: null</code></li>
 </ul>
-<p>Runtime-only slash commands (<code>subagent</code>, <code>pack</code>, <code>shelves</code>) are intentionally separate from provider-visible tools. <code>/browser</code> controls the optional browser recipe, while the provider-visible <code>browser</code> tool is only useful when that recipe is enabled and <code>agent-browser</code> is installed.</p>
+<p>Runtime-only slash commands (<code>pack</code>, <code>shelves</code>) are intentionally separate from provider-visible tools. <code>/browser</code> controls the optional browser recipe, while the provider-visible <code>browser</code> tool is only useful when that recipe is enabled and <code>agent-browser</code> is installed.</p>
 </div>
 </section>
 
@@ -920,7 +920,6 @@ description: One-line workflow summary
 <tr><td><code>/plan &lt;task&gt;</code></td><td>Run read-only planning and seed the plan into history</td></tr>
 <tr><td><code>/budget [cap]</code></td><td>Set or show budget cap</td></tr>
 <tr><td><code>/browser [off|agent-browser|status]</code></td><td>Browser automation control</td></tr>
-<tr><td><code>/subagent &lt;task&gt; [options]</code></td><td>Run a subagent task</td></tr>
 <tr><td><code>/pack list|inspect|run</code></td><td>Pack management</td></tr>
 <tr><td><code>/shelves</code></td><td>Show shelf registry</td></tr>
 <tr><td><code>/undo [--list|--apply|&lt;id&gt;]</code></td><td>Recovery checkpoint preview/apply management</td></tr>

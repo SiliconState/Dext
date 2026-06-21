@@ -262,10 +262,6 @@ pub(crate) fn session_artifacts_dir(root: &Path, session_id: &str) -> PathBuf {
     session_state_dir(root, session_id).join("artifacts")
 }
 
-pub(crate) fn session_subagents_dir(root: &Path, session_id: &str) -> PathBuf {
-    session_state_dir(root, session_id).join("subagents")
-}
-
 pub(crate) fn session_sudo_dir(root: &Path, session_id: &str) -> PathBuf {
     session_state_dir(root, session_id).join("sudo")
 }

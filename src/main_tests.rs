@@ -108,7 +108,6 @@ fn test_agent(root: &Path) -> Agent {
         provider_health: ProviderHealthLedger::default(),
         track_origin: None,
         privacy: PrivacyPolicy::default(),
-        detached_subagent_steer_path: None,
         checkpoint_cache: git_checkpoints::RepoRootCache::new(),
         checkpoint_ordinal: 0,
         prompt_scan_cache: Mutex::new(None),
@@ -756,6 +755,56 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
     );
     assert!(steering_rx.try_recv().is_err());
     assert!(input_rx.try_recv().is_err());
+}
+
+#[test]
+fn busy_console_input_allows_public_copied_text_as_steering() {
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (runtime_control_tx, mut runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+    let busy = AtomicBool::new(true);
+
+    for pasted in [
+        "https://x.com/zephyr_z9/status/1234567890123456789\n",
+        "zephyr_z9\n",
+        "@zephyr_z9\n",
+        "d6280ad878e3\n",
+    ] {
+        let route = route_interactive_input_line(
+            pasted.to_string(),
+            &busy,
+            &input_tx,
+            &runtime_control_tx,
+            &steering_tx,
+        );
+
+        assert_eq!(route, InteractiveInputRoute::SteeringQueued);
+        assert_eq!(steering_rx.try_recv().ok().as_deref(), Some(pasted.trim()));
+        assert!(runtime_control_rx.try_recv().is_err());
+        assert!(input_rx.try_recv().is_err());
+    }
+}
+
+#[test]
+fn potential_local_secret_detection_keeps_targeted_secret_coverage() {
+    assert!(text_is_potential_local_secret("token=abcdefghijklmnopqrstuvwxyz"));
+    assert!(text_is_potential_local_secret(
+        "Bearer sk-secret-token-that-should-stay-local"
+    ));
+    assert!(text_is_potential_local_secret(
+        "{\"accessToken\":\"secret-token-that-should-go-to-login\"}"
+    ));
+    assert!(text_is_potential_local_secret(
+        "/login chatgpt sk-secret-token-that-should-stay-local"
+    ));
+    assert!(text_is_potential_local_secret("sk-secret-token-that-should-stay-local"));
+    assert!(!text_is_potential_local_secret(
+        "d6280ad878e35256aa76aaf02d6bc62c3d850ab1"
+    ));
+    assert!(!text_is_potential_local_secret("https://x.com/zephyr_z9"));
+    assert!(!text_is_potential_local_secret("zephyr_z9"));
+    assert!(!text_is_potential_local_secret("@zephyr_z9"));
+    assert!(!text_is_potential_local_secret("d6280ad878e3"));
 }
 
 #[test]
@@ -1518,36 +1567,6 @@ fn session_replay_fixture_dedupe_cache_preserves_success_and_error_hits() -> Res
         replay.assistant_text().contains("deduped"),
         "{}",
         replay.assistant_text()
-    );
-    Ok(())
-}
-
-#[test]
-fn session_replay_fixture_ignores_irrelevant_subagent_and_handles_queued_update() -> Result<()> {
-    let replay = SessionReplayFixture::load("irrelevant_subagent_queued_update")?;
-    assert!(
-        !replay
-            .header
-            .exposed_tools
-            .contains(&"subagent".to_string())
-    );
-    assert_eq!(replay.tool_call_count("subagent"), 0);
-    assert_eq!(replay.tool_call_count("rg"), 1);
-    assert_eq!(replay.tool_call_count("read_file"), 1);
-    assert!(
-        replay.tool_names_after_marker("wealthtrak subagent is irrelevant")
-            == vec!["read_file".to_string()],
-        "expected Dext-source work after queued update, got {:?}",
-        replay.tool_names_after_marker("wealthtrak subagent is irrelevant")
-    );
-    let assistant = replay.assistant_text();
-    assert!(
-        assistant.contains("ignored the detached wealthtrak subagent"),
-        "{assistant}"
-    );
-    assert!(
-        assistant.contains("provider-visible tools exclude subagent"),
-        "{assistant}"
     );
     Ok(())
 }
@@ -4914,116 +4933,6 @@ fn dedupe_cache_short_circuit_preserves_cached_error_semantics_regression() {
 }
 
 #[test]
-fn subagent_request_inherits_parent_capability_profile() {
-    let root = temp_test_dir("subagent-request-profile");
-    let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let mut agent = test_agent(&root);
-    agent.set_approval_profile(ApprovalProfile::Always);
-    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
-    agent.set_browser_recipe(BrowserRecipe::AgentBrowser);
-    agent.set_thinking_effort(ThinkingEffort::High);
-    agent.tool_context_profile = ToolContextProfile::Full;
-    agent.context_mode = ContextMode::Frugal;
-    agent.tool_profile = ToolProfile::Lean;
-    agent.set_budget_cap(BudgetCap::parse("25k tokens"));
-    agent.privacy.enabled = false;
-
-    let input = json!({
-        "task": "survey repo",
-        "allowed_tools": ["rg", "read_file"],
-        "max_iterations": 7,
-    });
-    let request = SubagentRequest::from_input(&agent, &input).expect("request");
-    assert_eq!(request.approval_profile, ApprovalProfile::Always);
-    assert_eq!(request.sandbox_profile, SandboxProfile::DangerFullAccess);
-    assert_eq!(request.browser_recipe, BrowserRecipe::AgentBrowser);
-    assert_eq!(request.thinking_effort, ThinkingEffort::High);
-    assert_eq!(request.context_mode, ContextMode::Frugal);
-    assert_eq!(request.tool_context_profile, ToolContextProfile::Frugal);
-    assert_eq!(request.tool_profile, ToolProfile::Lean);
-    assert!(!tool_name_allowed_in_profile(
-        "http",
-        ToolContextProfile::Frugal
-    ));
-    assert_eq!(request.max_iterations, Some(7));
-    assert_eq!(
-        request.allowed_tools,
-        Some(vec!["rg".into(), "read_file".into()])
-    );
-    assert!(!request.privacy_enabled);
-    assert_eq!(request.to_tool_input()["task"], "survey repo");
-    assert_eq!(
-        request.to_tool_input()["tool_context_profile"],
-        json!("frugal")
-    );
-    assert_eq!(request.to_tool_input()["tool_profile"], json!("lean"));
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn subagent_detached_artifacts_are_session_scoped() {
-    let _guard = env_lock();
-    let root = temp_test_dir("subagent-artifacts");
-    let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let dext_home = root.join("dext-home");
-    unsafe {
-        std::env::set_var("DEXT_HOME", &dext_home);
-        std::env::remove_var("DEXT_SESSIONS_DIR");
-    }
-    let request = SubagentRequest {
-        task: "noop".to_string(),
-        ..SubagentRequest::default()
-    };
-    let (input_path, output_path, steer_path) =
-        write_subagent_input(&root, "sub-session", &request).expect("write subagent input");
-    assert!(
-        input_path.starts_with(session_subagents_dir(&root, "sub-session")),
-        "{}",
-        input_path.display()
-    );
-    assert!(
-        output_path.starts_with(session_subagents_dir(&root, "sub-session")),
-        "{}",
-        output_path.display()
-    );
-    assert!(input_path.exists(), "{}", input_path.display());
-    assert!(output_path.exists(), "{}", output_path.display());
-    assert!(steer_path.exists(), "{}", steer_path.display());
-    assert_eq!(
-        input_path
-            .extension()
-            .and_then(|e: &std::ffi::OsStr| e.to_str()),
-        Some("json")
-    );
-    assert_eq!(
-        output_path
-            .extension()
-            .and_then(|e: &std::ffi::OsStr| e.to_str()),
-        Some("md")
-    );
-    assert_eq!(
-        steer_path
-            .extension()
-            .and_then(|e: &std::ffi::OsStr| e.to_str()),
-        Some("steer")
-    );
-    assert_eq!(subagent_steer_path_for_output(&output_path), steer_path);
-    let parsed: SubagentRequest =
-        serde_json::from_slice(&std::fs::read(&input_path).unwrap()).unwrap();
-    assert_eq!(parsed.task, "noop");
-    let output = std::fs::read_to_string(&output_path).unwrap();
-    assert!(output.contains("# Dext subagent output bundle"), "{output}");
-    assert!(output.contains("## Logs"), "{output}");
-
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(session_subagents_dir(&root, "sub-session"));
-    unsafe {
-        std::env::remove_var("DEXT_HOME");
-    }
-}
-
-#[test]
 fn current_dext_executable_falls_back_to_path_when_current_exe_missing() {
     let _guard = env_lock();
     let root = temp_test_dir("dext-exe-path-fallback");
@@ -5058,52 +4967,9 @@ fn current_dext_executable_falls_back_to_path_when_current_exe_missing() {
 }
 
 #[test]
-fn subagent_runtime_renders_report_with_quality_gate() {
-    let report = SubagentRunReport {
-        task: "research".to_string(),
-        max_iterations: Some(3),
-        iterations: 1,
-        calls: 0,
-        failed_calls: 0,
-        elapsed: std::time::Duration::from_millis(12),
-        halted_reason: None,
-        traces: Vec::new(),
-        final_text: "source inspected: docs\nverification run: none\nfiles touched: none\nuncertainty/open questions: none\nconfidence: medium\nexact recommended edits: none\nremaining risks: none"
-            .to_string(),
-    };
-    let rendered = render_subagent_report(&report);
-    assert!(rendered.contains("=== SUBAGENT RESULT ==="), "{rendered}");
-    assert!(rendered.contains("(no tool calls)"), "{rendered}");
-    assert!(!rendered.contains("quality gate"), "{rendered}");
-}
-
-#[test]
 fn shell_single_quote_handles_spaces_and_quotes() {
     #[cfg(unix)]
     assert_eq!(shell_single_quote("a b'c"), "'a b'\\''c'");
-}
-
-#[test]
-fn subagent_quality_gate_requires_structured_handoff_headings() {
-    let good = "source inspected: src/main.rs\nverification run: cargo test\nfiles touched: src/main.rs\nuncertainty/open questions: none\nconfidence: high\nexact recommended edits: applied\nremaining risks: TUI manual check";
-    assert!(subagent_quality_gate_missing(good).is_empty());
-
-    let bad = "I looked around and it seems fine. No remaining risks were found.";
-    let missing = subagent_quality_gate_missing(bad);
-    assert!(missing.contains(&"source inspected"), "{missing:?}");
-    assert!(missing.contains(&"verification run"), "{missing:?}");
-    assert!(missing.contains(&"exact recommended edits"), "{missing:?}");
-    assert!(missing.contains(&"remaining risks"), "{missing:?}");
-}
-
-#[test]
-fn slash_subagent_command_usage_is_registered() {
-    let cmd = slash_command_definitions()
-        .into_iter()
-        .find(|cmd| cmd.name == "subagent")
-        .expect("subagent slash command");
-    assert!(cmd.usage.starts_with("/subagent <task>"));
-    assert!(cmd.description.contains("provider-visible tools"));
 }
 
 #[test]
@@ -6835,7 +6701,7 @@ fn provider_runtime_and_slash_registries_are_split() {
         .iter()
         .map(|tool| tool.name)
         .collect();
-    assert!(!provider_names.contains("subagent"));
+    assert!(!provider_names.contains("nonexistent_tool"));
     assert!(provider_names.contains("read_file"));
     assert!(provider_names.contains("jq"));
     assert!(provider_names.contains("csvkit"));
@@ -6858,57 +6724,21 @@ fn provider_runtime_and_slash_registries_are_split() {
     assert!(!default_names.contains("csvkit"));
     assert!(!default_names.contains("git_log"));
 
-    let runtime_names: HashSet<&str> = runtime_tool_definitions()
-        .iter()
-        .map(|tool| tool.name)
-        .collect();
-    assert!(runtime_names.contains("subagent-runtime"));
-    assert!(!runtime_names.contains("read_file"));
-
     assert_eq!(
         BrowserRecipe::parse("agentbrowser"),
         Some(BrowserRecipe::AgentBrowser)
     );
 
-    let slash_names: HashSet<&str> = slash_command_definitions()
+    let slash_names: HashSet<&str> = tools::slash_command_definitions()
         .iter()
         .map(|cmd| cmd.name)
         .collect();
-    assert!(slash_names.contains("subagent"));
     assert!(slash_names.contains("browser"));
     assert!(slash_names.contains("tools"));
     assert!(!slash_names.contains("toolset"));
     assert!(slash_names.contains("pack"));
     assert!(slash_names.contains("shelves"));
     assert!(!slash_names.contains("read_file"));
-    assert!(provider_names.is_disjoint(&runtime_names));
-}
-
-#[test]
-fn subagent_is_hidden_from_model_tool_state() {
-    let root = temp_test_dir("subagent-hidden");
-    let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let mut agent = test_agent(&root);
-    agent.allowed.insert("subagent".to_string());
-    assert!(!needs_permission("subagent"));
-    assert!(!agent.tools.iter().any(|t| t.name == "subagent"));
-    let header = agent.session_header();
-    assert!(!header.allowed.contains(&"subagent".to_string()));
-    assert!(!header.exposed_tools.contains(&"subagent".to_string()));
-    assert!(!header.auto_approved_tools.contains(&"subagent".to_string()));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    agent.set_sink(Box::new(ChannelSink { tx }));
-    assert_eq!(handle_slash("/allowed", &mut agent), Some(true));
-    let slash = drain_events(&mut rx)
-        .into_iter()
-        .find_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
-            _ => None,
-        })
-        .unwrap_or_default();
-    assert!(slash.contains("(none)"), "{slash}");
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -6975,7 +6805,7 @@ fn checkpoint_debounce_skips_rapid_non_critical_writes() {
 #[test]
 fn suppressed_checkpoints_do_not_clobber_parent_session() {
     let _guard = env_lock();
-    let root = temp_test_dir("subagent-no-clobber");
+    let root = temp_test_dir("checkpoint-no-clobber");
     let sessions = root.join("sessions");
     // Safe: test holds a global lock around env mutation.
     unsafe { std::env::set_var("DEXT_SESSIONS_DIR", &sessions) };
@@ -7001,7 +6831,7 @@ fn suppressed_checkpoints_do_not_clobber_parent_session() {
         sub.history.push(Message {
             role: "user".to_string(),
             content: vec![Block::Text {
-                text: "subagent-message".to_string(),
+                text: "child-message".to_string(),
             }],
         });
         sub.checkpoint_latest_session("sub_should_noop");
@@ -7009,11 +6839,11 @@ fn suppressed_checkpoints_do_not_clobber_parent_session() {
         let after_sub = std::fs::read_to_string(&session_path)?;
         assert!(
             after_sub.contains("parent-message"),
-            "parent session was clobbered by subagent: {after_sub}"
+            "parent session was clobbered by child: {after_sub}"
         );
         assert!(
-            !after_sub.contains("subagent-message"),
-            "subagent leaked into parent session: {after_sub}"
+            !after_sub.contains("child-message"),
+            "child leaked into parent session: {after_sub}"
         );
         Ok(())
     })();
@@ -7021,7 +6851,7 @@ fn suppressed_checkpoints_do_not_clobber_parent_session() {
     // Safe: test holds a global lock around env mutation.
     unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
     let _ = std::fs::remove_dir_all(&root);
-    result.expect("subagent checkpoint suppression");
+    result.expect("checkpoint suppression");
 }
 
 #[test]
@@ -7070,30 +6900,6 @@ async fn bash_tool_honors_input_timeout() {
     .await
     .expect_err("expected input timeout");
     assert!(err.contains("timed out after 1s running bash"), "{err}");
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn model_side_subagent_tool_call_does_not_launch_runtime() {
-    let root = temp_test_dir("model-subagent-blocked");
-    let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let out = execute_builtin_call(
-        "subagent".to_string(),
-        json!({"task": "do a thing"}),
-        root.clone(),
-        Arc::new(AtomicBool::new(false)),
-        None,
-        None,
-        None,
-        SandboxProfile::WorkspaceWrite,
-    )
-    .await
-    .expect("model-side subagent guidance");
-    assert!(out.contains("not a provider-visible tool"), "{out}");
-    assert!(
-        !session_subagents_dir(&root, "blocked").exists(),
-        "model-side subagent tool call must not create artifacts"
-    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -10692,14 +10498,6 @@ fn html_entity_decode_preserves_multibyte_utf8() {
 
     let text = extract_html_text("<p>caf\u{e9} &amp; cr\u{e8}me</p>");
     assert!(text.contains("caf\u{e9} & cr\u{e8}me"), "{text}");
-}
-
-#[test]
-fn compact_call_id_is_multibyte_safe() {
-    assert_eq!(compact_call_id("call_0123456789abcdef"), "#call_0123456");
-    assert_eq!(compact_call_id("sub.7.call_42"), "#call_42");
-    // 12 bytes lands mid-codepoint; must clamp to a char boundary, not panic.
-    assert_eq!(compact_call_id("toolcall\u{e9}\u{e9}\u{e9}\u{e9}"), "#toolcall\u{e9}\u{e9}");
 }
 
 #[test]

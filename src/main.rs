@@ -34,12 +34,12 @@ use session::{
     named_session_path_for_root, named_sessions_dir_for_root, new_session_id, parse_session_header,
     project_key, project_latest_session_path, release_registered_locks, render_limited_csv,
     restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
-    session_latest_session_path, session_state_lock_path, session_subagents_dir, session_sudo_dir,
+    session_latest_session_path, session_state_lock_path, session_sudo_dir,
     session_todo_path, unix_timestamp_secs,
 };
 use tools::{
     Tool, ToolProfile, is_external_process_tool, needs_permission, provider_tool_definitions,
-    runtime_tool_definitions, should_parallelize_builtin_tools, slash_command_definitions,
+    should_parallelize_builtin_tools,
 };
 
 #[cfg(test)]
@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const TOOL_RESULT_CAP: usize = 12_000;
@@ -564,19 +564,6 @@ fn normalize_tool_call_id(raw: &str, turn: u32, ordinal: usize) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-fn next_subagent_run_id() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-fn namespace_subagent_call_id(run_id: u64, call_id: &str) -> String {
-    format!("sub.{run_id}.{}", call_id)
-}
-
-fn namespace_subagent_batch_id(run_id: u64, batch_id: &str) -> String {
-    format!("sub.{run_id}.{}", batch_id)
 }
 
 #[derive(Debug, Default)]
@@ -1213,7 +1200,19 @@ pub(crate) fn text_is_potential_local_secret(text: &str) -> bool {
     if slash_login_contains_secret(trimmed) {
         return true;
     }
+    if contains_secretish_assignment(trimmed) {
+        return true;
+    }
+    if let Some(token) = strip_bearer_token(trimmed) {
+        return token.chars().count() >= 8;
+    }
+    if contains_known_secret_token(trimmed) {
+        return true;
+    }
     if trimmed.starts_with('/') || trimmed.starts_with('{') {
+        return false;
+    }
+    if looks_like_public_clipboard_reference(trimmed) {
         return false;
     }
     let words = trimmed.split_whitespace().count();
@@ -1221,6 +1220,181 @@ pub(crate) fn text_is_potential_local_secret(text: &str) -> bool {
         return false;
     }
     words <= 2 && trimmed.chars().count() >= 8
+}
+
+fn contains_secretish_assignment(text: &str) -> bool {
+    text.split(|c: char| c.is_whitespace() || matches!(c, '&' | '?' | ';' | ','))
+        .chain(text.lines())
+        .any(secretish_assignment_has_value)
+}
+
+fn secretish_assignment_has_value(segment: &str) -> bool {
+    let trimmed = segment.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '{' | '}' | '[' | ']' | '(' | ')')
+    });
+    let Some((key, value)) = trimmed.split_once('=').or_else(|| trimmed.split_once(':')) else {
+        return false;
+    };
+    let key = key
+        .trim()
+        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .rsplit(['/', '.'])
+        .next()
+        .unwrap_or(key);
+    let value = value.trim().trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '{' | '}' | '[' | ']' | '(' | ')')
+    });
+    let value_len = value.chars().count();
+    (secretish_key_name(key) && value_len >= 6) || (secretish_code_key(key) && value_len >= 12)
+}
+
+fn compact_key_name(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn secretish_key_name(key: &str) -> bool {
+    let compact = compact_key_name(key);
+    compact == "auth"
+        || compact == "authorization"
+        || compact == "passwd"
+        || compact == "pwd"
+        || compact == "privatekey"
+        || compact.ends_with("apikey")
+        || compact.ends_with("token")
+        || compact.contains("password")
+        || compact.contains("secret")
+}
+
+fn secretish_code_key(key: &str) -> bool {
+    matches!(
+        compact_key_name(key).as_str(),
+        "code" | "oauthcode" | "authorizationcode"
+    )
+}
+
+fn strip_bearer_token(text: &str) -> Option<&str> {
+    let prefix_len = "bearer".len();
+    let prefix = text.get(..prefix_len)?;
+    let rest = text.get(prefix_len..)?;
+    if prefix.eq_ignore_ascii_case("bearer")
+        && rest.chars().next().is_some_and(char::is_whitespace)
+    {
+        Some(rest.trim_start()).filter(|token| !token.is_empty())
+    } else {
+        None
+    }
+}
+
+fn contains_known_secret_token(text: &str) -> bool {
+    text.split(|c: char| c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '&' | '=' | ':' | ';' | ',' | '#'))
+        .any(|raw| {
+            let token = raw.trim_matches(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}')
+            });
+            let len = token.chars().count();
+            if len < 8 {
+                return false;
+            }
+            let lower = token.to_ascii_lowercase();
+            lower.starts_with("sk-")
+                || lower.starts_with("sk_")
+                || lower.starts_with("xoxb-")
+                || lower.starts_with("xoxp-")
+                || lower.starts_with("ghp_")
+                || lower.starts_with("github_pat_")
+                || lower.starts_with("glpat-")
+                || lower.starts_with("ya29.")
+                || (lower.starts_with("ac_") && len >= 16)
+                || (token.starts_with("AIza") && len >= 20)
+        })
+}
+
+fn looks_like_public_clipboard_reference(text: &str) -> bool {
+    let mut saw_reference = false;
+    for token in text.split_whitespace().map(|token| {
+        token.trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>')
+        })
+    }) {
+        if token.is_empty() {
+            continue;
+        }
+        if !(looks_like_url_reference(token)
+            || looks_like_social_handle(token)
+            || looks_like_git_sha(token))
+        {
+            return false;
+        }
+        saw_reference = true;
+    }
+    saw_reference
+}
+
+fn looks_like_url_reference(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if lower.contains("://") {
+        return !url_authority_has_userinfo(token);
+    }
+    if lower.starts_with("www.") {
+        return true;
+    }
+    token.split_once('/').is_some_and(|(host, rest)| {
+        if host.contains('@') {
+            return false;
+        }
+        let host = host
+            .split(':')
+            .next()
+            .unwrap_or(host);
+        !rest.is_empty() && looks_like_domain_name(host)
+    })
+}
+
+fn url_authority_has_userinfo(token: &str) -> bool {
+    let Some((_, rest)) = token.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.contains('@')
+}
+
+fn looks_like_domain_name(host: &str) -> bool {
+    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    let Some(tld) = host.rsplit('.').next() else {
+        return false;
+    };
+    (2..=24).contains(&tld.len())
+        && tld.chars().all(|c| c.is_ascii_alphabetic())
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+}
+
+fn looks_like_social_handle(token: &str) -> bool {
+    let Some(handle) = token.strip_prefix('@') else {
+        return (3..=15).contains(&token.len())
+            && token.contains('_')
+            && token.chars().any(|c| c.is_ascii_digit())
+            && token.chars().any(|c| c.is_ascii_lowercase())
+            && token
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    };
+    !handle.is_empty()
+        && handle.len() <= 15
+        && handle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn looks_like_git_sha(token: &str) -> bool {
+    let len = token.len();
+    matches!(len, 7..=12 | 40) && token.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn slash_login_contains_secret(trimmed: &str) -> bool {
@@ -1613,10 +1787,12 @@ impl EventSink for JsonSink {
     }
 }
 
+#[cfg(test)]
 struct ChannelSink {
     tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
 }
 
+#[cfg(test)]
 impl EventSink for ChannelSink {
     fn emit(&mut self, event: AgentEvent) {
         record_crash_event(&event);
@@ -1670,651 +1846,12 @@ impl EventSink for NullSink {
     fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubagentMode {
-    Inline,
-    Detached,
-}
-
-impl SubagentMode {
-    fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "inline" | "foreground" | "fg" => Some(Self::Inline),
-            "detached" | "background" | "bg" | "window" | "tmux" | "terminal" => {
-                Some(Self::Detached)
-            }
-            _ => None,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(default)]
-struct SubagentRequest {
-    task: String,
-    system: Option<String>,
-    allowed_tools: Option<Vec<String>>,
-    max_iterations: Option<u64>,
-    approval_profile: ApprovalProfile,
-    sandbox_profile: SandboxProfile,
-    browser_recipe: BrowserRecipe,
-    thinking_effort: ThinkingEffort,
-    context_mode: ContextMode,
-    tool_context_profile: ToolContextProfile,
-    tool_profile: ToolProfile,
-    budget_cap: Option<BudgetCap>,
-    privacy_enabled: bool,
-}
-
-impl Default for SubagentRequest {
-    fn default() -> Self {
-        Self {
-            task: String::new(),
-            system: None,
-            allowed_tools: None,
-            max_iterations: None,
-            approval_profile: ApprovalProfile::default(),
-            sandbox_profile: SandboxProfile::default(),
-            browser_recipe: BrowserRecipe::default(),
-            thinking_effort: ThinkingEffort::default(),
-            context_mode: ContextMode::default(),
-            tool_context_profile: ToolContextProfile::default(),
-            tool_profile: ToolProfile::default(),
-            budget_cap: None,
-            privacy_enabled: true,
-        }
-    }
-}
-
-impl SubagentRequest {
-    fn from_input(agent: &Agent, input: &Value) -> std::result::Result<Self, String> {
-        let task = input["task"].as_str().ok_or("missing task")?.to_string();
-        let system = input["system"].as_str().map(ToString::to_string);
-        let allowed_tools = input["allowed_tools"].as_array().map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        });
-        Ok(Self {
-            task,
-            system,
-            allowed_tools,
-            max_iterations: input["max_iterations"].as_u64(),
-            approval_profile: agent.approval_profile,
-            sandbox_profile: agent.sandbox_profile,
-            browser_recipe: agent.browser_recipe,
-            thinking_effort: agent.thinking_effort,
-            context_mode: agent.context_mode,
-            tool_context_profile: agent.tool_context_profile(),
-            tool_profile: agent.tool_profile,
-            budget_cap: agent.budget_cap,
-            privacy_enabled: agent.privacy.enabled,
-        })
-    }
-
-    fn to_tool_input(&self) -> Value {
-        let mut input = json!({
-            "task": self.task,
-            "tool_context_profile": self.tool_context_profile,
-            "tool_profile": self.tool_profile,
-        });
-        if let Some(max_iterations) = self.max_iterations {
-            input["max_iterations"] = json!(max_iterations);
-        }
-        if let Some(system) = &self.system {
-            input["system"] = json!(system);
-        }
-        if let Some(tools) = &self.allowed_tools {
-            input["allowed_tools"] = json!(tools);
-        }
-        input
-    }
-}
-
-#[derive(Debug)]
-struct DetachedSubagentLaunch {
-    label: String,
-    output_path: PathBuf,
-    steer_path: PathBuf,
-    monitor_command: String,
-}
-
 #[cfg(unix)]
 fn shell_single_quote(raw: &str) -> String {
     if raw.is_empty() {
         return "''".to_string();
     }
     format!("'{}'", raw.replace('\'', "'\\''"))
-}
-
-fn subagent_requests_dir(root: &Path, session_id: &str) -> PathBuf {
-    session_subagents_dir(root, session_id)
-}
-
-fn next_subagent_artifact_stem() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let seq = next_subagent_run_id();
-    format!("subagent-{nanos}-{}-{seq}", std::process::id())
-}
-
-fn subagent_steer_path_for_output(output_path: &Path) -> PathBuf {
-    let Some(file_name) = output_path.file_name().and_then(|s| s.to_str()) else {
-        return output_path.with_extension("steer");
-    };
-    if let Some(stem) = file_name.strip_suffix(".output.md") {
-        return output_path.with_file_name(format!("{stem}.steer"));
-    }
-    output_path.with_extension("steer")
-}
-
-fn write_subagent_input(
-    root: &Path,
-    session_id: &str,
-    request: &SubagentRequest,
-) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let dir = subagent_requests_dir(root, session_id);
-    std::fs::create_dir_all(&dir)?;
-    let stem = next_subagent_artifact_stem();
-    let input_path = dir.join(format!("{stem}.input.json"));
-    let output_path = dir.join(format!("{stem}.output.md"));
-    let steer_path = subagent_steer_path_for_output(&output_path);
-    let bytes = serde_json::to_vec_pretty(request)?;
-    atomic_write_bytes(&input_path, &bytes)?;
-    atomic_write_bytes(&steer_path, b"\n")?;
-    let header = format!(
-        "# Dext subagent output bundle\n\ninput: {}\ntask: {}\nstatus: launched\n\n## Logs\n",
-        input_path.display(),
-        request.task
-    );
-    atomic_write_bytes(&output_path, header.as_bytes())?;
-    Ok((input_path, output_path, steer_path))
-}
-
-#[cfg(unix)]
-fn subagent_runtime_shell_command(
-    root: &Path,
-    exe: &Path,
-    input_path: &Path,
-    output_path: &Path,
-) -> String {
-    format!(
-        "cd {} && {} subagent-runtime {} {}; status=$?; printf '\\n[subagent exited with status %s]\\n' \"$status\"; printf 'Press Enter to close...'; read _",
-        shell_single_quote(&root.display().to_string()),
-        shell_single_quote(&exe.display().to_string()),
-        shell_single_quote(&input_path.display().to_string()),
-        shell_single_quote(&output_path.display().to_string())
-    )
-}
-
-#[cfg(windows)]
-fn windows_cmd_quote(raw: &str) -> String {
-    format!("\"{}\"", raw.replace('"', "\\\""))
-}
-
-#[cfg(windows)]
-fn subagent_runtime_cmd_command(exe: &Path, input_path: &Path, output_path: &Path) -> String {
-    format!(
-        "{} subagent-runtime {} {}",
-        windows_cmd_quote(&exe.display().to_string()),
-        windows_cmd_quote(&input_path.display().to_string()),
-        windows_cmd_quote(&output_path.display().to_string())
-    )
-}
-
-fn spawn_background_subagent_process(
-    root: &Path,
-    exe: &Path,
-    input_path: &Path,
-    output_path: &Path,
-) -> Result<()> {
-    let output = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output_path)?;
-    let stderr = output.try_clone()?;
-    Command::new(exe)
-        .arg("subagent-runtime")
-        .arg(input_path)
-        .arg(output_path)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .context("launch background subagent process")?;
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn spawn_visible_subagent_terminal(
-    root: &Path,
-    exe: &Path,
-    input_path: &Path,
-    output_path: &Path,
-) -> Option<String> {
-    let command = subagent_runtime_shell_command(root, exe, input_path, output_path)
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    let script = format!("tell application \"Terminal\" to do script \"{command}\"");
-    Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    Some("terminal window".to_string())
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn spawn_visible_subagent_terminal(
-    root: &Path,
-    exe: &Path,
-    input_path: &Path,
-    output_path: &Path,
-) -> Option<String> {
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return None;
-    }
-    let command = subagent_runtime_shell_command(root, exe, input_path, output_path);
-    let candidates: Vec<(&str, Vec<String>)> = vec![
-        (
-            "x-terminal-emulator",
-            vec!["-e".into(), "sh".into(), "-lc".into(), command.clone()],
-        ),
-        (
-            "gnome-terminal",
-            vec!["--".into(), "sh".into(), "-lc".into(), command.clone()],
-        ),
-        (
-            "konsole",
-            vec!["-e".into(), "sh".into(), "-lc".into(), command.clone()],
-        ),
-        (
-            "xfce4-terminal",
-            vec![
-                "--command".into(),
-                format!("sh -lc {}", shell_single_quote(&command)),
-            ],
-        ),
-        (
-            "xterm",
-            vec!["-e".into(), "sh".into(), "-lc".into(), command.clone()],
-        ),
-        ("kitty", vec!["sh".into(), "-lc".into(), command.clone()]),
-        (
-            "alacritty",
-            vec!["-e".into(), "sh".into(), "-lc".into(), command],
-        ),
-    ];
-    for (terminal, args) in candidates {
-        if find_binary_on_path(terminal).is_none() {
-            continue;
-        }
-        if Command::new(terminal)
-            .args(args)
-            .current_dir(root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_ok()
-        {
-            return Some(format!("terminal window ({terminal})"));
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
-fn spawn_visible_subagent_terminal(
-    root: &Path,
-    exe: &Path,
-    input_path: &Path,
-    output_path: &Path,
-) -> Option<String> {
-    let command = subagent_runtime_cmd_command(exe, input_path, output_path);
-    Command::new("cmd")
-        .args(["/C", "start", "Dext subagent", "cmd", "/K", &command])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    Some("terminal window".to_string())
-}
-
-fn spawn_detached_subagent_process(
-    root: &Path,
-    input_path: &Path,
-    output_path: &Path,
-    steer_path: &Path,
-) -> Result<DetachedSubagentLaunch> {
-    let exe = current_dext_executable()?;
-    #[cfg(unix)]
-    let monitor_command = format!(
-        "tail -f {}",
-        shell_single_quote(&output_path.display().to_string())
-    );
-    #[cfg(windows)]
-    let monitor_command = format!(
-        "powershell -NoProfile -Command Get-Content -Wait {}",
-        output_path.display()
-    );
-
-    let label =
-        if let Some(label) = spawn_visible_subagent_terminal(root, &exe, input_path, output_path) {
-            label
-        } else {
-            spawn_background_subagent_process(root, &exe, input_path, output_path)?;
-            "background process (no terminal opener found)".to_string()
-        };
-
-    Ok(DetachedSubagentLaunch {
-        label,
-        output_path: output_path.to_path_buf(),
-        steer_path: steer_path.to_path_buf(),
-        monitor_command,
-    })
-}
-
-#[derive(Clone)]
-struct SubagentToolTrace {
-    call_id: String,
-    name: String,
-    summary: String,
-    content: String,
-    ok: bool,
-}
-
-struct SubagentRunReport {
-    task: String,
-    max_iterations: Option<u32>,
-    iterations: u32,
-    calls: usize,
-    failed_calls: usize,
-    elapsed: std::time::Duration,
-    halted_reason: Option<String>,
-    traces: Vec<SubagentToolTrace>,
-    final_text: String,
-}
-
-fn compact_call_id(call_id: &str) -> String {
-    let tail = call_id.rsplit('.').next().unwrap_or(call_id);
-    let compact = byte_prefix_at_char_boundary(tail, 12);
-    format!("#{compact}")
-}
-
-fn tool_target_key_for_summary(name: &str, summary: &str) -> String {
-    let prefix = format!("{name}: ");
-    let body = summary.strip_prefix(&prefix).unwrap_or(summary);
-    let head = match body.split_once(" (") {
-        Some((h, _)) => h,
-        None => body,
-    };
-    let trimmed = head.trim();
-    if trimmed.is_empty() {
-        "?".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn subagent_quality_gate_missing(final_text: &str) -> Vec<&'static str> {
-    fn heading_present(lower: &str, aliases: &[&str]) -> bool {
-        lower.lines().any(|line| {
-            let trimmed = line.trim_start_matches(['#', '-', '*', ' ', '\t']);
-            let heading = trimmed.split(':').next().unwrap_or(trimmed).trim();
-            aliases.contains(&heading)
-        })
-    }
-
-    const REQUIRED: &[(&str, &[&str])] = &[
-        ("source inspected", &["source inspected"]),
-        ("verification run", &["verification run"]),
-        ("files touched", &["files touched"]),
-        (
-            "uncertainty/open questions",
-            &[
-                "uncertainty/open questions",
-                "uncertainty",
-                "open questions",
-            ],
-        ),
-        ("confidence", &["confidence"]),
-        (
-            "exact recommended edits",
-            &["exact recommended edits", "recommended edits"],
-        ),
-        ("remaining risks", &["remaining risks"]),
-    ];
-    let lower = final_text.to_ascii_lowercase();
-    REQUIRED
-        .iter()
-        .filter_map(|(label, aliases)| (!heading_present(&lower, aliases)).then_some(*label))
-        .collect()
-}
-
-fn subagent_iteration_limit_label(max_iterations: Option<u32>) -> String {
-    max_iterations
-        .map(|max| max.to_string())
-        .unwrap_or_else(|| "unlimited".to_string())
-}
-
-fn render_subagent_report(report: &SubagentRunReport) -> String {
-    let mut summary = format!(
-        "=== SUBAGENT RESULT ===\n\
-         task: {}\n\
-         iterations: {}/{}, tool calls: {} ({} failed)\n\
-         elapsed: {:.1}s\n\
-         {}\n\
-         === OUTPUT ===\n{}\n=== END ===",
-        report.task,
-        report.iterations,
-        subagent_iteration_limit_label(report.max_iterations),
-        report.calls,
-        report.failed_calls,
-        report.elapsed.as_secs_f64(),
-        report
-            .halted_reason
-            .as_ref()
-            .map(|r| format!("HALTED: {r}\nParent should treat this as incomplete and verify/redo with higher --max-iter or narrower scope."))
-            .unwrap_or_default(),
-        report.final_text,
-    );
-
-    let trace_summary = render_subagent_ui_content(report);
-    if !trace_summary.is_empty() {
-        summary.push_str(&format!("\n--- tool trace ---\n{trace_summary}"));
-    }
-    let missing_quality_fields = subagent_quality_gate_missing(&report.final_text);
-    if !missing_quality_fields.is_empty() {
-        summary.push_str(&format!(
-            "\n--- quality gate ---\nmissing required handoff field(s): {}\nParent must verify before using this output.\n",
-            missing_quality_fields.join(", ")
-        ));
-    }
-    summary
-}
-
-fn append_subagent_output(output_path: &Path, text: &str) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output_path)?;
-    file.write_all(text.as_bytes())?;
-    Ok(())
-}
-
-async fn run_subagent_runtime(input_path: &Path, output_path: &Path) -> Result<()> {
-    let request: SubagentRequest = serde_json::from_slice(
-        &std::fs::read(input_path)
-            .with_context(|| format!("reading subagent input {}", input_path.display()))?,
-    )?;
-    append_subagent_output(
-        output_path,
-        &format!("[subagent-runtime] started task: {}\n", request.task),
-    )?;
-
-    let steer_path = subagent_steer_path_for_output(output_path);
-    let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    {
-        let _guard = tokio::spawn(async move {
-            let mut offset: u64 = 0;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let mut file = match std::fs::File::open(&steer_path) {
-                    Ok(f) => f,
-                    Err(_) => continue,
-                };
-                use std::io::{Read, Seek, SeekFrom};
-                if file.seek(SeekFrom::Start(offset)).is_err() {
-                    continue;
-                }
-                let mut buf = String::new();
-                if file.read_to_string(&mut buf).is_err() {
-                    continue;
-                }
-                if buf.is_empty() {
-                    continue;
-                }
-                offset += buf.len() as u64;
-                for line in buf.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('#') {
-                        continue;
-                    }
-                    let _ = steer_tx.send(trimmed.to_string());
-                }
-            }
-        });
-    }
-
-    let root = std::env::current_dir()?;
-    let mut agent = Agent::new_with_sandbox(Some(root), false)?;
-    agent.prewarm_connection();
-    agent.silent = false;
-    agent.pretty = io::stdout().is_terminal();
-    agent.sink = Box::new(ConsoleSink::new(agent.pretty, false));
-    agent.set_approval_profile(request.approval_profile);
-    agent.set_sandbox_profile(request.sandbox_profile);
-    agent.set_browser_recipe(request.browser_recipe);
-    agent.set_thinking_effort(request.thinking_effort);
-    agent.set_context_mode(request.context_mode);
-    agent.tool_context_profile = request.tool_context_profile.effective(request.context_mode);
-    agent.tool_profile = request.tool_profile;
-    agent.set_budget_cap(request.budget_cap);
-    if !request.privacy_enabled {
-        agent.privacy.enabled = false;
-    }
-    agent.install_steering(steer_rx, Agent::noop_steering_tx());
-    agent.refresh_tools_for_context();
-    let report = agent
-        .run_subagent(&request.to_tool_input())
-        .await
-        .map_err(anyhow::Error::msg)?;
-    let rendered = render_subagent_report(&report);
-    let bundle = format!(
-        "\n## Report\n\n{}\n\n## Status\ncomplete\n",
-        cap_bytes_with_hint(
-            rendered,
-            64_000,
-            "Subagent report truncated; rerun with a narrower task."
-        )
-    );
-    append_subagent_output(output_path, &bundle)?;
-    println!("\n[subagent output written: {}]", output_path.display());
-    Ok(())
-}
-
-fn render_subagent_ui_content(report: &SubagentRunReport) -> String {
-    let mut out = String::new();
-    out.push_str("subagent grouped activity\n");
-
-    if report.traces.is_empty() {
-        out.push_str("(no tool calls)\n");
-    } else {
-        let mut i = 0usize;
-        while i < report.traces.len() {
-            let first = &report.traces[i];
-            let first_target = tool_target_key_for_summary(&first.name, &first.summary);
-            let mut j = i + 1;
-            let mut total_lines = first.content.lines().count();
-            while j < report.traces.len() {
-                let next = &report.traces[j];
-                if next.name != first.name
-                    || next.ok != first.ok
-                    || tool_target_key_for_summary(&next.name, &next.summary) != first_target
-                {
-                    break;
-                }
-                total_lines += next.content.lines().count();
-                j += 1;
-            }
-            let count = j - i;
-            if count > 1 {
-                if first.ok {
-                    out.push_str(&format!(
-                        "- {}: {} · {} chunks · {} lines\n",
-                        first.name, first_target, count, total_lines
-                    ));
-                } else {
-                    out.push_str(&format!(
-                        "- {}: {} · {} failed attempts\n",
-                        first.name, first_target, count
-                    ));
-                }
-            } else {
-                out.push_str(&format!("- {}: {}\n", first.name, first_target));
-            }
-            i = j;
-        }
-    }
-
-    out.push_str("\noutput preview\n");
-    let mut preview_lines = 0usize;
-    for trace in &report.traces {
-        if trace.content.trim().is_empty() {
-            continue;
-        }
-        out.push_str(&format!(
-            "{} {}\n",
-            compact_call_id(&trace.call_id),
-            trace.summary
-        ));
-        let mut shown_for_trace = 0usize;
-        for line in trace.content.lines() {
-            out.push_str(line);
-            out.push('\n');
-            preview_lines += 1;
-            shown_for_trace += 1;
-            if preview_lines >= 14 || shown_for_trace >= 6 {
-                break;
-            }
-        }
-        if trace.content.lines().count() > shown_for_trace {
-            out.push_str("…\n");
-        }
-        if preview_lines >= 14 {
-            break;
-        }
-    }
-
-    if let Some(halt) = &report.halted_reason {
-        out.push_str(&format!("\n⚠ {halt}\n"));
-    }
-
-    out.push_str("\nfinal subagent response\n");
-    out.push_str(report.final_text.trim());
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -4558,12 +4095,7 @@ fn binary_on_path(name: &str) -> bool {
     find_binary_on_path(name).is_some()
 }
 
-fn current_dext_executable() -> Result<PathBuf> {
-    current_dext_executable_from(
-        std::env::current_exe().context("resolve current dext executable")?,
-    )
-}
-
+#[cfg(test)]
 fn current_dext_executable_from(exe: PathBuf) -> Result<PathBuf> {
     if exe.is_file() {
         return Ok(exe);
@@ -7738,12 +7270,6 @@ async fn execute_builtin_call(
     local_sudo_auth: Option<LocalSudoAuth>,
     sandbox_profile: SandboxProfile,
 ) -> std::result::Result<String, String> {
-    if name == "subagent" {
-        return Ok(
-            "subagent is not a provider-visible tool. Ask the user to run /subagent <task> if delegation is needed."
-                .to_string(),
-        );
-    }
     if name == "bash" {
         let cmd = input["command"].as_str().unwrap_or("").to_string();
         let guarded = tool_policy::apply_bash_guardrails(&cmd)?;
@@ -8133,7 +7659,6 @@ Editing: always read before editing. Use edit_file for small changes, multi_edit
 Git: inspect status/diff before editing tracked files. Use git_diff for diffs and git_commit (not raw git) for commits. Use bash git log only when history is needed and no git_log tool is exposed.
 Shell: preserve pipefail in bash. Treat bash calls as atomic: Dext cleans the tool process group after each call, so do not use shell backgrounding, nohup, or disown for persistence; setsid-style detaches are unsupported because they escape Dext cleanup. For requested persistent local services, use an OS supervisor when available (Linux: systemd-run --user with dext- unit, inspect/stop via systemctl --user). Exposed Dext tools like rg/fd/http/git_diff are API tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Obey [runtime-note] advisories in tool results before choosing the next tool. Validate external sources before scaling. On auth failures, ask for credentials.
 Browser: if browser_recipe=agent-browser, use the browser tool only when useful; start with browser args ['skills','get','core','--full'].
-Subagents: do not call subagent directly; suggest /subagent if delegation is requested. Review subagent output before acting.
 Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
 Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
 Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.
@@ -8222,23 +7747,6 @@ struct SystemParts {
     env: String,
     prompt_sources: Vec<PathBuf>,
 }
-
-const DEFAULT_SUBAGENT_SYSTEM: &str = "\
-You are a focused Dext subagent runtime spawned to complete one specific task delegated by a \
-parent agent. You share the same sandbox and toolkit, but you do NOT see the parent's \
-conversation — only the task you were given.
-
-Work like the main agent: use tools in parallel when independent, inspect exact source \
-before conclusions, and make the task self-contained and reviewable. Prefer broad \
-searches first, then read small focused windows around relevant symbols. If the task \
-needs code changes and write tools are available, make focused edits and run the \
-narrowest useful verification. If you only researched, provide concrete implementation \
-guidance.
-
-End with a concise handoff for the parent using these exact headings: source inspected, verification run, files touched, uncertainty/open questions, confidence, exact recommended edits, remaining risks. Include what you did, key findings, files and line numbers, edits made or recommended, verification performed, and any blockers. Be specific and terse; avoid vague recaps.
-
-Do not ask clarifying questions. If the task is under-specified, make a reasonable \
-interpretation, do the work, and note assumptions in your handoff.";
 
 const READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
@@ -9275,7 +8783,7 @@ fn compaction_user_text_with_evidence(transcript: &str, evidence: &str) -> Strin
         )
     };
     format!(
-        "Summarize the following transcript so a future assistant can resume the work.\n\nUse the exact section headings below and keep each section concise:\n- Task\n- Decisions\n- Files\n- Open work\n- Recent state\n\nPreserve concrete state over prose: latest user intent, active work ledger, verification results, file paths/line refs, subagent reports, provider/runtime errors, unresolved blockers, and cited tool/event IDs. If the transcript conflicts with the deterministic evidence packet, trust the evidence packet.\n{evidence_section}\n\n---\n{transcript}---"
+        "Summarize the following transcript so a future assistant can resume the work.\n\nUse the exact section headings below and keep each section concise:\n- Task\n- Decisions\n- Files\n- Open work\n- Recent state\n\nPreserve concrete state over prose: latest user intent, active work ledger, verification results, file paths/line refs, provider/runtime errors, unresolved blockers, and cited tool/event IDs. If the transcript conflicts with the deterministic evidence packet, trust the evidence packet.\n{evidence_section}\n\n---\n{transcript}---"
     )
 }
 
@@ -9451,9 +8959,6 @@ fn render_compaction_evidence(
                         "[tool:{tool_use_id}] {status} {name}: {summary} => {}",
                         summarize_inline(content, 240)
                     ));
-                }
-                Block::Text { text } if text.contains("[subagent completed]") => {
-                    tool_facts.push(format!("[subagent] {}", summarize_inline(text, 260)));
                 }
                 _ => {}
             }
@@ -9876,9 +9381,7 @@ struct Agent {
     latest_session_path: PathBuf,
     latest_log_path: PathBuf,
     pending_login_provider: Option<String>,
-    // Subagents share the parent's latest_session_path; without this guard,
-    // the child would clobber the parent's auto-saved session on every turn,
-    // so `--resume` after a crash would restore the subagent's transcript.
+    // non-critical checkpoints skip rewriting an unchanged transcript.
     suppress_checkpoints: bool,
     last_checkpoint_at: Option<std::time::Instant>,
     session_model_pins: HashMap<String, String>,
@@ -9909,7 +9412,6 @@ struct Agent {
     provider_health: ProviderHealthLedger,
     track_origin: Option<TrackOrigin>,
     privacy: PrivacyPolicy,
-    detached_subagent_steer_path: Option<PathBuf>,
     checkpoint_cache: git_checkpoints::RepoRootCache,
     checkpoint_ordinal: usize,
     prompt_scan_cache: Mutex<Option<PromptScanCache>>,
@@ -10074,7 +9576,6 @@ impl Agent {
             provider_health: ProviderHealthLedger::default(),
             track_origin: None,
             privacy: PrivacyPolicy::from_env(),
-            detached_subagent_steer_path: None,
             checkpoint_cache: git_checkpoints::RepoRootCache::new(),
             checkpoint_ordinal: 0,
             prompt_scan_cache: Mutex::new(None),
@@ -10088,6 +9589,7 @@ impl Agent {
         tx
     }
 
+    #[cfg(test)]
     fn noop_steering_tx() -> tokio::sync::mpsc::UnboundedSender<String> {
         Self::noop_text_tx()
     }
@@ -11943,7 +11445,6 @@ impl Agent {
         let composed_system = format!("{}\n\n{}", system_details.stable, system_details.env);
         let provenance = self.session_provenance_from(&system_details, &composed_system);
         let mut allowed: Vec<String> = self.allowed.iter().cloned().collect();
-        allowed.retain(|name| name != "subagent");
         allowed.sort();
         let mut exposed_tools: Vec<String> =
             self.tools.iter().map(|t| t.name.to_string()).collect();
@@ -12868,17 +12369,7 @@ impl Agent {
     }
 
     async fn run_plan(&mut self, task: String) -> Result<()> {
-        let input = json!({
-            "task": task,
-            "system": PLAN_SYSTEM,
-            "allowed_tools": READ_ONLY_TOOLS,
-            "max_iterations": 15,
-        });
-        let plan_report = self
-            .run_subagent(&input)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let plan = plan_report.final_text;
+        let plan = self.generate_read_only_plan(&task).await?;
         self.sink.emit(AgentEvent::Slash(format!(
             "=== PLAN ===\n{plan}\n=== END ==="
         )));
@@ -12897,202 +12388,52 @@ impl Agent {
         Ok(())
     }
 
-    async fn steer_detached_subagent(&mut self, message: String) -> Result<()> {
-        let steer_path = match self.detached_subagent_steer_path.as_ref() {
-            Some(p) => p.clone(),
-            None => {
-                self.sink.emit(AgentEvent::Slash(
-                    "No active detached subagent to steer.".into(),
-                ));
-                return Ok(());
-            }
-        };
-        if !steer_path.exists() {
-            self.sink.emit(AgentEvent::Slash(format!(
-                "Steer file not found: {}. Subagent may have exited.",
-                steer_path.display()
-            )));
-            return Ok(());
-        }
-        let line = format!("{message}\n");
-        let mut file = std::fs::OpenOptions::new().append(true).open(&steer_path)?;
-        file.write_all(line.as_bytes())?;
-        drop(file);
-        self.sink.emit(AgentEvent::Slash(format!(
-            "▶ steer: \"{message}\"\n  → {}",
-            steer_path.display()
-        )));
-        self.history.push(Message {
-            role: "user".to_string(),
-            content: vec![Block::Text {
-                text: format!(
-                    "[subagent steered] Sent: \"{message}\"\nThe subagent will pick this up within a few seconds."
-                ),
-            }],
-        });
-        Ok(())
-    }
+    async fn generate_read_only_plan(&mut self, task: &str) -> Result<String> {
+        let saved_system = std::mem::replace(&mut self.system, PLAN_SYSTEM.to_string());
+        let saved_tools = std::mem::replace(
+            &mut self.tools,
+            provider_tool_definitions()
+                .into_iter()
+                .filter(|tool| READ_ONLY_TOOLS.contains(&tool.name))
+                .collect(),
+        );
+        let saved_max_iterations = self.max_iterations.replace(15);
+        let saved_history = std::mem::take(&mut self.history);
+        self.silent = true;
+        self.pretty = false;
 
-    async fn run_subagent_cmd(&mut self, raw: String) -> Result<()> {
-        let mut task_parts: Vec<String> = Vec::new();
-        let mut tools_override: Option<Vec<String>> = None;
-        let mut max_iter: Option<u64> = None;
-        let mut system_override: Option<String> = None;
-        let mut readonly = false;
-        let mut mode = SubagentMode::Detached;
+        let prompt = format!("Produce a read-only implementation plan for this task:\n\n{task}");
+        let chat_result = self.chat(prompt).await;
 
-        let mut tokens = raw.split_whitespace().peekable();
-        while let Some(tok) = tokens.next() {
-            match tok {
-                "--tools" => {
-                    if let Some(list) = tokens.next() {
-                        tools_override = Some(list.split(',').map(String::from).collect());
-                    }
-                }
-                "--max-iter" => {
-                    if let Some(n) = tokens.next() {
-                        max_iter = n.parse().ok();
-                    }
-                }
-                "--system" => {
-                    let mut sys_parts: Vec<String> = Vec::new();
-                    while let Some(p) = tokens.peek() {
-                        if p.starts_with("--") {
-                            break;
-                        }
-                        sys_parts.push(tokens.next().unwrap().to_string());
-                    }
-                    if !sys_parts.is_empty() {
-                        system_override = Some(sys_parts.join(" "));
-                    }
-                }
-                "--readonly" => {
-                    readonly = true;
-                }
-                "--inline" | "--foreground" => {
-                    mode = SubagentMode::Inline;
-                }
-                "--detached" | "--background" | "--window" | "--tmux" => {
-                    mode = SubagentMode::Detached;
-                }
-                "--mode" => {
-                    if let Some(value) = tokens.next()
-                        && let Some(parsed) = SubagentMode::parse(value)
-                    {
-                        mode = parsed;
-                    }
-                }
-                other => task_parts.push(other.to_string()),
-            }
-        }
+        let plan = self
+            .history
+            .iter()
+            .rev()
+            .find_map(|message| {
+                (message.role == "assistant").then(|| {
+                    message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            Block::Text { text } | Block::PartialStream { text } => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+            })
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| "(planner returned no text)".to_string());
 
-        let task = task_parts.join(" ");
-        if task.is_empty() {
-            self.sink.emit(AgentEvent::Slash(
-                "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]".into(),
-            ));
-            return Ok(());
-        }
+        self.history = saved_history;
+        self.system = saved_system;
+        self.tools = saved_tools;
+        self.max_iterations = saved_max_iterations;
 
-        let allowed_tools = if readonly {
-            Some(READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect())
-        } else {
-            tools_override
-        };
-
-        let mut input = json!({
-            "task": task,
-        });
-        if let Some(max_iter) = max_iter {
-            input["max_iterations"] = json!(max_iter);
-        }
-        if let Some(tools) = &allowed_tools {
-            input["allowed_tools"] = json!(tools);
-        }
-        if let Some(sys) = &system_override {
-            input["system"] = json!(sys);
-        }
-
-        let request = SubagentRequest::from_input(self, &input).map_err(anyhow::Error::msg)?;
-        if mode == SubagentMode::Detached {
-            let (input_path, output_path, steer_path) =
-                write_subagent_input(&self.sandbox_root, &self.session_id, &request)?;
-            let launch = spawn_detached_subagent_process(
-                &self.sandbox_root,
-                &input_path,
-                &output_path,
-                &steer_path,
-            )?;
-            let iter_label = max_iter
-                .map(|max| max.to_string())
-                .unwrap_or_else(|| "unlimited".to_string());
-            let summary = format!(
-                "▶ subagent detached: \"{}\"{} · max_iter={}\nlauncher: {}\ninput: {}\noutput: {}\nmonitor: {}\nsteer: /subagent steer <message>\nParent remains usable; use /subagent steer to send corrections while it works.",
-                task,
-                if readonly { " [readonly]" } else { "" },
-                iter_label,
-                launch.label,
-                input_path.display(),
-                launch.output_path.display(),
-                launch.monitor_command
-            );
-            self.sink.emit(AgentEvent::Slash(summary.clone()));
-            self.history.push(Message {
-                role: "user".to_string(),
-                content: vec![Block::Text {
-                    text: format!(
-                        "[subagent detached]\nTask: {}\ninput: {}\noutput: {}\nmonitor: {}\nsteer: {}\n\nThe subagent is running outside the parent transcript. Monitor the single output bundle without interrupting parent work. Use /subagent steer <message> to send corrections while it works. When it completes, inspect the bundle and decide whether to use, verify, revise, or discard it.",
-                        task,
-                        input_path.display(),
-                        launch.output_path.display(),
-                        launch.monitor_command,
-                        launch.steer_path.display()
-                    ),
-                }],
-            });
-            self.detached_subagent_steer_path = Some(launch.steer_path.clone());
-            return Ok(());
-        }
-
-        self.sink.emit(AgentEvent::Slash(format!(
-            "▶ subagent inline: \"{task}\"{} · max_iter={}",
-            if readonly { " [readonly]" } else { "" },
-            max_iter
-                .map(|max| max.to_string())
-                .unwrap_or_else(|| "unlimited".to_string())
-        )));
-
-        let report = self
-            .run_subagent(&input)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        let summary = render_subagent_report(&report);
-
-        self.sink.emit(AgentEvent::Slash(summary.clone()));
-
-        self.history.push(Message {
-            role: "user".to_string(),
-            content: vec![Block::Text {
-                text: cap_bytes_with_hint(
-                    format!(
-                        "[subagent completed]\nTask: {}\n\nSubagent report for review:\n\n{}\n\nReview this report and decide whether to use, verify, revise, or discard the subagent work before continuing.",
-                        task, summary
-                    ),
-                    24_000,
-                    "Subagent report truncated; rerun /subagent with a narrower task or inspect forwarded tool output if needed.",
-                ),
-            }],
-        });
-        self.history.push(Message {
-            role: "assistant".to_string(),
-            content: vec![Block::Text {
-                text: "Received the subagent report. I will review its findings before using them."
-                    .to_string(),
-            }],
-        });
-
-        Ok(())
+        chat_result?;
+        Ok(plan)
     }
 
     async fn chat(&mut self, user_input: String) -> Result<()> {
@@ -13796,13 +13137,6 @@ impl Agent {
                             is_error: Some(true),
                         });
                     }
-                }
-
-                if plan.is_none() && name == "subagent" {
-                    plan = Some(Plan::Immediate {
-                        content: "subagent is not a provider-visible tool. Do not call it as a model tool; tell the user the /subagent command to run if delegation is needed.".to_string(),
-                        is_error: Some(true),
-                    });
                 }
 
                 if plan.is_none()
@@ -15171,321 +14505,6 @@ impl Agent {
         Ok((blocks, finish_reason, usage))
     }
 
-    async fn run_subagent(
-        &mut self,
-        input: &Value,
-    ) -> std::result::Result<SubagentRunReport, String> {
-        struct SubagentForwardState {
-            run_id: u64,
-            traces: Vec<SubagentToolTrace>,
-            halted_reason: Option<String>,
-            anon_counter: usize,
-        }
-
-        impl SubagentForwardState {
-            fn new(run_id: u64) -> Self {
-                Self {
-                    run_id,
-                    traces: Vec::new(),
-                    halted_reason: None,
-                    anon_counter: 0,
-                }
-            }
-
-            fn normalize_local_call_id(&mut self, call_id: String) -> String {
-                if call_id.trim().is_empty() {
-                    self.anon_counter = self.anon_counter.saturating_add(1);
-                    format!("anon-{}", self.anon_counter)
-                } else {
-                    call_id
-                }
-            }
-
-            fn namespace_call_id(&self, call_id: &str) -> String {
-                namespace_subagent_call_id(self.run_id, call_id)
-            }
-
-            fn forward(&mut self, sink: &mut dyn EventSink, ev: AgentEvent) {
-                match ev {
-                    AgentEvent::ToolCallPreview {
-                        call_id,
-                        name,
-                        summary,
-                    } => {
-                        let local = self.normalize_local_call_id(call_id);
-                        let call_id = self.namespace_call_id(&local);
-                        sink.emit(AgentEvent::ToolCallPreview {
-                            call_id,
-                            name,
-                            summary,
-                        });
-                    }
-                    AgentEvent::ToolCallStart {
-                        call_id,
-                        name,
-                        summary,
-                    } => {
-                        let local = self.normalize_local_call_id(call_id);
-                        let call_id = self.namespace_call_id(&local);
-                        sink.emit(AgentEvent::ToolCallStart {
-                            call_id,
-                            name,
-                            summary,
-                        });
-                    }
-                    AgentEvent::ToolCallResult {
-                        call_id,
-                        name,
-                        ok,
-                        preview,
-                        content,
-                    } => {
-                        let local = self.normalize_local_call_id(call_id);
-                        let call_id = self.namespace_call_id(&local);
-                        self.traces.push(SubagentToolTrace {
-                            call_id: call_id.clone(),
-                            name: name.clone(),
-                            summary: preview.clone(),
-                            content: content.clone(),
-                            ok,
-                        });
-                        sink.emit(AgentEvent::ToolCallResult {
-                            call_id,
-                            name,
-                            ok,
-                            preview,
-                            content,
-                        });
-                    }
-                    AgentEvent::ToolBatchStart {
-                        batch_id,
-                        call_ids,
-                        labels,
-                    } => {
-                        let batch_id = namespace_subagent_batch_id(self.run_id, &batch_id);
-                        let call_ids = call_ids
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, id)| {
-                                let local = normalize_tool_call_id(&id, 0, i);
-                                self.namespace_call_id(&local)
-                            })
-                            .collect();
-                        sink.emit(AgentEvent::ToolBatchStart {
-                            batch_id,
-                            call_ids,
-                            labels,
-                        });
-                    }
-                    AgentEvent::ToolBatchEnd {
-                        batch_id,
-                        call_ids,
-                        labels,
-                        failed,
-                    } => {
-                        let batch_id = namespace_subagent_batch_id(self.run_id, &batch_id);
-                        let call_ids = call_ids
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, id)| {
-                                let local = normalize_tool_call_id(&id, 0, i);
-                                self.namespace_call_id(&local)
-                            })
-                            .collect();
-                        sink.emit(AgentEvent::ToolBatchEnd {
-                            batch_id,
-                            call_ids,
-                            labels,
-                            failed,
-                        });
-                    }
-                    AgentEvent::Info(s) => {
-                        let msg = s.trim();
-                        if msg.starts_with("[halted:") {
-                            self.halted_reason = Some(msg.to_string());
-                        }
-                    }
-                    AgentEvent::Warn(s) => {
-                        let msg = s.trim();
-                        if msg.starts_with("[halted:") {
-                            self.halted_reason = Some(msg.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let started_at = std::time::Instant::now();
-        let request = SubagentRequest::from_input(self, input)?;
-        let task = request.task.clone();
-        let system = request.system.clone().unwrap_or_else(|| {
-            if request.context_mode.is_tiny() {
-                TINY_SYSTEM.to_string()
-            } else {
-                DEFAULT_SUBAGENT_SYSTEM.to_string()
-            }
-        });
-        let max_iter = request.max_iterations.map(|max| max as u32);
-        let whitelist = request.allowed_tools.clone();
-
-        let tools: Vec<Tool> = provider_tool_definitions()
-            .into_iter()
-            .filter(|t| {
-                request.browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser"
-            })
-            .filter(|t| {
-                tool_name_allowed_in_profile(
-                    t.name,
-                    request.tool_context_profile.effective(request.context_mode),
-                )
-            })
-            .filter(|t| match &whitelist {
-                Some(w) => w.iter().any(|n| n == t.name),
-                None => true,
-            })
-            .collect();
-
-        let run_id = next_subagent_run_id();
-        let mut forward = SubagentForwardState::new(run_id);
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        let mut sub = Agent {
-            client: self.client.clone(),
-            provider_id: self.provider_id.clone(),
-            api_key: self.api_key.clone(),
-            key_source: self.key_source.clone(),
-            provider_requires_api_key: self.provider_requires_api_key,
-            base_url: self.base_url.clone(),
-            model: self.model.clone(),
-            api_provider: self.api_provider,
-            thinking_effort: self.thinking_effort,
-            system,
-            history: Vec::new(),
-            tools,
-            allowed: self.allowed.clone(),
-            deny_tools: self.deny_tools.clone(),
-            sandbox_root: self.sandbox_root.clone(),
-            git_context: self.git_context.clone(),
-            silent: true,
-            pretty: false,
-            max_iterations: max_iter,
-            session_usage: Usage::default(),
-            last_request_usage: Usage::default(),
-            interrupt: self.interrupt.clone(),
-            shelf_registry: shelves::ShelfRegistry::discover(&self.sandbox_root),
-            hooks: self.hooks.clone(),
-            pack_hook_env: self.pack_hook_env.clone(),
-            state_lock: self.state_lock.clone(),
-            session_enabled: self.session_enabled,
-            session_id: self.session_id.clone(),
-            latest_session_path: self.latest_session_path.clone(),
-            latest_log_path: self.latest_log_path.clone(),
-            pending_login_provider: None,
-            suppress_checkpoints: true,
-            last_checkpoint_at: None,
-            session_model_pins: self.session_model_pins.clone(),
-            partial_stream_text: None,
-            compact_threshold_chars: self.compact_threshold_chars,
-            compact_threshold_percent: self.compact_threshold_percent,
-            context_window_tokens: self.context_window_tokens(),
-            approval_profile: request.approval_profile,
-            sandbox_profile: request.sandbox_profile,
-            browser_recipe: request.browser_recipe,
-            context_mode: request.context_mode,
-            tool_context_profile: request.tool_context_profile.effective(request.context_mode),
-            tool_profile: request.tool_profile,
-            preview_mode: self.preview_mode,
-            budget_cap: request.budget_cap,
-            budget_exhausted: false,
-            builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
-            sink: Box::new(ChannelSink { tx: ev_tx }),
-            runtime_control_rx: None,
-            runtime_control_tx: Self::noop_text_tx(),
-            steering_rx: None,
-            steering_tx: self.steering_tx.clone(),
-            read_cache: self.read_cache.clone(),
-            work_ledger: self.work_ledger.clone(),
-            provider_health: self.provider_health.clone(),
-            track_origin: self.track_origin.clone(),
-            privacy: self.privacy.clone(),
-            detached_subagent_steer_path: None,
-            checkpoint_cache: git_checkpoints::RepoRootCache::new(),
-            checkpoint_ordinal: 0,
-            prompt_scan_cache: Mutex::new(None),
-            prompt_scan_epoch: 0,
-            last_checkpoint_signature: None,
-        };
-
-        if !request.privacy_enabled {
-            sub.privacy.enabled = false;
-        }
-        sub.set_approval_profile(request.approval_profile);
-        sub.refresh_tools_for_context();
-
-        {
-            let delegated_prompt = format!(
-                "{task}\n\n[handoff requirement]\nFinish with these exact headings: source inspected, verification run, files touched, uncertainty/open questions, confidence, exact recommended edits, remaining risks. If the task is getting broad, prefer a partial handoff over endless tool use."
-            );
-            let chat_fut = Box::pin(sub.chat(delegated_prompt));
-            tokio::pin!(chat_fut);
-            let chat_result: Result<()> = loop {
-                tokio::select! {
-                    biased;
-                    r = &mut chat_fut => break r,
-                    maybe_ev = ev_rx.recv() => {
-                        if let Some(ev) = maybe_ev {
-                            forward.forward(self.sink.as_mut(), ev);
-                        }
-                    }
-                }
-            };
-            while let Ok(ev) = ev_rx.try_recv() {
-                forward.forward(self.sink.as_mut(), ev);
-            }
-            chat_result.map_err(|e| format!("subagent error: {e}"))?;
-        }
-
-        self.session_usage.add(sub.session_usage);
-        self.ensure_session_usage_cost();
-
-        let iterations = sub.history.iter().filter(|m| m.role == "assistant").count() as u32;
-        let final_text = sub
-            .history
-            .iter()
-            .rev()
-            .find_map(|m| {
-                if m.role == "assistant" {
-                    let t: String = m
-                        .content
-                        .iter()
-                        .filter_map(|b| match b {
-                            Block::Text { text } | Block::PartialStream { text } => {
-                                Some(text.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
-                    if t.is_empty() { None } else { Some(t) }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "(subagent returned no text)".to_string());
-
-        let failed_calls = forward.traces.iter().filter(|t| !t.ok).count();
-        Ok(SubagentRunReport {
-            task,
-            max_iterations: max_iter,
-            iterations,
-            calls: forward.traces.len(),
-            failed_calls,
-            elapsed: started_at.elapsed(),
-            halted_reason: forward.halted_reason,
-            traces: forward.traces,
-            final_text,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15877,7 +14896,6 @@ struct SessionAnalysis {
     failures: Vec<String>,
     verification: Vec<VerificationRecord>,
     compactions: usize,
-    subagents: usize,
     provider: String,
     model: String,
     usage: Usage,
@@ -15936,9 +14954,6 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
                     }
                     if lower.contains("[prior conversation, summarized for resume]") {
                         analysis.compactions += 1;
-                    }
-                    if lower.contains("[subagent completed]") {
-                        analysis.subagents += 1;
                     }
                     if lower.contains("error")
                         || lower.contains("failed")
@@ -17257,11 +16272,7 @@ fn render_session_analysis(
             let _ = writeln!(out, "- {item}");
         }
     }
-    let _ = writeln!(
-        out,
-        "compactions: {} · subagents: {}",
-        analysis.compactions, analysis.subagents
-    );
+    let _ = writeln!(out, "compactions: {}", analysis.compactions);
     out
 }
 
@@ -17845,11 +16856,8 @@ fn render_session_brief(
         analysis.messages,
         analysis.usage.line()
     ));
-    if analysis.compactions > 0 || analysis.subagents > 0 {
-        out.push_str(&format!(
-            "compactions: {}   subagents: {}\n",
-            analysis.compactions, analysis.subagents
-        ));
+    if analysis.compactions > 0 {
+        out.push_str(&format!("compactions: {}\n", analysis.compactions));
     }
 
     let ledger = render_work_ledger_prompt(&header.work_ledger)
@@ -18342,26 +17350,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(
                 w,
                 "  /plan <task>              run a read-only planner, seed the plan into history"
-            );
-            if let Some(cmd) = slash_command_definitions()
-                .into_iter()
-                .find(|cmd| cmd.name == "subagent")
-            {
-                let _ = writeln!(w, "  {:<27} {}", cmd.usage, cmd.description);
-            }
-            let _ = writeln!(w, "    --tools t1,t2           restrict tool whitelist");
-            let _ = writeln!(
-                w,
-                "    --max-iter N            optional max tool-use cycles (default unlimited)"
-            );
-            let _ = writeln!(
-                w,
-                "    --system PROMPT         override subagent system prompt"
-            );
-            let _ = writeln!(w, "    --readonly              read-only tools only");
-            let _ = writeln!(
-                w,
-                "    --inline                legacy foreground mode; default is detached"
             );
             let _ = writeln!(
                 w,
@@ -20678,21 +19666,6 @@ async fn main() -> Result<()> {
     }));
 
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.first().is_some_and(|a| a == "subagent-runtime") {
-        if argv.len() != 3 {
-            eprintln!("usage: dext subagent-runtime INPUT_JSON OUTPUT_MD");
-            release_registered_locks();
-            std::process::exit(2);
-        }
-        let input_path = Path::new(&argv[1]);
-        let output_path = Path::new(&argv[2]);
-        let result = run_subagent_runtime(input_path, output_path).await;
-        if let Err(e) = &result {
-            let _ = append_subagent_output(output_path, &format!("\n## Status\nfailed\n\n{e:#}\n"));
-        }
-        release_registered_locks();
-        return result;
-    }
     if argv.iter().any(|a| a == "-V" || a == "--version") {
         println!("dext {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -20796,12 +19769,6 @@ async fn main() -> Result<()> {
         println!("       dext session tracks");
         println!("       dext session track open [latest|NAME|PATH] @wNN [name]");
         println!("       dext session export [latest|NAME|PATH] [html|jsonl] [OUT]");
-        for runtime_tool in runtime_tool_definitions() {
-            println!(
-                "       dext {}  {}",
-                runtime_tool.name, runtime_tool.description
-            );
-        }
         println!("       dext doctor           check environment, sandbox, providers, and tools");
         println!("       dext pack list|inspect|run ...  discover or invoke Dext packs");
         println!(
@@ -21235,33 +20202,6 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if input == "/subagent" || input.starts_with("/subagent ") {
-            let raw = input.strip_prefix("/subagent").unwrap_or("").trim();
-            if raw.is_empty() {
-                println!(
-                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]\n       /subagent steer <message>"
-                );
-            } else if raw.starts_with("steer ") || raw == "steer" {
-                let msg = raw.strip_prefix("steer").unwrap_or("").trim();
-                if msg.is_empty() {
-                    println!("usage: /subagent steer <message>");
-                } else {
-                    agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    if let Err(e) = agent.steer_detached_subagent(msg.to_string()).await {
-                        eprintln!("[steer error] {e:#}");
-                    }
-                    agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-            } else {
-                agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Err(e) = agent.run_subagent_cmd(raw.to_string()).await {
-                    eprintln!("[subagent error] {e:#}");
-                }
-                agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-            autosave_latest(&mut agent);
-            continue;
-        }
         if input == "/pack"
             || input.starts_with("/pack ")
             || input == "/packs"

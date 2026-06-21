@@ -20,7 +20,6 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write as IoWrite};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -56,39 +55,6 @@ const THINKING_BG: Color = Color::Indexed(235);
 const STEERING_BG: Color = Color::Indexed(236);
 const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-fn is_subagent_call_id(call_id: &str) -> bool {
-    call_id.starts_with("sub.")
-}
-
-fn is_subagent_batch_id(batch_id: &str) -> bool {
-    batch_id.starts_with("sub.")
-}
-
-fn parse_detached_subagent_launch(s: &str) -> Option<DetachedSubagent> {
-    if !s.contains("▶ subagent detached:") {
-        return None;
-    }
-    let output_path = s
-        .lines()
-        .find(|l| l.starts_with("output:"))
-        .map(|l| l.trim_start_matches("output:").trim())?;
-    let task = s
-        .lines()
-        .find(|l| l.starts_with("▶ subagent detached:"))
-        .and_then(|l| {
-            let between = l.split('"').nth(1)?;
-            Some(between.to_string())
-        })
-        .unwrap_or_default();
-    Some(DetachedSubagent {
-        task,
-        output_path: PathBuf::from(output_path),
-        file_offset: 0,
-        tail: Vec::new(),
-        completed: false,
-    })
-}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ToolChunk {
@@ -274,14 +240,6 @@ struct LiveTool {
     summary: String,
     running: bool,
     started: Option<Instant>,
-    is_subagent: bool,
-}
-
-#[derive(Clone)]
-struct LiveBatch {
-    entries: Vec<String>,
-    failed: usize,
-    done: bool,
 }
 
 struct ExpandableBlock {
@@ -485,11 +443,6 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         name: "/plan",
         args: "<task>",
         help: "run read-only planner",
-    },
-    SlashCmd {
-        name: "/subagent",
-        args: "<task> [opts]",
-        help: "run detached subagent",
     },
     SlashCmd {
         name: "/pack",
@@ -768,14 +721,6 @@ struct TranscriptLayoutState {
     live_indicator_text: Option<Text<'static>>,
 }
 
-struct DetachedSubagent {
-    task: String,
-    output_path: PathBuf,
-    file_offset: u64,
-    tail: Vec<String>,
-    completed: bool,
-}
-
 struct TuiState {
     pending_insert: Vec<Line_>,
     transcript: Vec<Line_>,
@@ -836,7 +781,6 @@ struct TuiState {
     call_tag_seq: usize,
     turn_seq: usize,
     call_tags: HashMap<String, String>,
-    sub_batch: Option<LiveBatch>,
     verbose: bool,
     input_display_override: Option<String>,
     external_telemetry: ExternalTelemetry,
@@ -856,7 +800,6 @@ struct TuiState {
     todo_progress: Option<TodoProgress>,
     work_map: Option<WorkMapDrawer>,
     active_focus: Option<ActiveFocusLabel>,
-    detached_subagent: Option<DetachedSubagent>,
     debug_events: VecDeque<String>,
 }
 
@@ -935,7 +878,6 @@ impl TuiState {
             call_tag_seq: 0,
             turn_seq: 0,
             call_tags: HashMap::new(),
-            sub_batch: None,
             verbose: true,
             input_display_override: None,
             external_telemetry: ExternalTelemetry::default(),
@@ -954,7 +896,6 @@ impl TuiState {
             todo_progress: None,
             work_map: None,
             active_focus: None,
-            detached_subagent: None,
             debug_events: VecDeque::new(),
         }
     }
@@ -969,46 +910,6 @@ impl TuiState {
         }
         self.git_branch = git_summary(std::path::Path::new(&self.sandbox));
         self.git_branch_refreshed = Some(Instant::now());
-    }
-
-    fn poll_detached_subagent(&mut self) {
-        let ds = match self.detached_subagent.as_mut() {
-            Some(ds) if !ds.completed => ds,
-            _ => return,
-        };
-        let mut file = match std::fs::File::open(&ds.output_path) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        use std::io::{Read, Seek, SeekFrom};
-        if let Ok(meta) = file.metadata()
-            && meta.len() <= ds.file_offset
-        {
-            return;
-        }
-        if file.seek(SeekFrom::Start(ds.file_offset)).is_err() {
-            return;
-        }
-        let mut buf = String::new();
-        if file.read_to_string(&mut buf).is_err() {
-            return;
-        }
-        ds.file_offset += buf.len() as u64;
-        let new_lines: Vec<&str> = buf.lines().collect();
-        const MAX_TAIL: usize = 8;
-        for line in new_lines {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            ds.tail.push(trimmed.to_string());
-        }
-        while ds.tail.len() > MAX_TAIL {
-            ds.tail.remove(0);
-        }
-        if buf.contains("## Status\ncomplete") {
-            ds.completed = true;
-        }
     }
 
     fn push_debug_event(&mut self, event: impl Into<String>) {
@@ -1368,13 +1269,6 @@ impl TuiState {
                 self.turn_tool_counts.clear();
                 self.turn_error_count = 0;
                 self.turn_start_at = Some(Instant::now());
-                if self
-                    .detached_subagent
-                    .as_ref()
-                    .is_some_and(|ds| ds.completed)
-                {
-                    self.detached_subagent = None;
-                }
             }
             AgentEvent::HistoryContextUpdated { chars, tokens } => {
                 self.history_chars = chars as u64;
@@ -1460,14 +1354,12 @@ impl TuiState {
                 summary,
             } => {
                 self.push_debug_event(format!("tool preview · {name} · {call_id}"));
-                let is_subagent = is_subagent_call_id(&call_id);
                 let call_tag = self.tool_tag_for(&call_id);
                 if let Some(existing) = self.live_tools.iter_mut().find(|t| t.call_id == call_id) {
                     if existing.summary.is_empty() {
                         existing.summary = summary;
                     }
                     existing.name = name;
-                    existing.is_subagent = is_subagent;
                 } else {
                     self.live_tools.push(LiveTool {
                         call_id,
@@ -1476,7 +1368,6 @@ impl TuiState {
                         summary,
                         running: false,
                         started: None,
-                        is_subagent,
                     });
                 }
             }
@@ -1486,10 +1377,6 @@ impl TuiState {
                 summary,
             } => {
                 self.push_debug_event(format!("tool start · {name} · {call_id}"));
-                let is_subagent = is_subagent_call_id(&call_id);
-                if !is_subagent && self.sub_batch.as_ref().is_some_and(|b| b.done) {
-                    self.sub_batch = None;
-                }
                 let preferred_tag = self.tool_tag_for(&call_id);
                 let match_idx = self
                     .live_tools
@@ -1513,7 +1400,6 @@ impl TuiState {
                     entry.started = Some(Instant::now());
                     entry.call_tag = final_tag;
                     entry.name = name.clone();
-                    entry.is_subagent = is_subagent;
                     if !summary.is_empty() {
                         entry.summary = summary.clone();
                     }
@@ -1525,7 +1411,6 @@ impl TuiState {
                         summary,
                         running: true,
                         started: Some(Instant::now()),
-                        is_subagent,
                     });
                 }
                 self.retry_status = None;
@@ -1543,7 +1428,6 @@ impl TuiState {
                     if ok { "ok" } else { "error" },
                     content.lines().count()
                 ));
-                let is_subagent = is_subagent_call_id(&call_id);
                 let call_tag = self.tool_tag_for(&call_id);
                 let idx = self
                     .live_tools
@@ -1555,11 +1439,11 @@ impl TuiState {
                             .position(|t| t.call_id == call_id || (t.name == name && t.running))
                     })
                     .or_else(|| self.live_tools.iter().position(|t| t.name == name));
-                let (n, mut summary, tool_is_subagent, started_at) = if let Some(i) = idx {
+                let (n, mut summary, started_at) = if let Some(i) = idx {
                     let t = self.live_tools.remove(i);
-                    (t.name, t.summary, t.is_subagent, t.started)
+                    (t.name, t.summary, t.started)
                 } else {
-                    (name.clone(), String::new(), is_subagent, None)
+                    (name.clone(), String::new(), None)
                 };
                 let duration_secs = started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
                 let denied = !ok && content.contains("permission denied");
@@ -1568,10 +1452,6 @@ impl TuiState {
                 }
 
                 self.retry_status = None;
-                if tool_is_subagent {
-                    self.status = "subagent running".into();
-                    return;
-                }
 
                 if ok && !content.is_empty() && content_has_more_than_preview(&content) {
                     self.last_expandable = Some(ExpandableBlock {
@@ -1611,9 +1491,6 @@ impl TuiState {
                     density_rank: 1,
                     expanded: false,
                 });
-                if n == "subagent" {
-                    self.live_tools.retain(|t| !t.is_subagent);
-                }
                 self.status = "thinking".into();
             }
             AgentEvent::LocalAuthPrompt { tool, message } => {
@@ -1624,49 +1501,23 @@ impl TuiState {
             AgentEvent::ToolBatchStart {
                 batch_id,
                 call_ids,
-                labels,
+                labels: _,
             } => {
                 self.push_debug_event(format!(
                     "tool batch start · {batch_id} · {} calls",
                     call_ids.len()
                 ));
-                if is_subagent_batch_id(&batch_id) {
-                    let mut entries: Vec<String> = Vec::new();
-                    for (i, call_id) in call_ids.into_iter().enumerate() {
-                        let call_tag = self.tool_tag_for(&call_id);
-                        let label = labels.get(i).cloned().unwrap_or_else(|| "tool".to_string());
-                        entries.push(format!("{call_tag} {label}"));
-                    }
-                    self.sub_batch = Some(LiveBatch {
-                        entries,
-                        failed: 0,
-                        done: false,
-                    });
-                }
             }
             AgentEvent::ToolBatchEnd {
                 batch_id,
                 call_ids,
-                labels,
+                labels: _,
                 failed,
             } => {
                 self.push_debug_event(format!(
                     "tool batch end · {batch_id} · {} calls · {failed} failed",
                     call_ids.len()
                 ));
-                if is_subagent_batch_id(&batch_id) {
-                    let mut entries: Vec<String> = Vec::new();
-                    for (i, call_id) in call_ids.into_iter().enumerate() {
-                        let call_tag = self.tool_tag_for(&call_id);
-                        let label = labels.get(i).cloned().unwrap_or_else(|| "tool".to_string());
-                        entries.push(format!("{call_tag} {label}"));
-                    }
-                    self.sub_batch = Some(LiveBatch {
-                        entries,
-                        failed,
-                        done: true,
-                    });
-                }
             }
             AgentEvent::UsageUpdate { turn, session } => {
                 self.usage = session;
@@ -1788,15 +1639,11 @@ impl TuiState {
                 self.stream_started_at = None;
                 self.stream_chars = 0;
                 self.live_tools.clear();
-                self.sub_batch = None;
                 self.agent_busy = false;
                 if s.starts_with("focus cleared;") || s.starts_with("cleared ") {
                     self.active_focus = None;
                 }
                 self.status = phase_status_text(&s).unwrap_or_else(|| "ready".into());
-                if let Some(ds) = parse_detached_subagent_launch(&s) {
-                    self.detached_subagent = Some(ds);
-                }
                 self.queue(Line_::Info(s));
             }
             AgentEvent::WorkMap {
@@ -1816,7 +1663,6 @@ impl TuiState {
                 self.stream_started_at = None;
                 self.stream_chars = 0;
                 self.live_tools.clear();
-                self.sub_batch = None;
                 self.agent_busy = false;
                 if matches!(kind, WorkMapEventKind::Focus) {
                     self.active_focus = parse_work_map_focus_label(&text);
@@ -1877,7 +1723,6 @@ impl TuiState {
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
                 self.live_tools.clear();
-                self.sub_batch = None;
             }
             AgentEvent::CompactStart => {
                 self.push_debug_event("compact start");
@@ -1930,7 +1775,6 @@ impl TuiState {
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
                 self.live_tools.clear();
-                self.sub_batch = None;
             }
             AgentEvent::SteeringReceived { messages, preview } => {
                 self.push_debug_event(format!("steering received · {messages} updates"));
@@ -2046,36 +1890,16 @@ fn derived_busy_status(state: &TuiState) -> String {
     if let Some(retry) = &state.retry_status {
         return retry.clone();
     }
-    if let Some(ds) = &state.detached_subagent
-        && !ds.completed
-    {
-        return "subagent running".to_string();
-    }
     let running_tools: Vec<&LiveTool> = state
         .live_tools
         .iter()
         .filter(|tool| tool.running)
         .collect();
     if !running_tools.is_empty() {
-        let subagents = running_tools.iter().filter(|tool| tool.is_subagent).count();
-        let regular = running_tools.len().saturating_sub(subagents);
-        if regular == 1
-            && let Some(tool) = running_tools.iter().find(|tool| !tool.is_subagent)
-        {
-            return format!("running {}", tool.name);
+        if running_tools.len() == 1 {
+            return format!("running {}", running_tools[0].name);
         }
-        if regular > 1 {
-            return format!("running {regular} tools");
-        }
-        if subagents == 1 {
-            return "subagent running".to_string();
-        }
-        if subagents > 1 {
-            return format!("{subagents} subagents running");
-        }
-    }
-    if state.sub_batch.as_ref().is_some_and(|batch| !batch.done) {
-        return "subagent batch running".to_string();
+        return format!("running {} tools", running_tools.len());
     }
     if !state.streaming_text.is_empty() {
         return "responding".to_string();
@@ -2213,33 +2037,6 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
             ]));
         }
     }
-    if let Some(ds) = &state.detached_subagent {
-        if !ds.completed {
-            let last_tool = ds.tail.iter().rev().find(|l| l.starts_with("▶"));
-            let last_line = ds.tail.last().map(|s| s.as_str()).unwrap_or("launched");
-            let label = if let Some(tool) = last_tool {
-                format!("⟨sub⟩ {}", tool.trim_start_matches("▶ ").trim())
-            } else if ds.task.is_empty() {
-                last_line.to_string()
-            } else {
-                let task_head = ds.task.chars().take(30).collect::<String>();
-                format!("⟨sub⟩ {task_head}")
-            };
-            return Some(live_detail_line(
-                label,
-                Color::Cyan,
-                max_cells,
-                state.context_mode,
-            ));
-        } else {
-            return Some(live_detail_line(
-                "⟨sub⟩ complete".to_string(),
-                Color::Green,
-                max_cells,
-                state.context_mode,
-            ));
-        }
-    }
     let running_tools: Vec<&LiveTool> = state
         .live_tools
         .iter()
@@ -2248,27 +2045,6 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
     if let Some(tool) = running_tools.iter().find(|tool| !tool.summary.is_empty()) {
         return Some(live_detail_line(
             tool.summary.clone(),
-            Color::Reset,
-            max_cells,
-            state.context_mode,
-        ));
-    }
-    if let Some(batch) = state
-        .sub_batch
-        .as_ref()
-        .filter(|batch| !batch.entries.is_empty())
-    {
-        let detail = if batch.done {
-            format!(
-                "batch complete · {} entries · {} failed",
-                batch.entries.len(),
-                batch.failed
-            )
-        } else {
-            format!("batch active · {} entries", batch.entries.len())
-        };
-        return Some(live_detail_line(
-            detail,
             Color::Reset,
             max_cells,
             state.context_mode,
@@ -7805,30 +7581,6 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                                     .sink
                                     .emit(AgentEvent::Error(format!("[plan error] {e:#}")));
                             }
-                        } else if trimmed == "/subagent" || trimmed.starts_with("/subagent ") {
-                            let raw = trimmed.strip_prefix("/subagent").unwrap_or("").trim();
-                            if raw.is_empty() {
-                                agent.sink.emit(AgentEvent::Slash(
-                                    "usage: /subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]\n       /subagent steer <message>".into(),
-                                ));
-                            } else if raw.starts_with("steer ") || raw == "steer" {
-                                let msg = raw.strip_prefix("steer").unwrap_or("").trim();
-                                if msg.is_empty() {
-                                    agent.sink.emit(AgentEvent::Slash(
-                                        "usage: /subagent steer <message>".into(),
-                                    ));
-                                } else if let Err(e) =
-                                    agent.steer_detached_subagent(msg.to_string()).await
-                                {
-                                    agent
-                                        .sink
-                                        .emit(AgentEvent::Error(format!("[steer error] {e:#}")));
-                                }
-                            } else if let Err(e) = agent.run_subagent_cmd(raw.to_string()).await {
-                                agent
-                                    .sink
-                                    .emit(AgentEvent::Error(format!("[subagent error] {e:#}")));
-                            }
                         } else if trimmed == "/pack"
                             || trimmed.starts_with("/pack ")
                             || trimmed == "/packs"
@@ -7943,7 +7695,6 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
             }
             _ = tokio::time::sleep(timeout) => {
                 last_tick = Instant::now();
-                state.poll_detached_subagent();
             }
         }
     }
@@ -8688,7 +8439,6 @@ mod tests {
             summary: "bash: cargo test --release".to_string(),
             running: true,
             started: Some(Instant::now() - Duration::from_secs(5)),
-            is_subagent: false,
         });
 
         let text = transcript_live_indicator_text(&state, 80).expect("live indicator");
@@ -9414,7 +9164,6 @@ mod tests {
             summary: "bash: pwd".to_string(),
             running: true,
             started: Some(Instant::now()),
-            is_subagent: false,
         });
 
         state.apply_event(AgentEvent::Slash("ok".to_string()));
@@ -10148,7 +9897,6 @@ mod tests {
             summary: "bash: curl".to_string(),
             running: true,
             started: None,
-            is_subagent: false,
         });
         assert_eq!(derived_busy_status(&state), "running bash");
     }

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Removed
+
+- Removed the subagent feature completely: `/subagent` slash command,
+  `subagent-runtime` CLI subcommand, detached/inline runners, steering,
+  quality gates, TUI state, session artifacts dir, and all associated
+  tests/fixtures. `/plan` preserved via a direct read-only planner.
+  Net -1544 lines.
+
 ### Added
 
 - Added Git-native Dext checkpoints before approved write-risk tool calls.

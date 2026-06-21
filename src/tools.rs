@@ -11,32 +11,16 @@ pub(crate) struct Tool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RuntimeTool {
-    pub(crate) name: &'static str,
-    pub(crate) description: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct SlashCommand {
     pub(crate) name: &'static str,
     pub(crate) usage: &'static str,
     pub(crate) description: &'static str,
 }
 
-pub(crate) fn runtime_tool_definitions() -> Vec<RuntimeTool> {
-    vec![RuntimeTool {
-        name: "subagent-runtime",
-        description: "Run a detached subagent runtime from an input file into one output bundle.",
-    }]
-}
-
+#[cfg(test)]
 pub(crate) fn slash_command_definitions() -> Vec<SlashCommand> {
     vec![
-        SlashCommand {
-            name: "subagent",
-            usage: "/subagent <task> [--tools t1,t2] [--max-iter N] [--system PROMPT] [--readonly] [--inline|--detached]",
-            description: "Run a user-requested subagent while keeping delegation out of provider-visible tools.",
-        },
         SlashCommand {
             name: "browser",
             usage: "/browser [off|agent-browser|status]",
