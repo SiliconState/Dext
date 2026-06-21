@@ -1215,11 +1215,7 @@ pub(crate) fn text_is_potential_local_secret(text: &str) -> bool {
     if looks_like_public_clipboard_reference(trimmed) {
         return false;
     }
-    let words = trimmed.split_whitespace().count();
-    if words > 3 || (trimmed.contains(' ') && !trimmed.contains('=')) {
-        return false;
-    }
-    words <= 2 && trimmed.chars().count() >= 8
+    false
 }
 
 fn contains_secretish_assignment(text: &str) -> bool {

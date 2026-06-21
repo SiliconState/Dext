@@ -770,6 +770,10 @@ fn busy_console_input_allows_public_copied_text_as_steering() {
         "zephyr_z9\n",
         "@zephyr_z9\n",
         "d6280ad878e3\n",
+        "grad-programs-ai-security-2027.md\n",
+        "08_synthesis/grad-programs-ai-security-2027.md\n",
+        "- 08_synthesis/grad-programs-ai-security-2027.md\n",
+        "fix the narrow emoji status column\n",
     ] {
         let route = route_interactive_input_line(
             pasted.to_string(),
@@ -806,6 +810,18 @@ fn potential_local_secret_detection_keeps_targeted_secret_coverage() {
     assert!(!text_is_potential_local_secret("zephyr_z9"));
     assert!(!text_is_potential_local_secret("@zephyr_z9"));
     assert!(!text_is_potential_local_secret("d6280ad878e3"));
+    assert!(!text_is_potential_local_secret(
+        "grad-programs-ai-security-2027.md"
+    ));
+    assert!(!text_is_potential_local_secret(
+        "08_synthesis/grad-programs-ai-security-2027.md"
+    ));
+    assert!(!text_is_potential_local_secret(
+        "- 08_synthesis/grad-programs-ai-security-2027.md"
+    ));
+    assert!(!text_is_potential_local_secret(
+        "fix the narrow emoji status column"
+    ));
 }
 
 #[test]

@@ -3968,12 +3968,18 @@ fn buffer_to_lines(buffer: &ratatui::buffer::Buffer, area: Rect) -> Vec<Line<'st
         let mut spans = Vec::new();
         let mut text_line = String::new();
         let mut current_style: Option<Style> = None;
+        let mut hidden_by_wide_symbol = 0usize;
         for x in 0..area.width {
             let cell = &buffer[(x, y)];
+            if hidden_by_wide_symbol > 0 {
+                hidden_by_wide_symbol -= 1;
+                continue;
+            }
             let symbol = cell.symbol();
             if symbol.is_empty() {
                 continue;
             }
+            hidden_by_wide_symbol = unicode_width::UnicodeWidthStr::width(symbol).saturating_sub(1);
             let style = cell.style();
             if current_style == Some(style) {
                 text_line.push_str(symbol);
@@ -11079,6 +11085,47 @@ mod tests {
         assert!(!joined.contains("✅"), "{joined}");
         assert!(!joined.contains("Yes"), "{joined}");
         assert!(!joined.contains("No"), "{joined}");
+    }
+
+    #[test]
+    fn leading_emoji_cells_do_not_shift_right_table_border() {
+        let input = "| Dimension | My best guess | Confirm? |\n| --- | --- | --- |\n| Degree | PhD | ✅ clear |\n| Field | CS / Cybersecurity / AI | ⚠️ confirm |\n| GRE | Optional/waived | ⚠️ need this |";
+        let text = line_to_text(
+            &Line_::Assistant {
+                text: input.to_string(),
+                dim_prefix: false,
+            },
+            120,
+        );
+        let flat = flatten_lines(&text);
+        let joined = flat.join("\n");
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains("✅ clear"), "{joined}");
+        assert!(joined.contains("⚠️ confirm"), "{joined}");
+        assert!(joined.contains("⚠️ need this"), "{joined}");
+        assert!(!joined.contains("✅  clear"), "{joined}");
+        assert!(!joined.contains("⚠️  confirm"), "{joined}");
+        let table_edge = |line: &str| {
+            let idx = line
+                .rfind(['┐', '┤', '┘', '│'])
+                .expect("table right edge");
+            let edge = line[idx..].chars().next().expect("right edge marker");
+            text_width(&line[..idx]) + text_width(&line[idx..idx + edge.len_utf8()])
+        };
+        let border_width = flat
+            .iter()
+            .find(|line| line.starts_with("│ ┌"))
+            .map(|line| table_edge(line))
+            .expect("top border");
+        let emoji_rows = flat
+            .iter()
+            .filter(|line| line.starts_with("│ │") && (line.contains('✅') || line.contains('⚠')))
+            .collect::<Vec<_>>();
+        assert_eq!(emoji_rows.len(), 3, "{flat:?}");
+        assert!(
+            emoji_rows.iter().all(|line| table_edge(line) == border_width),
+            "emoji rows should keep separators and right border aligned with the table edge: {flat:?}"
+        );
     }
 
     #[test]
