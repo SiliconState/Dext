@@ -12399,8 +12399,15 @@ impl Agent {
         );
         let saved_max_iterations = self.max_iterations.replace(15);
         let saved_history = std::mem::take(&mut self.history);
+        let saved_silent = self.silent;
+        let saved_pretty = self.pretty;
+        let saved_suppress_checkpoints = self.suppress_checkpoints;
+        let saved_work_ledger = self.work_ledger.clone();
+        let saved_budget_exhausted = self.budget_exhausted;
         self.silent = true;
         self.pretty = false;
+        self.suppress_checkpoints = true;
+        self.budget_exhausted = false;
 
         let prompt = format!("Produce a read-only implementation plan for this task:\n\n{task}");
         let chat_result = self.chat(prompt).await;
@@ -12410,27 +12417,37 @@ impl Agent {
             .iter()
             .rev()
             .find_map(|message| {
-                (message.role == "assistant").then(|| {
-                    message
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            Block::Text { text } | Block::PartialStream { text } => {
-                                Some(text.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
+                if message.role != "assistant" {
+                    return None;
+                }
+                let text: String = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text { text } | Block::PartialStream { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
             })
-            .filter(|text| !text.trim().is_empty())
             .unwrap_or_else(|| "(planner returned no text)".to_string());
 
         self.history = saved_history;
         self.system = saved_system;
         self.tools = saved_tools;
         self.max_iterations = saved_max_iterations;
+        self.silent = saved_silent;
+        self.pretty = saved_pretty;
+        self.suppress_checkpoints = saved_suppress_checkpoints;
+        self.work_ledger = saved_work_ledger;
+        self.budget_exhausted = saved_budget_exhausted;
 
         chat_result?;
         Ok(plan)
