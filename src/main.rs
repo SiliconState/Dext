@@ -1831,6 +1831,18 @@ fn emit_work_map_event(
     });
 }
 
+struct SilentSink;
+
+impl EventSink for SilentSink {
+    fn emit(&mut self, _event: AgentEvent) {}
+
+    fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+        Choice::Deny
+    }
+
+    fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+}
+
 #[cfg(test)]
 struct NullSink;
 
@@ -9375,6 +9387,7 @@ struct Agent {
     shelf_registry: shelves::ShelfRegistry,
     hooks: Hooks,
     pack_hook_env: Vec<(String, String)>,
+    suppress_pack_activation: bool,
     state_lock: Option<Arc<SessionStateLock>>,
     session_enabled: bool,
     session_id: String,
@@ -9534,6 +9547,7 @@ impl Agent {
             shelf_registry: shelves::ShelfRegistry::discover(&sandbox_root),
             hooks: Hooks::load(&sandbox_root),
             pack_hook_env: Vec::new(),
+            suppress_pack_activation: false,
             sandbox_root,
             git_context,
             silent: false,
@@ -10160,6 +10174,7 @@ impl Agent {
 
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
         self.pack_hook_env.clear();
+        self.suppress_pack_activation = false;
         let next_lock_path = session_state_lock_path(&root, &self.session_id);
         let same_session = self
             .state_lock
@@ -12401,12 +12416,19 @@ impl Agent {
         let saved_history = std::mem::take(&mut self.history);
         let saved_silent = self.silent;
         let saved_pretty = self.pretty;
+        let saved_sink = std::mem::replace(&mut self.sink, Box::new(SilentSink));
         let saved_suppress_checkpoints = self.suppress_checkpoints;
+        let saved_hooks = self.hooks.clone();
+        let saved_pack_hook_env = self.pack_hook_env.clone();
+        let saved_suppress_pack_activation = self.suppress_pack_activation;
         let saved_work_ledger = self.work_ledger.clone();
         let saved_budget_exhausted = self.budget_exhausted;
         self.silent = true;
         self.pretty = false;
         self.suppress_checkpoints = true;
+        self.suppress_pack_activation = true;
+        self.hooks = Hooks::default();
+        self.pack_hook_env.clear();
         self.budget_exhausted = false;
 
         let prompt = format!("Produce a read-only implementation plan for this task:\n\n{task}");
@@ -12446,8 +12468,12 @@ impl Agent {
         self.silent = saved_silent;
         self.pretty = saved_pretty;
         self.suppress_checkpoints = saved_suppress_checkpoints;
+        self.hooks = saved_hooks;
+        self.pack_hook_env = saved_pack_hook_env;
+        self.suppress_pack_activation = saved_suppress_pack_activation;
         self.work_ledger = saved_work_ledger;
         self.budget_exhausted = saved_budget_exhausted;
+        self.sink = saved_sink;
 
         chat_result?;
         Ok(plan)
@@ -12474,7 +12500,9 @@ impl Agent {
         // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
         // walks, pack discovery) on the first request of the turn.
         self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
-        if let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input) {
+        if !self.suppress_pack_activation
+            && let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input)
+        {
             self.activate_pack_hooks(&invocation.pack);
             self.sink.emit(AgentEvent::Info(format!(
                 "[pack:{}] inferred conversational invocation",

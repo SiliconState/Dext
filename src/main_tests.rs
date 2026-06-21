@@ -75,6 +75,7 @@ fn test_agent(root: &Path) -> Agent {
         shelf_registry: shelves::ShelfRegistry::discover(root),
         hooks: Hooks::default(),
         pack_hook_env: Vec::new(),
+        suppress_pack_activation: false,
         state_lock: None,
         session_enabled: true,
         session_id: session_id.clone(),
@@ -10021,6 +10022,67 @@ async fn compact_uses_deterministic_evidence_fallback_when_summary_request_error
         "CompactEnd must fire when deterministic fallback compaction succeeds"
     );
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_only_plan_suppresses_internal_planner_events_hooks_and_restores_sink() {
+    let root = temp_test_dir("plan-silent-sink");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("hooks.json"),
+        r#"{"user_prompt":[{"match":"*","command":"printf fired > hook-fired"}]}"#,
+    )
+    .expect("write hooks");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request);
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"plan text\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+    });
+
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.provider_id = "local".to_string();
+    agent.provider_requires_api_key = false;
+    agent.api_key.clear();
+    agent.base_url = format!("http://{addr}");
+    agent.model = "qwen2.5-coder-7b".to_string();
+    agent.hooks = Hooks::load(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    let plan = agent
+        .generate_read_only_plan("write a plan")
+        .await
+        .expect("plan completes");
+    assert_eq!(plan, "plan text");
+    assert!(
+        drain_events(&mut rx).is_empty(),
+        "internal planner events must not leak to the active sink"
+    );
+    assert!(
+        !root.join("hook-fired").exists(),
+        "planning must not fire user_prompt hooks"
+    );
+
+    agent.sink.emit(AgentEvent::Slash("restored".to_string()));
+    assert!(
+        drain_events(&mut rx)
+            .into_iter()
+            .any(|event| matches!(event, AgentEvent::Slash(text) if text == "restored")),
+        "original sink should be restored after planning"
+    );
+
+    server.join().expect("server thread");
     let _ = std::fs::remove_dir_all(&root);
 }
 
