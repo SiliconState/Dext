@@ -11129,6 +11129,32 @@ mod tests {
     }
 
     #[test]
+    fn clipped_emoji_bullet_lines_keep_swim_lane_border() {
+        let input = "- That prevents the hidden blank cell after ✅ / ⚠️ from being emitted again and shifting the separator/right border.\n- Added regression: leading_emoji_cells_do_not_shift_right_table_border\n    - exercises actual assistant render path\n    - keeps ✅ clear, ⚠️ confirm, ⚠️ need this\n    - asserts table edge alignment stays stable on emoji rows.";
+        let text = line_to_text(
+            &Line_::Assistant {
+                text: input.to_string(),
+                dim_prefix: false,
+            },
+            80,
+        );
+        let flat = flatten_lines(&text);
+        let joined = flat.join("\n");
+        assert!(joined.contains("✅ / ⚠️"), "{joined}");
+        assert!(joined.contains("✅ clear"), "{joined}");
+        assert!(!joined.contains("✅  / ⚠️"), "{joined}");
+        assert!(!joined.contains("⚠️  from"), "{joined}");
+        assert!(!joined.contains("✅  clear"), "{joined}");
+        assert!(!joined.contains("⚠️  confirm"), "{joined}");
+        assert!(
+            flat.iter()
+                .filter(|line| !line.is_empty() && !line.starts_with("┌") && !line.starts_with("└"))
+                .all(|line| line.starts_with("│ ") && text_width(line) <= 80),
+            "body lines should keep the left swim-lane border and stay inside width: {flat:?}"
+        );
+    }
+
+    #[test]
     fn overloaded_table_renders_as_bordered_table() {
         let input = "| Area | Item | Result | Value | Recommendation |\n| --- | --- | --- | --- | --- |\n| Check | Model installed | ✅ Yes | | |\n| Performance | Best observed generation | | 10.87 tok/s | |\n| Constraint | WSL currently exposes | | ~15 GiB | |\n| Next step | Increase WSL memory | | | edit ~/.wslconfig and restart WSL |";
         let text = markdown_text(input, Style::default(), 120);
