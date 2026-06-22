@@ -345,7 +345,12 @@ pub(crate) fn render_pack_list(
         if opts.verbose {
             meta.push(("path", list_render::display_path(&pack.path, opts, root)));
         }
-        out.push_str(&list_render::render_entry(&pack.name, &pack.description, &meta, opts));
+        let desc = if pack.description.trim().is_empty() {
+            "(no description)"
+        } else {
+            pack.description.as_str()
+        };
+        out.push_str(&list_render::render_entry(&pack.name, desc, &meta, opts));
     }
     if packs.len() > PACK_LIST_LIMIT {
         let _ = writeln!(

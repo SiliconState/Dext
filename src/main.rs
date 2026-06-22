@@ -14727,12 +14727,15 @@ fn render_session_listing(root: &Path) -> String {
 
     let named_records = list_session_records_for_root(root);
 
-    let total = 1 + autosaved_sessions.len() + named_records.as_ref().map(|r| r.len()).unwrap_or(0);
+    let latest_exists = latest_path.exists();
+    let total = (if latest_exists { 1 } else { 0 })
+        + autosaved_sessions.len()
+        + named_records.as_ref().map(|r| r.len()).unwrap_or(0);
     let mut out = String::new();
     let _ = write!(out, "{}", list_render::render_header("Sessions", total, &opts));
 
     let _ = writeln!(out, "{}", list_render::bold("Latest", opts.color));
-    if latest_path.exists() {
+    if latest_exists {
         let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
         out.push_str(&render_session_entry(&latest_path, "latest", modified, &opts, root));
     } else {

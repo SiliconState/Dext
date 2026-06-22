@@ -191,12 +191,9 @@ pub(crate) fn render_entry(
     let mut out = String::new();
     let hang = 4;
     let _ = writeln!(out, "  {}", bold(name, opts.color));
-    let desc = if description.trim().is_empty() {
-        "(no description)"
-    } else {
-        description.trim()
-    };
-    write_wrapped(&mut out, desc, hang, opts.effective_width());
+    if !description.trim().is_empty() {
+        write_wrapped(&mut out, description.trim(), hang, opts.effective_width());
+    }
     if !meta.is_empty() {
         let pairs: Vec<String> = meta
             .iter()

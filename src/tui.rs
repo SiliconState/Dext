@@ -3273,7 +3273,8 @@ fn wrap_input_visual(
     let mut cursor_row = 0usize;
     let mut cursor_col = 0usize;
 
-    for (idx, ch) in input.char_indices() {
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    for (ci, &(idx, ch)) in chars.iter().enumerate() {
         if idx == clamped {
             cursor_row = row;
             cursor_col = col;
@@ -3286,7 +3287,22 @@ fn wrap_input_visual(
             continue;
         }
 
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        // Variation selector-16 (U+FE0F): zero-width formatting char that stays
+        // with its base char. Its width contribution is already folded into the
+        // base char's width via the VS16 lookahead below.
+        if ch == '\u{FE0F}' {
+            lines[row].push(ch);
+            continue;
+        }
+
+        let mut w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        // Emoji presentation: a width-1 char followed by VS16 renders as a
+        // 2-cell emoji in terminals, but UnicodeWidthChar counts the base as 1.
+        // Bump to match terminal rendering so wrapping doesn't overflow borders.
+        if w == 1 && chars.get(ci + 1).is_some_and(|&(_, nc)| nc == '\u{FE0F}') {
+            w = 2;
+        }
+
         if col + w > cols {
             lines.push(String::new());
             row += 1;
@@ -11460,5 +11476,40 @@ mod tests {
         let flat = flatten_lines(&text);
         let joined = flat.join("\n");
         assert!(joined.contains("7"));
+    }
+
+    #[test]
+    fn wrap_input_visual_counts_emoji_presentation_as_two_cells() {
+        // ⚠️ = U+26A0 (width 1) + U+FE0F (VS16, width 0).
+        // Per-char unicode-width counts ⚠ as 1, but terminals render ⚠️ as 2.
+        // The wrapper must account for this so tool-call borders don't overflow.
+        let text = "ab⚠️cd";
+        let (lines, _, _) = wrap_input_visual(text, text.len(), 4);
+        // "ab" = 2 cells, "⚠️" = 2 cells → total 4, fits on line 0.
+        // "cd" = 2 cells → line 1.
+        assert_eq!(lines.len(), 2, "⚠️ should count as 2 cells: {lines:?}");
+        assert_eq!(lines[0], "ab⚠️");
+        assert_eq!(lines[1], "cd");
+    }
+
+    #[test]
+    fn wrap_input_visual_keeps_vs16_with_base_char() {
+        // The VS16 must stay on the same line as its base char, not wrap separately.
+        let text = "aaa⚠️bbb";
+        let (lines, _, _) = wrap_input_visual(text, text.len(), 5);
+        // "aaa" = 3, "⚠️" = 2 → total 5, fits. "bbb" = 3 → next line.
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].ends_with("⚠️"), "VS16 must stay with base: {lines:?}");
+    }
+
+    #[test]
+    fn wrap_input_visual_vs16_at_exact_boundary() {
+        // Emoji at the very end of the line width — should not overflow.
+        let text = "abcd⚠️ef";
+        let (lines, _, _) = wrap_input_visual(text, text.len(), 6);
+        // "abcd" = 4, "⚠️" = 2 → total 6, exactly fits. "ef" → next line.
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "abcd⚠️");
+        assert_eq!(lines[1], "ef");
     }
 }
