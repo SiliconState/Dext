@@ -3210,6 +3210,57 @@ fn sanitize_display_text(text: &str) -> String {
     out
 }
 
+/// A single base char plus any trailing zero-width continuation chars (VS16,
+/// ZWJ, combining marks). Terminal display width is measured on the whole slice
+/// via `UnicodeWidthStr`, which is correct for every multi-codepoint symbol
+/// class — unlike per-char `UnicodeWidthChar::width`, which misses sequences
+/// like `⚙️` (⚙=1 + VS16) and would split a cluster across a clip boundary.
+#[derive(Debug)]
+pub(crate) struct DisplayCluster {
+    pub byte_start: usize,
+    pub byte_len: usize,
+    pub width: usize,
+}
+
+pub(crate) fn display_clusters(s: &str) -> Vec<DisplayCluster> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut prev_was_zwj = false;
+    let mut ri_run = 0u32;
+    for (i, ch) in s.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let is_zwj = ch == '\u{200D}';
+        let is_ri = ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch);
+        // This char continues the cluster at `start` when it is a zero-width
+        // continuation (combining mark / VS16 / ZWJ), a base char extending a
+        // ZWJ sequence (👨‍👩‍👧), or the second regional indicator of a flag pair.
+        let continues = start.is_some()
+            && ((w == 0 && !ch.is_control()) || prev_was_zwj || (is_ri && ri_run % 2 == 1));
+        if !continues {
+            if let Some(bs) = start.take() {
+                let slice = &s[bs..i];
+                out.push(DisplayCluster {
+                    byte_start: bs,
+                    byte_len: i - bs,
+                    width: unicode_width::UnicodeWidthStr::width(slice),
+                });
+            }
+            start = Some(i);
+        }
+        ri_run = if is_ri { ri_run + 1 } else { 0 };
+        prev_was_zwj = is_zwj;
+    }
+    if let Some(bs) = start {
+        let slice = &s[bs..];
+        out.push(DisplayCluster {
+            byte_start: bs,
+            byte_len: slice.len(),
+            width: unicode_width::UnicodeWidthStr::width(slice),
+        });
+    }
+    out
+}
+
 fn clamp_chars(s: &str, max_cells: usize) -> String {
     clamp_chars_plain(s, max_cells)
 }
@@ -3218,17 +3269,17 @@ fn clamp_chars_plain(s: &str, max_cells: usize) -> String {
     if max_cells == 0 {
         return String::new();
     }
+    let clusters = display_clusters(s);
     let mut cells = 0usize;
-    let mut char_end = 0usize;
-    for (i, c) in s.char_indices() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if cells + w > max_cells {
+    let mut byte_end = 0usize;
+    for c in &clusters {
+        if cells + c.width > max_cells {
             break;
         }
-        cells += w;
-        char_end = i + c.len_utf8();
+        cells += c.width;
+        byte_end = c.byte_start + c.byte_len;
     }
-    if char_end >= s.len() {
+    if byte_end >= s.len() {
         return s.to_string();
     }
     if max_cells == 1 {
@@ -3236,13 +3287,12 @@ fn clamp_chars_plain(s: &str, max_cells: usize) -> String {
     }
     let mut out = String::new();
     let mut truncated_cells = 0usize;
-    for c in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if truncated_cells + w + 1 > max_cells {
+    for c in &clusters {
+        if truncated_cells + c.width + 1 > max_cells {
             break;
         }
-        out.push(c);
-        truncated_cells += w;
+        out.push_str(&s[c.byte_start..c.byte_start + c.byte_len]);
+        truncated_cells += c.width;
     }
     out.push('…');
     out
@@ -3277,47 +3327,32 @@ fn wrap_input_visual(
     let mut col = 0usize;
     let mut cursor_row = 0usize;
     let mut cursor_col = 0usize;
+    let mut cursor_set = false;
 
-    let mut chars = input.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        if idx == clamped {
+    for c in display_clusters(input) {
+        let end = c.byte_start + c.byte_len;
+        if !cursor_set && clamped <= end {
             cursor_row = row;
-            cursor_col = col;
+            cursor_col = if clamped <= c.byte_start { col } else { col + c.width };
+            cursor_set = true;
         }
-
-        if ch == '\n' {
+        let cluster = &input[c.byte_start..end];
+        if cluster.starts_with('\n') {
             lines.push(String::new());
             row += 1;
             col = 0;
             continue;
         }
-
-        // Variation selector-16 (U+FE0F): zero-width formatting char that stays
-        // with its base char. Its width contribution is already folded into the
-        // base char's width via the VS16 lookahead below.
-        if ch == '\u{FE0F}' {
-            lines[row].push(ch);
-            continue;
-        }
-
-        let mut w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        // Emoji presentation: a width-1 char followed by VS16 renders as a
-        // 2-cell emoji in terminals, but UnicodeWidthChar counts the base as 1.
-        // Bump to match terminal rendering so wrapping doesn't overflow borders.
-        if w == 1 && chars.peek().is_some_and(|&(_, nc)| nc == '\u{FE0F}') {
-            w = 2;
-        }
-
-        if col + w > cols {
+        if col + c.width > cols {
             lines.push(String::new());
             row += 1;
             col = 0;
         }
-        lines[row].push(ch);
-        col += w;
+        lines[row].push_str(cluster);
+        col += c.width;
     }
 
-    if clamped == input.len() {
+    if !cursor_set {
         cursor_row = row;
         cursor_col = col;
     }
@@ -4698,17 +4733,16 @@ fn split_display_cells(s: &str, max_cells: usize) -> (String, String) {
 
     let mut cells = 0usize;
     let mut end = 0usize;
-    for (idx, ch) in s.char_indices() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cells + w > max_cells {
+    for c in display_clusters(s) {
+        if cells + c.width > max_cells {
             if end == 0 {
-                let next = idx + ch.len_utf8();
+                let next = c.byte_start + c.byte_len;
                 return ("…".to_string(), s[next..].to_string());
             }
             break;
         }
-        cells += w;
-        end = idx + ch.len_utf8();
+        cells += c.width;
+        end = c.byte_start + c.byte_len;
     }
 
     if end >= s.len() {
@@ -5638,27 +5672,27 @@ fn middle_truncate_rg_line(line: &str, max_cells: usize) -> String {
     let target = max_cells.saturating_sub(marker_width);
     let left_target = target / 2;
     let right_target = target.saturating_sub(left_target);
+    let clusters = display_clusters(line);
     let mut left = String::new();
     let mut left_cells = 0usize;
-    for ch in line.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if left_cells + w > left_target {
+    for c in &clusters {
+        if left_cells + c.width > left_target {
             break;
         }
-        left.push(ch);
-        left_cells += w;
+        left.push_str(&line[c.byte_start..c.byte_start + c.byte_len]);
+        left_cells += c.width;
     }
-    let mut right_rev = Vec::new();
+    let mut right_parts: Vec<&str> = Vec::new();
     let mut right_cells = 0usize;
-    for ch in line.chars().rev() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if right_cells + w > right_target {
+    for c in clusters.iter().rev() {
+        if right_cells + c.width > right_target {
             break;
         }
-        right_rev.push(ch);
-        right_cells += w;
+        right_parts.push(&line[c.byte_start..c.byte_start + c.byte_len]);
+        right_cells += c.width;
     }
-    let right: String = right_rev.into_iter().rev().collect();
+    right_parts.reverse();
+    let right: String = right_parts.join("");
     format!("{left}{marker}{right}")
 }
 
@@ -11221,6 +11255,93 @@ mod tests {
             emoji_rows.iter().all(|line| table_edge(line) == border_width),
             "emoji rows should keep separators and right border aligned with the table edge: {flat:?}"
         );
+    }
+
+    #[test]
+    fn mixed_emoji_table_keeps_borders_aligned_across_widths() {
+        // Exercises the symbol classes the user reported (🪙🧬 natural-wide emoji,
+        // ⚙️☢️ VS16-presentation, 🛒). The table must keep every data row's right
+        // border aligned regardless of terminal width; clip/split paths must never
+        // split a multi-codepoint cluster across a boundary.
+        let input = "| Theme | Tickers | Sidebar nav |\n| --- | --- | --- |\n\
+            | 🪙 Commodity | FSM, KGC, WPM, AG | Commodity |\n\
+            | 🧬 Biotech | VEEV, REGN, GILD, BMRN | Biotech |\n\
+            | ⚙️ Reshoring | BMI, KAI, AOS, MSA | Reshoring |\n\
+            | ☢️ Nuclear | CCJ, LEU, BWXT | Nuclear |\n\
+            | 🛒 China | PDD, YMM, EDU, TME, JD | China |";
+        for w in [40usize, 50, 58, 60, 80, 120] {
+            let text = line_to_text(
+                &Line_::Assistant {
+                    text: input.to_string(),
+                    dim_prefix: false,
+                },
+                w as u16,
+            );
+            let flat = flatten_lines(&text);
+            let joined = flat.join("\n");
+            // No cluster ever split: VS16 must stay glued to its base.
+            assert!(!joined.contains("⚙ \u{fe0f}"), "split ⚙/VS16 at w={w}: {joined}");
+            assert!(!joined.contains("☢ \u{fe0f}"), "split ☢/VS16 at w={w}: {joined}");
+            // Emoji preserved intact.
+            assert!(joined.contains('🪙'), "lost 🪙 at w={w}: {joined}");
+            assert!(joined.contains("⚙️"), "lost ⚙️ at w={w}: {joined}");
+            // Every line with a box edge must be no wider than the widest line.
+            let max_w = flat.iter().map(|l| text_width(l)).max().unwrap_or(0);
+            assert!(
+                flat.iter().all(|l| text_width(l) <= max_w),
+                "row exceeds table edge at w={w}: {flat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn display_clusters_groups_vs16_and_keeps_width_terminal_correct() {
+        let clusters = display_clusters("⚙️🪙☢️ab");
+        let widths: Vec<usize> = clusters.iter().map(|c| c.width).collect();
+        assert_eq!(widths, vec![2, 2, 2, 1, 1], "{clusters:?}");
+        // VS16 is glued to its base, never its own cluster.
+        assert_eq!(clusters[0].byte_len, "⚙️".len());
+        assert_eq!(clusters[2].byte_len, "☢️".len());
+    }
+
+    #[test]
+    fn display_clusters_unifies_zwj_family_emoji() {
+        // 👨‍👩‍👧 (man + ZWJ + woman + ZWJ + girl) renders as one 2-cell family
+        // glyph. Per-char width would over-count as 6; the cluster must stay whole.
+        let clusters = display_clusters("👨‍👩‍👧");
+        assert_eq!(clusters.len(), 1, "family must be a single cluster: {clusters:?}");
+        assert_eq!(clusters[0].width, 2, "{clusters:?}");
+        assert_eq!(clusters[0].byte_len, "👨‍👩‍👧".len());
+    }
+
+    #[test]
+    fn display_clusters_pairs_regional_indicator_flags() {
+        // 🇺🇸 = two regional indicators forming one 2-cell flag.
+        let clusters = display_clusters("🇺🇸");
+        assert_eq!(clusters.len(), 1, "flag must be one cluster: {clusters:?}");
+        assert_eq!(clusters[0].width, 2, "{clusters:?}");
+        // Two adjacent flags = two clusters, not four half-flags.
+        let two = display_clusters("🇺🇸🇬🇧");
+        assert_eq!(two.len(), 2, "{two:?}");
+    }
+
+    #[test]
+    fn clamp_chars_plain_never_splits_emoji_cluster() {
+        // Clipping must keep ⚙️ whole (drop the whole cluster, never split base
+        // from its VS16), so the ellipsis lands on a cluster boundary.
+        let out = clamp_chars_plain("⚙️xyz", 3);
+        assert!(!out.contains('\u{fe0f}') || out.contains("⚙️"), "{out}");
+        assert!(out.ends_with('…'), "{out}");
+        // A cluster that fits entirely stays intact.
+        assert_eq!(clamp_chars_plain("⚙️", 5), "⚙️");
+    }
+
+    #[test]
+    fn split_display_cells_keeps_emoji_whole_at_boundary() {
+        // Width-2 emoji at the exact boundary must not be split mid-sequence.
+        let (head, tail) = split_display_cells("ab🪙cd", 3);
+        assert!(!head.contains('🪙'), "split emoji into head: {head}|{tail}");
+        assert_eq!(head, "ab");
     }
 
     #[test]

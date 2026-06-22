@@ -135,14 +135,13 @@ fn word_chunks(word: &str, width: usize) -> Vec<&str> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     let mut cells = 0usize;
-    for (idx, ch) in word.char_indices() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cells > 0 && cells + w > width {
-            chunks.push(&word[start..idx]);
-            start = idx;
+    for c in crate::tui::display_clusters(word) {
+        if cells > 0 && cells + c.width > width {
+            chunks.push(&word[start..c.byte_start]);
+            start = c.byte_start;
             cells = 0;
         }
-        cells += w;
+        cells += c.width;
     }
     if start < word.len() {
         chunks.push(&word[start..]);
