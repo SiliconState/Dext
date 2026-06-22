@@ -3273,8 +3273,8 @@ fn wrap_input_visual(
     let mut cursor_row = 0usize;
     let mut cursor_col = 0usize;
 
-    let chars: Vec<(usize, char)> = input.char_indices().collect();
-    for (ci, &(idx, ch)) in chars.iter().enumerate() {
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
         if idx == clamped {
             cursor_row = row;
             cursor_col = col;
@@ -3299,7 +3299,7 @@ fn wrap_input_visual(
         // Emoji presentation: a width-1 char followed by VS16 renders as a
         // 2-cell emoji in terminals, but UnicodeWidthChar counts the base as 1.
         // Bump to match terminal rendering so wrapping doesn't overflow borders.
-        if w == 1 && chars.get(ci + 1).is_some_and(|&(_, nc)| nc == '\u{FE0F}') {
+        if w == 1 && chars.peek().is_some_and(|&(_, nc)| nc == '\u{FE0F}') {
             w = 2;
         }
 

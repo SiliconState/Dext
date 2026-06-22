@@ -366,18 +366,16 @@ pub(crate) fn render_pack_list(
     out
 }
 
-/// Trim `project:.dext/shelves/community` style sources to the trailing scope
-/// segment (`community`) for compactness; env/bundled sources keep their label.
+/// Extract the scope prefix from a source label (`project:...` → `project`,
+/// `user:...` → `user`, `env:...` → `env`, `bundled:...` → `bundled`).
+/// In verbose mode, returns the full source string unchanged.
 fn compact_source(source: &str, opts: &list_render::ListOptions) -> String {
     if opts.verbose {
         return source.to_string();
     }
-    if let Some((_, rest)) = source.rsplit_once('/') {
-        rest.to_string()
-    } else if let Some((_, rest)) = source.split_once(':') {
-        rest.to_string()
-    } else {
-        source.to_string()
+    match source.split_once(':') {
+        Some((scope, _)) => scope.to_string(),
+        None => source.to_string(),
     }
 }
 

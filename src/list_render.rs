@@ -181,7 +181,8 @@ pub(crate) fn write_wrapped(out: &mut String, text: &str, hang: usize, width: us
 // --- layout helpers ---------------------------------------------------------
 
 /// Render a single list entry block: a bold name line, an indented description
-/// (wrapped), and indented metadata pairs. Blank-separated from siblings.
+/// (wrapped), and indented metadata pairs. Ends with a trailing blank line so
+/// consecutive entries are visually separated.
 pub(crate) fn render_entry(
     name: &str,
     description: &str,
@@ -201,6 +202,7 @@ pub(crate) fn render_entry(
             .collect();
         let _ = writeln!(out, "{}{}", " ".repeat(hang), pairs.join("    "));
     }
+    out.push('\n');
     out
 }
 
