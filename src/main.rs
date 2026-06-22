@@ -14690,7 +14690,10 @@ fn render_session_entry(
         .unwrap_or_else(|| "updated unknown".to_string());
     let (messages, model) = match read_session_jsonl(path) {
         Ok((header, history)) => (history.len(), header.model),
-        Err(e) => return format!("  {}\n    unreadable ({e:#})\n", list_render::bold(name, opts.color)),
+        Err(e) => {
+            let meta = vec![("path", list_render::display_path(path, opts, root))];
+            return list_render::render_entry(name, &format!("unreadable ({e:#})"), &meta, opts);
+        }
     };
     let meta = vec![
         ("msgs", messages.to_string()),
@@ -17215,11 +17218,23 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
 
     match cmd {
         "pack" | "packs" => {
-            let mut parts = arg.splitn(3, char::is_whitespace);
+            let mut pack_arg = arg;
+            let mut leading_verbose = false;
+            loop {
+                let mut flag_parts = pack_arg.splitn(2, char::is_whitespace);
+                let tok = flag_parts.next().unwrap_or("").trim();
+                if !matches!(tok, "--verbose" | "-v" | "--paths") {
+                    break;
+                }
+                leading_verbose = true;
+                pack_arg = flag_parts.next().unwrap_or("").trim_start();
+            }
+            let mut parts = pack_arg.splitn(3, char::is_whitespace);
             let sub = parts.next().unwrap_or("").trim();
             match sub {
                 "" | "list" | "ls" => {
-                    let (_, verbose) = list_render::take_verbose(arg);
+                    let (_, inline_verbose) = list_render::take_verbose(pack_arg);
+                    let verbose = leading_verbose || inline_verbose;
                     let _ = write!(
                         w,
                         "{}",
@@ -19765,17 +19780,28 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from("."));
-        let sub = argv.get(1).map(String::as_str).unwrap_or("list");
+        let mut sub_idx = 1usize;
+        let mut leading_verbose = false;
+        while argv
+            .get(sub_idx)
+            .is_some_and(|a| matches!(a.as_str(), "--verbose" | "-v" | "--paths"))
+        {
+            leading_verbose = true;
+            sub_idx += 1;
+        }
+        let sub = argv.get(sub_idx).map(String::as_str).unwrap_or("list");
         match sub {
             "" | "list" | "ls" => {
-                let verbose = argv.iter().any(|a| {
-                    a == "--verbose" || a == "-v" || a == "--paths"
-                });
+                let verbose = leading_verbose
+                    || argv
+                        .iter()
+                        .skip(sub_idx + 1)
+                        .any(|a| a == "--verbose" || a == "-v" || a == "--paths");
                 println!("{}", packs::render_pack_listing_opts(&root, verbose));
                 return Ok(());
             }
             "inspect" | "info" | "show" => {
-                let Some(selector) = argv.get(2) else {
+                let Some(selector) = argv.get(sub_idx + 1) else {
                     eprintln!("usage: dext pack inspect <name>");
                     release_registered_locks();
                     std::process::exit(2);
@@ -19784,14 +19810,14 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             "run" | "use" | "start" => {
-                if argv.len() < 4 {
+                if argv.len() < sub_idx + 3 {
                     eprintln!("usage: dext pack run <name> <task>");
                     release_registered_locks();
                     std::process::exit(2);
                 }
-                let mut forwarded = argv[3..].to_vec();
+                let mut forwarded = argv[(sub_idx + 2)..].to_vec();
                 forwarded.insert(0, "--pack".to_string());
-                forwarded.insert(1, argv[2].clone());
+                forwarded.insert(1, argv[sub_idx + 1].clone());
                 argv = forwarded;
             }
             _ => {

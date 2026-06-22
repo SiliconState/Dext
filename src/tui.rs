@@ -3138,35 +3138,40 @@ fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
     }
 
     while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            flush!();
-            i += 2;
-            let start = i;
-            while i < bytes.len() && !((0x40..=0x7e).contains(&bytes[i])) {
-                i += 1;
-            }
-            // i now at the final byte (e.g. 'm'); parse params
-            if i < bytes.len() && bytes[i] == b'm' {
-                let params = &text[start..i];
-                for param in params.split(';') {
-                    match param.trim() {
-                        "" | "0" => style = Style::default(),
-                        "1" => style = style.add_modifier(Modifier::BOLD),
-                        "2" => style = style.add_modifier(Modifier::DIM),
-                        "30" => style = style.fg(Color::Black),
-                        "31" => style = style.fg(Color::Red),
-                        "32" => style = style.fg(Color::Green),
-                        "33" => style = style.fg(Color::Yellow),
-                        "34" => style = style.fg(Color::Blue),
-                        "35" => style = style.fg(Color::Magenta),
-                        "36" => style = style.fg(Color::Cyan),
-                        "37" => style = style.fg(Color::Gray),
-                        "90" => style = style.fg(Color::DarkGray),
-                        _ => {}
+        if bytes[i] == 0x1b {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                flush!();
+                i += 2;
+                let start = i;
+                while i < bytes.len() && !((0x40..=0x7e).contains(&bytes[i])) {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'm' {
+                    let params = &text[start..i];
+                    for param in params.split(';') {
+                        match param.trim() {
+                            "" | "0" => style = Style::default(),
+                            "1" => style = style.add_modifier(Modifier::BOLD),
+                            "2" => style = style.add_modifier(Modifier::DIM),
+                            "30" => style = style.fg(Color::Black),
+                            "31" => style = style.fg(Color::Red),
+                            "32" => style = style.fg(Color::Green),
+                            "33" => style = style.fg(Color::Yellow),
+                            "34" => style = style.fg(Color::Blue),
+                            "35" => style = style.fg(Color::Magenta),
+                            "36" => style = style.fg(Color::Cyan),
+                            "37" => style = style.fg(Color::Gray),
+                            "90" => style = style.fg(Color::DarkGray),
+                            _ => {}
+                        }
                     }
                 }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                i += 1;
             }
-            i += 1; // skip final byte
         } else {
             let ch = text[i..].chars().next().unwrap_or('\0');
             buf.push(ch);
@@ -3175,14 +3180,14 @@ fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
     }
     flush!();
     if spans.is_empty() {
-        spans.push(Span::raw(text.to_string()));
+        spans.push(Span::raw(strip_ansi_escapes(text)));
     }
     spans
 }
 
-/// True when text contains ANSI escape sequences (CSI).
+/// True when text contains ANSI CSI escape sequences.
 fn has_ansi(text: &str) -> bool {
-    text.as_bytes().iter().any(|&b| b == 0x1b)
+    text.as_bytes().windows(2).any(|w| w == b"\x1b[")
 }
 
 fn sanitize_display_text(text: &str) -> String {
@@ -5414,7 +5419,8 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                     lines.push(Line::from(ansi_to_spans(seg)));
                 }
             } else {
-                for seg in s.split('\n') {
+                let sanitized = sanitize_display_text(s);
+                for seg in sanitized.split('\n') {
                     lines.push(Line::from(vec![
                         Span::styled("• ", Style::default().fg(Color::DarkGray)),
                         Span::styled(
@@ -11476,6 +11482,22 @@ mod tests {
         let flat = flatten_lines(&text);
         let joined = flat.join("\n");
         assert!(joined.contains("7"));
+    }
+
+    #[test]
+    fn ansi_info_lines_strip_escape_codes_without_reemitting_raw_escapes() {
+        let text = line_to_text(&Line_::Info("\x1b[1mBold\x1b[0m plain".to_string()), 80);
+        let flat = flatten_lines(&text);
+        assert_eq!(flat, vec!["Bold plain"]);
+        assert!(!flat.join("\n").contains('\x1b'));
+    }
+
+    #[test]
+    fn non_csi_escape_in_info_line_is_sanitized_with_normal_info_style() {
+        let text = line_to_text(&Line_::Info("hello \x1bworld".to_string()), 80);
+        let flat = flatten_lines(&text);
+        assert_eq!(flat, vec!["• hello world"]);
+        assert!(!flat.join("\n").contains('\x1b'));
     }
 
     #[test]

@@ -98,20 +98,13 @@ pub(crate) fn label(key: &str, value: &str, color: bool) -> String {
 
 // --- path shortening --------------------------------------------------------
 
-/// Shorten an absolute path for display: home-relative (`~/...`), project-root
-/// relative (`./...`), or the absolute path when no anchor matches. When
+/// Shorten an absolute path for display: project-root relative (`./...`),
+/// home-relative (`~/...`), or the absolute path when no anchor matches. When
 /// `verbose` is set the full absolute path is returned unchanged.
 pub(crate) fn shorten_path(path: &Path, root: &Path, home: &Path, verbose: bool) -> String {
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if verbose {
         return canon.display().to_string();
-    }
-    if let Ok(rel) = canon.strip_prefix(home) {
-        return if rel.as_os_str().is_empty() {
-            "~".to_string()
-        } else {
-            format!("~/{}", rel.display())
-        };
     }
     let root_c = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if let Ok(rel) = canon.strip_prefix(&root_c) {
@@ -119,6 +112,13 @@ pub(crate) fn shorten_path(path: &Path, root: &Path, home: &Path, verbose: bool)
             ".".to_string()
         } else {
             format!("./{}", rel.display())
+        };
+    }
+    if let Ok(rel) = canon.strip_prefix(home) {
+        return if rel.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rel.display())
         };
     }
     canon.display().to_string()
@@ -131,8 +131,30 @@ pub(crate) fn display_path(path: &Path, opts: &ListOptions, root: &Path) -> Stri
 
 // --- word wrap --------------------------------------------------------------
 
+fn word_chunks(word: &str, width: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut cells = 0usize;
+    for (idx, ch) in word.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cells > 0 && cells + w > width {
+            chunks.push(&word[start..idx]);
+            start = idx;
+            cells = 0;
+        }
+        cells += w;
+    }
+    if start < word.len() {
+        chunks.push(&word[start..]);
+    }
+    if chunks.is_empty() {
+        chunks.push(word);
+    }
+    chunks
+}
+
 /// Word-wrap `text` to `width` columns, returning lines. Each line is at most
-/// `width` display columns; an over-long single word fills a line.
+/// `width` display columns except for a single glyph wider than `width`.
 pub(crate) fn wrap_lines(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
@@ -145,18 +167,20 @@ pub(crate) fn wrap_lines(text: &str, width: usize) -> Vec<String> {
         let mut line = String::new();
         let mut line_w = 0usize;
         for word in words {
-            let w = unicode_width::UnicodeWidthStr::width(word);
-            if line.is_empty() {
-                line.push_str(word);
-                line_w = w;
-            } else if line_w + 1 + w > width {
-                out.push(std::mem::take(&mut line));
-                line.push_str(word);
-                line_w = w;
-            } else {
-                line.push(' ');
-                line.push_str(word);
-                line_w += 1 + w;
+            for chunk in word_chunks(word, width) {
+                let w = unicode_width::UnicodeWidthStr::width(chunk);
+                if line.is_empty() {
+                    line.push_str(chunk);
+                    line_w = w;
+                } else if line_w + 1 + w > width {
+                    out.push(std::mem::take(&mut line));
+                    line.push_str(chunk);
+                    line_w = w;
+                } else {
+                    line.push(' ');
+                    line.push_str(chunk);
+                    line_w += 1 + w;
+                }
             }
         }
         if !line.is_empty() {

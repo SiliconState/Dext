@@ -10399,6 +10399,59 @@ fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
 }
 
 #[test]
+fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("slash-pack-verbose");
+    let pack_dir = root.join("packs/demo");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(
+        pack_dir.join("PACK.md"),
+        "---\nname: demo\ndescription: Verbose slash demo\n---\n# Demo\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(handle_slash("/pack -v", &mut agent), Some(true));
+    let slash_text = drain_events(&mut rx)
+        .into_iter()
+        .find_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(slash_text.contains("Verbose slash demo"), "{slash_text}");
+    assert!(slash_text.contains("path:"), "{slash_text}");
+    assert!(!slash_text.contains("usage: /pack"), "{slash_text}");
+
+    assert_eq!(handle_slash("/pack -v inspect demo", &mut agent), Some(true));
+    assert_eq!(handle_slash("/pack run demo -v task", &mut agent), Some(true));
+    let followup = drain_events(&mut rx)
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    assert!(followup.contains("pack: demo"), "{followup}");
+    assert!(followup.contains("dext pack run demo -v task"), "{followup}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn pack_list_renders_compact_blocks_with_header_and_footer() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-list-normal");
@@ -10532,9 +10585,9 @@ fn pack_list_long_description_wraps_within_width() -> Result<()> {
 
 #[test]
 fn list_render_shorten_path_uses_project_relative() {
-    let root = std::path::Path::new("/tmp/dext-test-root");
     let home = std::path::Path::new("/tmp/dext-test-home");
-    let pack_path = std::path::Path::new("/tmp/dext-test-root/packs/demo");
+    let root = std::path::Path::new("/tmp/dext-test-home/work/project");
+    let pack_path = std::path::Path::new("/tmp/dext-test-home/work/project/packs/demo");
 
     let shortened = list_render::shorten_path(pack_path, root, home, false);
     assert_eq!(shortened, "./packs/demo");
@@ -10550,6 +10603,13 @@ fn list_render_wrap_honors_hanging_indent() {
     assert!(lines.iter().all(|l| l.len() <= 10), "{lines:?}");
     assert_eq!(lines.join(" ").split_whitespace().collect::<Vec<_>>(),
                vec!["aaa", "bbb", "ccc", "ddd", "eee"]);
+}
+
+#[test]
+fn list_render_wrap_splits_long_words() {
+    let lines = list_render::wrap_lines("supercalifragilistic", 6);
+    assert!(lines.iter().all(|l| l.len() <= 6), "{lines:?}");
+    assert_eq!(lines.join(""), "supercalifragilistic");
 }
 
 #[test]
