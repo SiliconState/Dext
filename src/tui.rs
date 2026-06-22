@@ -3118,6 +3118,73 @@ fn strip_ansi_escapes(text: &str) -> String {
     out
 }
 
+/// Parse basic ANSI SGR codes into ratatui spans. Recognizes bold (`1`),
+/// dim/faint (`2`), and foreground colors (`30`-`37`, esp. cyan `36`). Unset
+/// attributes use `Color::Reset`. Lines with no escapes produce a single plain
+/// span. This lets ANSI-styled list output render correctly in the TUI.
+fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
+    let bytes = text.as_bytes();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut style = Style::default();
+    let mut i = 0usize;
+
+    macro_rules! flush {
+        () => {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), style));
+            }
+        };
+    }
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            flush!();
+            i += 2;
+            let start = i;
+            while i < bytes.len() && !((0x40..=0x7e).contains(&bytes[i])) {
+                i += 1;
+            }
+            // i now at the final byte (e.g. 'm'); parse params
+            if i < bytes.len() && bytes[i] == b'm' {
+                let params = &text[start..i];
+                for param in params.split(';') {
+                    match param.trim() {
+                        "" | "0" => style = Style::default(),
+                        "1" => style = style.add_modifier(Modifier::BOLD),
+                        "2" => style = style.add_modifier(Modifier::DIM),
+                        "30" => style = style.fg(Color::Black),
+                        "31" => style = style.fg(Color::Red),
+                        "32" => style = style.fg(Color::Green),
+                        "33" => style = style.fg(Color::Yellow),
+                        "34" => style = style.fg(Color::Blue),
+                        "35" => style = style.fg(Color::Magenta),
+                        "36" => style = style.fg(Color::Cyan),
+                        "37" => style = style.fg(Color::Gray),
+                        "90" => style = style.fg(Color::DarkGray),
+                        _ => {}
+                    }
+                }
+            }
+            i += 1; // skip final byte
+        } else {
+            let ch = text[i..].chars().next().unwrap_or('\0');
+            buf.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    flush!();
+    if spans.is_empty() {
+        spans.push(Span::raw(text.to_string()));
+    }
+    spans
+}
+
+/// True when text contains ANSI escape sequences (CSI).
+fn has_ansi(text: &str) -> bool {
+    text.as_bytes().iter().any(|&b| b == 0x1b)
+}
+
 fn sanitize_display_text(text: &str) -> String {
     let text = strip_ansi_escapes(text);
     let mut out = String::with_capacity(text.len());
@@ -5324,6 +5391,12 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                         .fg(Color::LightBlue)
                         .add_modifier(Modifier::BOLD),
                 )]));
+            } else if has_ansi(s) {
+                // List output (packs/sessions/shelves) styled with ANSI codes:
+                // render as styled spans without the dim-italic bullet treatment.
+                for seg in s.split('\n') {
+                    lines.push(Line::from(ansi_to_spans(seg)));
+                }
             } else {
                 for seg in s.split('\n') {
                     lines.push(Line::from(vec![

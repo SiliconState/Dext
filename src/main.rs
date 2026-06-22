@@ -1,4 +1,5 @@
 mod git_checkpoints;
+mod list_render;
 mod memory_merge;
 mod mutation_preview;
 mod orchestrator;
@@ -14676,46 +14677,37 @@ fn read_session_jsonl(path: &Path) -> Result<(SessionHeader, Vec<Message>)> {
     Ok((header, history))
 }
 
-fn session_file_line(path: &Path, name: &str, modified: Option<std::time::SystemTime>) -> String {
+fn render_session_entry(
+    path: &Path,
+    name: &str,
+    modified: Option<std::time::SystemTime>,
+    opts: &list_render::ListOptions,
+    root: &Path,
+) -> String {
     let updated = modified
         .and_then(system_time_unix_secs)
         .map(|secs| format!("updated {secs}"))
         .unwrap_or_else(|| "updated unknown".to_string());
-    match read_session_jsonl(path) {
-        Ok((header, history)) => format!(
-            "{name}: {} messages · model {} · {} -> {}",
-            history.len(),
-            header.model,
-            updated,
-            path.display()
-        ),
-        Err(e) => format!("{name}: unreadable ({e:#}) -> {}", path.display()),
-    }
+    let (messages, model) = match read_session_jsonl(path) {
+        Ok((header, history)) => (history.len(), header.model),
+        Err(e) => return format!("  {}\n    unreadable ({e:#})\n", list_render::bold(name, opts.color)),
+    };
+    let meta = vec![
+        ("msgs", messages.to_string()),
+        ("model", model),
+        ("updated", updated),
+        ("path", list_render::display_path(path, opts, root)),
+    ];
+    list_render::render_entry(name, "", &meta, opts)
 }
 
 fn render_session_listing(root: &Path) -> String {
     use std::fmt::Write as _;
+    let opts = list_render::ListOptions::detect(false);
 
     let latest_path = latest_session_path(root);
-    let mut out = String::new();
-    let _ = writeln!(out, "latest session:");
-    if latest_path.exists() {
-        let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
-        let _ = writeln!(
-            out,
-            "  {}",
-            session_file_line(&latest_path, "latest", modified)
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "  (none yet; send a message to create {})",
-            latest_path.display()
-        );
-    }
-
     let sessions_root = named_sessions_dir_for_root(root);
-    let _ = writeln!(out, "autosaved session dirs:");
+
     let mut autosaved_sessions: Vec<(String, PathBuf, Option<std::time::SystemTime>)> =
         std::fs::read_dir(&sessions_root)
             .ok()
@@ -14732,11 +14724,36 @@ fn render_session_listing(root: &Path) -> String {
             })
             .collect();
     autosaved_sessions.sort_by(|a, b| b.2.cmp(&a.2));
+
+    let named_records = list_session_records_for_root(root);
+
+    let total = 1 + autosaved_sessions.len() + named_records.as_ref().map(|r| r.len()).unwrap_or(0);
+    let mut out = String::new();
+    let _ = write!(out, "{}", list_render::render_header("Sessions", total, &opts));
+
+    let _ = writeln!(out, "{}", list_render::bold("Latest", opts.color));
+    if latest_path.exists() {
+        let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
+        out.push_str(&render_session_entry(&latest_path, "latest", modified, &opts, root));
+    } else {
+        let _ = writeln!(
+            out,
+            "    (none yet; send a message to create {})",
+            list_render::display_path(&latest_path, &opts, root)
+        );
+    }
+    out.push('\n');
+
+    let _ = writeln!(out, "{}", list_render::bold("Autosaved", opts.color));
     if autosaved_sessions.is_empty() {
-        let _ = writeln!(out, "  (none in {})", sessions_root.display());
+        let _ = writeln!(
+            out,
+            "    (none in {})",
+            list_render::display_path(&sessions_root, &opts, root)
+        );
     } else {
         for (name, path, modified) in autosaved_sessions.iter().take(SLASH_LIST_LIMIT) {
-            let _ = writeln!(out, "  {}", session_file_line(path, name, *modified));
+            out.push_str(&render_session_entry(path, name, *modified, &opts, root));
         }
         if autosaved_sessions.len() > SLASH_LIST_LIMIT {
             let _ = writeln!(
@@ -14746,23 +14763,26 @@ fn render_session_listing(root: &Path) -> String {
             );
         }
     }
+    out.push('\n');
 
-    let _ = writeln!(out, "named sessions:");
-    match list_session_records_for_root(root) {
+    let _ = writeln!(out, "{}", list_render::bold("Named", opts.color));
+    match &named_records {
         Ok(records) if records.is_empty() => {
             let _ = writeln!(
                 out,
-                "  (none in {}; use /save <name>)",
-                named_sessions_dir_for_root(root).display()
+                "    (none in {}; use /save <name>)",
+                list_render::display_path(&named_sessions_dir_for_root(root), &opts, root)
             );
         }
         Ok(records) => {
             for record in records.iter().take(SLASH_LIST_LIMIT) {
-                let _ = writeln!(
-                    out,
-                    "  {}",
-                    session_file_line(&record.path, &record.name, record.modified)
-                );
+                out.push_str(&render_session_entry(
+                    &record.path,
+                    &record.name,
+                    record.modified,
+                    &opts,
+                    root,
+                ));
             }
             if records.len() > SLASH_LIST_LIMIT {
                 let _ = writeln!(
@@ -14779,7 +14799,18 @@ fn render_session_listing(root: &Path) -> String {
 
     let _ = write!(
         out,
-        "commands: /resume [name] · /save <name> · /map · /packet @wNN · /focus @wNN · /export html [path]"
+        "{}",
+        list_render::render_footer(
+            &[
+                "/resume [name]",
+                "/save <name>",
+                "/map",
+                "/packet @wNN",
+                "/focus @wNN",
+                "/export html [path]",
+            ],
+            &opts,
+        )
     );
     out
 }
@@ -17185,7 +17216,12 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let sub = parts.next().unwrap_or("").trim();
             match sub {
                 "" | "list" | "ls" => {
-                    let _ = write!(w, "{}", packs::render_pack_listing(&agent.sandbox_root));
+                    let (_, verbose) = list_render::take_verbose(arg);
+                    let _ = write!(
+                        w,
+                        "{}",
+                        packs::render_pack_listing_opts(&agent.sandbox_root, verbose)
+                    );
                 }
                 "inspect" | "info" | "show" => {
                     let selector = parts.next().unwrap_or("").trim();
@@ -17229,10 +17265,12 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
         }
         "help" | "?" => {
-            let _ = writeln!(w, "commands:");
+            let _ = writeln!(w, "── Core ──");
             let _ = writeln!(w, "  /help                     show this");
             let _ = writeln!(w, "  /quit, /exit              exit dext");
             let _ = writeln!(w, "  /reset                    clear conversation history");
+            let _ = writeln!(w);
+            let _ = writeln!(w, "── Tools & policy ──");
             let _ = writeln!(
                 w,
                 "  /tools [default|full]     list or switch provider-visible tools"
@@ -17275,10 +17313,8 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 w,
                 "  /budget [cap|off]         show/set budget cap ($ or tokens)"
             );
-            let _ = writeln!(
-                w,
-                "  /browser [off|agent-browser|agentbrowser] optional browser automation recipe"
-            );
+            let _ = writeln!(w);
+            let _ = writeln!(w, "── Packs & shelves ──");
             let _ = writeln!(
                 w,
                 "  /pack [list|inspect|run]  discover or invoke Dext packs"
@@ -17289,8 +17325,14 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
+                "  /browser [off|agent-browser|agentbrowser] optional browser automation recipe"
+            );
+            let _ = writeln!(
+                w,
                 "  /sandbox [path]           show or change the sandbox root"
             );
+            let _ = writeln!(w);
+            let _ = writeln!(w, "── Provider & auth ──");
             let _ = writeln!(
                 w,
                 "  /model [id]               show or change model (persists per provider)"
@@ -17319,6 +17361,8 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 w,
                 "  /login cancel             abort a pending OAuth or browser login"
             );
+            let _ = writeln!(w);
+            let _ = writeln!(w, "── Context & diagnostics ──");
             let _ = writeln!(
                 w,
                 "  /effort [level]           set model reasoning depth/tool persistence: off|low|medium|high|xhigh|max"
@@ -17351,6 +17395,8 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 w,
                 "  /diagnostics              run rust-analyzer diagnostics (fallback: cargo check)"
             );
+            let _ = writeln!(w);
+            let _ = writeln!(w, "── Sessions & work map ──");
             let _ = writeln!(
                 w,
                 "  /save <name>              write history + config to sessions dir as JSONL"
@@ -19719,7 +19765,10 @@ async fn main() -> Result<()> {
         let sub = argv.get(1).map(String::as_str).unwrap_or("list");
         match sub {
             "" | "list" | "ls" => {
-                println!("{}", packs::render_pack_listing(&root));
+                let verbose = argv.iter().any(|a| {
+                    a == "--verbose" || a == "-v" || a == "--paths"
+                });
+                println!("{}", packs::render_pack_listing_opts(&root, verbose));
                 return Ok(());
             }
             "inspect" | "info" | "show" => {

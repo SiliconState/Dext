@@ -668,46 +668,45 @@ fn push_shelf_manifest_dir(
 }
 
 pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
+    use std::fmt::Write as _;
+    let opts = crate::list_render::ListOptions::detect(false);
+
     if registry.is_empty() {
-        return "shelves: none found\nsearch paths: .dext/shelves/*/shelf.json, DEXT_SHELVES_DIR, ~/.dext/shelves/*/shelf.json, bundled shelves".to_string();
+        return "Shelves  none found\nsearch paths: .dext/shelves/*/shelf.json, DEXT_SHELVES_DIR, ~/.dext/shelves/*/shelf.json, bundled shelves".to_string();
     }
 
-    let mut out = String::from("shelves:\n");
-    for manifest in registry.manifests() {
-        let path = manifest
-            .origin
-            .path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "(none)".to_string());
+    let manifests = registry.manifests();
+    let mut out = String::new();
+    let _ = write!(out, "{}", crate::list_render::render_header("Shelves", manifests.len(), &opts));
+
+    for manifest in manifests {
         let ability_count: usize = manifest.packs.iter().map(|pack| pack.abilities.len()).sum();
-        out.push_str(&format!(
-            "  {} — {}\n    id: {}\n    scope: {}\n    path: {}\n    packs: {} · abilities: {}\n",
-            manifest.name,
+        let meta = vec![
+            ("id", manifest.id.as_str().to_string()),
+            ("scope", scope_label(manifest.origin.scope).to_string()),
+            ("packs", manifest.packs.len().to_string()),
+            ("abilities", ability_count.to_string()),
+        ];
+        out.push_str(&crate::list_render::render_entry(
+            &manifest.name,
             empty_label(&manifest.description),
-            manifest.id.as_str(),
-            scope_label(manifest.origin.scope),
-            path,
-            manifest.packs.len(),
-            ability_count
+            &meta,
+            &opts,
         ));
     }
 
     let resolved = registry.resolve();
     if !resolved.is_empty() {
-        out.push_str("resolved abilities:\n");
+        out.push('\n');
+        let _ = writeln!(out, "{}", crate::list_render::bold("Resolved abilities", opts.color));
         for ability in resolved.iter().take(50) {
-            out.push_str(&format_resolved_ability(ability, "  "));
-            out.push('\n');
+            out.push_str(&format_resolved_ability_styled(ability, &opts));
         }
         if resolved.len() > 50 {
-            out.push_str(&format!(
-                "  … [{} more abilities omitted]\n",
-                resolved.len() - 50
-            ));
+            let _ = writeln!(out, "  … [{} more abilities omitted]", resolved.len() - 50);
         }
     }
-    out.push_str("commands: /shelves · dext shelves");
+    out.push_str(&crate::list_render::render_footer(&["/shelves", "dext shelves"], &opts));
     out
 }
 
@@ -761,6 +760,18 @@ fn format_resolved_ability(resolved: &ResolvedAbility, indent: &str) -> String {
         resolved.pack.as_str(),
         scope_label(resolved.origin.scope)
     )
+}
+
+fn format_resolved_ability_styled(resolved: &ResolvedAbility, opts: &crate::list_render::ListOptions) -> String {
+    let (kind, name) = resolved.ability.key();
+    let title = format!("{kind}:{name}");
+    let desc = ability_long_description(&resolved.ability);
+    let meta = vec![
+        ("shelf", resolved.shelf.as_str().to_string()),
+        ("pack", resolved.pack.as_str().to_string()),
+        ("scope", scope_label(resolved.origin.scope).to_string()),
+    ];
+    crate::list_render::render_entry(&title, &desc, &meta, opts)
 }
 
 fn ability_short_description(ability: &Ability) -> String {
@@ -1234,7 +1245,8 @@ mod tests {
         }
         let listing = render_registry_listing(&registry);
         assert!(listing.contains("scope: run"), "{listing}");
-        assert!(listing.contains("tool:search — run search"), "{listing}");
+        assert!(listing.contains("tool:search"), "{listing}");
+        assert!(listing.contains("run search"), "{listing}");
         let summary = registry_summary_for_prompt(&registry).unwrap();
         assert!(
             summary.contains("tool:search (community/search, run search)"),

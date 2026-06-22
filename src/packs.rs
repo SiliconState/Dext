@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::session::{canonicalize_or_clone, dext_state_dir};
 use crate::{byte_prefix_at_char_boundary, cap_bytes_with_hint};
+use crate::list_render;
 
 const PACK_PROMPT_CAP: usize = 32_000;
 const PACK_LIST_LIMIT: usize = 50;
@@ -314,38 +315,65 @@ pub(crate) fn find_pack(root: &Path, selector: &str) -> Result<PackInfo> {
     }
 }
 
+#[allow(dead_code)] // test convenience wrapper
 pub(crate) fn render_pack_listing(root: &Path) -> String {
-    let packs = discover_packs(root);
+    render_pack_listing_opts(root, false)
+}
+
+pub(crate) fn render_pack_listing_opts(root: &Path, verbose: bool) -> String {
+    render_pack_list(&discover_packs(root), &list_render::ListOptions::detect(verbose), root)
+}
+
+/// Pure list renderer over discovered packs. Discovery/loading stays unchanged.
+pub(crate) fn render_pack_list(
+    packs: &[PackInfo],
+    opts: &list_render::ListOptions,
+    root: &Path,
+) -> String {
+    use std::fmt::Write as _;
     if packs.is_empty() {
-        return "packs: none found\nsearch paths: .dext/shelves/*/packs, .dext/packs, packs, DEXT_SHELVES_DIR, DEXT_PACKS_DIR, ~/.dext/shelves/*/packs, ~/.dext/packs, bundled packs".to_string();
+        return "Packs  none found\nsearch paths: .dext/shelves/*/packs, .dext/packs, packs, DEXT_SHELVES_DIR, DEXT_PACKS_DIR, ~/.dext/shelves/*/packs, ~/.dext/packs, bundled packs".to_string();
     }
-    let mut out = String::from("packs:\n");
+    let mut out = String::new();
+    let _ = write!(out, "{}", list_render::render_header("Packs", packs.len(), opts));
     for pack in packs.iter().take(PACK_LIST_LIMIT) {
-        let desc = if pack.description.is_empty() {
-            "(no description)".to_string()
-        } else {
-            pack.description.clone()
-        };
-        let shelf = pack.shelf.as_deref().unwrap_or("(none)");
-        out.push_str(&format!(
-            "  {} — {}\n    shelf: {}\n    source: {}\n    path: {}\n",
-            pack.name,
-            desc,
-            shelf,
-            pack.source,
-            pack.path.display()
-        ));
+        let shelf = pack.shelf.clone().unwrap_or_else(|| "none".to_string());
+        let mut meta: Vec<(&str, String)> = vec![
+            ("source", compact_source(&pack.source, opts)),
+            ("shelf", shelf),
+        ];
+        if opts.verbose {
+            meta.push(("path", list_render::display_path(&pack.path, opts, root)));
+        }
+        out.push_str(&list_render::render_entry(&pack.name, &pack.description, &meta, opts));
     }
     if packs.len() > PACK_LIST_LIMIT {
-        out.push_str(&format!(
-            "  … [{} more packs omitted]\n",
+        let _ = writeln!(
+            out,
+            "  … [{} more packs omitted]",
             packs.len() - PACK_LIST_LIMIT
-        ));
+        );
     }
-    out.push_str(
-        "commands: /pack run <name> <task> · /pack inspect <name> · dext pack run <name> <task>",
-    );
+    out.push_str(&list_render::render_footer(
+        &["/pack inspect <name>", "/pack run <name> <task>"],
+        opts,
+    ));
     out
+}
+
+/// Trim `project:.dext/shelves/community` style sources to the trailing scope
+/// segment (`community`) for compactness; env/bundled sources keep their label.
+fn compact_source(source: &str, opts: &list_render::ListOptions) -> String {
+    if opts.verbose {
+        return source.to_string();
+    }
+    if let Some((_, rest)) = source.rsplit_once('/') {
+        rest.to_string()
+    } else if let Some((_, rest)) = source.split_once(':') {
+        rest.to_string()
+    } else {
+        source.to_string()
+    }
 }
 
 pub(crate) fn render_pack_inspect(root: &Path, selector: &str) -> Result<String> {

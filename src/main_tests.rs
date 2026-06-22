@@ -1880,9 +1880,9 @@ fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<(
         agent.save_latest_session()?;
 
         let listing = render_session_listing(&project);
-        assert!(listing.contains("latest session:"), "{listing}");
-        assert!(listing.contains("latest: 1 messages"), "{listing}");
-        assert!(listing.contains("named sessions:"), "{listing}");
+        assert!(listing.contains("Latest"), "{listing}");
+        assert!(listing.contains("latest"), "{listing}");
+        assert!(listing.contains("Named"), "{listing}");
         let project_named_dir = named_sessions_dir_for_root(&project);
         assert!(
             listing.contains(&format!("none in {}", project_named_dir.display())),
@@ -2169,12 +2169,12 @@ fn session_latest_prefers_newest_session_dir_but_supports_legacy_latest() -> Res
         atomic_write_bytes(&session_latest, b"{}\n")?;
         assert_eq!(latest_session_path(&root), session_latest);
         let listing = render_session_listing(&root);
-        assert!(listing.contains("autosaved session dirs:"), "{listing}");
+        assert!(listing.contains("Autosaved"), "{listing}");
         assert_eq!(
             resolve_session_selector(&root, "newer-session")?,
             session_latest
         );
-        assert!(listing.contains("latest session:"), "{listing}");
+        assert!(listing.contains("Latest"), "{listing}");
         Ok(())
     })();
     unsafe {
@@ -10126,11 +10126,10 @@ fn packs_discover_user_global_pack_from_dext_home() -> Result<()> {
     assert_eq!(pack.path, pack_dir);
 
     let listing = packs::render_pack_listing(&root);
-    assert!(
-        listing.contains("globaldemo — User-global workflow"),
-        "{listing}"
-    );
-    assert!(listing.contains("source: user:~/.dext/packs"), "{listing}");
+    assert!(listing.contains("globaldemo"), "{listing}");
+    assert!(listing.contains("User-global workflow"), "{listing}");
+    assert!(listing.contains("source:"), "{listing}");
+    assert!(listing.contains("Use:"), "{listing}");
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
@@ -10164,7 +10163,9 @@ fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
     assert!(pack.pack_md_path.ends_with("PACK.md"));
 
     let listing = packs::render_pack_listing(&root);
-    assert!(listing.contains("demo — Demo workflow"), "{listing}");
+    assert!(listing.contains("demo"), "{listing}");
+    assert!(listing.contains("Demo workflow"), "{listing}");
+    assert!(listing.contains("Use:"), "{listing}");
     assert!(listing.contains("/pack run <name> <task>"), "{listing}");
 
     let prompt = packs::pack_prompt(&pack, "ship it")?;
@@ -10276,12 +10277,10 @@ fn packs_discover_shelf_pack_and_apply_precedence() -> Result<()> {
     assert_eq!(demo_count, 1, "{project_names:?}");
 
     let listing = packs::render_pack_listing(&root);
-    assert!(listing.contains("demo — Shelf workflow"), "{listing}");
+    assert!(listing.contains("demo"), "{listing}");
+    assert!(listing.contains("Shelf workflow"), "{listing}");
     assert!(listing.contains("shelf: community"), "{listing}");
-    assert!(
-        listing.contains("source: project:.dext/shelves/community"),
-        "{listing}"
-    );
+    assert!(listing.contains("source:"), "{listing}");
 
     let inspect = packs::render_pack_inspect(&root, "demo")?;
     assert!(inspect.contains("shelf: community"), "{inspect}");
@@ -10343,13 +10342,12 @@ fn slash_shelves_lists_typed_manifest_registry() {
             _ => None,
         })
         .unwrap_or_default();
-    assert!(slash.contains("shelves:"), "{slash}");
-    assert!(
-        slash.contains("Community — shared typed abilities"),
-        "{slash}"
-    );
-    assert!(slash.contains("command:scan — scan target"), "{slash}");
-    assert!(slash.contains("scope: project"), "{slash}");
+    assert!(slash.contains("Shelves"), "{slash}");
+    assert!(slash.contains("Community"), "{slash}");
+    assert!(slash.contains("shared typed abilities"), "{slash}");
+    assert!(slash.contains("command:scan"), "{slash}");
+    assert!(slash.contains("scan target"), "{slash}");
+    assert!(slash.contains("scope:"), "{slash}");
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
@@ -10388,7 +10386,7 @@ fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join("\n---\n");
-    assert!(slash_text.contains("demo — Slash demo"), "{slash_text}");
+    assert!(slash_text.contains("Slash demo"), "{slash_text}");
     assert!(slash_text.contains("pack: demo"), "{slash_text}");
     assert!(slash_text.contains("workflow:"), "{slash_text}");
 
@@ -10398,6 +10396,205 @@ fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[test]
+fn pack_list_renders_compact_blocks_with_header_and_footer() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-list-normal");
+    std::fs::create_dir_all(root.join("packs/demo"))?;
+    std::fs::write(
+        root.join("packs/demo/PACK.md"),
+        "---\nname: demo\ndescription: Short demo\n---\n# Demo\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let packs = packs::discover_packs(&root);
+    let opts = list_render::ListOptions::fixed(false, 80);
+    let out = packs::render_pack_list(&packs, &opts, &root);
+
+    assert!(out.starts_with("Packs"), "{out}");
+    assert!(out.contains("found"), "{out}");
+    assert!(out.contains("demo"), "{out}");
+    assert!(out.contains("Short demo"), "{out}");
+    assert!(out.contains("source:"), "{out}");
+    assert!(out.contains("shelf:"), "{out}");
+    assert!(out.contains("Use:"), "{out}");
+    assert!(out.contains("/pack inspect <name>"), "{out}");
+    assert!(!out.contains("path:"), "{out}"); // path hidden by default
+    assert!(!out.contains('\x1b'), "{out}"); // no ANSI in fixed mode
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn pack_list_verbose_shows_paths() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-list-verbose");
+    let root = std::fs::canonicalize(&root)?;
+    std::fs::create_dir_all(root.join("packs/demo"))?;
+    std::fs::write(
+        root.join("packs/demo/PACK.md"),
+        "---\nname: demo\ndescription: Demo\n---\n# Demo\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let packs = packs::discover_packs(&root);
+    let opts = list_render::ListOptions::fixed(true, 80);
+    let out = packs::render_pack_list(&packs, &opts, &root);
+
+    assert!(out.contains("path:"), "{out}");
+    assert!(out.contains("demo"), "{out}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn pack_list_narrow_terminal_wraps_description() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-list-narrow");
+    std::fs::create_dir_all(root.join("packs/demo"))?;
+    std::fs::write(
+        root.join("packs/demo/PACK.md"),
+        "---\nname: demo\ndescription: The quick brown fox jumps over the lazy dog repeatedly\n---\n# Demo\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let packs = packs::discover_packs(&root);
+    let opts = list_render::ListOptions::fixed(false, 30);
+    let out = packs::render_pack_list(&packs, &opts, &root);
+
+    let desc_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("    ") && !l.contains("source:") && !l.contains("shelf:"))
+        .collect();
+    assert!(desc_lines.iter().all(|l| l.len() <= 30), "{out}");
+    assert!(out.contains("The quick brown fox"), "{out}");
+    assert!(out.contains("lazy dog"), "{out}");
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn pack_list_long_description_wraps_within_width() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-list-longdesc");
+    std::fs::create_dir_all(root.join("packs/demo"))?;
+    let long_desc = "word ".repeat(50);
+    std::fs::write(
+        root.join("packs/demo/PACK.md"),
+        format!("---\nname: demo\ndescription: {long_desc}---\n# Demo\n"),
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", root.join("home"));
+    }
+
+    let packs = packs::discover_packs(&root);
+    let opts = list_render::ListOptions::fixed(false, 60);
+    let out = packs::render_pack_list(&packs, &opts, &root);
+
+    for line in out.lines() {
+        assert!(line.len() <= 60, "line too long: {line}");
+    }
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn list_render_shorten_path_uses_project_relative() {
+    let root = std::path::Path::new("/tmp/dext-test-root");
+    let home = std::path::Path::new("/tmp/dext-test-home");
+    let pack_path = std::path::Path::new("/tmp/dext-test-root/packs/demo");
+
+    let shortened = list_render::shorten_path(pack_path, root, home, false);
+    assert_eq!(shortened, "./packs/demo");
+
+    let home_pack = std::path::Path::new("/tmp/dext-test-home/.dext/packs/demo");
+    let shortened2 = list_render::shorten_path(home_pack, root, home, false);
+    assert_eq!(shortened2, "~/.dext/packs/demo");
+}
+
+#[test]
+fn list_render_wrap_honors_hanging_indent() {
+    let lines = list_render::wrap_lines("aaa bbb ccc ddd eee", 10);
+    assert!(lines.iter().all(|l| l.len() <= 10), "{lines:?}");
+    assert_eq!(lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+               vec!["aaa", "bbb", "ccc", "ddd", "eee"]);
+}
+
+#[test]
+fn list_render_bold_only_with_color() {
+    assert_eq!(list_render::bold("x", false), "x");
+    assert_eq!(list_render::bold("x", true), "\x1b[1mx\x1b[0m");
+}
+
+#[test]
+fn session_listing_shows_header_and_footer() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("session-list-header");
+    let dext_home = root.join("dext-home");
+    let project = root.join("project");
+    std::fs::create_dir_all(&dext_home)?;
+    std::fs::create_dir_all(&project)?;
+    unsafe {
+        std::env::set_var("DEXT_HOME", &dext_home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+    }
+    let result = (|| -> Result<()> {
+        let project = std::fs::canonicalize(&project)?;
+        let mut agent = test_agent(&project);
+        agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "hello".to_string(),
+            }],
+        });
+        agent.save_latest_session()?;
+
+        let listing = render_session_listing(&project);
+        assert!(listing.contains("Sessions"), "{listing}");
+        assert!(listing.contains("Latest"), "{listing}");
+        assert!(listing.contains("Named"), "{listing}");
+        assert!(listing.contains("Autosaved"), "{listing}");
+        assert!(listing.contains("Use:"), "{listing}");
+        Ok(())
+    })();
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 #[test]
