@@ -75,6 +75,7 @@ fn test_agent(root: &Path) -> Agent {
         shelf_registry: shelves::ShelfRegistry::discover(root),
         hooks: Hooks::default(),
         pack_hook_env: Vec::new(),
+        active_pack_hook_paths: HashSet::new(),
         suppress_pack_activation: false,
         state_lock: None,
         session_enabled: true,
@@ -10683,6 +10684,43 @@ fn conversational_pack_inference_requires_invocation_intent() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[test]
+fn pack_auto_invocation_disabled_by_env_globs_and_specific_names() {
+    let _guard = env_lock();
+    let pack = packs::PackInfo {
+        name: "crew".to_string(),
+        description: String::new(),
+        path: PathBuf::from("/tmp/crew"),
+        pack_md_path: PathBuf::from("/tmp/crew/PACK.md"),
+        phooks_path: None,
+        source: "test".to_string(),
+        shelf: Some("orchestration".to_string()),
+    };
+
+    unsafe { std::env::remove_var("DEXT_NO_PACK"); }
+    assert!(!pack_auto_invocation_disabled_by_env(&pack), "unset → enabled");
+
+    for val in ["*", "all", "true", "1"] {
+        unsafe { std::env::set_var("DEXT_NO_PACK", val); }
+        assert!(pack_auto_invocation_disabled_by_env(&pack), "{val} → disabled");
+    }
+
+    for val in ["crew", "crew,autoresearch", "orchestration", "crew autoresearch"] {
+        unsafe { std::env::set_var("DEXT_NO_PACK", val); }
+        assert!(pack_auto_invocation_disabled_by_env(&pack), "{val} → disabled (matches crew)");
+    }
+
+    unsafe { std::env::set_var("DEXT_NO_PACK", "autoresearch"); }
+    assert!(!pack_auto_invocation_disabled_by_env(&pack), "autoresearch ≠ crew → enabled");
+
+    for val in ["0", "false", "off", "no", ""] {
+        unsafe { std::env::set_var("DEXT_NO_PACK", val); }
+        assert!(!pack_auto_invocation_disabled_by_env(&pack), "{val:?} → enabled");
+    }
+
+    unsafe { std::env::remove_var("DEXT_NO_PACK"); }
 }
 
 #[test]

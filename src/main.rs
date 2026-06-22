@@ -7890,6 +7890,12 @@ impl Hooks {
         }
     }
 
+    fn extend(&mut self, other: Self) {
+        self.pre_tool.extend(other.pre_tool);
+        self.post_tool.extend(other.post_tool);
+        self.user_prompt.extend(other.user_prompt);
+    }
+
     fn fire(
         &self,
         phase: &str,
@@ -7939,6 +7945,57 @@ impl Hooks {
             }
         }
         out
+    }
+}
+
+fn pack_auto_invocation_disabled_by_env(pack: &packs::PackInfo) -> bool {
+    let Ok(raw) = std::env::var("DEXT_NO_PACK") else {
+        return false;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || matches!(raw, "0" | "false" | "off" | "no") {
+        return false;
+    }
+    let tokens: Vec<&str> = raw
+        .split(|c: char| c == ',' || c == ';' || c.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Glob tokens disable all packs. Check before normalization since
+    // normalize_pack_disable_token strips non-alphanumeric chars like '*'.
+    if tokens.iter().any(|t| matches!(*t, "*" | "all" | "true" | "1")) {
+        return true;
+    }
+    let name = normalize_pack_disable_token(&pack.name);
+    let env_name = normalize_pack_disable_token(&pack.env_var_name());
+    let shelf = pack.shelf.as_deref().map(normalize_pack_disable_token);
+    tokens
+        .iter()
+        .map(|t| normalize_pack_disable_token(t))
+        .any(|t| t == name || t == env_name || shelf.as_deref() == Some(t.as_str()))
+}
+
+fn normalize_pack_disable_token(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if matches!(c, '-' | '_') {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn load_prompt_env_value(value: String) -> Result<String> {
+    if let Some(path) = value.strip_prefix('@') {
+        std::fs::read_to_string(path).with_context(|| format!("reading prompt env file {path}"))
+    } else {
+        Ok(value)
     }
 }
 
@@ -9384,6 +9441,7 @@ struct Agent {
     shelf_registry: shelves::ShelfRegistry,
     hooks: Hooks,
     pack_hook_env: Vec<(String, String)>,
+    active_pack_hook_paths: HashSet<PathBuf>,
     suppress_pack_activation: bool,
     state_lock: Option<Arc<SessionStateLock>>,
     session_enabled: bool,
@@ -9469,7 +9527,7 @@ impl Agent {
             .and_then(|v| ThinkingEffort::parse(&v))
             .unwrap_or_default();
         let context_mode = ContextMode::from_env();
-        let system = std::env::var("DEXT_SYSTEM")
+        let base_system = std::env::var("DEXT_SYSTEM")
             .ok()
             .and_then(|v| {
                 // Support `@path/to/file` to load system prompt from disk
@@ -9486,6 +9544,13 @@ impl Agent {
                     DEFAULT_SYSTEM.to_string()
                 }
             });
+        let system = match std::env::var("DEXT_SYSTEM_APPEND")
+            .ok()
+            .and_then(|v| load_prompt_env_value(v).ok())
+        {
+            Some(extra) if !extra.trim().is_empty() => format!("{base_system}\n\n{extra}"),
+            _ => base_system,
+        };
         let sandbox_root = std::fs::canonicalize(sandbox.unwrap_or_else(|| {
             PathBuf::from(std::env::var("DEXT_SANDBOX").unwrap_or_else(|_| ".".to_string()))
         }))
@@ -9544,6 +9609,7 @@ impl Agent {
             shelf_registry: shelves::ShelfRegistry::discover(&sandbox_root),
             hooks: Hooks::load(&sandbox_root),
             pack_hook_env: Vec::new(),
+            active_pack_hook_paths: HashSet::new(),
             suppress_pack_activation: false,
             sandbox_root,
             git_context,
@@ -10171,6 +10237,7 @@ impl Agent {
 
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
         self.pack_hook_env.clear();
+        self.active_pack_hook_paths.clear();
         self.suppress_pack_activation = false;
         let next_lock_path = session_state_lock_path(&root, &self.session_id);
         let same_session = self
@@ -10209,7 +10276,10 @@ impl Agent {
             .push(("DEXT_PACK_DIR".to_string(), path.clone()));
         self.pack_hook_env.push((env_name, path));
         if let Some(phooks) = &pack.phooks_path {
-            self.hooks = Hooks::load_file(phooks);
+            let key = std::fs::canonicalize(phooks).unwrap_or_else(|_| phooks.clone());
+            if self.active_pack_hook_paths.insert(key) {
+                self.hooks.extend(Hooks::load_file(phooks));
+            }
         }
     }
 
@@ -12417,6 +12487,7 @@ impl Agent {
         let saved_suppress_checkpoints = self.suppress_checkpoints;
         let saved_hooks = self.hooks.clone();
         let saved_pack_hook_env = self.pack_hook_env.clone();
+        let saved_active_pack_hook_paths = self.active_pack_hook_paths.clone();
         let saved_suppress_pack_activation = self.suppress_pack_activation;
         let saved_work_ledger = self.work_ledger.clone();
         let saved_budget_exhausted = self.budget_exhausted;
@@ -12426,6 +12497,7 @@ impl Agent {
         self.suppress_pack_activation = true;
         self.hooks = Hooks::default();
         self.pack_hook_env.clear();
+        self.active_pack_hook_paths.clear();
         self.budget_exhausted = false;
 
         let prompt = format!("Produce a read-only implementation plan for this task:\n\n{task}");
@@ -12467,6 +12539,7 @@ impl Agent {
         self.suppress_checkpoints = saved_suppress_checkpoints;
         self.hooks = saved_hooks;
         self.pack_hook_env = saved_pack_hook_env;
+        self.active_pack_hook_paths = saved_active_pack_hook_paths;
         self.suppress_pack_activation = saved_suppress_pack_activation;
         self.work_ledger = saved_work_ledger;
         self.budget_exhausted = saved_budget_exhausted;
@@ -12500,12 +12573,19 @@ impl Agent {
         if !self.suppress_pack_activation
             && let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input)
         {
-            self.activate_pack_hooks(&invocation.pack);
-            self.sink.emit(AgentEvent::Info(format!(
-                "[pack:{}] inferred conversational invocation",
-                invocation.pack.name
-            )));
-            user_input = packs::pack_prompt(&invocation.pack, &invocation.task)?;
+            if pack_auto_invocation_disabled_by_env(&invocation.pack) {
+                self.sink.emit(AgentEvent::Info(format!(
+                    "[pack:{}] auto-invocation disabled by DEXT_NO_PACK",
+                    invocation.pack.name
+                )));
+            } else {
+                self.activate_pack_hooks(&invocation.pack);
+                self.sink.emit(AgentEvent::Info(format!(
+                    "[pack:{}] inferred conversational invocation",
+                    invocation.pack.name
+                )));
+                user_input = packs::pack_prompt(&invocation.pack, &invocation.task)?;
+            }
         }
         let hook_env = [("DEXT_USER_INPUT", user_input.as_str())];
         for (out, _code) in self.hooks.fire(
@@ -18464,6 +18544,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "hooks" => {
             if arg == "reload" {
                 agent.hooks = Hooks::load(&agent.sandbox_root);
+                agent.active_pack_hook_paths.clear();
                 let _ = writeln!(w, "hooks reloaded");
             }
             let _ = writeln!(
