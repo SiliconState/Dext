@@ -15347,17 +15347,12 @@ fn build_session_work_map(source: &Path, header: &SessionHeader, history: &[Mess
     let mut tool_uses: HashMap<String, ToolUseInfo> = HashMap::new();
     let mut waypoints = Vec::new();
 
-    if !header.work_ledger.objective.trim().is_empty() {
-        add_work_map_waypoint(
-            &mut waypoints,
-            WorkMapKind::Intent,
-            0..=0,
-            format!("objective: {}", header.work_ledger.objective.trim()),
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
-    }
+    // The objective and blocked fields are intentionally NOT turned into
+    // waypoints here: objective is synthesized verbatim from the latest user
+    // prompt (redundant with the Intent waypoint every real user message
+    // already produces via text_work_map_kind), and blocked only ever holds
+    // synthesized objective-warning reminders. Real decisions, file changes,
+    // verification results, and history-derived waypoints are sufficient.
     for decision in &header.work_ledger.decisions {
         add_work_map_waypoint(
             &mut waypoints,
@@ -15367,17 +15362,6 @@ fn build_session_work_map(source: &Path, header: &SessionHeader, history: &[Mess
             Vec::new(),
             Vec::new(),
             None,
-        );
-    }
-    for blocked in &header.work_ledger.blocked {
-        add_work_map_waypoint(
-            &mut waypoints,
-            WorkMapKind::Failure,
-            0..=0,
-            blocked.clone(),
-            Vec::new(),
-            Vec::new(),
-            Some("blocked".to_string()),
         );
     }
     for file in &header.work_ledger.files_changed {
@@ -15888,13 +15872,8 @@ fn render_work_map_packet_with_mode(
     }
 
     let broad_packet = mode.is_none();
-    let carry_mode = matches!(mode, Some(FocusMode::Carry(_)));
-    let include_objective = broad_packet || carry_mode;
     let include_decisions =
         broad_packet || mode.is_some_and(|m| m.carries("decisions") || m.carries("decision"));
-    let include_failures = broad_packet
-        || mode
-            .is_some_and(|m| m.carries("failures") || m.carries("failure") || m.carries("blocked"));
     let include_files =
         broad_packet || mode.is_some_and(|m| m.carries("files") || m.carries("file"));
     let include_commands =
@@ -15906,10 +15885,8 @@ fn render_work_map_packet_with_mode(
     let include_constraints =
         broad_packet || mode.is_some_and(|m| m.carries("constraints") || m.carries("constraint"));
 
-    if include_objective && !map.header.work_ledger.objective.trim().is_empty() {
-        let _ = writeln!(out, "Intent:");
-        let _ = writeln!(out, "- {}", map.header.work_ledger.objective.trim());
-    }
+    // Intent is no longer synthesized from the objective field (which echoes
+    // raw user text); real user-message Intent waypoints appear below.
     if !waypoints.is_empty() {
         let _ = writeln!(out, "Selected waypoints:");
         for wp in waypoints.iter().take(24) {
@@ -15953,16 +15930,11 @@ fn render_work_map_packet_with_mode(
     } else {
         Vec::new()
     };
-    let mut failures = waypoints
+    let failures = waypoints
         .iter()
         .filter(|wp| wp.kind == WorkMapKind::Failure)
         .map(|wp| wp.summary.clone())
         .collect::<Vec<_>>();
-    if include_failures {
-        for blocked in &map.header.work_ledger.blocked {
-            push_unique_limited(&mut failures, blocked.clone(), 24);
-        }
-    }
     let mut verification = waypoints
         .iter()
         .filter(|wp| wp.kind == WorkMapKind::Verify)
@@ -16015,7 +15987,7 @@ fn render_work_map_packet_with_mode(
             out,
             "- Exact focus withholds prior session history from model context after activation; only this packet and later messages are sent."
         );
-    } else if carry_mode {
+    } else if matches!(mode, Some(FocusMode::Carry(_))) {
         let _ = writeln!(
             out,
             "- Carry focus withholds prior raw history and carries only the requested ledger categories plus selected waypoints."
