@@ -500,7 +500,13 @@ fn injected_steering_is_ledger_visible_and_final_required() {
     let ledger = agent.work_ledger_prompt();
     assert!(ledger.contains("queued_user_updates:"), "{ledger}");
     assert!(ledger.contains("rg border overflow"), "{ledger}");
-    assert!(ledger.contains("respond to queued user update"), "{ledger}");
+    // Synthesized objective/checkpoint fields (objective/done/pending/
+    // next_actions) are intentionally NOT rendered into the runtime status
+    // block; the surfaced [queued-user-update] history message carries the
+    // call to action instead.
+    assert!(!ledger.contains("objective:"), "{ledger}");
+    assert!(!ledger.contains("pending:"), "{ledger}");
+    assert!(!ledger.contains("next_actions:"), "{ledger}");
     let injected = agent
         .history
         .iter()
@@ -5078,11 +5084,10 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
     let root = temp_test_dir("compact-env-ledger");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
-    agent.work_ledger.objective = "keep prompt small".to_string();
-    agent.work_ledger.pending = (0..8)
+    agent.work_ledger.files_changed = (0..8)
         .map(|idx| {
             format!(
-                "pending item with enough detail to grow the ledger {idx}: {}",
+                "src/module_{idx}.rs: {}",
                 "x".repeat(500)
             )
         })
@@ -5229,10 +5234,16 @@ fn session_brief_renders_safe_continuation_packet() {
         model: "glm-4.6".to_string(),
         ..SessionHeader::default()
     };
-    header.work_ledger.objective = "fix the parser bug".to_string();
-    header.work_ledger.done = vec!["located root cause".to_string()];
-    header.work_ledger.pending = vec!["add regression test".to_string()];
-    header.work_ledger.next_actions = vec!["run cargo test".to_string()];
+    header.work_ledger.files_changed = vec!["src/parser.rs".to_string()];
+    header.work_ledger.verification.push(VerificationRecord {
+        name: "cargo test parser".to_string(),
+        command: "cargo test parser".to_string(),
+        status: "passed".to_string(),
+        exit_code: Some(0),
+        duration_ms: 12,
+        artifact: None,
+        validates: Vec::new(),
+    });
 
     let history = vec![
         Message {
@@ -5255,10 +5266,13 @@ fn session_brief_renders_safe_continuation_packet() {
     let brief = render_session_brief(std::path::Path::new("/tmp/s.jsonl"), &header, &analysis);
 
     assert!(brief.contains("# Dext session brief"), "{brief}");
-    assert!(brief.contains("objective: fix the parser bug"), "{brief}");
-    assert!(brief.contains("add regression test"), "{brief}");
-    assert!(brief.contains("run cargo test"), "{brief}");
+    assert!(brief.contains("src/parser.rs"), "{brief}");
+    assert!(brief.contains("cargo test parser: passed"), "{brief}");
     assert!(brief.contains("## Continue"), "{brief}");
+    // The brief surfaces real state only; synthesized objective/checkpoint
+    // placeholders are not echoed from the user prompt.
+    assert!(!brief.contains("objective: fix the parser bug"), "{brief}");
+    assert!(!brief.contains("deliver requested outcome"), "{brief}");
     // The brief is a distilled packet: it must not embed raw prompt transcript.
     assert!(!brief.contains("## Transcript"), "{brief}");
 }

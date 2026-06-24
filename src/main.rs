@@ -8438,22 +8438,21 @@ impl Default for SessionHeader {
 
 fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
     let mut out = String::new();
-    if !ledger.objective.trim().is_empty() {
-        out.push_str(&format!("objective: {}\n", ledger.objective.trim()));
-    }
     if !ledger.current_phase.trim().is_empty() {
         out.push_str(&format!("current_phase: {}\n", ledger.current_phase.trim()));
     }
+    // Only real, observable state is surfaced here. The objective/done/pending/
+    // in_progress/blocked/next_actions fields are excluded from the runtime
+    // status block: they were previously seeded from ObjectiveTracker's
+    // synthesized checkpoints and the latest user prompt, which produced
+    // placeholder noise ("produce execution plan", "deliver requested outcome
+    // …") and echoed raw user text. The ObjectiveTracker remains a turn-local
+    // mechanism for runtime nudges; it no longer pollutes displayed state.
     for (label, items) in [
         ("constraints", &ledger.constraints),
         ("decisions", &ledger.decisions),
-        ("done", &ledger.done),
-        ("in_progress", &ledger.in_progress),
-        ("pending", &ledger.pending),
-        ("blocked", &ledger.blocked),
         ("queued_user_updates", &ledger.steering),
         ("files_changed", &ledger.files_changed),
-        ("next_actions", &ledger.next_actions),
     ] {
         if !items.is_empty() {
             out.push_str(&format!("{label}:\n"));
@@ -13967,6 +13966,10 @@ impl Agent {
                 );
             }
         }
+        // Queued user updates were surfaced as a [queued-user-update] history
+        // message this turn. Retire the ledger summaries now so they appear at
+        // most once and never echo into later turns' runtime status block.
+        self.work_ledger.steering.clear();
         let coverage = objective.assess_history(&self.history);
         self.sync_work_ledger_with_objective_coverage(&coverage);
         if !coverage.unresolved.is_empty() && objective_warning_emitted {
