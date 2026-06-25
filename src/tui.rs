@@ -30,12 +30,12 @@ use tui_markdown::{
 use crate::provider::{curated_provider_models, provider_has_available_credentials};
 use crate::{
     Agent, AgentEvent, ApprovalProfile, Choice, ContextMode, EventSink,
-    HISTORY_CHAR_BUDGET_END_TURN_PERCENT, ThinkingEffort, Usage, WorkMapEventKind,
-    canonical_provider_id, git_summary, handle_slash, history_char_budget_with_window,
-    load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
-    parse_active_runtime_control_sequence, parse_compact_slash, provider_auth_status,
-    pseudo_tool_redaction_marker, redact_pseudo_tool_protocol_text, resolve_active_provider_id,
-    summarize_call, text_line_looks_like_pseudo_tool_syntax,
+    HISTORY_CHAR_BUDGET_END_TURN_PERCENT, LocalAuthSecret, ThinkingEffort, Usage, WorkMapEventKind,
+    canonical_provider_id, clear_secret_string, git_summary, handle_slash,
+    history_char_budget_with_window, load_auth_store, load_provider_catalog, model_context_window,
+    orchestrator::ExternalTelemetry, parse_active_runtime_control_sequence, parse_compact_slash,
+    provider_auth_status, pseudo_tool_redaction_marker, redact_pseudo_tool_protocol_text,
+    resolve_active_provider_id, summarize_call, text_line_looks_like_pseudo_tool_syntax,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
@@ -107,6 +107,12 @@ struct PendingPermission {
     audit_label: String,
     tier: PermissionTier,
     responder: std::sync::mpsc::SyncSender<Choice>,
+}
+
+struct PendingLocalAuth {
+    tool: String,
+    message: String,
+    responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
 }
 
 #[derive(Clone)]
@@ -191,6 +197,11 @@ enum ToTui {
         input: Value,
         responder: std::sync::mpsc::SyncSender<Choice>,
     },
+    LocalAuthSecretRequest {
+        tool: String,
+        message: String,
+        responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
+    },
 }
 
 enum FromTui {
@@ -229,6 +240,22 @@ impl EventSink for TuiSink {
             tool: tool.to_string(),
             message: message.to_string(),
         }));
+    }
+
+    fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
+        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(0);
+        if self
+            .tx
+            .send(ToTui::LocalAuthSecretRequest {
+                tool: tool.to_string(),
+                message: message.to_string(),
+                responder: resp_tx,
+            })
+            .is_err()
+        {
+            return LocalAuthSecret::Unavailable;
+        }
+        resp_rx.recv().unwrap_or(LocalAuthSecret::Canceled)
     }
 }
 
@@ -763,6 +790,8 @@ struct TuiState {
     stream_started_at: Option<Instant>,
     stream_chars: u64,
     pending_perm: Option<PendingPermission>,
+    pending_local_auth: Option<PendingLocalAuth>,
+    local_auth_input: String,
     agent_busy: bool,
     quit: bool,
     frame_count: u64,
@@ -859,6 +888,8 @@ impl TuiState {
             stream_started_at: None,
             stream_chars: 0,
             pending_perm: None,
+            pending_local_auth: None,
+            local_auth_input: String::new(),
             agent_busy: false,
             quit: false,
             frame_count: 0,
@@ -2012,7 +2043,7 @@ fn live_indicator_todo_detail(state: &TuiState, max_cells: usize) -> Option<Line
 }
 
 fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> {
-    if width == 0 || state.pending_perm.is_some() {
+    if width == 0 || state.pending_perm.is_some() || state.pending_local_auth.is_some() {
         return None;
     }
     let max_cells = width.saturating_sub(4) as usize;
@@ -2545,7 +2576,8 @@ fn dim_text(text: &mut Text<'static>) {
 }
 
 fn transcript_item_should_dim(item: &Line_, state: &TuiState) -> bool {
-    state.pending_perm.is_some() && !matches!(item, Line_::PermissionPrompt { .. })
+    (state.pending_perm.is_some() && !matches!(item, Line_::PermissionPrompt { .. }))
+        || state.pending_local_auth.is_some()
 }
 
 fn replace_last_permission_entry(items: &mut [Line_], replacement: Line_) -> bool {
@@ -3333,7 +3365,11 @@ fn wrap_input_visual(
         let end = c.byte_start + c.byte_len;
         if !cursor_set && clamped <= end {
             cursor_row = row;
-            cursor_col = if clamped <= c.byte_start { col } else { col + c.width };
+            cursor_col = if clamped <= c.byte_start {
+                col
+            } else {
+                col + c.width
+            };
             cursor_set = true;
         }
         let cluster = &input[c.byte_start..end];
@@ -6023,15 +6059,21 @@ fn set_last_tool_expanded(items: &mut [Line_], name: &str, expanded: bool) -> bo
 }
 
 fn input_border_style(state: &TuiState) -> Style {
-    let color = match state.approval_profile {
-        ApprovalProfile::Always => TRUST_INPUT_BORDER,
-        _ => Color::DarkGray,
+    let color = if state.pending_local_auth.is_some() {
+        Color::Yellow
+    } else {
+        match state.approval_profile {
+            ApprovalProfile::Always => TRUST_INPUT_BORDER,
+            _ => Color::DarkGray,
+        }
     };
     Style::default().fg(color)
 }
 
 fn input_hint_text(state: &TuiState) -> &'static str {
-    if state.pending_perm.is_some() {
+    if state.pending_local_auth.is_some() {
+        "local auth prompt active · Enter submit · Esc cancel"
+    } else if state.pending_perm.is_some() {
         "y once · a always · n deny"
     } else if state.work_map_is_active() {
         if state
@@ -6051,7 +6093,11 @@ fn input_hint_text(state: &TuiState) -> &'static str {
 }
 
 fn transcript_live_indicator_text(state: &TuiState, width: u16) -> Option<Text<'static>> {
-    if width == 0 || !state.agent_busy || state.pending_perm.is_some() {
+    if width == 0
+        || !state.agent_busy
+        || state.pending_perm.is_some()
+        || state.pending_local_auth.is_some()
+    {
         return None;
     }
     let status = display_busy_status(derived_busy_status(state));
@@ -6198,6 +6244,25 @@ fn queue_permission_request(
         tool: name,
         audit_label,
         tier,
+        responder,
+    });
+}
+
+fn queue_local_auth_secret_request(
+    state: &mut TuiState,
+    tool: String,
+    message: String,
+    responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
+) {
+    if let Some(pending) = state.pending_local_auth.take() {
+        let _ = pending.responder.send(LocalAuthSecret::Canceled);
+    }
+    clear_secret_string(&mut state.local_auth_input);
+    state.status = format!("local auth for {tool}");
+    state.push_debug_event(format!("local auth secret prompt · {tool}"));
+    state.pending_local_auth = Some(PendingLocalAuth {
+        tool,
+        message,
         responder,
     });
 }
@@ -6674,6 +6739,66 @@ fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
     Text::from(lines)
 }
 
+fn local_auth_overlay_text(state: &TuiState) -> Text<'static> {
+    let Some(pending) = state.pending_local_auth.as_ref() else {
+        return Text::from("");
+    };
+    let bullets = "•".repeat(state.local_auth_input.chars().count().min(32));
+    let shown = if bullets.is_empty() {
+        "<hidden>".to_string()
+    } else {
+        bullets
+    };
+    Text::from(vec![
+        Line::from(vec![
+            Span::styled("sudo password for ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                pending.tool.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            pending.message.clone(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(vec![
+            Span::styled("Password: ", Style::default().fg(Color::Yellow)),
+            Span::styled(shown, Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(Span::styled(
+            "Enter submit · Esc cancel · never sent to model/logs",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ])
+}
+
+fn render_local_auth_overlay(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+    if state.pending_local_auth.is_none() {
+        return;
+    }
+    let text = local_auth_overlay_text(state);
+    let width = area.width.min(72).max(20);
+    let height = (text.lines.len() as u16)
+        .saturating_add(2)
+        .min(area.height.max(1));
+    let rect = centered_rect(area, width, height);
+    let widget = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                " local sudo auth ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    render_widget_safe(frame, Clear, rect);
+    render_widget_safe(frame, widget, rect);
+}
+
 fn render_inspector(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -6778,7 +6903,8 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let input = Paragraph::new(lines).block(block);
     render_widget_safe(frame, input, input_area);
 
-    if state.pending_perm.is_none()
+    if state.pending_local_auth.is_none()
+        && state.pending_perm.is_none()
         && !state.show_help
         && !state.work_map_is_active()
         && input_area.width > 0
@@ -6812,7 +6938,12 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         render_widget_safe(frame, widget, rect);
     }
 
+    if state.pending_local_auth.is_some() {
+        render_local_auth_overlay(frame, state, area);
+    }
+
     if !state.show_help
+        && state.pending_local_auth.is_none()
         && state.pending_perm.is_none()
         && !state.work_map_is_active()
         && !state.show_inspector
@@ -6879,8 +7010,15 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     }
 }
 
-fn handle_paste(state: &mut TuiState, pasted: String) {
+fn handle_paste(state: &mut TuiState, mut pasted: String) {
     if pasted.is_empty() {
+        return;
+    }
+    if state.pending_local_auth.is_some() {
+        let secret = pasted.trim_end_matches(['\r', '\n']);
+        state.local_auth_input.push_str(secret);
+        clear_secret_string(&mut pasted);
+        state.status = "local auth input updated".to_string();
         return;
     }
     if state.agent_busy && crate::text_is_potential_local_secret(&pasted) {
@@ -7093,6 +7231,67 @@ fn queue_runtime_effort_control(
     };
 }
 
+fn submit_local_auth_secret(state: &mut TuiState) {
+    let Some(pending) = state.pending_local_auth.take() else {
+        return;
+    };
+    if state.local_auth_input.is_empty() {
+        state.pending_local_auth = Some(pending);
+        state.status = "enter sudo password or Esc cancel".to_string();
+        return;
+    }
+    let secret = std::mem::take(&mut state.local_auth_input);
+    let _ = pending.responder.send(LocalAuthSecret::Secret(secret));
+    state.status = format!("local auth submitted for {}", pending.tool);
+}
+
+fn cancel_local_auth_secret(state: &mut TuiState) {
+    if let Some(pending) = state.pending_local_auth.take() {
+        clear_secret_string(&mut state.local_auth_input);
+        let _ = pending.responder.send(LocalAuthSecret::Canceled);
+        state.status = format!("local auth canceled for {}", pending.tool);
+    }
+}
+
+fn handle_local_auth_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    if state.pending_local_auth.is_none() {
+        return false;
+    }
+    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META);
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, _) => submit_local_auth_secret(state),
+        (KeyCode::Esc, _) => cancel_local_auth_secret(state),
+        (KeyCode::Char('c'), _) if is_ctrl => cancel_local_auth_secret(state),
+        (KeyCode::Char('u'), _) if is_ctrl => {
+            clear_secret_string(&mut state.local_auth_input);
+            state.status = "local auth input cleared".to_string();
+        }
+        (KeyCode::Backspace, _) => {
+            state.local_auth_input.pop();
+            state.status = "local auth input updated".to_string();
+        }
+        (KeyCode::Delete, _) => {
+            state.status = "local auth input hidden".to_string();
+        }
+        (KeyCode::Char(c), m)
+            if !m.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            state.local_auth_input.push(c);
+            state.status = "local auth input updated".to_string();
+        }
+        _ => {}
+    }
+    true
+}
+
 fn handle_key(
     state: &mut TuiState,
     key: KeyEvent,
@@ -7102,6 +7301,9 @@ fn handle_key(
     interrupt: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     if key.kind != KeyEventKind::Press {
+        return;
+    }
+    if handle_local_auth_key(state, key) {
         return;
     }
     if state.work_map_is_active() && handle_work_map_key(state, key, agent_input) {
@@ -7807,6 +8009,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                     Some(ToTui::Event(ev)) => state.apply_event(ev),
                     Some(ToTui::PermissionRequest { name, input, responder }) => {
                         queue_permission_request(&mut state, name, input, responder);
+                    }
+                    Some(ToTui::LocalAuthSecretRequest { tool, message, responder }) => {
+                        queue_local_auth_secret_request(&mut state, tool, message, responder);
                     }
                     None => {}
                 }
@@ -11235,9 +11440,7 @@ mod tests {
         assert!(!joined.contains("✅  clear"), "{joined}");
         assert!(!joined.contains("⚠️  confirm"), "{joined}");
         let table_edge = |line: &str| {
-            let idx = line
-                .rfind(['┐', '┤', '┘', '│'])
-                .expect("table right edge");
+            let idx = line.rfind(['┐', '┤', '┘', '│']).expect("table right edge");
             let edge = line[idx..].chars().next().expect("right edge marker");
             text_width(&line[..idx]) + text_width(&line[idx..idx + edge.len_utf8()])
         };
@@ -11252,7 +11455,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(emoji_rows.len(), 3, "{flat:?}");
         assert!(
-            emoji_rows.iter().all(|line| table_edge(line) == border_width),
+            emoji_rows
+                .iter()
+                .all(|line| table_edge(line) == border_width),
             "emoji rows should keep separators and right border aligned with the table edge: {flat:?}"
         );
     }
@@ -11280,8 +11485,14 @@ mod tests {
             let flat = flatten_lines(&text);
             let joined = flat.join("\n");
             // No cluster ever split: VS16 must stay glued to its base.
-            assert!(!joined.contains("⚙ \u{fe0f}"), "split ⚙/VS16 at w={w}: {joined}");
-            assert!(!joined.contains("☢ \u{fe0f}"), "split ☢/VS16 at w={w}: {joined}");
+            assert!(
+                !joined.contains("⚙ \u{fe0f}"),
+                "split ⚙/VS16 at w={w}: {joined}"
+            );
+            assert!(
+                !joined.contains("☢ \u{fe0f}"),
+                "split ☢/VS16 at w={w}: {joined}"
+            );
             // Emoji preserved intact.
             assert!(joined.contains('🪙'), "lost 🪙 at w={w}: {joined}");
             assert!(joined.contains("⚙️"), "lost ⚙️ at w={w}: {joined}");
@@ -11309,7 +11520,11 @@ mod tests {
         // 👨‍👩‍👧 (man + ZWJ + woman + ZWJ + girl) renders as one 2-cell family
         // glyph. Per-char width would over-count as 6; the cluster must stay whole.
         let clusters = display_clusters("👨‍👩‍👧");
-        assert_eq!(clusters.len(), 1, "family must be a single cluster: {clusters:?}");
+        assert_eq!(
+            clusters.len(),
+            1,
+            "family must be a single cluster: {clusters:?}"
+        );
         assert_eq!(clusters[0].width, 2, "{clusters:?}");
         assert_eq!(clusters[0].byte_len, "👨‍👩‍👧".len());
     }
@@ -11642,7 +11857,10 @@ mod tests {
         let (lines, _, _) = wrap_input_visual(text, text.len(), 5);
         // "aaa" = 3, "⚠️" = 2 → total 5, fits. "bbb" = 3 → next line.
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].ends_with("⚠️"), "VS16 must stay with base: {lines:?}");
+        assert!(
+            lines[0].ends_with("⚠️"),
+            "VS16 must stay with base: {lines:?}"
+        );
     }
 
     #[test]

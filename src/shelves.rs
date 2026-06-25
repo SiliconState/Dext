@@ -677,7 +677,11 @@ pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
 
     let manifests = registry.manifests();
     let mut out = String::new();
-    let _ = write!(out, "{}", crate::list_render::render_header("Shelves", manifests.len(), &opts));
+    let _ = write!(
+        out,
+        "{}",
+        crate::list_render::render_header("Shelves", manifests.len(), &opts)
+    );
 
     for manifest in manifests {
         let ability_count: usize = manifest.packs.iter().map(|pack| pack.abilities.len()).sum();
@@ -698,7 +702,11 @@ pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
     let resolved = registry.resolve();
     if !resolved.is_empty() {
         out.push('\n');
-        let _ = writeln!(out, "{}", crate::list_render::bold("Resolved abilities", opts.color));
+        let _ = writeln!(
+            out,
+            "{}",
+            crate::list_render::bold("Resolved abilities", opts.color)
+        );
         for ability in resolved.iter().take(50) {
             out.push_str(&format_resolved_ability_styled(ability, &opts));
         }
@@ -706,7 +714,10 @@ pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
             let _ = writeln!(out, "  … [{} more abilities omitted]", resolved.len() - 50);
         }
     }
-    out.push_str(&crate::list_render::render_footer(&["/shelves", "dext shelves"], &opts));
+    out.push_str(&crate::list_render::render_footer(
+        &["/shelves", "dext shelves"],
+        &opts,
+    ));
     out
 }
 
@@ -762,7 +773,10 @@ fn format_resolved_ability(resolved: &ResolvedAbility, indent: &str) -> String {
     )
 }
 
-fn format_resolved_ability_styled(resolved: &ResolvedAbility, opts: &crate::list_render::ListOptions) -> String {
+fn format_resolved_ability_styled(
+    resolved: &ResolvedAbility,
+    opts: &crate::list_render::ListOptions,
+) -> String {
     let (kind, name) = resolved.ability.key();
     let title = format!("{kind}:{name}");
     let desc = ability_long_description(&resolved.ability);

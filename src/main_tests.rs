@@ -184,13 +184,9 @@ fn git_checkpoint_unborn_head_is_noop_before_and_after_mutation() {
     assert!(before.is_none());
 
     std::fs::write(root.join("created.txt"), "new\n").expect("write created");
-    let after = git_checkpoints::create_checkpoint(
-        &root,
-        "write_file",
-        &["created.txt".to_string()],
-        2,
-    )
-    .expect("checkpoint after mutation");
+    let after =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["created.txt".to_string()], 2)
+            .expect("checkpoint after mutation");
     assert!(after.is_none());
     assert!(!root.join(".dext/checkpoints/manifest.txt").exists());
 }
@@ -667,20 +663,69 @@ fn potential_login_secret_is_not_serialized_to_provider_request() {
 
 #[cfg(unix)]
 #[test]
-fn sudo_askpass_script_uses_local_tty_and_never_echoes_chat_guidance() {
+fn sudo_askpass_script_reads_fifo_and_never_echoes_chat_guidance() {
     let script = sudo_askpass_script_content_with_paths(
         "/tmp/zenity'bad",
         "/tmp/kdialog",
         "/usr/bin/osascript",
     );
-    assert!(script.contains("/dev/tty"), "{script}");
+    // Password flows only through the Dext-provided fifo, never a raw /dev/tty
+    // echo path inside the child, so it can't leak into the TUI scrollback.
+    assert!(script.contains("DEXT_SUDO_PASSWORD_FIFO"), "{script}");
     assert!(script.contains("osascript"), "{script}");
     assert!(
-        script.contains("Dext local sudo prompt requires a TTY"),
+        script.contains("Dext local sudo prompt requires Dext local auth"),
         "{script}"
     );
+    assert!(!script.contains("/dev/tty"), "{script}");
     assert!(!script.contains("chat/steering"), "{script}");
     assert!(script.contains("'\\''"), "{script}");
+}
+
+#[cfg(unix)]
+#[test]
+fn sudo_password_fifo_is_0600_and_unlinkable() {
+    let root = temp_test_dir("sudo-fifo-perms");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let path = create_sudo_password_fifo(&root, "test-session").expect("create fifo");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path)
+        .expect("stat fifo")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "fifo mode {mode:o}");
+    assert!(path.exists());
+    std::fs::remove_file(&path).expect("unlink fifo");
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn clear_secret_string_zeroes_then_empties() {
+    let mut secret = "hunter2-hunter2".to_string();
+    clear_secret_string(&mut secret);
+    assert!(secret.is_empty());
+    assert!(secret.capacity() == 0 || secret.as_bytes().iter().all(|&b| b == 0));
+}
+
+#[cfg(unix)]
+#[test]
+fn sudo_wrapper_prefix_uses_noninteractive_and_no_askpass_env() {
+    let auth = LocalSudoAuth {
+        askpass: Some(PathBuf::from("/nonexistent/askpass.sh")),
+        password_fifo: None,
+        password: None,
+        preauth_required: false,
+    };
+    let prefix = sudo_wrapper_prefix(&auth);
+    assert!(prefix.contains("sudo -n"), "{prefix}");
+    // After pre-auth, the wrapper must NOT export askpass env vars into the
+    // bash child (pre-auth already established the sudo timestamp; leaking
+    // askpass would risk re-prompting via the script's fallback paths).
+    assert!(!prefix.contains("SUDO_ASKPASS"), "{prefix}");
+    assert!(!prefix.contains("DEXT_SUDO_ASKPASS"), "{prefix}");
+    assert!(!prefix.contains("DEXT_SUDO_PASSWORD_FIFO"), "{prefix}");
 }
 
 #[test]
@@ -799,7 +844,9 @@ fn busy_console_input_allows_public_copied_text_as_steering() {
 
 #[test]
 fn potential_local_secret_detection_keeps_targeted_secret_coverage() {
-    assert!(text_is_potential_local_secret("token=abcdefghijklmnopqrstuvwxyz"));
+    assert!(text_is_potential_local_secret(
+        "token=abcdefghijklmnopqrstuvwxyz"
+    ));
     assert!(text_is_potential_local_secret(
         "Bearer sk-secret-token-that-should-stay-local"
     ));
@@ -809,7 +856,9 @@ fn potential_local_secret_detection_keeps_targeted_secret_coverage() {
     assert!(text_is_potential_local_secret(
         "/login chatgpt sk-secret-token-that-should-stay-local"
     ));
-    assert!(text_is_potential_local_secret("sk-secret-token-that-should-stay-local"));
+    assert!(text_is_potential_local_secret(
+        "sk-secret-token-that-should-stay-local"
+    ));
     assert!(!text_is_potential_local_secret(
         "d6280ad878e35256aa76aaf02d6bc62c3d850ab1"
     ));
@@ -1414,6 +1463,33 @@ fn work_map_filters_multiple_kinds_as_union_and_narrow_by_query() -> Result<()> 
         visible.iter().all(|wp| wp.kind == WorkMapKind::Failure),
         "{visible:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn work_map_query_does_not_match_hidden_objective_text() -> Result<()> {
+    let header = SessionHeader {
+        work_ledger: WorkLedger {
+            objective: "unique hidden objective text".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let history = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "visible unrelated request".to_string(),
+        }],
+    }];
+    let map = build_session_work_map(Path::new("test-session.jsonl"), &header, &history);
+    let args = parse_work_map_command_args("query unique hidden objective");
+    let (_, filters) = parse_work_map_filter_args(&args)?;
+    let visible = map
+        .waypoints
+        .iter()
+        .filter(|wp| work_map_filter_matches(&map, wp, &filters))
+        .collect::<Vec<_>>();
+    assert!(visible.is_empty(), "{visible:?}");
     Ok(())
 }
 
@@ -4683,6 +4759,17 @@ fn compaction_evidence_includes_ledger_verification_provider_health_and_tool_ref
 }
 
 #[test]
+fn compaction_evidence_skips_objective_only_ledger_header() {
+    let ledger = WorkLedger {
+        objective: "raw user prompt that should stay hidden here".to_string(),
+        ..Default::default()
+    };
+    let evidence = render_compaction_evidence(&[], &ledger, &ProviderHealthLedger::default());
+    assert!(!evidence.contains("[ledger:active]"), "{evidence}");
+    assert!(!evidence.contains("raw user prompt"), "{evidence}");
+}
+
+#[test]
 fn compaction_prompt_requests_structured_resume_packet() {
     let prompt = compaction_user_text("[user] fix compaction\n");
     assert!(prompt.contains("Task"), "{prompt}");
@@ -5085,12 +5172,7 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
     agent.work_ledger.files_changed = (0..8)
-        .map(|idx| {
-            format!(
-                "src/module_{idx}.rs: {}",
-                "x".repeat(500)
-            )
-        })
+        .map(|idx| format!("src/module_{idx}.rs: {}", "x".repeat(500)))
         .collect();
     agent.provider_health.providers.insert(
         "chatgpt".to_string(),
@@ -5273,6 +5355,7 @@ fn session_brief_renders_safe_continuation_packet() {
     // placeholders are not echoed from the user prompt.
     assert!(!brief.contains("objective: fix the parser bug"), "{brief}");
     assert!(!brief.contains("deliver requested outcome"), "{brief}");
+    assert!(!brief.contains("pending/next-action"), "{brief}");
     // The brief is a distilled packet: it must not embed raw prompt transcript.
     assert!(!brief.contains("## Transcript"), "{brief}");
 }
@@ -10445,8 +10528,14 @@ fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
     assert!(slash_text.contains("path:"), "{slash_text}");
     assert!(!slash_text.contains("usage: /pack"), "{slash_text}");
 
-    assert_eq!(handle_slash("/pack -v inspect demo", &mut agent), Some(true));
-    assert_eq!(handle_slash("/pack run demo -v task", &mut agent), Some(true));
+    assert_eq!(
+        handle_slash("/pack -v inspect demo", &mut agent),
+        Some(true)
+    );
+    assert_eq!(
+        handle_slash("/pack run demo -v task", &mut agent),
+        Some(true)
+    );
     let followup = drain_events(&mut rx)
         .into_iter()
         .filter_map(|event| match event {
@@ -10456,7 +10545,10 @@ fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
         .collect::<Vec<_>>()
         .join("\n---\n");
     assert!(followup.contains("pack: demo"), "{followup}");
-    assert!(followup.contains("dext pack run demo -v task"), "{followup}");
+    assert!(
+        followup.contains("dext pack run demo -v task"),
+        "{followup}"
+    );
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
@@ -10616,8 +10708,10 @@ fn list_render_shorten_path_uses_project_relative() {
 fn list_render_wrap_honors_hanging_indent() {
     let lines = list_render::wrap_lines("aaa bbb ccc ddd eee", 10);
     assert!(lines.iter().all(|l| l.len() <= 10), "{lines:?}");
-    assert_eq!(lines.join(" ").split_whitespace().collect::<Vec<_>>(),
-               vec!["aaa", "bbb", "ccc", "ddd", "eee"]);
+    assert_eq!(
+        lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+        vec!["aaa", "bbb", "ccc", "ddd", "eee"]
+    );
 }
 
 #[test]
@@ -10713,28 +10807,60 @@ fn pack_auto_invocation_disabled_by_env_globs_and_specific_names() {
         shelf: Some("orchestration".to_string()),
     };
 
-    unsafe { std::env::remove_var("DEXT_NO_PACK"); }
-    assert!(!pack_auto_invocation_disabled_by_env(&pack), "unset → enabled");
+    unsafe {
+        std::env::remove_var("DEXT_NO_PACK");
+    }
+    assert!(
+        !pack_auto_invocation_disabled_by_env(&pack),
+        "unset → enabled"
+    );
 
     for val in ["*", "all", "true", "1"] {
-        unsafe { std::env::set_var("DEXT_NO_PACK", val); }
-        assert!(pack_auto_invocation_disabled_by_env(&pack), "{val} → disabled");
+        unsafe {
+            std::env::set_var("DEXT_NO_PACK", val);
+        }
+        assert!(
+            pack_auto_invocation_disabled_by_env(&pack),
+            "{val} → disabled"
+        );
     }
 
-    for val in ["crew", "crew,autoresearch", "orchestration", "crew autoresearch"] {
-        unsafe { std::env::set_var("DEXT_NO_PACK", val); }
-        assert!(pack_auto_invocation_disabled_by_env(&pack), "{val} → disabled (matches crew)");
+    for val in [
+        "crew",
+        "crew,autoresearch",
+        "orchestration",
+        "crew autoresearch",
+    ] {
+        unsafe {
+            std::env::set_var("DEXT_NO_PACK", val);
+        }
+        assert!(
+            pack_auto_invocation_disabled_by_env(&pack),
+            "{val} → disabled (matches crew)"
+        );
     }
 
-    unsafe { std::env::set_var("DEXT_NO_PACK", "autoresearch"); }
-    assert!(!pack_auto_invocation_disabled_by_env(&pack), "autoresearch ≠ crew → enabled");
+    unsafe {
+        std::env::set_var("DEXT_NO_PACK", "autoresearch");
+    }
+    assert!(
+        !pack_auto_invocation_disabled_by_env(&pack),
+        "autoresearch ≠ crew → enabled"
+    );
 
     for val in ["0", "false", "off", "no", ""] {
-        unsafe { std::env::set_var("DEXT_NO_PACK", val); }
-        assert!(!pack_auto_invocation_disabled_by_env(&pack), "{val:?} → enabled");
+        unsafe {
+            std::env::set_var("DEXT_NO_PACK", val);
+        }
+        assert!(
+            !pack_auto_invocation_disabled_by_env(&pack),
+            "{val:?} → enabled"
+        );
     }
 
-    unsafe { std::env::remove_var("DEXT_NO_PACK"); }
+    unsafe {
+        std::env::remove_var("DEXT_NO_PACK");
+    }
 }
 
 #[test]
@@ -10879,9 +11005,15 @@ fn html_entity_decode_preserves_multibyte_utf8() {
         "caf\u{e9} \u{2014} r\u{e9}sum\u{e9} & t\u{e9}l\u{e9}"
     );
     assert_eq!(html_entity_decode_minimal("&lt;a&gt;&quot;&#39;"), "<a>\"'");
-    assert_eq!(html_entity_decode_minimal("&#x2014;&#8212;"), "\u{2014}\u{2014}");
+    assert_eq!(
+        html_entity_decode_minimal("&#x2014;&#8212;"),
+        "\u{2014}\u{2014}"
+    );
     // Unterminated/unknown entities pass through without panicking.
-    assert_eq!(html_entity_decode_minimal("a&b &unknown; &"), "a&b &unknown; &");
+    assert_eq!(
+        html_entity_decode_minimal("a&b &unknown; &"),
+        "a&b &unknown; &"
+    );
 
     let text = extract_html_text("<p>caf\u{e9} &amp; cr\u{e8}me</p>");
     assert!(text.contains("caf\u{e9} & cr\u{e8}me"), "{text}");
@@ -10981,7 +11113,10 @@ fn head_tail_cap_preserves_process_output_verdict() {
 
     // Under-cap content passes through untouched.
     let short = "all good".to_string();
-    assert_eq!(cap_bytes_head_tail_with_hint(short.clone(), 2_000, "x"), short);
+    assert_eq!(
+        cap_bytes_head_tail_with_hint(short.clone(), 2_000, "x"),
+        short
+    );
 }
 
 #[test]
@@ -11030,7 +11165,10 @@ fn prompt_scan_cache_revalidates_on_file_change() -> Result<()> {
     // A newly created DEXT.md at the project root must also invalidate.
     std::fs::write(root.join("DEXT.md"), "## Rules\nuse rg")?;
     let (dext, _, _) = agent.prompt_scans();
-    assert!(dext.iter().any(|(_, _, c)| c.contains("use rg")), "{dext:?}");
+    assert!(
+        dext.iter().any(|(_, _, c)| c.contains("use rg")),
+        "{dext:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -11070,16 +11208,16 @@ fn wire_messages_drop_content_emptied_by_sanitization() {
     let wire = anthropic_wire_messages(&sanitized, true).expect("wire");
     assert_eq!(wire.len(), 2, "{wire:?}");
     assert!(
-        wire.iter().all(|m| !m["content"]
-            .as_array()
-            .map(Vec::is_empty)
-            .unwrap_or(true)),
+        wire.iter()
+            .all(|m| !m["content"].as_array().map(Vec::is_empty).unwrap_or(true)),
         "{wire:?}"
     );
     // Breakpoint still lands on the last surviving message.
     let last_blocks = wire[1]["content"].as_array().expect("blocks");
     assert_eq!(
-        last_blocks.last().and_then(|b| b["cache_control"]["type"].as_str()),
+        last_blocks
+            .last()
+            .and_then(|b| b["cache_control"]["type"].as_str()),
         Some("ephemeral")
     );
 }

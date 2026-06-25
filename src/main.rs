@@ -35,8 +35,8 @@ use session::{
     named_session_path_for_root, named_sessions_dir_for_root, new_session_id, parse_session_header,
     project_key, project_latest_session_path, release_registered_locks, render_limited_csv,
     restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
-    session_latest_session_path, session_state_lock_path, session_sudo_dir,
-    session_todo_path, unix_timestamp_secs,
+    session_latest_session_path, session_state_lock_path, session_sudo_dir, session_todo_path,
+    unix_timestamp_secs,
 };
 use tools::{
     Tool, ToolProfile, is_external_process_tool, needs_permission, provider_tool_definitions,
@@ -89,6 +89,7 @@ const STREAM_EVENT_BUFFER_CAP: usize = 256_000;
 const TOOL_SUMMARY_CHAR_CAP: usize = 180;
 const TOOL_UI_CONTENT_CAP: usize = 8_000;
 const SUDO_ASKPASS_ENV: &str = "DEXT_SUDO_ASKPASS";
+const SUDO_PASSWORD_FIFO_ENV: &str = "DEXT_SUDO_PASSWORD_FIFO";
 const SUDO_AUTH_GUIDANCE: &str = "sudo auth is local only. If this command needs sudo, use the local prompt Dext opens; never type sudo passwords into chat/steering input.";
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
 pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "DEXT_ALLOW_BREAK_SYSTEM_PACKAGES";
@@ -1276,8 +1277,7 @@ fn strip_bearer_token(text: &str) -> Option<&str> {
     let prefix_len = "bearer".len();
     let prefix = text.get(..prefix_len)?;
     let rest = text.get(prefix_len..)?;
-    if prefix.eq_ignore_ascii_case("bearer")
-        && rest.chars().next().is_some_and(char::is_whitespace)
+    if prefix.eq_ignore_ascii_case("bearer") && rest.chars().next().is_some_and(char::is_whitespace)
     {
         Some(rest.trim_start()).filter(|token| !token.is_empty())
     } else {
@@ -1286,35 +1286,39 @@ fn strip_bearer_token(text: &str) -> Option<&str> {
 }
 
 fn contains_known_secret_token(text: &str) -> bool {
-    text.split(|c: char| c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '&' | '=' | ':' | ';' | ',' | '#'))
-        .any(|raw| {
-            let token = raw.trim_matches(|c: char| {
-                c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}')
-            });
-            let len = token.chars().count();
-            if len < 8 {
-                return false;
-            }
-            let lower = token.to_ascii_lowercase();
-            lower.starts_with("sk-")
-                || lower.starts_with("sk_")
-                || lower.starts_with("xoxb-")
-                || lower.starts_with("xoxp-")
-                || lower.starts_with("ghp_")
-                || lower.starts_with("github_pat_")
-                || lower.starts_with("glpat-")
-                || lower.starts_with("ya29.")
-                || (lower.starts_with("ac_") && len >= 16)
-                || (token.starts_with("AIza") && len >= 20)
-        })
+    text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '&' | '=' | ':' | ';' | ',' | '#')
+    })
+    .any(|raw| {
+        let token = raw.trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+        });
+        let len = token.chars().count();
+        if len < 8 {
+            return false;
+        }
+        let lower = token.to_ascii_lowercase();
+        lower.starts_with("sk-")
+            || lower.starts_with("sk_")
+            || lower.starts_with("xoxb-")
+            || lower.starts_with("xoxp-")
+            || lower.starts_with("ghp_")
+            || lower.starts_with("github_pat_")
+            || lower.starts_with("glpat-")
+            || lower.starts_with("ya29.")
+            || (lower.starts_with("ac_") && len >= 16)
+            || (token.starts_with("AIza") && len >= 20)
+    })
 }
 
 fn looks_like_public_clipboard_reference(text: &str) -> bool {
     let mut saw_reference = false;
     for token in text.split_whitespace().map(|token| {
-        token.trim_matches(|c: char| {
-            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>')
-        })
+        token.trim_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>'))
     }) {
         if token.is_empty() {
             continue;
@@ -1342,10 +1346,7 @@ fn looks_like_url_reference(token: &str) -> bool {
         if host.contains('@') {
             return false;
         }
-        let host = host
-            .split(':')
-            .next()
-            .unwrap_or(host);
+        let host = host.split(':').next().unwrap_or(host);
         !rest.is_empty() && looks_like_domain_name(host)
     })
 }
@@ -1546,6 +1547,10 @@ trait EventSink: Send + Sync {
     fn emit(&mut self, event: AgentEvent);
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice;
     fn local_auth_prompt(&mut self, tool: &str, message: &str);
+    fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
+        self.local_auth_prompt(tool, message);
+        LocalAuthSecret::Unavailable
+    }
 }
 
 struct ConsoleSink {
@@ -1685,6 +1690,12 @@ impl EventSink for ConsoleSink {
     fn local_auth_prompt(&mut self, _tool: &str, message: &str) {
         eprintln!("{message}");
     }
+
+    fn request_local_auth_secret(&mut self, _tool: &str, message: &str) -> LocalAuthSecret {
+        read_local_auth_secret_from_tty(message)
+            .map(LocalAuthSecret::Secret)
+            .unwrap_or(LocalAuthSecret::Unavailable)
+    }
 }
 
 #[derive(Serialize, Default)]
@@ -1782,6 +1793,18 @@ impl EventSink for JsonSink {
             self.inner.local_auth_prompt(tool, message);
         }
     }
+
+    fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
+        if self.mode == OutputMode::StreamJson {
+            if let Ok(value) = serde_json::to_value(AgentEvent::LocalAuthPrompt {
+                tool: tool.to_string(),
+                message: message.to_string(),
+            }) {
+                Self::emit_json_line(&value);
+            }
+        }
+        self.inner.request_local_auth_secret(tool, message)
+    }
 }
 
 #[cfg(test)]
@@ -1853,6 +1876,91 @@ impl EventSink for NullSink {
     }
 
     fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+}
+
+#[cfg(unix)]
+struct TerminalEchoGuard {
+    fd: i32,
+    original: libc::termios,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl TerminalEchoGuard {
+    fn disable(fd: i32) -> io::Result<Self> {
+        // Password input must never be echoed into the TUI/terminal scrollback.
+        unsafe {
+            let mut original: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut original) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut hidden = original;
+            hidden.c_lflag &= !libc::ECHO;
+            if libc::tcsetattr(fd, libc::TCSAFLUSH, &hidden) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                fd,
+                original,
+                active: true,
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            }
+            self.active = false;
+        }
+    }
+}
+
+fn trim_local_auth_secret_line(secret: &str) -> String {
+    secret.trim_end_matches(['\r', '\n']).to_string()
+}
+
+pub(crate) fn clear_secret_string(secret: &mut String) {
+    unsafe {
+        secret.as_mut_vec().fill(0);
+    }
+    secret.clear();
+}
+
+#[cfg(unix)]
+fn read_local_auth_secret_from_tty(message: &str) -> Option<String> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    writeln!(tty, "{message}").ok()?;
+    write!(tty, "Password: ").ok()?;
+    tty.flush().ok()?;
+
+    let _echo_guard = TerminalEchoGuard::disable(tty.as_raw_fd()).ok()?;
+    let mut line = String::new();
+    let mut reader = io::BufReader::new(tty.try_clone().ok()?);
+    let bytes = reader.read_line(&mut line).ok()?;
+    drop(_echo_guard);
+    writeln!(tty).ok()?;
+    if bytes == 0 {
+        None
+    } else {
+        Some(trim_local_auth_secret_line(&line))
+    }
+}
+
+#[cfg(not(unix))]
+fn read_local_auth_secret_from_tty(_message: &str) -> Option<String> {
+    None
 }
 
 #[cfg(unix)]
@@ -2824,15 +2932,12 @@ fn map_effort_to_provider_levels(levels: &[String], effort: ThinkingEffort) -> O
     };
     match effort {
         ThinkingEffort::Off => None,
-        ThinkingEffort::Low | ThinkingEffort::Medium | ThinkingEffort::High => pick(&[
-            "high",
-            effort.as_str(),
-            "medium",
-            "low",
-        ])
-        .or_else(|| levels.first().cloned()),
-        ThinkingEffort::XHigh | ThinkingEffort::Max => pick(&["max", "xhigh", "high"])
-            .or_else(|| levels.last().cloned()),
+        ThinkingEffort::Low | ThinkingEffort::Medium | ThinkingEffort::High => {
+            pick(&["high", effort.as_str(), "medium", "low"]).or_else(|| levels.first().cloned())
+        }
+        ThinkingEffort::XHigh | ThinkingEffort::Max => {
+            pick(&["max", "xhigh", "high"]).or_else(|| levels.last().cloned())
+        }
     }
 }
 
@@ -6914,9 +7019,11 @@ fn execute_tool_with_cache(
     }
 }
 
-#[derive(Clone, Debug)]
 struct LocalSudoAuth {
-    askpass: PathBuf,
+    askpass: Option<PathBuf>,
+    password_fifo: Option<PathBuf>,
+    password: Option<String>,
+    preauth_required: bool,
 }
 
 async fn prepare_local_sudo_auth(
@@ -6945,10 +7052,20 @@ async fn prepare_local_sudo_auth(
         _ => false,
     };
     if cached {
-        return Ok(None);
+        return Ok(Some(LocalSudoAuth {
+            askpass: None,
+            password_fifo: None,
+            password: None,
+            preauth_required: false,
+        }));
     }
     let askpass = write_sudo_askpass_script(root, session_id)?;
-    Ok(Some(LocalSudoAuth { askpass }))
+    Ok(Some(LocalSudoAuth {
+        askpass: Some(askpass),
+        password_fifo: None,
+        password: None,
+        preauth_required: true,
+    }))
 }
 
 #[cfg(unix)]
@@ -6959,6 +7076,11 @@ fn write_sudo_askpass_script(
     use std::os::unix::fs::PermissionsExt;
     let dir = session_sudo_dir(root, session_id);
     std::fs::create_dir_all(&dir).map_err(|e| format!("prepare local sudo prompt dir: {e}"))?;
+    let mut dir_perms = std::fs::metadata(&dir)
+        .map_err(|e| format!("metadata sudo prompt dir: {e}"))?
+        .permissions();
+    dir_perms.set_mode(0o700);
+    std::fs::set_permissions(&dir, dir_perms).map_err(|e| format!("chmod sudo prompt dir: {e}"))?;
     let path = dir.join("askpass.sh");
     let content = sudo_askpass_script_content();
     atomic_write_bytes(&path, content.as_bytes())
@@ -6981,6 +7103,11 @@ fn sudo_askpass_script_content_with_paths(zenity: &str, kdialog: &str, osascript
         r#"#!/bin/sh
 set -eu
 PROMPT=${{1:-'sudo password:'}}
+if [ -n "${{DEXT_SUDO_PASSWORD_FIFO:-}}" ] && [ -p "$DEXT_SUDO_PASSWORD_FIFO" ]; then
+  IFS= read -r password < "$DEXT_SUDO_PASSWORD_FIFO" || exit 1
+  printf '%s\n' "$password"
+  exit 0
+fi
 if command -v zenity >/dev/null 2>&1; then
   exec {zenity} --password --title='Dext local sudo prompt' --text="$PROMPT"
 fi
@@ -6996,17 +7123,7 @@ if [ -x {osascript} ] || command -v osascript >/dev/null 2>&1; then
     -e 'end run' \
     "$PROMPT"
 fi
-if [ -r /dev/tty ] && [ -w /dev/tty ]; then
-  printf 'Dext needs your sudo password locally for: %s\n' "$PROMPT" >/dev/tty
-  printf 'Password: ' >/dev/tty
-  stty -echo </dev/tty
-  IFS= read -r password </dev/tty
-  stty echo </dev/tty
-  printf '\n' >/dev/tty
-  printf '%s\n' "$password"
-  exit 0
-fi
-printf '%s\n' 'Dext local sudo prompt requires a TTY, osascript, zenity, or kdialog.' >&2
+printf '%s\n' 'Dext local sudo prompt requires Dext local auth, osascript, zenity, or kdialog.' >&2
 exit 1
 "#
     )
@@ -7034,6 +7151,241 @@ fn write_sudo_askpass_script(
     Err("local sudo prompts are only supported on Unix".to_string())
 }
 
+#[cfg(unix)]
+fn sudo_secret_random_suffix() -> std::result::Result<String, String> {
+    let mut bytes = [0u8; 12];
+    getrandom::fill(&mut bytes).map_err(|e| format!("random sudo pipe name: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(unix)]
+fn create_sudo_password_fifo(
+    root: &Path,
+    session_id: &str,
+) -> std::result::Result<PathBuf, String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = session_sudo_dir(root, session_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("prepare local sudo prompt dir: {e}"))?;
+    let mut dir_perms = std::fs::metadata(&dir)
+        .map_err(|e| format!("metadata sudo prompt dir: {e}"))?
+        .permissions();
+    dir_perms.set_mode(0o700);
+    std::fs::set_permissions(&dir, dir_perms).map_err(|e| format!("chmod sudo prompt dir: {e}"))?;
+
+    for _ in 0..16 {
+        let path = dir.join(format!("password-{}.fifo", sudo_secret_random_suffix()?));
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| "sudo password pipe path contains NUL".to_string())?;
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if rc == 0 {
+            let mut perms = std::fs::metadata(&path)
+                .map_err(|e| format!("metadata sudo password pipe: {e}"))?
+                .permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms)
+                .map_err(|e| format!("chmod sudo password pipe: {e}"))?;
+            return Ok(path);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            continue;
+        }
+        return Err(format!("create sudo password pipe: {err}"));
+    }
+    Err("create sudo password pipe: exhausted unique names".to_string())
+}
+
+#[cfg(not(unix))]
+fn create_sudo_password_fifo(
+    _root: &Path,
+    _session_id: &str,
+) -> std::result::Result<PathBuf, String> {
+    Err("local sudo password prompts are only supported on Unix".to_string())
+}
+
+struct SudoPasswordPipeRuntime {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+fn start_sudo_password_pipe_writer(path: PathBuf, password: String) -> SudoPasswordPipeRuntime {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread_path = path.clone();
+    let handle = std::thread::spawn(move || {
+        let mut password = password;
+        while !thread_stop.load(Ordering::SeqCst) {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&thread_path)
+            {
+                Ok(mut fifo) => {
+                    let _ = fifo.write_all(password.as_bytes());
+                    let _ = fifo.write_all(b"\n");
+                    let _ = fifo.flush();
+                    break;
+                }
+                Err(err)
+                    if matches!(err.raw_os_error(), Some(code) if code == libc::ENXIO)
+                        || err.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+        clear_secret_string(&mut password);
+    });
+    SudoPasswordPipeRuntime {
+        stop,
+        handle: Some(handle),
+        path,
+    }
+}
+
+#[cfg(not(unix))]
+fn start_sudo_password_pipe_writer(path: PathBuf, _password: String) -> SudoPasswordPipeRuntime {
+    SudoPasswordPipeRuntime {
+        stop: Arc::new(AtomicBool::new(true)),
+        handle: None,
+        path,
+    }
+}
+
+impl Drop for SudoPasswordPipeRuntime {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn sudo_wrapper_prefix(_auth: &LocalSudoAuth) -> String {
+    "sudo() { command sudo -n \"$@\"; }\n".to_string()
+}
+
+async fn preauthenticate_local_sudo(
+    root: &Path,
+    auth: &mut LocalSudoAuth,
+    interrupt: Arc<AtomicBool>,
+    timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
+    if !auth.preauth_required {
+        return Ok(());
+    }
+    let askpass = auth
+        .askpass
+        .as_ref()
+        .ok_or_else(|| "sudo auth prompt unavailable".to_string())?
+        .clone();
+    let _sudo_password_pipe = match (auth.password_fifo.clone(), auth.password.take()) {
+        (Some(fifo), Some(password)) => Some(start_sudo_password_pipe_writer(fifo, password)),
+        _ => None,
+    };
+    let mut command = tokio::process::Command::new("sudo");
+    command
+        .arg("-A")
+        .arg("-v")
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("SUDO_ASKPASS", &askpass)
+        .env(SUDO_ASKPASS_ENV, &askpass)
+        .env(
+            "SUDO_PROMPT",
+            "[dext local sudo] password for %u to run %p: ",
+        )
+        .kill_on_drop(true);
+    if let Some(fifo) = auth.password_fifo.as_ref() {
+        command.env(SUDO_PASSWORD_FIFO_ENV, fifo);
+    }
+    configure_tokio_process_group(&mut command);
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("spawn sudo auth failed: {e}"))?;
+    let child_pid = child.id();
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let out_task = tokio::spawn(collect_async_limited(stdout, PROCESS_STREAM_CAPTURE_CAP));
+    let err_task = tokio::spawn(collect_async_limited(stderr, PROCESS_STREAM_CAPTURE_CAP));
+    let deadline = tokio::time::Instant::now() + timeout;
+    let status = loop {
+        let outcome: ProcWaitOutcome = tokio::select! {
+            biased;
+            res = child.wait() => ProcWaitOutcome::Exited(res),
+            _ = tokio::time::sleep_until(deadline) => ProcWaitOutcome::Timeout,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                if interrupt.load(Ordering::SeqCst) {
+                    ProcWaitOutcome::Interrupt
+                } else {
+                    continue;
+                }
+            }
+        };
+        match outcome {
+            ProcWaitOutcome::Exited(Ok(s)) => {
+                if let Some(pid) = child_pid {
+                    terminate_process_group_after_exit(pid);
+                }
+                break s;
+            }
+            ProcWaitOutcome::Exited(Err(e)) => return Err(format!("sudo auth wait failed: {e}")),
+            ProcWaitOutcome::Interrupt => {
+                terminate_tokio_child(&mut child).await;
+                let _ = out_task.await;
+                let _ = err_task.await;
+                return Err("sudo authentication interrupted".to_string());
+            }
+            ProcWaitOutcome::Timeout => {
+                terminate_tokio_child(&mut child).await;
+                let _ = out_task.await;
+                let err = err_task.await.unwrap_or_default();
+                return Err(format!(
+                    "sudo authentication timed out after {}s{}",
+                    timeout.as_secs(),
+                    render_sudo_auth_stderr_hint(&err.render("stderr"))
+                ));
+            }
+        }
+    };
+    let _ = out_task.await;
+    let err = err_task.await.unwrap_or_default();
+    auth.password_fifo = None;
+    auth.preauth_required = false;
+    let code = status.code().unwrap_or(-1);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "sudo authentication failed (exit {code}){}",
+            render_sudo_auth_stderr_hint(&err.render("stderr"))
+        ))
+    }
+}
+
+fn render_sudo_auth_stderr_hint(stderr: &str) -> String {
+    let text = stderr.trim();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ": {}",
+            cap_chars(&text.replace('\r', "␍").replace('\n', " "), 240)
+        )
+    }
+}
+
 async fn execute_bash_async_with_timeout(
     cmd: &str,
     root: &Path,
@@ -7052,8 +7404,14 @@ async fn execute_bash_async_prepared(
     local_sudo_auth: Option<LocalSudoAuth>,
     sandbox_profile: SandboxProfile,
 ) -> std::result::Result<String, String> {
-    let bash_cmd = if local_sudo_auth.is_some() {
-        format!("sudo() {{ command sudo -A \"$@\"; }}\n{cmd}")
+    let mut local_sudo_auth = local_sudo_auth;
+    let _sudo_password_pipe = local_sudo_auth.as_mut().and_then(|auth| {
+        let fifo = auth.password_fifo.clone()?;
+        let password = auth.password.take()?;
+        Some(start_sudo_password_pipe_writer(fifo, password))
+    });
+    let bash_cmd = if let Some(auth) = local_sudo_auth.as_ref() {
+        format!("{}{cmd}", sudo_wrapper_prefix(auth))
     } else {
         cmd.to_string()
     };
@@ -7073,14 +7431,11 @@ async fn execute_bash_async_prepared(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    if let Some(auth) = local_sudo_auth.as_ref() {
+    if local_sudo_auth.is_some() {
         command
-            .env("SUDO_ASKPASS", &auth.askpass)
-            .env(
-                "SUDO_PROMPT",
-                "[dext local sudo] password for %u to run %p: ",
-            )
-            .env(SUDO_ASKPASS_ENV, &auth.askpass);
+            .env_remove("SUDO_ASKPASS")
+            .env_remove(SUDO_ASKPASS_ENV)
+            .env_remove(SUDO_PASSWORD_FIFO_ENV);
     }
     configure_tokio_process_group(&mut command);
     let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
@@ -7368,6 +7723,12 @@ enum Choice {
     Once,
     Always,
     Deny,
+}
+
+pub(crate) enum LocalAuthSecret {
+    Secret(String),
+    Canceled,
+    Unavailable,
 }
 
 fn cap_chars(s: &str, max_chars: usize) -> String {
@@ -7963,7 +8324,10 @@ fn pack_auto_invocation_disabled_by_env(pack: &packs::PackInfo) -> bool {
         .collect();
     // Glob tokens disable all packs. Check before normalization since
     // normalize_pack_disable_token strips non-alphanumeric chars like '*'.
-    if tokens.iter().any(|t| matches!(*t, "*" | "all" | "true" | "1")) {
+    if tokens
+        .iter()
+        .any(|t| matches!(*t, "*" | "all" | "true" | "1"))
+    {
         return true;
     }
     let name = normalize_pack_disable_token(&pack.name);
@@ -8973,12 +9337,10 @@ fn render_compaction_evidence(
     health: &ProviderHealthLedger,
 ) -> String {
     let mut out = String::new();
-    if !ledger.objective.trim().is_empty()
-        || !ledger.files_changed.is_empty()
-        || !ledger.verification.is_empty()
-    {
+    let ledger_text = render_work_ledger_prompt(ledger);
+    if !ledger_text.trim().is_empty() {
         out.push_str("[ledger:active]\n");
-        out.push_str(&render_work_ledger_prompt(ledger));
+        out.push_str(&ledger_text);
     }
     let health_text = render_provider_health_prompt(health);
     if !health_text.trim().is_empty() {
@@ -11444,44 +11806,46 @@ impl Agent {
             }
             ApiProvider::Anthropic => {
                 let max_tokens = max_output_tokens();
-                let (thinking, output_config) =
-                    if let Some(effort) = provider_model_output_config_effort(
+                let (thinking, output_config) = if let Some(effort) =
+                    provider_model_output_config_effort(
                         &self.provider_id,
                         &self.model,
                         self.thinking_effort,
                     ) {
-                        (
-                            Some(AnthropicThinking {
+                    (
+                        Some(AnthropicThinking {
+                            kind: "enabled",
+                            budget_tokens: None,
+                            display: None,
+                        }),
+                        Some(AnthropicOutputConfig { effort }),
+                    )
+                } else if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
+                    let effort = anthropic_output_config_effort(&self.model, self.thinking_effort);
+                    let always_adaptive = anthropic_model_is_always_adaptive(&self.model);
+                    let thinking = effort.as_ref().map(|_| AnthropicThinking {
+                        kind: "adaptive",
+                        budget_tokens: None,
+                        display: always_adaptive.then_some("omitted"),
+                    });
+                    (
+                        thinking,
+                        effort.map(|effort| AnthropicOutputConfig { effort }),
+                    )
+                } else {
+                    (
+                        anthropic_thinking_budget_tokens(self.thinking_effort)
+                            .and_then(|budget_tokens| {
+                                clamp_thinking_budget_below_max(budget_tokens, max_tokens)
+                            })
+                            .map(|budget_tokens| AnthropicThinking {
                                 kind: "enabled",
-                                budget_tokens: None,
+                                budget_tokens: Some(budget_tokens),
                                 display: None,
                             }),
-                            Some(AnthropicOutputConfig { effort }),
-                        )
-                    } else if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
-                        let effort =
-                            anthropic_output_config_effort(&self.model, self.thinking_effort);
-                        let always_adaptive = anthropic_model_is_always_adaptive(&self.model);
-                        let thinking = effort.as_ref().map(|_| AnthropicThinking {
-                            kind: "adaptive",
-                            budget_tokens: None,
-                            display: always_adaptive.then_some("omitted"),
-                        });
-                        (thinking, effort.map(|effort| AnthropicOutputConfig { effort }))
-                    } else {
-                        (
-                            anthropic_thinking_budget_tokens(self.thinking_effort)
-                                .and_then(|budget_tokens| {
-                                    clamp_thinking_budget_below_max(budget_tokens, max_tokens)
-                                })
-                                .map(|budget_tokens| AnthropicThinking {
-                                    kind: "enabled",
-                                    budget_tokens: Some(budget_tokens),
-                                    display: None,
-                                }),
-                            None,
-                        )
-                    };
+                        None,
+                    )
+                };
                 let history = self.provider_context_history();
                 let messages = sanitize_anthropic_messages(history, thinking.is_some());
                 let prompt_cache_enabled =
@@ -12135,89 +12499,89 @@ impl Agent {
             ChatGptSse,
         }
 
-        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) =
-            if self.api_provider == ApiProvider::ChatGpt {
-                let body =
-                    build_chatgpt_summary_request(&summary_model, COMPACT_SYSTEM, &user_text);
-                let url = provider_request_url(&self.base_url, self.api_provider);
-                let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
-                let req = apply_provider_headers(
-                    self.http_client()
-                        .post(&url)
-                        .header("content-type", "application/json")
-                        .header("accept", "text/event-stream")
-                        .body(bytes),
-                    self.api_provider,
-                    &self.api_key,
-                    None,
-                )?;
-                (req.send().await?, SummaryParse::ChatGptSse)
-            } else if self.api_provider == ApiProvider::OpenAi {
-                let reasoning_effort = openai_reasoning_effort(self.thinking_effort);
-                let messages = vec![
-                    OaiMessage {
-                        role: "system".to_string(),
-                        content: Some(COMPACT_SYSTEM.to_string()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                    OaiMessage {
-                        role: "user".to_string(),
-                        content: Some(user_text.clone()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                ];
-                let body = OaiRequest {
-                    model: &summary_model,
-                    max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
-                    messages,
-                    tools: Vec::new(),
-                    stream: false,
-                    stream_options: None,
-                    reasoning_effort,
-                    grammar: None,
-                };
-                let mut req = self
-                    .http_client()
-                    .post(provider_request_url(&self.base_url, self.api_provider))
+        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if self.api_provider
+            == ApiProvider::ChatGpt
+        {
+            let body = build_chatgpt_summary_request(&summary_model, COMPACT_SYSTEM, &user_text);
+            let url = provider_request_url(&self.base_url, self.api_provider);
+            let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
+            let req = apply_provider_headers(
+                self.http_client()
+                    .post(&url)
                     .header("content-type", "application/json")
-                    .json(&body);
-                if !self.api_key.trim().is_empty() {
-                    req = req.header("authorization", format!("Bearer {}", self.api_key));
-                }
-                (req.send().await?, SummaryParse::OpenAi)
-            } else {
-                let messages = vec![json!({
-                    "role": "user",
-                    "content": [{"type": "text", "text": user_text.clone()}],
-                })];
-                let sys_blocks = [SystemBlock {
-                    kind: "text",
-                    text: COMPACT_SYSTEM,
-                    cache_control: None,
-                }];
-                let body = Request {
-                    model: &summary_model,
-                    max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
-                    system: &sys_blocks,
-                    messages: &messages,
-                    tools: &[],
-                    stream: false,
-                    thinking: None,
-                    output_config: None,
-                };
-                let mut req = self
-                    .http_client()
-                    .post(provider_request_url(&self.base_url, self.api_provider))
-                    .header("anthropic-version", ANTHROPIC_API_VERSION)
-                    .header("content-type", "application/json")
-                    .json(&body);
-                if !self.api_key.trim().is_empty() {
-                    req = req.header("x-api-key", &self.api_key);
-                }
-                (req.send().await?, SummaryParse::Anthropic)
+                    .header("accept", "text/event-stream")
+                    .body(bytes),
+                self.api_provider,
+                &self.api_key,
+                None,
+            )?;
+            (req.send().await?, SummaryParse::ChatGptSse)
+        } else if self.api_provider == ApiProvider::OpenAi {
+            let reasoning_effort = openai_reasoning_effort(self.thinking_effort);
+            let messages = vec![
+                OaiMessage {
+                    role: "system".to_string(),
+                    content: Some(COMPACT_SYSTEM.to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                OaiMessage {
+                    role: "user".to_string(),
+                    content: Some(user_text.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ];
+            let body = OaiRequest {
+                model: &summary_model,
+                max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
+                messages,
+                tools: Vec::new(),
+                stream: false,
+                stream_options: None,
+                reasoning_effort,
+                grammar: None,
             };
+            let mut req = self
+                .http_client()
+                .post(provider_request_url(&self.base_url, self.api_provider))
+                .header("content-type", "application/json")
+                .json(&body);
+            if !self.api_key.trim().is_empty() {
+                req = req.header("authorization", format!("Bearer {}", self.api_key));
+            }
+            (req.send().await?, SummaryParse::OpenAi)
+        } else {
+            let messages = vec![json!({
+                "role": "user",
+                "content": [{"type": "text", "text": user_text.clone()}],
+            })];
+            let sys_blocks = [SystemBlock {
+                kind: "text",
+                text: COMPACT_SYSTEM,
+                cache_control: None,
+            }];
+            let body = Request {
+                model: &summary_model,
+                max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
+                system: &sys_blocks,
+                messages: &messages,
+                tools: &[],
+                stream: false,
+                thinking: None,
+                output_config: None,
+            };
+            let mut req = self
+                .http_client()
+                .post(provider_request_url(&self.base_url, self.api_provider))
+                .header("anthropic-version", ANTHROPIC_API_VERSION)
+                .header("content-type", "application/json")
+                .json(&body);
+            if !self.api_key.trim().is_empty() {
+                req = req.header("x-api-key", &self.api_key);
+            }
+            (req.send().await?, SummaryParse::Anthropic)
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -12514,9 +12878,7 @@ impl Agent {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        Block::Text { text } | Block::PartialStream { text } => {
-                            Some(text.as_str())
-                        }
+                        Block::Text { text } | Block::PartialStream { text } => Some(text.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -12751,8 +13113,7 @@ impl Agent {
                         && extended_prompt_cache_ttl().is_some()
                         && anthropic_prompt_cache_supported(&self.provider_id, &self.model)
                     {
-                        builder =
-                            builder.header("anthropic-beta", "extended-cache-ttl-2025-04-11");
+                        builder = builder.header("anthropic-beta", "extended-cache-ttl-2025-04-11");
                     }
                     let req = apply_provider_headers(
                         builder.body(req_body.clone()),
@@ -13570,7 +13931,7 @@ impl Agent {
                     });
                     self.append_latest_log("tool_start", &summary);
                     builtin_started_at.insert(idx, std::time::Instant::now());
-                    let local_sudo_auth = if local_sudo_auth_needed {
+                    let mut local_sudo_auth = if local_sudo_auth_needed {
                         match prepare_local_sudo_auth(&root, &session_id).await {
                             Ok(auth) => auth,
                             Err(e) => {
@@ -13581,8 +13942,47 @@ impl Agent {
                     } else {
                         None
                     };
-                    if local_sudo_auth.is_some() {
-                        self.sink.local_auth_prompt("bash", SUDO_AUTH_GUIDANCE);
+                    if let Some(auth) = local_sudo_auth.as_mut()
+                        && auth.preauth_required
+                    {
+                        let message = SUDO_AUTH_GUIDANCE.to_string();
+                        match self.sink.request_local_auth_secret("bash", &message) {
+                            LocalAuthSecret::Secret(password) => {
+                                match create_sudo_password_fifo(&root, &session_id) {
+                                    Ok(fifo) => {
+                                        auth.password_fifo = Some(fifo);
+                                        auth.password = Some(password);
+                                    }
+                                    Err(e) => {
+                                        let mut password = password;
+                                        clear_secret_string(&mut password);
+                                        builtin_outputs.insert(idx, Err(e));
+                                        continue;
+                                    }
+                                }
+                            }
+                            LocalAuthSecret::Canceled => {
+                                builtin_outputs.insert(
+                                    idx,
+                                    Err("sudo authentication canceled by user".to_string()),
+                                );
+                                continue;
+                            }
+                            LocalAuthSecret::Unavailable => {
+                                self.sink.local_auth_prompt("bash", SUDO_AUTH_GUIDANCE);
+                            }
+                        }
+                        if let Err(e) = preauthenticate_local_sudo(
+                            &root,
+                            auth,
+                            self.interrupt.clone(),
+                            std::time::Duration::from_secs(120),
+                        )
+                        .await
+                        {
+                            builtin_outputs.insert(idx, Err(e));
+                            continue;
+                        }
                     }
                     let r = execute_builtin_call(
                         n,
@@ -14629,7 +15029,6 @@ impl Agent {
         }
         Ok((blocks, finish_reason, usage))
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14818,12 +15217,22 @@ fn render_session_listing(root: &Path) -> String {
         + autosaved_sessions.len()
         + named_records.as_ref().map(|r| r.len()).unwrap_or(0);
     let mut out = String::new();
-    let _ = write!(out, "{}", list_render::render_header("Sessions", total, &opts));
+    let _ = write!(
+        out,
+        "{}",
+        list_render::render_header("Sessions", total, &opts)
+    );
 
     let _ = writeln!(out, "{}", list_render::bold("Latest", opts.color));
     if latest_exists {
         let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
-        out.push_str(&render_session_entry(&latest_path, "latest", modified, &opts, root));
+        out.push_str(&render_session_entry(
+            &latest_path,
+            "latest",
+            modified,
+            &opts,
+            root,
+        ));
     } else {
         let _ = writeln!(
             out,
@@ -15649,7 +16058,7 @@ fn parse_work_map_filter_args(args: &[String]) -> Result<(String, Vec<WorkMapFil
 }
 
 fn work_map_filter_matches(
-    map: &WorkMap,
+    _map: &WorkMap,
     waypoint: &WorkMapWaypoint,
     filters: &[WorkMapFilter],
 ) -> bool {
@@ -15690,12 +16099,6 @@ fn work_map_filter_matches(
                     .commands
                     .iter()
                     .any(|cmd| cmd.to_ascii_lowercase().contains(&needle))
-                || map
-                    .header
-                    .work_ledger
-                    .objective
-                    .to_ascii_lowercase()
-                    .contains(&needle)
         }
     })
 }
@@ -17032,7 +17435,7 @@ fn render_session_brief(
     }
 
     out.push_str(
-        "\n## Continue\nDistilled continuation packet, not the full transcript. Resume the live session with `dext --resume`, inspect detail with `dext session analyze`, or hand this brief to another agent to pick up the pending/next-action items above.\n",
+        "\n## Continue\nDistilled continuation packet, not the full transcript. Resume the live session with `dext --resume`, inspect detail with `dext session analyze`, or hand this brief to another agent to continue from the work ledger, recent failures, and verification facts above.\n",
     );
     out
 }

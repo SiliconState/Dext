@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::list_render;
 use crate::session::{canonicalize_or_clone, dext_state_dir};
 use crate::{byte_prefix_at_char_boundary, cap_bytes_with_hint};
-use crate::list_render;
 
 const PACK_PROMPT_CAP: usize = 32_000;
 const PACK_LIST_LIMIT: usize = 50;
@@ -321,7 +321,11 @@ pub(crate) fn render_pack_listing(root: &Path) -> String {
 }
 
 pub(crate) fn render_pack_listing_opts(root: &Path, verbose: bool) -> String {
-    render_pack_list(&discover_packs(root), &list_render::ListOptions::detect(verbose), root)
+    render_pack_list(
+        &discover_packs(root),
+        &list_render::ListOptions::detect(verbose),
+        root,
+    )
 }
 
 /// Pure list renderer over discovered packs. Discovery/loading stays unchanged.
@@ -335,7 +339,11 @@ pub(crate) fn render_pack_list(
         return "Packs  none found\nsearch paths: .dext/shelves/*/packs, .dext/packs, packs, DEXT_SHELVES_DIR, DEXT_PACKS_DIR, ~/.dext/shelves/*/packs, ~/.dext/packs, bundled packs".to_string();
     }
     let mut out = String::new();
-    let _ = write!(out, "{}", list_render::render_header("Packs", packs.len(), opts));
+    let _ = write!(
+        out,
+        "{}",
+        list_render::render_header("Packs", packs.len(), opts)
+    );
     for pack in packs.iter().take(PACK_LIST_LIMIT) {
         let shelf = pack.shelf.clone().unwrap_or_else(|| "none".to_string());
         let mut meta: Vec<(&str, String)> = vec![
