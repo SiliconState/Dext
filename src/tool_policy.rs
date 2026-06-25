@@ -734,6 +734,12 @@ fn shell_words(command: &str) -> Vec<String> {
         match ch {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
+            '\n' if !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+                words.push(";".to_string());
+            }
             c if c.is_whitespace() && !in_single && !in_double => {
                 if !current.is_empty() {
                     words.push(std::mem::take(&mut current));
@@ -1360,6 +1366,12 @@ mod tests {
             "echo sudo && sudo apt update"
         ));
         assert!(command_requests_sudo_password("/usr/bin/sudo apt update"));
+        assert!(command_requests_sudo_password(
+            "set -euo pipefail\nsudo apt update"
+        ));
+        assert!(command_requests_sudo_password(
+            "set -euo pipefail\nsudo -n true\nsudo apt update"
+        ));
         assert!(command_requests_sudo_password(
             "env FOO=bar sudo apt update"
         ));
