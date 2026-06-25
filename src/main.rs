@@ -1963,7 +1963,6 @@ fn read_local_auth_secret_from_tty(_message: &str) -> Option<String> {
     None
 }
 
-#[cfg(unix)]
 fn shell_single_quote(raw: &str) -> String {
     if raw.is_empty() {
         return "''".to_string();
@@ -7021,6 +7020,8 @@ fn execute_tool_with_cache(
 
 struct LocalSudoAuth {
     askpass: Option<PathBuf>,
+    sudo_path: PathBuf,
+    sudo_shim_dir: PathBuf,
     password_fifo: Option<PathBuf>,
     password: Option<String>,
     preauth_required: bool,
@@ -7030,13 +7031,12 @@ async fn prepare_local_sudo_auth(
     root: &Path,
     session_id: &str,
 ) -> std::result::Result<Option<LocalSudoAuth>, String> {
-    if std::env::var_os(SUDO_ASKPASS_ENV).is_some() {
+    let Some(sudo_path) = find_binary_on_path("sudo") else {
         return Ok(None);
-    }
-    if find_binary_on_path("sudo").is_none() {
-        return Ok(None);
-    }
-    let mut probe = tokio::process::Command::new("sudo");
+    };
+    let sudo_path = std::fs::canonicalize(&sudo_path).unwrap_or(sudo_path);
+    let sudo_shim_dir = write_sudo_command_shim(root, session_id, &sudo_path)?;
+    let mut probe = tokio::process::Command::new(&sudo_path);
     probe
         .arg("-n")
         .arg("-v")
@@ -7054,6 +7054,8 @@ async fn prepare_local_sudo_auth(
     if cached {
         return Ok(Some(LocalSudoAuth {
             askpass: None,
+            sudo_path,
+            sudo_shim_dir,
             password_fifo: None,
             password: None,
             preauth_required: false,
@@ -7062,6 +7064,8 @@ async fn prepare_local_sudo_auth(
     let askpass = write_sudo_askpass_script(root, session_id)?;
     Ok(Some(LocalSudoAuth {
         askpass: Some(askpass),
+        sudo_path,
+        sudo_shim_dir,
         password_fifo: None,
         password: None,
         preauth_required: true,
@@ -7149,6 +7153,48 @@ fn write_sudo_askpass_script(
     _session_id: &str,
 ) -> std::result::Result<PathBuf, String> {
     Err("local sudo prompts are only supported on Unix".to_string())
+}
+
+#[cfg(unix)]
+fn write_sudo_command_shim(
+    root: &Path,
+    session_id: &str,
+    sudo_path: &Path,
+) -> std::result::Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sudo_dir = session_sudo_dir(root, session_id);
+    let bin_dir = sudo_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).map_err(|e| format!("prepare sudo command shim dir: {e}"))?;
+    for dir in [&sudo_dir, &bin_dir] {
+        let mut perms = std::fs::metadata(dir)
+            .map_err(|e| format!("metadata sudo command shim dir: {e}"))?
+            .permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir, perms)
+            .map_err(|e| format!("chmod sudo command shim dir: {e}"))?;
+    }
+
+    let path = bin_dir.join("sudo");
+    let real_sudo = shell_single_quote(&sudo_path.display().to_string());
+    let content = format!("#!/bin/sh\nexec {real_sudo} -n \"$@\"\n");
+    atomic_write_bytes(&path, content.as_bytes())
+        .map_err(|e| format!("write sudo command shim: {e}"))?;
+    let mut perms = std::fs::metadata(&path)
+        .map_err(|e| format!("metadata sudo command shim: {e}"))?
+        .permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&path, perms).map_err(|e| format!("chmod sudo command shim: {e}"))?;
+    Ok(bin_dir)
+}
+
+#[cfg(not(unix))]
+fn write_sudo_command_shim(
+    _root: &Path,
+    _session_id: &str,
+    _sudo_path: &Path,
+) -> std::result::Result<PathBuf, String> {
+    Err("local sudo command shims are only supported on Unix".to_string())
 }
 
 #[cfg(unix)]
@@ -7270,8 +7316,35 @@ impl Drop for SudoPasswordPipeRuntime {
     }
 }
 
-fn sudo_wrapper_prefix(_auth: &LocalSudoAuth) -> String {
-    "sudo() { command sudo -n \"$@\"; }\n".to_string()
+fn sudo_wrapper_prefix(auth: &LocalSudoAuth) -> String {
+    let real_sudo = shell_single_quote(&auth.sudo_path.display().to_string());
+    let mut prefix = format!("sudo() {{ builtin command {real_sudo} -n \"$@\"; }}\n");
+    let mut seen = HashSet::new();
+    for path in std::iter::once(auth.sudo_path.display().to_string()).chain(
+        sudo_wrapper_command_paths()
+            .iter()
+            .map(|path| path.to_string()),
+    ) {
+        if !seen.insert(path.clone()) || !sudo_shell_function_name_is_safe(&path) {
+            continue;
+        }
+        prefix.push_str(&format!(
+            "function {path} {{ builtin command {} -n \"$@\"; }}\n",
+            shell_single_quote(&path)
+        ));
+    }
+    prefix
+}
+
+fn sudo_wrapper_command_paths() -> &'static [&'static str] {
+    &["/usr/bin/sudo", "/bin/sudo"]
+}
+
+fn sudo_shell_function_name_is_safe(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
 }
 
 async fn preauthenticate_local_sudo(
@@ -7292,7 +7365,7 @@ async fn preauthenticate_local_sudo(
         (Some(fifo), Some(password)) => Some(start_sudo_password_pipe_writer(fifo, password)),
         _ => None,
     };
-    let mut command = tokio::process::Command::new("sudo");
+    let mut command = tokio::process::Command::new(&auth.sudo_path);
     command
         .arg("-A")
         .arg("-v")
@@ -7431,8 +7504,15 @@ async fn execute_bash_async_prepared(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    if local_sudo_auth.is_some() {
+    if let Some(auth) = local_sudo_auth.as_ref() {
+        let mut paths = vec![auth.sudo_shim_dir.clone()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        let path_env =
+            std::env::join_paths(paths).map_err(|e| format!("prepare sudo PATH: {e}"))?;
         command
+            .env("PATH", path_env)
             .env_remove("SUDO_ASKPASS")
             .env_remove(SUDO_ASKPASS_ENV)
             .env_remove(SUDO_PASSWORD_FIFO_ENV);

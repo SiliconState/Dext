@@ -6254,10 +6254,11 @@ fn queue_local_auth_secret_request(
     message: String,
     responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
 ) {
-    if let Some(pending) = state.pending_local_auth.take() {
+    let previous = state.pending_local_auth.take();
+    clear_secret_string(&mut state.local_auth_input);
+    if let Some(pending) = previous {
         let _ = pending.responder.send(LocalAuthSecret::Canceled);
     }
-    clear_secret_string(&mut state.local_auth_input);
     state.status = format!("local auth for {tool}");
     state.push_debug_event(format!("local auth secret prompt · {tool}"));
     state.pending_local_auth = Some(PendingLocalAuth {
@@ -7025,6 +7026,7 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
         state.queue(Line_::Warn(
             "paste withheld: do not enter sudo passwords or local auth secrets in chat; use the local auth prompt".to_string(),
         ));
+        clear_secret_string(&mut pasted);
         state.status = "local secret paste withheld".to_string();
         return;
     }
@@ -7241,8 +7243,17 @@ fn submit_local_auth_secret(state: &mut TuiState) {
         return;
     }
     let secret = std::mem::take(&mut state.local_auth_input);
-    let _ = pending.responder.send(LocalAuthSecret::Secret(secret));
-    state.status = format!("local auth submitted for {}", pending.tool);
+    match pending.responder.send(LocalAuthSecret::Secret(secret)) {
+        Ok(()) => {
+            state.status = format!("local auth submitted for {}", pending.tool);
+        }
+        Err(err) => {
+            if let LocalAuthSecret::Secret(mut unsent) = err.0 {
+                clear_secret_string(&mut unsent);
+            }
+            state.status = format!("local auth unavailable for {}", pending.tool);
+        }
+    }
 }
 
 fn cancel_local_auth_secret(state: &mut TuiState) {
@@ -8040,6 +8051,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     }
 
     interrupt.store(true, Ordering::SeqCst);
+    cancel_local_auth_secret(&mut state);
 
     // Shut down channels in the right order to avoid deadlock:
     // 1. Drop in_tx so the bridge's in_rx.recv() returns None
@@ -10579,6 +10591,104 @@ mod tests {
             state.pending_insert.as_slice(),
             [Line_::Warn(s)] if s.contains("paste withheld")
         ));
+    }
+
+    #[test]
+    fn local_auth_submit_sends_secret_only_to_responder() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        queue_local_auth_secret_request(
+            &mut state,
+            "bash".to_string(),
+            "sudo auth".to_string(),
+            tx,
+        );
+        state.local_auth_input = "hunter2".to_string();
+
+        submit_local_auth_secret(&mut state);
+
+        match rx.try_recv().expect("local auth response") {
+            LocalAuthSecret::Secret(secret) => assert_eq!(secret, "hunter2"),
+            LocalAuthSecret::Canceled | LocalAuthSecret::Unavailable => {
+                panic!("expected submitted secret")
+            }
+        }
+        assert!(state.local_auth_input.is_empty());
+        assert!(state.pending_local_auth.is_none());
+        assert!(state.input.is_empty());
+        assert_eq!(state.status, "local auth submitted for bash");
+    }
+
+    #[test]
+    fn local_auth_replacement_cancels_previous_and_clears_input() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_tx, _second_rx) = std::sync::mpsc::sync_channel(1);
+        queue_local_auth_secret_request(
+            &mut state,
+            "bash".to_string(),
+            "first".to_string(),
+            first_tx,
+        );
+        state.local_auth_input = "typed-secret".to_string();
+
+        queue_local_auth_secret_request(
+            &mut state,
+            "bash".to_string(),
+            "second".to_string(),
+            second_tx,
+        );
+
+        assert!(matches!(
+            first_rx.try_recv().expect("first prompt canceled"),
+            LocalAuthSecret::Canceled
+        ));
+        assert!(state.local_auth_input.is_empty());
+        assert_eq!(
+            state
+                .pending_local_auth
+                .as_ref()
+                .map(|pending| pending.message.as_str()),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn local_auth_submit_failure_clears_input_and_unblocks_overlay() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(rx);
+        queue_local_auth_secret_request(
+            &mut state,
+            "bash".to_string(),
+            "sudo auth".to_string(),
+            tx,
+        );
+        state.local_auth_input = "hunter2".to_string();
+
+        submit_local_auth_secret(&mut state);
+
+        assert!(state.local_auth_input.is_empty());
+        assert!(state.pending_local_auth.is_none());
+        assert_eq!(state.status, "local auth unavailable for bash");
     }
 
     #[test]

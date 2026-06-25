@@ -714,18 +714,64 @@ fn clear_secret_string_zeroes_then_empties() {
 fn sudo_wrapper_prefix_uses_noninteractive_and_no_askpass_env() {
     let auth = LocalSudoAuth {
         askpass: Some(PathBuf::from("/nonexistent/askpass.sh")),
+        sudo_path: PathBuf::from("/usr/bin/sudo"),
+        sudo_shim_dir: PathBuf::from("/tmp/dext-sudo/bin"),
         password_fifo: None,
         password: None,
         preauth_required: false,
     };
     let prefix = sudo_wrapper_prefix(&auth);
-    assert!(prefix.contains("sudo -n"), "{prefix}");
+    assert!(prefix.contains("-n \"$@\""), "{prefix}");
+    assert!(prefix.contains("sudo()"), "{prefix}");
+    assert!(prefix.contains("function /usr/bin/sudo"), "{prefix}");
     // After pre-auth, the wrapper must NOT export askpass env vars into the
     // bash child (pre-auth already established the sudo timestamp; leaking
     // askpass would risk re-prompting via the script's fallback paths).
     assert!(!prefix.contains("SUDO_ASKPASS"), "{prefix}");
     assert!(!prefix.contains("DEXT_SUDO_ASKPASS"), "{prefix}");
     assert!(!prefix.contains("DEXT_SUDO_PASSWORD_FIFO"), "{prefix}");
+    assert!(sudo_shell_function_name_is_safe("/usr/bin/sudo"));
+    assert!(!sudo_shell_function_name_is_safe("/tmp/sudo;evil"));
+}
+
+#[cfg(unix)]
+#[test]
+fn sudo_command_shim_invokes_real_sudo_noninteractive_and_is_private() {
+    let root = temp_test_dir("sudo-command-shim");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let real_sudo = root.join("real-sudo");
+    std::fs::write(&real_sudo, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("write fake sudo");
+    use std::os::unix::fs::PermissionsExt;
+    let mut real_perms = std::fs::metadata(&real_sudo)
+        .expect("stat fake sudo")
+        .permissions();
+    real_perms.set_mode(0o700);
+    std::fs::set_permissions(&real_sudo, real_perms).expect("chmod fake sudo");
+
+    let bin_dir = write_sudo_command_shim(&root, "test-session", &real_sudo).expect("write shim");
+    let shim = bin_dir.join("sudo");
+    let output = Command::new(&shim).arg("true").output().expect("run shim");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "-n\ntrue\n");
+    assert_eq!(
+        std::fs::metadata(&bin_dir)
+            .expect("stat shim dir")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&shim)
+            .expect("stat shim")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let content = std::fs::read_to_string(&shim).expect("read shim");
+    assert!(content.contains(" -n \"$@\""), "{content}");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

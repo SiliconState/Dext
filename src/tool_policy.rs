@@ -159,22 +159,20 @@ pub(crate) fn command_requests_sudo_password(command: &str) -> bool {
             idx += 1;
             continue;
         }
+        if word == "env" {
+            idx += 1;
+            skip_env_command_prefix(&words, &mut idx);
+            if idx >= words.len() {
+                break;
+            }
+            continue;
+        }
         if shell_assignment_word(word) || shell_command_prefix_word(word) {
             idx += 1;
             continue;
         }
-        if word == "sudo" {
-            let has_noninteractive = words[idx..]
-                .iter()
-                .take_while(|arg| !shell_command_separator(arg))
-                .any(|arg| {
-                    arg == "-n"
-                        || arg == "--non-interactive"
-                        || arg.strip_prefix('-').is_some_and(|flags| {
-                            !flags.starts_with('-') && flags.chars().any(|ch| ch == 'n')
-                        })
-                });
-            if !has_noninteractive {
+        if is_sudo_command_word(word) {
+            if !sudo_segment_has_noninteractive_flag(&words[idx + 1..]) {
                 return true;
             }
         }
@@ -184,8 +182,132 @@ pub(crate) fn command_requests_sudo_password(command: &str) -> bool {
     false
 }
 
+fn is_sudo_command_word(word: &str) -> bool {
+    word.rsplit('/').next() == Some("sudo")
+}
+
+fn sudo_segment_has_noninteractive_flag(words_after_sudo: &[String]) -> bool {
+    let mut idx = 0usize;
+    while idx < words_after_sudo.len() {
+        let arg = &words_after_sudo[idx];
+        if shell_command_separator(arg) || arg == "--" {
+            return false;
+        }
+        if arg == "-n" || arg == "--non-interactive" {
+            return true;
+        }
+        if let Some(flags) = arg.strip_prefix('-')
+            && !flags.is_empty()
+            && !flags.starts_with('-')
+        {
+            if sudo_short_flags_have_noninteractive(flags) {
+                return true;
+            }
+            if sudo_short_flags_take_next_arg(flags) {
+                idx += 1;
+            }
+            idx += 1;
+            continue;
+        }
+        if is_sudo_long_option_with_required_arg(arg) {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+fn sudo_short_flags_have_noninteractive(flags: &str) -> bool {
+    for (pos, ch) in flags.char_indices() {
+        if ch == 'n' {
+            return true;
+        }
+        if sudo_short_option_char_takes_arg(ch) {
+            return false;
+        }
+        if pos >= flags.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn sudo_short_flags_take_next_arg(flags: &str) -> bool {
+    flags
+        .chars()
+        .last()
+        .is_some_and(sudo_short_option_char_takes_arg)
+}
+
+fn sudo_short_option_char_takes_arg(ch: char) -> bool {
+    matches!(
+        ch,
+        'a' | 'C' | 'c' | 'D' | 'g' | 'h' | 'p' | 'R' | 'r' | 'T' | 't' | 'U' | 'u'
+    )
+}
+
+fn is_sudo_long_option_with_required_arg(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix("--") else {
+        return false;
+    };
+    let Some(name) = rest.split_once('=').map(|(name, _)| name).or(Some(rest)) else {
+        return false;
+    };
+    matches!(
+        name,
+        "auth-type"
+            | "close-from"
+            | "chdir"
+            | "login-class"
+            | "group"
+            | "host"
+            | "prompt"
+            | "chroot"
+            | "role"
+            | "type"
+            | "other-user"
+            | "user"
+    ) && !arg.contains('=')
+}
+
 fn shell_command_separator(word: &str) -> bool {
     matches!(word, "&&" | ";" | "|" | "&")
+}
+
+fn skip_env_command_prefix(words: &[String], idx: &mut usize) {
+    while *idx < words.len() {
+        let word = &words[*idx];
+        if shell_command_separator(word) {
+            return;
+        }
+        if word == "--" {
+            *idx += 1;
+            break;
+        }
+        if shell_assignment_word(word)
+            || matches!(
+                word.as_str(),
+                "-" | "-i" | "--ignore-environment" | "-0" | "--null"
+            )
+        {
+            *idx += 1;
+            continue;
+        }
+        if matches!(word.as_str(), "-u" | "--unset" | "-C" | "--chdir") {
+            *idx = (*idx).saturating_add(2);
+            continue;
+        }
+        if word.starts_with("--unset=") || word.starts_with("--chdir=") {
+            *idx += 1;
+            continue;
+        }
+        break;
+    }
 }
 
 fn shell_command_prefix_word(word: &str) -> bool {
@@ -1237,9 +1359,25 @@ mod tests {
         assert!(command_requests_sudo_password(
             "echo sudo && sudo apt update"
         ));
+        assert!(command_requests_sudo_password("/usr/bin/sudo apt update"));
+        assert!(command_requests_sudo_password(
+            "env FOO=bar sudo apt update"
+        ));
+        assert!(command_requests_sudo_password("env -- sudo apt update"));
+        assert!(command_requests_sudo_password("sudo -u nobody true"));
+        assert!(command_requests_sudo_password("sudo -unobody true"));
+        assert!(command_requests_sudo_password("sudo -p -n true"));
+        assert!(command_requests_sudo_password("sudo --prompt -n true"));
         assert!(!command_requests_sudo_password("grep sudo README.md"));
         assert!(!command_requests_sudo_password("sudo -n true"));
         assert!(!command_requests_sudo_password("sudo -nv"));
+        assert!(!command_requests_sudo_password("sudo -u nobody -n true"));
+        assert!(!command_requests_sudo_password(
+            "sudo --user=nobody --non-interactive true"
+        ));
+        assert!(!command_requests_sudo_password(
+            "sudo --prompt=Password -n true"
+        ));
         assert!(!command_requests_sudo_password(
             "sudo --non-interactive true"
         ));
