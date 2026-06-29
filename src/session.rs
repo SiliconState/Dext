@@ -484,10 +484,13 @@ fn current_pid() -> u32 {
 
 #[cfg(unix)]
 fn process_is_running(pid: u32) -> bool {
-    if pid == 0 {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
         return false;
     }
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 

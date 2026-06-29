@@ -1425,6 +1425,7 @@ fn slash_login_contains_secret(trimmed: &str) -> bool {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkMapEventKind {
     Map,
+    Packet,
     Focus,
     Tracks,
 }
@@ -17777,17 +17778,23 @@ fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<(
             continue;
         }
         let sessions_dir = path.join("sessions");
-        let has_real_session = walkdir_jsonl_count(&sessions_dir).unwrap_or(0) > 0;
+        let has_real_session = match walkdir_jsonl_count(&sessions_dir) {
+            Ok(count) => count > 0,
+            Err(_) => {
+                kept += 1;
+                continue;
+            }
+        };
         if has_real_session {
             kept += 1;
             continue;
         }
-        let has_live_lock = {
-            let mut locks = Vec::new();
-            let _ = collect_session_lock_paths(&path, &mut locks);
-            locks.iter().any(|lock| session_state_lock_is_live(lock))
-        };
-        if has_live_lock {
+        let mut locks = Vec::new();
+        if collect_session_lock_paths(&path, &mut locks).is_err() {
+            kept += 1;
+            continue;
+        }
+        if locks.iter().any(|lock| session_state_lock_is_live(lock)) {
             kept += 1;
             continue;
         }
@@ -17843,6 +17850,9 @@ fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<(
 }
 
 fn walkdir_jsonl_count(dir: &Path) -> std::io::Result<usize> {
+    if !dir.exists() {
+        return Ok(0);
+    }
     let mut count = 0;
     let stack = vec![dir.to_path_buf()];
     let mut current = stack;
@@ -18076,7 +18086,7 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                                 .and_then(|s| s.to_str())
                                 .unwrap_or("branch");
                             println!(
-                                "Created branch \"{}\" — resume with: dext --resume {}",
+                                "Created branch \"{}\" — resume with: dext --resume={}",
                                 bn, bn
                             );
                             Ok(Some(0))
@@ -19054,13 +19064,13 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }) {
                 Ok((map, selection, selector)) => emit_work_map_event(
                     agent.sink.as_mut(),
-                    WorkMapEventKind::Focus,
+                    WorkMapEventKind::Packet,
                     render_work_map_packet(&map, &selection),
                     work_map_waypoint_ids(&map),
                     work_map_event_selector(selector),
                 ),
                 Err(e) => {
-                    let _ = writeln!(w, "[err] {e:#}\nusage: /focus @wNN [session]");
+                    let _ = writeln!(w, "[err] {e:#}\nusage: /packet @wNN [session]");
                 }
             }
         }
@@ -20205,6 +20215,7 @@ pub(crate) struct CliOptions {
     pub(crate) positional: Vec<String>,
     pub(crate) print: bool,
     pub(crate) resume_latest: bool,
+    pub(crate) resume_selector: Option<String>,
     pub(crate) no_session: bool,
     pub(crate) no_tui: bool,
     pub(crate) trust_mode: bool,
@@ -20228,6 +20239,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut positional = Vec::new();
     let mut print = false;
     let mut resume_latest = false;
+    let mut resume_selector: Option<String> = None;
     let mut no_session = false;
     let mut no_tui = false;
     let mut trust_mode = false;
@@ -20420,6 +20432,13 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .ok_or_else(|| anyhow::anyhow!("--cd requires a directory"))?;
                 cd = Some(PathBuf::from(value));
             }
+            _ if arg.starts_with("--resume=") => {
+                resume_latest = true;
+                let value = arg.trim_start_matches("--resume=").trim();
+                if !value.is_empty() {
+                    resume_selector = Some(value.to_string());
+                }
+            }
             _ if arg.starts_with("--output=") => {
                 let value = arg.trim_start_matches("--output=");
                 output = OutputMode::parse(value).ok_or_else(|| {
@@ -20549,6 +20568,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         positional,
         print,
         resume_latest,
+        resume_selector,
         no_session,
         no_tui,
         trust_mode,
@@ -20737,7 +20757,7 @@ async fn main() -> Result<()> {
         println!("usage: dext [TASK...]        run one-shot with TASK (joined with spaces)");
         println!("       dext -p               read task from stdin, run one-shot");
         println!(
-            "       dext --resume         resume the newest auto-saved session for this project"
+            "       dext --resume[=NAME|PATH]  resume the newest auto-saved session or selector"
         );
         println!("       dext sessions         list latest + autosaved/named sessions");
         println!("       dext session brief [latest|NAME|PATH]  distilled continuation packet");
@@ -20876,7 +20896,12 @@ async fn main() -> Result<()> {
         agent.set_sink(Box::new(JsonSink::new(opts.output, false, false)));
     }
     if opts.resume_latest || opts.fork {
-        match agent.load_latest_session() {
+        let loaded = if let Some(selector) = opts.resume_selector.as_deref() {
+            agent.load_session(selector)
+        } else {
+            agent.load_latest_session()
+        };
+        match loaded {
             Ok(path) => {
                 if let Some(mode) = opts.context_mode {
                     agent.set_context_mode(mode);
@@ -20914,7 +20939,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("[error] failed to resume latest session: {e:#}");
+                eprintln!("[error] failed to resume session: {e:#}");
                 release_registered_locks();
                 std::process::exit(1);
             }

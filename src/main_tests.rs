@@ -6470,6 +6470,23 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
 }
 
 #[test]
+fn parse_cli_options_accepts_resume_selector_equals_form() -> Result<()> {
+    let opts = parse_cli_options(vec![
+        "--resume=branch-w01".to_string(),
+        "tail task".to_string(),
+    ])?;
+
+    assert!(opts.resume_latest);
+    assert_eq!(opts.resume_selector.as_deref(), Some("branch-w01"));
+    assert_eq!(opts.positional, vec!["tail task".to_string()]);
+
+    let opts = parse_cli_options(vec!["--resume".to_string()])?;
+    assert!(opts.resume_latest);
+    assert!(opts.resume_selector.is_none());
+    Ok(())
+}
+
+#[test]
 fn tiny_context_mode_sets_distinct_system_prompt() {
     let root = temp_test_dir("tiny-mode-banner");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");

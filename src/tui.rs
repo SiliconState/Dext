@@ -5898,7 +5898,10 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
 
 fn work_map_line_style(raw: &str, is_selected: bool) -> Style {
     let trimmed = raw.trim_start();
-    let mut style = if trimmed.starts_with("Work map") || trimmed.starts_with("[dext") {
+    let mut style = if trimmed.starts_with("Session map")
+        || trimmed.starts_with("Work map")
+        || trimmed.starts_with("[dext")
+    {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
@@ -5926,6 +5929,7 @@ fn push_work_map_lines(
 ) {
     let title = match kind {
         WorkMapEventKind::Map => "Session map",
+        WorkMapEventKind::Packet => "Packet",
         WorkMapEventKind::Focus => "Focus",
         WorkMapEventKind::Tracks => "Branches",
     };
@@ -9692,19 +9696,23 @@ mod tests {
             ThinkingEffort::Medium,
         );
         state.apply_event(AgentEvent::WorkMap {
-            kind: WorkMapEventKind::Focus,
+            kind: WorkMapEventKind::Packet,
             text: "[dext packet @w01]\nsource: current".to_string(),
             waypoint_ids: vec!["@w01".to_string()],
             selector: None,
         });
 
         assert!(!state.work_map_is_active());
+        assert!(state.active_focus.is_none());
         assert!(matches!(
             state.pending_insert.last(),
             Some(Line_::WorkMap { .. })
         ));
         let lines = flatten_lines(&line_to_text(state.pending_insert.last().unwrap(), 80));
-        assert!(lines.iter().any(|line| line.contains("Focus")), "{lines:?}");
+        assert!(
+            lines.iter().any(|line| line.contains("Packet")),
+            "{lines:?}"
+        );
     }
 
     #[test]
