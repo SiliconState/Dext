@@ -13167,6 +13167,7 @@ impl Agent {
         // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
         // walks, pack discovery) on the first request of the turn.
         self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
+        self.git_context = git_summary(&self.sandbox_root);
         if !self.suppress_pack_activation
             && let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input)
         {
