@@ -19,6 +19,15 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     crate::test_env_lock().lock().expect("env lock")
 }
 
+fn restore_env_var(name: &str, old_value: Option<std::ffi::OsString>) {
+    unsafe {
+        match old_value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
 fn temp_test_dir(label: &str) -> PathBuf {
     let unique = format!(
         "dext-{label}-{}-{}",
@@ -532,6 +541,9 @@ fn injected_steering_is_ledger_visible_and_final_required() {
 fn busy_queued_slash_commands_are_not_injected_as_steering() {
     let root = temp_test_dir("busy-slash-not-steering");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let _guard = env_lock();
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
     let mut agent = test_agent(&root);
     let (tx_events, mut rx_events) = tokio::sync::mpsc::unbounded_channel();
     agent.set_sink(Box::new(ChannelSink { tx: tx_events }));
@@ -570,6 +582,7 @@ fn busy_queued_slash_commands_are_not_injected_as_steering() {
         AgentEvent::Warn(msg) if msg.contains("not run while agent is busy")
     )));
 
+    restore_env_var("DEXT_HOME", old_dext_home);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1403,7 +1416,7 @@ fn build_test_work_map() -> WorkMap {
 fn work_map_derives_waypoints_and_packets() {
     let map = build_test_work_map();
     let rendered = render_work_map(&map, &[]);
-    assert!(rendered.contains("Work map"), "{rendered}");
+    assert!(rendered.contains("Session map"), "{rendered}");
     assert!(rendered.contains("@w"), "{rendered}");
     assert!(
         map.waypoints
@@ -1424,10 +1437,7 @@ fn work_map_derives_waypoints_and_packets() {
     let packet = render_work_map_packet(&map, &selection);
     assert!(packet.contains("[dext packet"), "{packet}");
     assert!(packet.contains("Failures/blockers"), "{packet}");
-    assert!(
-        packet.contains("Focus changes model context only"),
-        "{packet}"
-    );
+    assert!(packet.contains("does not rewind files"), "{packet}");
 }
 
 #[test]
@@ -2280,6 +2290,93 @@ fn same_session_id_lock_blocks_double_open() -> Result<()> {
 }
 
 #[test]
+fn stale_session_lock_is_reaped_on_acquire() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("stale-session-lock");
+    let home = root.join("home");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+
+    let result = (|| -> Result<()> {
+        let project = std::fs::canonicalize(&root)?;
+        let lock_path = session_state_lock_path(&project, "same");
+        std::fs::create_dir_all(lock_path.parent().unwrap())?;
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&json!({
+                "token": "stale",
+                "pid": 0,
+                "acquired_at": 1,
+                "project_key": project_key(&project),
+                "sandbox_root": project.display().to_string(),
+                "session_id": "same"
+            }))?,
+        )?;
+
+        let lock = SessionStateLock::acquire(&project, "same")?;
+        assert!(lock.path.exists());
+        drop(lock);
+        assert!(!lock_path.exists(), "fresh lock should clean up on drop");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn session_prune_removes_stale_locks_but_preserves_sessions() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("prune-stale-locks");
+    let home = root.join("home");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+
+    let result = (|| -> Result<()> {
+        let project = std::fs::canonicalize(&root)?;
+        let session_path = session_latest_session_path(&project, "old-session");
+        std::fs::create_dir_all(session_path.parent().unwrap())?;
+        std::fs::write(&session_path, b"{}\n")?;
+        let lock_path = session_state_lock_path(&project, "old-session");
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&json!({
+                "token": "stale",
+                "pid": 0,
+                "acquired_at": 1,
+                "project_key": project_key(&project),
+                "sandbox_root": project.display().to_string(),
+                "session_id": "old-session"
+            }))?,
+        )?;
+
+        prune_project_dirs(&project, false, 0)?;
+        assert!(session_path.exists(), "session JSONL must be preserved");
+        assert!(!lock_path.exists(), "stale lock should be pruned");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn session_latest_prefers_newest_session_dir_but_supports_legacy_latest() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("latest-session-selector");
@@ -2306,6 +2403,67 @@ fn session_latest_prefers_newest_session_dir_but_supports_legacy_latest() -> Res
         assert!(listing.contains("Latest"), "{listing}");
         Ok(())
     })();
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn slash_resume_selector_loads_latest_autosaved_and_paths() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("slash-resume-selector");
+    let home = root.join("home");
+    let project = root.join("project");
+    let old_home = std::env::var_os("HOME");
+    let old_userprofile = std::env::var_os("USERPROFILE");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&project)?;
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+    }
+
+    let result = (|| -> Result<()> {
+        let project = std::fs::canonicalize(&project)?;
+        let mut agent = test_agent(&project);
+        let session_id = agent.session_id.clone();
+        agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "resume me".to_string(),
+            }],
+        });
+        let saved = agent.save_latest_session()?;
+
+        assert_eq!(resolve_session_selector(&project, "latest")?, saved);
+        assert_eq!(resolve_session_selector(&project, &session_id)?, saved);
+        assert_eq!(
+            resolve_session_selector(&project, saved.parent().unwrap().to_str().unwrap())?,
+            saved
+        );
+        let tilde = saved.strip_prefix(&home)?;
+        let bracketed_tilde = format!("[~/{}]", tilde.display());
+        assert_eq!(resolve_session_selector(&project, &bracketed_tilde)?, saved);
+
+        let mut loaded = test_agent(&project);
+        loaded.load_session("latest")?;
+        assert_eq!(loaded.history.len(), 1);
+        loaded.history.clear();
+        loaded.load_session(&session_id)?;
+        assert_eq!(loaded.history.len(), 1);
+        loaded.history.clear();
+        loaded.load_session(&bracketed_tilde)?;
+        assert_eq!(loaded.history.len(), 1);
+        Ok(())
+    })();
+
+    restore_env_var("HOME", old_home);
+    restore_env_var("USERPROFILE", old_userprofile);
     unsafe {
         std::env::remove_var("DEXT_HOME");
         std::env::remove_var("DEXT_SESSIONS_DIR");
@@ -10097,6 +10255,9 @@ fn active_compaction_checkpoint_runs_when_history_crosses_active_threshold() {
 #[tokio::test(flavor = "current_thread")]
 async fn active_compaction_runs_after_tool_results_when_history_crosses_active_threshold() {
     let root = temp_test_dir("active-compact-tool-results");
+    let _guard = env_lock();
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
     let mut agent = test_agent(&root);
     agent.work_ledger.objective = "preserve active compaction evidence".to_string();
     agent.compact_threshold_chars = Some(20_000);
@@ -10181,6 +10342,7 @@ async fn active_compaction_runs_after_tool_results_when_history_crosses_active_t
         "recent tool_result should remain paired after active compaction"
     );
 
+    restore_env_var("DEXT_HOME", old_dext_home);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -10189,6 +10351,9 @@ async fn compact_uses_deterministic_evidence_fallback_when_summary_request_error
     // Regression: if the summary HTTP call fails mid-compact, deterministic evidence
     // should still allow compaction to finish so the TUI clears its spinner.
     let root = temp_test_dir("compact-failed-event");
+    let _guard = env_lock();
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
     let mut agent = test_agent(&root);
     agent.work_ledger.objective = "keep deterministic evidence".to_string();
 
@@ -10247,6 +10412,7 @@ async fn compact_uses_deterministic_evidence_fallback_when_summary_request_error
         "CompactEnd must fire when deterministic fallback compaction succeeds"
     );
 
+    restore_env_var("DEXT_HOME", old_dext_home);
     let _ = std::fs::remove_dir_all(&root);
 }
 

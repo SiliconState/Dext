@@ -482,6 +482,20 @@ fn current_pid() -> u32 {
     std::process::id()
 }
 
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_is_running(pid: u32) -> bool {
+    pid != 0
+}
+
 fn random_hex<const N: usize>() -> Option<String> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).ok()?;
@@ -570,6 +584,23 @@ fn unregister_lock_cleanup(path: &Path, token: &str) {
     }
 }
 
+pub(crate) fn remove_stale_session_state_lock(path: &Path) -> bool {
+    let Ok(existing) = SessionStateLock::read_record(path) else {
+        return false;
+    };
+    if process_is_running(existing.pid) {
+        return false;
+    }
+    remove_lock_file_and_empty_parent(path);
+    true
+}
+
+pub(crate) fn session_state_lock_is_live(path: &Path) -> bool {
+    SessionStateLock::read_record(path)
+        .map(|record| process_is_running(record.pid))
+        .unwrap_or(true)
+}
+
 impl SessionStateLock {
     fn read_record(path: &Path) -> Result<SessionStateLockRecord> {
         let content = std::fs::read_to_string(path)
@@ -625,6 +656,15 @@ impl SessionStateLock {
                     return Err(e);
                 }
                 match Self::read_record(&path) {
+                    Ok(existing) if !process_is_running(existing.pid) => {
+                        remove_lock_file_and_empty_parent(&path);
+                        Self::write_record(&path, &record)?;
+                        register_lock_cleanup(&path, &record.token);
+                        Ok(Self {
+                            path,
+                            token: record.token,
+                        })
+                    }
                     Ok(existing) => anyhow::bail!(
                         "dext session {} is already open for {} (pid {}, lock {})",
                         existing.session_id,

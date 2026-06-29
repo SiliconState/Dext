@@ -454,27 +454,17 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/map",
         args: "[session]",
-        help: "open Work Map drawer",
-    },
-    SlashCmd {
-        name: "/packet",
-        args: "@wNN [session]",
-        help: "waypoint packet",
+        help: "open session map drawer",
     },
     SlashCmd {
         name: "/focus",
-        args: "@wNN [--exact]",
-        help: "load focus packet",
+        args: "@wNN [--branch|--exact]",
+        help: "inspect or branch from a moment",
     },
     SlashCmd {
-        name: "/track",
-        args: "open @wNN [name]",
-        help: "create continuation",
-    },
-    SlashCmd {
-        name: "/tracks",
+        name: "/branches",
         args: "",
-        help: "list continuations",
+        help: "list branches",
     },
     SlashCmd {
         name: "/sessions",
@@ -512,7 +502,6 @@ static TRUST_ARGS: &[&str] = &["on", "off", "status"];
 static TOOLS_ARGS: &[&str] = &["default", "full", "status"];
 static EFFORT_ARGS: &[&str] = &["off", "low", "medium", "high", "xhigh", "max"];
 static WORK_MAP_SESSION_ARGS: &[&str] = &["current", "latest"];
-static TRACK_ARGS: &[&str] = &["open", "list"];
 const SLASH_COMPLETION_MAX_VISIBLE: usize = 7;
 
 struct SlashCompletion {
@@ -707,8 +696,7 @@ fn slash_completions(input: &str) -> Vec<SlashCompletion> {
             "trust" => Some(TRUST_ARGS),
             "tools" => Some(TOOLS_ARGS),
             "effort" => Some(EFFORT_ARGS),
-            "map" | "packet" | "focus" => Some(WORK_MAP_SESSION_ARGS),
-            "track" => Some(TRACK_ARGS),
+            "map" | "focus" => Some(WORK_MAP_SESSION_ARGS),
             _ => None,
         };
         if let Some(args) = sub_args {
@@ -1985,8 +1973,10 @@ impl TuiState {
                 self.stream_chars = 0;
                 self.live_tools.clear();
                 self.agent_busy = false;
-                if matches!(kind, WorkMapEventKind::Focus) {
-                    self.active_focus = parse_work_map_focus_label(&text);
+                if matches!(kind, WorkMapEventKind::Focus)
+                    && let Some(focus) = parse_work_map_focus_label(&text)
+                {
+                    self.active_focus = Some(focus);
                 }
                 let visible_ids = visible_work_map_ids(&text, &waypoint_ids);
                 if matches!(kind, WorkMapEventKind::Map) && !visible_ids.is_empty() {
@@ -1998,11 +1988,11 @@ impl TuiState {
                         scroll: 0,
                         filter_input: false,
                     });
-                    self.status = "work map open: ↑/↓/PgUp/PgDn navigate · Enter focus now · f insert · p packet · t track · z filter · Esc close"
+                    self.status = "session map open: ↑/↓/PgUp/PgDn navigate · Enter inspect · f edit · b branch · z filter · Esc close"
                         .into();
                 } else {
                     self.work_map = None;
-                    self.status = "work map ready".into();
+                    self.status = "session map ready".into();
                     self.queue(Line_::WorkMap {
                         kind,
                         text,
@@ -5935,10 +5925,9 @@ fn push_work_map_lines(
     width: u16,
 ) {
     let title = match kind {
-        WorkMapEventKind::Map => "work map",
-        WorkMapEventKind::Packet => "work packet",
-        WorkMapEventKind::Focus => "work focus",
-        WorkMapEventKind::Tracks => "work tracks",
+        WorkMapEventKind::Map => "Session map",
+        WorkMapEventKind::Focus => "Focus",
+        WorkMapEventKind::Tracks => "Branches",
     };
     let selected_id = waypoint_ids.get(selected).map(String::as_str);
     let border_style = Style::default().fg(Color::Cyan);
@@ -5951,9 +5940,10 @@ fn push_work_map_lines(
         Span::styled("  ".to_string(), Style::default()),
         Span::styled(
             if waypoint_ids.is_empty() {
-                "printed in transcript".to_string()
+                "(static text)".to_string()
             } else {
-                "↑/↓/PgUp/PgDn navigate · Enter focus now · f insert · p packet · t track · z filter · Esc close".to_string()
+                "↑/↓/PgUp/PgDn navigate · Enter inspect · f edit · b branch · z filter · Esc close"
+                    .to_string()
             },
             Style::default().fg(Color::DarkGray),
         ),
@@ -6382,7 +6372,7 @@ fn input_hint_text(state: &TuiState) -> &'static str {
         {
             "type filter · Enter opens filtered map · Esc cancel"
         } else {
-            "Enter focus now · f insert · p packet · t track · z filter · Esc close"
+            "Enter inspect · f edit · b branch · z filter · Esc close"
         }
     } else if state.input_display_override.is_some() {
         "paste preview · Enter sends full input"
@@ -6848,7 +6838,7 @@ fn work_map_drawer_lines(state: &mut TuiState, width: u16, height: usize) -> Vec
         .unwrap_or("?");
     let inner_width = width.max(1) as usize;
     let mut lines = Vec::with_capacity(height);
-    let title = format!("▌ Work Map  {selected_id}  {}/{}", selected + 1, total);
+    let title = format!("▌ Session map  {selected_id}  {}/{}", selected + 1, total);
     lines.push(Line::from(vec![Span::styled(
         clamp_chars(&title, inner_width),
         Style::default()
@@ -6894,7 +6884,7 @@ fn work_map_drawer_lines(state: &mut TuiState, width: u16, height: usize) -> Vec
     };
     lines.push(Line::from(Span::styled(
         clamp_chars(
-            &format!("  {scroll_hint}Enter focus now · f insert · p packet · t track · z filter · Esc close"),
+            &format!("  {scroll_hint}Enter inspect · f edit · b branch · z filter · Esc close"),
             inner_width,
         ),
         Style::default().fg(Color::DarkGray),
@@ -7528,7 +7518,7 @@ fn handle_work_map_key(
                 if let Some(drawer) = state.work_map.as_mut() {
                     drawer.filter_input = false;
                 }
-                state.status = "work map filter canceled".to_string();
+                state.status = "session map filter canceled".to_string();
                 true
             }
             KeyCode::Enter => {
@@ -7538,7 +7528,7 @@ fn handle_work_map_key(
                 }
                 state.work_map = None;
                 state.clear_slash_completion_selection();
-                state.status = "opening filtered work map".to_string();
+                state.status = "opening filtered session map".to_string();
                 let _ = agent_input.send(FromTui::Submit(command));
                 state.clear_input();
                 true
@@ -7549,38 +7539,38 @@ fn handle_work_map_key(
         match key.code {
             KeyCode::Esc => {
                 state.work_map = None;
-                state.status = "work map drawer closed".to_string();
+                state.status = "session map drawer closed".to_string();
                 true
             }
             KeyCode::Up => {
                 if state.move_work_map_selection(-1) {
-                    state.status = "work map selection moved".to_string();
+                    state.status = "session map selection moved".to_string();
                 }
                 true
             }
             KeyCode::Down => {
                 if state.move_work_map_selection(1) {
-                    state.status = "work map selection moved".to_string();
+                    state.status = "session map selection moved".to_string();
                 }
                 true
             }
             KeyCode::PageUp => {
                 let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
                 if state.move_work_map_selection_for_rows(-step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
-                    state.status = "work map selection moved".to_string();
+                    state.status = "session map selection moved".to_string();
                 }
                 true
             }
             KeyCode::PageDown => {
                 let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
                 if state.move_work_map_selection_for_rows(step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
-                    state.status = "work map selection moved".to_string();
+                    state.status = "session map selection moved".to_string();
                 }
                 true
             }
             KeyCode::Home => {
                 state.set_work_map_selection(0);
-                state.status = "work map selection moved".to_string();
+                state.status = "session map selection moved".to_string();
                 true
             }
             KeyCode::End => {
@@ -7590,7 +7580,7 @@ fn handle_work_map_key(
                     .map(|drawer| drawer.waypoint_ids.len().saturating_sub(1))
                 {
                     state.set_work_map_selection(last);
-                    state.status = "work map selection moved".to_string();
+                    state.status = "session map selection moved".to_string();
                 }
                 true
             }
@@ -7598,7 +7588,7 @@ fn handle_work_map_key(
                 if let Some(arg) = state.selected_work_map_command_arg() {
                     state.work_map = None;
                     state.clear_slash_completion_selection();
-                    state.status = "activating work map focus".to_string();
+                    state.status = "inspecting moment".to_string();
                     let _ = agent_input.send(FromTui::Submit(format!("/focus {arg}")));
                 }
                 true
@@ -7611,20 +7601,11 @@ fn handle_work_map_key(
                 }
                 true
             }
-            KeyCode::Char('p') | KeyCode::Char('P') => {
+            KeyCode::Char('b') | KeyCode::Char('B') => {
                 if let Some(arg) = state.selected_work_map_command_arg() {
+                    insert_command_into_input(state, format!("/focus {arg} --branch"));
                     state.work_map = None;
-                    state.clear_slash_completion_selection();
-                    state.status = "opening work map packet".to_string();
-                    let _ = agent_input.send(FromTui::Submit(format!("/packet {arg}")));
-                }
-                true
-            }
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                if let Some(arg) = state.selected_work_map_command_arg() {
-                    insert_command_into_input(state, format!("/track open {arg}"));
-                    state.work_map = None;
-                    state.status = "inserted /track command".to_string();
+                    state.status = "inserted branch command".to_string();
                 }
                 true
             }
@@ -7639,7 +7620,7 @@ fn handle_work_map_key(
                 }
                 state.replace_input(prefix);
                 state.status =
-                    "work map filter: type failures|changes|verify|file <path>|query <text>"
+                    "session map filter: type failures|changes|verify|file <path>|query <text>"
                         .to_string();
                 true
             }
@@ -7919,7 +7900,7 @@ fn handle_key(
         (KeyCode::Esc, _) => {
             if state.work_map_is_active() {
                 state.work_map = None;
-                state.status = "work map drawer closed".to_string();
+                state.status = "session map drawer closed".to_string();
             } else if state.show_help {
                 state.show_help = false;
             } else if state.show_inspector {
@@ -9711,7 +9692,7 @@ mod tests {
             ThinkingEffort::Medium,
         );
         state.apply_event(AgentEvent::WorkMap {
-            kind: WorkMapEventKind::Packet,
+            kind: WorkMapEventKind::Focus,
             text: "[dext packet @w01]\nsource: current".to_string(),
             waypoint_ids: vec!["@w01".to_string()],
             selector: None,
@@ -9723,10 +9704,7 @@ mod tests {
             Some(Line_::WorkMap { .. })
         ));
         let lines = flatten_lines(&line_to_text(state.pending_insert.last().unwrap(), 80));
-        assert!(
-            lines.iter().any(|line| line.contains("work packet")),
-            "{lines:?}"
-        );
+        assert!(lines.iter().any(|line| line.contains("Focus")), "{lines:?}");
     }
 
     #[test]
@@ -9740,7 +9718,7 @@ mod tests {
         );
         state.apply_event(AgentEvent::WorkMap {
             kind: WorkMapEventKind::Map,
-            text: "Work map — current\n@w01 intent #1  first\n@w02 change #2  second\ncommands: /packet @wNN".to_string(),
+            text: "Session map — current\n@w01 intent #1  first\n@w02 change #2  second\ncommands: /focus @wNN".to_string(),
             waypoint_ids: vec!["@w01".to_string(), "@w02".to_string(), "@w99".to_string()],
             selector: None,
         });
@@ -9749,7 +9727,7 @@ mod tests {
         assert!(state.pending_insert.is_empty());
         let lines = flatten_lines(&Text::from(work_map_drawer_lines(&mut state, 80, 4)));
         assert!(
-            lines.iter().any(|line| line.contains("Work Map")),
+            lines.iter().any(|line| line.contains("Session map")),
             "{lines:?}"
         );
         assert!(
@@ -9770,16 +9748,12 @@ mod tests {
         );
         handle_work_map_key(
             &mut state,
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::empty()),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()),
             &tx,
         );
 
-        assert_eq!(state.input, "");
+        assert_eq!(state.input, "/focus @w02 --branch");
         assert!(!state.work_map_is_active());
-        match rx.try_recv() {
-            Ok(FromTui::Submit(text)) => assert_eq!(text, "/packet @w02"),
-            _ => panic!("expected packet submit"),
-        }
 
         state.apply_event(AgentEvent::WorkMap {
             kind: WorkMapEventKind::Focus,
@@ -9809,7 +9783,7 @@ mod tests {
         state.cursor = 0;
         state.apply_event(AgentEvent::WorkMap {
             kind: WorkMapEventKind::Map,
-            text: "Work map — old-session\n@w01 intent #1  first".to_string(),
+            text: "Session map — old-session\n@w01 intent #1  first".to_string(),
             waypoint_ids: vec!["@w01".to_string()],
             selector: Some("old-session".to_string()),
         });
@@ -9840,7 +9814,7 @@ mod tests {
 
         state.apply_event(AgentEvent::WorkMap {
             kind: WorkMapEventKind::Map,
-            text: "Work map — old-session\n@w01 intent #1  first".to_string(),
+            text: "Session map — old-session\n@w01 intent #1  first".to_string(),
             waypoint_ids: vec!["@w01".to_string()],
             selector: Some("old-session".to_string()),
         });
