@@ -175,12 +175,12 @@ mod linux {
     /// that the only work left for the forked child is the `restrict_self`
     /// syscall. Building before fork avoids allocating between fork and execve.
     fn build_ruleset(profile: SandboxProfile, root: &Path) -> Option<landlock::RulesetCreated> {
-        let abi = ABI::V1;
         let writable: Vec<_> = writable_roots(profile, root)
             .into_iter()
             .filter(|p| p.exists())
             .collect();
 
+        let abi = ABI::from(landlock_abi()? as i32);
         let created = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))
             .ok()?

@@ -4,7 +4,7 @@ use crossterm::event::{
     KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::enable_raw_mode;
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -55,6 +55,9 @@ const THINKING_BG: Color = Color::Indexed(235);
 const STEERING_BG: Color = Color::Indexed(236);
 const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const LIVE_BACKEND_RING_CAP: usize = 256_000;
+const LIVE_BACKEND_MAX_TOOLS: usize = 8;
+const LIVE_OUTPUT_DRAIN_BATCH: usize = 32;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ToolChunk {
@@ -212,6 +215,7 @@ enum FromTui {
 
 struct TuiSink {
     tx: tokio::sync::mpsc::UnboundedSender<ToTui>,
+    live_tx: tokio::sync::mpsc::Sender<AgentEvent>,
 }
 
 impl EventSink for TuiSink {
@@ -242,6 +246,10 @@ impl EventSink for TuiSink {
         }));
     }
 
+    fn live_output_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
+        Some(self.live_tx.clone())
+    }
+
     fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
         let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(0);
         if self
@@ -257,6 +265,18 @@ impl EventSink for TuiSink {
         }
         resp_rx.recv().unwrap_or(LocalAuthSecret::Canceled)
     }
+}
+
+#[derive(Clone)]
+struct BackendOutput {
+    call_id: String,
+    call_tag: String,
+    name: String,
+    summary: String,
+    text: String,
+    dropped_bytes: usize,
+    running: bool,
+    partial_stream: Option<String>,
 }
 
 #[derive(Clone)]
@@ -830,6 +850,10 @@ struct TuiState {
     work_map: Option<WorkMapDrawer>,
     active_focus: Option<ActiveFocusLabel>,
     debug_events: VecDeque<String>,
+    backend_outputs: VecDeque<BackendOutput>,
+    backend_viewer_open: bool,
+    backend_viewer_call_id: Option<String>,
+    backend_viewer_scroll_from_bottom: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -928,6 +952,10 @@ impl TuiState {
             work_map: None,
             active_focus: None,
             debug_events: VecDeque::new(),
+            backend_outputs: VecDeque::new(),
+            backend_viewer_open: false,
+            backend_viewer_call_id: None,
+            backend_viewer_scroll_from_bottom: 0,
         }
     }
 
@@ -948,6 +976,258 @@ impl TuiState {
         self.debug_events.push_back(event.into());
         while self.debug_events.len() > MAX_DEBUG_EVENTS {
             self.debug_events.pop_front();
+        }
+    }
+
+    fn selected_backend_index(&self) -> Option<usize> {
+        if let Some(call_id) = self.backend_viewer_call_id.as_deref()
+            && let Some(idx) = self
+                .backend_outputs
+                .iter()
+                .position(|output| output.call_id == call_id)
+        {
+            return Some(idx);
+        }
+        self.backend_outputs.len().checked_sub(1)
+    }
+
+    fn selected_backend_output(&self) -> Option<&BackendOutput> {
+        self.selected_backend_index()
+            .and_then(|idx| self.backend_outputs.get(idx))
+    }
+
+    fn set_backend_selection_to_latest(&mut self) {
+        self.backend_viewer_call_id = self
+            .backend_outputs
+            .back()
+            .map(|output| output.call_id.clone());
+        self.backend_viewer_scroll_from_bottom = 0;
+    }
+
+    fn open_backend_viewer(&mut self) -> bool {
+        if self.backend_outputs.is_empty() {
+            self.status = "backend output unavailable".to_string();
+            return false;
+        }
+        self.backend_viewer_open = true;
+        if self.backend_viewer_call_id.as_ref().is_none_or(|call_id| {
+            !self
+                .backend_outputs
+                .iter()
+                .any(|output| &output.call_id == call_id)
+        }) {
+            self.set_backend_selection_to_latest();
+        }
+        self.status = "backend viewer open".to_string();
+        true
+    }
+
+    fn close_backend_viewer(&mut self) {
+        let was_open = self.backend_viewer_open;
+        self.backend_viewer_open = false;
+        if was_open {
+            self.status = "backend viewer closed".to_string();
+        }
+    }
+
+    fn cycle_backend_selection(&mut self, delta: isize) {
+        if self.backend_outputs.is_empty() {
+            self.backend_viewer_call_id = None;
+            self.backend_viewer_scroll_from_bottom = 0;
+            return;
+        }
+        let len = self.backend_outputs.len();
+        let current = self
+            .selected_backend_index()
+            .unwrap_or(len.saturating_sub(1));
+        let next = ((current as isize + delta).rem_euclid(len as isize)) as usize;
+        self.backend_viewer_call_id = self
+            .backend_outputs
+            .get(next)
+            .map(|output| output.call_id.clone());
+        self.backend_viewer_scroll_from_bottom = 0;
+    }
+
+    fn append_backend_output_text(output: &mut BackendOutput, text: String) {
+        output.text.push_str(&text);
+        if output.text.len() <= LIVE_BACKEND_RING_CAP {
+            return;
+        }
+        let mut drain_to = output.text.len() - LIVE_BACKEND_RING_CAP;
+        while drain_to < output.text.len() && !output.text.is_char_boundary(drain_to) {
+            drain_to += 1;
+        }
+        output.text.drain(..drain_to);
+        output.dropped_bytes = output.dropped_bytes.saturating_add(drain_to);
+    }
+
+    fn append_backend_labeled_text(output: &mut BackendOutput, stream: &str, text: &str) {
+        let normalized = text.replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+        let label = if stream == "stderr" {
+            "stderr"
+        } else {
+            "stdout"
+        };
+        let mut line_open_stream = if output.text.ends_with('\n') {
+            None
+        } else {
+            output.partial_stream.clone()
+        };
+        let mut ends_with_newline = output.text.is_empty() || output.text.ends_with('\n');
+        let mut chunk = String::new();
+
+        for piece in normalized.split_inclusive('\n') {
+            if piece.is_empty() {
+                continue;
+            }
+            let continues_same_line =
+                line_open_stream.as_deref() == Some(label) && !ends_with_newline;
+            if !continues_same_line {
+                if !ends_with_newline {
+                    chunk.push('\n');
+                }
+                chunk.push_str(label);
+                chunk.push_str(" │ ");
+            }
+            chunk.push_str(piece);
+            if piece.ends_with('\n') {
+                line_open_stream = None;
+                ends_with_newline = true;
+            } else {
+                line_open_stream = Some(label.to_string());
+                ends_with_newline = false;
+            }
+        }
+
+        output.partial_stream = if ends_with_newline {
+            None
+        } else {
+            line_open_stream
+        };
+        Self::append_backend_output_text(output, chunk);
+    }
+
+    fn trim_backend_outputs(&mut self) {
+        while self.backend_outputs.len() > LIVE_BACKEND_MAX_TOOLS {
+            let removed_selected = self
+                .backend_outputs
+                .front()
+                .zip(self.backend_viewer_call_id.as_ref())
+                .is_some_and(|(output, selected)| output.call_id == *selected);
+            self.backend_outputs.pop_front();
+            if removed_selected {
+                self.set_backend_selection_to_latest();
+            }
+        }
+    }
+
+    fn upsert_backend_output(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        summary: &str,
+        running: bool,
+        create: bool,
+    ) {
+        if name != "bash" {
+            return;
+        }
+        let call_tag = self.tool_tag_for(call_id);
+        if let Some(output) = self
+            .backend_outputs
+            .iter_mut()
+            .find(|output| output.call_id == call_id)
+        {
+            output.call_tag = call_tag;
+            output.name = name.to_string();
+            if !summary.is_empty() {
+                output.summary = summary.to_string();
+            }
+            output.running = running;
+        } else if create {
+            self.backend_outputs.push_back(BackendOutput {
+                call_id: call_id.to_string(),
+                call_tag,
+                name: name.to_string(),
+                summary: summary.to_string(),
+                text: String::new(),
+                dropped_bytes: 0,
+                running,
+                partial_stream: None,
+            });
+            if self.backend_viewer_call_id.is_none() {
+                self.set_backend_selection_to_latest();
+            }
+        }
+        self.trim_backend_outputs();
+    }
+
+    fn apply_backend_output_delta(
+        &mut self,
+        call_id: String,
+        name: String,
+        stream: String,
+        text: String,
+    ) {
+        if !self
+            .backend_outputs
+            .iter()
+            .any(|output| output.call_id == call_id)
+        {
+            self.upsert_backend_output(&call_id, &name, "", true, true);
+        }
+        if let Some(output) = self
+            .backend_outputs
+            .iter_mut()
+            .find(|output| output.call_id == call_id)
+        {
+            Self::append_backend_labeled_text(output, &stream, &text);
+        }
+    }
+
+    fn backend_body_rows_for_width(&self, width: u16) -> Vec<String> {
+        let Some(output) = self.selected_backend_output() else {
+            return vec!["No backend output captured yet.".to_string()];
+        };
+        let inner = width.max(1) as usize;
+        let mut rows = Vec::new();
+        if output.dropped_bytes > 0 {
+            rows.push(clamp_chars(
+                &format!(
+                    "…[dropped oldest {} bytes from live ring buffer]",
+                    output.dropped_bytes
+                ),
+                inner,
+            ));
+        }
+        if output.text.is_empty() {
+            rows.push("(waiting for bash output…)".to_string());
+        } else {
+            for line in sanitize_display_text(&output.text).lines() {
+                rows.extend(wrap_plain_visual(line, inner));
+            }
+        }
+        rows
+    }
+
+    fn clamp_backend_scroll(&mut self, body_rows: usize, visible_rows: usize) {
+        let max_scroll = body_rows.saturating_sub(visible_rows);
+        self.backend_viewer_scroll_from_bottom =
+            self.backend_viewer_scroll_from_bottom.min(max_scroll);
+    }
+
+    fn scroll_backend_viewer(&mut self, delta_from_bottom: isize) {
+        if delta_from_bottom >= 0 {
+            self.backend_viewer_scroll_from_bottom = self
+                .backend_viewer_scroll_from_bottom
+                .saturating_add(delta_from_bottom as usize);
+        } else {
+            self.backend_viewer_scroll_from_bottom = self
+                .backend_viewer_scroll_from_bottom
+                .saturating_sub(delta_from_bottom.unsigned_abs());
         }
     }
 
@@ -1408,6 +1688,7 @@ impl TuiState {
                 summary,
             } => {
                 self.push_debug_event(format!("tool start · {name} · {call_id}"));
+                self.upsert_backend_output(&call_id, &name, &summary, true, true);
                 let preferred_tag = self.tool_tag_for(&call_id);
                 let match_idx = self
                     .live_tools
@@ -1459,6 +1740,7 @@ impl TuiState {
                     if ok { "ok" } else { "error" },
                     content.lines().count()
                 ));
+                self.upsert_backend_output(&call_id, &name, &preview, false, false);
                 let call_tag = self.tool_tag_for(&call_id);
                 let idx = self
                     .live_tools
@@ -1523,6 +1805,14 @@ impl TuiState {
                     expanded: false,
                 });
                 self.status = "thinking".into();
+            }
+            AgentEvent::ToolOutputDelta {
+                call_id,
+                name,
+                stream,
+                text,
+            } => {
+                self.apply_backend_output_delta(call_id, name, stream, text);
             }
             AgentEvent::LocalAuthPrompt { tool, message } => {
                 self.push_debug_event(format!("local auth prompt · {tool}"));
@@ -2074,8 +2364,17 @@ fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> 
         .filter(|tool| tool.running)
         .collect();
     if let Some(tool) = running_tools.iter().find(|tool| !tool.summary.is_empty()) {
+        let mut detail = tool.summary.clone();
+        if tool.name == "bash"
+            && state
+                .backend_outputs
+                .iter()
+                .any(|output| output.call_id == tool.call_id)
+        {
+            detail.push_str(" · Ctrl+B backend");
+        }
         return Some(live_detail_line(
-            tool.summary.clone(),
+            detail,
             Color::Reset,
             max_cells,
             state.context_mode,
@@ -6272,6 +6571,7 @@ fn help_overlay_text() -> Text<'static> {
     let keymap_rows: &[(&str, &str)] = &[
         ("Enter", "submit prompt"),
         ("Shift+Enter / Alt+Enter", "insert newline"),
+        ("Ctrl+B", "open backend output viewer while bash runs"),
         ("Ctrl+O", "toggle last tool output"),
         ("Ctrl+T", "toggle token/status details"),
         ("Paste", "multi-line paste is inserted without auto-submit"),
@@ -6800,6 +7100,124 @@ fn render_local_auth_overlay(frame: &mut ratatui::Frame, state: &TuiState, area:
     render_widget_safe(frame, widget, rect);
 }
 
+fn apply_tui_message(state: &mut TuiState, msg: ToTui) {
+    match msg {
+        ToTui::Event(ev) => state.apply_event(ev),
+        ToTui::PermissionRequest {
+            name,
+            input,
+            responder,
+        } => {
+            state.close_backend_viewer();
+            queue_permission_request(state, name, input, responder);
+        }
+        ToTui::LocalAuthSecretRequest {
+            tool,
+            message,
+            responder,
+        } => {
+            state.close_backend_viewer();
+            queue_local_auth_secret_request(state, tool, message, responder);
+        }
+    }
+}
+
+fn drain_live_output_events(
+    state: &mut TuiState,
+    live_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    first: Option<AgentEvent>,
+) {
+    let mut applied = 0usize;
+    if let Some(event) = first {
+        state.apply_event(event);
+        applied = 1;
+    }
+    while applied < LIVE_OUTPUT_DRAIN_BATCH {
+        match live_rx.try_recv() {
+            Ok(event) => {
+                state.apply_event(event);
+                applied = applied.saturating_add(1);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn backend_viewer_text(state: &mut TuiState, area: Rect) -> (Text<'static>, String, String) {
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let visible_rows = area.height.saturating_sub(2).max(1) as usize;
+    let rows = state.backend_body_rows_for_width(inner_width);
+
+    let total = state.backend_outputs.len();
+    let selected = state
+        .selected_backend_index()
+        .map(|idx| idx.saturating_add(1))
+        .unwrap_or(0);
+    let (call_tag, status, summary) = state
+        .selected_backend_output()
+        .map(|output| {
+            (
+                output.call_tag.clone(),
+                if output.running { "running" } else { "done" }.to_string(),
+                output.summary.clone(),
+            )
+        })
+        .unwrap_or_else(|| ("—".to_string(), "idle".to_string(), String::new()));
+    let summary_rows = usize::from(!summary.is_empty()).min(visible_rows);
+    let body_visible_rows = visible_rows.saturating_sub(summary_rows);
+    state.clamp_backend_scroll(rows.len(), body_visible_rows);
+
+    let title = clamp_chars(
+        &format!(" backend {selected}/{total} {call_tag} · {status} "),
+        area.width.max(1) as usize,
+    );
+    let footer = clamp_chars(
+        " Esc/q close · ↑↓/Pg scroll · Tab next · Shift+Tab prev ",
+        area.width.max(1) as usize,
+    );
+
+    let end = rows
+        .len()
+        .saturating_sub(state.backend_viewer_scroll_from_bottom);
+    let start = end.saturating_sub(body_visible_rows);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !summary.is_empty() {
+        lines.push(Line::from(Span::styled(
+            clamp_chars(&summary, inner_width as usize),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    for row in rows.iter().skip(start).take(end.saturating_sub(start)) {
+        lines.push(Line::from(row.clone()));
+    }
+    while lines.len() < visible_rows {
+        lines.push(Line::from(""));
+    }
+    (Text::from(lines), title, footer)
+}
+
+fn render_backend_viewer(frame: &mut ratatui::Frame, state: &mut TuiState) {
+    let area = frame.area();
+    render_widget_safe(frame, Clear, area);
+    let (text, title, footer) = backend_viewer_text(state, area);
+    let widget = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::from(Span::styled(
+                footer,
+                Style::default().fg(Color::DarkGray),
+            )))
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    render_widget_safe(frame, widget, area);
+}
+
 fn render_inspector(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -7015,6 +7433,11 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
     if pasted.is_empty() {
         return;
     }
+    if state.backend_viewer_open {
+        clear_secret_string(&mut pasted);
+        state.status = "backend viewer open; paste ignored".to_string();
+        return;
+    }
     if state.pending_local_auth.is_some() {
         let secret = pasted.trim_end_matches(['\r', '\n']);
         state.local_auth_input.push_str(secret);
@@ -7047,6 +7470,15 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
 }
 
 fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
+    if state.backend_viewer_open {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => state.scroll_backend_viewer(1),
+            MouseEventKind::ScrollDown => state.scroll_backend_viewer(-1),
+            _ => {}
+        }
+        return;
+    }
+
     let column = mouse.column;
     let row = mouse.row;
 
@@ -7303,6 +7735,37 @@ fn handle_local_auth_key(state: &mut TuiState, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_backend_viewer_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    if !state.backend_viewer_open {
+        return false;
+    }
+    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META);
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('c'), _) | (KeyCode::Char('d'), _) if is_ctrl => return false,
+        (KeyCode::Esc, _) | (KeyCode::Char('q'), _) | (KeyCode::Char('Q'), _) => {
+            state.close_backend_viewer()
+        }
+        (KeyCode::Char('b'), _) if is_ctrl => state.close_backend_viewer(),
+        (KeyCode::Up, _) => state.scroll_backend_viewer(1),
+        (KeyCode::Down, _) => state.scroll_backend_viewer(-1),
+        (KeyCode::PageUp, _) => state.scroll_backend_viewer(10),
+        (KeyCode::PageDown, _) => state.scroll_backend_viewer(-10),
+        (KeyCode::Home, _) => state.scroll_backend_viewer(isize::MAX / 4),
+        (KeyCode::End, _) => state.backend_viewer_scroll_from_bottom = 0,
+        (KeyCode::Tab, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
+            state.cycle_backend_selection(1)
+        }
+        (KeyCode::BackTab, _) | (KeyCode::Char('p'), _) | (KeyCode::Char('P'), _) => {
+            state.cycle_backend_selection(-1)
+        }
+        _ => {}
+    }
+    true
+}
+
 fn handle_key(
     state: &mut TuiState,
     key: KeyEvent,
@@ -7312,6 +7775,9 @@ fn handle_key(
     interrupt: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     if key.kind != KeyEventKind::Press {
+        return;
+    }
+    if handle_backend_viewer_key(state, key) {
         return;
     }
     if handle_local_auth_key(state, key) {
@@ -7422,6 +7888,9 @@ fn handle_key(
                     }
                 }
             }
+        }
+        (KeyCode::Char('b'), m) if is_ctrl(m) => {
+            state.open_backend_viewer();
         }
         (KeyCode::Char('t'), m) if is_ctrl(m) => {
             state.show_status_details = !state.show_status_details;
@@ -7745,6 +8214,36 @@ fn terminal_supports_keyboard_enhancement() -> bool {
     false
 }
 
+struct AlternateScreenGuard {
+    active: bool,
+}
+
+impl AlternateScreenGuard {
+    fn new() -> io::Result<Self> {
+        let mut out = io::stdout();
+        crossterm::execute!(out, EnterAlternateScreen)?;
+        let guard = Self { active: true };
+        if let Err(err) =
+            crossterm::execute!(out, crossterm::cursor::Hide).and_then(|_| out.flush())
+        {
+            drop(guard);
+            return Err(err);
+        }
+        Ok(guard)
+    }
+}
+
+impl Drop for AlternateScreenGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut out = io::stdout();
+            let _ = crossterm::execute!(out, LeaveAlternateScreen, crossterm::cursor::Show);
+            let _ = out.flush();
+            self.active = false;
+        }
+    }
+}
+
 struct TerminalGuard {
     active: bool,
     keyboard_enhancement_enabled: bool,
@@ -7800,6 +8299,66 @@ impl Drop for TerminalGuard {
     }
 }
 
+async fn run_backend_viewer(
+    state: &mut TuiState,
+    live_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    ev_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ToTui>,
+    key_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    agent_input: &tokio::sync::mpsc::UnboundedSender<FromTui>,
+    runtime_control_input: &tokio::sync::mpsc::UnboundedSender<String>,
+    steering_input: &tokio::sync::mpsc::UnboundedSender<String>,
+    interrupt: &Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let _guard = AlternateScreenGuard::new()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    let tick = Duration::from_millis(80);
+    let mut last_tick = Instant::now();
+
+    while state.backend_viewer_open && !state.quit {
+        terminal.draw(|f| render_backend_viewer(f, state))?;
+        let timeout = tick
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or(Duration::ZERO);
+
+        tokio::select! {
+            biased;
+            maybe_ev = ev_rx.recv() => {
+                if let Some(msg) = maybe_ev {
+                    apply_tui_message(state, msg);
+                }
+            }
+            maybe_key = key_rx.recv() => {
+                if let Some(ev) = maybe_key {
+                    match ev {
+                        Event::Key(k) => handle_key(
+                            state,
+                            k,
+                            agent_input,
+                            runtime_control_input,
+                            steering_input,
+                            interrupt,
+                        ),
+                        Event::Mouse(mouse) => handle_mouse(state, mouse),
+                        Event::Paste(pasted) => handle_paste(state, pasted),
+                        _ => {}
+                    }
+                }
+            }
+            maybe_live = live_rx.recv() => {
+                drain_live_output_events(state, live_rx, maybe_live);
+            }
+            _ = tokio::time::sleep(timeout) => {
+                last_tick = Instant::now();
+            }
+        }
+    }
+
+    let _ = terminal.clear();
+    Ok(())
+}
+
 pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let model = agent.model.clone();
     let context_window_tokens = agent.context_window_tokens();
@@ -7819,11 +8378,13 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     )?;
 
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<ToTui>();
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<AgentEvent>(crate::LIVE_OUTPUT_EVENT_QUEUE_CAP);
     let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<FromTui>();
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
 
     let interrupt = agent.interrupt.clone();
-    agent.set_sink(Box::new(TuiSink { tx: ev_tx }));
+    agent.set_sink(Box::new(TuiSink { tx: ev_tx, live_tx }));
     agent.pretty = false;
     agent.silent = false;
 
@@ -8004,6 +8565,22 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let mut last_tick = Instant::now();
 
     while !state.quit {
+        if state.backend_viewer_open {
+            Backend::flush(terminal.backend_mut())?;
+            run_backend_viewer(
+                &mut state,
+                &mut live_rx,
+                &mut ev_rx,
+                &mut key_rx,
+                &in_tx,
+                &direct_runtime_control_tx,
+                &direct_steer_tx,
+                &interrupt,
+            )
+            .await?;
+            continue;
+        }
+
         state.refresh_git_branch();
         let width = current_transcript_pane_width(&mut terminal, &state)?;
         flush_pending_insert(&mut terminal, &mut state, width)?;
@@ -8017,13 +8594,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
             biased;
             maybe_ev = ev_rx.recv() => {
                 match maybe_ev {
-                    Some(ToTui::Event(ev)) => state.apply_event(ev),
-                    Some(ToTui::PermissionRequest { name, input, responder }) => {
-                        queue_permission_request(&mut state, name, input, responder);
-                    }
-                    Some(ToTui::LocalAuthSecretRequest { tool, message, responder }) => {
-                        queue_local_auth_secret_request(&mut state, tool, message, responder);
-                    }
+                    Some(msg) => apply_tui_message(&mut state, msg),
                     None => {}
                 }
             }
@@ -8043,6 +8614,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                         _ => {}
                     }
                 }
+            }
+            maybe_live = live_rx.recv() => {
+                drain_live_output_events(&mut state, &mut live_rx, maybe_live);
             }
             _ = tokio::time::sleep(timeout) => {
                 last_tick = Instant::now();
@@ -8081,6 +8655,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     }
 
     // Drain remaining events quickly so final output renders
+    while let Ok(ev) = live_rx.try_recv() {
+        state.apply_event(ev);
+    }
     while let Ok(ev) = ev_rx.try_recv() {
         if let ToTui::Event(e) = ev {
             state.apply_event(e);
@@ -8367,6 +8944,127 @@ mod tests {
         state.agent_busy = true;
 
         assert_eq!(input_hint_text(&state), "");
+    }
+
+    #[test]
+    fn backend_output_delta_stays_out_of_transcript_and_marks_done() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+
+        state.apply_event(AgentEvent::ToolCallStart {
+            call_id: "call_backend".to_string(),
+            name: "bash".to_string(),
+            summary: "bash: long job".to_string(),
+        });
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_backend".to_string(),
+            name: "bash".to_string(),
+            stream: "stdout".to_string(),
+            text: "phase 1\n".to_string(),
+        });
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_backend".to_string(),
+            name: "bash".to_string(),
+            stream: "stderr".to_string(),
+            text: "warn\n".to_string(),
+        });
+
+        assert!(state.pending_insert.is_empty());
+        let output = state.backend_outputs.back().expect("backend output");
+        assert!(output.running);
+        assert_eq!(output.summary, "bash: long job");
+        assert!(output.text.contains("stdout │ phase 1"), "{}", output.text);
+        assert!(output.text.contains("stderr │ warn"), "{}", output.text);
+
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_backend".to_string(),
+            name: "bash".to_string(),
+            stream: "stdout".to_string(),
+            text: "partial ".to_string(),
+        });
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_backend".to_string(),
+            name: "bash".to_string(),
+            stream: "stdout".to_string(),
+            text: "line\n".to_string(),
+        });
+        let output = state.backend_outputs.back().expect("backend output");
+        assert!(
+            output.text.contains("stdout │ partial line"),
+            "{}",
+            output.text
+        );
+
+        state.apply_event(AgentEvent::ToolCallResult {
+            call_id: "call_backend".to_string(),
+            name: "bash".to_string(),
+            ok: true,
+            preview: "bash: long job".to_string(),
+            content: "exit: 0".to_string(),
+        });
+
+        assert!(!state.backend_outputs.back().unwrap().running);
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_backend".to_string(),
+            name: "bash".to_string(),
+            stream: "stdout".to_string(),
+            text: "late tail\n".to_string(),
+        });
+        let output = state.backend_outputs.back().unwrap();
+        assert!(!output.running);
+        assert!(
+            output.text.contains("stdout │ late tail"),
+            "{}",
+            output.text
+        );
+        assert!(
+            matches!(state.pending_insert.as_slice(), [Line_::Tool { name, .. }] if name == "bash")
+        );
+    }
+
+    #[test]
+    fn ctrl_b_opens_and_esc_closes_backend_viewer() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::ToolCallStart {
+            call_id: "call_backend".to_string(),
+            name: "bash".to_string(),
+            summary: "bash: long job".to_string(),
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+        assert!(state.backend_viewer_open);
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+        assert!(!state.backend_viewer_open);
     }
 
     #[test]

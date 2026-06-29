@@ -3032,6 +3032,7 @@ async fn read_only_sandbox_does_not_break_git_inspection() {
                 None,
                 None,
                 SandboxProfile::ReadOnly,
+                None,
             )
             .await
         }
@@ -3071,6 +3072,20 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
         "workspace write inside root: {out}"
     );
     assert!(inside.exists(), "expected inside-root write to succeed");
+
+    // WorkspaceWrite must allow toolchain-style atomic moves inside writable roots.
+    // On Landlock ABI v2+, cross-directory rename/link needs the REFER access.
+    let rename_out = execute_bash_async_with_timeout(
+        "mkdir -p a b && printf x > a/tmp && mv a/tmp b/out && cat b/out",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        SandboxProfile::WorkspaceWrite,
+    )
+    .await
+    .expect("workspace-write cross-directory rename should run");
+    assert!(rename_out.contains("exit: 0"), "{rename_out}");
+    assert!(rename_out.contains("x"), "{rename_out}");
 
     if crate::sandbox::is_enforced() {
         // Target a HOME-based path: normally writable by this user, but outside
@@ -3213,6 +3228,54 @@ async fn bash_runner_times_out() {
     .await
     .expect_err("expected timeout");
     assert!(err.contains("timed out after"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn bash_runner_emits_live_output_deltas() {
+    let root = temp_test_dir("bash-live-output");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let live = LiveToolOutput {
+        call_id: "call_live".to_string(),
+        name: "bash".to_string(),
+        tx,
+    };
+    let out = execute_bash_async_prepared(
+        "printf 'out\\n'; printf 'err\\n' >&2",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        None,
+        SandboxProfile::WorkspaceWrite,
+        Some(live),
+    )
+    .await
+    .expect("expected success");
+    assert!(out.contains("exit: 0"), "{out}");
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            AgentEvent::ToolOutputDelta {
+                call_id,
+                name,
+                stream,
+                text,
+            } => {
+                assert_eq!(call_id, "call_live");
+                assert_eq!(name, "bash");
+                match stream.as_str() {
+                    "stdout" => stdout.push_str(&text),
+                    "stderr" => stderr.push_str(&text),
+                    other => panic!("unexpected stream {other}"),
+                }
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+    assert!(stdout.contains("out"), "stdout={stdout:?}");
+    assert!(stderr.contains("err"), "stderr={stderr:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3906,6 +3969,7 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
         None,
         None,
         SandboxProfile::WorkspaceWrite,
+        None,
     )
     .await
     .expect("http request should succeed without xh installed");
@@ -7057,6 +7121,7 @@ async fn bash_tool_honors_input_timeout() {
         None,
         None,
         SandboxProfile::WorkspaceWrite,
+        None,
     )
     .await
     .expect_err("expected input timeout");

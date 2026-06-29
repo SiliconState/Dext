@@ -66,6 +66,7 @@ const FRUGAL_TEXT_TOOL_CAPTURE_CAP: usize = 6_000;
 const READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 16_000;
 const FRUGAL_READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 10_000;
 const PROCESS_STREAM_CAPTURE_CAP: usize = 6_000;
+const LIVE_OUTPUT_EVENT_QUEUE_CAP: usize = 256;
 const EDIT_MATCH_CONTEXT_LINES: usize = 2;
 const EDIT_MATCH_DISPLAY_LIMIT: usize = 8;
 const EDIT_MATCH_CONTEXT_CAP: usize = 6_000;
@@ -461,6 +462,7 @@ pub(crate) fn record_crash_event(event: &AgentEvent) {
         AgentEvent::ToolCallResult {
             call_id, name, ok, ..
         } => Some(format!("tool_result:{name}:{call_id}:ok={ok}")),
+        AgentEvent::ToolOutputDelta { .. } => None,
         AgentEvent::ToolBatchStart { batch_id, .. } => Some(format!("tool_batch_start:{batch_id}")),
         AgentEvent::ToolBatchEnd { batch_id, .. } => Some(format!("tool_batch_end:{batch_id}")),
         AgentEvent::HttpRetry {
@@ -1457,6 +1459,12 @@ enum AgentEvent {
         preview: String,
         content: String,
     },
+    ToolOutputDelta {
+        call_id: String,
+        name: String,
+        stream: String,
+        text: String,
+    },
     LocalAuthPrompt {
         tool: String,
         message: String,
@@ -1547,6 +1555,9 @@ trait EventSink: Send + Sync {
     fn emit(&mut self, event: AgentEvent);
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice;
     fn local_auth_prompt(&mut self, tool: &str, message: &str);
+    fn live_output_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
+        None
+    }
     fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
         self.local_auth_prompt(tool, message);
         LocalAuthSecret::Unavailable
@@ -1629,6 +1640,7 @@ impl EventSink for ConsoleSink {
             }
             AgentEvent::ToolCallStart { .. } => {}
             AgentEvent::ToolCallResult { .. } => {}
+            AgentEvent::ToolOutputDelta { .. } => {}
             AgentEvent::LocalAuthPrompt { .. } => {}
             AgentEvent::ToolBatchStart { .. } => {}
             AgentEvent::ToolBatchEnd { .. } => {}
@@ -1739,6 +1751,9 @@ impl EventSink for JsonSink {
                         ..
                     } => self.stream.text.clear(),
                     _ => {}
+                }
+                if matches!(&event, AgentEvent::ToolOutputDelta { .. }) {
+                    return;
                 }
                 if let Ok(value) = serde_json::to_value(&event) {
                     Self::emit_json_line(&value);
@@ -3827,21 +3842,130 @@ enum ProcWaitOutcome {
     Interrupt,
 }
 
-async fn collect_async_limited<R>(mut reader: R, cap: usize) -> LimitedByteCapture
+#[derive(Clone)]
+struct LiveToolOutput {
+    call_id: String,
+    name: String,
+    tx: tokio::sync::mpsc::Sender<AgentEvent>,
+}
+
+impl LiveToolOutput {
+    fn emit(&self, stream: &'static str, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let _ = self.tx.try_send(AgentEvent::ToolOutputDelta {
+            call_id: self.call_id.clone(),
+            name: self.name.clone(),
+            stream: stream.to_string(),
+            text,
+        });
+    }
+}
+
+struct LiveUtf8Emitter {
+    target: Option<LiveToolOutput>,
+    stream: &'static str,
+    pending: Vec<u8>,
+}
+
+impl LiveUtf8Emitter {
+    fn new(target: Option<LiveToolOutput>, stream: &'static str) -> Self {
+        Self {
+            target,
+            stream,
+            pending: Vec::new(),
+        }
+    }
+
+    fn emit_text(&self, text: String) {
+        if let Some(target) = &self.target {
+            target.emit(self.stream, text);
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.target.is_none() || bytes.is_empty() {
+            return;
+        }
+        self.pending.extend_from_slice(bytes);
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    let text = text.to_string();
+                    self.pending.clear();
+                    self.emit_text(text);
+                    break;
+                }
+                Err(err) => {
+                    let valid = err.valid_up_to();
+                    if valid > 0 {
+                        let text = String::from_utf8_lossy(&self.pending[..valid]).to_string();
+                        self.pending.drain(..valid);
+                        self.emit_text(text);
+                        continue;
+                    }
+                    if let Some(len) = err.error_len() {
+                        let take = len.min(self.pending.len());
+                        let text = String::from_utf8_lossy(&self.pending[..take]).to_string();
+                        self.pending.drain(..take);
+                        self.emit_text(text);
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        if self.pending.len() > 4 {
+            let emit_len = self.pending.len() - 4;
+            let text = String::from_utf8_lossy(&self.pending[..emit_len]).to_string();
+            self.pending.drain(..emit_len);
+            self.emit_text(text);
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&self.pending).to_string();
+        self.pending.clear();
+        self.emit_text(text);
+    }
+}
+
+async fn collect_async_limited<R>(reader: R, cap: usize) -> LimitedByteCapture
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    collect_async_limited_live(reader, cap, None, "stdout").await
+}
+
+async fn collect_async_limited_live<R>(
+    mut reader: R,
+    cap: usize,
+    live_output: Option<LiveToolOutput>,
+    stream: &'static str,
+) -> LimitedByteCapture
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
 
     let mut capture = LimitedByteCapture::new(cap);
+    let mut live = LiveUtf8Emitter::new(live_output, stream);
     let mut buf = [0u8; 64 * 1024];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
-            Ok(n) => capture.push(&buf[..n]),
+            Ok(n) => {
+                capture.push(&buf[..n]);
+                live.push(&buf[..n]);
+            }
             Err(_) => break,
         }
     }
+    live.finish();
     capture
 }
 
@@ -7459,6 +7583,7 @@ fn render_sudo_auth_stderr_hint(stderr: &str) -> String {
     }
 }
 
+#[cfg(test)]
 async fn execute_bash_async_with_timeout(
     cmd: &str,
     root: &Path,
@@ -7466,7 +7591,7 @@ async fn execute_bash_async_with_timeout(
     timeout: std::time::Duration,
     sandbox_profile: SandboxProfile,
 ) -> std::result::Result<String, String> {
-    execute_bash_async_prepared(cmd, root, interrupt, timeout, None, sandbox_profile).await
+    execute_bash_async_prepared(cmd, root, interrupt, timeout, None, sandbox_profile, None).await
 }
 
 async fn execute_bash_async_prepared(
@@ -7476,6 +7601,7 @@ async fn execute_bash_async_prepared(
     timeout: std::time::Duration,
     local_sudo_auth: Option<LocalSudoAuth>,
     sandbox_profile: SandboxProfile,
+    live_output: Option<LiveToolOutput>,
 ) -> std::result::Result<String, String> {
     let mut local_sudo_auth = local_sudo_auth;
     let _sudo_password_pipe = local_sudo_auth.as_mut().and_then(|auth| {
@@ -7524,8 +7650,18 @@ async fn execute_bash_async_prepared(
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
 
-    let out_task = tokio::spawn(collect_async_limited(stdout, PROCESS_STREAM_CAPTURE_CAP));
-    let err_task = tokio::spawn(collect_async_limited(stderr, PROCESS_STREAM_CAPTURE_CAP));
+    let out_task = tokio::spawn(collect_async_limited_live(
+        stdout,
+        PROCESS_STREAM_CAPTURE_CAP,
+        live_output.clone(),
+        "stdout",
+    ));
+    let err_task = tokio::spawn(collect_async_limited_live(
+        stderr,
+        PROCESS_STREAM_CAPTURE_CAP,
+        live_output,
+        "stderr",
+    ));
     let deadline = tokio::time::Instant::now() + timeout;
 
     let status = loop {
@@ -7701,6 +7837,22 @@ fn should_retry_external_tool_with_fallback(name: &str, bin: &str, err: &str) ->
             || lower.contains("invalid option"))
 }
 
+fn live_output_for_tool(
+    sink: &dyn EventSink,
+    call_id: &str,
+    name: &str,
+    _input: &Value,
+) -> Option<LiveToolOutput> {
+    if name != "bash" {
+        return None;
+    }
+    sink.live_output_sender().map(|tx| LiveToolOutput {
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        tx,
+    })
+}
+
 // Per-call execution context; args are distinct types passed straight through
 // from the agent loop, so a struct adds indirection without preventing misuse.
 #[allow(clippy::too_many_arguments)]
@@ -7713,6 +7865,7 @@ async fn execute_builtin_call(
     session_id: Option<String>,
     local_sudo_auth: Option<LocalSudoAuth>,
     sandbox_profile: SandboxProfile,
+    live_output: Option<LiveToolOutput>,
 ) -> std::result::Result<String, String> {
     if name == "bash" {
         let cmd = input["command"].as_str().unwrap_or("").to_string();
@@ -7727,16 +7880,19 @@ async fn execute_builtin_call(
                     timeout,
                     Some(auth),
                     sandbox_profile,
+                    live_output,
                 )
                 .await
             }
             None => {
-                execute_bash_async_with_timeout(
+                execute_bash_async_prepared(
                     &guarded,
                     &root,
                     interrupt,
                     timeout,
+                    None,
                     sandbox_profile,
+                    live_output,
                 )
                 .await
             }
@@ -13982,6 +14138,7 @@ impl Agent {
                                 Some(session_id),
                                 None,
                                 sandbox_profile,
+                                None,
                             )
                             .await
                         });
@@ -14064,6 +14221,12 @@ impl Agent {
                             continue;
                         }
                     }
+                    let live_output = live_output_for_tool(
+                        self.sink.as_ref(),
+                        &plans[idx].event_call_id,
+                        &n,
+                        &inp,
+                    );
                     let r = execute_builtin_call(
                         n,
                         inp,
@@ -14073,6 +14236,7 @@ impl Agent {
                         Some(session_id),
                         local_sudo_auth,
                         self.sandbox_profile,
+                        live_output,
                     )
                     .await;
                     builtin_outputs.insert(idx, r);
