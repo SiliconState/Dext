@@ -4049,6 +4049,100 @@ fn prepare_http_tool_request_accepts_extract_text_flag() {
     assert_eq!(request.output_mode, HttpOutputMode::Text);
 }
 
+#[test]
+fn http_tool_blocks_link_local_and_metadata_destinations_by_default() {
+    let _guard = env_lock();
+    let old = std::env::var_os(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    unsafe {
+        std::env::remove_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    }
+
+    let link_local = reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+    let link_local_err = validate_http_tool_destination(&link_local).err();
+
+    let aws_v6 = reqwest::Url::parse("http://[fd00:ec2::254]/latest/meta-data/").unwrap();
+    let aws_v6_err = validate_http_tool_destination(&aws_v6).err();
+
+    let mapped = reqwest::Url::parse("http://[::ffff:169.254.169.254]/latest/meta-data/").unwrap();
+    let mapped_err = validate_http_tool_destination(&mapped).err();
+
+    let gcp = reqwest::Url::parse("http://metadata.google.internal/computeMetadata/v1/").unwrap();
+    let gcp_err = validate_http_tool_destination(&gcp).err();
+
+    let localhost = reqwest::Url::parse("http://127.0.0.1:1/").unwrap();
+    let localhost_ok = validate_http_tool_destination(&localhost).is_ok();
+
+    unsafe {
+        std::env::set_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, "1");
+    }
+    let override_ok = validate_http_tool_destination(&link_local).is_ok();
+
+    restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old);
+
+    let err = link_local_err.expect("link-local blocked");
+    assert!(err.contains("link-local"), "{err}");
+    let err = aws_v6_err.expect("AWS IPv6 metadata blocked");
+    assert!(err.contains("metadata"), "{err}");
+    let err = mapped_err.expect("IPv4-mapped link-local blocked");
+    assert!(err.contains("IPv4-embedded"), "{err}");
+    let err = gcp_err.expect("metadata alias blocked");
+    assert!(err.contains("metadata alias"), "{err}");
+    assert!(localhost_ok, "localhost remains allowed");
+    assert!(override_ok, "env override allows link-local");
+}
+
+#[test]
+fn builtin_http_tool_blocks_redirect_to_link_local_metadata() {
+    let _guard = env_lock();
+    let old = std::env::var_os(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    unsafe {
+        std::env::remove_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    }
+
+    let root = temp_test_dir("http-redirect-link-local");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = stream.read(&mut buf).expect("read request headers");
+            assert!(n > 0, "client closed before sending headers");
+            request.extend_from_slice(&buf[..n]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n",
+            )
+            .expect("write redirect");
+    });
+
+    let outcome = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(execute_builtin_call(
+            "http".to_string(),
+            json!({"args": [format!("http://{addr}/redirect")]}),
+            root.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+            SandboxProfile::WorkspaceWrite,
+            None,
+        ));
+
+    restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old);
+    let out = outcome.expect_err("redirect to link-local should be blocked");
+    assert!(out.contains("blocked http redirect"), "{out}");
+    assert!(out.contains("169.254.169.254"), "{out}");
+    server.join().expect("server thread");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn builtin_http_tool_executes_without_xh_dependency() {
     let root = temp_test_dir("http-built-in");
@@ -8147,6 +8241,68 @@ fn local_provider_merge_preserves_user_local_context_override_without_retired_ar
     let merged = merge_provider_profile(builtin, stored);
     assert_eq!(merged.context_window, Some(65_536));
     assert!(merged.models.iter().any(|m| m == "custom-local-model"));
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_writes_create_private_auth_and_oauth_files() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("secret-file-modes");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let standalone = PathBuf::from(&root).join("standalone-secret.json");
+        crate::session::atomic_write_secret(&standalone, b"secret")?;
+        assert_eq!(
+            std::fs::metadata(&standalone)?.permissions().mode() & 0o777,
+            0o600
+        );
+
+        let mut store = AuthStore::default();
+        let auth_path = auth_store_path();
+        std::fs::write(&auth_path, b"{}")?;
+        let mut old_auth_perms = std::fs::metadata(&auth_path)?.permissions();
+        old_auth_perms.set_mode(0o644);
+        std::fs::set_permissions(&auth_path, old_auth_perms)?;
+        store.providers.insert(
+            "glm".to_string(),
+            StoredCredential::ApiKey {
+                key: "secret-key".to_string(),
+            },
+        );
+        save_auth_store(&store)?;
+        assert_eq!(
+            std::fs::metadata(&auth_path)?.permissions().mode() & 0o777,
+            0o600
+        );
+
+        let pending_path = crate::provider::pending_oauth_path();
+        std::fs::write(&pending_path, b"{}")?;
+        let mut old_pending_perms = std::fs::metadata(&pending_path)?.permissions();
+        old_pending_perms.set_mode(0o644);
+        std::fs::set_permissions(&pending_path, old_pending_perms)?;
+        crate::provider::save_pending_oauth(
+            "chatgpt",
+            "code-verifier-secret",
+            "oauth-state",
+            "http://localhost:1455/auth/callback",
+        )?;
+        assert_eq!(
+            std::fs::metadata(&pending_path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 #[test]

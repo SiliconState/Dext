@@ -171,10 +171,8 @@ pub(crate) fn command_requests_sudo_password(command: &str) -> bool {
             idx += 1;
             continue;
         }
-        if is_sudo_command_word(word) {
-            if !sudo_segment_has_noninteractive_flag(&words[idx + 1..]) {
-                return true;
-            }
+        if is_sudo_command_word(word) && !sudo_segment_has_noninteractive_flag(&words[idx + 1..]) {
+            return true;
         }
         command_position = false;
         idx += 1;
@@ -223,15 +221,12 @@ fn sudo_segment_has_noninteractive_flag(words_after_sudo: &[String]) -> bool {
 }
 
 fn sudo_short_flags_have_noninteractive(flags: &str) -> bool {
-    for (pos, ch) in flags.char_indices() {
+    for ch in flags.chars() {
         if ch == 'n' {
             return true;
         }
         if sudo_short_option_char_takes_arg(ch) {
             return false;
-        }
-        if pos >= flags.len() {
-            break;
         }
     }
     false

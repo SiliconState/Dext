@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::session::{atomic_write_bytes, dext_state_dir, unix_timestamp_secs};
+use crate::session::{
+    atomic_write_bytes, atomic_write_secret, dext_state_dir, unix_timestamp_secs,
+};
 
 /// `anthropic-version` request header value sent on all Anthropic Messages API calls.
 pub(crate) const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -958,12 +960,7 @@ pub(crate) fn save_auth_store(store: &AuthStore) -> Result<()> {
     let path = auth_store_path();
     let normalized = normalize_auth_store(store.clone());
     let bytes = serde_json::to_vec_pretty(&normalized)?;
-    atomic_write_bytes(&path, &bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    atomic_write_secret(&path, &bytes)?;
     Ok(())
 }
 
@@ -2612,7 +2609,7 @@ pub(crate) fn save_pending_oauth(
         pending_oauth_path().display(),
         state
     );
-    Ok(atomic_write_bytes(&pending_oauth_path(), json.as_bytes())?)
+    Ok(atomic_write_secret(&pending_oauth_path(), json.as_bytes())?)
 }
 
 #[cfg(not(test))]
@@ -2635,7 +2632,7 @@ fn save_pending_oauth(
         pending_oauth_path().display(),
         state
     );
-    Ok(atomic_write_bytes(&pending_oauth_path(), json.as_bytes())?)
+    Ok(atomic_write_secret(&pending_oauth_path(), json.as_bytes())?)
 }
 
 fn load_pending_oauth() -> Option<PendingOAuthState> {
@@ -2657,7 +2654,7 @@ fn load_pending_oauth() -> Option<PendingOAuthState> {
     let age = unix_timestamp_secs().saturating_sub(state.created_at);
     if age > 600 {
         eprintln!("[oauth] pending state expired ({age}s old)");
-        let _ = std::fs::remove_file(&path);
+        remove_pending_oauth_file(&path, "expired pending state");
         return None;
     }
     eprintln!(
@@ -2667,8 +2664,17 @@ fn load_pending_oauth() -> Option<PendingOAuthState> {
     Some(state)
 }
 
+fn remove_pending_oauth_file(path: &Path, context: &str) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("[oauth] failed to remove {context} {}: {e}", path.display()),
+    }
+}
+
 fn clear_pending_oauth() {
-    let _ = std::fs::remove_file(pending_oauth_path());
+    let path = pending_oauth_path();
+    remove_pending_oauth_file(&path, "pending state");
 }
 
 pub(crate) fn cancel_pending_oauth_login() {

@@ -318,13 +318,32 @@ fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
-pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
+fn atomic_write_bytes_with_mode(path: &Path, data: &[u8], secret: bool) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = temp_swap_path(path);
     let write_result = (|| -> io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if secret {
+                options.mode(0o600);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = secret;
+
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        if secret {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(data)?;
         file.sync_all()?;
         drop(file);
@@ -334,6 +353,14 @@ pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     write_result
+}
+
+pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> io::Result<()> {
+    atomic_write_bytes_with_mode(path, data, false)
+}
+
+pub(crate) fn atomic_write_secret(path: &Path, data: &[u8]) -> io::Result<()> {
+    atomic_write_bytes_with_mode(path, data, true)
 }
 
 fn log_detail(s: &str) -> String {

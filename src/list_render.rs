@@ -52,17 +52,17 @@ impl ListOptions {
 pub(crate) fn use_color() -> bool {
     use std::io::IsTerminal;
     std::env::var_os("NO_COLOR").is_none()
-        && std::env::var_os("TERM").map_or(true, |t| t != "dumb")
+        && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
         && std::io::stdout().is_terminal()
 }
 
 /// Terminal width from the controlling TTY, clamped to a sane default for
 /// non-TTY output (pipes, redirects, tests).
 pub(crate) fn terminal_width() -> usize {
-    if let Some((cols, _)) = crossterm::terminal::size().ok() {
-        if cols >= MIN_WIDTH as u16 {
-            return cols as usize;
-        }
+    if let Ok((cols, _)) = crossterm::terminal::size()
+        && cols >= MIN_WIDTH as u16
+    {
+        return cols as usize;
     }
     DEFAULT_WIDTH
 }

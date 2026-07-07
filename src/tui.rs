@@ -7074,7 +7074,7 @@ fn render_local_auth_overlay(frame: &mut ratatui::Frame, state: &TuiState, area:
         return;
     }
     let text = local_auth_overlay_text(state);
-    let width = area.width.min(72).max(20);
+    let width = area.width.clamp(20, 72);
     let height = (text.lines.len() as u16)
         .saturating_add(2)
         .min(area.height.max(1));
@@ -8284,15 +8284,19 @@ impl Drop for TerminalGuard {
     }
 }
 
+struct BackendViewerIo<'a> {
+    agent_input: &'a tokio::sync::mpsc::UnboundedSender<FromTui>,
+    runtime_control_input: &'a tokio::sync::mpsc::UnboundedSender<String>,
+    steering_input: &'a tokio::sync::mpsc::UnboundedSender<String>,
+    interrupt: &'a Arc<std::sync::atomic::AtomicBool>,
+}
+
 async fn run_backend_viewer(
     state: &mut TuiState,
     live_rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
     ev_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ToTui>,
     key_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    agent_input: &tokio::sync::mpsc::UnboundedSender<FromTui>,
-    runtime_control_input: &tokio::sync::mpsc::UnboundedSender<String>,
-    steering_input: &tokio::sync::mpsc::UnboundedSender<String>,
-    interrupt: &Arc<std::sync::atomic::AtomicBool>,
+    channels: BackendViewerIo<'_>,
 ) -> Result<()> {
     let _guard = AlternateScreenGuard::new()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -8320,10 +8324,10 @@ async fn run_backend_viewer(
                         Event::Key(k) => handle_key(
                             state,
                             k,
-                            agent_input,
-                            runtime_control_input,
-                            steering_input,
-                            interrupt,
+                            channels.agent_input,
+                            channels.runtime_control_input,
+                            channels.steering_input,
+                            channels.interrupt,
                         ),
                         Event::Mouse(mouse) => handle_mouse(state, mouse),
                         Event::Paste(pasted) => handle_paste(state, pasted),
@@ -8557,10 +8561,12 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                 &mut live_rx,
                 &mut ev_rx,
                 &mut key_rx,
-                &in_tx,
-                &direct_runtime_control_tx,
-                &direct_steer_tx,
-                &interrupt,
+                BackendViewerIo {
+                    agent_input: &in_tx,
+                    runtime_control_input: &direct_runtime_control_tx,
+                    steering_input: &direct_steer_tx,
+                    interrupt: &interrupt,
+                },
             )
             .await?;
             continue;
@@ -8578,9 +8584,8 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         tokio::select! {
             biased;
             maybe_ev = ev_rx.recv() => {
-                match maybe_ev {
-                    Some(msg) => apply_tui_message(&mut state, msg),
-                    None => {}
+                if let Some(msg) = maybe_ev {
+                    apply_tui_message(&mut state, msg);
                 }
             }
             maybe_key = key_rx.recv() => {

@@ -46,7 +46,7 @@ use tools::{
 
 #[cfg(test)]
 use provider::{
-    ProviderCatalog, StoredCredential, login_provider_with_key, normalize_login_secret,
+    AuthStore, ProviderCatalog, StoredCredential, login_provider_with_key, normalize_login_secret,
     oauth_exchange_failure_result_message, resolve_provider_api_key, save_auth_store,
     save_provider_catalog,
 };
@@ -55,6 +55,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +76,8 @@ const READ_SYMBOL_SUGGESTION_LIMIT: usize = 5;
 const CARGO_DIAGNOSTIC_SUMMARY_LIMIT: usize = 20;
 const HTTP_EXTRACT_INPUT_CAP: usize = 128_000;
 const HTTP_EXTRACT_OUTPUT_CAP: usize = 24_000;
+const HTTP_TOOL_REDIRECT_LIMIT: usize = 10;
+const HTTP_TOOL_ALLOW_LINK_LOCAL_ENV: &str = "DEXT_HTTP_ALLOW_LINK_LOCAL";
 const HOOK_OUTPUT_CAPTURE_CAP: usize = 4_000;
 const HTTP_ERROR_BODY_CAP: usize = 4_000;
 const PROJECT_CONTEXT_CAP: usize = 12_000;
@@ -1811,13 +1814,13 @@ impl EventSink for JsonSink {
     }
 
     fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
-        if self.mode == OutputMode::StreamJson {
-            if let Ok(value) = serde_json::to_value(AgentEvent::LocalAuthPrompt {
+        if self.mode == OutputMode::StreamJson
+            && let Ok(value) = serde_json::to_value(AgentEvent::LocalAuthPrompt {
                 tool: tool.to_string(),
                 message: message.to_string(),
-            }) {
-                Self::emit_json_line(&value);
-            }
+            })
+        {
+            Self::emit_json_line(&value);
         }
         self.inner.request_local_auth_secret(tool, message)
     }
@@ -4863,14 +4866,170 @@ struct PreparedHttpToolRequest {
     output_mode: HttpOutputMode,
 }
 
+fn http_tool_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > HTTP_TOOL_REDIRECT_LIMIT {
+            return attempt.error("too many redirects");
+        }
+        if let Err(reason) = validate_http_tool_destination(attempt.url()) {
+            let url = attempt.url().to_string();
+            return attempt.error(format!("blocked http redirect to {url}: {reason}"));
+        }
+        attempt.follow()
+    })
+}
+
 fn http_tool_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .dns_resolver(Arc::new(HttpToolResolver))
+            .redirect(http_tool_redirect_policy())
             .build()
             .expect("build http tool client")
     })
+}
+
+struct HttpToolResolver;
+
+impl reqwest::dns::Resolve for HttpToolResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            if !http_tool_allow_link_local() && http_tool_metadata_host(&host) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("blocked http DNS resolution for host '{host}': cloud metadata alias"),
+                )
+                .into());
+            }
+
+            if let Some(ip) = http_tool_host_ip_literal(&host) {
+                if !http_tool_allow_link_local()
+                    && let Some(reason) = http_tool_blocked_ip_reason(ip)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("host '{host}' is {ip} ({reason})"),
+                    )
+                    .into());
+                }
+                let addrs = vec![SocketAddr::new(ip, 0)];
+                return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
+            }
+
+            let host_for_lookup = host.clone();
+            let addrs = tokio::task::spawn_blocking(move || {
+                (host_for_lookup.as_str(), 0)
+                    .to_socket_addrs()
+                    .map(|iter| iter.collect::<Vec<SocketAddr>>())
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("HTTP DNS resolver task failed: {e}")))?
+            .map_err(|e| io::Error::other(format!("HTTP DNS lookup for {host} failed: {e}")))?;
+
+            if !http_tool_allow_link_local()
+                && let Some(reason) = http_tool_blocked_addrs_reason(&host, &addrs)
+            {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason).into());
+            }
+
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn http_tool_allow_link_local() -> bool {
+    env_flag_default(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, false)
+}
+
+fn validate_http_tool_destination(url: &reqwest::Url) -> std::result::Result<(), String> {
+    if http_tool_allow_link_local() {
+        return Ok(());
+    }
+    if let Some(reason) = http_tool_blocked_destination_reason(url) {
+        Err(format!(
+            "{reason}; set {HTTP_TOOL_ALLOW_LINK_LOCAL_ENV}=1 to allow link-local/metadata HTTP targets"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn http_tool_blocked_destination_reason(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?;
+    if http_tool_metadata_host(host) {
+        return Some(format!("host '{host}' is a cloud metadata alias"));
+    }
+    if let Some(ip) = http_tool_host_ip_literal(host) {
+        return http_tool_blocked_ip_reason(ip).map(str::to_string);
+    }
+    None
+}
+
+fn http_tool_host_ip_literal(host: &str) -> Option<IpAddr> {
+    let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip_literal = ip_host.split('%').next().unwrap_or(ip_host);
+    ip_literal.parse::<IpAddr>().ok()
+}
+
+fn http_tool_blocked_addrs_reason(host: &str, addrs: &[SocketAddr]) -> Option<String> {
+    for addr in addrs {
+        let ip = addr.ip();
+        if let Some(reason) = http_tool_blocked_ip_reason(ip) {
+            return Some(format!("host '{host}' resolves to {ip} ({reason})"));
+        }
+    }
+    None
+}
+
+fn http_tool_metadata_host(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    matches!(normalized.as_str(), "metadata" | "metadata.google.internal")
+}
+
+fn http_tool_blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => http_tool_blocked_ipv4_reason(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = http_tool_ipv6_embedded_ipv4(v6)
+                && http_tool_blocked_ipv4_reason(v4).is_some()
+            {
+                return Some("IPv4-embedded IPv6 metadata/link-local address");
+            }
+            let first = v6.segments()[0];
+            if first & 0xffc0 == 0xfe80 {
+                Some("IPv6 link-local address")
+            } else if v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
+                Some("AWS IPv6 metadata address")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn http_tool_blocked_ipv4_reason(v4: Ipv4Addr) -> Option<&'static str> {
+    if v4.is_link_local() {
+        Some("IPv4 link-local address")
+    } else if v4 == Ipv4Addr::new(100, 100, 100, 200) {
+        Some("cloud metadata address")
+    } else {
+        None
+    }
+}
+
+fn http_tool_ipv6_embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = v6.segments();
+    if segments[..5] != [0, 0, 0, 0, 0] || !matches!(segments[5], 0 | 0xffff) {
+        return None;
+    }
+    Some(Ipv4Addr::new(
+        (segments[6] >> 8) as u8,
+        segments[6] as u8,
+        (segments[7] >> 8) as u8,
+        segments[7] as u8,
+    ))
 }
 
 fn parse_http_method_token(token: &str) -> Option<reqwest::Method> {
@@ -5268,12 +5427,27 @@ fn extract_response_text(body: String, content_type: Option<&str>) -> String {
     }
 }
 
+fn format_http_request_error(err: reqwest::Error) -> String {
+    let mut message = format!("HTTP request failed: {err}");
+    let mut source = std::error::Error::source(&err);
+    while let Some(err) = source {
+        let detail = err.to_string();
+        if !detail.is_empty() && !message.contains(&detail) {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        source = err.source();
+    }
+    message
+}
+
 async fn execute_http_tool_async(
     input: &Value,
     interrupt: Arc<AtomicBool>,
     default_timeout: std::time::Duration,
 ) -> std::result::Result<String, String> {
     let request = prepare_http_tool_request(input, default_timeout)?;
+    validate_http_tool_destination(&request.url)?;
     if interrupt.load(Ordering::SeqCst) {
         return Err("killed by interrupt (^C)".to_string());
     }
@@ -5298,10 +5472,7 @@ async fn execute_http_tool_async(
         None => {}
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    let resp = req.send().await.map_err(format_http_request_error)?;
     let status = resp.status();
     let content_type = resp
         .headers()
@@ -16962,7 +17133,7 @@ fn create_branch_text(
     name: Option<&str>,
 ) -> Result<String> {
     let mode = FocusMode::Carry(vec!["failures".into(), "decisions".into(), "files".into()]);
-    let label = work_map_selection_label(&selected_waypoints(map, selection));
+    let label = work_map_selection_label(selected_waypoints(map, selection));
     let path = create_track_from_work_map(agent, map, selection, name, &mode)?;
     let branch_name = path
         .file_stem()
