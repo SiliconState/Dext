@@ -119,6 +119,7 @@ fn test_agent(root: &Path) -> Agent {
         provider_health: ProviderHealthLedger::default(),
         track_origin: None,
         privacy: PrivacyPolicy::default(),
+        git_credential: None,
         checkpoint_cache: git_checkpoints::RepoRootCache::new(),
         checkpoint_ordinal: 0,
         prompt_scan_cache: Mutex::new(None),
@@ -700,6 +701,10 @@ fn sudo_askpass_script_reads_fifo_and_never_echoes_chat_guidance() {
 fn sudo_password_fifo_is_0600_and_unlinkable() {
     let root = temp_test_dir("sudo-fifo-perms");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    // session_sudo_dir resolves through DEXT_HOME; hold the env lock so a
+    // concurrent test mutating it can't redirect the fifo into a temp root
+    // that gets deleted mid-test.
+    let _guard = env_lock();
     let path = create_sudo_password_fifo(&root, "test-session").expect("create fifo");
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(&path)
@@ -711,6 +716,244 @@ fn sudo_password_fifo_is_0600_and_unlinkable() {
     assert!(path.exists());
     std::fs::remove_file(&path).expect("unlink fifo");
     assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn git_credential_input_parses_token_and_username_forms() {
+    let cred = parse_git_credential_input("ghp_abcdef1234567890\n");
+    assert_eq!(cred.username, "x-access-token");
+    assert_eq!(cred.secret, "ghp_abcdef1234567890");
+
+    let cred = parse_git_credential_input("oauth2:glpat-abc123");
+    assert_eq!(cred.username, "oauth2");
+    assert_eq!(cred.secret, "glpat-abc123");
+
+    // URL-shaped and colon-bearing passwords must not be mis-split.
+    let cred = parse_git_credential_input("https://example.com/secret");
+    assert_eq!(cred.username, "x-access-token");
+    assert_eq!(cred.secret, "https://example.com/secret");
+}
+
+#[test]
+fn git_credential_failure_detection_matches_prompt_and_auth_errors() {
+    assert!(output_indicates_git_credential_failure(
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+    ));
+    assert!(output_indicates_git_credential_failure(
+        "fatal: could not read Password for 'https://x@github.com': No such device or address"
+    ));
+    assert!(output_indicates_git_credential_failure(
+        "remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/x/y.git/'"
+    ));
+    assert!(!output_indicates_git_credential_failure(
+        "exit: 0\n--- stdout ---\nEverything up-to-date"
+    ));
+    assert!(!output_indicates_git_credential_failure(
+        "npm ERR! terminal prompts disabled while installing dependency"
+    ));
+    assert!(!output_indicates_git_credential_failure(
+        "fatal: could not read Username for 'http://insecure.example': terminal prompts disabled"
+    ));
+}
+
+#[test]
+fn git_credential_scope_limits_install_and_rejection_to_matching_hosts() {
+    let hosts = git_credential_hosts_for_failure(
+        &[],
+        "fatal: Authentication failed for 'https://user@GitHub.COM/owner/repo.git/'",
+    );
+    assert_eq!(hosts, vec!["github.com"]);
+
+    let cred = LocalGitCredential {
+        username: "x-access-token".to_string(),
+        secret: "test-token".to_string(),
+        hosts: vec!["github.com".to_string()],
+    };
+    assert!(bash_command_should_install_git_credential(
+        "set -euo pipefail\ngit -C repo push https://github.com/owner/repo.git",
+        &cred
+    ));
+    assert!(!bash_command_should_install_git_credential(
+        "git push https://gitlab.com/owner/repo.git",
+        &cred
+    ));
+    assert!(!bash_command_should_install_git_credential(
+        "printf '%s\\n' hi; git push https://github.com/owner/repo.git",
+        &cred
+    ));
+    assert!(!bash_command_should_install_git_credential(
+        "git push http://github.com/owner/repo.git",
+        &cred
+    ));
+    assert!(!bash_command_should_install_git_credential(
+        "cd repo && git push https://github.com/owner/repo.git",
+        &cred
+    ));
+    assert!(!bash_command_should_install_git_credential(
+        "git push https://github.com/owner/repo.git > /tmp/out",
+        &cred
+    ));
+    assert!(!bash_command_should_install_git_credential(
+        "git push https://github.com/owner/repo.git | cat",
+        &cred
+    ));
+    assert!(!bash_command_should_install_git_credential(
+        "GIT_CONFIG_COUNT=1 git push https://github.com/owner/repo.git",
+        &cred
+    ));
+    assert!(!bash_command_should_install_git_credential(
+        "git -c credential.helper='!cat /tmp/leak' push https://github.com/owner/repo.git",
+        &cred
+    ));
+    assert!(
+        stored_git_credential_for_bash_call(
+            "bash",
+            &json!({"command": "command git ls-remote https://github.com/owner/repo.git"}),
+            Some(&cred),
+        )
+        .is_some()
+    );
+    assert!(
+        stored_git_credential_for_bash_call(
+            "read_file",
+            &json!({"path": "src/main.rs"}),
+            Some(&cred),
+        )
+        .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_credential_helper_script_answers_get_from_fifo_only() {
+    let script = git_credential_helper_script_content();
+    assert!(script.contains("DEXT_GIT_CRED_FIFO"), "{script}");
+    assert!(script.contains("DEXT_GIT_CRED_HOSTS"), "{script}");
+    assert!(script.contains("[ \"$protocol\" = https ]"), "{script}");
+    assert!(!script.contains("/dev/tty"), "{script}");
+    // Only `get` is answered; store/erase silently succeed without state.
+    assert!(
+        script.contains("if [ \"$op\" != get ]; then exit 0; fi"),
+        "{script}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_credential_helper_feeds_git_credential_fill() {
+    let root = temp_test_dir("git-cred-helper");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    // Isolate the session state dir (where the helper script and FIFO live)
+    // from the shared ./.dext tree so concurrent tests' state cleanup can't
+    // unlink the FIFO mid-test.
+    let _guard = env_lock();
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
+    let cred = LocalGitCredential {
+        username: "x-access-token".to_string(),
+        secret: "test-token-not-a-real-secret".to_string(),
+        hosts: vec!["example.invalid".to_string()],
+    };
+    let runtime = prepare_git_credential_helper(&root, "test-session", cred);
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let runtime = runtime.expect("prepare helper");
+
+    assert!(
+        runtime
+            .env
+            .iter()
+            .any(|(k, v)| k == "GIT_CONFIG_KEY_0" && v == "credential.helper")
+    );
+    assert!(
+        runtime
+            .env
+            .iter()
+            .any(|(k, v)| k == "GIT_CONFIG_VALUE_0" && v.is_empty())
+    );
+    assert!(
+        runtime
+            .env
+            .iter()
+            .any(|(k, v)| k == "GIT_CONFIG_VALUE_1" && v.starts_with('!'))
+    );
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("credential").arg("fill").current_dir(&root);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // Isolate from the developer's real credential helpers.
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    for (k, v) in &runtime.env {
+        cmd.env(k, v);
+    }
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn git credential fill");
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"protocol=https\nhost=example.invalid\n\n")
+            .expect("write request");
+    }
+    // Hard deadline so a broken helper can never wedge the whole suite.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("poll git credential fill") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("git credential fill did not finish within 30s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut so) = child.stdout.take() {
+            let _ = so.read_to_string(&mut stdout);
+        }
+        if let Some(mut se) = child.stderr.take() {
+            let _ = se.read_to_string(&mut stderr);
+        }
+    }
+    assert!(status.success(), "status {status:?}: {stderr}");
+    assert!(stdout.contains("username=x-access-token"), "{stdout}");
+    assert!(
+        stdout.contains("password=test-token-not-a-real-secret"),
+        "{stdout}"
+    );
+    drop(runtime);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_transcript_files_are_written_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_test_dir("session-transcript-perms");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let _guard = env_lock();
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
+    let agent = test_agent(&root);
+    let path = root.join("exported-session.jsonl");
+    let saved = agent.save_session_to_path(&path);
+    restore_env_var("DEXT_HOME", old_dext_home);
+    saved.expect("save session");
+    let mode = std::fs::metadata(&path)
+        .expect("stat session file")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "session transcript mode {mode:o}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -761,6 +1004,10 @@ fn sudo_command_shim_invokes_real_sudo_noninteractive_and_is_private() {
     real_perms.set_mode(0o700);
     std::fs::set_permissions(&real_sudo, real_perms).expect("chmod fake sudo");
 
+    // session_sudo_dir resolves through DEXT_HOME; hold the env lock so a
+    // concurrent test mutating it can't point the shim into a temp root that
+    // gets deleted before the shim is executed below.
+    let _guard = env_lock();
     let bin_dir = write_sudo_command_shim(&root, "test-session", &real_sudo).expect("write shim");
     let shim = bin_dir.join("sudo");
     let output = Command::new(&shim).arg("true").output().expect("run shim");
@@ -800,6 +1047,7 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
 
     assert_eq!(route, InteractiveInputRoute::Dropped);
@@ -813,6 +1061,7 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
     assert_eq!(route, InteractiveInputRoute::Dropped);
     assert!(runtime_control_rx.try_recv().is_err());
@@ -825,6 +1074,7 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
     assert_eq!(route, InteractiveInputRoute::Dropped);
     assert!(runtime_control_rx.try_recv().is_err());
@@ -837,6 +1087,7 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
     let InteractiveInputRoute::UnsupportedBusySlash(warning) = route else {
         panic!("unexpected route: {route:?}");
@@ -855,6 +1106,7 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
     assert_eq!(route, InteractiveInputRoute::RuntimeControlQueued);
     assert_eq!(
@@ -892,6 +1144,7 @@ fn busy_console_input_allows_public_copied_text_as_steering() {
             &input_tx,
             &runtime_control_tx,
             &steering_tx,
+            &mut None,
         );
 
         assert_eq!(route, InteractiveInputRoute::SteeringQueued);
@@ -899,6 +1152,81 @@ fn busy_console_input_allows_public_copied_text_as_steering() {
         assert!(runtime_control_rx.try_recv().is_err());
         assert!(input_rx.try_recv().is_err());
     }
+}
+
+#[test]
+fn idle_console_input_withholds_secret_until_repeated() {
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+    let busy = AtomicBool::new(false);
+    let mut pending_secret = None;
+
+    // First Enter with a token-shaped line is withheld even while idle — this
+    // is exactly how a pasted GitHub PAT once reached the model transcript.
+    let route = route_interactive_input_line(
+        "\"ghp_0123456789abcdefghijABCDEFGHIJ012345\"\r\n".to_string(),
+        &busy,
+        &input_tx,
+        &runtime_control_tx,
+        &steering_tx,
+        &mut pending_secret,
+    );
+    assert_eq!(route, InteractiveInputRoute::SecretWithheld);
+    assert!(input_rx.try_recv().is_err());
+
+    // An identical repeat is an explicit confirmation and goes through.
+    let route = route_interactive_input_line(
+        "\"ghp_0123456789abcdefghijABCDEFGHIJ012345\"\r\n".to_string(),
+        &busy,
+        &input_tx,
+        &runtime_control_tx,
+        &steering_tx,
+        &mut pending_secret,
+    );
+    assert_eq!(route, InteractiveInputRoute::Submitted);
+    assert!(input_rx.try_recv().is_ok());
+    assert_eq!(pending_secret, None);
+
+    // Ordinary prose is unaffected.
+    let route = route_interactive_input_line(
+        "clean up repo and push to remote\n".to_string(),
+        &busy,
+        &input_tx,
+        &runtime_control_tx,
+        &steering_tx,
+        &mut pending_secret,
+    );
+    assert_eq!(route, InteractiveInputRoute::Submitted);
+    assert!(input_rx.try_recv().is_ok());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_children_get_no_terminal_and_no_git_prompts() {
+    let root = temp_test_dir("bash-no-tty");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let out = execute_bash_async_prepared(
+        "printf 'GTP=%s\\n' \"${GIT_TERMINAL_PROMPT:-unset}\"; \
+         printf 'ASKPASS=%s\\n' \"${SSH_ASKPASS_REQUIRE:-unset}\"; \
+         if read -r -t 1 _line < /dev/tty 2>/dev/null; then echo TTY=open; else echo TTY=closed; fi",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(10),
+        None,
+        SandboxProfile::WorkspaceWrite,
+        None,
+        &[],
+    )
+    .await
+    .expect("bash runs");
+    assert!(out.contains("GTP=0"), "{out}");
+    assert!(out.contains("ASKPASS=never"), "{out}");
+    // setsid detached the child from the controlling terminal, so /dev/tty
+    // cannot be opened and a would-be credential prompt fails instantly
+    // instead of hanging or scribbling over the TUI.
+    assert!(out.contains("TTY=closed"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1004,6 +1332,7 @@ fn non_tui_busy_input_routes_steering_and_runtime_controls_immediately() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
 
     assert_eq!(route, InteractiveInputRoute::SteeringQueued);
@@ -1020,6 +1349,7 @@ fn non_tui_busy_input_routes_steering_and_runtime_controls_immediately() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
     assert_eq!(route, InteractiveInputRoute::RuntimeControlQueued);
     assert_eq!(
@@ -1035,6 +1365,7 @@ fn non_tui_busy_input_routes_steering_and_runtime_controls_immediately() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
     assert_eq!(route, InteractiveInputRoute::RuntimeControlQueued);
     assert_eq!(
@@ -1050,6 +1381,7 @@ fn non_tui_busy_input_routes_steering_and_runtime_controls_immediately() {
         &input_tx,
         &runtime_control_tx,
         &steering_tx,
+        &mut None,
     );
     let InteractiveInputRoute::UnsupportedBusySlash(warning) = route else {
         panic!("unexpected route: {route:?}");
@@ -3189,6 +3521,7 @@ async fn read_only_sandbox_does_not_break_git_inspection() {
                 None,
                 None,
                 None,
+                None,
                 SandboxProfile::ReadOnly,
                 None,
             )
@@ -3406,6 +3739,7 @@ async fn bash_runner_emits_live_output_deltas() {
         None,
         SandboxProfile::WorkspaceWrite,
         Some(live),
+        &[],
     )
     .await
     .expect("expected success");
@@ -4131,6 +4465,7 @@ fn builtin_http_tool_blocks_redirect_to_link_local_metadata() {
             None,
             None,
             None,
+            None,
             SandboxProfile::WorkspaceWrite,
             None,
         ));
@@ -4217,6 +4552,7 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
         }),
         root.clone(),
         Arc::new(AtomicBool::new(false)),
+        None,
         None,
         None,
         None,
@@ -7386,6 +7722,7 @@ async fn bash_tool_honors_input_timeout() {
         json!({"command": "sleep 2", "timeout": 1}),
         root.clone(),
         Arc::new(AtomicBool::new(false)),
+        None,
         None,
         None,
         None,

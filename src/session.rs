@@ -266,6 +266,10 @@ pub(crate) fn session_sudo_dir(root: &Path, session_id: &str) -> PathBuf {
     session_state_dir(root, session_id).join("sudo")
 }
 
+pub(crate) fn session_git_auth_dir(root: &Path, session_id: &str) -> PathBuf {
+    session_state_dir(root, session_id).join("git-auth")
+}
+
 pub(crate) fn session_todo_path(root: &Path, session_id: &str) -> PathBuf {
     session_state_dir(root, session_id).join("DEXT.todo.json")
 }
@@ -423,7 +427,7 @@ fn rotate_log_archives(path: &Path, current: &[u8], keep: u32) -> io::Result<()>
     }
     let first_archive = path.with_extension("log.1");
     let _ = std::fs::remove_file(&first_archive);
-    atomic_write_bytes(&first_archive, current)
+    atomic_write_secret(&first_archive, current)
 }
 
 pub(crate) fn append_log_line(path: &Path, line: &str) {
@@ -437,11 +441,16 @@ pub(crate) fn append_log_line(path: &Path, line: &str) {
         {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        // Log lines can embed command text and tool summaries; keep them
+        // private like the transcript files.
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut f) = options.open(path) {
             let mut buf = String::with_capacity(needed);
             buf.push_str(line);
             buf.push('\n');
@@ -464,7 +473,7 @@ pub(crate) fn append_log_line(path: &Path, line: &str) {
         match rotate_log_archives(path, &existing, archives) {
             Ok(()) => {
                 let fresh = format!("{line}\n");
-                let _ = atomic_write_bytes(path, fresh.as_bytes());
+                let _ = atomic_write_secret(path, fresh.as_bytes());
                 return;
             }
             Err(e) => {
@@ -479,7 +488,7 @@ pub(crate) fn append_log_line(path: &Path, line: &str) {
     }
 
     let data = cap_latest_log_buffer(data);
-    let _ = atomic_write_bytes(path, data.as_bytes());
+    let _ = atomic_write_secret(path, data.as_bytes());
 }
 
 pub(crate) fn append_log_event(path: &Path, event: &str, detail: &str) {

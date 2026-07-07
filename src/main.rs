@@ -96,6 +96,7 @@ const TOOL_UI_CONTENT_CAP: usize = 8_000;
 const SUDO_ASKPASS_ENV: &str = "DEXT_SUDO_ASKPASS";
 const SUDO_PASSWORD_FIFO_ENV: &str = "DEXT_SUDO_PASSWORD_FIFO";
 const SUDO_AUTH_GUIDANCE: &str = "sudo auth is local only. If this command needs sudo, use the local prompt Dext opens; never type sudo passwords into chat/steering input.";
+const GIT_AUTH_GUIDANCE: &str = "git needs credentials for an HTTPS remote. Enter the token/password here (masked, kept local, never sent to the model). Use username:token if a specific username is required; otherwise the username defaults to x-access-token. Never paste tokens into chat input.";
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
 pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "DEXT_ALLOW_BREAK_SYSTEM_PACKAGES";
 const AUTH_CIRCUIT_BREAKER_THRESHOLD: usize = 2;
@@ -1152,6 +1153,7 @@ enum InteractiveInputRoute {
     RuntimeControlQueued,
     SteeringQueued,
     UnsupportedBusySlash(String),
+    SecretWithheld,
     Dropped,
 }
 
@@ -1161,12 +1163,15 @@ fn route_interactive_input_line(
     input_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     runtime_control_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     steering_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    pending_secret_send: &mut Option<String>,
 ) -> InteractiveInputRoute {
     let trimmed = line.trim().to_string();
     if trimmed.is_empty() {
+        *pending_secret_send = None;
         return InteractiveInputRoute::Dropped;
     }
     if agent_busy.load(Ordering::SeqCst) {
+        *pending_secret_send = None;
         if is_active_runtime_control_command(&trimmed) {
             let commands = parse_active_runtime_control_sequence(&trimmed)
                 .unwrap_or_else(|| vec![trimmed.clone()]);
@@ -1190,7 +1195,15 @@ fn route_interactive_input_line(
         } else {
             InteractiveInputRoute::Dropped
         }
+    } else if text_is_potential_local_secret(&trimmed)
+        && pending_secret_send.as_deref() != Some(trimmed.as_str())
+    {
+        // Same double-confirm as the TUI: never forward credential-looking
+        // input to the model on the first Enter.
+        *pending_secret_send = Some(trimmed);
+        InteractiveInputRoute::SecretWithheld
     } else if input_tx.send(trimmed).is_ok() {
+        *pending_secret_send = None;
         InteractiveInputRoute::Submitted
     } else {
         InteractiveInputRoute::Dropped
@@ -3973,10 +3986,32 @@ where
     capture
 }
 
+// Children run in a new *session*, not merely a new process group: setsid()
+// also detaches them from Dext's controlling terminal, so nothing they spawn
+// can read from or paint over the TUI via /dev/tty (git credential prompts
+// did exactly that — the prompt text garbled the input box while git hung on
+// a terminal read that could never be answered). setsid() implies a fresh
+// process group with pgid == pid, so the pgid-based cleanup in
+// terminate_process_group_after_exit keeps working unchanged; setpgid is the
+// fallback if setsid is ever refused.
+#[cfg(unix)]
+fn detach_session_pre_exec() -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    || {
+        unsafe {
+            if libc::setsid() == -1 {
+                let _ = libc::setpgid(0, 0);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn configure_std_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
-    cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(detach_session_pre_exec());
+    }
 }
 
 #[cfg(not(unix))]
@@ -3984,11 +4019,24 @@ fn configure_std_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
 fn configure_tokio_process_group(cmd: &mut tokio::process::Command) {
-    cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(detach_session_pre_exec());
+    }
 }
 
 #[cfg(not(unix))]
 fn configure_tokio_process_group(_cmd: &mut tokio::process::Command) {}
+
+/// Forbid interactive credential prompting in tool children. They have no
+/// usable terminal (see detach_session_pre_exec), so a git/ssh prompt could
+/// only hang the call until timeout; with these set, git instead fails in
+/// milliseconds with an explicit "terminal prompts disabled" error that the
+/// model can surface and Dext can react to with a local credential prompt.
+fn deny_interactive_prompt_env(cmd: &mut tokio::process::Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env("GCM_INTERACTIVE", "never");
+}
 
 #[cfg(unix)]
 fn signal_process_group(pid: u32, signal: libc::c_int) {
@@ -7501,43 +7549,48 @@ fn sudo_secret_random_suffix() -> std::result::Result<String, String> {
 }
 
 #[cfg(unix)]
-fn create_sudo_password_fifo(
-    root: &Path,
-    session_id: &str,
-) -> std::result::Result<PathBuf, String> {
+fn create_secret_fifo_in_dir(dir: &Path, label: &str) -> std::result::Result<PathBuf, String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = session_sudo_dir(root, session_id);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("prepare local sudo prompt dir: {e}"))?;
-    let mut dir_perms = std::fs::metadata(&dir)
-        .map_err(|e| format!("metadata sudo prompt dir: {e}"))?
+    std::fs::create_dir_all(dir).map_err(|e| format!("prepare {label} prompt dir: {e}"))?;
+    let mut dir_perms = std::fs::metadata(dir)
+        .map_err(|e| format!("metadata {label} prompt dir: {e}"))?
         .permissions();
     dir_perms.set_mode(0o700);
-    std::fs::set_permissions(&dir, dir_perms).map_err(|e| format!("chmod sudo prompt dir: {e}"))?;
+    std::fs::set_permissions(dir, dir_perms)
+        .map_err(|e| format!("chmod {label} prompt dir: {e}"))?;
 
     for _ in 0..16 {
         let path = dir.join(format!("password-{}.fifo", sudo_secret_random_suffix()?));
         let c_path = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| "sudo password pipe path contains NUL".to_string())?;
+            .map_err(|_| format!("{label} pipe path contains NUL"))?;
         let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
         if rc == 0 {
             let mut perms = std::fs::metadata(&path)
-                .map_err(|e| format!("metadata sudo password pipe: {e}"))?
+                .map_err(|e| format!("metadata {label} pipe: {e}"))?
                 .permissions();
             perms.set_mode(0o600);
             std::fs::set_permissions(&path, perms)
-                .map_err(|e| format!("chmod sudo password pipe: {e}"))?;
+                .map_err(|e| format!("chmod {label} pipe: {e}"))?;
             return Ok(path);
         }
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::AlreadyExists {
             continue;
         }
-        return Err(format!("create sudo password pipe: {err}"));
+        return Err(format!("create {label} pipe: {err}"));
     }
-    Err("create sudo password pipe: exhausted unique names".to_string())
+    Err(format!("create {label} pipe: exhausted unique names"))
+}
+
+#[cfg(unix)]
+fn create_sudo_password_fifo(
+    root: &Path,
+    session_id: &str,
+) -> std::result::Result<PathBuf, String> {
+    create_secret_fifo_in_dir(&session_sudo_dir(root, session_id), "sudo password")
 }
 
 #[cfg(not(unix))]
@@ -7610,6 +7663,528 @@ impl Drop for SudoPasswordPipeRuntime {
         }
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// A git HTTPS credential the user entered through the masked local prompt.
+/// It lives only in Dext's memory for the rest of the session and is handed
+/// to git through a FIFO-fed credential helper — it must never appear in the
+/// model transcript, session logs, argv, or on disk.
+#[derive(Clone)]
+struct LocalGitCredential {
+    username: String,
+    secret: String,
+    hosts: Vec<String>,
+}
+
+impl LocalGitCredential {
+    fn covers_any_host(&self, hosts: &[String]) -> bool {
+        !self.hosts.is_empty() && hosts.iter().any(|host| self.hosts.contains(host))
+    }
+
+    fn host_scope_label(&self) -> String {
+        format_git_hosts(&self.hosts)
+    }
+}
+
+impl Drop for LocalGitCredential {
+    fn drop(&mut self) {
+        clear_secret_string(&mut self.username);
+        clear_secret_string(&mut self.secret);
+        self.hosts.clear();
+    }
+}
+
+/// Interpret masked-prompt input as either `token` or `username:token`.
+/// The username split is deliberately conservative: bare secrets that happen
+/// to contain a colon (URLs, generic passwords) stay intact.
+fn parse_git_credential_input(raw: &str) -> LocalGitCredential {
+    let trimmed = raw.trim();
+    if let Some((user, pass)) = trimmed.split_once(':')
+        && !user.is_empty()
+        && !pass.is_empty()
+        && !pass.starts_with("//")
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+'))
+    {
+        return LocalGitCredential {
+            username: user.to_string(),
+            secret: pass.to_string(),
+            hosts: Vec::new(),
+        };
+    }
+    LocalGitCredential {
+        // Any non-empty username works for GitHub/GitLab token auth; this is
+        // the conventional placeholder.
+        username: "x-access-token".to_string(),
+        secret: trimmed.to_string(),
+        hosts: Vec::new(),
+    }
+}
+
+/// Match the HTTPS credential failures git emits with GIT_TERMINAL_PROMPT=0.
+/// Keep this git-specific so unrelated bash output mentioning disabled
+/// terminal prompts doesn't trigger Dext's local git credential prompt.
+fn output_indicates_git_credential_failure(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("could not read username for 'https://")
+        || lower.contains("could not read password for 'https://")
+        || lower.contains("authentication failed for 'https://")
+        || ((lower.contains("invalid username or token")
+            || lower.contains("invalid username or password"))
+            && (lower.contains("fatal: authentication failed for 'https://")
+                || (lower.contains("remote:") && lower.contains("https://"))))
+}
+
+fn normalize_git_credential_host(host: &str) -> Option<String> {
+    let host = host
+        .trim()
+        .trim_matches(|c| matches!(c, '\'' | '"' | '[' | ']' | '(' | ')' | ',' | ';'))
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('.');
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+fn extract_https_git_hosts(text: &str) -> Vec<String> {
+    text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']')
+    })
+    .filter_map(|raw| {
+        let token = raw.trim_matches(|c| matches!(c, ',' | ';' | '.' | ')' | ']' | '}'));
+        let lower = token.to_ascii_lowercase();
+        let rest = lower.strip_prefix("https://")?;
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        normalize_git_credential_host(authority)
+    })
+    .collect()
+}
+
+fn dedupe_git_hosts<I>(hosts: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for host in hosts {
+        if let Some(host) = normalize_git_credential_host(&host)
+            && seen.insert(host.clone())
+        {
+            out.push(host);
+        }
+    }
+    out
+}
+
+fn git_credential_hosts_for_failure(planned_hosts: &[String], output: &str) -> Vec<String> {
+    dedupe_git_hosts(
+        planned_hosts
+            .iter()
+            .cloned()
+            .chain(extract_https_git_hosts(output)),
+    )
+}
+
+fn format_git_hosts(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        "the HTTPS remote".to_string()
+    } else if hosts.len() == 1 {
+        hosts[0].clone()
+    } else {
+        format!("{} +{} more", hosts[0], hosts.len() - 1)
+    }
+}
+
+fn simple_shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn split_bash_credential_segments(command: &str) -> Vec<&str> {
+    command
+        .split(|c| matches!(c, ';' | '\n' | '&' | '|'))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn word_is_env_assignment(word: &str) -> bool {
+    let Some((key, value)) = word.split_once('=') else {
+        return false;
+    };
+    !key.is_empty()
+        && !value.is_empty()
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
+fn env_assignment_is_safe_for_git_credential(word: &str) -> bool {
+    let Some((key, _value)) = word.split_once('=') else {
+        return false;
+    };
+    let upper = key.to_ascii_uppercase();
+    !(upper.starts_with("GIT_CONFIG")
+        || upper == "GIT_ASKPASS"
+        || upper == "GIT_CURL_VERBOSE"
+        || upper.starts_with("GIT_TRACE")
+        || upper == "SSH_ASKPASS"
+        || upper == "SSH_ASKPASS_REQUIRE")
+}
+
+fn git_config_word_is_safe_for_credential(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    !(lower.starts_with("credential.")
+        || lower.starts_with("core.askpass")
+        || lower.starts_with("core.hookspath")
+        || lower.starts_with("http.extraheader")
+        || lower.starts_with("url."))
+}
+
+fn git_subcommand_for_credential_segment(words: &[String], git_idx: usize) -> Option<&str> {
+    let mut idx = git_idx.saturating_add(1);
+    while idx < words.len() {
+        let word = words[idx].as_str();
+        if matches!(word, "-C" | "--git-dir" | "--work-tree" | "--namespace") {
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if word == "-c" {
+            if !words
+                .get(idx.saturating_add(1))
+                .is_some_and(|config| git_config_word_is_safe_for_credential(config))
+            {
+                return None;
+            }
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if word.starts_with("-c") && word.len() > 2 {
+            if !git_config_word_is_safe_for_credential(&word[2..]) {
+                return None;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if word.starts_with("-C")
+            || word.starts_with("--git-dir=")
+            || word.starts_with("--work-tree=")
+            || word.starts_with("--namespace=")
+            || matches!(word, "--no-pager" | "--literal-pathspecs")
+        {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if word.starts_with('-') {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        return Some(word);
+    }
+    None
+}
+
+fn git_subcommand_can_use_https_credential(words: &[String], git_idx: usize) -> bool {
+    let Some(subcommand) = git_subcommand_for_credential_segment(words, git_idx) else {
+        return false;
+    };
+    match subcommand {
+        "clone" | "fetch" | "pull" | "push" | "ls-remote" => true,
+        "remote" => words.iter().any(|word| word == "update"),
+        "submodule" => words
+            .iter()
+            .any(|word| matches!(word.as_str(), "update" | "sync")),
+        _ => false,
+    }
+}
+
+fn git_credential_segment_is_safe(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() || trimmed == "set -euo pipefail" || trimmed == "set -eo pipefail" {
+        return true;
+    }
+    if trimmed.contains("$(")
+        || trimmed.contains('`')
+        || trimmed.contains('<')
+        || trimmed.contains('>')
+        || trimmed.contains("DEXT_GIT_CRED")
+    {
+        return false;
+    }
+    let words = simple_shell_words(trimmed);
+    let mut idx = 0;
+    while idx < words.len() && word_is_env_assignment(&words[idx]) {
+        if !env_assignment_is_safe_for_git_credential(&words[idx]) {
+            return false;
+        }
+        idx += 1;
+    }
+    if matches!(
+        words.get(idx).map(String::as_str),
+        Some("command" | "builtin")
+    ) {
+        idx += 1;
+    }
+    let Some(command) = words.get(idx).map(String::as_str) else {
+        return false;
+    };
+    if !(command == "git" || command.ends_with("/git")) {
+        return false;
+    }
+    git_subcommand_can_use_https_credential(&words, idx)
+}
+
+fn bash_command_can_receive_git_credential(command: &str) -> bool {
+    let segments = split_bash_credential_segments(command);
+    !segments.is_empty()
+        && segments
+            .iter()
+            .all(|segment| git_credential_segment_is_safe(segment))
+}
+
+fn bash_command_should_install_git_credential(command: &str, cred: &LocalGitCredential) -> bool {
+    if cred.hosts.is_empty()
+        || command.to_ascii_lowercase().contains("http://")
+        || !bash_command_can_receive_git_credential(command)
+    {
+        return false;
+    }
+    let command_hosts = dedupe_git_hosts(extract_https_git_hosts(command));
+    command_hosts.is_empty() || cred.covers_any_host(&command_hosts)
+}
+
+fn stored_git_credential_for_bash_call(
+    name: &str,
+    input: &Value,
+    cred: Option<&LocalGitCredential>,
+) -> Option<LocalGitCredential> {
+    let cred = cred?;
+    if name != "bash" {
+        return None;
+    }
+    let cmd = input["command"].as_str()?;
+    bash_command_should_install_git_credential(cmd, cred).then(|| cred.clone())
+}
+
+fn git_auth_guidance_for_hosts(hosts: &[String]) -> String {
+    let host_label = format_git_hosts(hosts);
+    let tail = GIT_AUTH_GUIDANCE
+        .strip_prefix("git needs credentials for an HTTPS remote. ")
+        .unwrap_or(GIT_AUTH_GUIDANCE);
+    format!("git needs credentials for {host_label}. {tail}")
+}
+
+#[cfg(unix)]
+fn git_credential_helper_script_content() -> &'static str {
+    // Answers `get` with the credential the user typed into Dext's masked
+    // prompt, delivered through a private FIFO so the secret never lands on
+    // disk, in argv, or in the transcript. `store`/`erase` are no-ops.
+    r#"#!/bin/sh
+set -eu
+op=${1:-}
+if [ "$op" != get ]; then exit 0; fi
+protocol=
+host=
+while IFS= read -r line; do
+  [ -n "$line" ] || break
+  case "$line" in
+    protocol=*) protocol=${line#protocol=} ;;
+    host=*) host=${line#host=} ;;
+  esac
+done
+[ "$protocol" = https ] || exit 1
+host=${host%%:*}
+host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+[ -n "${DEXT_GIT_CRED_HOSTS:-}" ] || exit 1
+case " $DEXT_GIT_CRED_HOSTS " in
+  *" $host "*) ;;
+  *) exit 1 ;;
+esac
+if [ -z "${DEXT_GIT_CRED_FIFO:-}" ] || [ ! -p "$DEXT_GIT_CRED_FIFO" ]; then exit 1; fi
+{ IFS= read -r u && IFS= read -r p; } < "$DEXT_GIT_CRED_FIFO" || exit 1
+printf 'username=%s\npassword=%s\n' "$u" "$p"
+"#
+}
+
+#[cfg(unix)]
+fn write_git_credential_helper_script(
+    root: &Path,
+    session_id: &str,
+) -> std::result::Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::session::session_git_auth_dir(root, session_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("prepare git auth dir: {e}"))?;
+    let mut dir_perms = std::fs::metadata(&dir)
+        .map_err(|e| format!("metadata git auth dir: {e}"))?
+        .permissions();
+    dir_perms.set_mode(0o700);
+    std::fs::set_permissions(&dir, dir_perms).map_err(|e| format!("chmod git auth dir: {e}"))?;
+    let path = dir.join("credential-helper.sh");
+    atomic_write_bytes(&path, git_credential_helper_script_content().as_bytes())
+        .map_err(|e| format!("write git credential helper: {e}"))?;
+    let mut perms = std::fs::metadata(&path)
+        .map_err(|e| format!("metadata git credential helper: {e}"))?
+        .permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&path, perms)
+        .map_err(|e| format!("chmod git credential helper: {e}"))?;
+    Ok(path)
+}
+
+/// Like start_sudo_password_pipe_writer, but keeps serving after the first
+/// read: one git command may invoke the credential helper several times
+/// (fetch + push, redirects, submodules), and each helper run opens the FIFO
+/// once.
+///
+/// The writer holds the FIFO open O_RDWR for its whole lifetime. That
+/// guarantees liveness: a reader's blocking open always completes while the
+/// runtime is alive, and once the FIFO is unlinked, new readers fail with
+/// ENOENT instead of blocking in open() on an orphaned inode forever (which
+/// would wedge git and the tool call behind it).
+#[cfg(unix)]
+fn start_git_credential_pipe_writer(path: PathBuf, payload: String) -> SudoPasswordPipeRuntime {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread_path = path.clone();
+    let handle = std::thread::spawn(move || {
+        let mut payload = payload;
+        let fifo = loop {
+            if thread_stop.load(Ordering::SeqCst) {
+                clear_secret_string(&mut payload);
+                return;
+            }
+            // O_RDWR on a FIFO never blocks regardless of readers.
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&thread_path)
+            {
+                Ok(f) => break f,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
+        // Keep the pipe buffer topped up with whole payloads. Writes are
+        // atomic (payload << PIPE_BUF), each helper run consumes exactly one
+        // payload's lines, so readers always stay line-aligned; a full buffer
+        // (EAGAIN) just means plenty of unread copies are queued.
+        while !thread_stop.load(Ordering::SeqCst) {
+            let _ = (&fifo).write_all(payload.as_bytes());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        clear_secret_string(&mut payload);
+    });
+    SudoPasswordPipeRuntime {
+        stop,
+        handle: Some(handle),
+        path,
+    }
+}
+
+/// Per-bash-call runtime for supplying the session git credential. `env` is
+/// injected into the child; dropping this stops the FIFO writer and removes
+/// the FIFO, so it must outlive the tool call.
+struct GitCredentialHelperRuntime {
+    env: Vec<(String, String)>,
+    _pipe: SudoPasswordPipeRuntime,
+}
+
+#[cfg(unix)]
+fn prepare_git_credential_helper(
+    root: &Path,
+    session_id: &str,
+    cred: LocalGitCredential,
+) -> std::result::Result<GitCredentialHelperRuntime, String> {
+    if cred.hosts.is_empty() {
+        return Err("git credential host scope is empty".to_string());
+    }
+    // Absolute paths only: git may run the helper from any working directory
+    // (git -C, submodules), and the session state dir can be relative.
+    let script = write_git_credential_helper_script(root, session_id)?;
+    let script = std::fs::canonicalize(&script).unwrap_or(script);
+    let fifo = create_secret_fifo_in_dir(
+        &crate::session::session_git_auth_dir(root, session_id),
+        "git credential",
+    )?;
+    let fifo = std::fs::canonicalize(&fifo).unwrap_or(fifo);
+    let payload = format!("{}\n{}\n", cred.username, cred.secret);
+    let pipe = start_git_credential_pipe_writer(fifo.clone(), payload);
+    // GIT_CONFIG_* appends the helper for every git invocation in the
+    // command, including nested ones, without touching any config file. The
+    // `!` form runs the script through the shell with the operation appended.
+    let helper_value = format!("!{}", shell_single_quote(&script.display().to_string()));
+    let env = vec![
+        ("DEXT_GIT_CRED_FIFO".to_string(), fifo.display().to_string()),
+        ("DEXT_GIT_CRED_HOSTS".to_string(), cred.hosts.join(" ")),
+        ("GIT_CONFIG_COUNT".to_string(), "5".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "credential.helper".to_string(),
+        ),
+        ("GIT_CONFIG_VALUE_0".to_string(), String::new()),
+        (
+            "GIT_CONFIG_KEY_1".to_string(),
+            "credential.helper".to_string(),
+        ),
+        ("GIT_CONFIG_VALUE_1".to_string(), helper_value),
+        ("GIT_CONFIG_KEY_2".to_string(), "core.hooksPath".to_string()),
+        ("GIT_CONFIG_VALUE_2".to_string(), "/dev/null".to_string()),
+        ("GIT_CONFIG_KEY_3".to_string(), "protocol.allow".to_string()),
+        ("GIT_CONFIG_VALUE_3".to_string(), "never".to_string()),
+        (
+            "GIT_CONFIG_KEY_4".to_string(),
+            "protocol.https.allow".to_string(),
+        ),
+        ("GIT_CONFIG_VALUE_4".to_string(), "always".to_string()),
+    ];
+    Ok(GitCredentialHelperRuntime { env, _pipe: pipe })
+}
+
+#[cfg(not(unix))]
+fn prepare_git_credential_helper(
+    _root: &Path,
+    _session_id: &str,
+    _cred: LocalGitCredential,
+) -> std::result::Result<GitCredentialHelperRuntime, String> {
+    Err("local git credential prompts are only supported on Unix".to_string())
 }
 
 fn sudo_wrapper_prefix(auth: &LocalSudoAuth) -> String {
@@ -7763,9 +8338,20 @@ async fn execute_bash_async_with_timeout(
     timeout: std::time::Duration,
     sandbox_profile: SandboxProfile,
 ) -> std::result::Result<String, String> {
-    execute_bash_async_prepared(cmd, root, interrupt, timeout, None, sandbox_profile, None).await
+    execute_bash_async_prepared(
+        cmd,
+        root,
+        interrupt,
+        timeout,
+        None,
+        sandbox_profile,
+        None,
+        &[],
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_bash_async_prepared(
     cmd: &str,
     root: &Path,
@@ -7774,6 +8360,7 @@ async fn execute_bash_async_prepared(
     local_sudo_auth: Option<LocalSudoAuth>,
     sandbox_profile: SandboxProfile,
     live_output: Option<LiveToolOutput>,
+    extra_env: &[(String, String)],
 ) -> std::result::Result<String, String> {
     let mut local_sudo_auth = local_sudo_auth;
     let _sudo_password_pipe = local_sudo_auth.as_mut().and_then(|auth| {
@@ -7802,6 +8389,10 @@ async fn execute_bash_async_prepared(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    deny_interactive_prompt_env(&mut command);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     if let Some(auth) = local_sudo_auth.as_ref() {
         let mut paths = vec![auth.sudo_shim_dir.clone()];
         if let Some(existing) = std::env::var_os("PATH") {
@@ -7914,6 +8505,7 @@ async fn execute_external_async(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    deny_interactive_prompt_env(&mut cmd);
     configure_tokio_process_group(&mut cmd);
     if stdin_data.is_some() {
         cmd.stdin(std::process::Stdio::piped());
@@ -8036,6 +8628,7 @@ async fn execute_builtin_call(
     read_cache: Option<Arc<Mutex<ReadFileCache>>>,
     session_id: Option<String>,
     local_sudo_auth: Option<LocalSudoAuth>,
+    git_credential: Option<LocalGitCredential>,
     sandbox_profile: SandboxProfile,
     live_output: Option<LiveToolOutput>,
 ) -> std::result::Result<String, String> {
@@ -8043,32 +8636,34 @@ async fn execute_builtin_call(
         let cmd = input["command"].as_str().unwrap_or("").to_string();
         let guarded = tool_policy::apply_bash_guardrails(&cmd)?;
         let timeout = timeout_from_tool_input(&input, bash_tool_timeout());
-        match local_sudo_auth {
-            Some(auth) => {
-                execute_bash_async_prepared(
-                    &guarded,
-                    &root,
-                    interrupt,
-                    timeout,
-                    Some(auth),
-                    sandbox_profile,
-                    live_output,
-                )
-                .await
+        // Keep the credential-helper runtime (FIFO + writer thread) alive for
+        // the duration of the call; its Drop stops the writer and removes the
+        // FIFO. Setup failures are explicit failures: silently running without
+        // the helper would make an auth failure look like a rejected token.
+        let git_cred_runtime = match git_credential {
+            Some(cred) if bash_command_should_install_git_credential(&cmd, &cred) => {
+                let session_id = session_id
+                    .as_deref()
+                    .ok_or_else(|| "git credential helper needs a session id".to_string())?;
+                Some(prepare_git_credential_helper(&root, session_id, cred)?)
             }
-            None => {
-                execute_bash_async_prepared(
-                    &guarded,
-                    &root,
-                    interrupt,
-                    timeout,
-                    None,
-                    sandbox_profile,
-                    live_output,
-                )
-                .await
-            }
-        }
+            _ => None,
+        };
+        let extra_env = git_cred_runtime
+            .as_ref()
+            .map(|runtime| runtime.env.clone())
+            .unwrap_or_default();
+        execute_bash_async_prepared(
+            &guarded,
+            &root,
+            interrupt,
+            timeout,
+            local_sudo_auth,
+            sandbox_profile,
+            live_output,
+            &extra_env,
+        )
+        .await
     } else if name == "http" {
         execute_http_tool_async(&input, interrupt, external_tool_timeout()).await
     } else if is_external_process_tool(&name) {
@@ -10249,6 +10844,9 @@ struct Agent {
     provider_health: ProviderHealthLedger,
     track_origin: Option<TrackOrigin>,
     privacy: PrivacyPolicy,
+    // Session-scoped git HTTPS credential from the masked local prompt.
+    // Never serialized, logged, or shown to the model.
+    git_credential: Option<LocalGitCredential>,
     checkpoint_cache: git_checkpoints::RepoRootCache,
     checkpoint_ordinal: usize,
     prompt_scan_cache: Mutex<Option<PromptScanCache>>,
@@ -10422,6 +11020,7 @@ impl Agent {
             provider_health: ProviderHealthLedger::default(),
             track_origin: None,
             privacy: PrivacyPolicy::from_env(),
+            git_credential: None,
             checkpoint_cache: git_checkpoints::RepoRootCache::new(),
             checkpoint_ordinal: 0,
             prompt_scan_cache: Mutex::new(None),
@@ -10433,6 +11032,87 @@ impl Agent {
     fn noop_text_tx() -> tokio::sync::mpsc::UnboundedSender<String> {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         tx
+    }
+
+    fn prompt_for_git_credential(&mut self, hosts: &[String]) -> String {
+        let hosts = dedupe_git_hosts(hosts.iter().cloned());
+        if hosts.is_empty() {
+            return "\n\n[dext] git asked for credentials, but Dext could not determine the \
+                    HTTPS host to scope a local credential safely. Ask the user to configure a git \
+                    credential helper or re-run with an explicit HTTPS remote URL; never ask for \
+                    tokens in chat."
+                .to_string();
+        }
+        let message = git_auth_guidance_for_hosts(&hosts);
+        match self.sink.request_local_auth_secret("git", &message) {
+            LocalAuthSecret::Secret(mut raw) => {
+                let mut cred = parse_git_credential_input(&raw);
+                clear_secret_string(&mut raw);
+                cred.hosts = hosts;
+                let host_label = cred.host_scope_label();
+                self.git_credential = Some(cred);
+                format!(
+                    "\n\n[dext] git asked for credentials for {host_label}; the user entered them \
+                     in a masked local prompt (they are never shown in chat or to you). They will \
+                     be supplied automatically through a credential helper for matching HTTPS git \
+                     remotes for the rest of this session — re-run the failed command now."
+                )
+            }
+            LocalAuthSecret::Canceled => "\n\n[dext] git asked for credentials and the user \
+                 dismissed the local prompt. Do not retry the command; ask the user how they \
+                 want to authenticate."
+                .to_string(),
+            LocalAuthSecret::Unavailable => {
+                self.sink.local_auth_prompt("git", &message);
+                "\n\n[dext] git needs credentials but this frontend has no local secret \
+                 prompt. Ask the user to configure a credential helper (for example `gh auth \
+                 login` or `git config credential.helper`) and then re-run the command. Never \
+                 ask for tokens in chat."
+                    .to_string()
+            }
+        }
+    }
+
+    /// A bash tool call failed because git could not obtain HTTPS credentials.
+    /// Collect them through the masked local prompt (never chat input) and
+    /// return a note for the model describing what happened and whether a
+    /// retry will now succeed. `ran_with_credential` is whether the failing
+    /// call had the stored credential helper installed; only if the failure's
+    /// host matches that credential does it mean the credential was rejected.
+    fn handle_git_credential_failure(
+        &mut self,
+        ran_with_credential: bool,
+        hosts: Vec<String>,
+    ) -> String {
+        let hosts = dedupe_git_hosts(hosts);
+        if let Some(stored) = self.git_credential.as_ref() {
+            let matches_stored = !hosts.is_empty() && stored.covers_any_host(&hosts);
+            if ran_with_credential && matches_stored {
+                let host_label = stored.host_scope_label();
+                self.git_credential = None;
+                return format!(
+                    "\n\n[dext] The stored git credential for {host_label} was rejected by the \
+                     remote and has been discarded. Re-running the command will prompt the user for \
+                     a new one; if it keeps failing, ask the user to verify the token's scopes."
+                );
+            }
+            if matches_stored {
+                if ran_with_credential {
+                    return format!(
+                        "\n\n[dext] git asked for credentials for {}; the user has since provided \
+                         them via the masked local prompt. Re-run the failed command now.",
+                        stored.host_scope_label()
+                    );
+                }
+                return format!(
+                    "\n\n[dext] A stored git credential is available for {}, but Dext did not \
+                     attach it to this compound or unsafe shell command. Re-run as a direct git \
+                     fetch/pull/push/ls-remote command for that HTTPS remote.",
+                    stored.host_scope_label()
+                );
+            }
+        }
+        self.prompt_for_git_credential(&hosts)
     }
 
     #[cfg(test)]
@@ -12418,14 +13098,17 @@ impl Agent {
         for m in &self.history {
             writeln!(&mut data, "{}", serde_json::to_string(m)?)?;
         }
-        atomic_write_bytes(path, &data)?;
+        // Transcripts carry whatever the user typed and every tool output;
+        // treat them as secrets (0600) so a leaked credential in the
+        // conversation is at least not world-readable.
+        crate::session::atomic_write_secret(path, &data)?;
         Ok(())
     }
 
     pub(crate) fn export_session_html_to_path(&self, path: &Path) -> Result<()> {
         let header = self.session_header();
         let html = render_session_html(&header, &self.history, "current session");
-        atomic_write_bytes(path, html.as_bytes())?;
+        crate::session::atomic_write_secret(path, html.as_bytes())?;
         Ok(())
     }
 
@@ -14266,6 +14949,9 @@ impl Agent {
                 })
                 .collect();
             let mut builtin_started_at: HashMap<usize, std::time::Instant> = HashMap::new();
+            // Calls that executed while a git credential was installed: only
+            // their auth failures mean the credential itself was rejected.
+            let mut builtin_git_cred_used: HashSet<usize> = HashSet::new();
             let builtin_names: Vec<&str> = builtin_indices
                 .iter()
                 .map(|idx| plans[*idx].name.as_str())
@@ -14297,6 +14983,14 @@ impl Agent {
                         let read_cache = read_cache.clone();
                         let session_id = self.session_id.clone();
                         let sandbox_profile = self.sandbox_profile;
+                        let git_credential = stored_git_credential_for_bash_call(
+                            &n,
+                            &inp,
+                            self.git_credential.as_ref(),
+                        );
+                        if git_credential.is_some() {
+                            builtin_git_cred_used.insert(*idx);
+                        }
                         let handle = tokio::spawn(async move {
                             let _permit = match sem.acquire_owned().await {
                                 Ok(p) => p,
@@ -14310,6 +15004,7 @@ impl Agent {
                                 Some(read_cache),
                                 Some(session_id),
                                 None,
+                                git_credential,
                                 sandbox_profile,
                                 None,
                             )
@@ -14400,6 +15095,11 @@ impl Agent {
                         &n,
                         &inp,
                     );
+                    let git_credential_for_call =
+                        stored_git_credential_for_bash_call(&n, &inp, self.git_credential.as_ref());
+                    if git_credential_for_call.is_some() {
+                        builtin_git_cred_used.insert(idx);
+                    }
                     let r = execute_builtin_call(
                         n,
                         inp,
@@ -14408,6 +15108,7 @@ impl Agent {
                         Some(read_cache.clone()),
                         Some(session_id),
                         local_sudo_auth,
+                        git_credential_for_call,
                         self.sandbox_profile,
                         live_output,
                     )
@@ -14462,6 +15163,14 @@ impl Agent {
                         Err(e) => (e, Some(true)),
                     },
                 };
+
+                if name == "bash" && output_indicates_git_credential_failure(&content) {
+                    let ran_with_credential = builtin_git_cred_used.contains(&idx);
+                    let failure_hosts = git_credential_hosts_for_failure(&hosts, &content);
+                    content.push_str(
+                        &self.handle_git_credential_failure(ran_with_credential, failure_hosts),
+                    );
+                }
 
                 let post_env = [
                     ("DEXT_TOOL_NAME", name.as_str()),
@@ -17122,7 +17831,7 @@ fn create_track_from_work_map_with_header(
     for message in history {
         writeln!(&mut data, "{}", serde_json::to_string(&message)?)?;
     }
-    atomic_write_bytes(&path, &data)?;
+    crate::session::atomic_write_secret(&path, &data)?;
     Ok(path)
 }
 
@@ -17299,7 +18008,7 @@ fn export_session_file(source: &Path, format: SessionExportFormat, target: &Path
         SessionExportFormat::Jsonl => {
             let bytes =
                 std::fs::read(source).with_context(|| format!("reading {}", source.display()))?;
-            atomic_write_bytes(target, &bytes)?;
+            crate::session::atomic_write_secret(target, &bytes)?;
         }
         SessionExportFormat::Html => {
             let (header, history) = read_session_jsonl(source)?;
@@ -17308,7 +18017,7 @@ fn export_session_file(source: &Path, format: SessionExportFormat, target: &Path
                 .and_then(|s| s.to_str())
                 .unwrap_or("dext session");
             let html = render_session_html(&header, &history, title);
-            atomic_write_bytes(target, html.as_bytes())?;
+            crate::session::atomic_write_secret(target, html.as_bytes())?;
         }
     }
     Ok(())
@@ -21230,6 +21939,7 @@ async fn main() -> Result<()> {
         let busy = agent_busy_flag.clone();
         std::thread::spawn(move || {
             let stdin = io::stdin();
+            let mut pending_secret_send: Option<String> = None;
             loop {
                 let mut line = String::new();
                 match stdin.lock().read_line(&mut line) {
@@ -21241,6 +21951,7 @@ async fn main() -> Result<()> {
                             &input_tx,
                             &runtime_control_tx,
                             &steering_tx,
+                            &mut pending_secret_send,
                         ) {
                             InteractiveInputRoute::RuntimeControlQueued => {
                                 eprintln!("[runtime control queued]");
@@ -21250,6 +21961,11 @@ async fn main() -> Result<()> {
                             }
                             InteractiveInputRoute::UnsupportedBusySlash(text) => {
                                 eprintln!("{}", unsupported_busy_slash_message(&text));
+                            }
+                            InteractiveInputRoute::SecretWithheld => {
+                                eprintln!(
+                                    "[input looks like a credential and was NOT sent; if a command needs auth, let Dext open its masked prompt. Repeat the exact line to send anyway]"
+                                );
                             }
                             InteractiveInputRoute::Dropped if busy.load(Ordering::SeqCst) => {
                                 eprintln!(

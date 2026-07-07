@@ -800,6 +800,9 @@ struct TuiState {
     pending_perm: Option<PendingPermission>,
     pending_local_auth: Option<PendingLocalAuth>,
     local_auth_input: String,
+    // Secret-looking input the user was warned about; sending requires an
+    // identical second Enter so credentials never reach the model by accident.
+    pending_secret_send: Option<String>,
     agent_busy: bool,
     quit: bool,
     frame_count: u64,
@@ -902,6 +905,7 @@ impl TuiState {
             pending_perm: None,
             pending_local_auth: None,
             local_auth_input: String::new(),
+            pending_secret_send: None,
             agent_busy: false,
             quit: false,
             frame_count: 0,
@@ -1220,34 +1224,31 @@ impl TuiState {
     }
 
     fn queue(&mut self, line: Line_) {
-        if matches!(line, Line_::Tool { .. }) && self.last_line_is_completed_thinking() {
-            self.pending_insert.push(Line_::Blank);
-        }
-        if matches!(line, Line_::Thinking(_)) && self.last_line_is_tool() {
-            self.pending_insert.push(Line_::Blank);
-        }
-        if matches!(line, Line_::Steering(_)) && !self.pending_insert.ends_with(&[Line_::Blank]) {
-            self.pending_insert.push(Line_::Blank);
-        }
+        let is_transcript_block = Self::line_needs_history_spacing(&line);
         let is_steering = matches!(line, Line_::Steering(_));
+        if ((is_transcript_block && self.last_line_needs_history_spacing()) || is_steering)
+            && !self.pending_insert.ends_with(&[Line_::Blank])
+        {
+            self.pending_insert.push(Line_::Blank);
+        }
         self.pending_insert.push(line);
         if is_steering {
             self.pending_insert.push(Line_::Blank);
         }
     }
 
-    fn last_line_is_completed_thinking(&self) -> bool {
-        self.pending_insert
-            .last()
-            .or_else(|| self.transcript.last())
-            .is_some_and(|line| matches!(line, Line_::Thinking(_)))
+    fn line_needs_history_spacing(line: &Line_) -> bool {
+        matches!(
+            line,
+            Line_::Assistant { .. } | Line_::Tool { .. } | Line_::Thinking(_)
+        )
     }
 
-    fn last_line_is_tool(&self) -> bool {
+    fn last_line_needs_history_spacing(&self) -> bool {
         self.pending_insert
             .last()
             .or_else(|| self.transcript.last())
-            .is_some_and(|line| matches!(line, Line_::Tool { .. }))
+            .is_some_and(Self::line_needs_history_spacing)
     }
 
     fn scroll_transcript_by(&mut self, delta: isize) {
@@ -7044,9 +7045,13 @@ fn local_auth_overlay_text(state: &TuiState) -> Text<'static> {
     } else {
         bullets
     };
+    let (header, input_label) = match pending.tool.as_str() {
+        "git" => ("git credential for ".to_string(), "Token/password: "),
+        _ => ("sudo password for ".to_string(), "Password: "),
+    };
     Text::from(vec![
         Line::from(vec![
-            Span::styled("sudo password for ", Style::default().fg(Color::Yellow)),
+            Span::styled(header, Style::default().fg(Color::Yellow)),
             Span::styled(
                 pending.tool.clone(),
                 Style::default()
@@ -7059,7 +7064,7 @@ fn local_auth_overlay_text(state: &TuiState) -> Text<'static> {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(vec![
-            Span::styled("Password: ", Style::default().fg(Color::Yellow)),
+            Span::styled(input_label, Style::default().fg(Color::Yellow)),
             Span::styled(shown, Style::default().fg(Color::Yellow)),
         ]),
         Line::from(Span::styled(
@@ -7083,7 +7088,7 @@ fn render_local_auth_overlay(frame: &mut ratatui::Frame, state: &TuiState, area:
         Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(
-                " local sudo auth ",
+                " local auth ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -7447,9 +7452,14 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
         state.status = "local secret paste withheld".to_string();
         return;
     }
+    let secret_looking = crate::text_is_potential_local_secret(&pasted);
     let start = state.cursor;
     state.insert_input_str(&pasted);
     let end = state.cursor;
+    if secret_looking {
+        state.status =
+            "pasted text looks like a credential; submitting will ask for confirmation".to_string();
+    }
     let words = count_words(&pasted);
     if words > PASTE_WORD_THRESHOLD {
         state
@@ -7656,7 +7666,7 @@ fn submit_local_auth_secret(state: &mut TuiState) {
     };
     if state.local_auth_input.is_empty() {
         state.pending_local_auth = Some(pending);
-        state.status = "enter sudo password or Esc cancel".to_string();
+        state.status = "enter the secret or Esc cancel".to_string();
         return;
     }
     let secret = std::mem::take(&mut state.local_auth_input);
@@ -7999,6 +8009,20 @@ fn handle_key(
                 state.clear_input();
                 state.clear_slash_completion_selection();
                 return;
+            }
+            if crate::text_is_potential_local_secret(&text) {
+                if state.pending_secret_send.as_deref() != Some(text.as_str()) {
+                    state.pending_secret_send = Some(text.clone());
+                    state.queue(Line_::Warn(
+                        "input looks like it contains a credential and was NOT sent. If a command is waiting for auth, cancel and let Dext open its masked local prompt instead — anything typed here goes into the model transcript. Press Enter again to send anyway.".to_string(),
+                    ));
+                    state.status =
+                        "secret-looking input withheld · Enter again to send".to_string();
+                    return;
+                }
+                state.pending_secret_send = None;
+            } else {
+                state.pending_secret_send = None;
             }
             state.queue(Line_::TurnSep);
             state.queue(Line_::User(text.clone()));
@@ -9692,6 +9716,48 @@ mod tests {
     }
 
     #[test]
+    fn transcript_blocks_insert_single_blank_rows() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::ThinkingBlockComplete("one".to_string()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete("two".to_string()));
+        state.apply_event(AgentEvent::ToolCallResult {
+            call_id: "call_1".to_string(),
+            name: "rg".to_string(),
+            ok: true,
+            preview: "rg: needle".to_string(),
+            content: "match".to_string(),
+        });
+        state.apply_event(AgentEvent::TextBlockComplete("done".to_string()));
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [
+                Line_::Thinking(_),
+                Line_::Blank,
+                Line_::Thinking(_),
+                Line_::Blank,
+                Line_::Tool { .. },
+                Line_::Blank,
+                Line_::Assistant { .. }
+            ]
+        ));
+        assert_eq!(
+            state
+                .pending_insert
+                .iter()
+                .filter(|line| matches!(line, Line_::Blank))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
     fn work_map_packet_still_renders_in_transcript() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -10048,6 +10114,7 @@ mod tests {
                     dim_prefix: false,
                     ..
                 },
+                Line_::Blank,
                 Line_::Assistant {
                     dim_prefix: true,
                     ..
