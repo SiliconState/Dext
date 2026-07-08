@@ -7068,7 +7068,7 @@ fn local_auth_overlay_text(state: &TuiState) -> Text<'static> {
             Span::styled(shown, Style::default().fg(Color::Yellow)),
         ]),
         Line::from(Span::styled(
-            "Enter submit · Esc cancel · never sent to model/logs",
+            "Paste token/password here · Enter submit · Esc cancel · kept local",
             Style::default().fg(Color::DarkGray),
         )),
     ])
@@ -7428,6 +7428,10 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     }
 }
 
+fn local_auth_input_status(_state: &TuiState) -> String {
+    "local auth input updated; Enter submits".to_string()
+}
+
 fn handle_paste(state: &mut TuiState, mut pasted: String) {
     if pasted.is_empty() {
         return;
@@ -7438,15 +7442,22 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
         return;
     }
     if state.pending_local_auth.is_some() {
-        let secret = pasted.trim_end_matches(['\r', '\n']);
-        state.local_auth_input.push_str(secret);
+        let submit = pasted.ends_with('\n') || pasted.ends_with('\r');
+        pasted.retain(|ch| !matches!(ch, '\r' | '\n'));
+        if !pasted.is_empty() {
+            state.local_auth_input.push_str(&pasted);
+        }
         clear_secret_string(&mut pasted);
-        state.status = "local auth input updated".to_string();
+        if submit {
+            submit_local_auth_secret(state);
+        } else {
+            state.status = local_auth_input_status(state);
+        }
         return;
     }
     if state.agent_busy && crate::text_is_potential_local_secret(&pasted) {
         state.queue(Line_::Warn(
-            "paste withheld: do not enter sudo passwords or local auth secrets in chat; use the local auth prompt".to_string(),
+            "paste withheld: wait for the yellow local auth box, then paste the token/password there; chat input is never used for secrets".to_string(),
         ));
         clear_secret_string(&mut pasted);
         state.status = "local secret paste withheld".to_string();
@@ -7703,13 +7714,18 @@ fn handle_local_auth_key(state: &mut TuiState, key: KeyEvent) -> bool {
         (KeyCode::Enter, _) => submit_local_auth_secret(state),
         (KeyCode::Esc, _) => cancel_local_auth_secret(state),
         (KeyCode::Char('c'), _) if is_ctrl => cancel_local_auth_secret(state),
+        (KeyCode::Char('v'), _) if is_ctrl => {
+            state.status =
+                "use terminal paste shortcut (Ctrl+Shift+V/right-click); Ctrl+V is not paste"
+                    .to_string();
+        }
         (KeyCode::Char('u'), _) if is_ctrl => {
             clear_secret_string(&mut state.local_auth_input);
             state.status = "local auth input cleared".to_string();
         }
         (KeyCode::Backspace, _) => {
             state.local_auth_input.pop();
-            state.status = "local auth input updated".to_string();
+            state.status = local_auth_input_status(state);
         }
         (KeyCode::Delete, _) => {
             state.status = "local auth input hidden".to_string();
@@ -7723,7 +7739,7 @@ fn handle_local_auth_key(state: &mut TuiState, key: KeyEvent) -> bool {
             ) =>
         {
             state.local_auth_input.push(c);
-            state.status = "local auth input updated".to_string();
+            state.status = local_auth_input_status(state);
         }
         _ => {}
     }
@@ -7986,7 +8002,7 @@ fn handle_key(
                 }
                 if crate::text_is_potential_local_secret(&text) {
                     state.queue(Line_::Warn(
-                        "input withheld: do not enter sudo passwords or local auth secrets in chat; use the local auth prompt".to_string(),
+                        "input withheld: wait for the yellow local auth box, then paste the token/password there; chat input is never used for secrets".to_string(),
                     ));
                     state.clear_input();
                     state.clear_slash_completion_selection();
@@ -11375,6 +11391,84 @@ mod tests {
         assert!(state.pending_local_auth.is_none());
         assert!(state.input.is_empty());
         assert_eq!(state.status, "local auth submitted for bash");
+    }
+
+    #[test]
+    fn local_auth_paste_without_newline_stays_in_masked_prompt() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        queue_local_auth_secret_request(&mut state, "git".to_string(), "git auth".to_string(), tx);
+
+        handle_paste(&mut state, "github_pat_testtoken".to_string());
+
+        assert_eq!(state.local_auth_input, "github_pat_testtoken");
+        assert!(state.pending_local_auth.is_some());
+        assert!(state.input.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.status, "local auth input updated; Enter submits");
+    }
+
+    #[test]
+    fn local_auth_paste_with_newline_submits_secret_only_to_responder() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        queue_local_auth_secret_request(&mut state, "git".to_string(), "git auth".to_string(), tx);
+
+        handle_paste(&mut state, "github_pat_testtoken\n".to_string());
+
+        match rx.try_recv().expect("local auth response") {
+            LocalAuthSecret::Secret(secret) => assert_eq!(secret, "github_pat_testtoken"),
+            LocalAuthSecret::Canceled | LocalAuthSecret::Unavailable => {
+                panic!("expected submitted secret")
+            }
+        }
+        assert!(state.local_auth_input.is_empty());
+        assert!(state.pending_local_auth.is_none());
+        assert!(state.input.is_empty());
+        assert_eq!(state.status, "local auth submitted for git");
+    }
+
+    #[test]
+    fn local_auth_ctrl_v_explains_terminal_paste_shortcut() {
+        let mut state = TuiState::new(
+            "glm-5.1".to_string(),
+            model_context_window("glm-5.1"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        queue_local_auth_secret_request(&mut state, "git".to_string(), "git auth".to_string(), tx);
+        let (submit_tx, _submit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            &submit_tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(state.pending_local_auth.is_some());
+        assert!(state.local_auth_input.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(state.status.contains("Ctrl+Shift+V"), "{}", state.status);
     }
 
     #[test]

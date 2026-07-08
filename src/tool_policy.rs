@@ -140,7 +140,7 @@ pub(crate) fn tool_input_advisory(name: &str, input: &Value) -> Option<String> {
     }
 }
 
-pub(crate) fn command_requests_sudo_password(command: &str) -> bool {
+pub(crate) fn command_invokes_sudo(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     if !lower.contains("sudo") {
         return false;
@@ -171,7 +171,7 @@ pub(crate) fn command_requests_sudo_password(command: &str) -> bool {
             idx += 1;
             continue;
         }
-        if is_sudo_command_word(word) && !sudo_segment_has_noninteractive_flag(&words[idx + 1..]) {
+        if is_sudo_command_word(word) {
             return true;
         }
         command_position = false;
@@ -182,92 +182,6 @@ pub(crate) fn command_requests_sudo_password(command: &str) -> bool {
 
 fn is_sudo_command_word(word: &str) -> bool {
     word.rsplit('/').next() == Some("sudo")
-}
-
-fn sudo_segment_has_noninteractive_flag(words_after_sudo: &[String]) -> bool {
-    let mut idx = 0usize;
-    while idx < words_after_sudo.len() {
-        let arg = &words_after_sudo[idx];
-        if shell_command_separator(arg) || arg == "--" {
-            return false;
-        }
-        if arg == "-n" || arg == "--non-interactive" {
-            return true;
-        }
-        if let Some(flags) = arg.strip_prefix('-')
-            && !flags.is_empty()
-            && !flags.starts_with('-')
-        {
-            if sudo_short_flags_have_noninteractive(flags) {
-                return true;
-            }
-            if sudo_short_flags_take_next_arg(flags) {
-                idx += 1;
-            }
-            idx += 1;
-            continue;
-        }
-        if is_sudo_long_option_with_required_arg(arg) {
-            idx += 2;
-            continue;
-        }
-        if arg.starts_with('-') {
-            idx += 1;
-            continue;
-        }
-        return false;
-    }
-    false
-}
-
-fn sudo_short_flags_have_noninteractive(flags: &str) -> bool {
-    for ch in flags.chars() {
-        if ch == 'n' {
-            return true;
-        }
-        if sudo_short_option_char_takes_arg(ch) {
-            return false;
-        }
-    }
-    false
-}
-
-fn sudo_short_flags_take_next_arg(flags: &str) -> bool {
-    flags
-        .chars()
-        .last()
-        .is_some_and(sudo_short_option_char_takes_arg)
-}
-
-fn sudo_short_option_char_takes_arg(ch: char) -> bool {
-    matches!(
-        ch,
-        'a' | 'C' | 'c' | 'D' | 'g' | 'h' | 'p' | 'R' | 'r' | 'T' | 't' | 'U' | 'u'
-    )
-}
-
-fn is_sudo_long_option_with_required_arg(arg: &str) -> bool {
-    let Some(rest) = arg.strip_prefix("--") else {
-        return false;
-    };
-    let Some(name) = rest.split_once('=').map(|(name, _)| name).or(Some(rest)) else {
-        return false;
-    };
-    matches!(
-        name,
-        "auth-type"
-            | "close-from"
-            | "chdir"
-            | "login-class"
-            | "group"
-            | "host"
-            | "prompt"
-            | "chroot"
-            | "role"
-            | "type"
-            | "other-user"
-            | "user"
-    ) && !arg.contains('=')
 }
 
 fn shell_command_separator(word: &str) -> bool {
@@ -362,9 +276,9 @@ fn bash_command_advisory(command: &str) -> Option<String> {
             "bash advisory: `{tool}` is available as a Dext API tool but may not be installed as a shell binary. Use the native {tool} tool, use grep/awk, or probe with `command -v {tool}`."
         ));
     }
-    if command_requests_sudo_password(command) {
+    if command_invokes_sudo(command) {
         return Some(
-            "bash advisory: sudo auth is local only. Dext will open a local password prompt if sudo needs authentication; never type sudo passwords into chat or steering input."
+            "bash advisory: sudo auth is local only. Dext will run sudo through its local preauth path; never type sudo passwords into chat or steering input."
                 .to_string(),
         );
     }
@@ -989,8 +903,10 @@ fn shell_command_is_dangerous(command: &str) -> bool {
     if lower.is_empty() {
         return true;
     }
+    if command_invokes_sudo(command) {
+        return true;
+    }
     let dangerous_needles = [
-        "sudo ",
         "rm -",
         " rm ",
         "\nrm ",
@@ -1351,43 +1267,31 @@ mod tests {
             ),
             CommandRisk::Write
         );
-        assert!(command_requests_sudo_password("sudo apt update"));
-        assert!(command_requests_sudo_password("sudo -v"));
-        assert!(command_requests_sudo_password("echo ok && sudo apt update"));
-        assert!(command_requests_sudo_password(
-            "sudo -n true; sudo apt update"
-        ));
-        assert!(command_requests_sudo_password(
-            "echo sudo && sudo apt update"
-        ));
-        assert!(command_requests_sudo_password("/usr/bin/sudo apt update"));
-        assert!(command_requests_sudo_password(
-            "set -euo pipefail\nsudo apt update"
-        ));
-        assert!(command_requests_sudo_password(
+        assert!(command_invokes_sudo("sudo apt update"));
+        assert!(command_invokes_sudo("sudo -v"));
+        assert!(command_invokes_sudo("echo ok && sudo apt update"));
+        assert!(command_invokes_sudo("sudo -n true; sudo apt update"));
+        assert!(command_invokes_sudo("echo sudo && sudo apt update"));
+        assert!(command_invokes_sudo("/usr/bin/sudo apt update"));
+        assert!(command_invokes_sudo("set -euo pipefail\nsudo apt update"));
+        assert!(command_invokes_sudo(
             "set -euo pipefail\nsudo -n true\nsudo apt update"
         ));
-        assert!(command_requests_sudo_password(
-            "env FOO=bar sudo apt update"
-        ));
-        assert!(command_requests_sudo_password("env -- sudo apt update"));
-        assert!(command_requests_sudo_password("sudo -u nobody true"));
-        assert!(command_requests_sudo_password("sudo -unobody true"));
-        assert!(command_requests_sudo_password("sudo -p -n true"));
-        assert!(command_requests_sudo_password("sudo --prompt -n true"));
-        assert!(!command_requests_sudo_password("grep sudo README.md"));
-        assert!(!command_requests_sudo_password("sudo -n true"));
-        assert!(!command_requests_sudo_password("sudo -nv"));
-        assert!(!command_requests_sudo_password("sudo -u nobody -n true"));
-        assert!(!command_requests_sudo_password(
+        assert!(command_invokes_sudo("env FOO=bar sudo apt update"));
+        assert!(command_invokes_sudo("env -- sudo apt update"));
+        assert!(command_invokes_sudo("sudo -u nobody true"));
+        assert!(command_invokes_sudo("sudo -unobody true"));
+        assert!(command_invokes_sudo("sudo -p -n true"));
+        assert!(command_invokes_sudo("sudo --prompt -n true"));
+        assert!(command_invokes_sudo("sudo -n true"));
+        assert!(command_invokes_sudo("sudo -nv"));
+        assert!(command_invokes_sudo("sudo -u nobody -n true"));
+        assert!(command_invokes_sudo(
             "sudo --user=nobody --non-interactive true"
         ));
-        assert!(!command_requests_sudo_password(
-            "sudo --prompt=Password -n true"
-        ));
-        assert!(!command_requests_sudo_password(
-            "sudo --non-interactive true"
-        ));
+        assert!(command_invokes_sudo("sudo --prompt=Password -n true"));
+        assert!(command_invokes_sudo("sudo --non-interactive true"));
+        assert!(!command_invokes_sudo("grep sudo README.md"));
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "sed -n '1,10p' src/main.rs"})),
             CommandRisk::Read

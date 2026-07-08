@@ -1034,6 +1034,83 @@ fn sudo_command_shim_invokes_real_sudo_noninteractive_and_is_private() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
+    let root = temp_test_dir("sudo-preauth-noninteractive");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let fake_sudo = root.join("fake-sudo");
+    let state_dir = root.join("sudo-state");
+    std::fs::create_dir_all(&state_dir).expect("create sudo state dir");
+    let state_dir = shell_single_quote(&state_dir.to_string_lossy());
+    std::fs::write(
+        &fake_sudo,
+        format!(
+            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\nsid=$(ps -o sid= -p \"$$\" | tr -d '[:space:]')\nif [ -z \"$sid\" ]; then sid=$PPID; fi\nstate=\"$state_dir/$sid\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n  [ \"$pass\" = hunter2 ] || exit 1\n  : > \"$state\"\n  exit 0\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then exec \"$@\"; fi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
+        ),
+    )
+    .expect("write fake sudo");
+    use std::os::unix::fs::PermissionsExt;
+    let mut fake_perms = std::fs::metadata(&fake_sudo)
+        .expect("stat fake sudo")
+        .permissions();
+    fake_perms.set_mode(0o700);
+    std::fs::set_permissions(&fake_sudo, fake_perms).expect("chmod fake sudo");
+
+    let target = {
+        let _guard = env_lock();
+        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            Ok(home) => PathBuf::from(home),
+            Err(_) => root.clone(),
+        };
+        let dir = home.join(format!(".dext-sudo-preauth-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create target dir");
+        dir.join("out.txt")
+    };
+    let _ = std::fs::remove_file(&target);
+
+    let (sudo_shim_dir, askpass, fifo) = {
+        let _guard = env_lock();
+        (
+            write_sudo_command_shim(&root, "test-session", &fake_sudo).expect("write sudo shim"),
+            write_sudo_askpass_script(&root, "test-session").expect("write askpass"),
+            create_sudo_password_fifo(&root, "test-session").expect("create sudo fifo"),
+        )
+    };
+    let auth = LocalSudoAuth {
+        askpass: Some(askpass),
+        sudo_path: fake_sudo,
+        sudo_shim_dir,
+        password_fifo: Some(fifo),
+        password: Some("hunter2".to_string()),
+        preauth_required: true,
+    };
+    let command = format!(
+        "printf ok | sudo -n tee {} >/dev/null",
+        shell_single_quote(&target.to_string_lossy())
+    );
+    let out = execute_bash_async_prepared(
+        &command,
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(10),
+        Some(auth),
+        SandboxProfile::ReadOnly,
+        None,
+        &[],
+    )
+    .await
+    .expect("preauthed sudo command runs");
+
+    assert!(out.contains("exit: 0"), "{out}");
+    assert_eq!(std::fs::read_to_string(&target).expect("read target"), "ok");
+    let _ = std::fs::remove_file(&target);
+    if let Some(dir) = target.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn busy_console_input_withholds_potential_local_secret_from_steering() {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();

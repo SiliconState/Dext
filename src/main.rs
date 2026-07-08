@@ -7380,31 +7380,6 @@ async fn prepare_local_sudo_auth(
     };
     let sudo_path = std::fs::canonicalize(&sudo_path).unwrap_or(sudo_path);
     let sudo_shim_dir = write_sudo_command_shim(root, session_id, &sudo_path)?;
-    let mut probe = tokio::process::Command::new(&sudo_path);
-    probe
-        .arg("-n")
-        .arg("-v")
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    configure_tokio_process_group(&mut probe);
-    let cached = match tokio::time::timeout(std::time::Duration::from_secs(2), probe.status()).await
-    {
-        Ok(Ok(status)) => status.success(),
-        _ => false,
-    };
-    if cached {
-        return Ok(Some(LocalSudoAuth {
-            askpass: None,
-            sudo_path,
-            sudo_shim_dir,
-            password_fifo: None,
-            password: None,
-            preauth_required: false,
-        }));
-    }
     let askpass = write_sudo_askpass_script(root, session_id)?;
     Ok(Some(LocalSudoAuth {
         askpass: Some(askpass),
@@ -8189,7 +8164,32 @@ fn prepare_git_credential_helper(
 
 fn sudo_wrapper_prefix(auth: &LocalSudoAuth) -> String {
     let real_sudo = shell_single_quote(&auth.sudo_path.display().to_string());
-    let mut prefix = format!("sudo() {{ builtin command {real_sudo} -n \"$@\"; }}\n");
+    let mut prefix = String::new();
+    if auth.preauth_required {
+        if let Some(askpass) = auth.askpass.as_ref() {
+            let askpass_path = std::fs::canonicalize(askpass).unwrap_or_else(|_| askpass.clone());
+            let askpass = shell_single_quote(&askpass_path.display().to_string());
+            let fifo_env = auth
+                .password_fifo
+                .as_ref()
+                .map(|fifo| {
+                    let fifo = std::fs::canonicalize(fifo).unwrap_or_else(|_| fifo.clone());
+                    format!(
+                        " {SUDO_PASSWORD_FIFO_ENV}={}",
+                        shell_single_quote(&fifo.display().to_string())
+                    )
+                })
+                .unwrap_or_default();
+            prefix.push_str(&format!(
+                "if ! builtin command {real_sudo} -n -v 2>/dev/null; then\n  SUDO_ASKPASS={askpass} {SUDO_ASKPASS_ENV}={askpass}{fifo_env} SUDO_PROMPT='[dext local sudo] password for %u to run %p: ' builtin command {real_sudo} -A -v || exit $?\nfi\nunset SUDO_ASKPASS {SUDO_ASKPASS_ENV} {SUDO_PASSWORD_FIFO_ENV} SUDO_PROMPT\n"
+            ));
+        } else {
+            prefix.push_str("printf '%s\\n' 'sudo auth prompt unavailable' >&2\nexit 1\n");
+        }
+    }
+    prefix.push_str(&format!(
+        "sudo() {{ builtin command {real_sudo} -n \"$@\"; }}\n"
+    ));
     let mut seen = HashSet::new();
     for path in std::iter::once(auth.sudo_path.display().to_string()).chain(
         sudo_wrapper_command_paths()
@@ -8216,118 +8216,6 @@ fn sudo_shell_function_name_is_safe(path: &str) -> bool {
         && path
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
-}
-
-async fn preauthenticate_local_sudo(
-    root: &Path,
-    auth: &mut LocalSudoAuth,
-    interrupt: Arc<AtomicBool>,
-    timeout: std::time::Duration,
-) -> std::result::Result<(), String> {
-    if !auth.preauth_required {
-        return Ok(());
-    }
-    let askpass = auth
-        .askpass
-        .as_ref()
-        .ok_or_else(|| "sudo auth prompt unavailable".to_string())?
-        .clone();
-    let _sudo_password_pipe = match (auth.password_fifo.clone(), auth.password.take()) {
-        (Some(fifo), Some(password)) => Some(start_sudo_password_pipe_writer(fifo, password)),
-        _ => None,
-    };
-    let mut command = tokio::process::Command::new(&auth.sudo_path);
-    command
-        .arg("-A")
-        .arg("-v")
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env("SUDO_ASKPASS", &askpass)
-        .env(SUDO_ASKPASS_ENV, &askpass)
-        .env(
-            "SUDO_PROMPT",
-            "[dext local sudo] password for %u to run %p: ",
-        )
-        .kill_on_drop(true);
-    if let Some(fifo) = auth.password_fifo.as_ref() {
-        command.env(SUDO_PASSWORD_FIFO_ENV, fifo);
-    }
-    configure_tokio_process_group(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("spawn sudo auth failed: {e}"))?;
-    let child_pid = child.id();
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    let out_task = tokio::spawn(collect_async_limited(stdout, PROCESS_STREAM_CAPTURE_CAP));
-    let err_task = tokio::spawn(collect_async_limited(stderr, PROCESS_STREAM_CAPTURE_CAP));
-    let deadline = tokio::time::Instant::now() + timeout;
-    let status = loop {
-        let outcome: ProcWaitOutcome = tokio::select! {
-            biased;
-            res = child.wait() => ProcWaitOutcome::Exited(res),
-            _ = tokio::time::sleep_until(deadline) => ProcWaitOutcome::Timeout,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                if interrupt.load(Ordering::SeqCst) {
-                    ProcWaitOutcome::Interrupt
-                } else {
-                    continue;
-                }
-            }
-        };
-        match outcome {
-            ProcWaitOutcome::Exited(Ok(s)) => {
-                if let Some(pid) = child_pid {
-                    terminate_process_group_after_exit(pid);
-                }
-                break s;
-            }
-            ProcWaitOutcome::Exited(Err(e)) => return Err(format!("sudo auth wait failed: {e}")),
-            ProcWaitOutcome::Interrupt => {
-                terminate_tokio_child(&mut child).await;
-                let _ = out_task.await;
-                let _ = err_task.await;
-                return Err("sudo authentication interrupted".to_string());
-            }
-            ProcWaitOutcome::Timeout => {
-                terminate_tokio_child(&mut child).await;
-                let _ = out_task.await;
-                let err = err_task.await.unwrap_or_default();
-                return Err(format!(
-                    "sudo authentication timed out after {}s{}",
-                    timeout.as_secs(),
-                    render_sudo_auth_stderr_hint(&err.render("stderr"))
-                ));
-            }
-        }
-    };
-    let _ = out_task.await;
-    let err = err_task.await.unwrap_or_default();
-    auth.password_fifo = None;
-    auth.preauth_required = false;
-    let code = status.code().unwrap_or(-1);
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "sudo authentication failed (exit {code}){}",
-            render_sudo_auth_stderr_hint(&err.render("stderr"))
-        ))
-    }
-}
-
-fn render_sudo_auth_stderr_hint(stderr: &str) -> String {
-    let text = stderr.trim();
-    if text.is_empty() {
-        String::new()
-    } else {
-        format!(
-            ": {}",
-            cap_chars(&text.replace('\r', "␍").replace('\n', " "), 240)
-        )
-    }
 }
 
 #[cfg(test)]
@@ -14843,7 +14731,7 @@ impl Agent {
                             },
                             None => {
                                 local_sudo_auth_needed = name == "bash"
-                                    && tool_policy::command_requests_sudo_password(
+                                    && tool_policy::command_invokes_sudo(
                                         input["command"].as_str().unwrap_or(""),
                                     );
                                 Plan::Builtin
@@ -15076,17 +14964,6 @@ impl Agent {
                             LocalAuthSecret::Unavailable => {
                                 self.sink.local_auth_prompt("bash", SUDO_AUTH_GUIDANCE);
                             }
-                        }
-                        if let Err(e) = preauthenticate_local_sudo(
-                            &root,
-                            auth,
-                            self.interrupt.clone(),
-                            std::time::Duration::from_secs(120),
-                        )
-                        .await
-                        {
-                            builtin_outputs.insert(idx, Err(e));
-                            continue;
                         }
                     }
                     let live_output = live_output_for_tool(
