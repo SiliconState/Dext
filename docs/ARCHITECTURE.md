@@ -40,7 +40,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 - `src/provider.rs`
   - Provider profile/catalog loading and normalization.
   - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, DeepSeek, and local OpenAI-compatible profiles.
-  - llama.cpp runtime context probing for the local provider, with a 32K fallback.
+  - llama.cpp runtime context probing for the local provider, with a 131K fallback.
   - API-key and OAuth login flows.
   - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs.
   - Model alias normalization and provider/model switching helpers.
