@@ -436,7 +436,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>openai</code></td><td>OpenAI API</td><td>OpenAI</td><td>gpt-5</td><td>API Key (<code>OPENAI_API_KEY</code>)</td></tr>
 <tr><td><code>anthropic</code></td><td>Anthropic</td><td>Anthropic</td><td>claude-sonnet-4-5</td><td>API Key (<code>ANTHROPIC_API_KEY</code>)</td></tr>
 <tr><td><code>deepseek</code></td><td>DeepSeek</td><td>OpenAI</td><td>deepseek-chat</td><td>API Key (<code>DEEPSEEK_API_KEY</code>)</td></tr>
-<tr><td><code>local</code></td><td>Local llama.cpp</td><td>OpenAI</td><td>qwen2.5-coder-7b</td><td>None</td></tr>
+<tr><td><code>local</code></td><td>Local llama.cpp</td><td>OpenAI</td><td>qwen3.6-35b-a3b-mtp-ud-q5_k_m</td><td>None</td></tr>
 </table>
 <h3>Provider Resolution Chain</h3>
 <ol>
@@ -1063,7 +1063,7 @@ description: One-line workflow summary
 </ul>
 <h3>Local (llama.cpp)</h3>
 <ul>
-<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — Default model <code>qwen2.5-coder-7b</code>, alternate <code>qwen3.5-9b</code>; Dext probes llama.cpp runtime context and falls back to 32K tokens</li>
+<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — Default model <code>qwen3.6-35b-a3b-mtp-ud-q5_k_m</code>; Dext probes llama.cpp runtime context and falls back to 131K tokens</li>
 </ul>
 </div>
 </section>

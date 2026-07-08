@@ -1,9 +1,9 @@
 use super::*;
 use crate::provider::{
-    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS, clear_cached_local_llama_context_windows,
-    list_models_for_available_providers, merge_provider_profile, normalize_chatgpt_model_slug,
-    parse_llama_context_window, refresh_local_llama_context_window,
-    resolve_provider_model_selection,
+    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS, DEFAULT_LOCAL_MODEL,
+    clear_cached_local_llama_context_windows, list_models_for_available_providers,
+    merge_provider_profile, normalize_chatgpt_model_slug, parse_llama_context_window,
+    refresh_local_llama_context_window, resolve_provider_model_selection,
 };
 use crate::session::{
     append_log_line, canonicalize_read_tool_path, canonicalize_tool_path, cap_latest_log_buffer,
@@ -1527,7 +1527,7 @@ async fn non_aborting_runtime_control_keeps_pending_provider_response() {
     agent.provider_requires_api_key = false;
     agent.api_key.clear();
     agent.base_url = format!("http://{addr}");
-    agent.model = "qwen2.5-coder-7b".to_string();
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
     let (runtime_control_tx, runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
     agent.install_runtime_controls(runtime_control_rx, runtime_control_tx.clone());
 
@@ -5438,7 +5438,7 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
     let mut agent = test_agent(&root);
     agent.api_provider = ApiProvider::OpenAi;
     agent.base_url = "http://127.0.0.1:8080".to_string();
-    agent.model = "qwen2.5-coder-7b".to_string();
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
     agent.thinking_effort = ThinkingEffort::Off;
 
     let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
@@ -6433,12 +6433,15 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
         60_000
     );
     assert_eq!(
-        history_char_budget_with_override("qwen2.5-coder-7b", None, ContextMode::Tiny),
+        history_char_budget_with_override(DEFAULT_LOCAL_MODEL, None, ContextMode::Tiny),
         32_000
     );
-    assert_eq!(model_context_window("qwen2.5-coder-7b"), 32_000);
     assert_eq!(
-        active_history_char_budget_with_override("qwen2.5-coder-7b", None, ContextMode::Tiny),
+        model_context_window(DEFAULT_LOCAL_MODEL),
+        DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
+    );
+    assert_eq!(
+        active_history_char_budget_with_override(DEFAULT_LOCAL_MODEL, None, ContextMode::Tiny),
         32_000
     );
     assert_eq!(
@@ -6652,15 +6655,15 @@ fn local_llama_context_cache_overrides_builtin_local_default() {
     }
     clear_cached_local_llama_context_windows();
     assert_eq!(
-        model_context_window("qwen3.5-9b"),
+        model_context_window(DEFAULT_LOCAL_MODEL),
         crate::provider::DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
     );
-    crate::provider::set_cached_local_llama_context_window("qwen3.5-9b", 30_000);
-    assert_eq!(model_context_window("qwen3.5-9b"), 30_000);
+    crate::provider::set_cached_local_llama_context_window(DEFAULT_LOCAL_MODEL, 30_000);
+    assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 30_000);
     unsafe {
         std::env::set_var("DEXT_CONTEXT_WINDOW", "64000");
     }
-    assert_eq!(model_context_window("qwen3.5-9b"), 64_000);
+    assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 64_000);
     unsafe {
         std::env::remove_var("DEXT_CONTEXT_WINDOW");
         std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
@@ -6706,15 +6709,15 @@ fn local_llama_runtime_probe_updates_model_context_window() -> Result<()> {
         "local",
         ApiProvider::OpenAi,
         &format!("http://{addr}"),
-        "qwen3.5-9b",
+        DEFAULT_LOCAL_MODEL,
     );
     assert_eq!(tokens, Some(30_000));
-    assert_eq!(model_context_window("qwen3.5-9b"), 30_000);
+    assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 30_000);
     let _ = refresh_local_llama_context_window(
         "local",
         ApiProvider::OpenAi,
         &format!("http://{addr}"),
-        "qwen2.5-coder-7b",
+        "custom-local-probe",
     );
     server.join().expect("server thread");
     clear_cached_local_llama_context_windows();
@@ -7344,7 +7347,7 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
         "local",
         ApiProvider::OpenAi,
         "http://127.0.0.1:8080",
-        "qwen3.5-9b",
+        DEFAULT_LOCAL_MODEL,
     );
     let usage = Usage {
         input: 32,
@@ -8561,7 +8564,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         let local = find_provider_profile(&catalog, "local").context("local")?;
         assert_eq!(local.api_provider, ApiProvider::OpenAi);
         assert!(!local.requires_api_key);
-        assert_eq!(local.default_model, "qwen2.5-coder-7b");
+        assert_eq!(local.default_model, DEFAULT_LOCAL_MODEL);
         Ok(())
     })();
 
@@ -8581,6 +8584,8 @@ fn local_provider_merge_drops_retired_catalog_artifacts() {
     let mut stored = builtin.clone();
     stored.default_model = "qwen-local".to_string();
     stored.models.push("qwen-local".to_string());
+    stored.models.push("qwen2.5-coder-7b".to_string());
+    stored.models.push("qwen3.5-9b".to_string());
     stored
         .models
         .push("Qwen3.6-35B-A3B-Q4_K_M.gguf".to_string());
@@ -8594,12 +8599,14 @@ fn local_provider_merge_drops_retired_catalog_artifacts() {
         .insert("custom-local-model".to_string(), 12_345);
 
     let merged = merge_provider_profile(builtin, stored);
-    assert_eq!(merged.default_model, "qwen2.5-coder-7b");
+    assert_eq!(merged.default_model, DEFAULT_LOCAL_MODEL);
     assert_eq!(
         merged.context_window,
         Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
     );
     assert!(!merged.models.iter().any(|m| m == "qwen-local"));
+    assert!(!merged.models.iter().any(|m| m == "qwen2.5-coder-7b"));
+    assert!(!merged.models.iter().any(|m| m == "qwen3.5-9b"));
     assert!(merged.models.iter().any(|m| m == "custom-local-model"));
     assert!(!merged.model_context_windows.contains_key("qwen-local"));
     assert_eq!(
@@ -8609,37 +8616,40 @@ fn local_provider_merge_drops_retired_catalog_artifacts() {
 }
 
 #[test]
-fn local_provider_merge_drops_stale_local_4k_context_without_retired_models() {
+fn local_provider_merge_preserves_user_local_context_without_retired_artifacts_even_when_small() {
     let builtin = built_in_provider_profiles()
         .into_iter()
         .find(|p| p.id == "local")
         .expect("local profile");
     let mut stored = builtin.clone();
     stored.context_window = Some(4_096);
+    stored.models.push("custom-local-model".to_string());
 
     let merged = merge_provider_profile(builtin, stored);
-    assert_eq!(
-        merged.context_window,
-        Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
-    );
+    assert_eq!(merged.context_window, Some(4_096));
+    assert!(merged.models.iter().any(|m| m == "custom-local-model"));
 }
 
 #[test]
-fn local_provider_merge_drops_stale_local_16k_context_without_retired_models() {
+fn local_provider_merge_drops_context_when_it_belongs_to_retired_local_artifact() {
     let builtin = built_in_provider_profiles()
         .into_iter()
         .find(|p| p.id == "local")
         .expect("local profile");
     let mut stored = builtin.clone();
-    stored.context_window = Some(16_384);
-    stored.models.push("custom-local-model".to_string());
+    stored.context_window = Some(123_456);
+    stored.models.push("qwen-local".to_string());
+    stored
+        .model_context_windows
+        .insert("qwen-local".to_string(), 123_456);
 
     let merged = merge_provider_profile(builtin, stored);
     assert_eq!(
         merged.context_window,
         Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
     );
-    assert!(merged.models.iter().any(|m| m == "custom-local-model"));
+    assert!(!merged.models.iter().any(|m| m == "qwen-local"));
+    assert!(!merged.model_context_windows.contains_key("qwen-local"));
 }
 
 #[test]
@@ -8899,15 +8909,23 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
         assert_eq!(glm.provider_id, "glm");
         assert_eq!(glm.model, "glm-5.1");
 
-        let local =
-            resolve_provider_model_selection(&catalog, &store, "glm", "local/qwen2.5-coder-7b")?;
+        let local = resolve_provider_model_selection(
+            &catalog,
+            &store,
+            "glm",
+            &format!("local/{DEFAULT_LOCAL_MODEL}"),
+        )?;
         assert_eq!(local.provider_id, "local");
-        assert_eq!(local.model, "qwen2.5-coder-7b");
+        assert_eq!(local.model, DEFAULT_LOCAL_MODEL);
 
-        let qwen_alias =
-            resolve_provider_model_selection(&catalog, &store, "glm", "qwen/qwen3.5-9b")?;
+        let qwen_alias = resolve_provider_model_selection(
+            &catalog,
+            &store,
+            "glm",
+            &format!("qwen/{DEFAULT_LOCAL_MODEL}"),
+        )?;
         assert_eq!(qwen_alias.provider_id, "local");
-        assert_eq!(qwen_alias.model, "qwen3.5-9b");
+        assert_eq!(qwen_alias.model, DEFAULT_LOCAL_MODEL);
 
         let explicit =
             resolve_provider_model_selection(&catalog, &store, "glm", "chatgpt/gpt-5-4")?;
@@ -8949,7 +8967,8 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
             .expect("local provider");
         assert_eq!(local.api_provider, ApiProvider::OpenAi);
         assert!(!local.requires_api_key);
-        assert_eq!(local.default_model, "qwen2.5-coder-7b");
+        assert_eq!(local.default_model, DEFAULT_LOCAL_MODEL);
+        assert_eq!(local.models, vec![DEFAULT_LOCAL_MODEL.to_string()]);
         assert_eq!(
             local.context_window,
             Some(crate::provider::DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
@@ -11033,7 +11052,7 @@ async fn read_only_plan_suppresses_internal_planner_events_hooks_and_restores_si
     agent.provider_requires_api_key = false;
     agent.api_key.clear();
     agent.base_url = format!("http://{addr}");
-    agent.model = "qwen2.5-coder-7b".to_string();
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
     agent.hooks = Hooks::load(&root);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent.set_sink(Box::new(ChannelSink { tx }));

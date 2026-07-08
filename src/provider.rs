@@ -84,7 +84,8 @@ impl ApiProvider {
 
 const PROVIDER_CATALOG_VERSION: u32 = 1;
 const AUTH_STORE_VERSION: u32 = 1;
-pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS: u64 = 32_000;
+pub(crate) const DEFAULT_LOCAL_MODEL: &str = "qwen3.6-35b-a3b-mtp-ud-q5_k_m";
+pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS: u64 = 131_072;
 const LLAMA_CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(700);
 const LLAMA_CONTEXT_DISCOVERY_PATHS: &[&str] = &["/props", "/slots", "/v1/models", "/models"];
 
@@ -392,34 +393,17 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             display_name: "Local llama.cpp".to_string(),
             api_provider: ApiProvider::OpenAi,
             base_url: "http://127.0.0.1:8080".to_string(),
-            default_model: "qwen2.5-coder-7b".to_string(),
-            models: vec![
-                "qwen2.5-coder-7b".to_string(),
-                "qwen3.5-9b".to_string(),
-                "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf".to_string(),
-                "Qwen3.5-9B-Q4_K_M.gguf".to_string(),
-            ],
+            default_model: DEFAULT_LOCAL_MODEL.to_string(),
+            models: vec![DEFAULT_LOCAL_MODEL.to_string()],
             env_vars: Vec::new(),
             requires_api_key: false,
             login_url: None,
             oauth_flow: None,
-            notes: Some("Local OpenAI-compatible llama.cpp server. Start exactly one llama-server on 127.0.0.1:8080 with --alias qwen2.5-coder-7b or --alias qwen3.5-9b; no cloud credentials are used. On startup Dext probes llama.cpp for its runtime context and otherwise budgets 32K tokens.".to_string()),
+            notes: Some("Local OpenAI-compatible llama.cpp server. Start exactly one llama-server on 127.0.0.1:8080 with --alias qwen3.6-35b-a3b-mtp-ud-q5_k_m; no cloud credentials are used. On startup Dext probes llama.cpp for its runtime context and otherwise budgets 131K tokens.".to_string()),
             context_window: Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS),
             model_context_windows: {
                 let mut m = HashMap::new();
-                m.insert(
-                    "qwen2.5-coder-7b".to_string(),
-                    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS,
-                );
-                m.insert("qwen3.5-9b".to_string(), DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS);
-                m.insert(
-                    "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf".to_string(),
-                    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS,
-                );
-                m.insert(
-                    "Qwen3.5-9B-Q4_K_M.gguf".to_string(),
-                    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS,
-                );
+                m.insert(DEFAULT_LOCAL_MODEL.to_string(), DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS);
                 m
             },
             model_effort_levels: HashMap::new(),
@@ -599,7 +583,7 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     }
 
     let fallback_model = if profile.id == "local" {
-        "qwen2.5-coder-7b"
+        DEFAULT_LOCAL_MODEL
     } else {
         "glm-5.2[1m]"
     };
@@ -676,19 +660,28 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     Some(profile)
 }
 
-const RETIRED_BUNDLED_LOCAL_MODELS: &[&str] = &["qwen-local", "Qwen3.6-35B-A3B-Q4_K_M.gguf"];
-const RETIRED_BUNDLED_LOCAL_CONTEXT_WINDOWS: &[u64] = &[4_096, 16_384];
-
+const RETIRED_BUNDLED_LOCAL_MODELS: &[&str] = &[
+    "qwen-local",
+    "qwen2.5-coder-7b",
+    "qwen3.5-9b",
+    "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+    "Qwen3.5-9B-Q4_K_M.gguf",
+    "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+];
+fn local_context_window_matches_retired_artifact(stored: &ProviderProfile, window: u64) -> bool {
+    stored
+        .model_context_windows
+        .iter()
+        .any(|(model, model_window)| {
+            *model_window == window && is_retired_bundled_local_model(model)
+        })
+}
 fn is_retired_bundled_local_model(model: &str) -> bool {
     let model = model.trim();
     !model.is_empty()
         && RETIRED_BUNDLED_LOCAL_MODELS
             .iter()
             .any(|retired| model.eq_ignore_ascii_case(retired))
-}
-
-fn is_retired_bundled_local_context_window(tokens: u64) -> bool {
-    RETIRED_BUNDLED_LOCAL_CONTEXT_WINDOWS.contains(&tokens)
 }
 
 pub(crate) fn merge_provider_profile(
@@ -698,9 +691,8 @@ pub(crate) fn merge_provider_profile(
     let builtin_id = canonical_provider_id(&builtin.id);
     let local_profile = builtin_id == "local";
     let stored_default = stored.default_model.trim();
-    if !(stored_default.is_empty()
-        || (local_profile && is_retired_bundled_local_model(stored_default)))
-    {
+    let stored_default_retired = local_profile && is_retired_bundled_local_model(stored_default);
+    if !(stored_default.is_empty() || stored_default_retired) {
         builtin.default_model = if builtin.api_provider == ApiProvider::ChatGpt {
             normalize_chatgpt_model_slug(stored_default)
         } else {
@@ -708,8 +700,16 @@ pub(crate) fn merge_provider_profile(
         };
     }
 
+    let drop_stored_context_window = local_profile
+        && stored
+            .context_window
+            .filter(|window| *window > 0)
+            .is_some_and(|window| {
+                stored_default_retired
+                    || local_context_window_matches_retired_artifact(&stored, window)
+            });
     if let Some(window) = stored.context_window.filter(|window| *window > 0)
-        && !(local_profile && is_retired_bundled_local_context_window(window))
+        && !drop_stored_context_window
     {
         builtin.context_window = Some(window);
     }

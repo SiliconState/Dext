@@ -64,19 +64,19 @@ Inside the interactive session, the matching slash commands are:
 /models all
 /login chatgpt
 /logout chatgpt
-/model local/qwen2.5-coder-7b
+/model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
 ```
 
 Credentials are stored in Dext state, not in the repository. Do not commit `.env`, `.dext/`, exported sessions, or auth stores.
 
 ## Local Qwen / llama.cpp
 
-Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. The curated local model ids are `qwen2.5-coder-7b` (fast coding/default) and `qwen3.5-9b` (chat/reasoning). On startup/provider switch, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) for the live runtime context window; if the probe misses, local context budgeting falls back to 32K tokens. Start exactly one server first, then select it:
+Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. The curated local model id is `qwen3.6-35b-a3b-mtp-ud-q5_k_m`. On startup/provider switch, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) for the live runtime context window; if the probe misses, local context budgeting falls back to 131K tokens. Start exactly one server first, then select it:
 
 ```bash
 dext auth provider local
 # or inside Dext:
-/model local/qwen2.5-coder-7b
+/model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
 /effort off
 ```
 
@@ -85,17 +85,13 @@ Example local GGUF launch commands:
 ```bash
 cd /path/to/llama.cpp
 ./build/bin/llama-server \
-  -m /path/to/models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf \
-  --alias qwen2.5-coder-7b -ngl 99 -c 32000 -t 8 \
-  --flash-attn on --host 127.0.0.1 --port 8080
-
-./build/bin/llama-server \
-  -m /path/to/models/Qwen3.5-9B-Q4_K_M.gguf \
-  --alias qwen3.5-9b -ngl 99 -c 32000 -t 8 \
-  --flash-attn on --reasoning off --host 127.0.0.1 --port 8080
+  -m /path/to/models/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf \
+  --alias qwen3.6-35b-a3b-mtp-ud-q5_k_m -ngl 99 -c 131072 -t 24 \
+  --flash-attn on --spec-type draft-mtp --spec-draft-n-max 2 \
+  --host 127.0.0.1 --port 8080
 ```
 
-For Qwen3.5 thinking mode, omit `--reasoning off` and give Dext enough output budget (`DEXT_MAX_OUTPUT_TOKENS=8192` is the default). Use `--context-mode tiny --effort off` or `/context tiny` plus `/effort off` for the lowest local token/compute pressure.
+Use `--context-mode tiny --effort off` or `/context tiny` plus `/effort off` for the lowest local token/compute pressure.
 
 ## Interactive workflow
 
@@ -323,7 +319,7 @@ Provider/model:
 
 ```bash
 DEXT_PROVIDER=local
-DEXT_MODEL=qwen2.5-coder-7b
+DEXT_MODEL=qwen3.6-35b-a3b-mtp-ud-q5_k_m
 DEXT_BASE_URL=http://127.0.0.1:8080
 DEXT_THINKING_EFFORT=off
 # cloud examples:
