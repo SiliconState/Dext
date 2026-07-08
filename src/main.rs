@@ -3149,6 +3149,13 @@ struct OaiRequest<'a> {
     /// user opts in — see `llama_tool_call_grammar`.
     #[serde(skip_serializing_if = "Option::is_none")]
     grammar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<OaiChatTemplateKwargs>,
+}
+
+#[derive(Serialize)]
+struct OaiChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]
@@ -8912,7 +8919,9 @@ fn prompt_permission(name: &str, input: &Value, pretty: bool) -> Choice {
 const DEFAULT_SYSTEM: &str = "You are dext, a terse coding assistant running as a CLI agent on the user's machine.
 
 Use only tools exposed in the current API tool list. Do not assume unavailable tools exist.
+Tool protocol: invoke tools only through actual provider tool calls; never print raw `to=functions.*`, `tool_use`, function-call JSON, or bash command envelopes as assistant text.
 Runtime: privileged ops are auto-approved; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested. Avoid mutating external state stores directly.
+Runtime state: check the auto-refreshed Context State before each tool call; if a strategy shows PIVOT REQUIRED or a pattern line, stop repeating and pivot or ask.
 Project state: use todo_read/todo_write for nontrivial work. Treat DEXT.md/recall.md as guidance; update recall.md only for durable decisions.
 Tool hierarchy: use exposed native Dext tools before bash. Use fd/rg/read_file/read_symbol/git_diff/todo/edit tools, and http when exposed, for their domains; bash is last resort for shell-only orchestration, build/test/install, or catalog gaps.
 Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Read-only tools may inspect absolute paths outside the sandbox; writes stay confined. Avoid broad reads; paginate. Use read-only tools in parallel. Do not use bash for ordinary file reads, recursive search, file discovery, git diff, or HTTP when an exposed native tool fits.
@@ -8926,7 +8935,7 @@ Communication: be terse. Report what changed, verification results, gaps. No nar
 Tables: single well-formed tables render best. When several small related tables share a theme/schema, consolidate them into one grouped table with one header row; use grouping columns/rows, one physical line per row, compact cell delimiters like ` · ` or `;`, and plain short cells. Avoid stacked heading+table blocks and fragile cell content: nested markdown/bold, emoji verdict icons, unescaped `|` characters, or multi-line cells. If separate tables are truly needed, separate them with a full prose sentence.
 Packs: when creating or installing a reusable pack or shelf, default to Dext's user-global scope (`~/.dext/packs` or `~/.dext/shelves/<shelf>/packs`) unless the user explicitly asks for project-local placement.";
 
-const TINY_SYSTEM: &str = "You are dext in tiny mode: terse CLI coding agent. Use only exposed tools. Tool protocol: real tool calls only; never print raw to=functions/tool_use/function-call JSON/bash command envelopes or prefill the TUI input. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit, and http when exposed; read-only absolute paths are allowed, writes stay confined; bash only for shell-only orchestration, build/test/install, or gaps. Inspect before edits. Keep output small. Use todo for nontrivial work. Bash is atomic; use supervised dext- services only for requested persistence. Obey [runtime-note] tool-result advisories. Reusable packs default user-global unless asked otherwise. Tables: related data -> one grouped table; one row/line; plain cells, no emoji/bold/unescaped `|`/linebreaks; prose between unrelated tables. Verify narrowly. Final: changed, tests, gaps.";
+const TINY_SYSTEM: &str = "You are dext tiny: terse CLI agent. Use exposed tools only. Tool protocol: real tool calls only; never print raw to=functions/tool_use/function-call JSON/bash envelopes or prefill the TUI input. Check Context State; pivot at PIVOT REQUIRED or repeated-action pattern. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit/http; read-only absolute paths ok, writes confined; bash only for shell orchestration, build/test/install, or gaps. Inspect before edits. Keep output small. Use todo for nontrivial work. Bash is atomic; supervised dext- services only for requested persistence. Obey [runtime-note] advisories. Reusable packs default user-global unless asked otherwise. Tables: related data -> one grouped table; one row/line; plain cells, no emoji/bold/unescaped `|`/linebreaks; prose between unrelated tables. Verify narrowly. Final: changed, tests, gaps.";
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Tool protocol: invoke tools only through actual provider tool calls. Never print raw tool syntax (`to=functions.*`, `tool_use`, function-call JSON, or bash command envelopes) as assistant text, and never try to prefill the TUI input/composer.";
 
@@ -9089,6 +9098,15 @@ Keep each section concise. Capture the user's overall goal, key decisions and wh
 // Output cap for the one-shot compaction/summary request (kept small: the
 // summary is intentionally terse).
 const COMPACT_SUMMARY_MAX_TOKENS: u32 = 2_048;
+const COMPACT_SUMMARY_MAX_TOKENS_THINKING: u32 = 8_192;
+
+fn compact_summary_max_tokens(thinking_effort: ThinkingEffort) -> u32 {
+    if thinking_effort == ThinkingEffort::Off {
+        COMPACT_SUMMARY_MAX_TOKENS
+    } else {
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING
+    }
+}
 
 const HISTORY_CHAR_BUDGET_MIN: usize = 24_000;
 pub(crate) const HISTORY_CHAR_BUDGET_END_TURN_PERCENT: u8 = 90;
@@ -9778,6 +9796,462 @@ fn render_provider_health_prompt(health: &ProviderHealthLedger) -> String {
         out.push('\n');
     }
     out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ContextStrategy {
+    GitStatus,
+    HttpUrlHunt,
+    BinaryHunt,
+}
+
+impl ContextStrategy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GitStatus => "git_status",
+            Self::HttpUrlHunt => "http_url_hunt",
+            Self::BinaryHunt => "binary_hunt",
+        }
+    }
+
+    fn limit(self) -> usize {
+        match self {
+            Self::GitStatus | Self::BinaryHunt => 1,
+            Self::HttpUrlHunt => 2,
+        }
+    }
+
+    fn counts_successes(self) -> bool {
+        matches!(self, Self::GitStatus)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ContextToolUseSummary {
+    summary: String,
+    action_key: String,
+    strategy: Option<ContextStrategy>,
+    mutates_worktree: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ContextActionSummary {
+    summary: String,
+    action_key: String,
+    strategy: Option<ContextStrategy>,
+    mutates_worktree: bool,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Default)]
+struct ContextStrategyBudget {
+    used: usize,
+}
+
+fn command_looks_like_git_status(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains("git status")
+        || lower.contains("git diff --stat")
+        || lower.contains("git diff --shortstat")
+}
+
+fn command_looks_like_http_probe(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains("curl ")
+        || lower.contains("wget ")
+        || lower.contains("httpie ")
+        || lower.contains("python -m requests")
+}
+
+fn command_looks_like_binary_hunt(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let names_browser = [
+        "agent-browser",
+        "lightpanda",
+        "chromium",
+        "google-chrome",
+        "chrome",
+        "firefox",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    names_browser
+        && (lower.contains("which ")
+            || lower.contains("command -v")
+            || lower.contains("type -p")
+            || lower.contains("/usr/bin/")
+            || lower.contains("/snap/bin/")
+            || lower.contains("/bin/"))
+}
+
+fn context_strategy_for_tool(name: &str, input: &Value) -> Option<ContextStrategy> {
+    match name {
+        "git_diff" if input["stat"].as_bool().unwrap_or(false) => Some(ContextStrategy::GitStatus),
+        "http" => Some(ContextStrategy::HttpUrlHunt),
+        "browser" => Some(ContextStrategy::HttpUrlHunt),
+        "bash" => {
+            let command = input["command"].as_str().unwrap_or("");
+            if command_looks_like_git_status(command) {
+                Some(ContextStrategy::GitStatus)
+            } else if command_looks_like_binary_hunt(command) {
+                Some(ContextStrategy::BinaryHunt)
+            } else if command_looks_like_http_probe(command) {
+                Some(ContextStrategy::HttpUrlHunt)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn context_action_key(name: &str, input: &Value) -> String {
+    if name == "bash" {
+        format!(
+            "bash:{}",
+            summarize_bash_command(
+                input["command"].as_str().unwrap_or(""),
+                TOOL_SUMMARY_CHAR_CAP
+            )
+        )
+    } else {
+        format!("{name}:{}", input)
+    }
+}
+
+fn bash_command_may_mutate_worktree(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "rm ",
+        "mv ",
+        "cp ",
+        "touch ",
+        "mkdir ",
+        "rmdir ",
+        "git commit",
+        "git add",
+        "git rm",
+        "git mv",
+        ">",
+        "sed -i",
+        "python - <<",
+        "cat <<",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn context_action_mutates_worktree(name: &str, input: &Value) -> bool {
+    match name {
+        "write_file" | "edit_file" | "multi_edit" | "git_commit" => true,
+        "bash" => bash_command_may_mutate_worktree(input["command"].as_str().unwrap_or("")),
+        _ => false,
+    }
+}
+
+fn output_has_blocked_source_marker(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    [
+        "captcha",
+        "cloudflare",
+        "verify you are human",
+        "access denied",
+        "attention required",
+        "enable javascript",
+        "just a moment",
+        "unrecognized http arg",
+        "decode error",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn context_strategy_semantic_failure(strategy: Option<ContextStrategy>, content: &str) -> bool {
+    matches!(strategy, Some(ContextStrategy::HttpUrlHunt))
+        && (tool_policy::output_has_auth_failure_markers(content)
+            || output_has_blocked_source_marker(content))
+}
+
+fn collect_context_actions(history: &[Message]) -> Vec<ContextActionSummary> {
+    let start = history
+        .iter()
+        .rposition(is_fresh_user_prompt_message)
+        .unwrap_or(0);
+    let mut uses: HashMap<String, ContextToolUseSummary> = HashMap::new();
+    let mut actions = Vec::new();
+    for message in &history[start..] {
+        match message.role.as_str() {
+            "assistant" => {
+                for block in &message.content {
+                    if let Block::ToolUse { id, name, input } = block {
+                        uses.insert(
+                            id.clone(),
+                            ContextToolUseSummary {
+                                summary: summarize_call(name, input),
+                                action_key: context_action_key(name, input),
+                                strategy: context_strategy_for_tool(name, input),
+                                mutates_worktree: context_action_mutates_worktree(name, input),
+                            },
+                        );
+                    }
+                }
+            }
+            "user" => {
+                for block in &message.content {
+                    if let Block::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } = block
+                        && let Some(call) = uses.get(tool_use_id)
+                    {
+                        let failed = is_error.unwrap_or(false)
+                            || context_strategy_semantic_failure(call.strategy, content);
+                        actions.push(ContextActionSummary {
+                            summary: call.summary.clone(),
+                            action_key: call.action_key.clone(),
+                            strategy: call.strategy,
+                            mutates_worktree: call.mutates_worktree,
+                            ok: !failed,
+                            detail: summarize_inline(content, 160),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    actions
+}
+
+fn context_strategy_budget_usage(
+    actions: &[ContextActionSummary],
+) -> BTreeMap<ContextStrategy, ContextStrategyBudget> {
+    let mut budgets: BTreeMap<ContextStrategy, ContextStrategyBudget> = BTreeMap::new();
+    for action in actions {
+        if action.ok && action.mutates_worktree {
+            budgets.remove(&ContextStrategy::GitStatus);
+        }
+        let Some(strategy) = action.strategy else {
+            continue;
+        };
+        if strategy.counts_successes() || !action.ok {
+            let budget = budgets.entry(strategy).or_default();
+            budget.used = budget.used.saturating_add(1);
+        }
+    }
+    budgets
+}
+
+fn context_strategy_budget_status(strategy: ContextStrategy, used: usize) -> &'static str {
+    let limit = strategy.limit();
+    if used >= limit {
+        "PIVOT REQUIRED"
+    } else if used > 0 && used + 1 >= limit {
+        "WARNING"
+    } else {
+        "OK"
+    }
+}
+
+fn context_repetition_pattern(actions: &[ContextActionSummary]) -> Option<String> {
+    let mut best_key = "";
+    let mut best_summary = "";
+    let mut best_run = 0usize;
+    let mut idx = 0usize;
+    while idx < actions.len() {
+        let action = &actions[idx];
+        let mut end = idx + 1;
+        while end < actions.len() && actions[end].action_key == action.action_key {
+            end += 1;
+        }
+        let run = end - idx;
+        if run >= 2 && run >= best_run {
+            best_key = &action.action_key;
+            best_summary = &action.summary;
+            best_run = run;
+        }
+        idx = end;
+    }
+    if best_run >= 2 && !best_key.is_empty() {
+        Some(format!(
+            "→ PATTERN: same action repeated {best_run}x ({best_summary}). Stop repeating; trust the latest result or pivot."
+        ))
+    } else {
+        None
+    }
+}
+
+fn active_checkpoint_lines(ledger: &WorkLedger) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut lines = Vec::new();
+    for (status, items) in [
+        ("in_progress", &ledger.in_progress),
+        ("unresolved", &ledger.pending),
+        ("blocked", &ledger.blocked),
+    ] {
+        for item in items {
+            let item = item.trim();
+            if item.is_empty() || !seen.insert(item.to_string()) {
+                continue;
+            }
+            lines.push(format!("- [{status}] {}", summarize_inline(item, 180)));
+            if lines.len() >= 6 {
+                return lines;
+            }
+        }
+    }
+    lines
+}
+
+fn render_context_state_prompt(history: &[Message], ledger: &WorkLedger) -> String {
+    let actions = collect_context_actions(history);
+    let checkpoints = active_checkpoint_lines(ledger);
+    if actions.is_empty() && checkpoints.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    if !actions.is_empty() {
+        out.push_str("Recent actions (last 5):\n");
+        let recent_start = actions.len().saturating_sub(5);
+        let recent = &actions[recent_start..];
+        for (idx, action) in recent.iter().enumerate() {
+            let offset = recent.len() - idx;
+            out.push_str(&format!(
+                "- T-{offset}: {} · {} · {}\n",
+                if action.ok { "ok" } else { "err" },
+                action.summary,
+                action.detail
+            ));
+        }
+        if let Some(pattern) = context_repetition_pattern(recent) {
+            out.push_str(&pattern);
+            out.push('\n');
+        }
+    }
+
+    let budgets = context_strategy_budget_usage(&actions);
+    out.push_str("Strategy budget:\n");
+    for strategy in [
+        ContextStrategy::HttpUrlHunt,
+        ContextStrategy::BinaryHunt,
+        ContextStrategy::GitStatus,
+    ] {
+        let used = budgets
+            .get(&strategy)
+            .map(|budget| budget.used)
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "- {}: {}/{} used · {}\n",
+            strategy.label(),
+            used,
+            strategy.limit(),
+            context_strategy_budget_status(strategy, used)
+        ));
+    }
+
+    if !checkpoints.is_empty() {
+        out.push_str("Active checkpoints:\n");
+        for line in checkpoints {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    let errors: Vec<&ContextActionSummary> = actions.iter().filter(|action| !action.ok).collect();
+    if !errors.is_empty() {
+        out.push_str("Last errors:\n");
+        let start = errors.len().saturating_sub(3);
+        for action in &errors[start..] {
+            let label = action
+                .strategy
+                .map(ContextStrategy::label)
+                .unwrap_or("tool");
+            out.push_str(&format!(
+                "- {label}: {} => {}\n",
+                action.summary, action.detail
+            ));
+        }
+    }
+    out
+}
+
+fn compact_summary_chat_template_kwargs(
+    provider_id: &str,
+    api_provider: ApiProvider,
+    base_url: &str,
+) -> Option<OaiChatTemplateKwargs> {
+    provider::is_local_llama_provider(provider_id, api_provider, base_url).then_some(
+        OaiChatTemplateKwargs {
+            enable_thinking: false,
+        },
+    )
+}
+
+fn summary_task_marker_pos(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    let leading_ws = line.len().saturating_sub(trimmed.len());
+    let stripped = trimmed.trim_start_matches('#').trim_start();
+    let stripped = stripped.trim_matches('*').trim();
+    let lower = stripped.to_ascii_lowercase();
+    (lower == "task" || lower.starts_with("task:")).then_some(leading_ws)
+}
+
+fn tail_chars(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.trim().to_string();
+    }
+    s.chars()
+        .skip(count.saturating_sub(max_chars))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn extract_summary_from_reasoning(reasoning: &str) -> String {
+    let mut best_pos = None;
+    let mut cursor = 0usize;
+    for line in reasoning.split_inclusive('\n') {
+        let line_no_newline = line.trim_end_matches(['\r', '\n']);
+        if let Some(offset) = summary_task_marker_pos(line_no_newline) {
+            best_pos = Some(cursor + offset);
+        }
+        cursor += line.len();
+    }
+    if cursor < reasoning.len() {
+        let line = &reasoning[cursor..];
+        if let Some(offset) = summary_task_marker_pos(line) {
+            best_pos = Some(cursor + offset);
+        }
+    }
+    best_pos
+        .map(|pos| reasoning[pos..].trim().to_string())
+        .unwrap_or_else(|| tail_chars(reasoning, 2_000))
+}
+
+fn openai_summary_text_from_response(json: &Value) -> Result<String> {
+    let choice = json["choices"].as_array().and_then(|arr| arr.first());
+    let mut text = choice
+        .and_then(|c| c["message"]["content"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let finish_reason = choice
+        .and_then(|c| c["finish_reason"].as_str())
+        .unwrap_or_default();
+    if text.trim().is_empty()
+        && finish_reason == "length"
+        && let Some(reasoning) = choice.and_then(|c| c["message"]["reasoning_content"].as_str())
+    {
+        text = extract_summary_from_reasoning(reasoning);
+    }
+    if text.trim().is_empty() {
+        anyhow::bail!("summary response had no text: {json}");
+    }
+    Ok(text)
 }
 
 fn default_session_version() -> u32 {
@@ -11964,6 +12438,18 @@ impl Agent {
                     env.push('\n');
                 }
             }
+            let context_state = self.context_state_prompt();
+            if !context_state.trim().is_empty() {
+                env.push_str("\n## Context State\n");
+                env.push_str(&cap_bytes_with_hint(
+                    context_state,
+                    800,
+                    "context state trimmed for tiny context.",
+                ));
+                if !env.ends_with('\n') {
+                    env.push('\n');
+                }
+            }
             env.push_str(&self.privacy.prompt_status_line());
             env.push('\n');
             return SystemParts {
@@ -12026,6 +12512,18 @@ impl Agent {
                     ledger,
                     1_200,
                     "work ledger trimmed for frugal context.",
+                ));
+                if !env.ends_with('\n') {
+                    env.push('\n');
+                }
+            }
+            let context_state = self.context_state_prompt();
+            if !context_state.trim().is_empty() {
+                env.push_str("\n## Context State\n");
+                env.push_str(&cap_bytes_with_hint(
+                    context_state,
+                    1_200,
+                    "context state trimmed for frugal context.",
                 ));
                 if !env.ends_with('\n') {
                     env.push('\n');
@@ -12154,6 +12652,18 @@ impl Agent {
                 env.push('\n');
             }
         }
+        let context_state = self.context_state_prompt();
+        if !context_state.trim().is_empty() {
+            env.push_str("\n## Context State\n");
+            env.push_str(&cap_bytes_with_hint(
+                context_state,
+                1_800,
+                "context state trimmed for prompt budget.",
+            ));
+            if !env.ends_with('\n') {
+                env.push('\n');
+            }
+        }
         let health = self.provider_health_prompt();
         if !health.trim().is_empty() {
             env.push_str("\n## Provider health\n");
@@ -12224,6 +12734,10 @@ impl Agent {
 
     fn work_ledger_prompt(&self) -> String {
         render_work_ledger_prompt(&self.work_ledger)
+    }
+
+    fn context_state_prompt(&self) -> String {
+        render_context_state_prompt(&self.history, &self.work_ledger)
     }
 
     fn provider_health_prompt(&self) -> String {
@@ -12776,6 +13290,7 @@ impl Agent {
                     stream_options,
                     reasoning_effort,
                     grammar,
+                    chat_template_kwargs: None,
                 };
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                 Ok((url, bytes))
@@ -13470,6 +13985,7 @@ impl Agent {
         let transcript = render_transcript_for_summary(old, self.context_mode);
         let user_text = compaction_user_text_with_evidence(&transcript, evidence);
         let summary_model = self.compact_summary_model();
+        let summary_max_tokens = compact_summary_max_tokens(self.thinking_effort);
 
         #[derive(PartialEq, Eq)]
         enum SummaryParse {
@@ -13496,7 +14012,7 @@ impl Agent {
             )?;
             (req.send().await?, SummaryParse::ChatGptSse)
         } else if self.api_provider == ApiProvider::OpenAi {
-            let reasoning_effort = openai_reasoning_effort(self.thinking_effort);
+            let reasoning_effort = None;
             let messages = vec![
                 OaiMessage {
                     role: "system".to_string(),
@@ -13513,13 +14029,18 @@ impl Agent {
             ];
             let body = OaiRequest {
                 model: &summary_model,
-                max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
+                max_tokens: summary_max_tokens,
                 messages,
                 tools: Vec::new(),
                 stream: false,
                 stream_options: None,
                 reasoning_effort,
                 grammar: None,
+                chat_template_kwargs: compact_summary_chat_template_kwargs(
+                    &self.provider_id,
+                    self.api_provider,
+                    &self.base_url,
+                ),
             };
             let mut req = self
                 .http_client()
@@ -13542,7 +14063,7 @@ impl Agent {
             }];
             let body = Request {
                 model: &summary_model,
-                max_tokens: COMPACT_SUMMARY_MAX_TOKENS,
+                max_tokens: summary_max_tokens,
                 system: &sys_blocks,
                 messages: &messages,
                 tools: &[],
@@ -13614,7 +14135,7 @@ impl Agent {
                             });
                             let _ = self.interrupt_aware_sleep(wait).await;
                             let body = build_chatgpt_summary_request(
-                                &self.model,
+                                &summary_model,
                                 COMPACT_SYSTEM,
                                 &user_text,
                             );
@@ -13654,15 +14175,7 @@ impl Agent {
         match parse_mode {
             SummaryParse::ChatGptSse => unreachable!("handled above"),
             SummaryParse::OpenAi => {
-                let text = json["choices"]
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|c| c["message"]["content"].as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if text.trim().is_empty() {
-                    anyhow::bail!("summary response had no text: {json}");
-                }
+                let text = openai_summary_text_from_response(&json)?;
                 let mut usage = Usage::parse_openai(&json["usage"]);
                 self.finalize_usage_metrics(&mut usage);
                 Ok((text, usage))

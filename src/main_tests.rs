@@ -12018,6 +12018,262 @@ fn compact_summary_model_env_override() {
 }
 
 #[test]
+fn context_state_warns_on_repeated_actions_and_strategy_budget() {
+    let history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "inspect the repo".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_status_1".to_string(),
+                name: "git_diff".to_string(),
+                input: json!({"stat": true}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_status_1", "clean", Some(false))],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_status_2".to_string(),
+                name: "git_diff".to_string(),
+                input: json!({"stat": true}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_status_2", "clean", Some(false))],
+        },
+    ];
+
+    let state = render_context_state_prompt(&history, &WorkLedger::default());
+    assert!(state.contains("Recent actions (last 5):"), "{state}");
+    assert!(
+        state.contains("git_status: 2/1 used · PIVOT REQUIRED"),
+        "{state}"
+    );
+    assert!(
+        state.contains("PATTERN: same action repeated 2x"),
+        "{state}"
+    );
+}
+
+#[test]
+fn context_state_resets_git_status_budget_after_mutation() {
+    let history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "make a change".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_status".to_string(),
+                name: "git_diff".to_string(),
+                input: json!({"stat": true}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_status", "clean", Some(false))],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_write".to_string(),
+                name: "write_file".to_string(),
+                input: json!({"path":"src/lib.rs","content":"x"}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_write", "wrote file", Some(false))],
+        },
+    ];
+
+    let state = render_context_state_prompt(&history, &WorkLedger::default());
+    assert!(state.contains("git_status: 0/1 used · OK"), "{state}");
+}
+
+#[test]
+fn compose_system_parts_includes_context_state_section() {
+    let root = temp_test_dir("context-state-env");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "check status".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ToolUse {
+                id: "call_status".to_string(),
+                name: "git_diff".to_string(),
+                input: json!({"stat": true}),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_status", "dirty", Some(false))],
+        },
+    ];
+
+    let (_stable, env) = agent.compose_system_parts();
+    assert!(env.contains("## Context State"), "{env}");
+    assert!(
+        env.contains("git_status: 1/1 used · PIVOT REQUIRED"),
+        "{env}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn compact_summary_thinking_budget_and_reasoning_fallbacks() {
+    assert_eq!(
+        compact_summary_max_tokens(ThinkingEffort::Off),
+        COMPACT_SUMMARY_MAX_TOKENS
+    );
+    assert_eq!(
+        compact_summary_max_tokens(ThinkingEffort::High),
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING
+    );
+    assert!(
+        compact_summary_chat_template_kwargs("local", ApiProvider::OpenAi, "http://127.0.0.1:8080")
+            .is_some()
+    );
+    assert!(
+        compact_summary_chat_template_kwargs(
+            "openai",
+            ApiProvider::OpenAi,
+            "https://api.openai.com"
+        )
+        .is_none()
+    );
+
+    let reasoning =
+        "draft\n**Task**\nFirst draft.\n\nmore\n## Task\nFinal draft.\nDecisions\n- keep it";
+    let extracted = extract_summary_from_reasoning(reasoning);
+    assert!(
+        extracted.starts_with("## Task\nFinal draft."),
+        "{extracted}"
+    );
+    assert!(!extracted.contains("First draft"), "{extracted}");
+
+    let json = json!({
+        "choices": [{
+            "finish_reason": "length",
+            "message": {
+                "content": "",
+                "reasoning_content": reasoning,
+            }
+        }],
+        "usage": {}
+    });
+    let text = openai_summary_text_from_response(&json).expect("reasoning fallback");
+    assert!(text.contains("Final draft"), "{text}");
+
+    let empty = json!({"choices":[{"finish_reason":"stop","message":{"content":""}}]});
+    let err = openai_summary_text_from_response(&empty).expect_err("empty summary should fail");
+    assert!(
+        err.to_string().contains("summary response had no text"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn openai_compact_summary_request_disables_local_thinking() {
+    let root = temp_test_dir("compact-summary-local-thinking");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        let mut header_end = None;
+        while header_end.is_none() {
+            let n = stream.read(&mut buf).expect("read request headers");
+            assert!(n > 0, "client closed before sending headers");
+            request.extend_from_slice(&buf[..n]);
+            header_end = request.windows(4).position(|w| w == b"\r\n\r\n");
+        }
+        let header_end = header_end.expect("header terminator") + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let n = stream.read(&mut buf).expect("read request body");
+            assert!(n > 0, "client closed before sending body");
+            request.extend_from_slice(&buf[..n]);
+        }
+        let body = request[header_end..header_end + content_length].to_vec();
+        tx.send(body).expect("send request body");
+        let response_body = r#"{"choices":[{"finish_reason":"stop","message":{"content":"Task\nSummarized."}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    });
+
+    let mut agent = test_agent(&root);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.provider_id = "local".to_string();
+    agent.provider_requires_api_key = false;
+    agent.api_key.clear();
+    agent.base_url = format!("http://{addr}");
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
+    agent.thinking_effort = ThinkingEffort::High;
+    let old = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "old context".to_string(),
+        }],
+    }];
+
+    let (summary, usage) = agent
+        .one_shot_summary(&old, "")
+        .await
+        .expect("summary request should complete");
+    assert_eq!(summary, "Task\nSummarized.");
+    assert_eq!(usage.output, 2);
+    let body = rx.recv().expect("request body");
+    let value: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(value["max_tokens"], COMPACT_SUMMARY_MAX_TOKENS_THINKING);
+    assert!(value.get("reasoning_effort").is_none(), "{value}");
+    assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
+    assert_eq!(value["stream"], false);
+
+    server.join().expect("server thread");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn prompt_scan_cache_revalidates_on_file_change() -> Result<()> {
     let root = temp_test_dir("prompt-scan-cache");
     let root = std::fs::canonicalize(&root)?;
