@@ -8402,6 +8402,44 @@ fn global_model_override_respects_provider_compatibility() -> Result<()> {
 }
 
 #[test]
+fn retired_local_model_env_overrides_fall_back_to_current_local_default() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-local-retired-env");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("DEXT_PROVIDER", "local");
+        std::env::set_var("DEXT_MODEL", "qwen3-coder-next-ud-iq4_nl");
+        std::env::set_var("DEXT_MODEL_FORCE", "1");
+        std::env::remove_var("DEXT_MODEL_LOCAL");
+    }
+
+    let result = (|| -> Result<()> {
+        let resolved = resolve_runtime_provider(None, false)?;
+        assert_eq!(resolved.profile.id, "local");
+        assert_eq!(resolved.model, DEFAULT_LOCAL_MODEL);
+
+        unsafe {
+            std::env::remove_var("DEXT_MODEL");
+            std::env::set_var("DEXT_MODEL_LOCAL", "qwen3-coder-next-ud-iq4_nl");
+        }
+        let resolved = resolve_runtime_provider(None, false)?;
+        assert_eq!(resolved.profile.id, "local");
+        assert_eq!(resolved.model, DEFAULT_LOCAL_MODEL);
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_PROVIDER");
+        std::env::remove_var("DEXT_MODEL");
+        std::env::remove_var("DEXT_MODEL_LOCAL");
+        std::env::remove_var("DEXT_MODEL_FORCE");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn provider_default_model_persists_and_is_listed() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-default-model");
@@ -8880,6 +8918,67 @@ fn provider_selector_accepts_index_and_id() -> Result<()> {
         assert_eq!(first, canonical_provider_id(&catalog.providers[0].id));
         assert_eq!(provider_id_from_selector(&catalog, "chatgpt")?, "chatgpt");
         assert!(provider_id_from_selector(&catalog, "999").is_err());
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn retired_local_model_cannot_be_saved_as_local_default() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-local-retired-default");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let err = set_provider_default_model_in_catalog("local", "qwen3-coder-next-ud-iq4_nl")
+            .expect_err("retired bundled local model should be rejected");
+        assert!(format!("{err:#}").contains("has been retired"), "{err:#}");
+        let catalog = load_provider_catalog()?;
+        let local = find_provider_profile(&catalog, "local").context("local profile")?;
+        assert_eq!(local.default_model, DEFAULT_LOCAL_MODEL);
+        assert!(
+            !local
+                .models
+                .iter()
+                .any(|m| m == "qwen3-coder-next-ud-iq4_nl")
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn retired_local_model_selectors_are_rejected() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("provider-local-retired-selector");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let store = load_auth_store()?;
+        for selector in [
+            "local/qwen3-coder-next-ud-iq4_nl",
+            "qwen/qwen3-coder-next-ud-iq4_nl",
+            "qwen3-coder-next-ud-iq4_nl",
+        ] {
+            let err = resolve_provider_model_selection(&catalog, &store, "local", selector)
+                .expect_err("retired bundled local model should be rejected");
+            assert!(format!("{err:#}").contains("has been retired"), "{err:#}");
+        }
         Ok(())
     })();
 

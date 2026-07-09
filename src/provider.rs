@@ -686,6 +686,19 @@ fn is_retired_bundled_local_model(model: &str) -> bool {
             .any(|retired| model.eq_ignore_ascii_case(retired))
 }
 
+fn is_retired_local_model_for_profile(profile: &ProviderProfile, model: &str) -> bool {
+    canonical_provider_id(&profile.id) == "local" && is_retired_bundled_local_model(model)
+}
+
+fn reject_retired_local_model(profile: &ProviderProfile, model: &str) -> Result<()> {
+    if is_retired_local_model_for_profile(profile, model) {
+        anyhow::bail!(
+            "local model '{model}' has been retired from Dext's bundled local wiring; use {DEFAULT_LOCAL_MODEL} or another running local model alias."
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn merge_provider_profile(
     mut builtin: ProviderProfile,
     stored: ProviderProfile,
@@ -1171,14 +1184,14 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
     );
     if let Ok(v) = std::env::var(&provider_env) {
         let t = normalize_provider_model_value(profile, &v);
-        if !t.is_empty() {
+        if !t.is_empty() && !is_retired_local_model_for_profile(profile, &t) {
             return t;
         }
     }
 
     if let Ok(v) = std::env::var("DEXT_MODEL") {
         let t = normalize_provider_model_value(profile, &v);
-        if !t.is_empty() {
+        if !t.is_empty() && !is_retired_local_model_for_profile(profile, &t) {
             let force = std::env::var("DEXT_MODEL_FORCE").ok().is_some_and(|raw| {
                 let low = raw.trim().to_ascii_lowercase();
                 !(low.is_empty() || low == "0" || low == "false" || low == "off" || low == "no")
@@ -1201,7 +1214,12 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
             }
         }
     }
-    normalize_provider_model_value(profile, &profile.default_model)
+    let model = normalize_provider_model_value(profile, &profile.default_model);
+    if is_retired_local_model_for_profile(profile, &model) {
+        DEFAULT_LOCAL_MODEL.to_string()
+    } else {
+        model
+    }
 }
 
 pub(crate) fn resolve_provider_base_url(profile: &ProviderProfile) -> String {
@@ -1723,6 +1741,7 @@ pub(crate) fn resolve_provider_model_selection(
                 if model.is_empty() {
                     anyhow::bail!("model selector cannot be empty");
                 }
+                reject_retired_local_model(&profile, &model)?;
                 if profile.requires_api_key && !provider_has_available_credentials(&profile, store)
                 {
                     anyhow::bail!(
@@ -1738,7 +1757,7 @@ pub(crate) fn resolve_provider_model_selection(
     let mut all_matches = Vec::new();
     for profile in &catalog.providers {
         let normalized = normalize_provider_model_value(profile, selector);
-        if normalized.is_empty() {
+        if normalized.is_empty() || is_retired_local_model_for_profile(profile, &normalized) {
             continue;
         }
         let matches_curated = curated_provider_models(profile)
@@ -1771,6 +1790,7 @@ pub(crate) fn resolve_provider_model_selection(
     if model.is_empty() {
         anyhow::bail!("model selector cannot be empty");
     }
+    reject_retired_local_model(&profile, &model)?;
     Ok(ProviderModelRef {
         provider_id: active_provider,
         model,
@@ -2247,6 +2267,7 @@ pub(crate) fn set_provider_default_model_in_catalog(provider_id: &str, model: &s
     };
 
     let normalized = normalize_provider_model_value(profile, model);
+    reject_retired_local_model(profile, &normalized)?;
     profile.default_model = normalized.clone();
     if !profile
         .models
