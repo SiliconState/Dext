@@ -52,7 +52,7 @@ dext auth login anthropic <api-key>
 dext auth login deepseek <api-key>
 # Local llama.cpp/Qwen on 127.0.0.1:8080, no key. Start exactly one local model service first.
 dext auth provider local
-# local model choices: qwen3.6-35b-a3b-mtp-ud-q5_k_m, qwen3-coder-next-ud-iq4_nl
+# local model choice: qwen3.6-35b-a3b-mtp-ud-q5_k_m
 ```
 
 Start an interactive session:
@@ -115,7 +115,6 @@ Interactive slash commands:
 /models all
 /login chatgpt
 /model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
-/model local/qwen3-coder-next-ud-iq4_nl
 /approval ask|auto-read|auto-write|never|always
 /sandbox-profile read-only|workspace-write|danger-full-access
 /context standard|frugal|tiny
@@ -265,7 +264,7 @@ Useful environment variables:
 
 ```bash
 DEXT_PROVIDER=local
-DEXT_MODEL=qwen3-coder-next-ud-iq4_nl
+DEXT_MODEL=qwen3.6-35b-a3b-mtp-ud-q5_k_m
 DEXT_BASE_URL=http://127.0.0.1:8080
 DEXT_THINKING_EFFORT=off
 # Experimental: force well-formed tool calls on local llama.cpp (opt-in).

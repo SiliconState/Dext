@@ -85,9 +85,7 @@ impl ApiProvider {
 const PROVIDER_CATALOG_VERSION: u32 = 1;
 const AUTH_STORE_VERSION: u32 = 1;
 pub(crate) const DEFAULT_LOCAL_MODEL: &str = "qwen3.6-35b-a3b-mtp-ud-q5_k_m";
-pub(crate) const DEFAULT_LOCAL_CODER_MODEL: &str = "qwen3-coder-next-ud-iq4_nl";
 pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS: u64 = 131_072;
-pub(crate) const DEFAULT_LOCAL_CODER_CONTEXT_WINDOW_TOKENS: u64 = 32_768;
 const LLAMA_CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(700);
 const LLAMA_CONTEXT_DISCOVERY_PATHS: &[&str] = &["/props", "/slots", "/v1/models", "/models"];
 
@@ -396,23 +394,16 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             api_provider: ApiProvider::OpenAi,
             base_url: "http://127.0.0.1:8080".to_string(),
             default_model: DEFAULT_LOCAL_MODEL.to_string(),
-            models: vec![
-                DEFAULT_LOCAL_MODEL.to_string(),
-                DEFAULT_LOCAL_CODER_MODEL.to_string(),
-            ],
+            models: vec![DEFAULT_LOCAL_MODEL.to_string()],
             env_vars: Vec::new(),
             requires_api_key: false,
             login_url: None,
             oauth_flow: None,
-            notes: Some("Local OpenAI-compatible llama.cpp server. Start exactly one llama-server on 127.0.0.1:8080 with alias qwen3.6-35b-a3b-mtp-ud-q5_k_m or qwen3-coder-next-ud-iq4_nl; no cloud credentials are used. On startup Dext probes llama.cpp for its runtime context and otherwise uses per-model local context fallbacks.".to_string()),
+            notes: Some("Local OpenAI-compatible llama.cpp server. Start exactly one llama-server on 127.0.0.1:8080 with alias qwen3.6-35b-a3b-mtp-ud-q5_k_m; no cloud credentials are used. On startup Dext probes llama.cpp for its runtime context and otherwise uses the local context fallback.".to_string()),
             context_window: Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS),
             model_context_windows: {
                 let mut m = HashMap::new();
                 m.insert(DEFAULT_LOCAL_MODEL.to_string(), DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS);
-                m.insert(
-                    DEFAULT_LOCAL_CODER_MODEL.to_string(),
-                    DEFAULT_LOCAL_CODER_CONTEXT_WINDOW_TOKENS,
-                );
                 m
             },
             model_effort_levels: HashMap::new(),
@@ -676,6 +667,8 @@ const RETIRED_BUNDLED_LOCAL_MODELS: &[&str] = &[
     "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
     "Qwen3.5-9B-Q4_K_M.gguf",
     "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "qwen3-coder-next-ud-iq4_nl",
+    "Qwen3-Coder-Next-UD-IQ4_NL.gguf",
 ];
 fn local_context_window_matches_retired_artifact(stored: &ProviderProfile, window: u64) -> bool {
     stored

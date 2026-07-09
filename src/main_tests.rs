@@ -1,6 +1,5 @@
 use super::*;
 use crate::provider::{
-    DEFAULT_LOCAL_CODER_CONTEXT_WINDOW_TOKENS, DEFAULT_LOCAL_CODER_MODEL,
     DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS, DEFAULT_LOCAL_MODEL,
     clear_cached_local_llama_context_windows, list_models_for_available_providers,
     merge_provider_profile, normalize_chatgpt_model_slug, parse_llama_context_window,
@@ -6442,10 +6441,6 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
         DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
     );
     assert_eq!(
-        model_context_window(DEFAULT_LOCAL_CODER_MODEL),
-        DEFAULT_LOCAL_CODER_CONTEXT_WINDOW_TOKENS
-    );
-    assert_eq!(
         active_history_char_budget_with_override(DEFAULT_LOCAL_MODEL, None, ContextMode::Tiny),
         32_000
     );
@@ -6662,10 +6657,6 @@ fn local_llama_context_cache_overrides_builtin_local_default() {
     assert_eq!(
         model_context_window(DEFAULT_LOCAL_MODEL),
         crate::provider::DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
-    );
-    assert_eq!(
-        model_context_window(DEFAULT_LOCAL_CODER_MODEL),
-        crate::provider::DEFAULT_LOCAL_CODER_CONTEXT_WINDOW_TOKENS
     );
     crate::provider::set_cached_local_llama_context_window(DEFAULT_LOCAL_MODEL, 30_000);
     assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 30_000);
@@ -8591,18 +8582,25 @@ fn local_provider_merge_drops_retired_catalog_artifacts() {
         .find(|p| p.id == "local")
         .expect("local profile");
     let mut stored = builtin.clone();
-    stored.default_model = "qwen-local".to_string();
+    stored.default_model = "qwen3-coder-next-ud-iq4_nl".to_string();
     stored.models.push("qwen-local".to_string());
     stored.models.push("qwen2.5-coder-7b".to_string());
     stored.models.push("qwen3.5-9b".to_string());
     stored
         .models
         .push("Qwen3.6-35B-A3B-Q4_K_M.gguf".to_string());
+    stored.models.push("qwen3-coder-next-ud-iq4_nl".to_string());
+    stored
+        .models
+        .push("Qwen3-Coder-Next-UD-IQ4_NL.gguf".to_string());
     stored.models.push("custom-local-model".to_string());
     stored.context_window = Some(4_096);
     stored
         .model_context_windows
         .insert("qwen-local".to_string(), 4_096);
+    stored
+        .model_context_windows
+        .insert("qwen3-coder-next-ud-iq4_nl".to_string(), 32_768);
     stored
         .model_context_windows
         .insert("custom-local-model".to_string(), 12_345);
@@ -8616,8 +8614,19 @@ fn local_provider_merge_drops_retired_catalog_artifacts() {
     assert!(!merged.models.iter().any(|m| m == "qwen-local"));
     assert!(!merged.models.iter().any(|m| m == "qwen2.5-coder-7b"));
     assert!(!merged.models.iter().any(|m| m == "qwen3.5-9b"));
+    assert!(
+        !merged
+            .models
+            .iter()
+            .any(|m| m == "qwen3-coder-next-ud-iq4_nl")
+    );
     assert!(merged.models.iter().any(|m| m == "custom-local-model"));
     assert!(!merged.model_context_windows.contains_key("qwen-local"));
+    assert!(
+        !merged
+            .model_context_windows
+            .contains_key("qwen3-coder-next-ud-iq4_nl")
+    );
     assert_eq!(
         merged.model_context_windows.get("custom-local-model"),
         Some(&12_345)
@@ -8936,15 +8945,6 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
         assert_eq!(qwen_alias.provider_id, "local");
         assert_eq!(qwen_alias.model, DEFAULT_LOCAL_MODEL);
 
-        let coder = resolve_provider_model_selection(
-            &catalog,
-            &store,
-            "glm",
-            &format!("local/{DEFAULT_LOCAL_CODER_MODEL}"),
-        )?;
-        assert_eq!(coder.provider_id, "local");
-        assert_eq!(coder.model, DEFAULT_LOCAL_CODER_MODEL);
-
         let explicit =
             resolve_provider_model_selection(&catalog, &store, "glm", "chatgpt/gpt-5-4")?;
         assert_eq!(explicit.provider_id, "chatgpt");
@@ -8986,20 +8986,10 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
         assert_eq!(local.api_provider, ApiProvider::OpenAi);
         assert!(!local.requires_api_key);
         assert_eq!(local.default_model, DEFAULT_LOCAL_MODEL);
-        assert_eq!(
-            local.models,
-            vec![
-                DEFAULT_LOCAL_MODEL.to_string(),
-                DEFAULT_LOCAL_CODER_MODEL.to_string()
-            ]
-        );
+        assert_eq!(local.models, vec![DEFAULT_LOCAL_MODEL.to_string()]);
         assert_eq!(
             local.context_window,
             Some(crate::provider::DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
-        );
-        assert_eq!(
-            local.model_context_windows.get(DEFAULT_LOCAL_CODER_MODEL),
-            Some(&DEFAULT_LOCAL_CODER_CONTEXT_WINDOW_TOKENS)
         );
         assert_eq!(resolve_active_provider_id(&catalog), "glm");
         Ok(())
