@@ -65,17 +65,20 @@ Inside the interactive session, the matching slash commands are:
 /login chatgpt
 /logout chatgpt
 /model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
+/model local/qwen3-coder-next-ud-iq4_nl
 ```
 
 Credentials are stored in Dext state, not in the repository. Do not commit `.env`, `.dext/`, exported sessions, or auth stores.
 
 ## Local Qwen / llama.cpp
 
-Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. The curated local model id is `qwen3.6-35b-a3b-mtp-ud-q5_k_m`. On startup/provider switch, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) for the live runtime context window; if the probe misses, local context budgeting falls back to 131K tokens. Start exactly one server first, then select it:
+Dext includes a `local` provider for one OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. The curated local model ids are `qwen3.6-35b-a3b-mtp-ud-q5_k_m` and `qwen3-coder-next-ud-iq4_nl`. On startup/provider switch, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) for the live runtime context window; if the probe misses, local context budgeting falls back to 131K tokens for Qwen3.6 and 32K tokens for Qwen3-Coder-Next. Start exactly one server first, then select it:
 
 ```bash
 dext auth provider local
 # or inside Dext:
+/model local/qwen3-coder-next-ud-iq4_nl
+# or:
 /model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
 /effort off
 ```
@@ -84,11 +87,18 @@ Example local GGUF launch commands:
 
 ```bash
 cd /path/to/llama.cpp
+# Qwen3.6
 ./build/bin/llama-server \
   -m /path/to/models/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf \
   --alias qwen3.6-35b-a3b-mtp-ud-q5_k_m -ngl 99 -c 131072 -t 24 \
   --flash-attn on --spec-type draft-mtp --spec-draft-n-max 2 \
   --host 127.0.0.1 --port 8080
+
+# Qwen3-Coder-Next
+./build/bin/llama-server \
+  -m /path/to/models/Qwen3-Coder-Next-UD-IQ4_NL.gguf \
+  --alias qwen3-coder-next-ud-iq4_nl -ngl auto -c 32768 -t 24 \
+  --flash-attn on --host 127.0.0.1 --port 8080
 ```
 
 Use `--context-mode tiny --effort off` or `/context tiny` plus `/effort off` for the lowest local token/compute pressure.
@@ -319,7 +329,7 @@ Provider/model:
 
 ```bash
 DEXT_PROVIDER=local
-DEXT_MODEL=qwen3.6-35b-a3b-mtp-ud-q5_k_m
+DEXT_MODEL=qwen3-coder-next-ud-iq4_nl
 DEXT_BASE_URL=http://127.0.0.1:8080
 DEXT_THINKING_EFFORT=off
 # cloud examples:
