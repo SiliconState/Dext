@@ -11488,6 +11488,36 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_d_quits_and_emits_quit_command() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_control_tx, mut runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &submit_tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(state.quit);
+        assert!(matches!(submit_rx.try_recv(), Ok(FromTui::Quit)));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(runtime_control_rx.try_recv().is_err());
+        assert!(steering_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn busy_enter_routes_runtime_controls_separately_from_steering() {
         let cases = [
             (

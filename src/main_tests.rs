@@ -1,7 +1,7 @@
 use super::*;
 use crate::provider::{
-    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS, DEFAULT_LOCAL_MODEL,
-    clear_cached_local_llama_context_windows, list_models_for_available_providers,
+    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS, DEFAULT_LOCAL_MODEL, ModelCapabilities, ModelPricing,
+    ModelSpec, clear_cached_local_llama_context_windows, list_models_for_available_providers,
     merge_provider_profile, normalize_chatgpt_model_slug, parse_llama_context_window,
     refresh_local_llama_context_window, resolve_provider_model_selection,
 };
@@ -57,6 +57,7 @@ fn test_agent(root: &Path) -> Agent {
     Agent {
         client: Arc::new(OnceLock::new()),
         provider_id: "test".to_string(),
+        provider_profile: None,
         api_key: "test-key".to_string(),
         key_source: "test".to_string(),
         provider_requires_api_key: true,
@@ -5457,6 +5458,7 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
         Vec::new(),
     );
     assert!(chatgpt.get("reasoning").is_none(), "{chatgpt}");
+    assert!(chatgpt.get("max_output_tokens").is_none(), "{chatgpt}");
 
     assert!(openai_reasoning_effort(ThinkingEffort::Off).is_none());
     assert!(anthropic_thinking_budget_tokens(ThinkingEffort::Off).is_none());
@@ -6479,7 +6481,7 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
 
 #[test]
 fn context_window_reads_from_provider_catalog() -> Result<()> {
-    // Resolution order: env > runtime cache > catalog override > built-in catalog > family heuristic > 200k fallback.
+    // Resolution order: env > runtime cache > per-model catalog metadata > model-name hint > provider default > family heuristic > fallback.
     // This test isolates the catalog path: write a providers.json with a custom
     // provider and per-model override, then confirm model_context_window reads it.
     let _guard = env_lock();
@@ -6502,9 +6504,13 @@ fn context_window_reads_from_provider_catalog() -> Result<()> {
                 id: "custom".to_string(),
                 display_name: "Custom".to_string(),
                 api_provider: ApiProvider::OpenAi,
+                request_contract: Some(RequestContract::OpenAiChatCompletions),
                 base_url: "https://example.invalid".to_string(),
                 default_model: "custom-default".to_string(),
                 models: vec!["custom-default".to_string(), "special-1m-model".to_string()],
+                model_aliases: HashMap::new(),
+                model_defaults: ModelSpec::default(),
+                model_specs: HashMap::new(),
                 env_vars: Vec::new(),
                 requires_api_key: false,
                 login_url: None,
@@ -6519,8 +6525,29 @@ fn context_window_reads_from_provider_catalog() -> Result<()> {
 
         // Provider-default applies for a model listed but not per-model-overridden.
         assert_eq!(model_context_window("custom-default"), 333_000);
-        // Per-model override wins over provider default.
+        // An explicit per-model value beats a conflicting name hint.
         assert_eq!(model_context_window("special-1m-model"), 1_000_000);
+        // Provider-wide defaults apply only after model-name hints.
+        let profile = &catalog.providers[0];
+        assert_eq!(
+            model_context_window_for_profile(Some(profile), "custom-128k"),
+            128_000
+        );
+        let mut explicit_hint_profile = profile.clone();
+        explicit_hint_profile
+            .models
+            .push("explicit-128k".to_string());
+        explicit_hint_profile.model_specs.insert(
+            "explicit-128k".to_string(),
+            ModelSpec {
+                context_window: Some(96_000),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            model_context_window_for_profile(Some(&explicit_hint_profile), "explicit-128k"),
+            96_000
+        );
         // Family heuristics beat a catalog provider default when a foreign built-in model
         // was accidentally saved under the wrong provider.
         let mut polluted = catalog.clone();
@@ -8803,9 +8830,13 @@ fn auth_store_reads_legacy_provider_map() -> Result<()> {
             id: "openai".to_string(),
             display_name: "OpenAI API".to_string(),
             api_provider: ApiProvider::OpenAi,
+            request_contract: Some(RequestContract::OpenAiChatCompletions),
             base_url: "https://api.openai.com".to_string(),
             default_model: "gpt-5".to_string(),
             models: vec!["gpt-5".to_string()],
+            model_aliases: HashMap::new(),
+            model_defaults: ModelSpec::default(),
+            model_specs: HashMap::new(),
             env_vars: vec!["OPENAI_API_KEY".to_string()],
             requires_api_key: true,
             login_url: None,
@@ -9807,6 +9838,184 @@ fn normalize_chatgpt_model_slug_accepts_compact_aliases() {
 }
 
 #[test]
+fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
+    let chatgpt = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "chatgpt")
+        .expect("chatgpt profile");
+    let openai = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile");
+    assert_eq!(
+        normalize_provider_model_value(&chatgpt, "gpt-5.6"),
+        "gpt-5.6-sol"
+    );
+    assert_eq!(
+        normalize_provider_model_value(&openai, "gpt-5.6"),
+        "gpt-5.6"
+    );
+
+    let mut legacy = chatgpt.clone();
+    legacy.request_contract = Some(RequestContract::OpenAiChatCompletions);
+    legacy.model_aliases = HashMap::from([("gpt-5.6".to_string(), "wrong".to_string())]);
+    legacy.model_defaults.max_output_tokens = Some(123);
+    let migrated = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 1,
+        active_provider: "chatgpt".to_string(),
+        providers: vec![legacy],
+    });
+    let migrated = find_provider_profile(&migrated, "chatgpt").expect("migrated chatgpt");
+    assert_eq!(
+        request_contract_for_profile(&migrated),
+        RequestContract::ChatGptResponses
+    );
+    assert_eq!(
+        normalize_provider_model_value(&migrated, "gpt-5.6"),
+        "gpt-5.6-sol"
+    );
+    assert_eq!(
+        resolve_model_spec(&migrated, "gpt-5.4").max_output_tokens,
+        Some(8_192)
+    );
+
+    let mut explicit = chatgpt;
+    explicit.request_contract = Some(RequestContract::OpenAiChatCompletions);
+    explicit
+        .model_aliases
+        .insert("fast".to_string(), "custom-fast".to_string());
+    explicit.model_defaults.max_output_tokens = Some(1_234);
+    explicit.model_defaults.capabilities.tools = Some(false);
+    explicit.model_specs.insert(
+        "gpt-5.4".to_string(),
+        ModelSpec {
+            pricing: Some(ModelPricing {
+                input_usd_per_mtok: 2.0,
+                output_usd_per_mtok: 4.0,
+                cache_read_usd_per_mtok: 0.5,
+                cache_create_usd_per_mtok: 1.0,
+            }),
+            ..Default::default()
+        },
+    );
+    let normalized = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 2,
+        active_provider: "chatgpt".to_string(),
+        providers: vec![explicit],
+    });
+    let explicit = find_provider_profile(&normalized, "chatgpt").expect("explicit chatgpt");
+    assert_eq!(
+        request_contract_for_profile(&explicit),
+        RequestContract::OpenAiChatCompletions
+    );
+    assert_eq!(explicit.api_provider, ApiProvider::OpenAi);
+    assert_eq!(
+        normalize_provider_model_value(&explicit, "fast"),
+        "custom-fast"
+    );
+    let spec = resolve_model_spec(&explicit, "gpt-5.4");
+    assert_eq!(spec.max_output_tokens, Some(1_234));
+    assert!(!spec.tools);
+    assert_eq!(
+        spec.pricing.expect("explicit pricing").output_usd_per_mtok,
+        4.0
+    );
+}
+
+#[test]
+fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Result<()> {
+    let root = temp_test_dir("profile-request-metadata");
+    let root = std::fs::canonicalize(&root)?;
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "chatgpt")
+        .expect("chatgpt profile");
+    let spec = profile
+        .model_specs
+        .entry("gpt-5.4".to_string())
+        .or_default();
+    spec.max_output_tokens = Some(1_234);
+    spec.capabilities = ModelCapabilities {
+        tools: Some(false),
+        reasoning: Some(false),
+        image_input: Some(false),
+        prompt_cache: Some(false),
+    };
+    spec.pricing = Some(ModelPricing {
+        input_usd_per_mtok: 2.0,
+        output_usd_per_mtok: 4.0,
+        cache_read_usd_per_mtok: 0.5,
+        cache_create_usd_per_mtok: 1.0,
+    });
+
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.base_url = profile.base_url.clone();
+    agent.model = "gpt-5.4".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.provider_profile = Some(profile);
+    agent.thinking_effort = ThinkingEffort::XHigh;
+
+    let (url, body) = agent.build_streaming_request("sys", "env", &[], &[], "sess")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(url.ends_with("/codex/responses"), "{url}");
+    // The codex backend rejects max_output_tokens, so the spec cap must not
+    // leak into ChatGPT Responses requests.
+    assert!(body.get("max_output_tokens").is_none(), "{body}");
+    assert!(body.get("reasoning").is_none(), "{body}");
+    assert!(body.get("prompt_cache_key").is_none(), "{body}");
+    assert!(body.get("tools").is_none(), "{body}");
+    assert!(body.get("tool_choice").is_none(), "{body}");
+    assert!(body.get("parallel_tool_calls").is_none(), "{body}");
+
+    let mut usage = Usage {
+        input: 1_000_000,
+        output: 2_000_000,
+        cache_read: 4_000_000,
+        cache_create: 3_000_000,
+        cost_usd: None,
+    };
+    agent.finalize_usage_metrics(&mut usage);
+    assert_eq!(usage.cost_usd, Some(15.0));
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn provider_health_key_and_picker_include_route_provenance() {
+    let root = temp_test_dir("provider-health-route");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "OPENAI".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "HTTPS://EXAMPLE.TEST/v1/".to_string();
+    agent.model = "MODEL-A".to_string();
+    let original = agent.provider_health_key();
+    assert_eq!(
+        original,
+        "openai|openai-chat-completions|https://example.test/v1|model-a"
+    );
+    agent.base_url = "https://other.test/v1".to_string();
+    assert_ne!(agent.provider_health_key(), original);
+    agent.base_url = "https://example.test/v1".to_string();
+    agent.model = "model-b".to_string();
+    assert_ne!(agent.provider_health_key(), original);
+    agent.model = "MODEL-A".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    assert_ne!(agent.provider_health_key(), original);
+
+    let catalog = crate::provider::default_provider_catalog();
+    let store = AuthStore::default();
+    let list = render_provider_list(&catalog, &store, "chatgpt");
+    let picker = render_provider_picker(&catalog, &store, "chatgpt");
+    assert!(list.contains("contract=chatgpt-responses"), "{list}");
+    assert!(list.contains("api=chatgpt"), "{list}");
+    assert!(list.contains("spec=model"), "{list}");
+    assert!(picker.contains("contract=chatgpt-responses"), "{picker}");
+    assert!(picker.contains("spec=model"), "{picker}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn implementation_model_mitigation_lowers_codex_53_xhigh() {
     let root = temp_test_dir("codex-53-implementation-effort-mitigation");
     let root = std::fs::canonicalize(&root).unwrap();
@@ -10149,6 +10358,55 @@ fn sliding_breakpoint_skips_thinking_blocks_and_cache_gate_env_works() {
 }
 
 #[test]
+fn prompt_cache_env_overrides_attached_profile_metadata_in_requests() -> Result<()> {
+    let _guard = env_lock();
+    unsafe {
+        std::env::remove_var("DEXT_PROMPT_CACHE");
+        std::env::remove_var("DEXT_PROMPT_CACHE_TTL");
+    }
+    let root = temp_test_dir("profile-prompt-cache-env");
+    let root = std::fs::canonicalize(&root)?;
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "stable prompt",
+        cache_control: Some(CacheControl::EPHEMERAL),
+    }];
+
+    let mut agent = test_agent(&root);
+    let anthropic = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .expect("anthropic profile");
+    agent.provider_id = anthropic.id.clone();
+    agent.api_provider = anthropic.api_provider;
+    agent.model = anthropic.default_model.clone();
+    agent.provider_profile = Some(anthropic);
+    unsafe { std::env::set_var("DEXT_PROMPT_CACHE", "off") };
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(body["system"][0].get("cache_control").is_none(), "{body}");
+    assert!(!agent.model_supports_prompt_cache());
+
+    let glm = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "glm")
+        .expect("glm profile");
+    agent.provider_id = glm.id.clone();
+    agent.api_provider = glm.api_provider;
+    agent.model = "glm-5.1".to_string();
+    agent.provider_profile = Some(glm);
+    unsafe { std::env::set_var("DEXT_PROMPT_CACHE", "on") };
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert!(agent.model_supports_prompt_cache());
+
+    unsafe { std::env::remove_var("DEXT_PROMPT_CACHE") };
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn openai_and_chatgpt_requests_keep_system_stable_and_append_tail_env() -> Result<()> {
     let root = temp_test_dir("oai-stable-system");
     let root = std::fs::canonicalize(&root)?;
@@ -10285,22 +10543,22 @@ fn max_output_tokens_reads_positive_env_override() {
     unsafe {
         std::env::remove_var("DEXT_MAX_OUTPUT_TOKENS");
     }
-    assert_eq!(max_output_tokens(), 8_192);
+    assert_eq!(max_output_tokens_for(None), 8_192);
 
     unsafe {
         std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "1234");
     }
-    assert_eq!(max_output_tokens(), 1_234);
+    assert_eq!(max_output_tokens_for(None), 1_234);
 
     unsafe {
         std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "0");
     }
-    assert_eq!(max_output_tokens(), 8_192);
+    assert_eq!(max_output_tokens_for(None), 8_192);
 
     unsafe {
         std::env::set_var("DEXT_MAX_OUTPUT_TOKENS", "not-a-number");
     }
-    assert_eq!(max_output_tokens(), 8_192);
+    assert_eq!(max_output_tokens_for(None), 8_192);
 
     unsafe {
         std::env::remove_var("DEXT_MAX_OUTPUT_TOKENS");
@@ -10569,7 +10827,8 @@ fn chatgpt_summary_request_body_matches_current_responses_api_expectations() {
     agent.api_provider = ApiProvider::ChatGpt;
     agent.model = "gpt-5.4".to_string();
 
-    let body = build_chatgpt_summary_request(&agent.model, COMPACT_SYSTEM, "resume this work");
+    let body =
+        build_chatgpt_summary_request(&agent.model, COMPACT_SYSTEM, "resume this work", true);
     assert_eq!(body["store"], false, "store must be false");
     assert_eq!(body["stream"], true, "summary requests must stream");
     assert_eq!(body["tool_choice"], "none", "summary should disable tools");
@@ -10585,6 +10844,94 @@ fn chatgpt_summary_request_body_matches_current_responses_api_expectations() {
     assert_eq!(body["reasoning"]["effort"], "low", "missing low effort");
     assert_eq!(body["reasoning"]["summary"], "auto", "missing summary mode");
 
+    let body = build_chatgpt_summary_request("gpt-4o", COMPACT_SYSTEM, "resume this work", false);
+    assert!(body.get("reasoning").is_none(), "{body}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn chatgpt_compact_summary_honors_summary_model_reasoning_capability() {
+    let _guard = env_lock();
+    let old_compact_model = std::env::var_os("DEXT_COMPACT_MODEL");
+    unsafe { std::env::set_var("DEXT_COMPACT_MODEL", "gpt-4o") };
+    let root = temp_test_dir("chatgpt-summary-non-reasoning-model");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set read timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        let mut header_end = None;
+        while header_end.is_none() {
+            let n = stream.read(&mut buf).expect("read request headers");
+            assert!(n > 0, "client closed before sending headers");
+            request.extend_from_slice(&buf[..n]);
+            header_end = request.windows(4).position(|window| window == b"\r\n\r\n");
+        }
+        let header_end = header_end.expect("header terminator") + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let n = stream.read(&mut buf).expect("read request body");
+            assert!(n > 0, "client closed before sending body");
+            request.extend_from_slice(&buf[..n]);
+        }
+        tx.send(request[header_end..header_end + content_length].to_vec())
+            .expect("send request body");
+        let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Summarized.\"}\n\ndata: [DONE]\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    });
+
+    let mut agent = test_agent(&root);
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "chatgpt")
+        .expect("chatgpt profile");
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.provider_profile = Some(profile);
+    agent.base_url = format!("http://{addr}");
+    agent.model = "gpt-5.4".to_string();
+    agent.api_key = "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string();
+    let old = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "old context".to_string(),
+        }],
+    }];
+
+    let (summary, _) = agent
+        .one_shot_summary(&old, "")
+        .await
+        .expect("summary request should complete");
+    assert_eq!(summary, "Summarized.");
+    let body: Value = serde_json::from_slice(&rx.recv().expect("request body")).expect("json body");
+    assert_eq!(body["model"], "gpt-4o");
+    assert!(body.get("reasoning").is_none(), "{body}");
+
+    server.join().expect("server thread");
+    restore_env_var("DEXT_COMPACT_MODEL", old_compact_model);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -10774,6 +11121,76 @@ fn reasoning_summary_normalization_only_removes_empty_separator_comments() {
         normalize_reasoning_summary_text("first\n\n<!-- unfinished"),
         "first\n\n<!-- unfinished"
     );
+}
+
+#[test]
+fn restored_chatgpt_reasoning_removes_only_empty_separator_comments() -> Result<()> {
+    let root = temp_test_dir("restored-chatgpt-reasoning");
+    let root = std::fs::canonicalize(&root)?;
+    let chatgpt_path = root.join("chatgpt.jsonl");
+    let anthropic_path = root.join("anthropic.jsonl");
+    let raw_thinking =
+        "**Planning removal**\n\n<!-- -->**Planning masked login input**\n\n<!-- -->";
+    let message = Message {
+        role: "assistant".to_string(),
+        content: vec![
+            Block::Thinking {
+                text: raw_thinking.to_string(),
+                signature: None,
+            },
+            Block::Text {
+                text: "ordinary <!-- --> marker".to_string(),
+            },
+        ],
+    };
+
+    let mut header = SessionHeader {
+        model: "gpt-5.6-sol".to_string(),
+        provenance: SessionProvenance {
+            provider: "chatgpt".to_string(),
+            api_provider: ApiProvider::ChatGpt,
+            model: "gpt-5.6-sol".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    std::fs::write(
+        &chatgpt_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header)?,
+            serde_json::to_string(&message)?
+        ),
+    )?;
+    let mut agent = test_agent(&root);
+    agent.load_session_from_path(&chatgpt_path)?;
+    assert!(matches!(
+        &agent.history[0].content[0],
+        Block::Thinking { text, .. }
+            if text == "**Planning removal**\n\n**Planning masked login input**"
+    ));
+    assert!(matches!(
+        &agent.history[0].content[1],
+        Block::Text { text } if text == "ordinary <!-- --> marker"
+    ));
+
+    header.provenance.provider = "anthropic".to_string();
+    header.provenance.api_provider = ApiProvider::Anthropic;
+    std::fs::write(
+        &anthropic_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header)?,
+            serde_json::to_string(&message)?
+        ),
+    )?;
+    agent.load_session_from_path(&anthropic_path)?;
+    assert!(matches!(
+        &agent.history[0].content[0],
+        Block::Thinking { text, .. } if text == raw_thinking
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 #[test]

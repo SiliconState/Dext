@@ -82,7 +82,87 @@ impl ApiProvider {
     }
 }
 
-const PROVIDER_CATALOG_VERSION: u32 = 1;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RequestContract {
+    #[serde(rename = "anthropic-messages", alias = "anthropic")]
+    AnthropicMessages,
+    #[serde(
+        rename = "openai-chat-completions",
+        alias = "openai",
+        alias = "openai-compatible"
+    )]
+    OpenAiChatCompletions,
+    #[serde(rename = "chatgpt-responses", alias = "chatgpt", alias = "codex")]
+    ChatGptResponses,
+}
+
+impl RequestContract {
+    pub(crate) fn for_api_provider(api_provider: ApiProvider) -> Self {
+        match api_provider {
+            ApiProvider::Anthropic => Self::AnthropicMessages,
+            ApiProvider::OpenAi => Self::OpenAiChatCompletions,
+            ApiProvider::ChatGpt => Self::ChatGptResponses,
+        }
+    }
+
+    pub(crate) fn api_provider(self) -> ApiProvider {
+        match self {
+            Self::AnthropicMessages => ApiProvider::Anthropic,
+            Self::OpenAiChatCompletions => ApiProvider::OpenAi,
+            Self::ChatGptResponses => ApiProvider::ChatGpt,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::OpenAiChatCompletions => "openai-chat-completions",
+            Self::ChatGptResponses => "chatgpt-responses",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ModelCapabilities {
+    pub(crate) tools: Option<bool>,
+    pub(crate) reasoning: Option<bool>,
+    pub(crate) image_input: Option<bool>,
+    pub(crate) prompt_cache: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ModelPricing {
+    pub(crate) input_usd_per_mtok: f64,
+    pub(crate) output_usd_per_mtok: f64,
+    pub(crate) cache_read_usd_per_mtok: f64,
+    pub(crate) cache_create_usd_per_mtok: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ModelSpec {
+    pub(crate) context_window: Option<u64>,
+    pub(crate) max_output_tokens: Option<u32>,
+    pub(crate) effort_levels: Vec<String>,
+    pub(crate) capabilities: ModelCapabilities,
+    pub(crate) pricing: Option<ModelPricing>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedModelSpec {
+    pub(crate) context_window: Option<u64>,
+    pub(crate) max_output_tokens: Option<u32>,
+    pub(crate) effort_levels: Vec<String>,
+    pub(crate) tools: bool,
+    pub(crate) reasoning: bool,
+    pub(crate) image_input: bool,
+    pub(crate) prompt_cache: bool,
+    pub(crate) pricing: Option<ModelPricing>,
+    pub(crate) source: &'static str,
+}
+
+const PROVIDER_CATALOG_VERSION: u32 = 2;
 const AUTH_STORE_VERSION: u32 = 1;
 pub(crate) const DEFAULT_LOCAL_MODEL: &str = "qwen3.6-35b-a3b-mtp-ud-q5_k_m";
 pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS: u64 = 131_072;
@@ -109,10 +189,18 @@ pub(crate) struct ProviderProfile {
     #[serde(default)]
     pub(crate) display_name: String,
     pub(crate) api_provider: ApiProvider,
+    #[serde(default)]
+    pub(crate) request_contract: Option<RequestContract>,
     pub(crate) base_url: String,
     pub(crate) default_model: String,
     #[serde(default)]
     pub(crate) models: Vec<String>,
+    #[serde(default)]
+    pub(crate) model_aliases: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) model_defaults: ModelSpec,
+    #[serde(default)]
+    pub(crate) model_specs: HashMap<String, ModelSpec>,
     #[serde(default)]
     pub(crate) env_vars: Vec<String>,
     #[serde(default = "default_provider_requires_api_key")]
@@ -224,8 +312,110 @@ pub(crate) fn canonical_provider_id(raw: &str) -> String {
 
 const RETIRED_BUNDLED_PROVIDER_IDS: &[&str] = &["openrouter", "ollama"];
 
+fn model_pricing(input: f64, output: f64, cache_read: f64, cache_create: f64) -> ModelPricing {
+    ModelPricing {
+        input_usd_per_mtok: input,
+        output_usd_per_mtok: output,
+        cache_read_usd_per_mtok: cache_read,
+        cache_create_usd_per_mtok: cache_create,
+    }
+}
+
+fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing> {
+    let model = model.to_ascii_lowercase();
+    match canonical_provider_id(provider_id).as_str() {
+        "local" => Some(model_pricing(0.0, 0.0, 0.0, 0.0)),
+        "glm" => Some(model_pricing(1.0, 5.0, 0.1, 1.25)),
+        "deepseek" if model.contains("reasoner") => Some(model_pricing(0.55, 2.19, 0.14, 0.55)),
+        "deepseek" if model.contains("chat") => Some(model_pricing(0.27, 1.1, 0.07, 0.27)),
+        "anthropic" if model.contains("fable") => Some(model_pricing(
+            11.721718363700392,
+            58.60859181850196,
+            1.1721718363700393,
+            14.65214795462549,
+        )),
+        "anthropic" if model.contains("opus") => Some(model_pricing(15.0, 75.0, 1.5, 18.75)),
+        "anthropic" if model.contains("sonnet") => Some(model_pricing(3.0, 15.0, 0.3, 3.75)),
+        "anthropic" if model.contains("haiku-4-5") || model.contains("haiku-4.5") => {
+            Some(model_pricing(1.0, 5.0, 0.1, 1.25))
+        }
+        "anthropic" if model.contains("haiku") => Some(model_pricing(0.8, 4.0, 0.08, 1.0)),
+        "openai" | "chatgpt" if model.starts_with("gpt-5.4-mini") => {
+            Some(model_pricing(0.25, 2.0, 0.025, 0.25))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-5.3-codex-spark") => {
+            Some(model_pricing(0.25, 2.0, 0.025, 0.25))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-5-mini") => {
+            Some(model_pricing(0.25, 2.0, 0.025, 0.25))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-5-nano") => {
+            Some(model_pricing(0.05, 0.4, 0.005, 0.05))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-5") => {
+            Some(model_pricing(1.25, 10.0, 0.125, 1.25))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-4.1-mini") => {
+            Some(model_pricing(0.4, 1.6, 0.1, 0.4))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-4.1-nano") => {
+            Some(model_pricing(0.1, 0.4, 0.025, 0.1))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-4.1") => {
+            Some(model_pricing(2.0, 8.0, 0.5, 2.0))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-4o-mini") => {
+            Some(model_pricing(0.15, 0.6, 0.075, 0.15))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-4o") => {
+            Some(model_pricing(2.5, 10.0, 1.25, 2.5))
+        }
+        "openai" | "chatgpt" if model.starts_with("o3-mini") || model.starts_with("o4-mini") => {
+            Some(model_pricing(1.1, 4.4, 0.55, 1.1))
+        }
+        "openai" | "chatgpt" if model.starts_with("o3") => Some(model_pricing(2.0, 8.0, 0.5, 2.0)),
+        _ => None,
+    }
+}
+
+fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
+    for profile in profiles {
+        let provider_id = canonical_provider_id(&profile.id);
+        let contract = request_contract_for_profile(profile);
+        profile.model_defaults.max_output_tokens = Some(8_192);
+        profile.model_defaults.capabilities = ModelCapabilities {
+            tools: Some(true),
+            reasoning: Some(true),
+            image_input: Some(
+                matches!(
+                    contract,
+                    RequestContract::AnthropicMessages | RequestContract::ChatGptResponses
+                ) || provider_id == "openai",
+            ),
+            prompt_cache: Some(matches!(
+                provider_id.as_str(),
+                "anthropic" | "openai" | "chatgpt" | "deepseek" | "local"
+            )),
+        };
+        for model in profile.models.clone() {
+            let normalized = model.to_ascii_lowercase();
+            let mut spec = profile.model_specs.remove(&normalized).unwrap_or_default();
+            spec.pricing = builtin_model_pricing(&provider_id, &normalized);
+            if matches!(provider_id.as_str(), "openai" | "chatgpt")
+                && (normalized.starts_with("gpt-4.1") || normalized.starts_with("gpt-4o"))
+            {
+                spec.capabilities.reasoning = Some(false);
+            }
+            if provider_id == "deepseek" && normalized.contains("chat") {
+                spec.capabilities.reasoning = Some(false);
+            }
+            profile.model_specs.insert(normalized, spec);
+        }
+    }
+}
+
 pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
-    vec![
+    let mut profiles = vec![
         ProviderProfile {
             id: "glm".to_string(),
             display_name: "ZAI GLM".to_string(),
@@ -263,6 +453,10 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 );
                 m
             },
+            request_contract: Some(RequestContract::AnthropicMessages),
+            model_aliases: HashMap::new(),
+            model_defaults: ModelSpec::default(),
+            model_specs: HashMap::new(),
         },
         ProviderProfile {
             id: "chatgpt".to_string(),
@@ -271,6 +465,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             default_model: "gpt-5.4".to_string(),
             models: vec![
+                "gpt-5.6-sol".to_string(),
                 "gpt-5.4".to_string(),
                 "gpt-5.4-mini".to_string(),
                 "gpt-5.5".to_string(),
@@ -311,6 +506,13 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 m
             },
             model_effort_levels: HashMap::new(),
+            request_contract: Some(RequestContract::ChatGptResponses),
+            model_aliases: HashMap::from([(
+                "gpt-5.6".to_string(),
+                "gpt-5.6-sol".to_string(),
+            )]),
+            model_defaults: ModelSpec::default(),
+            model_specs: HashMap::new(),
         },
         ProviderProfile {
             id: "openai".to_string(),
@@ -344,6 +546,10 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 m
             },
             model_effort_levels: HashMap::new(),
+            request_contract: Some(RequestContract::OpenAiChatCompletions),
+            model_aliases: HashMap::new(),
+            model_defaults: ModelSpec::default(),
+            model_specs: HashMap::new(),
         },
         ProviderProfile {
             id: "anthropic".to_string(),
@@ -371,6 +577,10 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             context_window: Some(200_000),
             model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
+            request_contract: Some(RequestContract::AnthropicMessages),
+            model_aliases: HashMap::new(),
+            model_defaults: ModelSpec::default(),
+            model_specs: HashMap::new(),
         },
         ProviderProfile {
             id: "deepseek".to_string(),
@@ -387,6 +597,10 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             context_window: Some(128_000),
             model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
+            request_contract: Some(RequestContract::OpenAiChatCompletions),
+            model_aliases: HashMap::new(),
+            model_defaults: ModelSpec::default(),
+            model_specs: HashMap::new(),
         },
         ProviderProfile {
             id: "local".to_string(),
@@ -407,8 +621,14 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 m
             },
             model_effort_levels: HashMap::new(),
+            request_contract: Some(RequestContract::OpenAiChatCompletions),
+            model_aliases: HashMap::new(),
+            model_defaults: ModelSpec::default(),
+            model_specs: HashMap::new(),
         },
-    ]
+    ];
+    hydrate_builtin_model_specs(&mut profiles);
+    profiles
 }
 
 fn local_llama_cache() -> &'static Mutex<HashMap<String, u64>> {
@@ -591,25 +811,35 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     if profile.display_name.trim().is_empty() {
         profile.display_name = profile.id.clone();
     }
+    profile.request_contract = Some(request_contract_for_profile(&profile));
+    profile.api_provider = request_contract_for_profile(&profile).api_provider();
+    let mut normalized_aliases = HashMap::new();
+    for (alias, target) in std::mem::take(&mut profile.model_aliases) {
+        let alias = normalize_model_alias_key(&alias);
+        let target = if request_contract_for_profile(&profile) == RequestContract::ChatGptResponses
+        {
+            normalize_chatgpt_model_slug(&target)
+        } else {
+            target.trim().to_string()
+        };
+        if !alias.is_empty() && !target.is_empty() && alias != target.to_ascii_lowercase() {
+            normalized_aliases.insert(alias, target);
+        }
+    }
+    profile.model_aliases = normalized_aliases;
     if profile.default_model.trim().is_empty() {
         profile.default_model = fallback_model.to_string();
     }
-    if profile.api_provider == ApiProvider::ChatGpt {
-        profile.default_model = normalize_chatgpt_model_slug(&profile.default_model);
-    }
+    profile.default_model = normalize_provider_model_value(&profile, &profile.default_model);
     let mut seen_models = HashSet::new();
     let mut models = Vec::new();
-    for m in profile.models {
-        let trimmed = if profile.api_provider == ApiProvider::ChatGpt {
-            normalize_chatgpt_model_slug(&m)
-        } else {
-            m.trim().to_string()
-        };
-        if trimmed.is_empty() {
+    for model in std::mem::take(&mut profile.models) {
+        let normalized = normalize_provider_model_value(&profile, &model);
+        if normalized.is_empty() {
             continue;
         }
-        if seen_models.insert(trimmed.to_ascii_lowercase()) {
-            models.push(trimmed.to_string());
+        if seen_models.insert(normalized.to_ascii_lowercase()) {
+            models.push(normalized);
         }
     }
     if !models.iter().any(|m| m == &profile.default_model) {
@@ -647,6 +877,16 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
         }
     }
     profile.model_effort_levels = normalized_effort_levels;
+
+    profile.model_defaults = normalize_model_spec(profile.model_defaults);
+    let mut normalized_model_specs = HashMap::new();
+    for (model, spec) in std::mem::take(&mut profile.model_specs) {
+        let key = normalize_provider_model_value(&profile, &model).to_ascii_lowercase();
+        if !key.is_empty() {
+            normalized_model_specs.insert(key, normalize_model_spec(spec));
+        }
+    }
+    profile.model_specs = normalized_model_specs;
 
     let mut seen_env = HashSet::new();
     profile.env_vars = profile
@@ -708,13 +948,8 @@ pub(crate) fn merge_provider_profile(
     let stored_default = stored.default_model.trim();
     let stored_default_retired = local_profile && is_retired_bundled_local_model(stored_default);
     if !(stored_default.is_empty() || stored_default_retired) {
-        builtin.default_model = if builtin.api_provider == ApiProvider::ChatGpt {
-            normalize_chatgpt_model_slug(stored_default)
-        } else {
-            stored_default.to_string()
-        };
+        builtin.default_model = normalize_provider_model_value(&builtin, stored_default);
     }
-
     let drop_stored_context_window = local_profile
         && stored
             .context_window
@@ -723,6 +958,18 @@ pub(crate) fn merge_provider_profile(
                 stored_default_retired
                     || local_context_window_matches_retired_artifact(&stored, window)
             });
+    if let Some(contract) = stored.request_contract {
+        builtin.request_contract = Some(contract);
+        builtin.api_provider = contract.api_provider();
+    }
+    for (alias, target) in stored.model_aliases {
+        builtin.model_aliases.insert(alias, target);
+    }
+    merge_model_spec(&mut builtin.model_defaults, stored.model_defaults);
+    for (model, spec) in stored.model_specs {
+        merge_model_spec(builtin.model_specs.entry(model).or_default(), spec);
+    }
+
     if let Some(window) = stored.context_window.filter(|window| *window > 0)
         && !drop_stored_context_window
     {
@@ -772,11 +1019,12 @@ pub(crate) fn merge_provider_profile(
         .iter()
         .map(|model| model.to_ascii_lowercase())
         .collect();
+    let chatgpt_route = request_contract_for_profile(&builtin) == RequestContract::ChatGptResponses;
     let extra_models = stored
         .models
         .into_iter()
         .map(|model| {
-            if builtin.api_provider == ApiProvider::ChatGpt {
+            if chatgpt_route {
                 normalize_chatgpt_model_slug(&model)
             } else {
                 model.trim().to_string()
@@ -805,6 +1053,7 @@ pub(crate) fn merge_provider_profile(
 }
 
 pub(crate) fn normalize_provider_catalog(mut catalog: ProviderCatalog) -> ProviderCatalog {
+    let legacy_catalog = catalog.version < PROVIDER_CATALOG_VERSION;
     let mut stored_by_id: HashMap<String, ProviderProfile> = HashMap::new();
     let mut providers: Vec<ProviderProfile> = Vec::new();
     let builtin_ids: HashSet<String> = built_in_provider_profiles()
@@ -812,7 +1061,13 @@ pub(crate) fn normalize_provider_catalog(mut catalog: ProviderCatalog) -> Provid
         .map(|profile| canonical_provider_id(&profile.id))
         .collect();
 
-    for profile in catalog.providers.drain(..) {
+    for mut profile in catalog.providers.drain(..) {
+        if legacy_catalog {
+            profile.request_contract = None;
+            profile.model_aliases.clear();
+            profile.model_defaults = ModelSpec::default();
+            profile.model_specs.clear();
+        }
         if let Some(profile) = normalize_provider_profile(profile) {
             stored_by_id.insert(canonical_provider_id(&profile.id), profile);
         }
@@ -1134,10 +1389,158 @@ pub(crate) fn resolve_provider_api_key(
     None
 }
 
+pub(crate) fn request_contract_for_profile(profile: &ProviderProfile) -> RequestContract {
+    profile
+        .request_contract
+        .unwrap_or_else(|| RequestContract::for_api_provider(profile.api_provider))
+}
+
+fn normalize_model_alias_key(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace(['_', ' '], "-")
+}
+
+fn normalize_effort_levels(levels: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    levels
+        .into_iter()
+        .map(|level| level.trim().to_ascii_lowercase())
+        .filter(|level| !level.is_empty())
+        .filter(|level| seen.insert(level.clone()))
+        .collect()
+}
+
+fn merge_model_spec(base: &mut ModelSpec, overlay: ModelSpec) {
+    if overlay.context_window.is_some() {
+        base.context_window = overlay.context_window;
+    }
+    if overlay.max_output_tokens.is_some() {
+        base.max_output_tokens = overlay.max_output_tokens;
+    }
+    if !overlay.effort_levels.is_empty() {
+        base.effort_levels = overlay.effort_levels;
+    }
+    for (target, value) in [
+        (&mut base.capabilities.tools, overlay.capabilities.tools),
+        (
+            &mut base.capabilities.reasoning,
+            overlay.capabilities.reasoning,
+        ),
+        (
+            &mut base.capabilities.image_input,
+            overlay.capabilities.image_input,
+        ),
+        (
+            &mut base.capabilities.prompt_cache,
+            overlay.capabilities.prompt_cache,
+        ),
+    ] {
+        if value.is_some() {
+            *target = value;
+        }
+    }
+    if overlay.pricing.is_some() {
+        base.pricing = overlay.pricing;
+    }
+}
+
+fn normalize_model_spec(mut spec: ModelSpec) -> ModelSpec {
+    spec.context_window = spec.context_window.filter(|value| *value > 0);
+    spec.max_output_tokens = spec.max_output_tokens.filter(|value| *value > 0);
+    spec.effort_levels = normalize_effort_levels(spec.effort_levels);
+    spec.pricing = spec.pricing.filter(|pricing| {
+        [
+            pricing.input_usd_per_mtok,
+            pricing.output_usd_per_mtok,
+            pricing.cache_read_usd_per_mtok,
+            pricing.cache_create_usd_per_mtok,
+        ]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+    });
+    spec
+}
+
+pub(crate) fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> ResolvedModelSpec {
+    let model = normalize_provider_model_value(profile, model).to_ascii_lowercase();
+    let explicit = profile.model_specs.get(&model);
+    let defaults = &profile.model_defaults;
+    let capability = |model_value: Option<bool>, default_value: Option<bool>, fallback: bool| {
+        model_value.or(default_value).unwrap_or(fallback)
+    };
+    let effort_levels = explicit
+        .filter(|spec| !spec.effort_levels.is_empty())
+        .map(|spec| spec.effort_levels.clone())
+        .or_else(|| {
+            profile
+                .model_effort_levels
+                .get(&model)
+                .filter(|levels| !levels.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| defaults.effort_levels.clone());
+    let contract = request_contract_for_profile(profile);
+    ResolvedModelSpec {
+        context_window: explicit
+            .and_then(|spec| spec.context_window)
+            .or_else(|| profile.model_context_windows.get(&model).copied())
+            .or(defaults.context_window)
+            .or(profile.context_window),
+        max_output_tokens: explicit
+            .and_then(|spec| spec.max_output_tokens)
+            .or(defaults.max_output_tokens),
+        effort_levels,
+        tools: capability(
+            explicit.and_then(|spec| spec.capabilities.tools),
+            defaults.capabilities.tools,
+            true,
+        ),
+        reasoning: capability(
+            explicit.and_then(|spec| spec.capabilities.reasoning),
+            defaults.capabilities.reasoning,
+            true,
+        ),
+        image_input: capability(
+            explicit.and_then(|spec| spec.capabilities.image_input),
+            defaults.capabilities.image_input,
+            false,
+        ),
+        prompt_cache: capability(
+            explicit.and_then(|spec| spec.capabilities.prompt_cache),
+            defaults.capabilities.prompt_cache,
+            contract == RequestContract::ChatGptResponses,
+        ),
+        pricing: explicit
+            .and_then(|spec| spec.pricing.clone())
+            .or_else(|| defaults.pricing.clone()),
+        source: if explicit.is_some() {
+            "model"
+        } else if profile.model_specs.is_empty() && profile.model_defaults == ModelSpec::default() {
+            "legacy"
+        } else {
+            "provider"
+        },
+    }
+}
+
 pub(crate) fn normalize_provider_model_value(profile: &ProviderProfile, model: &str) -> String {
     let trimmed = model.trim();
-    if profile.api_provider == ApiProvider::ChatGpt {
-        return normalize_chatgpt_model_slug(trimmed);
+    let chatgpt_contract =
+        request_contract_for_profile(profile) == RequestContract::ChatGptResponses;
+    let normalized_input = if chatgpt_contract {
+        normalize_chatgpt_model_slug(trimmed)
+    } else {
+        trimmed.split_whitespace().collect::<Vec<_>>().join("-")
+    };
+    let alias_key = normalize_model_alias_key(&normalized_input);
+    if let Some(target) = profile.model_aliases.get(&alias_key) {
+        return if chatgpt_contract {
+            normalize_chatgpt_model_slug(target)
+        } else {
+            target.trim().to_string()
+        };
+    }
+    if chatgpt_contract {
+        return normalized_input;
     }
 
     let find_curated = |needle: &str| {
@@ -1150,7 +1553,7 @@ pub(crate) fn normalize_provider_model_value(profile: &ProviderProfile, model: &
         return found;
     }
 
-    let hyphenated = trimmed.split_whitespace().collect::<Vec<_>>().join("-");
+    let hyphenated = normalized_input;
     if hyphenated != trimmed
         && let Some(found) = find_curated(&hyphenated)
     {
@@ -1202,7 +1605,7 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
             }
             if !force
                 && !compatible
-                && profile.api_provider == ApiProvider::OpenAi
+                && request_contract_for_profile(profile).api_provider() == ApiProvider::OpenAi
                 && !profile.requires_api_key
             {
                 let looks_local = canonical_provider_id(&profile.id) == "local"
@@ -1230,7 +1633,7 @@ pub(crate) fn resolve_provider_base_url(profile: &ProviderProfile) -> String {
         }
     }
 
-    match profile.api_provider {
+    match request_contract_for_profile(profile).api_provider() {
         ApiProvider::OpenAi => {
             if let Ok(v) = std::env::var("OPENAI_BASE_URL") {
                 let t = v.trim().trim_end_matches('/').to_string();
@@ -1253,17 +1656,17 @@ pub(crate) fn resolve_provider_base_url(profile: &ProviderProfile) -> String {
     profile.base_url.trim_end_matches('/').to_string()
 }
 
-pub(crate) fn provider_request_url(base_url: &str, api_provider: ApiProvider) -> String {
+pub(crate) fn provider_request_url(base_url: &str, contract: RequestContract) -> String {
     let base = base_url.trim_end_matches('/');
-    match api_provider {
-        ApiProvider::OpenAi => {
+    match contract {
+        RequestContract::OpenAiChatCompletions => {
             if base.ends_with("/v1") {
                 format!("{base}/chat/completions")
             } else {
                 format!("{base}/v1/chat/completions")
             }
         }
-        ApiProvider::ChatGpt => {
+        RequestContract::ChatGptResponses => {
             if base.ends_with("/codex/responses") {
                 base.to_string()
             } else if base.ends_with("/codex") {
@@ -1272,7 +1675,7 @@ pub(crate) fn provider_request_url(base_url: &str, api_provider: ApiProvider) ->
                 format!("{base}/codex/responses")
             }
         }
-        ApiProvider::Anthropic => {
+        RequestContract::AnthropicMessages => {
             if base.ends_with("/v1") {
                 format!("{base}/messages")
             } else {
@@ -1366,6 +1769,9 @@ pub(crate) fn build_chatgpt_request(
 ) -> Value {
     let model = normalize_chatgpt_model_slug(model);
     let effort = chatgpt_reasoning_effort(&model, thinking_effort);
+    // The ChatGPT codex backend rejects max_output_tokens with HTTP 400
+    // ("Unsupported parameter"), so this request must never carry an output
+    // cap — not even from DEXT_MAX_OUTPUT_TOKENS or catalog model specs.
     let mut body = json!({
         "model": model,
         "store": false,
@@ -1375,8 +1781,6 @@ pub(crate) fn build_chatgpt_request(
         "include": ["reasoning.encrypted_content"],
         "text": { "verbosity": "medium" },
         "prompt_cache_key": session_id,
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
     });
     if let Some(effort) = effort {
         body.as_object_mut()
@@ -1387,9 +1791,12 @@ pub(crate) fn build_chatgpt_request(
             );
     }
     if !tools.is_empty() {
-        body.as_object_mut()
-            .expect("chatgpt request body is always an object")
-            .insert("tools".to_string(), json!(tools));
+        let object = body
+            .as_object_mut()
+            .expect("chatgpt request body is always an object");
+        object.insert("tool_choice".to_string(), json!("auto"));
+        object.insert("parallel_tool_calls".to_string(), json!(true));
+        object.insert("tools".to_string(), json!(tools));
     }
     body
 }
@@ -1398,8 +1805,9 @@ pub(crate) fn build_chatgpt_summary_request(
     model: &str,
     compact_system: &str,
     user_text: &str,
+    reasoning_supported: bool,
 ) -> Value {
-    json!({
+    let mut body = json!({
         "model": normalize_chatgpt_model_slug(model),
         "store": false,
         "stream": true,
@@ -1413,17 +1821,25 @@ pub(crate) fn build_chatgpt_summary_request(
         "text": { "verbosity": "low" },
         "tool_choice": "none",
         "parallel_tool_calls": false,
-        "reasoning": { "effort": "low", "summary": "auto" },
-    })
+    });
+    if reasoning_supported {
+        body.as_object_mut()
+            .expect("chatgpt summary request body is always an object")
+            .insert(
+                "reasoning".to_string(),
+                json!({ "effort": "low", "summary": "auto" }),
+            );
+    }
+    body
 }
 
 pub(crate) fn apply_provider_headers(
     req: RequestBuilder,
-    api_provider: ApiProvider,
+    contract: RequestContract,
     api_key: &str,
     session_id: Option<&str>,
 ) -> Result<RequestBuilder> {
-    Ok(match api_provider {
+    Ok(match contract.api_provider() {
         ApiProvider::OpenAi => {
             if api_key.trim().is_empty() {
                 req
@@ -1815,9 +2231,18 @@ pub(crate) fn render_provider_list(
             profile.display_name.clone()
         };
         let status = provider_auth_status(profile, store);
+        let contract = request_contract_for_profile(profile);
+        let spec = resolve_model_spec(profile, &profile.default_model);
         lines.push(format!(
-            "{marker} {:<12} {:<18} model={} auth={} base={}",
-            profile.id, name, profile.default_model, status, profile.base_url
+            "{marker} {:<12} {:<18} model={} contract={} api={} spec={} auth={} base={}",
+            profile.id,
+            name,
+            profile.default_model,
+            contract.as_str(),
+            contract.api_provider().as_str(),
+            spec.source,
+            status,
+            profile.base_url
         ));
     }
     lines.join("\n")
@@ -1836,12 +2261,16 @@ pub(crate) fn render_provider_picker(
             " "
         };
         let status = provider_auth_status(profile, store);
+        let contract = request_contract_for_profile(profile);
+        let spec = resolve_model_spec(profile, &profile.default_model);
         lines.push(format!(
-            "{:>2}) {} {:<10} model={:<16} auth={}",
+            "{:>2}) {} {:<10} model={:<16} contract={} spec={} auth={}",
             i + 1,
             marker,
             profile.id,
             profile.default_model,
+            contract.as_str(),
+            spec.source,
             status
         ));
     }
@@ -2073,7 +2502,7 @@ pub(crate) fn validate_login_secret_for_provider(
     profile: &ProviderProfile,
     secret: &str,
 ) -> Result<()> {
-    if profile.api_provider == ApiProvider::ChatGpt
+    if request_contract_for_profile(profile) == RequestContract::ChatGptResponses
         && chatgpt_account_id_from_token(secret).is_none()
     {
         anyhow::bail!(
@@ -3111,7 +3540,9 @@ pub(crate) fn login_provider(
         }
 
         if allow_prompt {
-            let prompt = if profile.api_provider == ApiProvider::ChatGpt {
+            let prompt = if request_contract_for_profile(&profile)
+                == RequestContract::ChatGptResponses
+            {
                 "paste ChatGPT access token (or full JSON session blob) now, or press Enter to skip: "
             } else {
                 "paste API key/token now, or press Enter to skip: "
@@ -3126,7 +3557,9 @@ pub(crate) fn login_provider(
             catalog.active_provider = profile.id.clone();
             save_provider_catalog(&catalog)?;
 
-            let mut msg = if profile.api_provider == ApiProvider::ChatGpt {
+            let mut msg = if request_contract_for_profile(&profile)
+                == RequestContract::ChatGptResponses
+            {
                 "opened ChatGPT in your browser. sign in if needed, then paste the access token or full session JSON directly into dext.".to_string()
             } else {
                 format!(
@@ -3143,7 +3576,7 @@ pub(crate) fn login_provider(
             for warn in launch_warnings {
                 msg.push_str(&format!("\n[warn] {warn}"));
             }
-            if profile.api_provider != ApiProvider::ChatGpt
+            if request_contract_for_profile(&profile) != RequestContract::ChatGptResponses
                 && let Some(notes) = &profile.notes
             {
                 msg.push_str(&format!("\n{notes}"));
@@ -3259,7 +3692,7 @@ fn render_provider_models(profile: &ProviderProfile) -> String {
         out.push('\n');
         out.push_str(notes);
     }
-    if profile.api_provider == ApiProvider::ChatGpt {
+    if request_contract_for_profile(profile) == RequestContract::ChatGptResponses {
         out.push_str(
             "\nnote: this is a local curated list, not your full account entitlement list.\nset any model slug directly with /model <slug>.",
         );

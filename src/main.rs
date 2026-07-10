@@ -17,15 +17,16 @@ mod main_tests;
 
 use anyhow::{Context, Result};
 use provider::{
-    ANTHROPIC_API_VERSION, ApiProvider, ProviderProfile, ResolvedProviderConfig,
-    apply_provider_headers, auth_store_path, build_chatgpt_request, build_chatgpt_summary_request,
-    built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
-    extract_oauth_code_from_callback, find_provider_profile, handle_auth_cli,
-    list_models_for_available_providers, list_models_for_provider, load_auth_store,
-    load_provider_catalog, login_provider, logout_provider, looks_like_login_secret_input,
-    normalize_provider_model_value, provider_auth_status, provider_catalog_path,
-    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
-    render_provider_list, render_provider_picker, resolve_active_provider_id,
+    ANTHROPIC_API_VERSION, ApiProvider, ModelPricing, ProviderProfile, RequestContract,
+    ResolvedModelSpec, ResolvedProviderConfig, apply_provider_headers, auth_store_path,
+    build_chatgpt_request, build_chatgpt_summary_request, built_in_provider_profiles,
+    cancel_pending_oauth_login, canonical_provider_id, extract_oauth_code_from_callback,
+    find_provider_profile, handle_auth_cli, list_models_for_available_providers,
+    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
+    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
+    provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
+    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
+    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
     resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
@@ -130,12 +131,8 @@ const DEFAULT_CACHE_READ_USD_PER_MTOK: f64 = 0.1;
 const DEFAULT_CACHE_CREATE_USD_PER_MTOK: f64 = 1.25;
 const SESSION_HTML_STYLE: &str = r#"body{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:980px;margin:2rem auto;padding:0 1rem;background:#0f1115;color:#e6edf3}a{color:#8ab4ff}.meta{color:#9aa4b2;margin-bottom:1.5rem}.msg{border:1px solid #283241;border-radius:12px;margin:1rem 0;padding:1rem;background:#151922}.role{font-weight:700;text-transform:uppercase;font-size:.8rem;letter-spacing:.08em;margin-bottom:.6rem;color:#9aa4b2}.user{border-left:4px solid #7dd3fc}.assistant{border-left:4px solid #a78bfa}.tool{border-left:4px solid #f59e0b}.thinking{color:#9aa4b2}.block{white-space:pre-wrap;line-height:1.45}.tool-name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#fbbf24}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b0d12;border:1px solid #283241;border-radius:8px;padding:.8rem}code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.err{color:#fca5a5}.ok{color:#86efac}summary{cursor:pointer}.footer{margin:2rem 0;color:#687385;font-size:.85rem}"#;
 
-fn api_family_label(provider: ApiProvider) -> &'static str {
-    match provider {
-        ApiProvider::Anthropic => "anthropic-messages",
-        ApiProvider::OpenAi => "openai-chat-completions",
-        ApiProvider::ChatGpt => "chatgpt-responses",
-    }
+fn api_family_label(contract: RequestContract) -> &'static str {
+    contract.as_str()
 }
 
 #[cfg(test)]
@@ -3048,19 +3045,24 @@ fn uses_anthropic_adaptive_thinking(provider_id: &str, model: &str) -> bool {
     is_anthropic && anthropic_model_supports_adaptive_thinking(model)
 }
 
-fn anthropic_prompt_cache_supported(provider_id: &str, model: &str) -> bool {
-    // DEXT_PROMPT_CACHE=off strips every cache_control breakpoint; =on sends
-    // breakpoints on any Anthropic-style provider (e.g. to test whether ZAI
-    // GLM honors them). Default: Anthropic itself or claude-* models only.
+fn prompt_cache_env_override() -> Option<bool> {
     match std::env::var("DEXT_PROMPT_CACHE")
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
-        "off" | "0" | "false" | "no" => return false,
-        "on" | "1" | "true" | "all" | "yes" => return true,
-        _ => {}
+        "off" | "0" | "false" | "no" => Some(false),
+        "on" | "1" | "true" | "all" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+fn anthropic_prompt_cache_supported(provider_id: &str, model: &str) -> bool {
+    // Explicit env configuration overrides catalog capabilities. Auto mode uses
+    // metadata first and this legacy family gate only when metadata is absent.
+    if let Some(enabled) = prompt_cache_env_override() {
+        return enabled;
     }
     let provider_id = canonical_provider_id(provider_id);
     provider_id == "anthropic" || model.trim().to_ascii_lowercase().starts_with("claude-")
@@ -3403,6 +3405,17 @@ impl UsagePricing {
     }
 }
 
+impl From<&ModelPricing> for UsagePricing {
+    fn from(pricing: &ModelPricing) -> Self {
+        Self::new(
+            pricing.input_usd_per_mtok,
+            pricing.output_usd_per_mtok,
+            pricing.cache_read_usd_per_mtok,
+            pricing.cache_create_usd_per_mtok,
+        )
+    }
+}
+
 impl Default for UsagePricing {
     fn default() -> Self {
         Self::new(
@@ -3452,13 +3465,17 @@ fn usage_with_current_pricing(
     api_provider: ApiProvider,
     base_url: &str,
     model: &str,
+    model_pricing: Option<&ModelPricing>,
 ) -> Usage {
     if usage.total_tokens() > 0
         && (provider_cost_estimate_overrides_wire_cost(provider_id, api_provider, model)
             || usage.cost_usd.is_none())
     {
-        usage.cost_usd =
-            Some(usage_pricing_for(provider_id, api_provider, base_url, model).estimate(usage));
+        let pricing = model_pricing.map_or_else(
+            || usage_pricing_for(provider_id, api_provider, base_url, model),
+            |pricing| usage_pricing_from_env(UsagePricing::from(pricing)),
+        );
+        usage.cost_usd = Some(pricing.estimate(usage));
     }
     usage
 }
@@ -3798,6 +3815,16 @@ pub(crate) fn normalize_reasoning_summary_text(text: &str) -> String {
     }
     normalized.push_str(remaining);
     normalized
+}
+
+fn normalize_restored_chatgpt_reasoning(history: &mut [Message]) {
+    for message in history {
+        for block in &mut message.content {
+            if let Block::Thinking { text, .. } = block {
+                *text = normalize_reasoning_summary_text(text);
+            }
+        }
+    }
 }
 
 fn reasoning_summary_stream_delta(raw: &str, emitted: &mut String) -> Option<String> {
@@ -10913,6 +10940,12 @@ pub(crate) fn model_context_window(model: &str) -> u64 {
         return tokens;
     }
 
+    if let Some(tokens) = provider_catalog_context_window(model, true) {
+        return tokens;
+    }
+    if let Some(tokens) = builtin_profile_context_window(model, true) {
+        return tokens;
+    }
     if let Some(hint) = parse_model_context_hint_tokens(model) {
         return hint;
     }
@@ -10920,22 +10953,61 @@ pub(crate) fn model_context_window(model: &str) -> u64 {
     // Resolution order (first match wins):
     //   1. DEXT_CONTEXT_WINDOW / DEXT_CONTEXT_WINDOW_TOKENS env var (handled above).
     //   2. llama.cpp runtime context cached from startup/provider switch.
-    //   3. Model-name suffix hint ("-128k", "-1m", etc).
-    //   4. Provider-catalog override: providers.json → profile.context_window
-    //      OR profile.model_context_windows[model].
-    //   5. Built-in family heuristics keyed by substring match.
-    //   6. Hard fallback (200_000).
-    // All of 4-6 are overridable by the user without a rebuild.
-    if let Some(tokens) = provider_catalog_context_window(model) {
+    //   3. Explicit per-model provider-catalog metadata.
+    //   4. Model-name suffix hint ("-128k", "-1m", etc).
+    //   5. Provider-catalog default.
+    //   6. Built-in family heuristics.
+    //   7. Hard fallback (200_000).
+    if let Some(tokens) = provider_catalog_context_window(model, false) {
         return tokens;
     }
     if let Some(tokens) = builtin_family_context_window(model) {
         return tokens;
     }
-    if let Some(tokens) = builtin_profile_context_window(model) {
+    if let Some(tokens) = builtin_profile_context_window(model, false) {
         return tokens;
     }
     DEFAULT_CONTEXT_WINDOW_TOKENS
+}
+
+fn model_context_window_for_profile(profile: Option<&ProviderProfile>, model: &str) -> u64 {
+    if let Ok(raw) = std::env::var("DEXT_CONTEXT_WINDOW")
+        .or_else(|_| std::env::var("DEXT_CONTEXT_WINDOW_TOKENS"))
+        && let Ok(value) = raw.trim().parse::<u64>()
+        && value > 0
+    {
+        return value;
+    }
+    if let Some(tokens) = provider::cached_local_llama_context_window(model) {
+        return tokens;
+    }
+    if let Some((profile, normalized)) = profile.map(|profile| {
+        let normalized = normalize_provider_model_value(profile, model).to_ascii_lowercase();
+        (profile, normalized)
+    }) {
+        if let Some(tokens) = profile
+            .model_specs
+            .get(&normalized)
+            .and_then(|spec| spec.context_window)
+            .or_else(|| profile.model_context_windows.get(&normalized).copied())
+            .filter(|tokens| *tokens > 0)
+        {
+            return tokens;
+        }
+        if let Some(tokens) = parse_model_context_hint_tokens(model) {
+            return tokens;
+        }
+        if let Some(tokens) = profile
+            .model_defaults
+            .context_window
+            .or(profile.context_window)
+            .filter(|tokens| *tokens > 0)
+        {
+            return tokens;
+        }
+        return builtin_family_context_window(model).unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+    }
+    model_context_window(model)
 }
 
 // Default per-request output token cap for streaming completions. Override with
@@ -10944,14 +11016,15 @@ pub(crate) fn model_context_window(model: &str) -> u64 {
 // clamps the thinking budget below this via clamp_thinking_budget_below_max.
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
-fn max_output_tokens() -> u32 {
+fn max_output_tokens_for(spec: Option<&ResolvedModelSpec>) -> u32 {
     if let Ok(raw) = std::env::var("DEXT_MAX_OUTPUT_TOKENS")
         && let Ok(v) = raw.trim().parse::<u32>()
         && v > 0
     {
         return v;
     }
-    DEFAULT_MAX_OUTPUT_TOKENS
+    spec.and_then(|spec| spec.max_output_tokens)
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
 }
 
 // True for ChatGPT/Codex "codex" implementation models (gpt-5.3-codex,
@@ -10961,14 +11034,10 @@ fn model_is_codex_implementation_model(model: &str) -> bool {
     model.to_ascii_lowercase().contains("codex")
 }
 
-fn provider_catalog_context_window(model: &str) -> Option<u64> {
+fn provider_catalog_context_window(model: &str, per_model_only: bool) -> Option<u64> {
     let normalized_model = model.trim().to_ascii_lowercase();
     let catalog = load_provider_catalog().ok()?;
-    if let Some(tokens) = context_window_from_profiles(&catalog.providers, &normalized_model, true)
-    {
-        return Some(tokens);
-    }
-    context_window_from_profiles(&catalog.providers, &normalized_model, false)
+    context_window_from_profiles(&catalog.providers, &normalized_model, per_model_only)
 }
 
 fn context_window_from_profiles(
@@ -10984,14 +11053,20 @@ fn context_window_from_profiles(
             || profile
                 .default_model
                 .trim()
-                .eq_ignore_ascii_case(normalized_model);
+                .eq_ignore_ascii_case(normalized_model)
+            || profile.model_specs.contains_key(normalized_model)
+            || profile.model_context_windows.contains_key(normalized_model);
         if !profile_knows_model {
             continue;
         }
-        if let Some(per_model) = profile.model_context_windows.get(normalized_model)
-            && *per_model > 0
+        if let Some(per_model) = profile
+            .model_specs
+            .get(normalized_model)
+            .and_then(|spec| spec.context_window)
+            .or_else(|| profile.model_context_windows.get(normalized_model).copied())
+            .filter(|window| *window > 0)
         {
-            return Some(*per_model);
+            return Some(per_model);
         }
         if per_model_only {
             continue;
@@ -11005,10 +11080,10 @@ fn context_window_from_profiles(
     None
 }
 
-fn builtin_profile_context_window(model: &str) -> Option<u64> {
+fn builtin_profile_context_window(model: &str, per_model_only: bool) -> Option<u64> {
     let normalized_model = model.trim().to_ascii_lowercase();
     let profiles = built_in_provider_profiles();
-    context_window_from_profiles(&profiles, &normalized_model, false)
+    context_window_from_profiles(&profiles, &normalized_model, per_model_only)
 }
 
 fn builtin_family_context_window(model: &str) -> Option<u64> {
@@ -11194,6 +11269,7 @@ pub(crate) fn git_summary(root: &Path) -> Option<String> {
 struct Agent {
     client: Arc<OnceLock<reqwest::Client>>,
     provider_id: String,
+    provider_profile: Option<ProviderProfile>,
     api_key: String,
     key_source: String,
     provider_requires_api_key: bool,
@@ -11286,11 +11362,12 @@ impl Agent {
         let api_key = resolved.api_key;
         let key_source = resolved.key_source;
         let provider_requires_api_key = resolved.requires_api_key;
-        let api_provider = resolved.profile.api_provider;
+        let api_provider = request_contract_for_profile(&resolved.profile).api_provider();
         let base_url = resolved.base_url;
         let model = resolved.model;
         let _ = refresh_local_llama_context_window(&provider_id, api_provider, &base_url, &model);
-        let context_window_tokens = model_context_window(&model);
+        let context_window_tokens =
+            model_context_window_for_profile(Some(&resolved.profile), &model);
 
         // If resolve_runtime_provider auto-rerouted away from a stale active
         // provider (e.g. chatgpt whose stored default_model actually belongs to
@@ -11377,6 +11454,7 @@ impl Agent {
         Ok(Self {
             client: Arc::new(OnceLock::new()),
             provider_id,
+            provider_profile: Some(resolved.profile),
             api_key,
             key_source,
             provider_requires_api_key,
@@ -11587,8 +11665,9 @@ impl Agent {
     }
 
     fn apply_runtime_provider(&mut self, resolved: ResolvedProviderConfig) {
-        self.provider_id = resolved.profile.id;
-        self.api_provider = resolved.profile.api_provider;
+        self.provider_id = resolved.profile.id.clone();
+        self.api_provider = request_contract_for_profile(&resolved.profile).api_provider();
+        self.provider_profile = Some(resolved.profile);
         self.api_key = resolved.api_key;
         self.key_source = resolved.key_source;
         self.provider_requires_api_key = resolved.requires_api_key;
@@ -11603,6 +11682,96 @@ impl Agent {
         self.refresh_context_window();
     }
 
+    fn request_contract(&self) -> RequestContract {
+        self.provider_profile
+            .as_ref()
+            .map(request_contract_for_profile)
+            .unwrap_or_else(|| RequestContract::for_api_provider(self.api_provider))
+    }
+
+    fn route_api_provider(&self) -> ApiProvider {
+        self.request_contract().api_provider()
+    }
+
+    fn resolved_model_spec(&self) -> Option<ResolvedModelSpec> {
+        self.provider_profile
+            .as_ref()
+            .map(|profile| resolve_model_spec(profile, &self.model))
+    }
+
+    fn request_max_output_tokens(&self) -> u32 {
+        max_output_tokens_for(self.resolved_model_spec().as_ref())
+    }
+
+    fn effective_thinking_effort(&self) -> ThinkingEffort {
+        if self
+            .resolved_model_spec()
+            .is_some_and(|spec| !spec.reasoning)
+        {
+            ThinkingEffort::Off
+        } else {
+            self.thinking_effort
+        }
+    }
+
+    fn model_supports_tools(&self) -> bool {
+        self.resolved_model_spec().is_none_or(|spec| spec.tools)
+    }
+
+    fn model_supports_prompt_cache(&self) -> bool {
+        let contract = self.request_contract();
+        if contract == RequestContract::AnthropicMessages
+            && let Some(enabled) = prompt_cache_env_override()
+        {
+            return enabled;
+        }
+        self.resolved_model_spec().map_or_else(
+            || {
+                contract == RequestContract::ChatGptResponses
+                    || (contract == RequestContract::AnthropicMessages
+                        && anthropic_prompt_cache_supported(&self.provider_id, &self.model))
+            },
+            |spec| {
+                if spec.source == "legacy" {
+                    contract == RequestContract::ChatGptResponses
+                        || (contract == RequestContract::AnthropicMessages
+                            && anthropic_prompt_cache_supported(&self.provider_id, &self.model))
+                } else {
+                    spec.prompt_cache
+                }
+            },
+        )
+    }
+
+    fn model_supports_reasoning(&self, model: &str) -> bool {
+        self.provider_profile
+            .as_ref()
+            .is_none_or(|profile| resolve_model_spec(profile, model).reasoning)
+    }
+
+    fn model_supports_image_input(&self) -> bool {
+        self.resolved_model_spec()
+            .is_some_and(|spec| spec.image_input)
+    }
+
+    fn model_spec_source(&self) -> &'static str {
+        self.resolved_model_spec()
+            .map_or("legacy", |spec| spec.source)
+    }
+
+    fn provider_health_key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            canonical_provider_id(&self.provider_id),
+            self.request_contract().as_str(),
+            self.base_url
+                .trim()
+                .trim_end_matches('/')
+                .to_ascii_lowercase(),
+            self.model.trim().to_ascii_lowercase()
+        )
+    }
+
     pub(crate) fn context_window_tokens(&self) -> u64 {
         if self.context_window_tokens > 0 {
             self.context_window_tokens
@@ -11612,12 +11781,14 @@ impl Agent {
     }
 
     fn finalize_usage_metrics(&self, usage: &mut Usage) {
+        let model_spec = self.resolved_model_spec();
         *usage = usage_with_current_pricing(
             *usage,
             &self.provider_id,
-            self.api_provider,
+            self.route_api_provider(),
             &self.base_url,
             &self.model,
+            model_spec.as_ref().and_then(|spec| spec.pricing.as_ref()),
         );
     }
 
@@ -11646,23 +11817,26 @@ impl Agent {
     }
 
     fn priced_session_usage(&self) -> Usage {
+        let model_spec = self.resolved_model_spec();
         usage_with_current_pricing(
             self.session_usage,
             &self.provider_id,
-            self.api_provider,
+            self.route_api_provider(),
             &self.base_url,
             &self.model,
+            model_spec.as_ref().and_then(|spec| spec.pricing.as_ref()),
         )
     }
 
     fn refresh_context_window(&mut self) -> Option<u64> {
         let updated = refresh_local_llama_context_window(
             &self.provider_id,
-            self.api_provider,
+            self.route_api_provider(),
             &self.base_url,
             &self.model,
         );
-        self.context_window_tokens = model_context_window(&self.model);
+        self.context_window_tokens =
+            model_context_window_for_profile(self.provider_profile.as_ref(), &self.model);
         if let Some(percent) = self.compact_threshold_percent {
             self.compact_threshold_chars = Some(compact_threshold_chars_for_window(
                 self.context_window_tokens,
@@ -11692,7 +11866,7 @@ impl Agent {
     fn emit_runtime_provider_state(&mut self) {
         self.sink.emit(AgentEvent::TurnDiagnostics {
             provider: self.provider_id.clone(),
-            api_family: api_family_label(self.api_provider).to_string(),
+            api_family: api_family_label(self.request_contract()).to_string(),
             auth_source: self.key_source.clone(),
             model: self.model.clone(),
             context_window: Some(self.context_window_tokens()),
@@ -11711,17 +11885,23 @@ impl Agent {
 
     fn provider_status_line(&self) -> String {
         format!(
-            "provider={} api={} model={} auth={} base={}",
+            "provider={} contract={} api={} model={} spec={} tools={} reasoning={} image_input={} prompt_cache={} auth={} base={}",
             self.provider_id,
-            self.api_provider.as_str(),
+            self.request_contract().as_str(),
+            self.route_api_provider().as_str(),
             self.model,
+            self.model_spec_source(),
+            self.model_supports_tools(),
+            self.resolved_model_spec().is_none_or(|spec| spec.reasoning),
+            self.model_supports_image_input(),
+            self.model_supports_prompt_cache(),
             self.key_source,
             self.base_url
         )
     }
 
     fn api_family_label(&self) -> &'static str {
-        api_family_label(self.api_provider)
+        api_family_label(self.request_contract())
     }
 
     fn set_pending_login_provider(&mut self, provider: Option<String>) {
@@ -11824,7 +12004,7 @@ impl Agent {
     }
 
     fn apply_implementation_phase_model_mitigation(&mut self) -> Option<String> {
-        if self.api_provider != ApiProvider::ChatGpt
+        if self.request_contract() != RequestContract::ChatGptResponses
             || !model_is_codex_implementation_model(&self.model)
             || self.thinking_effort != ThinkingEffort::XHigh
         {
@@ -11838,7 +12018,7 @@ impl Agent {
     }
 
     fn maybe_fallback_implementation_model(&mut self) -> Option<String> {
-        if self.api_provider != ApiProvider::ChatGpt
+        if self.request_contract() != RequestContract::ChatGptResponses
             || !model_is_codex_implementation_model(&self.model)
         {
             return None;
@@ -12062,7 +12242,7 @@ impl Agent {
     /// lightweight request. The actual API call will reuse the warm connection.
     fn prewarm_connection(&self) {
         let client = self.client.get_or_init(reqwest::Client::new).clone();
-        let url = provider_request_url(&self.base_url, self.api_provider);
+        let url = provider_request_url(&self.base_url, self.request_contract());
         // Fire-and-forget HEAD request to warm TLS
         std::mem::drop(tokio::spawn(async move {
             let _ = client
@@ -12976,10 +13156,12 @@ impl Agent {
         text: &str,
         retry_after: Option<u64>,
     ) {
+        let health_key = self.provider_health_key();
+        let mode = api_family_label(self.request_contract()).to_string();
         let state = self
             .provider_health
             .providers
-            .entry(self.provider_id.clone())
+            .entry(health_key)
             .or_default();
         state.auth = if matches!(status.as_u16(), 401 | 403) {
             "failed".to_string()
@@ -12988,7 +13170,7 @@ impl Agent {
         };
         state.last_error = Some(format!("HTTP {status}: {}", summarize_inline(text, 220)));
         state.retry_after = retry_after;
-        state.mode = Some(api_family_label(self.api_provider).to_string());
+        state.mode = Some(mode);
         let is_server_error = matches!(status.as_u16(), 502..=504);
         if is_server_error {
             state.consecutive_server_errors = state.consecutive_server_errors.saturating_add(1);
@@ -13001,14 +13183,16 @@ impl Agent {
     }
 
     fn record_provider_stream_failure(&mut self, text: &str) {
+        let health_key = self.provider_health_key();
+        let mode = api_family_label(self.request_contract()).to_string();
         let state = self
             .provider_health
             .providers
-            .entry(self.provider_id.clone())
+            .entry(health_key)
             .or_default();
         state.auth = "present".to_string();
         state.last_error = Some(summarize_inline(text, 260));
-        state.mode = Some(api_family_label(self.api_provider).to_string());
+        state.mode = Some(mode);
         state.disabled_for_turn = tool_policy::output_has_auth_failure_markers(text);
     }
 
@@ -13054,10 +13238,16 @@ impl Agent {
     }
 
     fn wire_tools(&self) -> Vec<WireTool> {
+        if !self.model_supports_tools() {
+            return Vec::new();
+        }
         tools::wire_tools(&self.tools, self.wire_tool_profile())
     }
 
     fn wire_tools_oai(&self) -> Vec<OaiTool> {
+        if !self.model_supports_tools() {
+            return Vec::new();
+        }
         tools::wire_tools_oai(&self.tools, self.wire_tool_profile())
     }
 
@@ -13213,6 +13403,9 @@ impl Agent {
     }
 
     fn wire_tools_chatgpt(&self) -> Vec<Value> {
+        if !self.model_supports_tools() {
+            return Vec::new();
+        }
         tools::wire_tools_chatgpt(&self.tools, self.wire_tool_profile())
     }
 
@@ -13297,36 +13490,44 @@ impl Agent {
         wire_tools: &[WireTool],
         chatgpt_session_id: &str,
     ) -> Result<(String, Vec<u8>)> {
-        let url = provider_request_url(&self.base_url, self.api_provider);
-        match self.api_provider {
-            ApiProvider::ChatGpt => {
+        let contract = self.request_contract();
+        let effort = self.effective_thinking_effort();
+        let max_output_tokens = self.request_max_output_tokens();
+        let url = provider_request_url(&self.base_url, contract);
+        match contract {
+            RequestContract::ChatGptResponses => {
                 // Instructions carry only the stable system text; volatile env
                 // state rides as a transient trailing input item so the prefix
                 // stays byte-stable for the Responses API's implicit caching.
                 let mut input = self.history_to_chatgpt_input();
                 append_runtime_env_chatgpt_item(&mut input, sys_env);
-                let body = build_chatgpt_request(
+                let mut body = build_chatgpt_request(
                     &self.model,
-                    self.thinking_effort,
+                    effort,
                     sys_stable,
                     chatgpt_session_id,
                     input,
                     self.wire_tools_chatgpt(),
                 );
+                if !self.model_supports_prompt_cache()
+                    && let Some(object) = body.as_object_mut()
+                {
+                    object.remove("prompt_cache_key");
+                }
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                 Ok((url, bytes))
             }
-            ApiProvider::OpenAi => {
+            RequestContract::OpenAiChatCompletions => {
                 // Same split for OpenAI-compatible providers (DeepSeek, local
                 // llama.cpp, OpenAI): a changing system message would invalidate
                 // their implicit prefix caches on every tool round.
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
-                let reasoning_effort = openai_reasoning_effort(self.thinking_effort);
+                let reasoning_effort = openai_reasoning_effort(effort);
                 let stream_options = (!provider::is_local_llama_provider(
                     &self.provider_id,
-                    self.api_provider,
+                    self.route_api_provider(),
                     &self.base_url,
                 ))
                 .then_some(OaiStreamOptions {
@@ -13336,14 +13537,14 @@ impl Agent {
                     oai_tools.iter().map(|t| t.function.name.as_str()).collect();
                 let grammar = llama_tool_grammar_for(
                     &self.provider_id,
-                    self.api_provider,
+                    self.route_api_provider(),
                     &self.base_url,
                     &tool_names,
                     env_flag_default(LLAMA_TOOL_GRAMMAR_ENV, false),
                 );
                 let body = OaiRequest {
                     model: &self.model,
-                    max_tokens: max_output_tokens(),
+                    max_tokens: max_output_tokens,
                     messages: oai_msgs,
                     tools: oai_tools,
                     stream: true,
@@ -13355,14 +13556,27 @@ impl Agent {
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                 Ok((url, bytes))
             }
-            ApiProvider::Anthropic => {
-                let max_tokens = max_output_tokens();
-                let (thinking, output_config) = if let Some(effort) =
-                    provider_model_output_config_effort(
-                        &self.provider_id,
-                        &self.model,
-                        self.thinking_effort,
-                    ) {
+            RequestContract::AnthropicMessages => {
+                let max_tokens = max_output_tokens;
+                let resolved_spec = self.resolved_model_spec();
+                let configured_effort = resolved_spec
+                    .as_ref()
+                    .filter(|spec| !spec.effort_levels.is_empty())
+                    .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, effort))
+                    .or_else(|| {
+                        (resolved_spec
+                            .as_ref()
+                            .is_none_or(|spec| spec.source == "legacy"))
+                        .then(|| {
+                            provider_model_output_config_effort(
+                                &self.provider_id,
+                                &self.model,
+                                effort,
+                            )
+                        })
+                        .flatten()
+                    });
+                let (thinking, output_config) = if let Some(effort) = configured_effort {
                     (
                         Some(AnthropicThinking {
                             kind: "enabled",
@@ -13372,7 +13586,7 @@ impl Agent {
                         Some(AnthropicOutputConfig { effort }),
                     )
                 } else if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
-                    let effort = anthropic_output_config_effort(&self.model, self.thinking_effort);
+                    let effort = anthropic_output_config_effort(&self.model, effort);
                     let always_adaptive = anthropic_model_is_always_adaptive(&self.model);
                     let thinking = effort.as_ref().map(|_| AnthropicThinking {
                         kind: "adaptive",
@@ -13385,7 +13599,7 @@ impl Agent {
                     )
                 } else {
                     (
-                        anthropic_thinking_budget_tokens(self.thinking_effort)
+                        anthropic_thinking_budget_tokens(effort)
                             .and_then(|budget_tokens| {
                                 clamp_thinking_budget_below_max(budget_tokens, max_tokens)
                             })
@@ -13399,8 +13613,7 @@ impl Agent {
                 };
                 let history = self.provider_context_history();
                 let messages = sanitize_anthropic_messages(history, thinking.is_some());
-                let prompt_cache_enabled =
-                    anthropic_prompt_cache_supported(&self.provider_id, &self.model);
+                let prompt_cache_enabled = self.model_supports_prompt_cache();
                 let mut messages = anthropic_wire_messages(&messages, prompt_cache_enabled)?;
                 append_runtime_env_block(&mut messages, sys_env);
                 let system = system_blocks_with_cache_control(sys_blocks, prompt_cache_enabled);
@@ -13425,10 +13638,10 @@ impl Agent {
         &mut self,
         resp: reqwest::Response,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        match self.api_provider {
-            ApiProvider::OpenAi => self.read_stream_oai(resp).await,
-            ApiProvider::ChatGpt => self.read_stream_chatgpt(resp).await,
-            ApiProvider::Anthropic => self.read_stream(resp).await,
+        match self.request_contract() {
+            RequestContract::OpenAiChatCompletions => self.read_stream_oai(resp).await,
+            RequestContract::ChatGptResponses => self.read_stream_chatgpt(resp).await,
+            RequestContract::AnthropicMessages => self.read_stream(resp).await,
         }
     }
 
@@ -13533,7 +13746,7 @@ impl Agent {
             dext_version: env!("CARGO_PKG_VERSION").to_string(),
             git: self.git_context.clone(),
             provider: self.provider_id.clone(),
-            api_provider: self.api_provider,
+            api_provider: self.route_api_provider(),
             model: self.model.clone(),
             thinking_effort: self.thinking_effort,
             approval_profile: self.approval_profile,
@@ -13663,6 +13876,7 @@ impl Agent {
             provider_health,
             track_origin,
             privacy,
+            provenance,
             ..
         } = parse_session_header(header)?;
 
@@ -13710,6 +13924,9 @@ impl Agent {
                 serde_json::from_str(line)
                     .with_context(|| format!("bad message on line {}", i + 2))?,
             );
+        }
+        if provenance.api_provider == ApiProvider::ChatGpt {
+            normalize_restored_chatgpt_reasoning(&mut hist);
         }
         self.history = hist;
         self.clear_pending_login();
@@ -14045,6 +14262,7 @@ impl Agent {
         let transcript = render_transcript_for_summary(old, self.context_mode);
         let user_text = compaction_user_text_with_evidence(&transcript, evidence);
         let summary_model = self.compact_summary_model();
+        let summary_reasoning_supported = self.model_supports_reasoning(&summary_model);
         let summary_max_tokens = compact_summary_max_tokens(self.thinking_effort);
 
         #[derive(PartialEq, Eq)]
@@ -14054,11 +14272,16 @@ impl Agent {
             ChatGptSse,
         }
 
-        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if self.api_provider
-            == ApiProvider::ChatGpt
-        {
-            let body = build_chatgpt_summary_request(&summary_model, COMPACT_SYSTEM, &user_text);
-            let url = provider_request_url(&self.base_url, self.api_provider);
+        let request_contract = self.request_contract();
+        let is_chatgpt_summary = request_contract == RequestContract::ChatGptResponses;
+        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if is_chatgpt_summary {
+            let body = build_chatgpt_summary_request(
+                &summary_model,
+                COMPACT_SYSTEM,
+                &user_text,
+                summary_reasoning_supported,
+            );
+            let url = provider_request_url(&self.base_url, self.request_contract());
             let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
             let req = apply_provider_headers(
                 self.http_client()
@@ -14066,12 +14289,12 @@ impl Agent {
                     .header("content-type", "application/json")
                     .header("accept", "text/event-stream")
                     .body(bytes),
-                self.api_provider,
+                self.request_contract(),
                 &self.api_key,
                 None,
             )?;
             (req.send().await?, SummaryParse::ChatGptSse)
-        } else if self.api_provider == ApiProvider::OpenAi {
+        } else if request_contract == RequestContract::OpenAiChatCompletions {
             let reasoning_effort = None;
             let messages = vec![
                 OaiMessage {
@@ -14098,13 +14321,16 @@ impl Agent {
                 grammar: None,
                 chat_template_kwargs: compact_summary_chat_template_kwargs(
                     &self.provider_id,
-                    self.api_provider,
+                    self.route_api_provider(),
                     &self.base_url,
                 ),
             };
             let mut req = self
                 .http_client()
-                .post(provider_request_url(&self.base_url, self.api_provider))
+                .post(provider_request_url(
+                    &self.base_url,
+                    self.request_contract(),
+                ))
                 .header("content-type", "application/json")
                 .json(&body);
             if !self.api_key.trim().is_empty() {
@@ -14133,7 +14359,10 @@ impl Agent {
             };
             let mut req = self
                 .http_client()
-                .post(provider_request_url(&self.base_url, self.api_provider))
+                .post(provider_request_url(
+                    &self.base_url,
+                    self.request_contract(),
+                ))
                 .header("anthropic-version", ANTHROPIC_API_VERSION)
                 .header("content-type", "application/json")
                 .json(&body);
@@ -14198,8 +14427,9 @@ impl Agent {
                                 &summary_model,
                                 COMPACT_SYSTEM,
                                 &user_text,
+                                summary_reasoning_supported,
                             );
-                            let url = provider_request_url(&self.base_url, self.api_provider);
+                            let url = provider_request_url(&self.base_url, self.request_contract());
                             let bytes =
                                 serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                             let req = apply_provider_headers(
@@ -14208,7 +14438,7 @@ impl Agent {
                                     .header("content-type", "application/json")
                                     .header("accept", "text/event-stream")
                                     .body(bytes),
-                                self.api_provider,
+                                self.request_contract(),
                                 &self.api_key,
                                 None,
                             )?;
@@ -14624,13 +14854,14 @@ impl Agent {
                 continue;
             }
 
-            let chatgpt_session_id = (self.api_provider == ApiProvider::ChatGpt).then(|| {
-                format!(
-                    "dext-{}-{}",
-                    self.provider_id,
-                    project_key(&self.sandbox_root)
-                )
-            });
+            let chatgpt_session_id = (self.request_contract() == RequestContract::ChatGptResponses)
+                .then(|| {
+                    format!(
+                        "dext-{}-{}",
+                        self.provider_id,
+                        project_key(&self.sandbox_root)
+                    )
+                });
             self.partial_stream_text = None;
             let (sys_stable, sys_env) = self.compose_system_parts();
             // Only the stable text lives in the system prompt (with a cache
@@ -14662,15 +14893,15 @@ impl Agent {
                         .post(&url)
                         .header("content-type", "application/json")
                         .header("accept", "text/event-stream");
-                    if self.api_provider == ApiProvider::Anthropic
+                    if self.request_contract() == RequestContract::AnthropicMessages
                         && extended_prompt_cache_ttl().is_some()
-                        && anthropic_prompt_cache_supported(&self.provider_id, &self.model)
+                        && self.model_supports_prompt_cache()
                     {
                         builder = builder.header("anthropic-beta", "extended-cache-ttl-2025-04-11");
                     }
                     let req = apply_provider_headers(
                         builder.body(req_body.clone()),
-                        self.api_provider,
+                        self.request_contract(),
                         &self.api_key,
                         chatgpt_session_id.as_deref(),
                     )?;
@@ -14871,7 +15102,7 @@ impl Agent {
                             }
                             continue 'stream_retry;
                         }
-                        if self.api_provider == ApiProvider::ChatGpt {
+                        if self.request_contract() == RequestContract::ChatGptResponses {
                             let partial_blocks = self.partial_chatgpt_stream_blocks();
                             if maybe_preserve_partial_stream(
                                 &partial_blocks,
@@ -15965,7 +16196,7 @@ impl Agent {
         }
         self.sink.emit(AgentEvent::TurnDiagnostics {
             provider: self.provider_id.clone(),
-            api_family: api_family_label(self.api_provider).to_string(),
+            api_family: api_family_label(self.request_contract()).to_string(),
             auth_source: self.key_source.clone(),
             model: self.model.clone(),
             context_window: Some(self.context_window_tokens()),
@@ -16300,7 +16531,7 @@ impl Agent {
                     let parsed = Usage::parse_openai(u);
                     let keep_local_timings = provider::is_local_llama_provider(
                         &self.provider_id,
-                        self.api_provider,
+                        self.route_api_provider(),
                         &self.base_url,
                     ) && usage.cache_read > 0
                         && parsed.cache_read == 0;
@@ -17093,6 +17324,7 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
         header.provenance.api_provider,
         base_url,
         model,
+        None,
     );
     let mut analysis = SessionAnalysis {
         messages: history.len(),

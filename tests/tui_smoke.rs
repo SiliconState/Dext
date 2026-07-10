@@ -61,7 +61,8 @@ fn tui_smoke_shift_enter_inserts_newline() {
         tail(&visible, 3000)
     );
 
-    pty.write_all_retry(&[0x04]).expect("send Ctrl+D");
+    pty.write_all_retry(b"\x1b[100;5u")
+        .expect("send Ctrl+D CSI-u");
     let status =
         wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).expect("wait for dext exit");
     assert!(
@@ -101,7 +102,7 @@ fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
         );
     }
 
-    pty.write_all_retry(&[0x04]).expect("send Ctrl+D");
+    pty.write_all_retry(b"\x04").expect("send raw Ctrl+D");
     let status =
         wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).expect("wait for dext exit");
     pty.read_available().expect("final pty drain");

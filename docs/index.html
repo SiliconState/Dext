@@ -1073,6 +1073,7 @@ description: One-line workflow summary
 <div class="collapsible-content">
 <h3><code>providers.json</code> (~/.dext/providers.json)</h3>
 <p>Provider catalog with merged built-in + custom profiles. Editable via <code>/provider</code> and <code>/model</code> commands. Auto-normalized on load.</p>
+<p>Catalog v2 profiles may set <code>request_contract</code> to <code>anthropic-messages</code>, <code>openai-chat-completions</code>, or <code>chatgpt-responses</code>. Optional <code>model_aliases</code>, <code>model_defaults</code>, and <code>model_specs</code> provide canonical model ids, limits, effort levels, capabilities, and pricing. Explicit per-model metadata wins; context hints in model names such as <code>-128k</code> and <code>[1m]</code> win over provider-wide context defaults. Built-in metadata only fills omissions, and v1 profile fields remain accepted. <code>DEXT_PROMPT_CACHE=on|off</code> overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.</p>
 <h3><code>auth.json</code> (~/.dext/auth.json)</h3>
 <p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types.</p>
 <h3><code>DEXT.md</code> (project root)</h3>

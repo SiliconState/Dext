@@ -69,6 +69,10 @@ Inside the interactive session, the matching slash commands are:
 
 Credentials are stored in Dext state, not in the repository. Do not commit `.env`, `.dext/`, exported sessions, or auth stores.
 
+### Provider catalog metadata
+
+`~/.dext/providers.json` is auto-normalized to catalog v2 while continuing to accept v1 profiles. A provider may set `request_contract` to `anthropic-messages`, `openai-chat-completions`, or `chatgpt-responses`; this controls request and response routing independently of the provider id. Optional `model_aliases`, `model_defaults`, and per-model `model_specs` supply canonical ids, context/output limits, effort levels, capabilities (`tools`, `reasoning`, `image_input`, and `prompt_cache`), and pricing. Explicit per-model metadata takes precedence; context hints embedded in model names (such as `-128k` or `[1m]`) take precedence over provider-wide context defaults. Built-in metadata only fills omitted values. Legacy `context_window`, `model_context_windows`, and `model_effort_levels` fields remain accepted. `DEXT_PROMPT_CACHE=on|off` overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.
+
 ## Local Qwen / llama.cpp
 
 Dext includes a `local` provider for one OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. The curated local model id is `qwen3.6-35b-a3b-mtp-ud-q5_k_m`. On startup/provider switch, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) for the live runtime context window; if the probe misses, local context budgeting falls back to 131K tokens for Qwen3.6. Start exactly one server first, then select it:
