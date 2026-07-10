@@ -1,4 +1,6 @@
+use crate::provider::ExecutionPolicy;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 const MIN_DYNAMIC_UI_CAP: usize = 2_000;
@@ -75,6 +77,47 @@ pub(crate) fn phase_transition(
     Some((next, message))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnControlLevel {
+    Open,
+    Guarded,
+    Finalize,
+}
+
+impl TurnControlLevel {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Guarded => "guarded",
+            Self::Finalize => "finalize",
+        }
+    }
+}
+
+fn controlled_action_family(tool_name: &str, input: &Value) -> String {
+    match tool_name {
+        "bash" => format!(
+            "bash:{}",
+            normalize_bash_similarity_key(input["command"].as_str().unwrap_or(""))
+        ),
+        "browser" | "http" => {
+            let url = input["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find(|arg| arg.starts_with("http://") || arg.starts_with("https://"));
+            if let Some(url) = url.and_then(|value| reqwest::Url::parse(value).ok()) {
+                let host = url.host_str().unwrap_or("unknown");
+                return format!("{tool_name}:{host}:{}", url.path());
+            }
+            format!("{tool_name}:{}", input)
+        }
+        "read_file" | "read_symbol" | "rg" | "fd" => format!("{tool_name}:{input}"),
+        _ => format!("{tool_name}:{input}"),
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExternalObservation {
     pub(crate) round_external_failures: usize,
@@ -89,11 +132,26 @@ pub(crate) struct ExternalTelemetry {
     pub(crate) partial_delivery_hints: usize,
     pub(crate) http_retries: usize,
     pub(crate) empty_tool_call_hints: usize,
+    pub(crate) adaptive_escalations: usize,
+    pub(crate) action_locks: usize,
+    pub(crate) forced_finalizations: usize,
 }
 
 #[derive(Debug)]
 pub(crate) struct TurnRuntimeState {
     phase: WorkPhase,
+    execution_policy: ExecutionPolicy,
+    control_level: TurnControlLevel,
+    tool_rounds: usize,
+    guarded_at_round: Option<usize>,
+    no_progress_streak: usize,
+    guard_block_count: usize,
+    action_failures: HashMap<String, usize>,
+    blocked_action_families: HashSet<String>,
+    result_fingerprints: HashSet<String>,
+    finalization_note_emitted: bool,
+    finalized_at_round: Option<usize>,
+    finalization_halt_emitted: bool,
     partial_delivery_hint_emitted: bool,
     total_auth_failure_events: usize,
     blocked_hosts: HashSet<String>,
@@ -112,6 +170,18 @@ impl Default for TurnRuntimeState {
     fn default() -> Self {
         Self {
             phase: WorkPhase::Probe,
+            execution_policy: ExecutionPolicy::Open,
+            control_level: TurnControlLevel::Open,
+            tool_rounds: 0,
+            guarded_at_round: None,
+            no_progress_streak: 0,
+            guard_block_count: 0,
+            action_failures: HashMap::new(),
+            blocked_action_families: HashSet::new(),
+            result_fingerprints: HashSet::new(),
+            finalization_note_emitted: false,
+            finalized_at_round: None,
+            finalization_halt_emitted: false,
             partial_delivery_hint_emitted: false,
             total_auth_failure_events: 0,
             blocked_hosts: HashSet::new(),
@@ -129,8 +199,216 @@ impl Default for TurnRuntimeState {
 }
 
 impl TurnRuntimeState {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_execution_policy(execution_policy: ExecutionPolicy) -> Self {
+        let mut state = Self {
+            execution_policy,
+            ..Self::default()
+        };
+        if execution_policy == ExecutionPolicy::Bounded {
+            state.control_level = TurnControlLevel::Guarded;
+            state.guarded_at_round = Some(0);
+        }
+        state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_policy(&self) -> ExecutionPolicy {
+        self.execution_policy
+    }
+
+    #[cfg(test)]
+    pub(crate) fn control_level(&self) -> TurnControlLevel {
+        self.control_level
+    }
+
+    pub(crate) fn sync_execution_policy(&mut self, execution_policy: ExecutionPolicy) {
+        if self.execution_policy == execution_policy {
+            return;
+        }
+        self.execution_policy = execution_policy;
+        self.reset_supervision_epoch();
+    }
+
+    pub(crate) fn reset_supervision_for_steering(&mut self) {
+        if self.execution_policy != ExecutionPolicy::Open {
+            self.reset_supervision_epoch();
+        }
+    }
+
+    fn reset_supervision_epoch(&mut self) {
+        self.control_level = if self.execution_policy == ExecutionPolicy::Bounded {
+            TurnControlLevel::Guarded
+        } else {
+            TurnControlLevel::Open
+        };
+        self.tool_rounds = 0;
+        self.guarded_at_round = (self.execution_policy == ExecutionPolicy::Bounded).then_some(0);
+        self.no_progress_streak = 0;
+        self.guard_block_count = 0;
+        self.action_failures.clear();
+        self.blocked_action_families.clear();
+        self.result_fingerprints.clear();
+        self.finalization_note_emitted = false;
+        self.finalized_at_round = None;
+        self.finalization_halt_emitted = false;
+    }
+
+    pub(crate) fn begin_tool_round(&mut self) {
+        if self.execution_policy == ExecutionPolicy::Open {
+            return;
+        }
+        self.tool_rounds = self.tool_rounds.saturating_add(1);
+        let limit_reached = match self.execution_policy {
+            ExecutionPolicy::Open => false,
+            ExecutionPolicy::Bounded => self.tool_rounds > 12,
+            ExecutionPolicy::Adaptive => self
+                .guarded_at_round
+                .is_some_and(|start| self.tool_rounds.saturating_sub(start) > 6),
+        };
+        if limit_reached {
+            self.force_finalize();
+        }
+    }
+
+    pub(crate) fn should_finalize(&self) -> bool {
+        self.control_level == TurnControlLevel::Finalize
+    }
+
+    pub(crate) fn take_finalization_note(&mut self) -> Option<String> {
+        if !self.should_finalize() || self.finalization_note_emitted {
+            return None;
+        }
+        self.finalization_note_emitted = true;
+        Some("runtime control: collection is stopped after repeated non-progress. Produce the best supported result now, explicitly label unresolved evidence, and do not issue more tool calls.".to_string())
+    }
+
+    pub(crate) fn take_finalization_halt_message(&mut self) -> Option<String> {
+        if self.finalization_halt_emitted
+            || !self.should_finalize()
+            || self
+                .finalized_at_round
+                .is_none_or(|round| self.tool_rounds.saturating_sub(round) < 2)
+        {
+            return None;
+        }
+        self.finalization_halt_emitted = true;
+        Some("runtime control halted this turn because the model continued issuing tool calls after tool execution was disabled. Existing supported results remain in the session; continue to request synthesis or switch provider/model.".to_string())
+    }
+
+    pub(crate) fn control_prompt(&self) -> Option<String> {
+        (self.execution_policy != ExecutionPolicy::Open).then(|| {
+            format!(
+                "## Execution control\npolicy={} state={} tool_rounds={} no_progress_streak={}\nTreat successful-but-unchanged results as no progress. A locked action must not be retried. In finalize state, return the best supported answer and label unresolved evidence.",
+                self.execution_policy.as_str(),
+                self.control_level.label(),
+                self.tool_rounds,
+                self.no_progress_streak
+            )
+        })
+    }
+
+    pub(crate) fn controlled_action_guard(&self, tool_name: &str, input: &Value) -> Option<String> {
+        if self.execution_policy == ExecutionPolicy::Open {
+            return None;
+        }
+        if self.should_finalize() {
+            return Some("runtime control: tool execution is disabled because this turn is finalizing. Return the best supported result and label unresolved evidence.".to_string());
+        }
+        let family = controlled_action_family(tool_name, input);
+        self.blocked_action_families.contains(&family).then(|| {
+            format!(
+                "runtime action lock: '{family}' is disabled for this turn after repeated failures. Use a materially different source/method or synthesize the supported partial result."
+            )
+        })
+    }
+
+    pub(crate) fn record_controlled_outcome(
+        &mut self,
+        tool_name: &str,
+        input: &Value,
+        content: &str,
+        is_error: Option<bool>,
+    ) -> Option<String> {
+        if self.execution_policy == ExecutionPolicy::Open {
+            return None;
+        }
+        let family = controlled_action_family(tool_name, input);
+        let lower = content.to_ascii_lowercase();
+        let blocked = lower.contains("similarity guard")
+            || lower.contains("runtime action lock")
+            || lower.contains("tool retry budget exceeded");
+        let failed = is_error.unwrap_or(false) || blocked;
+        let mut hasher = Sha256::new();
+        hasher.update(content.trim().as_bytes());
+        let fingerprint = format!("{family}:{:x}", hasher.finalize());
+        let duplicate = !content.trim().is_empty() && !self.result_fingerprints.insert(fingerprint);
+        let navigation_only = tool_name == "browser"
+            && input["args"]
+                .as_array()
+                .and_then(|args| args.first())
+                .and_then(Value::as_str)
+                .is_some_and(|arg| matches!(arg, "navigate" | "open"));
+        let has_result = !content.trim().is_empty();
+        let productive = !failed && !duplicate && !navigation_only && has_result;
+
+        if productive {
+            self.no_progress_streak = 0;
+            self.action_failures.remove(&family);
+            return None;
+        }
+
+        self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+        let failures = self.action_failures.entry(family.clone()).or_default();
+        *failures = failures.saturating_add(1);
+        if blocked {
+            self.guard_block_count = self.guard_block_count.saturating_add(1);
+        }
+
+        let mut notes = Vec::new();
+        if self.control_level == TurnControlLevel::Open
+            && (self.no_progress_streak >= 3 || *failures >= 2 || blocked)
+        {
+            self.control_level = TurnControlLevel::Guarded;
+            self.guarded_at_round = Some(self.tool_rounds);
+            self.telemetry.adaptive_escalations =
+                self.telemetry.adaptive_escalations.saturating_add(1);
+            notes.push(format!(
+                "runtime control: adaptive supervision entered guarded state after non-progress in '{family}'."
+            ));
+        }
+
+        if self.control_level == TurnControlLevel::Guarded
+            && *failures >= 3
+            && self.blocked_action_families.insert(family.clone())
+        {
+            self.telemetry.action_locks = self.telemetry.action_locks.saturating_add(1);
+            notes.push(format!(
+                "runtime control: action family '{family}' is now locked; choose a different source/method."
+            ));
+        }
+
+        if self.control_level == TurnControlLevel::Guarded
+            && (self.no_progress_streak >= 5 || self.guard_block_count >= 2)
+        {
+            self.force_finalize();
+            notes.push("runtime control: repeated non-progress exhausted the guarded budget; collection is stopping and the next response must synthesize supported evidence.".to_string());
+        }
+
+        (!notes.is_empty()).then(|| notes.join("\n"))
+    }
+
+    fn force_finalize(&mut self) {
+        if self.control_level != TurnControlLevel::Finalize {
+            self.control_level = TurnControlLevel::Finalize;
+            self.finalized_at_round = Some(self.tool_rounds);
+            self.telemetry.forced_finalizations =
+                self.telemetry.forced_finalizations.saturating_add(1);
+        }
     }
 
     pub(crate) fn phase(&self) -> WorkPhase {
@@ -540,6 +818,47 @@ fn explicit_apply_fixes_requested(lowered: &str) -> bool {
     cleanup_requested_as_action(&words)
         || commit_requested_as_action(&words)
         || explicit_implementation_requested(lowered)
+}
+
+pub(crate) fn continuation_prompt(input: &str) -> bool {
+    let normalized = input
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if normalized.is_empty() || normalized.len() > 6 {
+        return false;
+    }
+    matches!(
+        normalized.as_slice(),
+        [word] if matches!(word.as_str(), "ok" | "okay" | "continue" | "proceed" | "go" | "yes" | "yep")
+    ) || matches!(
+        normalized.as_slice(),
+        [first, second]
+            if matches!(
+                (first.as_str(), second.as_str()),
+                ("go", "ahead")
+                    | ("go", "forth")
+                    | ("do", "it")
+                    | ("sounds", "good")
+                    | ("keep", "going")
+            )
+    ) || normalized
+        .first()
+        .is_some_and(|word| word == "ok" || word == "okay")
+        && normalized.iter().all(|word| {
+            matches!(
+                word.as_str(),
+                "ok" | "okay"
+                    | "go"
+                    | "forth"
+                    | "ahead"
+                    | "continue"
+                    | "please"
+                    | "young"
+                    | "padawan"
+            )
+        })
 }
 
 impl ObjectiveTracker {
@@ -2426,5 +2745,169 @@ mod tests {
             .expect("should halt after continued empty-call loop");
         assert!(halt.contains("halted"), "{halt}");
         assert!(halt.contains("switch provider/model"), "{halt}");
+    }
+
+    #[test]
+    fn execution_control_is_inert_for_open_policy() {
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Open);
+        let input = json!({"command": "curl https://example.test/items"});
+        for _ in 0..20 {
+            state.begin_tool_round();
+            assert!(
+                state
+                    .record_controlled_outcome("bash", &input, "same failure", Some(true))
+                    .is_none()
+            );
+        }
+
+        assert_eq!(state.execution_policy(), ExecutionPolicy::Open);
+        assert_eq!(state.control_level(), TurnControlLevel::Open);
+        assert!(!state.should_finalize());
+        assert!(state.control_prompt().is_none());
+        assert!(state.controlled_action_guard("bash", &input).is_none());
+    }
+
+    #[test]
+    fn concise_successes_count_as_progress_and_distinct_searches_do_not_share_locks() {
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        for index in 0..8 {
+            state.begin_tool_round();
+            let input = json!({"path": "src", "pattern": format!("symbol_{index}")});
+            assert!(
+                state
+                    .record_controlled_outcome("rg", &input, "1:match", Some(false))
+                    .is_none()
+            );
+        }
+        assert_eq!(state.control_level(), TurnControlLevel::Open);
+        assert!(!state.should_finalize());
+
+        let first = json!({"path": "src", "pattern": "first"});
+        for _ in 0..3 {
+            state.begin_tool_round();
+            state.record_controlled_outcome("rg", &first, "", Some(false));
+        }
+        assert!(state.controlled_action_guard("rg", &first).is_some());
+        let second = json!({"path": "src", "pattern": "second"});
+        assert!(state.controlled_action_guard("rg", &second).is_none());
+
+        let mut read_state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        let first_page = json!({"path": "src/lib.rs", "offset": 1, "limit": 50});
+        for _ in 0..3 {
+            read_state.begin_tool_round();
+            read_state.record_controlled_outcome("read_file", &first_page, "", Some(false));
+        }
+        assert!(
+            read_state
+                .controlled_action_guard("read_file", &first_page)
+                .is_some()
+        );
+        let second_page = json!({"path": "src/lib.rs", "offset": 51, "limit": 50});
+        assert!(
+            read_state
+                .controlled_action_guard("read_file", &second_page)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn policy_sync_and_steering_reset_only_reset_supervision_epoch() {
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        let input = json!({"command": "curl https://example.test/items"});
+        for _ in 0..5 {
+            state.begin_tool_round();
+            state.record_controlled_outcome("bash", &input, "failure", Some(true));
+        }
+        assert!(state.should_finalize());
+        let telemetry = state.telemetry();
+
+        state.reset_supervision_for_steering();
+        assert_eq!(state.control_level(), TurnControlLevel::Open);
+        assert!(!state.should_finalize());
+        assert_eq!(state.telemetry(), telemetry);
+        assert!(state.controlled_action_guard("bash", &input).is_none());
+
+        state.sync_execution_policy(ExecutionPolicy::Open);
+        assert_eq!(state.execution_policy(), ExecutionPolicy::Open);
+        assert!(state.control_prompt().is_none());
+        for _ in 0..20 {
+            state.begin_tool_round();
+        }
+        assert!(!state.should_finalize());
+
+        state.sync_execution_policy(ExecutionPolicy::Bounded);
+        assert_eq!(state.control_level(), TurnControlLevel::Guarded);
+    }
+
+    #[test]
+    fn finalization_halts_persistent_post_finalize_tool_calls() {
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Bounded);
+        for _ in 0..13 {
+            state.begin_tool_round();
+        }
+        assert!(state.should_finalize());
+        assert!(state.take_finalization_halt_message().is_none());
+
+        state.begin_tool_round();
+        assert!(state.take_finalization_halt_message().is_none());
+        state.begin_tool_round();
+        let halt = state
+            .take_finalization_halt_message()
+            .expect("second post-finalize tool round should halt");
+        assert!(halt.contains("continued issuing tool calls"), "{halt}");
+        assert!(state.take_finalization_halt_message().is_none());
+    }
+
+    #[test]
+    fn adaptive_policy_escalates_locks_and_finalizes_repeated_failures() {
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        let input = json!({"command": "curl https://example.test/items"});
+
+        assert_eq!(state.control_level(), TurnControlLevel::Open);
+        for attempt in 1..=5 {
+            state.begin_tool_round();
+            let note = state.record_controlled_outcome(
+                "bash",
+                &input,
+                "HTTP 401 unauthorized",
+                Some(true),
+            );
+            if attempt == 2 {
+                assert!(note.as_deref().is_some_and(|text| text.contains("guarded")));
+                assert_eq!(state.control_level(), TurnControlLevel::Guarded);
+            }
+            if attempt == 3 {
+                assert!(note.as_deref().is_some_and(|text| text.contains("locked")));
+                assert!(state.controlled_action_guard("bash", &input).is_some());
+            }
+        }
+
+        assert_eq!(state.control_level(), TurnControlLevel::Finalize);
+        assert!(state.should_finalize());
+        assert!(state.take_finalization_note().is_some());
+        assert!(state.take_finalization_note().is_none());
+    }
+
+    #[test]
+    fn bounded_policy_starts_guarded_and_has_a_hard_round_limit() {
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Bounded);
+        assert_eq!(state.control_level(), TurnControlLevel::Guarded);
+        for _ in 0..13 {
+            state.begin_tool_round();
+        }
+        assert_eq!(state.control_level(), TurnControlLevel::Finalize);
+    }
+
+    #[test]
+    fn continuation_prompt_recognizes_short_steering_without_swallowing_new_tasks() {
+        for prompt in ["continue", "go ahead", "go forth", "okay, go forth please"] {
+            assert!(continuation_prompt(prompt), "{prompt}");
+        }
+        assert!(!continuation_prompt(
+            "go inspect the provider implementation"
+        ));
+        assert!(!continuation_prompt(
+            "continue, but replace the objective with a security audit"
+        ));
     }
 }

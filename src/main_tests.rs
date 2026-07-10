@@ -106,6 +106,7 @@ fn test_agent(root: &Path) -> Agent {
         context_mode: ContextMode::default(),
         tool_context_profile: ToolContextProfile::default(),
         tool_profile: ToolProfile::default(),
+        execution_policy_override: None,
         preview_mode: MutationPreviewMode::default(),
         budget_cap: None,
         budget_exhausted: false,
@@ -501,9 +502,19 @@ fn injected_steering_is_ledger_visible_and_final_required() {
     agent.install_steering(rx, tx.clone());
     tx.send("fix the rg border overflow and tell me what happened".to_string())
         .expect("send steering");
-    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let mut turn_state =
+        orchestrator::TurnRuntimeState::with_execution_policy(ExecutionPolicy::Bounded);
+    for _ in 0..13 {
+        turn_state.begin_tool_round();
+    }
+    assert!(turn_state.should_finalize());
 
     assert!(agent.inject_queued_steering(&mut turn_state, 3, 7, true));
+    assert!(!turn_state.should_finalize());
+    assert_eq!(
+        turn_state.control_level(),
+        orchestrator::TurnControlLevel::Guarded
+    );
     let ledger = agent.work_ledger_prompt();
     assert!(ledger.contains("queued_user_updates:"), "{ledger}");
     assert!(ledger.contains("rg border overflow"), "{ledger}");
@@ -2158,6 +2169,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         saved.context_mode = ContextMode::Standard;
         saved.tool_context_profile = ToolContextProfile::Full;
         saved.tool_profile = ToolProfile::Full;
+        saved.execution_policy_override = Some(ExecutionPolicy::Bounded);
         saved.refresh_tools_for_context();
         saved.system = "saved-system".to_string();
         saved.allowed.insert("read_file".to_string());
@@ -2292,6 +2304,10 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         assert_eq!(saved_header.context_mode, ContextMode::Standard);
         assert_eq!(saved_header.tool_context_profile, ToolContextProfile::Full);
         assert_eq!(saved_header.tool_profile, ToolProfile::Full);
+        assert_eq!(
+            saved_header.execution_policy_override,
+            Some(ExecutionPolicy::Bounded)
+        );
         assert!(saved_header.exposed_tools.contains(&"jq".to_string()));
         assert_eq!(saved_header.work_ledger.current_phase, "done");
         assert!(saved_header.work_ledger.next_actions.is_empty());
@@ -2310,6 +2326,14 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         assert_eq!(loaded.context_mode, ContextMode::Standard);
         assert_eq!(loaded.tool_context_profile(), ToolContextProfile::Full);
         assert_eq!(loaded.tool_profile, ToolProfile::Full);
+        assert_eq!(
+            loaded.execution_policy_override,
+            Some(ExecutionPolicy::Bounded)
+        );
+        assert_eq!(
+            loaded.effective_execution_policy(),
+            ExecutionPolicy::Bounded
+        );
         assert!(loaded.tools.iter().any(|t| t.name == "jq"));
         assert_eq!(loaded.system, "saved-system");
         assert_eq!(loaded.sandbox_root, sandbox);
@@ -2515,6 +2539,24 @@ fn session_export_target_parses_html_and_jsonl() {
     let (format, path) = parse_session_export_target("archive.jsonl");
     assert_eq!(format, SessionExportFormat::Jsonl);
     assert_eq!(path, PathBuf::from("archive.jsonl"));
+}
+
+#[test]
+fn session_header_fallback_preserves_valid_execution_policy_override() -> Result<()> {
+    let header = parse_session_header(
+        r#"{"version":1,"model":"legacy-model","system":"legacy-system","thinking_effort":"future-value","execution_policy_override":"bounded"}"#,
+    )?;
+    assert_eq!(header.thinking_effort, ThinkingEffort::default());
+    assert_eq!(
+        header.execution_policy_override,
+        Some(ExecutionPolicy::Bounded)
+    );
+
+    let invalid = parse_session_header(
+        r#"{"version":1,"model":"legacy-model","system":"legacy-system","thinking_effort":"future-value","execution_policy_override":"not-a-policy"}"#,
+    )?;
+    assert_eq!(invalid.execution_policy_override, None);
+    Ok(())
 }
 
 #[test]
@@ -6981,6 +7023,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--tiny".to_string(),
         "--tool-context-profile=full".to_string(),
         "--tool-profile=default".to_string(),
+        "--execution-policy=bounded".to_string(),
         format!("@{}", task_file.display()),
         "tail".to_string(),
     ])?;
@@ -6998,6 +7041,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
     assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
     assert_eq!(opts.tool_context_profile, Some(ToolContextProfile::Full));
     assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
+    assert_eq!(opts.execution_policy, Some(ExecutionPolicy::Bounded));
     assert_eq!(
         opts.positional,
         vec!["from file".to_string(), "tail".to_string()]
@@ -9847,6 +9891,90 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         .into_iter()
         .find(|profile| profile.id == "openai")
         .expect("openai profile");
+    let local = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "local")
+        .expect("local profile");
+    let mut custom_local = openai.clone();
+    custom_local.id = "custom-local".to_string();
+    custom_local.base_url = "http://localhost:11434/v1".to_string();
+    custom_local.model_defaults = ModelSpec::default();
+    custom_local.model_specs.clear();
+    assert_eq!(
+        resolve_model_spec(&custom_local, "custom-model").execution_policy,
+        ExecutionPolicy::Adaptive
+    );
+    custom_local.model_defaults.execution_policy = Some(ExecutionPolicy::Open);
+    assert_eq!(
+        resolve_model_spec(&custom_local, "custom-model").execution_policy,
+        ExecutionPolicy::Open
+    );
+    let root = temp_test_dir("execution-policy-route-precedence");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let mut route_agent = test_agent(&root);
+    route_agent.provider_id = openai.id.clone();
+    route_agent.provider_profile = Some(openai.clone());
+    route_agent.api_provider = ApiProvider::OpenAi;
+    route_agent.base_url = "http://localhost:8080/v1".to_string();
+    route_agent.model = "gpt-5".to_string();
+    assert_eq!(
+        route_agent.effective_execution_policy(),
+        ExecutionPolicy::Adaptive
+    );
+    route_agent.base_url = "https://api.example.test/v1".to_string();
+    assert_eq!(
+        route_agent.effective_execution_policy(),
+        ExecutionPolicy::Open
+    );
+    route_agent.base_url = "http://localhost:8080/v1".to_string();
+    route_agent
+        .provider_profile
+        .as_mut()
+        .expect("profile")
+        .model_defaults
+        .execution_policy = Some(ExecutionPolicy::Open);
+    assert_eq!(
+        route_agent.effective_execution_policy(),
+        ExecutionPolicy::Open
+    );
+    route_agent.execution_policy_override = Some(ExecutionPolicy::Bounded);
+    assert_eq!(
+        route_agent.effective_execution_policy(),
+        ExecutionPolicy::Bounded
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        resolve_model_spec(&local, DEFAULT_LOCAL_MODEL).execution_policy,
+        ExecutionPolicy::Adaptive
+    );
+    assert_eq!(
+        resolve_model_spec(&chatgpt, "gpt-5.4").execution_policy,
+        ExecutionPolicy::Open
+    );
+    assert_eq!(
+        resolve_model_spec(&openai, "gpt-5").execution_policy,
+        ExecutionPolicy::Open
+    );
+    assert!(crate::provider::is_local_llama_provider(
+        "custom",
+        ApiProvider::OpenAi,
+        "http://127.8.9.10:8080/v1"
+    ));
+    assert!(crate::provider::is_local_llama_provider(
+        "custom",
+        ApiProvider::OpenAi,
+        "http://[::1]:8080/v1"
+    ));
+    assert!(!crate::provider::is_local_llama_provider(
+        "custom",
+        ApiProvider::OpenAi,
+        "https://localhost.example.com/v1"
+    ));
+    assert!(!crate::provider::is_local_llama_provider(
+        "custom",
+        ApiProvider::Anthropic,
+        "http://localhost:8080"
+    ));
     assert_eq!(
         normalize_provider_model_value(&chatgpt, "gpt-5.6"),
         "gpt-5.6-sol"
@@ -9886,6 +10014,7 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         .insert("fast".to_string(), "custom-fast".to_string());
     explicit.model_defaults.max_output_tokens = Some(1_234);
     explicit.model_defaults.capabilities.tools = Some(false);
+    explicit.model_defaults.execution_policy = Some(ExecutionPolicy::Bounded);
     explicit.model_specs.insert(
         "gpt-5.4".to_string(),
         ModelSpec {
@@ -9916,6 +10045,7 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
     let spec = resolve_model_spec(&explicit, "gpt-5.4");
     assert_eq!(spec.max_output_tokens, Some(1_234));
     assert!(!spec.tools);
+    assert_eq!(spec.execution_policy, ExecutionPolicy::Bounded);
     assert_eq!(
         spec.pricing.expect("explicit pricing").output_usd_per_mtok,
         4.0
@@ -10214,6 +10344,59 @@ fn claude_streaming_request_marks_stable_system_and_tools_cacheable() -> Result<
     assert_eq!(value["system"][0]["cache_control"]["type"], "ephemeral");
     assert!(value["system"][1].get("cache_control").is_none(), "{value}");
     assert_eq!(value["tools"][0]["cache_control"]["type"], "ephemeral");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn controlled_request_builder_preserves_open_payload_and_disables_tools_only_when_finalizing()
+-> Result<()> {
+    let root = temp_test_dir("execution-policy-request-parity");
+    let root = std::fs::canonicalize(&root)?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = "anthropic".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-sonnet-4-6".to_string();
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "stable prompt",
+        cache_control: None,
+    }];
+    let wire_tools = vec![WireTool {
+        name: "read_file".to_string(),
+        description: "read".to_string(),
+        input_schema: json!({"type":"object","properties":{}}),
+        cache_control: None,
+    }];
+
+    let legacy = agent.build_streaming_request(
+        "stable prompt",
+        "runtime env",
+        &sys_blocks,
+        &wire_tools,
+        "unused",
+    )?;
+    let controlled_open = agent.build_streaming_request_controlled(
+        "stable prompt",
+        "runtime env",
+        &sys_blocks,
+        &wire_tools,
+        "unused",
+        true,
+    )?;
+    assert_eq!(legacy, controlled_open);
+
+    let (_, finalized_body) = agent.build_streaming_request_controlled(
+        "stable prompt",
+        "runtime env",
+        &sys_blocks,
+        &wire_tools,
+        "unused",
+        false,
+    )?;
+    let finalized: Value = serde_json::from_slice(&finalized_body)?;
+    assert_eq!(finalized["tools"].as_array().map(Vec::len), Some(0));
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())

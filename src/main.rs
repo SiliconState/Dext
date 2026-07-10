@@ -17,17 +17,18 @@ mod main_tests;
 
 use anyhow::{Context, Result};
 use provider::{
-    ANTHROPIC_API_VERSION, ApiProvider, ModelPricing, ProviderProfile, RequestContract,
-    ResolvedModelSpec, ResolvedProviderConfig, apply_provider_headers, auth_store_path,
-    build_chatgpt_request, build_chatgpt_summary_request, built_in_provider_profiles,
-    cancel_pending_oauth_login, canonical_provider_id, extract_oauth_code_from_callback,
-    find_provider_profile, handle_auth_cli, list_models_for_available_providers,
-    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
-    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
-    provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
-    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
-    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
-    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
+    ANTHROPIC_API_VERSION, ApiProvider, ExecutionPolicy, ModelPricing, ProviderProfile,
+    RequestContract, ResolvedModelSpec, ResolvedProviderConfig, apply_provider_headers,
+    auth_store_path, build_chatgpt_request, build_chatgpt_summary_request,
+    built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
+    extract_oauth_code_from_callback, find_provider_profile, handle_auth_cli,
+    list_models_for_available_providers, list_models_for_provider, load_auth_store,
+    load_provider_catalog, login_provider, logout_provider, looks_like_login_secret_input,
+    normalize_provider_model_value, provider_auth_status, provider_catalog_path,
+    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
+    render_provider_list, render_provider_picker, request_contract_for_profile,
+    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
+    resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 use session::{
@@ -9746,6 +9747,8 @@ struct SessionHeader {
     tool_context_profile: ToolContextProfile,
     #[serde(default)]
     tool_profile: ToolProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_policy_override: Option<ExecutionPolicy>,
     #[serde(default)]
     provenance: SessionProvenance,
     #[serde(default)]
@@ -9781,6 +9784,7 @@ impl Default for SessionHeader {
             context_mode: ContextMode::default(),
             tool_context_profile: ToolContextProfile::default(),
             tool_profile: ToolProfile::default(),
+            execution_policy_override: None,
             provenance: SessionProvenance::default(),
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
@@ -11319,6 +11323,7 @@ struct Agent {
     context_mode: ContextMode,
     tool_context_profile: ToolContextProfile,
     tool_profile: ToolProfile,
+    execution_policy_override: Option<ExecutionPolicy>,
     preview_mode: MutationPreviewMode,
     budget_cap: Option<BudgetCap>,
     budget_exhausted: bool,
@@ -11500,6 +11505,9 @@ impl Agent {
             context_mode,
             tool_context_profile,
             tool_profile,
+            execution_policy_override: std::env::var("DEXT_EXECUTION_POLICY")
+                .ok()
+                .and_then(|value| ExecutionPolicy::parse(&value)),
             preview_mode: MutationPreviewMode::from_env(),
             budget_cap,
             budget_exhausted: false,
@@ -11697,6 +11705,31 @@ impl Agent {
         self.provider_profile
             .as_ref()
             .map(|profile| resolve_model_spec(profile, &self.model))
+    }
+
+    fn effective_execution_policy(&self) -> ExecutionPolicy {
+        if let Some(policy) = self.execution_policy_override {
+            return policy;
+        }
+        let resolved = self.resolved_model_spec();
+        if let Some(spec) = resolved.as_ref()
+            && spec.execution_policy_configured
+        {
+            return spec.execution_policy;
+        }
+        if provider::is_local_llama_provider(
+            &self.provider_id,
+            self.route_api_provider(),
+            &self.base_url,
+        ) {
+            ExecutionPolicy::Adaptive
+        } else {
+            ExecutionPolicy::Open
+        }
+    }
+
+    fn set_execution_policy_override(&mut self, policy: Option<ExecutionPolicy>) {
+        self.execution_policy_override = policy;
     }
 
     fn request_max_output_tokens(&self) -> u32 {
@@ -13108,6 +13141,9 @@ impl Agent {
             )
         };
         let combined = pending_steering.join("\n\n");
+        if !pending_steering.is_empty() {
+            turn_state.reset_supervision_for_steering();
+        }
         let user_update = if combined.trim().is_empty() {
             "(runtime control command only)".to_string()
         } else {
@@ -13482,6 +13518,7 @@ impl Agent {
         items
     }
 
+    #[cfg(test)]
     fn build_streaming_request(
         &self,
         sys_stable: &str,
@@ -13489,6 +13526,25 @@ impl Agent {
         sys_blocks: &[SystemBlock<'_>],
         wire_tools: &[WireTool],
         chatgpt_session_id: &str,
+    ) -> Result<(String, Vec<u8>)> {
+        self.build_streaming_request_controlled(
+            sys_stable,
+            sys_env,
+            sys_blocks,
+            wire_tools,
+            chatgpt_session_id,
+            true,
+        )
+    }
+
+    fn build_streaming_request_controlled(
+        &self,
+        sys_stable: &str,
+        sys_env: &str,
+        sys_blocks: &[SystemBlock<'_>],
+        wire_tools: &[WireTool],
+        chatgpt_session_id: &str,
+        tools_enabled: bool,
     ) -> Result<(String, Vec<u8>)> {
         let contract = self.request_contract();
         let effort = self.effective_thinking_effort();
@@ -13507,7 +13563,11 @@ impl Agent {
                     sys_stable,
                     chatgpt_session_id,
                     input,
-                    self.wire_tools_chatgpt(),
+                    if tools_enabled {
+                        self.wire_tools_chatgpt()
+                    } else {
+                        Vec::new()
+                    },
                 );
                 if !self.model_supports_prompt_cache()
                     && let Some(object) = body.as_object_mut()
@@ -13523,7 +13583,11 @@ impl Agent {
                 // their implicit prefix caches on every tool round.
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
-                let oai_tools = self.wire_tools_oai();
+                let oai_tools = if tools_enabled {
+                    self.wire_tools_oai()
+                } else {
+                    Vec::new()
+                };
                 let reasoning_effort = openai_reasoning_effort(effort);
                 let stream_options = (!provider::is_local_llama_provider(
                     &self.provider_id,
@@ -13617,7 +13681,10 @@ impl Agent {
                 let mut messages = anthropic_wire_messages(&messages, prompt_cache_enabled)?;
                 append_runtime_env_block(&mut messages, sys_env);
                 let system = system_blocks_with_cache_control(sys_blocks, prompt_cache_enabled);
-                let tools = wire_tools_with_cache_control(wire_tools, prompt_cache_enabled);
+                let tools = wire_tools_with_cache_control(
+                    if tools_enabled { wire_tools } else { &[] },
+                    prompt_cache_enabled,
+                );
                 let body = Request {
                     model: &self.model,
                     max_tokens,
@@ -13695,6 +13762,7 @@ impl Agent {
             context_mode: self.context_mode,
             tool_context_profile: self.tool_context_profile(),
             tool_profile: self.tool_profile,
+            execution_policy_override: self.execution_policy_override,
             provenance,
             work_ledger: self.cleaned_work_ledger(),
             provider_health: self.provider_health.clone(),
@@ -13872,6 +13940,7 @@ impl Agent {
             context_mode,
             tool_context_profile,
             tool_profile,
+            execution_policy_override,
             work_ledger,
             provider_health,
             track_origin,
@@ -13908,6 +13977,7 @@ impl Agent {
         } else {
             tool_profile
         };
+        self.execution_policy_override = execution_policy_override;
         self.set_browser_recipe(browser_recipe);
         if let Some(saved_sandbox) = sandbox.as_deref()
             && let Ok(restored) = std::fs::canonicalize(saved_sandbox)
@@ -14753,21 +14823,31 @@ impl Agent {
 
         let turn_started_at = std::time::Instant::now();
 
-        let objective = orchestrator::ObjectiveTracker::from_user_prompt(
-            self.history
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .and_then(|m| {
-                    m.content.iter().find_map(|b| match b {
-                        Block::Text { text } | Block::PartialStream { text } => Some(text.as_str()),
-                        _ => None,
-                    })
+        let latest_user_prompt = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .and_then(|m| {
+                m.content.iter().find_map(|b| match b {
+                    Block::Text { text } | Block::PartialStream { text } => Some(text.as_str()),
+                    _ => None,
                 })
-                .unwrap_or_default(),
-        );
+            })
+            .unwrap_or_default();
+        let preserve_objective = self.effective_execution_policy() != ExecutionPolicy::Open
+            && orchestrator::continuation_prompt(latest_user_prompt)
+            && !self.work_ledger.objective.trim().is_empty();
+        let objective_input = if preserve_objective {
+            self.work_ledger.objective.as_str()
+        } else {
+            latest_user_prompt
+        };
+        let objective = orchestrator::ObjectiveTracker::from_user_prompt(objective_input);
         let objective_line = objective.display_line();
-        self.update_work_ledger_from_objective(&objective);
+        if !preserve_objective {
+            self.update_work_ledger_from_objective(&objective);
+        }
         self.sink
             .emit(AgentEvent::Info(format!("[{}]", objective_line)));
         self.append_latest_log("objective", &objective_line);
@@ -14775,7 +14855,9 @@ impl Agent {
         let mut iterations: u32 = 0;
         let mut turn_usage = Usage::default();
         let mut denied_signatures: HashSet<String> = HashSet::new();
-        let mut turn_state = orchestrator::TurnRuntimeState::new();
+        let mut turn_state = orchestrator::TurnRuntimeState::with_execution_policy(
+            self.effective_execution_policy(),
+        );
         let read_cache = self.read_cache.clone();
         let mut objective_warning_emitted = false;
         let mut steering_final_followup_emitted = false;
@@ -14850,8 +14932,21 @@ impl Agent {
             }
             iterations += 1;
             let runtime_controls = apply_queued_runtime_controls(self);
+            turn_state.sync_execution_policy(self.effective_execution_policy());
             if runtime_controls.aborted_stream {
                 continue;
+            }
+
+            if let Some(note) = turn_state.take_finalization_note() {
+                self.sink.emit(AgentEvent::Warn(note.clone()));
+                self.append_latest_log("execution_finalize", &note);
+                self.history.push(Message {
+                    role: "user".to_string(),
+                    content: vec![Block::Text {
+                        text: format!("[runtime-note] {note}"),
+                    }],
+                });
+                self.checkpoint_latest_session("after_execution_finalize");
             }
 
             let chatgpt_session_id = (self.request_contract() == RequestContract::ChatGptResponses)
@@ -14863,7 +14958,12 @@ impl Agent {
                     )
                 });
             self.partial_stream_text = None;
-            let (sys_stable, sys_env) = self.compose_system_parts();
+            let (sys_stable, mut sys_env) = self.compose_system_parts();
+            if let Some(control) = turn_state.control_prompt() {
+                sys_env.push('\n');
+                sys_env.push_str(&control);
+                sys_env.push('\n');
+            }
             // Only the stable text lives in the system prompt (with a cache
             // breakpoint); the volatile env section is appended per request at
             // the tail of the message list so it never invalidates the cached
@@ -14876,12 +14976,13 @@ impl Agent {
             let mut stream_attempt: u32 = 0;
             let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
-                let (url, req_body) = self.build_streaming_request(
+                let (url, req_body) = self.build_streaming_request_controlled(
                     &sys_stable,
                     &sys_env,
                     &sys_blocks,
                     &wire_tools,
                     chatgpt_session_id.as_deref().unwrap_or("dext"),
+                    !turn_state.should_finalize(),
                 )?;
                 stream_attempt += 1;
                 let mut attempt: u32 = 0;
@@ -15324,6 +15425,8 @@ impl Agent {
                 break;
             }
 
+            turn_state.begin_tool_round();
+
             if self.interrupt.load(Ordering::SeqCst) {
                 self.append_latest_log("tool_round_interrupted", "before tool execution");
                 let results: Vec<Block> = tool_calls
@@ -15390,7 +15493,16 @@ impl Agent {
                 let mut plan: Option<Plan> = None;
                 let mut local_sudo_auth_needed = false;
 
-                if let Err(msg) = tool_policy::validate_tool_input(&name, &input) {
+                if let Some(msg) = turn_state.controlled_action_guard(&name, &input) {
+                    plan = Some(Plan::Immediate {
+                        content: msg,
+                        is_error: Some(true),
+                    });
+                }
+
+                if plan.is_none()
+                    && let Err(msg) = tool_policy::validate_tool_input(&name, &input)
+                {
                     if let Some(budget_msg) = turn_state.tool_retry_guard(&name, &msg) {
                         emit_external_telemetry(self.sink.as_mut(), &turn_state);
                         plan = Some(Plan::Immediate {
@@ -15998,6 +16110,17 @@ impl Agent {
                         );
                     }
                 }
+
+                if let Some(note) =
+                    turn_state.record_controlled_outcome(&name, &input, &content, is_error)
+                {
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("execution_control", &note);
+                    content.push_str("\n\n[runtime-control]\n");
+                    content.push_str(&note);
+                }
+                emit_external_telemetry(self.sink.as_mut(), &turn_state);
+
                 let dynamic_result_cap = tool_result_context_cap_with_window(
                     &name,
                     &input,
@@ -16054,6 +16177,17 @@ impl Agent {
                 content: squashed_results,
             });
             self.checkpoint_latest_session("after_tool_results");
+
+            if let Some(halt) = turn_state.take_finalization_halt_message() {
+                self.sink.emit(AgentEvent::Warn(halt.clone()));
+                self.append_latest_log("execution_finalize_halt", &halt);
+                self.history.push(Message {
+                    role: "assistant".to_string(),
+                    content: vec![Block::Text { text: halt }],
+                });
+                self.checkpoint_latest_session("after_execution_finalize_halt");
+                break;
+            }
 
             if let Some(halt) = turn_state.empty_tool_call_halt_message() {
                 self.sink.emit(AgentEvent::Warn(halt.clone()));
@@ -19870,6 +20004,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
+                "  /execution [policy]       next-turn autonomy: auto|open|adaptive|bounded"
+            );
+            let _ = writeln!(
+                w,
                 "  /context [standard|frugal|tiny] context/cap mode; tiny is skinny local mode"
             );
             let _ = writeln!(
@@ -20399,6 +20537,30 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 }
             }
         }
+        "execution" | "execution-policy" => {
+            match arg.to_ascii_lowercase().as_str() {
+                "" | "status" => {}
+                "auto" | "default" => agent.set_execution_policy_override(None),
+                _ => {
+                    if let Some(policy) = ExecutionPolicy::parse(arg) {
+                        agent.set_execution_policy_override(Some(policy));
+                    } else {
+                        let _ =
+                            writeln!(w, "usage: /execution [auto|open|adaptive|bounded|status]");
+                    }
+                }
+            }
+            let source = if agent.execution_policy_override.is_some() {
+                "override"
+            } else {
+                "model/provider default"
+            };
+            let _ = writeln!(
+                w,
+                "execution policy: {} ({source}; applies on the next turn)",
+                agent.effective_execution_policy().as_str()
+            );
+        }
         "context" | "context-mode" => {
             if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
                 let _ = writeln!(w, "context mode: {}", agent.context_mode.as_str());
@@ -20521,6 +20683,16 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 agent.thinking_effort.as_str()
             );
             let _ = writeln!(w, "context mode: {}", agent.context_mode.as_str());
+            let _ = writeln!(
+                w,
+                "execution policy: {} ({})",
+                agent.effective_execution_policy().as_str(),
+                if agent.execution_policy_override.is_some() {
+                    "override"
+                } else {
+                    "model/provider default"
+                }
+            );
             let _ = writeln!(w, "schemas: {}", agent.wire_tool_profile().as_str());
             let _ = writeln!(w, "toolset: {}", agent.tool_context_profile().as_str());
             let _ = writeln!(w, "compact threshold: {}", agent.compact_threshold_chars());
@@ -21805,6 +21977,7 @@ pub(crate) struct CliOptions {
     pub(crate) browser_recipe: Option<BrowserRecipe>,
     pub(crate) thinking_effort: Option<ThinkingEffort>,
     pub(crate) context_mode: Option<ContextMode>,
+    pub(crate) execution_policy: Option<ExecutionPolicy>,
     pub(crate) tool_context_profile: Option<ToolContextProfile>,
     pub(crate) tool_profile: Option<ToolProfile>,
     pub(crate) preview_mode: Option<MutationPreviewMode>,
@@ -21829,6 +22002,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut browser_recipe: Option<BrowserRecipe> = None;
     let mut thinking_effort: Option<ThinkingEffort> = None;
     let mut context_mode: Option<ContextMode> = None;
+    let mut execution_policy: Option<ExecutionPolicy> = None;
     let mut tool_context_profile: Option<ToolContextProfile> = None;
     let mut tool_profile: Option<ToolProfile> = None;
     let mut preview_mode: Option<MutationPreviewMode> = None;
@@ -21872,6 +22046,17 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                 context_mode = Some(ContextMode::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
                         "invalid --context-mode '{value}' (expected standard|frugal|tiny)"
+                    )
+                })?);
+            }
+            "--execution-policy" | "--execution" => {
+                i += 1;
+                let value = argv.get(i).ok_or_else(|| {
+                    anyhow::anyhow!("--execution-policy requires open|adaptive|bounded")
+                })?;
+                execution_policy = Some(ExecutionPolicy::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid execution policy '{value}' (expected open|adaptive|bounded)"
                     )
                 })?);
             }
@@ -22043,6 +22228,17 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     )
                 })?);
             }
+            _ if arg.starts_with("--execution-policy=") || arg.starts_with("--execution=") => {
+                let value = arg
+                    .strip_prefix("--execution-policy=")
+                    .or_else(|| arg.strip_prefix("--execution="))
+                    .unwrap_or_default();
+                execution_policy = Some(ExecutionPolicy::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid execution policy '{value}' (expected open|adaptive|bounded)"
+                    )
+                })?);
+            }
             _ if arg.starts_with("--pack=") => {
                 let value = arg.trim_start_matches("--pack=");
                 if value.trim().is_empty() {
@@ -22158,6 +22354,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         browser_recipe,
         thinking_effort,
         context_mode,
+        execution_policy,
         tool_context_profile,
         tool_profile,
         preview_mode,
@@ -22369,6 +22566,9 @@ async fn main() -> Result<()> {
         );
         println!("       dext --tiny          extra-light context mode with condensed prompt");
         println!("       dext --context-mode standard|frugal|tiny");
+        println!(
+            "       dext --execution-policy open|adaptive|bounded  override model/provider execution policy"
+        );
         println!("       dext --toolset default|full  choose provider-visible tool count profile");
         println!("       dext --tool-context-profile default|full  alias for --toolset");
         println!(
@@ -22387,7 +22587,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_EXECUTION_POLICY=open|adaptive|bounded, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }
@@ -22448,6 +22648,9 @@ async fn main() -> Result<()> {
     if let Some(mode) = opts.context_mode {
         agent.set_context_mode(mode);
     }
+    if let Some(policy) = opts.execution_policy {
+        agent.set_execution_policy_override(Some(policy));
+    }
     if let Some(profile) = opts.tool_context_profile {
         agent.tool_context_profile = profile.effective(agent.context_mode);
     }
@@ -22481,6 +22684,9 @@ async fn main() -> Result<()> {
             Ok(path) => {
                 if let Some(mode) = opts.context_mode {
                     agent.set_context_mode(mode);
+                }
+                if let Some(policy) = opts.execution_policy {
+                    agent.set_execution_policy_override(Some(policy));
                 }
                 if let Some(profile) = opts.tool_context_profile {
                     agent.tool_context_profile = profile.effective(agent.context_mode);

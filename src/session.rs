@@ -927,6 +927,9 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .as_str()
             .and_then(crate::ToolProfile::parse)
             .unwrap_or_default(),
+        execution_policy_override: meta["execution_policy_override"]
+            .as_str()
+            .and_then(crate::provider::ExecutionPolicy::parse),
         provenance: serde_json::from_value(meta["provenance"].clone()).unwrap_or_default(),
         work_ledger: serde_json::from_value(meta["work_ledger"].clone()).unwrap_or_default(),
         provider_health: serde_json::from_value(meta["provider_health"].clone())

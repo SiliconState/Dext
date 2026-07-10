@@ -122,6 +122,34 @@ impl RequestContract {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ExecutionPolicy {
+    #[default]
+    Open,
+    Adaptive,
+    Bounded,
+}
+
+impl ExecutionPolicy {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "open" | "frontier" => Some(Self::Open),
+            "adaptive" | "local" => Some(Self::Adaptive),
+            "bounded" | "strict" => Some(Self::Bounded),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Adaptive => "adaptive",
+            Self::Bounded => "bounded",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ModelCapabilities {
@@ -147,6 +175,7 @@ pub(crate) struct ModelSpec {
     pub(crate) effort_levels: Vec<String>,
     pub(crate) capabilities: ModelCapabilities,
     pub(crate) pricing: Option<ModelPricing>,
+    pub(crate) execution_policy: Option<ExecutionPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +188,8 @@ pub(crate) struct ResolvedModelSpec {
     pub(crate) image_input: bool,
     pub(crate) prompt_cache: bool,
     pub(crate) pricing: Option<ModelPricing>,
+    pub(crate) execution_policy: ExecutionPolicy,
+    pub(crate) execution_policy_configured: bool,
     pub(crate) source: &'static str,
 }
 
@@ -383,6 +414,9 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
         let provider_id = canonical_provider_id(&profile.id);
         let contract = request_contract_for_profile(profile);
         profile.model_defaults.max_output_tokens = Some(8_192);
+        if provider_id == "local" {
+            profile.model_defaults.execution_policy = Some(ExecutionPolicy::Adaptive);
+        }
         profile.model_defaults.capabilities = ModelCapabilities {
             tools: Some(true),
             reasoning: Some(true),
@@ -644,10 +678,19 @@ pub(crate) fn is_local_llama_provider(
     if api_provider != ApiProvider::OpenAi {
         return false;
     }
-    let lower = base_url.trim().to_ascii_lowercase();
-    canonical_provider_id(provider_id) == "local"
-        || lower.contains("127.0.0.1")
-        || lower.contains("localhost")
+    if canonical_provider_id(provider_id) == "local" {
+        return true;
+    }
+    reqwest::Url::parse(base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
 }
 
 fn local_llama_cache_key(base_url: &str, model: &str) -> String {
@@ -1441,6 +1484,9 @@ fn merge_model_spec(base: &mut ModelSpec, overlay: ModelSpec) {
     if overlay.pricing.is_some() {
         base.pricing = overlay.pricing;
     }
+    if overlay.execution_policy.is_some() {
+        base.execution_policy = overlay.execution_policy;
+    }
 }
 
 fn normalize_model_spec(mut spec: ModelSpec) -> ModelSpec {
@@ -1479,6 +1525,9 @@ pub(crate) fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> Reso
         })
         .unwrap_or_else(|| defaults.effort_levels.clone());
     let contract = request_contract_for_profile(profile);
+    let configured_execution_policy = explicit
+        .and_then(|spec| spec.execution_policy)
+        .or(defaults.execution_policy);
     ResolvedModelSpec {
         context_window: explicit
             .and_then(|spec| spec.context_window)
@@ -1512,6 +1561,14 @@ pub(crate) fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> Reso
         pricing: explicit
             .and_then(|spec| spec.pricing.clone())
             .or_else(|| defaults.pricing.clone()),
+        execution_policy: configured_execution_policy.unwrap_or_else(|| {
+            if is_local_llama_provider(&profile.id, profile.api_provider, &profile.base_url) {
+                ExecutionPolicy::Adaptive
+            } else {
+                ExecutionPolicy::Open
+            }
+        }),
+        execution_policy_configured: configured_execution_policy.is_some(),
         source: if explicit.is_some() {
             "model"
         } else if profile.model_specs.is_empty() && profile.model_defaults == ModelSpec::default() {
