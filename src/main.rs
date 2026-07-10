@@ -1428,13 +1428,12 @@ fn slash_login_contains_secret(trimmed: &str) -> bool {
     }
     let secret = args[1..].join(" ");
     let lowered = secret.trim().to_ascii_lowercase();
-    if matches!(
-        lowered.as_str(),
-        "web" | "import" | "--import" | "reuse" | "--reuse" | "cancel"
-    ) {
+    if provider::login_arg_requests_web_flow(&lowered)
+        || provider::login_arg_requests_import(&lowered)
+    {
         return false;
     }
-    looks_like_login_secret_input(&secret)
+    true
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1485,6 +1484,9 @@ enum AgentEvent {
     LocalAuthPrompt {
         tool: String,
         message: String,
+    },
+    LoginInputMode {
+        provider: Option<String>,
     },
     ToolBatchStart {
         batch_id: String,
@@ -1659,6 +1661,7 @@ impl EventSink for ConsoleSink {
             AgentEvent::ToolCallResult { .. } => {}
             AgentEvent::ToolOutputDelta { .. } => {}
             AgentEvent::LocalAuthPrompt { .. } => {}
+            AgentEvent::LoginInputMode { .. } => {}
             AgentEvent::ToolBatchStart { .. } => {}
             AgentEvent::ToolBatchEnd { .. } => {}
             AgentEvent::UsageUpdate { .. } => {}
@@ -3757,6 +3760,57 @@ fn append_tool_input_json_fragment(dst: &mut String, fragment: &str) {
         dst.clear();
     }
     dst.push_str(fragment);
+}
+
+pub(crate) fn normalize_reasoning_summary_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<!--") {
+        normalized.push_str(&remaining[..start]);
+        let comment = &remaining[start + "<!--".len()..];
+        let paragraph_separator = normalized
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_whitespace())
+            .filter(|ch| *ch == '\n')
+            .count()
+            >= 2;
+        let Some(end) = comment.find("-->") else {
+            if paragraph_separator && comment.trim().is_empty() {
+                normalized.truncate(normalized.trim_end().len());
+            } else {
+                normalized.push_str(&remaining[start..]);
+            }
+            return normalized;
+        };
+        let after = &comment[end + "-->".len()..];
+        if paragraph_separator && comment[..end].trim().is_empty() {
+            if after.trim().is_empty() {
+                normalized.truncate(normalized.trim_end().len());
+                return normalized;
+            }
+        } else {
+            normalized.push_str("<!--");
+            normalized.push_str(&comment[..end]);
+            normalized.push_str("-->");
+        }
+        remaining = after;
+    }
+    normalized.push_str(remaining);
+    normalized
+}
+
+fn reasoning_summary_stream_delta(raw: &str, emitted: &mut String) -> Option<String> {
+    let mut visible = normalize_reasoning_summary_text(raw);
+    for partial_comment_start in ["<!-", "<!", "<"] {
+        if raw.ends_with(partial_comment_start) && visible.ends_with(partial_comment_start) {
+            visible.truncate(visible.len() - partial_comment_start.len());
+            break;
+        }
+    }
+    let delta = visible.strip_prefix(emitted.as_str())?.to_string();
+    *emitted = visible;
+    (!delta.is_empty()).then_some(delta)
 }
 
 // Finds the earliest SSE event delimiter in `buf` starting the scan at
@@ -7818,7 +7872,7 @@ fn simple_shell_words(command: &str) -> Vec<String> {
 
 fn split_bash_credential_segments(command: &str) -> Vec<&str> {
     command
-        .split(|c| matches!(c, ';' | '\n' | '&' | '|'))
+        .split([';', '\n', '&', '|'])
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .collect()
@@ -11671,11 +11725,17 @@ impl Agent {
     }
 
     fn set_pending_login_provider(&mut self, provider: Option<String>) {
-        self.pending_login_provider = provider;
+        self.pending_login_provider = provider.clone();
+        self.sink.emit(AgentEvent::LoginInputMode { provider });
     }
 
     fn clear_pending_login(&mut self) -> Option<String> {
-        self.pending_login_provider.take()
+        let provider = self.pending_login_provider.take();
+        if provider.is_some() {
+            self.sink
+                .emit(AgentEvent::LoginInputMode { provider: None });
+        }
+        provider
     }
 
     fn try_consume_pending_login_input(&mut self, raw: &str) -> Result<Option<String>> {
@@ -11692,7 +11752,7 @@ impl Agent {
         };
 
         if let Some(msg) = try_complete_oauth_from_callback(raw)? {
-            self.pending_login_provider = None;
+            self.clear_pending_login();
             self.reload_provider(None, false)?;
             return Ok(Some(format!(
                 "{msg}\nactive -> {}",
@@ -11708,7 +11768,7 @@ impl Agent {
         }
 
         let login = login_provider(Some(&provider), Some(raw), false)?;
-        self.pending_login_provider = None;
+        self.clear_pending_login();
         self.reload_provider(None, false)?;
         Ok(Some(format!(
             "{}\nactive -> {}",
@@ -16300,6 +16360,7 @@ impl Agent {
         let mut scan_cursor: usize = 0;
         let mut text_buf = String::new();
         let mut reasoning_buf = String::new();
+        let mut reasoning_emitted = String::new();
         let mut usage = Usage::default();
         let mut finish_reason: Option<String> = None;
         // Keyed by item_id (fc_...). Value: (name, arguments_json, call_id).
@@ -16386,8 +16447,13 @@ impl Agent {
                         if let Some(delta) = data["delta"].as_str()
                             && !delta.is_empty()
                         {
-                            self.sink.emit(AgentEvent::ThinkingDelta(delta.to_string()));
                             reasoning_buf.push_str(delta);
+                            if let Some(visible) = reasoning_summary_stream_delta(
+                                &reasoning_buf,
+                                &mut reasoning_emitted,
+                            ) {
+                                self.sink.emit(AgentEvent::ThinkingDelta(visible));
+                            }
                         }
                     }
                     "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
@@ -16395,8 +16461,13 @@ impl Agent {
                             && let Some(text) = data["text"].as_str()
                             && !text.is_empty()
                         {
-                            self.sink.emit(AgentEvent::ThinkingDelta(text.to_string()));
                             reasoning_buf.push_str(text);
+                            if let Some(visible) = reasoning_summary_stream_delta(
+                                &reasoning_buf,
+                                &mut reasoning_emitted,
+                            ) {
+                                self.sink.emit(AgentEvent::ThinkingDelta(visible));
+                            }
                         }
                     }
                     "response.output_item.added" => {
@@ -16504,12 +16575,15 @@ impl Agent {
 
         let mut blocks: Vec<Block> = Vec::new();
         if !reasoning_buf.is_empty() {
-            self.sink
-                .emit(AgentEvent::ThinkingBlockComplete(reasoning_buf.clone()));
-            blocks.push(Block::Thinking {
-                text: reasoning_buf,
-                signature: None,
-            });
+            let reasoning = normalize_reasoning_summary_text(&reasoning_buf);
+            if !reasoning.is_empty() {
+                self.sink
+                    .emit(AgentEvent::ThinkingBlockComplete(reasoning.clone()));
+                blocks.push(Block::Thinking {
+                    text: reasoning,
+                    signature: None,
+                });
+            }
         }
         if !text_buf.is_empty() {
             self.partial_stream_text = None;
@@ -16724,7 +16798,7 @@ fn render_session_listing(root: &Path) -> String {
                 Some((name, path, modified))
             })
             .collect();
-    autosaved_sessions.sort_by(|a, b| b.2.cmp(&a.2));
+    autosaved_sessions.sort_by_key(|(_, _, modified)| std::cmp::Reverse(*modified));
 
     let named_records = list_session_records_for_root(root);
 
@@ -20802,7 +20876,7 @@ fn render_tokens_report(history: &[Message]) -> String {
         history.len()
     );
     let mut indexed: Vec<(usize, usize)> = per_msg.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.cmp(&a.1));
+    indexed.sort_by_key(|(_, tokens)| std::cmp::Reverse(*tokens));
     let top = indexed.iter().take(5);
     let _ = writeln!(out, "top hogs:");
     for (i, toks) in top {

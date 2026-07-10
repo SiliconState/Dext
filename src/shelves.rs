@@ -460,7 +460,7 @@ impl ShelfRegistry {
         if items.is_empty() {
             return None;
         }
-        items.sort_by(|a, b| b.0.cmp(&a.0));
+        items.sort_by_key(|(priority, _)| std::cmp::Reverse(*priority));
 
         let mut out = String::new();
         for (_, text) in items {

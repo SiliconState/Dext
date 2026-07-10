@@ -406,7 +406,7 @@ pub(crate) fn list_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoi
         .filter_map(|l| parse_manifest_line(l.trim()))
         .collect();
     // Newest first
-    cps.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+    cps.sort_by_key(|checkpoint| std::cmp::Reverse(checkpoint.created_at_ms));
     cps.truncate(limit);
     Ok(cps)
 }

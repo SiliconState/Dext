@@ -236,7 +236,7 @@ impl Pty {
     fn open(cols: u16, rows: u16) -> io::Result<Self> {
         let mut master = -1;
         let mut slave = -1;
-        let mut winsize = libc::winsize {
+        let winsize = libc::winsize {
             ws_row: rows,
             ws_col: cols,
             ws_xpixel: 0,
@@ -248,7 +248,7 @@ impl Pty {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut winsize,
+                &winsize,
             )
         };
         if rc == -1 {

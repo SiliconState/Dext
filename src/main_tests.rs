@@ -10699,7 +10699,7 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request);
-        let body = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking \"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"ignored because delta already populated\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n";
+        let body = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning removal**\\n\\n<!-- \"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"-->**Planning masked login input**\\n\\n<!-- -->\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"ignored because delta already populated\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -10710,6 +10710,8 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
 
     let mut agent = test_agent(&root);
     agent.api_provider = ApiProvider::ChatGpt;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
     let resp = reqwest::get(format!("http://{addr}/stream"))
         .await
         .expect("response");
@@ -10717,7 +10719,8 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
     assert!(
         matches!(
             blocks.first(),
-            Some(Block::Thinking { text, .. }) if text == "thinking "
+            Some(Block::Thinking { text, .. })
+                if text == "**Planning removal**\n\n**Planning masked login input**"
         ),
         "{blocks:?}"
     );
@@ -10728,8 +10731,49 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
         ),
         "{blocks:?}"
     );
+    let events = drain_events(&mut rx);
+    let streamed_thinking = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ThinkingDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        streamed_thinking,
+        "**Planning removal**\n\n**Planning masked login input**"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ThinkingBlockComplete(text)
+            if text == "**Planning removal**\n\n**Planning masked login input**"
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ThinkingBlockComplete(text) if text.contains("<!--")
+    )));
     server.join().expect("server thread");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn reasoning_summary_normalization_only_removes_empty_separator_comments() {
+    assert_eq!(
+        normalize_reasoning_summary_text("first\n\n<!-- -->second\n\n<!--   -->"),
+        "first\n\nsecond"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("first  \n<!-- keep this -->\n`code  `\n"),
+        "first  \n<!-- keep this -->\n`code  `\n"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("inline <!-- --> marker\n`<!-- -->`\n"),
+        "inline <!-- --> marker\n`<!-- -->`\n"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("first\n\n<!-- unfinished"),
+        "first\n\n<!-- unfinished"
+    );
 }
 
 #[test]
@@ -10976,6 +11020,7 @@ fn active_compaction_checkpoint_runs_when_history_crosses_active_threshold() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn active_compaction_runs_after_tool_results_when_history_crosses_active_threshold() {
     let root = temp_test_dir("active-compact-tool-results");
     let _guard = env_lock();
@@ -11070,6 +11115,7 @@ async fn active_compaction_runs_after_tool_results_when_history_crosses_active_t
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn compact_uses_deterministic_evidence_fallback_when_summary_request_errors() {
     // Regression: if the summary HTTP call fails mid-compact, deterministic evidence
     // should still allow compaction to finish so the TUI clears its spinner.

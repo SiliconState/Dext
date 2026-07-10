@@ -2627,11 +2627,6 @@ pub(crate) fn save_pending_oauth(
         created_at: unix_timestamp_secs(),
     };
     let json = serde_json::to_string_pretty(&pending)?;
-    eprintln!(
-        "[oauth] saving pending state to {} (state={})",
-        pending_oauth_path().display(),
-        state
-    );
     Ok(atomic_write_secret(&pending_oauth_path(), json.as_bytes())?)
 }
 
@@ -2650,54 +2645,32 @@ fn save_pending_oauth(
         created_at: unix_timestamp_secs(),
     };
     let json = serde_json::to_string_pretty(&pending)?;
-    eprintln!(
-        "[oauth] saving pending state to {} (state={})",
-        pending_oauth_path().display(),
-        state
-    );
     Ok(atomic_write_secret(&pending_oauth_path(), json.as_bytes())?)
 }
 
 fn load_pending_oauth() -> Option<PendingOAuthState> {
     let path = pending_oauth_path();
-    let data = match std::fs::read_to_string(&path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[oauth] no pending state at {}: {e}", path.display());
-            return None;
-        }
-    };
-    let state: PendingOAuthState = match serde_json::from_str(&data) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[oauth] failed to parse pending state: {e}");
-            return None;
-        }
-    };
+    let data = std::fs::read_to_string(&path).ok()?;
+    let state: PendingOAuthState = serde_json::from_str(&data).ok()?;
     let age = unix_timestamp_secs().saturating_sub(state.created_at);
     if age > 600 {
-        eprintln!("[oauth] pending state expired ({age}s old)");
-        remove_pending_oauth_file(&path, "expired pending state");
+        remove_pending_oauth_file(&path);
         return None;
     }
-    eprintln!(
-        "[oauth] loaded pending state for provider={} state={} age={}s",
-        state.provider_id, state.state, age
-    );
     Some(state)
 }
 
-fn remove_pending_oauth_file(path: &Path, context: &str) {
+fn remove_pending_oauth_file(path: &Path) {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!("[oauth] failed to remove {context} {}: {e}", path.display()),
+        Err(_) => {}
     }
 }
 
 fn clear_pending_oauth() {
     let path = pending_oauth_path();
-    remove_pending_oauth_file(&path, "pending state");
+    remove_pending_oauth_file(&path);
 }
 
 pub(crate) fn cancel_pending_oauth_login() {
@@ -2803,12 +2776,6 @@ pub(crate) fn try_complete_oauth_from_callback(input: &str) -> Result<Option<Str
         None => return Ok(None),
     };
 
-    eprintln!(
-        "[oauth] extracted code from callback input: {}...{}",
-        crate::byte_prefix_at_char_boundary(&parsed.code, 12),
-        crate::byte_suffix_at_char_boundary(&parsed.code, 8)
-    );
-
     let pending = match load_pending_oauth() {
         Some(p) => p,
         None => anyhow::bail!(
@@ -2819,11 +2786,7 @@ pub(crate) fn try_complete_oauth_from_callback(input: &str) -> Result<Option<Str
     if let Some(returned_state) = parsed.state.as_deref()
         && returned_state != pending.state
     {
-        anyhow::bail!(
-            "OAuth state mismatch (expected {}, got {}). Start a fresh login with /login chatgpt web",
-            pending.state,
-            returned_state
-        );
+        anyhow::bail!("OAuth state mismatch. Start a fresh login with /login chatgpt web");
     }
 
     let catalog = load_provider_catalog()?;
@@ -2909,12 +2872,7 @@ fn exchange_oauth_code(
         .json()
         .context("token exchange response was not valid JSON")?;
     if !status.is_success() {
-        let error_desc = body
-            .get("error_description")
-            .or_else(|| body.get("error"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("token exchange failed ({status}): {error_desc}");
+        anyhow::bail!("token exchange failed ({status}): provider rejected the OAuth exchange");
     }
 
     let access_token = body
@@ -2956,12 +2914,7 @@ fn exchange_oauth_refresh_token(
         .json()
         .context("token refresh response was not valid JSON")?;
     if !status.is_success() {
-        let error_desc = body
-            .get("error_description")
-            .or_else(|| body.get("error"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("token refresh failed ({status}): {error_desc}");
+        anyhow::bail!("token refresh failed ({status}): provider rejected the OAuth refresh");
     }
 
     let access_token = body

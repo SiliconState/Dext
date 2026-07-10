@@ -209,6 +209,8 @@ enum ToTui {
 
 enum FromTui {
     Submit(String),
+    LoginInput(String),
+    LoginCancel,
     CycleEffort(i8),
     Quit,
 }
@@ -781,6 +783,8 @@ struct TuiState {
     live_tools: Vec<LiveTool>,
     input: String,
     cursor: usize,
+    login_input: String,
+    login_cursor: usize,
     input_preview_spans: Vec<InputPreviewSpan>,
     history: VecDeque<String>,
     history_idx: Option<usize>,
@@ -799,6 +803,7 @@ struct TuiState {
     stream_chars: u64,
     pending_perm: Option<PendingPermission>,
     pending_local_auth: Option<PendingLocalAuth>,
+    pending_login_provider: Option<String>,
     local_auth_input: String,
     // Secret-looking input the user was warned about; sending requires an
     // identical second Enter so credentials never reach the model by accident.
@@ -888,6 +893,8 @@ impl TuiState {
             live_tools: Vec::new(),
             input: String::new(),
             cursor: 0,
+            login_input: String::new(),
+            login_cursor: 0,
             input_preview_spans: Vec::new(),
             history: VecDeque::new(),
             history_idx: None,
@@ -904,6 +911,7 @@ impl TuiState {
             stream_chars: 0,
             pending_perm: None,
             pending_local_auth: None,
+            pending_login_provider: None,
             local_auth_input: String::new(),
             pending_secret_send: None,
             agent_busy: false,
@@ -1373,6 +1381,47 @@ impl TuiState {
         self.replace_input(String::new());
     }
 
+    fn login_input_active(&self) -> bool {
+        self.pending_login_provider.is_some() || !self.login_input.is_empty()
+    }
+
+    fn clear_login_input(&mut self) {
+        clear_secret_string(&mut self.login_input);
+        self.login_cursor = 0;
+    }
+
+    fn take_login_input(&mut self) -> String {
+        self.login_cursor = 0;
+        std::mem::take(&mut self.login_input)
+    }
+
+    fn move_composer_to_login_input_if_secret(&mut self) -> bool {
+        if !crate::slash_login_contains_secret(&self.input) {
+            return false;
+        }
+        self.clear_login_input();
+        self.login_input = std::mem::take(&mut self.input);
+        self.login_cursor = self.cursor.min(self.login_input.len());
+        self.cursor = 0;
+        self.input_preview_spans.clear();
+        self.input_display_override = None;
+        self.history_idx = None;
+        if let Some(mut secret) = self.pending_secret_send.take() {
+            clear_secret_string(&mut secret);
+        }
+        true
+    }
+
+    fn insert_login_input_str(&mut self, text: &str) {
+        self.login_input.insert_str(self.login_cursor, text);
+        self.login_cursor += text.len();
+    }
+
+    fn remove_login_input_range(&mut self, start: usize, end: usize) {
+        self.login_input.replace_range(start..end, "");
+        self.login_cursor = self.login_cursor.min(self.login_input.len());
+    }
+
     fn insert_input_str(&mut self, text: &str) {
         let at = self.cursor;
         self.input.insert_str(at, text);
@@ -1807,6 +1856,21 @@ impl TuiState {
                 self.push_debug_event(format!("local auth prompt · {tool}"));
                 self.status = "local sudo prompt".into();
                 self.queue(Line_::LocalAuth { tool, message });
+            }
+            AgentEvent::LoginInputMode { provider } => {
+                self.clear_login_input();
+                clear_secret_string(&mut self.input);
+                self.cursor = 0;
+                self.input_preview_spans.clear();
+                self.input_display_override = None;
+                self.history_idx = None;
+                self.agent_busy = false;
+                self.pending_login_provider = provider;
+                self.status = self
+                    .pending_login_provider
+                    .as_ref()
+                    .map(|provider| format!("waiting for {provider} credentials · input masked"))
+                    .unwrap_or_else(|| "ready".to_string());
             }
             AgentEvent::ToolBatchStart {
                 batch_id,
@@ -3686,8 +3750,32 @@ fn wrap_input_visual(
     (lines, cursor_row, cursor_col)
 }
 
+fn login_input_is_non_secret_command(state: &TuiState) -> bool {
+    state.pending_login_provider.is_none()
+        && crate::is_slash_command(&state.login_input)
+        && !crate::slash_login_contains_secret(&state.login_input)
+}
+
+fn input_is_login_secret(state: &TuiState) -> bool {
+    if state.pending_login_provider.is_some() {
+        true
+    } else if !state.login_input.is_empty() {
+        !login_input_is_non_secret_command(state)
+    } else {
+        crate::slash_login_contains_secret(&state.input)
+    }
+}
+
 fn input_editor_text(state: &TuiState) -> Cow<'_, str> {
-    if let Some(preview) = &state.input_display_override {
+    if input_is_login_secret(state) {
+        if state.login_input.is_empty() && state.input.is_empty() {
+            Cow::Borrowed("Paste credentials…")
+        } else {
+            Cow::Borrowed("••••••••")
+        }
+    } else if !state.login_input.is_empty() {
+        Cow::Borrowed(state.login_input.as_str())
+    } else if let Some(preview) = &state.input_display_override {
         Cow::Borrowed(preview.as_str())
     } else if state.input.is_empty() {
         Cow::Borrowed("Type a request…")
@@ -3697,8 +3785,10 @@ fn input_editor_text(state: &TuiState) -> Cow<'_, str> {
 }
 
 fn input_display_cursor(state: &TuiState) -> usize {
-    if state.input_display_override.is_some() {
+    if input_is_login_secret(state) || state.input_display_override.is_some() {
         input_editor_text(state).len()
+    } else if !state.login_input.is_empty() {
+        state.login_cursor
     } else {
         state.cursor
     }
@@ -5244,7 +5334,7 @@ fn push_thinking_body_lines(
     let prefix = "│ ";
     let prefix_width = text_width(prefix);
     let body_width = max_width.saturating_sub(prefix_width).max(1);
-    for raw in sanitize_display_text(body).lines().take(20) {
+    for raw in body.lines().filter(|line| !line.trim().is_empty()).take(20) {
         let cleaned = strip_markdown_markers(raw);
         for row in wrap_plain_words_visual(&cleaned, body_width) {
             lines.push(Line::from(vec![
@@ -5871,7 +5961,11 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 .add_modifier(Modifier::ITALIC);
             let border_style = Style::default().fg(Color::Indexed(244)).bg(THINKING_BG);
             push_thinking_body_lines(&mut lines, &sanitized, border_style, thinking_style, width);
-            let remaining = sanitized.lines().count().saturating_sub(20);
+            let remaining = sanitized
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                .saturating_sub(20);
             if remaining > 0 {
                 push_prefixed_wrapped_spans(
                     &mut lines,
@@ -6353,7 +6447,7 @@ fn set_last_tool_expanded(items: &mut [Line_], name: &str, expanded: bool) -> bo
 }
 
 fn input_border_style(state: &TuiState) -> Style {
-    let color = if state.pending_local_auth.is_some() {
+    let color = if state.pending_local_auth.is_some() || input_is_login_secret(state) {
         Color::Yellow
     } else {
         match state.approval_profile {
@@ -6367,6 +6461,8 @@ fn input_border_style(state: &TuiState) -> Style {
 fn input_hint_text(state: &TuiState) -> &'static str {
     if state.pending_local_auth.is_some() {
         "local auth prompt active · Enter submit · Esc cancel"
+    } else if input_is_login_secret(state) {
+        "login input masked · Enter submits locally · Esc clear/cancel"
     } else if state.pending_perm.is_some() {
         "y once · a always · n deny"
     } else if state.work_map_is_active() {
@@ -7455,6 +7551,12 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
         }
         return;
     }
+    if state.login_input_active() {
+        state.insert_login_input_str(&pasted);
+        clear_secret_string(&mut pasted);
+        state.status = "login credentials ready · Enter submits locally".to_string();
+        return;
+    }
     if state.agent_busy && crate::text_is_potential_local_secret(&pasted) {
         state.queue(Line_::Warn(
             "paste withheld: wait for the yellow local auth box, then paste the token/password there; chat input is never used for secrets".to_string(),
@@ -7467,6 +7569,12 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
     let start = state.cursor;
     state.insert_input_str(&pasted);
     let end = state.cursor;
+    if state.move_composer_to_login_input_if_secret() {
+        clear_secret_string(&mut pasted);
+        state.status = "login credentials ready · Enter submits locally".to_string();
+        state.clear_slash_completion_selection();
+        return;
+    }
     if secret_looking {
         state.status =
             "pasted text looks like a credential; submitting will ask for confirmation".to_string();
@@ -7498,15 +7606,11 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
     let row = mouse.row;
 
     match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            if state.managed_region_contains(column, row) {
-                state.scroll_transcript_by(1);
-            }
+        MouseEventKind::ScrollUp if state.managed_region_contains(column, row) => {
+            state.scroll_transcript_by(1);
         }
-        MouseEventKind::ScrollDown => {
-            if state.managed_region_contains(column, row) {
-                state.scroll_transcript_by(-1);
-            }
+        MouseEventKind::ScrollDown if state.managed_region_contains(column, row) => {
+            state.scroll_transcript_by(-1);
         }
         _ => {}
     }
@@ -7746,6 +7850,126 @@ fn handle_local_auth_key(state: &mut TuiState, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_login_input_key(
+    state: &mut TuiState,
+    key: KeyEvent,
+    agent_input: &tokio::sync::mpsc::UnboundedSender<FromTui>,
+) -> bool {
+    if !state.login_input_active() {
+        return false;
+    }
+    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META);
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) => {
+            state.insert_login_input_str("\n");
+            state.status = "login credentials ready · Enter submits locally".to_string();
+        }
+        (KeyCode::Enter, _) => {
+            if state.login_input.trim().is_empty() {
+                state.status = "paste credentials or press Esc to cancel".to_string();
+            } else {
+                let non_secret_command = login_input_is_non_secret_command(state);
+                let text = state.take_login_input();
+                state.agent_busy = true;
+                state.status = if non_secret_command {
+                    "running login command…".to_string()
+                } else {
+                    "authenticating locally…".to_string()
+                };
+                state.clear_slash_completion_selection();
+                if non_secret_command {
+                    let _ = agent_input.send(FromTui::Submit(text));
+                } else {
+                    let _ = agent_input.send(FromTui::LoginInput(text));
+                }
+            }
+        }
+        (KeyCode::Esc, _) | (KeyCode::Char('c'), _) if key.code == KeyCode::Esc || is_ctrl => {
+            if state.login_input.is_empty() && state.pending_login_provider.is_some() {
+                state.status = "canceling login…".to_string();
+                let _ = agent_input.send(FromTui::LoginCancel);
+            } else {
+                state.clear_login_input();
+                state.status = if state.pending_login_provider.is_some() {
+                    "login input cleared · Esc again cancels".to_string()
+                } else {
+                    "login input cleared".to_string()
+                };
+            }
+        }
+        (KeyCode::Char('v'), _) if is_ctrl => {
+            state.status =
+                "use terminal paste shortcut (Ctrl+Shift+V/right-click); Ctrl+V is not paste"
+                    .to_string();
+        }
+        (KeyCode::Char('u'), _) if is_ctrl => {
+            state.clear_login_input();
+            state.status = "login input cleared".to_string();
+        }
+        (KeyCode::Backspace, _) => {
+            if state.login_cursor > 0 {
+                let previous = state.login_input[..state.login_cursor]
+                    .chars()
+                    .last()
+                    .map(|ch| ch.len_utf8())
+                    .unwrap_or(0);
+                let start = state.login_cursor - previous;
+                state.remove_login_input_range(start, state.login_cursor);
+                state.login_cursor = start;
+            }
+        }
+        (KeyCode::Delete, _) => {
+            if state.login_cursor < state.login_input.len() {
+                let next = state.login_input[state.login_cursor..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.len_utf8())
+                    .unwrap_or(0);
+                state.remove_login_input_range(state.login_cursor, state.login_cursor + next);
+            }
+        }
+        (KeyCode::Left, _) => {
+            if state.login_cursor > 0 {
+                let previous = state.login_input[..state.login_cursor]
+                    .chars()
+                    .last()
+                    .map(|ch| ch.len_utf8())
+                    .unwrap_or(0);
+                state.login_cursor -= previous;
+            }
+        }
+        (KeyCode::Right, _) => {
+            if state.login_cursor < state.login_input.len() {
+                let next = state.login_input[state.login_cursor..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.len_utf8())
+                    .unwrap_or(0);
+                state.login_cursor += next;
+            }
+        }
+        (KeyCode::Home, _) => state.login_cursor = 0,
+        (KeyCode::End, _) => state.login_cursor = state.login_input.len(),
+        (KeyCode::Char(c), m)
+            if !m.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            let mut encoded = [0u8; 4];
+            state.insert_login_input_str(c.encode_utf8(&mut encoded));
+            state.status = "login credentials ready · Enter submits locally".to_string();
+        }
+        _ => {}
+    }
+    true
+}
+
 fn handle_backend_viewer_key(state: &mut TuiState, key: KeyEvent) -> bool {
     if !state.backend_viewer_open {
         return false;
@@ -7792,6 +8016,10 @@ fn handle_key(
         return;
     }
     if handle_local_auth_key(state, key) {
+        return;
+    }
+    state.move_composer_to_login_input_if_secret();
+    if handle_login_input_key(state, key, agent_input) {
         return;
     }
     if state.work_map_is_active() && handle_work_map_key(state, key, agent_input) {
@@ -8170,8 +8398,10 @@ fn handle_key(
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
             state.insert_input_char(c);
-            state.refresh_input_display_override();
-            state.reset_slash_completion_selection();
+            if !state.move_composer_to_login_input_if_secret() {
+                state.refresh_input_display_override();
+                state.reset_slash_completion_selection();
+            }
         }
         _ => {}
     }
@@ -8565,6 +8795,40 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                     }
                     agent.checkpoint_latest_session("outer_loop_autosave");
                 }
+                FromTui::LoginInput(mut text) => {
+                    let result = if text.trim_start().starts_with("/login") {
+                        if run_slash(&text, &mut agent) {
+                            Ok(None)
+                        } else {
+                            break;
+                        }
+                    } else {
+                        agent.try_consume_pending_login_input(&text)
+                    };
+                    clear_secret_string(&mut text);
+                    match result {
+                        Ok(Some(msg)) => agent.sink.emit(AgentEvent::Slash(msg)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            agent
+                                .sink
+                                .emit(AgentEvent::Error(format!("[login error] {e:#}")));
+                            agent.sink.emit(AgentEvent::LoginInputMode {
+                                provider: agent.pending_login_provider.clone(),
+                            });
+                        }
+                    }
+                    agent.checkpoint_latest_session("outer_loop_autosave");
+                }
+                FromTui::LoginCancel => {
+                    crate::cancel_pending_oauth_login();
+                    let message = if let Some(provider) = agent.clear_pending_login() {
+                        format!("cancelled pending login for {provider}")
+                    } else {
+                        "no login is waiting for credentials".to_string()
+                    };
+                    agent.sink.emit(AgentEvent::Slash(message));
+                }
                 FromTui::CycleEffort(step) => {
                     let effort = agent.cycle_thinking_effort(step);
                     agent
@@ -8656,6 +8920,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
 
     interrupt.store(true, Ordering::SeqCst);
     cancel_local_auth_secret(&mut state);
+    state.clear_login_input();
 
     // Shut down channels in the right order to avoid deadlock:
     // 1. Drop in_tx so the bridge's in_rx.recv() returns None
@@ -11306,7 +11571,177 @@ mod tests {
     }
 
     #[test]
-    fn busy_input_withholds_potential_local_secret_from_steering() {
+    fn login_commands_and_pending_callbacks_stay_masked_and_use_local_channel() {
+        let cases = [
+            (
+                None,
+                "/login glm generic-provider-secret-123456",
+                "/login glm generic-provider-secret-123456",
+            ),
+            (
+                None,
+                "/login chatgpt eyJhbGciOiJIUzI1NiJ9.private.signature",
+                "/login chatgpt eyJhbGciOiJIUzI1NiJ9.private.signature",
+            ),
+            (
+                Some("chatgpt"),
+                "http://localhost:1455/auth/callback?code=ac_private_code_123456&state=oauth-state",
+                "http://localhost:1455/auth/callback?code=ac_private_code_123456&state=oauth-state",
+            ),
+            (
+                Some("chatgpt"),
+                "ac_private_code_123456",
+                "ac_private_code_123456",
+            ),
+            (
+                Some("chatgpt"),
+                "eyJhbGciOiJIUzI1NiJ9.private.signature",
+                "eyJhbGciOiJIUzI1NiJ9.private.signature",
+            ),
+            (
+                Some("chatgpt"),
+                r#"{"accessToken":"eyJhbGciOiJIUzI1NiJ9.private.signature"}"#,
+                r#"{"accessToken":"eyJhbGciOiJIUzI1NiJ9.private.signature"}"#,
+            ),
+        ];
+
+        for (pending_provider, input, expected) in cases {
+            let mut state = TuiState::new(
+                "glm-5.1".to_string(),
+                model_context_window("glm-5.1"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            if let Some(provider) = pending_provider {
+                state.apply_event(AgentEvent::LoginInputMode {
+                    provider: Some(provider.to_string()),
+                });
+            }
+            handle_paste(&mut state, input.to_string());
+
+            assert!(state.input.is_empty());
+            assert_eq!(state.login_input, expected);
+            assert!(state.history.is_empty());
+            assert!(state.pending_insert.is_empty());
+            assert!(state.transcript.is_empty());
+            assert!(
+                state
+                    .debug_events
+                    .iter()
+                    .all(|event| !event.contains(input))
+            );
+            let rendered = input_editor_text(&state).into_owned();
+            assert!(!rendered.contains("secret"), "{rendered}");
+            assert!(!rendered.contains("ac_private"), "{rendered}");
+            assert!(rendered.chars().all(|ch| ch == '•'), "{rendered}");
+            assert_eq!(input_border_style(&state).fg, Some(Color::Yellow));
+            assert!(input_hint_text(&state).contains("submits locally"));
+
+            let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (runtime_control_tx, mut runtime_control_rx) =
+                tokio::sync::mpsc::unbounded_channel();
+            let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+            let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+                &submit_tx,
+                &runtime_control_tx,
+                &steering_tx,
+                &interrupt,
+            );
+
+            match submit_rx.try_recv() {
+                Ok(FromTui::LoginInput(secret)) => assert_eq!(secret, expected),
+                _ => panic!("expected local-only login input"),
+            }
+            assert!(submit_rx.try_recv().is_err());
+            assert!(runtime_control_rx.try_recv().is_err());
+            assert!(steering_rx.try_recv().is_err());
+            assert!(state.input.is_empty());
+            assert!(state.login_input.is_empty());
+            assert!(state.history.is_empty());
+            assert!(state.pending_insert.is_empty());
+            assert!(state.transcript.is_empty());
+            assert!(
+                state
+                    .debug_events
+                    .iter()
+                    .all(|event| !event.contains(input))
+            );
+        }
+    }
+
+    #[test]
+    fn non_secret_login_actions_remain_visible_and_use_slash_channel() {
+        for action in [
+            "web",
+            "--web",
+            "browser",
+            "--browser",
+            "reauth",
+            "--reauth",
+            "import",
+            "--import",
+            "reuse",
+            "--reuse",
+        ] {
+            let mut state = TuiState::new(
+                "glm-5.1".to_string(),
+                model_context_window("glm-5.1"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            let command = format!("/login chatgpt {action}");
+            let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (runtime_control_tx, mut runtime_control_rx) =
+                tokio::sync::mpsc::unbounded_channel();
+            let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+            let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            for ch in command.chars() {
+                handle_key(
+                    &mut state,
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+                    &submit_tx,
+                    &runtime_control_tx,
+                    &steering_tx,
+                    &interrupt,
+                );
+            }
+
+            assert!(state.input.is_empty());
+            assert_eq!(state.login_input, command);
+            assert_eq!(input_editor_text(&state), command);
+            assert!(!input_is_login_secret(&state));
+
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+                &submit_tx,
+                &runtime_control_tx,
+                &steering_tx,
+                &interrupt,
+            );
+
+            match submit_rx.try_recv() {
+                Ok(FromTui::Submit(text)) => assert_eq!(text, command),
+                _ => panic!("expected ordinary slash-command submission"),
+            }
+            assert!(submit_rx.try_recv().is_err());
+            assert!(runtime_control_rx.try_recv().is_err());
+            assert!(steering_rx.try_recv().is_err());
+            assert!(state.input.is_empty());
+            assert!(state.login_input.is_empty());
+            assert!(state.history.is_empty());
+            assert!(state.pending_insert.is_empty());
+        }
+    }
+
+    #[test]
+    fn busy_login_secret_uses_local_channel_instead_of_steering() {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
             model_context_window("glm-5.1"),
@@ -11332,13 +11767,20 @@ mod tests {
         );
 
         assert!(steering_rx.try_recv().is_err());
-        assert!(submit_rx.try_recv().is_err());
+        match submit_rx.try_recv() {
+            Ok(FromTui::LoginInput(secret)) => {
+                assert_eq!(
+                    secret,
+                    "/login chatgpt sk-secret-token-that-should-stay-local"
+                )
+            }
+            _ => panic!("expected local-only login input"),
+        }
         assert!(state.input.is_empty());
-        assert_eq!(state.status, "local secret withheld from provider");
-        assert!(matches!(
-            state.pending_insert.as_slice(),
-            [Line_::Warn(s)] if s.contains("input withheld")
-        ));
+        assert!(state.login_input.is_empty());
+        assert!(state.history.is_empty());
+        assert!(state.pending_insert.is_empty());
+        assert_eq!(state.status, "authenticating locally…");
     }
 
     #[test]
