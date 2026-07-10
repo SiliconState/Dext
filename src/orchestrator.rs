@@ -492,7 +492,7 @@ fn cleanup_requested_as_action(words: &[&str]) -> bool {
 
 fn commit_requested_as_action(words: &[&str]) -> bool {
     for (idx, word) in words.iter().enumerate() {
-        if *word != "commit" || words.get(idx + 1).is_none() {
+        if !matches!(*word, "commit" | "committing" | "committ") {
             continue;
         }
         let prev = idx.checked_sub(1).and_then(|i| words.get(i)).copied();
@@ -512,11 +512,7 @@ fn commit_requested_as_action(words: &[&str]) -> bool {
     false
 }
 
-fn explicit_apply_fixes_requested(lowered: &str) -> bool {
-    let words = normalized_words(lowered);
-    if cleanup_requested_as_action(&words) || commit_requested_as_action(&words) {
-        return true;
-    }
+fn explicit_implementation_requested(lowered: &str) -> bool {
     [
         &["apply", "fix"][..],
         &["apply", "fixes"],
@@ -539,6 +535,13 @@ fn explicit_apply_fixes_requested(lowered: &str) -> bool {
     .any(|sequence| contains_word_sequence(lowered, sequence))
 }
 
+fn explicit_apply_fixes_requested(lowered: &str) -> bool {
+    let words = normalized_words(lowered);
+    cleanup_requested_as_action(&words)
+        || commit_requested_as_action(&words)
+        || explicit_implementation_requested(lowered)
+}
+
 impl ObjectiveTracker {
     pub(crate) fn from_user_prompt(input: &str) -> Self {
         let compact = input
@@ -557,6 +560,9 @@ impl ObjectiveTracker {
 
         let lowered = compact.to_ascii_lowercase();
         let words = normalized_words(&lowered);
+        let cleanup_requested = cleanup_requested_as_action(&words);
+        let commit_requested = commit_requested_as_action(&words);
+        let implementation_requested = explicit_implementation_requested(&lowered);
         let apply_fixes_requested = explicit_apply_fixes_requested(&lowered);
         let mut checkpoints: Vec<String> = Vec::new();
 
@@ -566,8 +572,14 @@ impl ObjectiveTracker {
         if any_word_starts_with(&words, &["analy", "review"]) {
             checkpoints.push("analyze current behavior and constraints".to_string());
         }
-        if apply_fixes_requested {
+        if implementation_requested {
             checkpoints.push("implement requested changes".to_string());
+        }
+        if cleanup_requested {
+            checkpoints.push("clean up repository".to_string());
+        }
+        if commit_requested {
+            checkpoints.push("commit requested changes".to_string());
         }
         if any_word_starts_with(&words, &["test", "verif"]) {
             checkpoints.push("run verification checks".to_string());
@@ -765,6 +777,15 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
         }
         "implement requested changes" => {
             evidence.mutation_count > 0
+                || assistant_text_has_blocked_reason(&evidence.final_assistant_text_raw)
+        }
+        "clean up repository" => {
+            evidence.mutation_count > 0
+                || evidence.commit_count > 0
+                || assistant_text_has_blocked_reason(&evidence.final_assistant_text_raw)
+        }
+        "commit requested changes" => {
+            evidence.commit_count > 0
                 || assistant_text_has_blocked_reason(&evidence.final_assistant_text_raw)
         }
         "run verification checks" => {
@@ -987,6 +1008,11 @@ pub(crate) fn assistant_text_has_blocked_reason(text: &str) -> bool {
                 "requires clarification",
                 "need clarification",
                 "no changes needed",
+                "nothing to commit",
+                "nothing to clean",
+                "repo is clean",
+                "repository is clean",
+                "working tree is clean",
                 "not applicable",
             ],
         )
@@ -1581,6 +1607,79 @@ mod tests {
             "{:?}",
             terse.checkpoints
         );
+        assert!(
+            terse
+                .checkpoints
+                .iter()
+                .any(|c| c.contains("clean up repository")),
+            "{:?}",
+            terse.checkpoints
+        );
+    }
+
+    #[test]
+    fn cleanup_and_commit_task_does_not_require_an_extra_file_edit() {
+        let tracker =
+            ObjectiveTracker::from_user_prompt("clean up repo and committ all thats needed");
+        assert_eq!(
+            tracker.checkpoints,
+            vec![
+                "clean up repository".to_string(),
+                "commit requested changes".to_string(),
+            ]
+        );
+
+        let history = vec![crate::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::Block::ToolUse {
+                id: "tool-commit".to_string(),
+                name: "git_commit".to_string(),
+                input: json!({"message": "chore: commit reviewed changes"}),
+            }],
+        }];
+        let coverage = tracker.assess_history(&history);
+        assert!(coverage.unresolved.is_empty(), "{coverage:?}");
+    }
+
+    #[test]
+    fn implementation_and_commit_task_keeps_both_requirements() {
+        let tracker = ObjectiveTracker::from_user_prompt("fix the bug and commit the changes");
+        assert!(
+            tracker
+                .checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint == "implement requested changes")
+        );
+        assert!(
+            tracker
+                .checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint == "commit requested changes")
+        );
+
+        let history = vec![crate::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::Block::ToolUse {
+                id: "tool-commit".to_string(),
+                name: "git_commit".to_string(),
+                input: json!({"message": "fix: existing work"}),
+            }],
+        }];
+        let coverage = tracker.assess_history(&history);
+        assert!(
+            coverage
+                .unresolved
+                .iter()
+                .any(|checkpoint| checkpoint == "implement requested changes"),
+            "{coverage:?}"
+        );
+        assert!(
+            coverage
+                .satisfied
+                .iter()
+                .any(|checkpoint| checkpoint == "commit requested changes"),
+            "{coverage:?}"
+        );
     }
 
     #[test]
@@ -1757,7 +1856,7 @@ mod tests {
             coverage
                 .unresolved
                 .iter()
-                .any(|item| item == "implement requested changes"),
+                .any(|item| item == "clean up repository"),
             "{:?}",
             coverage
         );
