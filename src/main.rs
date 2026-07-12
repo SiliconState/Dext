@@ -17,18 +17,17 @@ mod main_tests;
 
 use anyhow::{Context, Result};
 use provider::{
-    ANTHROPIC_API_VERSION, ApiProvider, ExecutionPolicy, ModelPricing, ProviderProfile,
-    RequestContract, ResolvedModelSpec, ResolvedProviderConfig, apply_provider_headers,
-    auth_store_path, build_chatgpt_request, build_chatgpt_summary_request,
-    built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
-    extract_oauth_code_from_callback, find_provider_profile, handle_auth_cli,
-    list_models_for_available_providers, list_models_for_provider, load_auth_store,
-    load_provider_catalog, login_provider, logout_provider, looks_like_login_secret_input,
-    normalize_provider_model_value, provider_auth_status, provider_catalog_path,
-    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
-    render_provider_list, render_provider_picker, request_contract_for_profile,
-    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
-    resolve_runtime_provider, set_active_provider_in_catalog,
+    ANTHROPIC_API_VERSION, ApiProvider, ModelPricing, ProviderProfile, RequestContract,
+    ResolvedModelSpec, ResolvedProviderConfig, apply_provider_headers, auth_store_path,
+    build_chatgpt_request, build_chatgpt_summary_request, built_in_provider_profiles,
+    cancel_pending_oauth_login, canonical_provider_id, extract_oauth_code_from_callback,
+    find_provider_profile, handle_auth_cli, list_models_for_available_providers,
+    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
+    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
+    provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
+    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
+    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
+    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 use session::{
@@ -418,31 +417,8 @@ fn redact_pseudo_tool_protocol_blocks(blocks: &[Block]) -> Vec<Block> {
         .collect()
 }
 
-fn controlled_assistant_display_text(text: &str, policy: ExecutionPolicy) -> Option<String> {
-    (policy == ExecutionPolicy::Open).then(|| text.to_string())
-}
-
-fn suppressed_pseudo_tool_blocks(blocks: &[Block]) -> Vec<Block> {
-    let mut sanitized = vec![Block::Text {
-        text: "Malformed tool response suppressed; malformed text was not executed.".to_string(),
-    }];
-    sanitized.extend(
-        blocks
-            .iter()
-            .filter(|block| matches!(block, Block::ToolUse { .. }))
-            .cloned(),
-    );
-    sanitized
-}
-
-fn assistant_blocks_for_context(
-    blocks: &[Block],
-    context_mode: ContextMode,
-    suppress_pseudo_tool_text: bool,
-) -> Vec<Block> {
-    if suppress_pseudo_tool_text && blocks_contain_pseudo_tool_syntax_or_start(blocks) {
-        suppressed_pseudo_tool_blocks(blocks)
-    } else if context_mode.is_frugal() {
+fn assistant_blocks_for_context(blocks: &[Block], context_mode: ContextMode) -> Vec<Block> {
+    if context_mode.is_frugal() {
         redact_pseudo_tool_protocol_blocks(blocks)
     } else {
         blocks.to_vec()
@@ -453,7 +429,6 @@ fn maybe_preserve_partial_stream(
     blocks: &[Block],
     history: &mut Vec<Message>,
     context_mode: ContextMode,
-    suppress_pseudo_tool_text: bool,
 ) -> bool {
     if blocks.is_empty()
         || !blocks
@@ -462,8 +437,7 @@ fn maybe_preserve_partial_stream(
     {
         return false;
     }
-    let visible_blocks =
-        assistant_blocks_for_context(blocks, context_mode, suppress_pseudo_tool_text);
+    let visible_blocks = assistant_blocks_for_context(blocks, context_mode);
     if let Some(last) = history.last()
         && last.role == "assistant"
         && last.content == visible_blocks
@@ -1016,34 +990,6 @@ impl ReadFileCache {
 
 fn canonical_within(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
     canonicalize_tool_path(root, user_path)
-}
-
-fn native_mutation_attempt_key(root: &Path, name: &str, input: &Value) -> Option<String> {
-    if !matches!(name, "write_file" | "edit_file" | "multi_edit") {
-        return None;
-    }
-    let path = canonical_within(root, input["path"].as_str()?).ok()?;
-    let mut normalized_input = input.clone();
-    normalized_input["path"] = Value::String(path.to_string_lossy().into_owned());
-    let mut hasher = Sha256::new();
-    hasher.update(name.as_bytes());
-    hasher.update([0]);
-    hasher.update(normalized_input.to_string().as_bytes());
-    hasher.update([0]);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            hasher.update(b"present\0");
-            hasher.update(bytes);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            hasher.update(b"missing");
-        }
-        Err(error) => {
-            hasher.update(b"unreadable\0");
-            hasher.update(error.kind().to_string().as_bytes());
-        }
-    }
-    Some(format!("{name}:{:x}", hasher.finalize()))
 }
 
 fn canonical_read_path(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
@@ -3183,39 +3129,6 @@ fn clamp_thinking_budget_below_max(budget_tokens: u32, max_tokens: u32) -> Optio
     Some(budget_tokens.min(ceiling.max(1)).min(strict_max))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolRequestMode {
-    Disabled,
-    Auto,
-    Required,
-}
-
-impl ToolRequestMode {
-    fn tools_enabled(self) -> bool {
-        self != Self::Disabled
-    }
-
-    fn requires_tool_call(self) -> bool {
-        self == Self::Required
-    }
-}
-
-fn controlled_tool_request_mode(
-    policy: ExecutionPolicy,
-    finalizing: bool,
-    recovery_requested: bool,
-) -> ToolRequestMode {
-    if policy == ExecutionPolicy::Open {
-        ToolRequestMode::Auto
-    } else if finalizing {
-        ToolRequestMode::Disabled
-    } else if recovery_requested {
-        ToolRequestMode::Required
-    } else {
-        ToolRequestMode::Auto
-    }
-}
-
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
@@ -3258,8 +3171,6 @@ struct OaiRequest<'a> {
     max_tokens: u32,
     messages: Vec<OaiMessage>,
     tools: Vec<OaiTool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OaiStreamOptions>,
@@ -7403,10 +7314,6 @@ fn execute_tool_with_cache(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(format!("failed to read existing file for preview: {e}")),
             };
-            let unchanged = before.as_deref() == Some(content);
-            if unchanged {
-                return Ok(format!("no changes to {}", path.display()));
-            }
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -7436,9 +7343,6 @@ fn execute_tool_with_cache(
                 ));
             }
             let updated = content.replacen(old, new, 1);
-            if updated == content {
-                return Ok(format!("no changes to {}", path.display()));
-            }
             std::fs::write(&path, &updated).map_err(|e| format!("{e}"))?;
             Ok(edit_result_with_diff(1, &path, root, &content, &updated))
         }
@@ -7474,9 +7378,6 @@ fn execute_tool_with_cache(
                     }
                     content = content.replacen(old, new, 1);
                 }
-            }
-            if content == before {
-                return Ok(format!("no changes to {}", path.display()));
             }
             std::fs::write(&path, &content).map_err(|e| format!("{e}"))?;
             Ok(edit_result_with_diff(
@@ -9142,9 +9043,9 @@ Communication: be terse. Report what changed, verification results, gaps. No nar
 Tables: single well-formed tables render best. When several small related tables share a theme/schema, consolidate them into one grouped table with one header row; use grouping columns/rows, one physical line per row, compact cell delimiters like ` · ` or `;`, and plain short cells. Avoid stacked heading+table blocks and fragile cell content: nested markdown/bold, emoji verdict icons, unescaped `|` characters, or multi-line cells. If separate tables are truly needed, separate them with a full prose sentence.
 Packs: when creating or installing a reusable pack or shelf, default to Dext's user-global scope (`~/.dext/packs` or `~/.dext/shelves/<shelf>/packs`) unless the user explicitly asks for project-local placement.";
 
-const TINY_SYSTEM: &str = "You are dext tiny: terse CLI agent. Use exposed tools only. Tool protocol: real tool calls only; never print raw to=functions/tool_use/function-call JSON/bash envelopes or prefill the TUI input. Check Context State; pivot at PIVOT REQUIRED or repeated-action pattern. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit/http; read-only absolute paths ok, writes confined; bash only for shell orchestration, build/test/install, or gaps. Inspect before edits. Keep output small. Use todo for nontrivial work. Bash is atomic; supervised dext- services only for requested persistence. Obey [runtime-note] advisories. Reusable packs default user-global unless asked otherwise. Tables: related data -> one grouped table; one row/line; plain cells, no emoji/bold/unescaped `|`/linebreaks; prose between unrelated tables. Verify narrowly. Final: changed, tests, gaps.";
+const TINY_SYSTEM: &str = "You are dext tiny: terse CLI agent. Use exposed tools only. Tool protocol: real tool calls only; never print raw to=functions/tool_use/function-call JSON/bash envelopes or prefill the TUI input. Check Context State; pivot at PIVOT REQUIRED or repeated-action pattern. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit/http; read-only absolute paths ok, writes confined; bash only for shell orchestration, build/test/install, or gaps. Inspect before edits. Keep output small. Use todo for nontrivial work. Bash is atomic; supervised dext- services only for requested persistence. Obey [runtime-note] advisories. Reusable packs default user-global unless asked otherwise. Tables: related data -> one grouped table; one row/line; plain cells, no emoji/bold/unescaped `|`/linebreaks; prose between unrelated tables. Verify narrowly. Final: changed, tests, gaps.";
 
-const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Tool protocol: invoke tools only through actual provider tool calls. Never print raw tool syntax (`to=functions.*`, `tool_use`, function-call JSON, or bash command envelopes) as assistant text, and never try to prefill the TUI input/composer.";
+const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
 
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     scan_prompt_context_files(root, filename).sections
@@ -9482,6 +9383,18 @@ fn load_prompt_env_value(value: String) -> Result<String> {
 const LATEST_SESSION_NAME: &str = "_latest";
 const SESSION_FORMAT_VERSION: u32 = 3;
 
+fn default_context_mode_for_provider(
+    provider_id: &str,
+    api_provider: ApiProvider,
+    base_url: &str,
+) -> ContextMode {
+    if provider::is_local_llama_provider(provider_id, api_provider, base_url) {
+        ContextMode::Frugal
+    } else {
+        ContextMode::Standard
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum ContextMode {
     #[default]
@@ -9558,10 +9471,8 @@ impl ToolContextProfile {
             .unwrap_or_default()
     }
 
-    fn effective(self, context_mode: ContextMode) -> Self {
-        if context_mode.is_frugal() {
-            Self::Frugal
-        } else if self == Self::Frugal {
+    fn effective(self, _context_mode: ContextMode) -> Self {
+        if self == Self::Frugal {
             Self::Default
         } else {
             self
@@ -9594,28 +9505,14 @@ const DEFAULT_TOOL_NAMES: &[&str] = &[
     "todo_write",
 ];
 
-const FRUGAL_TOOL_NAMES: &[&str] = &[
-    "read_file",
-    "read_symbol",
-    "write_file",
-    "edit_file",
-    "multi_edit",
-    "bash",
-    "fd",
-    "rg",
-    "browser",
-    "git_diff",
-    "todo_read",
-    "todo_write",
-];
-
 const SPECIALIZED_TOOL_NAMES: &[&str] = &["jq", "fzf", "awk", "git_log", "csvkit"];
 
 fn tool_name_allowed_in_profile(name: &str, profile: ToolContextProfile) -> bool {
     match profile {
         ToolContextProfile::Full => true,
-        ToolContextProfile::Default => DEFAULT_TOOL_NAMES.contains(&name),
-        ToolContextProfile::Frugal => FRUGAL_TOOL_NAMES.contains(&name),
+        ToolContextProfile::Default | ToolContextProfile::Frugal => {
+            DEFAULT_TOOL_NAMES.contains(&name)
+        }
     }
 }
 
@@ -9671,20 +9568,11 @@ fn render_tools_status(agent: &Agent) -> String {
         .map(|name| (*name).to_string())
         .collect();
     if !hidden_specialized.is_empty() {
-        if agent.context_mode.is_frugal() {
-            let _ = writeln!(
-                out,
-                "hidden by {} context: {} (switch /context standard before /tools full)",
-                agent.context_mode.as_str(),
-                hidden_specialized.join(", ")
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "hidden until /tools full: {}",
-                hidden_specialized.join(", ")
-            );
-        }
+        let _ = writeln!(
+            out,
+            "hidden until /tools full: {}",
+            hidden_specialized.join(", ")
+        );
     }
     if agent.browser_recipe() == BrowserRecipe::Disabled {
         let _ = writeln!(out, "browser: off (separate /browser agent-browser opt-in)");
@@ -9700,15 +9588,6 @@ fn handle_tools_command(agent: &mut Agent, arg: &str) -> ToolsCommandResult {
             output: render_tools_status(agent),
         },
         "default" | "standard" | "core" | "full" | "all" => {
-            if agent.context_mode.is_frugal() {
-                return ToolsCommandResult {
-                    output: format!(
-                        "context mode {} pins tools {}; switch /context standard before changing /tools",
-                        agent.context_mode.as_str(),
-                        agent.tool_context_profile().as_str()
-                    ),
-                };
-            }
             let profile =
                 ToolContextProfile::parse_selectable(raw).unwrap_or(ToolContextProfile::Default);
             agent.tool_context_profile = profile.effective(agent.context_mode);
@@ -9869,11 +9748,11 @@ struct SessionHeader {
     #[serde(default)]
     context_mode: ContextMode,
     #[serde(default)]
+    context_mode_explicit: bool,
+    #[serde(default)]
     tool_context_profile: ToolContextProfile,
     #[serde(default)]
     tool_profile: ToolProfile,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    execution_policy_override: Option<ExecutionPolicy>,
     #[serde(default)]
     provenance: SessionProvenance,
     #[serde(default)]
@@ -9907,9 +9786,9 @@ impl Default for SessionHeader {
             budget_cap: None,
             browser_recipe: BrowserRecipe::default(),
             context_mode: ContextMode::default(),
+            context_mode_explicit: false,
             tool_context_profile: ToolContextProfile::default(),
             tool_profile: ToolProfile::default(),
-            execution_policy_override: None,
             provenance: SessionProvenance::default(),
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
@@ -11446,9 +11325,9 @@ struct Agent {
     sandbox_profile: SandboxProfile,
     browser_recipe: BrowserRecipe,
     context_mode: ContextMode,
+    context_mode_explicit: bool,
     tool_context_profile: ToolContextProfile,
     tool_profile: ToolProfile,
-    execution_policy_override: Option<ExecutionPolicy>,
     preview_mode: MutationPreviewMode,
     budget_cap: Option<BudgetCap>,
     budget_exhausted: bool,
@@ -11516,7 +11395,13 @@ impl Agent {
             .ok()
             .and_then(|v| ThinkingEffort::parse(&v))
             .unwrap_or_default();
-        let context_mode = ContextMode::from_env();
+        let configured_context_mode = std::env::var("DEXT_CONTEXT_MODE")
+            .ok()
+            .and_then(|value| ContextMode::parse(&value));
+        let context_mode_explicit = configured_context_mode.is_some();
+        let context_mode = configured_context_mode.unwrap_or_else(|| {
+            default_context_mode_for_provider(&provider_id, api_provider, &base_url)
+        });
         let base_system = std::env::var("DEXT_SYSTEM")
             .ok()
             .and_then(|v| {
@@ -11568,11 +11453,7 @@ impl Agent {
             .ok()
             .and_then(|v| BrowserRecipe::parse(&v))
             .unwrap_or_default();
-        let tool_profile = if context_mode.is_frugal() {
-            ToolProfile::Lean
-        } else {
-            ToolProfile::from_env()
-        };
+        let tool_profile = ToolProfile::from_env();
         let budget_cap = BudgetCap::from_env();
         let tool_context_profile = ToolContextProfile::from_env().effective(context_mode);
         let tools: Vec<Tool> = provider_tool_definitions()
@@ -11628,11 +11509,9 @@ impl Agent {
             sandbox_profile: SandboxProfile::default(),
             browser_recipe,
             context_mode,
+            context_mode_explicit,
             tool_context_profile,
             tool_profile,
-            execution_policy_override: std::env::var("DEXT_EXECUTION_POLICY")
-                .ok()
-                .and_then(|value| ExecutionPolicy::parse(&value)),
             preview_mode: MutationPreviewMode::from_env(),
             budget_cap,
             budget_exhausted: false,
@@ -11813,6 +11692,14 @@ impl Agent {
             self.model = pinned.clone();
         }
         self.refresh_context_window();
+        if !self.context_mode_explicit {
+            let mode = default_context_mode_for_provider(
+                &self.provider_id,
+                self.route_api_provider(),
+                &self.base_url,
+            );
+            self.set_context_mode_automatic(mode);
+        }
     }
 
     fn request_contract(&self) -> RequestContract {
@@ -11830,31 +11717,6 @@ impl Agent {
         self.provider_profile
             .as_ref()
             .map(|profile| resolve_model_spec(profile, &self.model))
-    }
-
-    fn effective_execution_policy(&self) -> ExecutionPolicy {
-        if let Some(policy) = self.execution_policy_override {
-            return policy;
-        }
-        let resolved = self.resolved_model_spec();
-        if let Some(spec) = resolved.as_ref()
-            && spec.execution_policy_configured
-        {
-            return spec.execution_policy;
-        }
-        if provider::is_local_llama_provider(
-            &self.provider_id,
-            self.route_api_provider(),
-            &self.base_url,
-        ) {
-            ExecutionPolicy::Adaptive
-        } else {
-            ExecutionPolicy::Open
-        }
-    }
-
-    fn set_execution_policy_override(&mut self, policy: Option<ExecutionPolicy>) {
-        self.execution_policy_override = policy;
     }
 
     fn request_max_output_tokens(&self) -> u32 {
@@ -12736,7 +12598,7 @@ impl Agent {
             stable.push_str(FRUGAL_TOOL_PROTOCOL_NOTE);
         }
         let mut context_budget = if self.context_mode.is_tiny() {
-            1_500
+            1_300
         } else if self.context_mode.is_frugal() {
             FRUGAL_PROJECT_CONTEXT_CAP
         } else {
@@ -13266,9 +13128,6 @@ impl Agent {
             )
         };
         let combined = pending_steering.join("\n\n");
-        if !pending_steering.is_empty() {
-            turn_state.reset_supervision_for_steering();
-        }
         let user_update = if combined.trim().is_empty() {
             "(runtime control command only)".to_string()
         } else {
@@ -13358,12 +13217,14 @@ impl Agent {
     }
 
     fn set_context_mode(&mut self, mode: ContextMode) {
+        self.context_mode_explicit = true;
+        self.set_context_mode_automatic(mode);
+    }
+
+    fn set_context_mode_automatic(&mut self, mode: ContextMode) {
         let switching_to_tiny = mode.is_tiny();
         self.context_mode = mode;
         self.tool_context_profile = self.tool_context_profile.effective(mode);
-        if mode.is_frugal() {
-            self.tool_profile = ToolProfile::Lean;
-        }
         if switching_to_tiny {
             if self.system == DEFAULT_SYSTEM {
                 self.system = TINY_SYSTEM.to_string();
@@ -13391,11 +13252,7 @@ impl Agent {
     }
 
     fn wire_tool_profile(&self) -> ToolProfile {
-        if self.context_mode.is_frugal() {
-            ToolProfile::Lean
-        } else {
-            self.tool_profile
-        }
+        self.tool_profile
     }
 
     fn wire_tools(&self) -> Vec<WireTool> {
@@ -13643,7 +13500,6 @@ impl Agent {
         items
     }
 
-    #[cfg(test)]
     fn build_streaming_request(
         &self,
         sys_stable: &str,
@@ -13651,25 +13507,6 @@ impl Agent {
         sys_blocks: &[SystemBlock<'_>],
         wire_tools: &[WireTool],
         chatgpt_session_id: &str,
-    ) -> Result<(String, Vec<u8>)> {
-        self.build_streaming_request_controlled(
-            sys_stable,
-            sys_env,
-            sys_blocks,
-            wire_tools,
-            chatgpt_session_id,
-            ToolRequestMode::Auto,
-        )
-    }
-
-    fn build_streaming_request_controlled(
-        &self,
-        sys_stable: &str,
-        sys_env: &str,
-        sys_blocks: &[SystemBlock<'_>],
-        wire_tools: &[WireTool],
-        chatgpt_session_id: &str,
-        tool_mode: ToolRequestMode,
     ) -> Result<(String, Vec<u8>)> {
         let contract = self.request_contract();
         let effort = self.effective_thinking_effort();
@@ -13688,19 +13525,8 @@ impl Agent {
                     sys_stable,
                     chatgpt_session_id,
                     input,
-                    if tool_mode.tools_enabled() {
-                        self.wire_tools_chatgpt()
-                    } else {
-                        Vec::new()
-                    },
+                    self.wire_tools_chatgpt(),
                 );
-                if tool_mode.requires_tool_call()
-                    && let Some(object) = body.as_object_mut()
-                    && object.contains_key("tools")
-                {
-                    object.insert("tool_choice".to_string(), json!("required"));
-                    object.insert("parallel_tool_calls".to_string(), json!(false));
-                }
                 if !self.model_supports_prompt_cache()
                     && let Some(object) = body.as_object_mut()
                 {
@@ -13715,11 +13541,7 @@ impl Agent {
                 // their implicit prefix caches on every tool round.
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
-                let oai_tools = if tool_mode.tools_enabled() {
-                    self.wire_tools_oai()
-                } else {
-                    Vec::new()
-                };
+                let oai_tools = self.wire_tools_oai();
                 let reasoning_effort = openai_reasoning_effort(effort);
                 let stream_options = (!provider::is_local_llama_provider(
                     &self.provider_id,
@@ -13738,14 +13560,11 @@ impl Agent {
                     &tool_names,
                     env_flag_default(LLAMA_TOOL_GRAMMAR_ENV, false),
                 );
-                let tool_choice =
-                    (tool_mode.requires_tool_call() && !oai_tools.is_empty()).then_some("required");
                 let body = OaiRequest {
                     model: &self.model,
                     max_tokens: max_output_tokens,
                     messages: oai_msgs,
                     tools: oai_tools,
-                    tool_choice,
                     stream: true,
                     stream_options,
                     reasoning_effort,
@@ -13816,14 +13635,7 @@ impl Agent {
                 let mut messages = anthropic_wire_messages(&messages, prompt_cache_enabled)?;
                 append_runtime_env_block(&mut messages, sys_env);
                 let system = system_blocks_with_cache_control(sys_blocks, prompt_cache_enabled);
-                let tools = wire_tools_with_cache_control(
-                    if tool_mode.tools_enabled() {
-                        wire_tools
-                    } else {
-                        &[]
-                    },
-                    prompt_cache_enabled,
-                );
+                let tools = wire_tools_with_cache_control(wire_tools, prompt_cache_enabled);
                 let body = Request {
                     model: &self.model,
                     max_tokens,
@@ -13899,9 +13711,9 @@ impl Agent {
             budget_cap: self.budget_cap,
             browser_recipe: self.browser_recipe,
             context_mode: self.context_mode,
+            context_mode_explicit: self.context_mode_explicit,
             tool_context_profile: self.tool_context_profile(),
             tool_profile: self.tool_profile,
-            execution_policy_override: self.execution_policy_override,
             provenance,
             work_ledger: self.cleaned_work_ledger(),
             provider_health: self.provider_health.clone(),
@@ -14077,9 +13889,9 @@ impl Agent {
             budget_cap,
             browser_recipe,
             context_mode,
+            context_mode_explicit,
             tool_context_profile,
             tool_profile,
-            execution_policy_override,
             work_ledger,
             provider_health,
             track_origin,
@@ -14109,14 +13921,19 @@ impl Agent {
         self.provider_health = provider_health;
         self.track_origin = track_origin;
         self.privacy = privacy;
-        self.context_mode = context_mode;
-        self.tool_context_profile = tool_context_profile.effective(context_mode);
-        self.tool_profile = if self.context_mode.is_frugal() {
-            ToolProfile::Lean
+        self.context_mode_explicit = context_mode_explicit;
+        let restored_context_mode = if context_mode_explicit {
+            context_mode
         } else {
-            tool_profile
+            default_context_mode_for_provider(
+                &self.provider_id,
+                self.route_api_provider(),
+                &self.base_url,
+            )
         };
-        self.execution_policy_override = execution_policy_override;
+        self.set_context_mode_automatic(restored_context_mode);
+        self.tool_context_profile = tool_context_profile.effective(restored_context_mode);
+        self.tool_profile = tool_profile;
         self.set_browser_recipe(browser_recipe);
         if let Some(saved_sandbox) = sandbox.as_deref()
             && let Ok(restored) = std::fs::canonicalize(saved_sandbox)
@@ -14524,7 +14341,6 @@ impl Agent {
                 max_tokens: summary_max_tokens,
                 messages,
                 tools: Vec::new(),
-                tool_choice: None,
                 stream: false,
                 stream_options: None,
                 reasoning_effort,
@@ -14963,31 +14779,21 @@ impl Agent {
 
         let turn_started_at = std::time::Instant::now();
 
-        let latest_user_prompt = self
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .and_then(|m| {
-                m.content.iter().find_map(|b| match b {
-                    Block::Text { text } | Block::PartialStream { text } => Some(text.as_str()),
-                    _ => None,
+        let objective = orchestrator::ObjectiveTracker::from_user_prompt(
+            self.history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .and_then(|m| {
+                    m.content.iter().find_map(|b| match b {
+                        Block::Text { text } | Block::PartialStream { text } => Some(text.as_str()),
+                        _ => None,
+                    })
                 })
-            })
-            .unwrap_or_default();
-        let preserve_objective = self.effective_execution_policy() != ExecutionPolicy::Open
-            && orchestrator::continuation_prompt(latest_user_prompt)
-            && !self.work_ledger.objective.trim().is_empty();
-        let objective_input = if preserve_objective {
-            self.work_ledger.objective.as_str()
-        } else {
-            latest_user_prompt
-        };
-        let objective = orchestrator::ObjectiveTracker::from_user_prompt(objective_input);
+                .unwrap_or_default(),
+        );
         let objective_line = objective.display_line();
-        if !preserve_objective {
-            self.update_work_ledger_from_objective(&objective);
-        }
+        self.update_work_ledger_from_objective(&objective);
         self.sink
             .emit(AgentEvent::Info(format!("[{}]", objective_line)));
         self.append_latest_log("objective", &objective_line);
@@ -14995,21 +14801,15 @@ impl Agent {
         let mut iterations: u32 = 0;
         let mut turn_usage = Usage::default();
         let mut denied_signatures: HashSet<String> = HashSet::new();
-        let mut turn_state = orchestrator::TurnRuntimeState::with_execution_policy(
-            self.effective_execution_policy(),
-        );
+        let mut turn_state = orchestrator::TurnRuntimeState::new();
         let read_cache = self.read_cache.clone();
         let mut objective_warning_emitted = false;
         let mut steering_final_followup_emitted = false;
         let mut action_contract_must_mutate = false;
         let mut action_contract_no_mutation_turns: u32 = 0;
         let mut implementation_fallback_emitted = false;
-        let mut successful_content_change_this_turn = false;
-        let mut successful_unchanged_mutation_this_turn = false;
-        let mut exhaustive_cleanup_verified = false;
         let mut last_retry_reason: Option<String> = None;
         let mut workaround_fired_this_turn = false;
-        let mut require_tool_call_next = false;
 
         self.set_work_phase(turn_state.phase().label());
         self.sink.emit(AgentEvent::Info(format!(
@@ -15076,21 +14876,8 @@ impl Agent {
             }
             iterations += 1;
             let runtime_controls = apply_queued_runtime_controls(self);
-            turn_state.sync_execution_policy(self.effective_execution_policy());
             if runtime_controls.aborted_stream {
                 continue;
-            }
-
-            if let Some(note) = turn_state.take_finalization_note() {
-                self.sink.emit(AgentEvent::Warn(note.clone()));
-                self.append_latest_log("execution_finalize", &note);
-                self.history.push(Message {
-                    role: "user".to_string(),
-                    content: vec![Block::Text {
-                        text: format!("[runtime-note] {note}"),
-                    }],
-                });
-                self.checkpoint_latest_session("after_execution_finalize");
             }
 
             let chatgpt_session_id = (self.request_contract() == RequestContract::ChatGptResponses)
@@ -15102,12 +14889,7 @@ impl Agent {
                     )
                 });
             self.partial_stream_text = None;
-            let (sys_stable, mut sys_env) = self.compose_system_parts();
-            if let Some(control) = turn_state.control_prompt() {
-                sys_env.push('\n');
-                sys_env.push_str(&control);
-                sys_env.push('\n');
-            }
+            let (sys_stable, sys_env) = self.compose_system_parts();
             // Only the stable text lives in the system prompt (with a cache
             // breakpoint); the volatile env section is appended per request at
             // the tail of the message list so it never invalidates the cached
@@ -15118,20 +14900,14 @@ impl Agent {
                 cache_control: Some(CacheControl::for_prompt()),
             }];
             let mut stream_attempt: u32 = 0;
-            let (mut blocks, stop_reason, mut usage) = 'stream_retry: loop {
+            let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
-                let tool_mode = controlled_tool_request_mode(
-                    self.effective_execution_policy(),
-                    turn_state.should_finalize(),
-                    require_tool_call_next,
-                );
-                let (url, req_body) = self.build_streaming_request_controlled(
+                let (url, req_body) = self.build_streaming_request(
                     &sys_stable,
                     &sys_env,
                     &sys_blocks,
                     &wire_tools,
                     chatgpt_session_id.as_deref().unwrap_or("dext"),
-                    tool_mode,
                 )?;
                 stream_attempt += 1;
                 let mut attempt: u32 = 0;
@@ -15354,9 +15130,14 @@ impl Agent {
                         }
                         if self.request_contract() == RequestContract::ChatGptResponses {
                             let partial_blocks = self.partial_chatgpt_stream_blocks();
-                            if !partial_blocks.is_empty() {
+                            if maybe_preserve_partial_stream(
+                                &partial_blocks,
+                                &mut self.history,
+                                self.context_mode,
+                            ) {
+                                self.checkpoint_latest_session("after_partial_stream_preserve");
                                 self.sink.emit(AgentEvent::Warn(
-                                    "provider closed the stream after partial text; preserving and classifying the partial response instead of replaying the same turn".to_string(),
+                                    "provider closed the stream after partial text; preserved partial response instead of replaying the same turn".to_string(),
                                 ));
                                 break 'stream_retry (
                                     partial_blocks,
@@ -15404,83 +15185,15 @@ impl Agent {
             }
 
             let assistant_response_text = assistant_blocks_text(&blocks);
-            let response_has_pseudo_tool = blocks_contain_pseudo_tool_syntax_or_start(&blocks);
-            let response_has_tool_use = blocks
-                .iter()
-                .any(|block| matches!(block, Block::ToolUse { .. }));
-            let controlled_execution = self.effective_execution_policy() != ExecutionPolicy::Open;
-            let completion_claim_requires_content_change =
-                assistant_text_has_content_change_claim(&assistant_response_text);
-            let unchanged_target_explained = successful_unchanged_mutation_this_turn
-                && orchestrator::assistant_text_explains_unchanged_target(&assistant_response_text);
-            let completion_claim_supported = if completion_claim_requires_content_change {
-                successful_content_change_this_turn
-            } else {
-                successful_content_change_this_turn || unchanged_target_explained
-            };
-            let unverified_completion_claim = controlled_execution
-                && !response_has_tool_use
-                && objective.apply_fixes_allowed()
-                && assistant_text_has_completion_claim(&assistant_response_text)
-                && (!completion_claim_supported
-                    || objective.exhaustive_cleanup && !exhaustive_cleanup_verified)
-                && (!orchestrator::assistant_text_has_blocked_reason(&assistant_response_text)
-                    || completion_claim_requires_content_change);
-            if controlled_execution && response_has_pseudo_tool {
-                blocks = suppressed_pseudo_tool_blocks(&blocks);
-            } else if unverified_completion_claim {
-                blocks = vec![Block::Text {
-                    text:
-                        "Unsupported completion claim suppressed; no verified mutation supports it."
-                            .to_string(),
-                }];
-            } else if controlled_execution {
-                for block in &blocks {
-                    match block {
-                        Block::Text { text } | Block::PartialStream { text } => {
-                            self.sink.emit(AgentEvent::TextBlockComplete(text.clone()))
-                        }
-                        Block::Thinking { text, .. } => self
-                            .sink
-                            .emit(AgentEvent::ThinkingBlockComplete(text.clone())),
-                        _ => {}
-                    }
-                }
-            }
-            if controlled_execution && !response_has_pseudo_tool {
-                for (ordinal, block) in blocks
-                    .iter()
-                    .filter(|block| matches!(block, Block::ToolUse { .. }))
-                    .enumerate()
-                {
-                    let Block::ToolUse { id, name, input } = block else {
-                        continue;
-                    };
-                    let privileged = needs_permission(name) && !self.allowed.contains(name);
-                    if !privileged {
-                        self.sink.emit(AgentEvent::ToolCallPreview {
-                            call_id: normalize_tool_call_id(id, 0, ordinal),
-                            name: name.clone(),
-                            summary: summarize_call(name, input),
-                        });
-                    }
-                }
-            }
-            let implementation_commitment = objective.apply_fixes_allowed()
-                && assistant_text_has_implementation_commitment(&assistant_response_text);
-            if implementation_commitment {
+            let response_has_pseudo_tool =
+                blocks_contain_pseudo_tool_syntax_for_context(&blocks, self.context_mode);
+            if objective.apply_fixes_allowed()
+                && assistant_text_has_implementation_commitment(&assistant_response_text)
+            {
                 action_contract_must_mutate = true;
-            } else if unchanged_target_explained {
-                action_contract_must_mutate = false;
-                action_contract_no_mutation_turns = 0;
             }
 
-            if maybe_preserve_partial_stream(
-                &blocks,
-                &mut self.history,
-                self.context_mode,
-                controlled_execution,
-            ) {
+            if maybe_preserve_partial_stream(&blocks, &mut self.history, self.context_mode) {
                 self.checkpoint_latest_session("after_assistant_message");
             } else {
                 // maybe_preserve_partial_stream skips messages that lack Text/PartialStream
@@ -15493,11 +15206,7 @@ impl Agent {
                 if has_tool_use {
                     self.history.push(Message {
                         role: "assistant".to_string(),
-                        content: assistant_blocks_for_context(
-                            &blocks,
-                            self.context_mode,
-                            controlled_execution,
-                        ),
+                        content: assistant_blocks_for_context(&blocks, self.context_mode),
                     });
                     self.checkpoint_latest_session("after_assistant_message");
                 }
@@ -15513,7 +15222,9 @@ impl Agent {
 
             let empty_call_count = tool_calls
                 .iter()
-                .filter(|(_, name, input)| tool_call_has_empty_required_arguments(name, input))
+                .filter(|(_, _, input)| {
+                    input.as_object().is_some_and(|m| m.is_empty()) || input.is_null()
+                })
                 .count();
             turn_state.record_empty_tool_calls(empty_call_count);
             let empty_tool_call_loop_note = turn_state.empty_tool_call_loop_note();
@@ -15531,98 +15242,22 @@ impl Agent {
                 {
                     action_contract_must_mutate = true;
                 }
-                if controlled_execution && response_has_pseudo_tool {
-                    let recovery_note = turn_state.take_pseudo_tool_recovery_message();
-                    let tools_available = !turn_state.should_finalize();
-                    require_tool_call_next = tools_available;
-                    if let Some(halt) = turn_state.take_invalid_response_halt_message() {
-                        self.sink.emit(AgentEvent::Warn(halt.clone()));
-                        self.append_latest_log("invalid_response_halt", &halt);
-                        if let Some(message) = self
-                            .history
-                            .last_mut()
-                            .filter(|message| message.role == "assistant")
-                        {
-                            message.content.push(Block::Text { text: halt });
-                        }
-                        self.checkpoint_latest_session("after_invalid_response_halt");
-                        break;
-                    }
-                    let note =
-                        recovery_note.unwrap_or_else(|| pseudo_tool_runtime_note(tools_available));
-                    let recovery = note.starts_with("Malformed tool response suppressed again");
+                if response_has_pseudo_tool {
+                    let note = pseudo_tool_runtime_note();
                     self.sink.emit(AgentEvent::Warn(note.clone()));
-                    self.append_latest_log(
-                        if recovery {
-                            "pseudo_tool_recovery"
-                        } else {
-                            "pseudo_tool_text"
-                        },
-                        &note,
-                    );
+                    self.append_latest_log("pseudo_tool_text", &note);
                     self.history.push(Message {
                         role: "user".to_string(),
                         content: vec![Block::Text {
                             text: format!("[runtime-note] {note}"),
                         }],
                     });
-                    self.checkpoint_latest_session(if recovery {
-                        "after_pseudo_tool_recovery"
-                    } else {
-                        "after_pseudo_tool_warning"
-                    });
+                    self.checkpoint_latest_session("after_pseudo_tool_warning");
                     continue;
                 }
-                if unverified_completion_claim {
-                    let recovery_note = turn_state.take_unverified_completion_recovery_message();
-                    let tools_available = !turn_state.should_finalize();
-                    require_tool_call_next = tools_available;
-                    if let Some(halt) = turn_state.take_invalid_response_halt_message() {
-                        self.sink.emit(AgentEvent::Warn(halt.clone()));
-                        self.append_latest_log("invalid_response_halt", &halt);
-                        if let Some(message) = self
-                            .history
-                            .last_mut()
-                            .filter(|message| message.role == "assistant")
-                        {
-                            message.content.push(Block::Text { text: halt });
-                        }
-                        self.checkpoint_latest_session("after_invalid_response_halt");
-                        break;
-                    }
-                    let note = recovery_note
-                        .unwrap_or_else(|| unverified_completion_runtime_note(tools_available));
-                    let recovery = note.starts_with("runtime recovery:");
-                    self.sink.emit(AgentEvent::Warn(note.clone()));
-                    self.append_latest_log(
-                        if recovery {
-                            "unverified_completion_recovery"
-                        } else {
-                            "unverified_completion"
-                        },
-                        &note,
-                    );
-                    self.history.push(Message {
-                        role: "user".to_string(),
-                        content: vec![Block::Text {
-                            text: format!("[runtime-note] {note}"),
-                        }],
-                    });
-                    self.checkpoint_latest_session(if recovery {
-                        "after_unverified_completion_recovery"
-                    } else {
-                        "after_unverified_completion_warning"
-                    });
-                    continue;
-                }
-                if action_contract_must_mutate && !turn_state.should_finalize() {
-                    turn_state.record_response_nonprogress();
-                    if turn_state.should_finalize() {
-                        continue;
-                    }
+                if action_contract_must_mutate {
                     action_contract_no_mutation_turns =
                         action_contract_no_mutation_turns.saturating_add(1);
-                    require_tool_call_next = controlled_execution;
                     let notes = self.action_contract_violation_runtime_notes(
                         action_contract_no_mutation_turns,
                         &mut implementation_fallback_emitted,
@@ -15653,41 +15288,29 @@ impl Agent {
                 }
                 let coverage = objective.assess_history(&self.history);
                 self.sync_work_ledger_with_objective_coverage(&coverage);
-                if !coverage.unresolved.is_empty() {
-                    let retry_unresolved = if controlled_execution {
-                        if turn_state.should_finalize() {
-                            false
-                        } else {
-                            turn_state.record_response_nonprogress();
-                            true
-                        }
-                    } else {
-                        !objective_warning_emitted
-                    };
-                    if retry_unresolved {
-                        let reminder =
-                            orchestrator::objective_runtime_reminder_from_coverage(&coverage);
-                        self.sink.emit(AgentEvent::Warn(reminder.clone()));
-                        self.append_latest_log("objective_unresolved", &reminder);
-                        self.history.push(Message {
-                            role: "user".to_string(),
-                            content: vec![Block::Text {
-                                text: format!("[runtime-note] {reminder}"),
-                            }],
-                        });
-                        self.checkpoint_latest_session("after_objective_warning");
-                        objective_warning_emitted = true;
-                        if let Some((_, msg)) =
-                            turn_state.advance_phase(orchestrator::PhaseTrigger::FinalResponse)
-                        {
-                            self.set_work_phase(turn_state.phase().label());
-                            self.sink.emit(AgentEvent::Info(format!(
-                                "[phase:{}] {msg}",
-                                turn_state.phase().label()
-                            )));
-                        }
-                        continue;
+                if !objective_warning_emitted && !coverage.unresolved.is_empty() {
+                    let reminder =
+                        orchestrator::objective_runtime_reminder_from_coverage(&coverage);
+                    self.sink.emit(AgentEvent::Warn(reminder.clone()));
+                    self.append_latest_log("objective_unresolved", &reminder);
+                    self.history.push(Message {
+                        role: "user".to_string(),
+                        content: vec![Block::Text {
+                            text: format!("[runtime-note] {reminder}"),
+                        }],
+                    });
+                    self.checkpoint_latest_session("after_objective_warning");
+                    objective_warning_emitted = true;
+                    if let Some((_, msg)) =
+                        turn_state.advance_phase(orchestrator::PhaseTrigger::FinalResponse)
+                    {
+                        self.set_work_phase(turn_state.phase().label());
+                        self.sink.emit(AgentEvent::Info(format!(
+                            "[phase:{}] {msg}",
+                            turn_state.phase().label()
+                        )));
                     }
+                    continue;
                 }
                 if let Some((_, msg)) =
                     turn_state.advance_phase(orchestrator::PhaseTrigger::FinalResponse)
@@ -15726,10 +15349,6 @@ impl Agent {
                 );
                 break;
             }
-
-            turn_state.reset_protocol_response_streaks();
-            require_tool_call_next = false;
-            turn_state.begin_tool_round();
 
             if self.interrupt.load(Ordering::SeqCst) {
                 self.append_latest_log("tool_round_interrupted", "before tool execution");
@@ -15771,7 +15390,6 @@ impl Agent {
                 bulk_network: bool,
                 local_sudo_auth_needed: bool,
                 cache_key: Option<String>,
-                mutation_attempt_key: Option<String>,
                 bash_similarity_key: Option<String>,
                 plan: Plan,
             }
@@ -15785,44 +15403,20 @@ impl Agent {
                 let hosts = tool_policy::hosts_for_tool_call(&name, &input);
                 let bulk_network = tool_policy::looks_like_bulk_network_call(&name, &input);
                 let cache_key = orchestrator::network_cache_key(&name, &input);
-                let mutation_attempt_key =
-                    native_mutation_attempt_key(&self.sandbox_root, &name, &input);
                 let bash_similarity_key = if name == "bash" {
                     Some(orchestrator::normalize_bash_similarity_key(
                         input["command"].as_str().unwrap_or(""),
                     ))
+                } else if matches!(name.as_str(), "write_file" | "edit_file") {
+                    input["path"].as_str().map(|p| format!("{name}:{p}"))
                 } else {
-                    mutation_attempt_key.clone()
+                    None
                 };
 
                 let mut plan: Option<Plan> = None;
                 let mut local_sudo_auth_needed = false;
 
-                if let Some(msg) = turn_state.controlled_action_guard_for_attempt(
-                    &name,
-                    &input,
-                    mutation_attempt_key.as_deref(),
-                ) {
-                    plan = Some(Plan::Immediate {
-                        content: msg,
-                        is_error: Some(true),
-                    });
-                }
-
-                if plan.is_none()
-                    && controlled_execution
-                    && objective.repo_scoped_mutation
-                    && repo_scoped_external_mutation(&name, &input, &self.sandbox_root)
-                {
-                    plan = Some(Plan::Immediate {
-                        content: "runtime scope guard: this request is scoped to the current repo/project, but the proposed mutation targets Dext user-global state outside it. Ask for explicit confirmation before changing the external path.".to_string(),
-                        is_error: Some(true),
-                    });
-                }
-
-                if plan.is_none()
-                    && let Err(msg) = tool_policy::validate_tool_input(&name, &input)
-                {
+                if let Err(msg) = tool_policy::validate_tool_input(&name, &input) {
                     if let Some(budget_msg) = turn_state.tool_retry_guard(&name, &msg) {
                         emit_external_telemetry(self.sink.as_mut(), &turn_state);
                         plan = Some(Plan::Immediate {
@@ -15978,6 +15572,12 @@ impl Agent {
 
                 let plan = plan.expect("plan must be set");
 
+                if matches!(plan, Plan::Builtin)
+                    && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
+                {
+                    self.work_ledger_note_file_change(&input);
+                }
+
                 // Create recovery checkpoint before write-risk mutations.
                 if matches!(plan, Plan::Builtin) {
                     self.maybe_create_tool_checkpoint(&name, &input);
@@ -16021,7 +15621,6 @@ impl Agent {
                     bulk_network,
                     local_sudo_auth_needed,
                     cache_key,
-                    mutation_attempt_key,
                     bash_similarity_key,
                     plan,
                 });
@@ -16230,11 +15829,7 @@ impl Agent {
             let mut batch_labels: Vec<String> = Vec::new();
             let mut results = Vec::new();
             let mut round_external_failures: usize = 0;
-            let mut mutation_content_changed = false;
-            let mut unchanged_mutation_succeeded = false;
-            let mut mutation_attempted = false;
-            let mut cleanup_check_attempted = false;
-            let mut cleanup_checks_clean = true;
+            let mut mutation_succeeded = false;
             for (idx, p) in plans.into_iter().enumerate() {
                 let PlannedCall {
                     tool_use_id,
@@ -16247,7 +15842,6 @@ impl Agent {
                     bulk_network: _bulk_network,
                     local_sudo_auth_needed: _local_sudo_auth_needed,
                     cache_key,
-                    mutation_attempt_key,
                     bash_similarity_key,
                     plan,
                 } = p;
@@ -16304,40 +15898,16 @@ impl Agent {
                 }
 
                 let ok = !is_error.unwrap_or(false);
-                let mutating_call = ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
-                    || name == "bash"
-                        && input["command"]
-                            .as_str()
-                            .is_some_and(orchestrator::bash_command_likely_mutates_files);
-                mutation_attempted |= mutating_call;
-                if ran_builtin
-                    && objective.exhaustive_cleanup
-                    && orchestrator::cleanup_check_candidate(&name, &input)
+                if ok
+                    && ran_builtin
+                    && (ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
+                        || name == "bash"
+                            && input["command"]
+                                .as_str()
+                                .is_some_and(orchestrator::bash_command_likely_mutates_files))
                 {
-                    cleanup_check_attempted = true;
-                    cleanup_checks_clean &=
-                        ok && orchestrator::cleanup_check_has_no_residue(&name, &input, &content);
-                }
-                let mutation_operation_completed = ok && ran_builtin && mutating_call;
-                let mutation_no_content_delta = mutation_operation_completed
-                    && orchestrator::successful_mutation_result_has_no_content_delta(
-                        &name, &input, &content,
-                    );
-                let mutation_changed = mutation_operation_completed && !mutation_no_content_delta;
-                if mutation_no_content_delta {
-                    unchanged_mutation_succeeded = true;
-                    successful_unchanged_mutation_this_turn = true;
-                }
-                if mutation_changed {
-                    mutation_content_changed = true;
-                    successful_content_change_this_turn = true;
-                    if matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit") {
-                        self.work_ledger_note_file_change(&input);
-                    }
-                    if objective.exhaustive_cleanup {
-                        exhaustive_cleanup_verified = false;
-                    }
-                    turn_state.mark_content_changed();
+                    mutation_succeeded = true;
+                    turn_state.mark_mutation_succeeded();
                 }
                 let privacy_redaction = self.privacy.apply_tool_output(&name, &input, content);
                 let redacted_count = privacy_redaction.counts.total();
@@ -16454,21 +16024,6 @@ impl Agent {
                         );
                     }
                 }
-
-                if let Some(note) = turn_state.record_controlled_outcome_for_attempt(
-                    &name,
-                    &input,
-                    &content,
-                    is_error,
-                    mutation_attempt_key.as_deref(),
-                ) {
-                    self.sink.emit(AgentEvent::Warn(note.clone()));
-                    self.append_latest_log("execution_control", &note);
-                    content.push_str("\n\n[runtime-control]\n");
-                    content.push_str(&note);
-                }
-                emit_external_telemetry(self.sink.as_mut(), &turn_state);
-
                 let dynamic_result_cap = tool_result_context_cap_with_window(
                     &name,
                     &input,
@@ -16510,14 +16065,6 @@ impl Agent {
                 });
             }
 
-            if objective.exhaustive_cleanup {
-                if mutation_attempted {
-                    exhaustive_cleanup_verified = false;
-                } else if cleanup_check_attempted {
-                    exhaustive_cleanup_verified = cleanup_checks_clean;
-                }
-            }
-
             if runnable_indices.len() > 1 {
                 self.sink.emit(AgentEvent::ToolBatchEnd {
                     batch_id,
@@ -16534,31 +16081,6 @@ impl Agent {
             });
             self.checkpoint_latest_session("after_tool_results");
 
-            if let Some(halt) = turn_state.take_finalization_halt_message() {
-                self.sink.emit(AgentEvent::Warn(halt.clone()));
-                self.append_latest_log("execution_finalize_halt", &halt);
-                self.history.push(Message {
-                    role: "assistant".to_string(),
-                    content: vec![Block::Text { text: halt }],
-                });
-                self.checkpoint_latest_session("after_execution_finalize_halt");
-                break;
-            }
-
-            if let Some(note) = turn_state.take_empty_tool_call_recovery_message() {
-                require_tool_call_next = true;
-                self.sink.emit(AgentEvent::Warn(note.clone()));
-                self.append_latest_log("empty_tool_call_recovery", &note);
-                self.history.push(Message {
-                    role: "user".to_string(),
-                    content: vec![Block::Text {
-                        text: format!("[runtime-note] {note}"),
-                    }],
-                });
-                self.checkpoint_latest_session("after_empty_tool_call_recovery");
-                continue;
-            }
-
             if let Some(halt) = turn_state.empty_tool_call_halt_message() {
                 self.sink.emit(AgentEvent::Warn(halt.clone()));
                 self.append_latest_log("empty_tool_call_halt", &halt);
@@ -16571,7 +16093,6 @@ impl Agent {
             }
 
             if let Some(note) = empty_tool_call_loop_note {
-                require_tool_call_next = true;
                 self.sink.emit(AgentEvent::Warn(note.clone()));
                 self.append_latest_log("empty_tool_call_loop", &note);
                 self.history.push(Message {
@@ -16584,18 +16105,12 @@ impl Agent {
                 continue;
             }
 
-            if mutation_content_changed || unchanged_mutation_succeeded {
+            if mutation_succeeded {
                 action_contract_must_mutate = false;
                 action_contract_no_mutation_turns = 0;
-                require_tool_call_next = false;
             } else if action_contract_must_mutate {
-                turn_state.record_response_nonprogress();
-                if turn_state.should_finalize() {
-                    continue;
-                }
                 action_contract_no_mutation_turns =
                     action_contract_no_mutation_turns.saturating_add(1);
-                require_tool_call_next = controlled_execution;
                 let notes = self.action_contract_violation_runtime_notes(
                     action_contract_no_mutation_turns,
                     &mut implementation_fallback_emitted,
@@ -16852,22 +16367,13 @@ impl Agent {
                             match dtype {
                                 "text_delta" => {
                                     if let Some(t) = delta["text"].as_str() {
-                                        if self.effective_execution_policy()
-                                            == ExecutionPolicy::Open
-                                        {
-                                            self.sink.emit(AgentEvent::TextDelta(t.to_string()));
-                                        }
+                                        self.sink.emit(AgentEvent::TextDelta(t.to_string()));
                                         pb.text.push_str(t);
                                     }
                                 }
                                 "thinking_delta" => {
                                     if let Some(t) = delta["thinking"].as_str() {
-                                        if self.effective_execution_policy()
-                                            == ExecutionPolicy::Open
-                                        {
-                                            self.sink
-                                                .emit(AgentEvent::ThinkingDelta(t.to_string()));
-                                        }
+                                        self.sink.emit(AgentEvent::ThinkingDelta(t.to_string()));
                                         pb.text.push_str(t);
                                     }
                                 }
@@ -16894,22 +16400,12 @@ impl Agent {
                         let idx = data["index"].as_u64().unwrap_or(0) as usize;
                         if let Some(pb) = blocks.get(&idx) {
                             if pb.kind == "text" {
-                                if let Some(visible) = controlled_assistant_display_text(
-                                    &pb.text,
-                                    self.effective_execution_policy(),
-                                ) {
-                                    self.sink.emit(AgentEvent::TextBlockComplete(visible));
-                                }
+                                self.sink
+                                    .emit(AgentEvent::TextBlockComplete(pb.text.clone()));
                             } else if pb.kind == "thinking" {
-                                if let Some(visible) = controlled_assistant_display_text(
-                                    &pb.text,
-                                    self.effective_execution_policy(),
-                                ) {
-                                    self.sink.emit(AgentEvent::ThinkingBlockComplete(visible));
-                                }
-                            } else if pb.kind == "tool_use"
-                                && self.effective_execution_policy() == ExecutionPolicy::Open
-                            {
+                                self.sink
+                                    .emit(AgentEvent::ThinkingBlockComplete(pb.text.clone()));
+                            } else if pb.kind == "tool_use" {
                                 let privileged =
                                     needs_permission(&pb.name) && !self.allowed.contains(&pb.name);
                                 if !privileged {
@@ -17026,9 +16522,7 @@ impl Agent {
                             self.partial_stream_text
                                 .get_or_insert_with(String::new)
                                 .push_str(content);
-                            if self.effective_execution_policy() == ExecutionPolicy::Open {
-                                self.sink.emit(AgentEvent::TextDelta(content.to_string()));
-                            }
+                            self.sink.emit(AgentEvent::TextDelta(content.to_string()));
                             text_buf.push_str(content);
                         }
                         if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -17084,24 +16578,19 @@ impl Agent {
         let mut blocks: Vec<Block> = Vec::new();
         if !text_buf.is_empty() {
             self.partial_stream_text = None;
-            if let Some(visible) =
-                controlled_assistant_display_text(&text_buf, self.effective_execution_policy())
-            {
-                self.sink.emit(AgentEvent::TextBlockComplete(visible));
-            }
+            self.sink
+                .emit(AgentEvent::TextBlockComplete(text_buf.clone()));
             blocks.push(Block::Text { text: text_buf });
         }
         for (idx, (id, name, args)) in tool_calls {
             let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
             let summary = summarize_call(&name, &input);
             let call_id = normalize_tool_call_id(&id, 0, idx);
-            if self.effective_execution_policy() == ExecutionPolicy::Open {
-                self.sink.emit(AgentEvent::ToolCallPreview {
-                    call_id,
-                    name: name.clone(),
-                    summary,
-                });
-            }
+            self.sink.emit(AgentEvent::ToolCallPreview {
+                call_id,
+                name: name.clone(),
+                summary,
+            });
             blocks.push(Block::ToolUse { id, name, input });
         }
         Ok((blocks, finish_reason, usage))
@@ -17195,9 +16684,7 @@ impl Agent {
                             self.partial_stream_text
                                 .get_or_insert_with(String::new)
                                 .push_str(delta);
-                            if self.effective_execution_policy() == ExecutionPolicy::Open {
-                                self.sink.emit(AgentEvent::TextDelta(delta.to_string()));
-                            }
+                            self.sink.emit(AgentEvent::TextDelta(delta.to_string()));
                             text_buf.push_str(delta);
                         }
                     }
@@ -17209,9 +16696,7 @@ impl Agent {
                             self.partial_stream_text
                                 .get_or_insert_with(String::new)
                                 .push_str(text);
-                            if self.effective_execution_policy() == ExecutionPolicy::Open {
-                                self.sink.emit(AgentEvent::TextDelta(text.to_string()));
-                            }
+                            self.sink.emit(AgentEvent::TextDelta(text.to_string()));
                             text_buf.push_str(text);
                         }
                     }
@@ -17223,8 +16708,7 @@ impl Agent {
                             if let Some(visible) = reasoning_summary_stream_delta(
                                 &reasoning_buf,
                                 &mut reasoning_emitted,
-                            ) && self.effective_execution_policy() == ExecutionPolicy::Open
-                            {
+                            ) {
                                 self.sink.emit(AgentEvent::ThinkingDelta(visible));
                             }
                         }
@@ -17238,8 +16722,7 @@ impl Agent {
                             if let Some(visible) = reasoning_summary_stream_delta(
                                 &reasoning_buf,
                                 &mut reasoning_emitted,
-                            ) && self.effective_execution_policy() == ExecutionPolicy::Open
-                            {
+                            ) {
                                 self.sink.emit(AgentEvent::ThinkingDelta(visible));
                             }
                         }
@@ -17351,11 +16834,8 @@ impl Agent {
         if !reasoning_buf.is_empty() {
             let reasoning = normalize_reasoning_summary_text(&reasoning_buf);
             if !reasoning.is_empty() {
-                if let Some(visible) =
-                    controlled_assistant_display_text(&reasoning, self.effective_execution_policy())
-                {
-                    self.sink.emit(AgentEvent::ThinkingBlockComplete(visible));
-                }
+                self.sink
+                    .emit(AgentEvent::ThinkingBlockComplete(reasoning.clone()));
                 blocks.push(Block::Thinking {
                     text: reasoning,
                     signature: None,
@@ -17364,11 +16844,8 @@ impl Agent {
         }
         if !text_buf.is_empty() {
             self.partial_stream_text = None;
-            if let Some(visible) =
-                controlled_assistant_display_text(&text_buf, self.effective_execution_policy())
-            {
-                self.sink.emit(AgentEvent::TextBlockComplete(visible));
-            }
+            self.sink
+                .emit(AgentEvent::TextBlockComplete(text_buf.clone()));
             blocks.push(Block::Text { text: text_buf });
         }
         for (idx, item_id) in tool_call_order.iter().enumerate() {
@@ -17386,13 +16863,11 @@ impl Agent {
                 call_id
             };
             let display_call_id = normalize_tool_call_id(&block_id, 0, idx);
-            if self.effective_execution_policy() == ExecutionPolicy::Open {
-                self.sink.emit(AgentEvent::ToolCallPreview {
-                    call_id: display_call_id,
-                    name: name.clone(),
-                    summary,
-                });
-            }
+            self.sink.emit(AgentEvent::ToolCallPreview {
+                call_id: display_call_id,
+                name: name.clone(),
+                summary,
+            });
             blocks.push(Block::ToolUse {
                 id: block_id,
                 name,
@@ -20421,10 +19896,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /execution [policy]       next-turn autonomy: auto|open|adaptive|bounded"
-            );
-            let _ = writeln!(
-                w,
                 "  /context [standard|frugal|tiny] context/cap mode; tiny is skinny local mode"
             );
             let _ = writeln!(
@@ -20954,30 +20425,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 }
             }
         }
-        "execution" | "execution-policy" => {
-            match arg.to_ascii_lowercase().as_str() {
-                "" | "status" => {}
-                "auto" | "default" => agent.set_execution_policy_override(None),
-                _ => {
-                    if let Some(policy) = ExecutionPolicy::parse(arg) {
-                        agent.set_execution_policy_override(Some(policy));
-                    } else {
-                        let _ =
-                            writeln!(w, "usage: /execution [auto|open|adaptive|bounded|status]");
-                    }
-                }
-            }
-            let source = if agent.execution_policy_override.is_some() {
-                "override"
-            } else {
-                "model/provider default"
-            };
-            let _ = writeln!(
-                w,
-                "execution policy: {} ({source}; applies on the next turn)",
-                agent.effective_execution_policy().as_str()
-            );
-        }
         "context" | "context-mode" => {
             if arg.is_empty() || arg.eq_ignore_ascii_case("status") {
                 let _ = writeln!(w, "context mode: {}", agent.context_mode.as_str());
@@ -21005,9 +20452,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 );
             } else if let Some(profile) = ToolProfile::parse(arg) {
                 agent.tool_profile = profile;
-                if agent.context_mode.is_frugal() {
-                    agent.tool_profile = ToolProfile::Lean;
-                }
                 agent.refresh_tools_for_context();
                 let _ = writeln!(
                     w,
@@ -21100,16 +20544,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 agent.thinking_effort.as_str()
             );
             let _ = writeln!(w, "context mode: {}", agent.context_mode.as_str());
-            let _ = writeln!(
-                w,
-                "execution policy: {} ({})",
-                agent.effective_execution_policy().as_str(),
-                if agent.execution_policy_override.is_some() {
-                    "override"
-                } else {
-                    "model/provider default"
-                }
-            );
             let _ = writeln!(w, "schemas: {}", agent.wire_tool_profile().as_str());
             let _ = writeln!(w, "toolset: {}", agent.tool_context_profile().as_str());
             let _ = writeln!(w, "compact threshold: {}", agent.compact_threshold_chars());
@@ -21853,25 +21287,12 @@ fn block_text(block: &Block) -> Option<&str> {
     }
 }
 
-fn protocol_block_text(block: &Block) -> Option<&str> {
-    match block {
-        Block::Text { text } | Block::PartialStream { text } | Block::Thinking { text, .. } => {
-            Some(text.as_str())
-        }
-        _ => None,
-    }
-}
-
 fn assistant_blocks_text(blocks: &[Block]) -> String {
     blocks
         .iter()
         .filter_map(block_text)
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn tool_call_has_empty_required_arguments(name: &str, input: &Value) -> bool {
-    !tool_policy::missing_required_tool_fields(name, input).is_empty()
 }
 
 fn assistant_text_has_implementation_commitment(text: &str) -> bool {
@@ -21907,102 +21328,6 @@ fn assistant_text_has_implementation_commitment(text: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
-fn assistant_text_has_content_change_claim(text: &str) -> bool {
-    let lower = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    !lower.is_empty()
-        && ([
-            "i deleted",
-            "i removed",
-            "i installed",
-            "i updated",
-            "i wrote",
-            "i saved",
-            "i fixed",
-            "has been deleted",
-            "has been removed",
-            "has been installed",
-            "has been updated",
-            "is written and saved",
-            "is complete and saved",
-            "is now installed",
-            "successfully deleted",
-            "successfully removed",
-            "successfully installed",
-            "successfully updated",
-            "successfully wrote",
-            "successfully saved",
-            "successfully fixed",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-            || lower.contains("all ")
-                && [" fixed", " resolved", " removed", " deleted", " updated"]
-                    .iter()
-                    .any(|needle| lower.contains(needle)))
-}
-
-fn assistant_text_has_completion_claim(text: &str) -> bool {
-    let lower = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    !lower.is_empty()
-        && ([
-            "i deleted",
-            "i removed",
-            "i installed",
-            "i updated",
-            "i wrote",
-            "i saved",
-            "i fixed",
-            "has been deleted",
-            "has been removed",
-            "has been installed",
-            "has been updated",
-            "is now installed",
-            "is written and saved",
-            "is complete and saved",
-            "successfully deleted",
-            "successfully removed",
-            "successfully installed",
-            "successfully updated",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
-            || lower.contains("all ")
-                && [" fixed", " resolved", " removed", " deleted", " updated"]
-                    .iter()
-                    .any(|needle| lower.contains(needle)))
-}
-
-fn repo_scoped_external_mutation(name: &str, input: &Value, root: &Path) -> bool {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    if matches!(name, "write_file" | "edit_file" | "multi_edit") {
-        return input["path"]
-            .as_str()
-            .and_then(|path| canonicalize_read_tool_path(&root, path).ok())
-            .is_some_and(|path| !path.starts_with(&root));
-    }
-    if name != "bash" {
-        return false;
-    }
-    let command = input["command"].as_str().unwrap_or("");
-    if !orchestrator::bash_command_likely_mutates_files(command) {
-        return false;
-    }
-    let dext_home = dext_state_dir();
-    let dext_home = dext_home.to_string_lossy();
-    command.contains(dext_home.as_ref())
-        || command.contains("~/.dext/")
-        || command.contains("$HOME/.dext/")
-        || command.contains("${HOME}/.dext/")
-}
-
 pub(crate) fn text_line_looks_like_pseudo_tool_start(line: &str) -> bool {
     let trimmed = line.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -22017,8 +21342,6 @@ pub(crate) fn text_line_looks_like_pseudo_tool_start(line: &str) -> bool {
         || lower.starts_with("multi_tool_use.")
         || lower.starts_with("<|tool")
         || lower.starts_with("<tool")
-        || lower.contains("<function=")
-        || lower.contains("<parameter=")
         || lower.starts_with("tool_use")
         || lower.starts_with("function_call")
         || compact.starts_with("{\"recipient")
@@ -22038,8 +21361,6 @@ pub(crate) fn text_line_looks_like_pseudo_tool_syntax(line: &str) -> bool {
         || lower.starts_with("multi_tool_use.")
         || lower.starts_with("<|tool")
         || lower.starts_with("<tool")
-        || lower.contains("<function=")
-        || lower.contains("<parameter=")
         || lower.starts_with("tool_use")
         || lower.starts_with("tool call:") && lower.contains("functions.")
         || lower.starts_with("function_call")
@@ -22058,12 +21379,10 @@ pub(crate) fn text_line_looks_like_pseudo_tool_syntax(line: &str) -> bool {
             && compact.contains("\"command\""))
 }
 
-#[cfg(test)]
 pub(crate) fn text_contains_pseudo_tool_syntax(text: &str) -> bool {
     text.lines().any(text_line_looks_like_pseudo_tool_syntax)
 }
 
-#[cfg(test)]
 fn text_contains_pseudo_tool_syntax_for_context(text: &str, context_mode: ContextMode) -> bool {
     if context_mode.is_frugal() {
         text.lines().any(|line| {
@@ -22075,21 +21394,25 @@ fn text_contains_pseudo_tool_syntax_for_context(text: &str, context_mode: Contex
     }
 }
 
-#[cfg(test)]
 fn blocks_contain_pseudo_tool_syntax(blocks: &[Block]) -> bool {
     blocks
         .iter()
-        .filter_map(protocol_block_text)
+        .filter_map(block_text)
         .any(text_contains_pseudo_tool_syntax)
 }
 
-fn blocks_contain_pseudo_tool_syntax_or_start(blocks: &[Block]) -> bool {
-    blocks.iter().filter_map(protocol_block_text).any(|text| {
-        text.lines().any(|line| {
-            text_line_looks_like_pseudo_tool_syntax(line)
-                || text_line_looks_like_pseudo_tool_start(line)
-        })
-    })
+fn blocks_contain_pseudo_tool_syntax_for_context(
+    blocks: &[Block],
+    context_mode: ContextMode,
+) -> bool {
+    if context_mode.is_frugal() {
+        blocks
+            .iter()
+            .filter_map(block_text)
+            .any(|text| text_contains_pseudo_tool_syntax_for_context(text, context_mode))
+    } else {
+        blocks_contain_pseudo_tool_syntax(blocks)
+    }
 }
 
 fn action_contract_runtime_note(no_mutation_turns: u32) -> String {
@@ -22099,22 +21422,8 @@ fn action_contract_runtime_note(no_mutation_turns: u32) -> String {
     )
 }
 
-fn pseudo_tool_runtime_note(tools_available: bool) -> String {
-    if tools_available {
-        "Malformed tool response suppressed; no tool ran. Retry with one native structured tool call with complete arguments, or return a supported final answer without tool syntax."
-    } else {
-        "Malformed tool response suppressed; no tool ran. Tools are disabled for bounded finalization; return the best supported result, label unresolved work, and emit no tool syntax."
-    }
-    .to_string()
-}
-
-fn unverified_completion_runtime_note(tools_available: bool) -> String {
-    if tools_available {
-        "runtime guidance: completion claim is unsupported because no successful mutation occurred in this turn. Use a real mutating tool call and verify its result, or state that the change is blocked."
-    } else {
-        "runtime guidance: completion claim is unsupported and bounded finalization has disabled tools. Return the supported partial result and explicitly label the unresolved mutation."
-    }
-    .to_string()
+fn pseudo_tool_runtime_note() -> String {
+    "runtime guidance: pseudo-tool syntax emitted as plain text is invalid progress. Use an actual provider tool_use block, or state a concise blocked reason if no tool can run.".to_string()
 }
 
 fn final_objective_warning_from_coverage(coverage: &orchestrator::ObjectiveCoverage) -> String {
@@ -22519,7 +21828,6 @@ pub(crate) struct CliOptions {
     pub(crate) browser_recipe: Option<BrowserRecipe>,
     pub(crate) thinking_effort: Option<ThinkingEffort>,
     pub(crate) context_mode: Option<ContextMode>,
-    pub(crate) execution_policy: Option<ExecutionPolicy>,
     pub(crate) tool_context_profile: Option<ToolContextProfile>,
     pub(crate) tool_profile: Option<ToolProfile>,
     pub(crate) preview_mode: Option<MutationPreviewMode>,
@@ -22544,7 +21852,6 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut browser_recipe: Option<BrowserRecipe> = None;
     let mut thinking_effort: Option<ThinkingEffort> = None;
     let mut context_mode: Option<ContextMode> = None;
-    let mut execution_policy: Option<ExecutionPolicy> = None;
     let mut tool_context_profile: Option<ToolContextProfile> = None;
     let mut tool_profile: Option<ToolProfile> = None;
     let mut preview_mode: Option<MutationPreviewMode> = None;
@@ -22588,17 +21895,6 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                 context_mode = Some(ContextMode::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
                         "invalid --context-mode '{value}' (expected standard|frugal|tiny)"
-                    )
-                })?);
-            }
-            "--execution-policy" | "--execution" => {
-                i += 1;
-                let value = argv.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--execution-policy requires open|adaptive|bounded")
-                })?;
-                execution_policy = Some(ExecutionPolicy::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid execution policy '{value}' (expected open|adaptive|bounded)"
                     )
                 })?);
             }
@@ -22770,17 +22066,6 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     )
                 })?);
             }
-            _ if arg.starts_with("--execution-policy=") || arg.starts_with("--execution=") => {
-                let value = arg
-                    .strip_prefix("--execution-policy=")
-                    .or_else(|| arg.strip_prefix("--execution="))
-                    .unwrap_or_default();
-                execution_policy = Some(ExecutionPolicy::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid execution policy '{value}' (expected open|adaptive|bounded)"
-                    )
-                })?);
-            }
             _ if arg.starts_with("--pack=") => {
                 let value = arg.trim_start_matches("--pack=");
                 if value.trim().is_empty() {
@@ -22896,7 +22181,6 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         browser_recipe,
         thinking_effort,
         context_mode,
-        execution_policy,
         tool_context_profile,
         tool_profile,
         preview_mode,
@@ -23108,9 +22392,6 @@ async fn main() -> Result<()> {
         );
         println!("       dext --tiny          extra-light context mode with condensed prompt");
         println!("       dext --context-mode standard|frugal|tiny");
-        println!(
-            "       dext --execution-policy open|adaptive|bounded  override model/provider execution policy"
-        );
         println!("       dext --toolset default|full  choose provider-visible tool count profile");
         println!("       dext --tool-context-profile default|full  alias for --toolset");
         println!(
@@ -23129,7 +22410,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_EXECUTION_POLICY=open|adaptive|bounded, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }
@@ -23190,9 +22471,6 @@ async fn main() -> Result<()> {
     if let Some(mode) = opts.context_mode {
         agent.set_context_mode(mode);
     }
-    if let Some(policy) = opts.execution_policy {
-        agent.set_execution_policy_override(Some(policy));
-    }
     if let Some(profile) = opts.tool_context_profile {
         agent.tool_context_profile = profile.effective(agent.context_mode);
     }
@@ -23201,9 +22479,6 @@ async fn main() -> Result<()> {
     }
     if let Some(mode) = opts.preview_mode {
         agent.preview_mode = mode;
-    }
-    if agent.context_mode.is_frugal() {
-        agent.tool_profile = ToolProfile::Lean;
     }
     agent.refresh_tools_for_context();
     if opts.fork {
@@ -23224,20 +22499,19 @@ async fn main() -> Result<()> {
         };
         match loaded {
             Ok(path) => {
-                if let Some(mode) = opts.context_mode {
+                let configured_context_mode = opts.context_mode.or_else(|| {
+                    std::env::var("DEXT_CONTEXT_MODE")
+                        .ok()
+                        .and_then(|value| ContextMode::parse(&value))
+                });
+                if let Some(mode) = configured_context_mode {
                     agent.set_context_mode(mode);
-                }
-                if let Some(policy) = opts.execution_policy {
-                    agent.set_execution_policy_override(Some(policy));
                 }
                 if let Some(profile) = opts.tool_context_profile {
                     agent.tool_context_profile = profile.effective(agent.context_mode);
                 }
                 if let Some(profile) = opts.tool_profile {
                     agent.tool_profile = profile;
-                }
-                if agent.context_mode.is_frugal() {
-                    agent.tool_profile = ToolProfile::Lean;
                 }
                 agent.refresh_tools_for_context();
                 if opts.fork {

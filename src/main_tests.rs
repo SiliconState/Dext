@@ -1,7 +1,7 @@
 use super::*;
 use crate::provider::{
-    DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS, DEFAULT_LOCAL_MODEL, ModelCapabilities, ModelPricing,
-    ModelSpec, clear_cached_local_llama_context_windows, list_models_for_available_providers,
+    DEFAULT_LOCAL_MODEL, ModelCapabilities, ModelPricing, ModelSpec,
+    clear_cached_local_llama_context_windows, list_models_for_available_providers,
     merge_provider_profile, normalize_chatgpt_model_slug, parse_llama_context_window,
     refresh_local_llama_context_window, resolve_provider_model_selection,
 };
@@ -104,9 +104,9 @@ fn test_agent(root: &Path) -> Agent {
         sandbox_profile: SandboxProfile::default(),
         browser_recipe: BrowserRecipe::default(),
         context_mode: ContextMode::default(),
+        context_mode_explicit: false,
         tool_context_profile: ToolContextProfile::default(),
         tool_profile: ToolProfile::default(),
-        execution_policy_override: None,
         preview_mode: MutationPreviewMode::default(),
         budget_cap: None,
         budget_exhausted: false,
@@ -502,19 +502,9 @@ fn injected_steering_is_ledger_visible_and_final_required() {
     agent.install_steering(rx, tx.clone());
     tx.send("fix the rg border overflow and tell me what happened".to_string())
         .expect("send steering");
-    let mut turn_state =
-        orchestrator::TurnRuntimeState::with_execution_policy(ExecutionPolicy::Bounded);
-    for _ in 0..13 {
-        turn_state.begin_tool_round();
-    }
-    assert!(turn_state.should_finalize());
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
 
     assert!(agent.inject_queued_steering(&mut turn_state, 3, 7, true));
-    assert!(!turn_state.should_finalize());
-    assert_eq!(
-        turn_state.control_level(),
-        orchestrator::TurnControlLevel::Guarded
-    );
     let ledger = agent.work_ledger_prompt();
     assert!(ledger.contains("queued_user_updates:"), "{ledger}");
     assert!(ledger.contains("rg border overflow"), "{ledger}");
@@ -2169,7 +2159,6 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         saved.context_mode = ContextMode::Standard;
         saved.tool_context_profile = ToolContextProfile::Full;
         saved.tool_profile = ToolProfile::Full;
-        saved.execution_policy_override = Some(ExecutionPolicy::Bounded);
         saved.refresh_tools_for_context();
         saved.system = "saved-system".to_string();
         saved.allowed.insert("read_file".to_string());
@@ -2304,10 +2293,6 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         assert_eq!(saved_header.context_mode, ContextMode::Standard);
         assert_eq!(saved_header.tool_context_profile, ToolContextProfile::Full);
         assert_eq!(saved_header.tool_profile, ToolProfile::Full);
-        assert_eq!(
-            saved_header.execution_policy_override,
-            Some(ExecutionPolicy::Bounded)
-        );
         assert!(saved_header.exposed_tools.contains(&"jq".to_string()));
         assert_eq!(saved_header.work_ledger.current_phase, "done");
         assert!(saved_header.work_ledger.next_actions.is_empty());
@@ -2326,14 +2311,6 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         assert_eq!(loaded.context_mode, ContextMode::Standard);
         assert_eq!(loaded.tool_context_profile(), ToolContextProfile::Full);
         assert_eq!(loaded.tool_profile, ToolProfile::Full);
-        assert_eq!(
-            loaded.execution_policy_override,
-            Some(ExecutionPolicy::Bounded)
-        );
-        assert_eq!(
-            loaded.effective_execution_policy(),
-            ExecutionPolicy::Bounded
-        );
         assert!(loaded.tools.iter().any(|t| t.name == "jq"));
         assert_eq!(loaded.system, "saved-system");
         assert_eq!(loaded.sandbox_root, sandbox);
@@ -2539,24 +2516,6 @@ fn session_export_target_parses_html_and_jsonl() {
     let (format, path) = parse_session_export_target("archive.jsonl");
     assert_eq!(format, SessionExportFormat::Jsonl);
     assert_eq!(path, PathBuf::from("archive.jsonl"));
-}
-
-#[test]
-fn session_header_fallback_preserves_valid_execution_policy_override() -> Result<()> {
-    let header = parse_session_header(
-        r#"{"version":1,"model":"legacy-model","system":"legacy-system","thinking_effort":"future-value","execution_policy_override":"bounded"}"#,
-    )?;
-    assert_eq!(header.thinking_effort, ThinkingEffort::default());
-    assert_eq!(
-        header.execution_policy_override,
-        Some(ExecutionPolicy::Bounded)
-    );
-
-    let invalid = parse_session_header(
-        r#"{"version":1,"model":"legacy-model","system":"legacy-system","thinking_effort":"future-value","execution_policy_override":"not-a-policy"}"#,
-    )?;
-    assert_eq!(invalid.execution_policy_override, None);
-    Ok(())
 }
 
 #[test]
@@ -3118,15 +3077,6 @@ fn sync_work_ledger_keeps_only_unresolved_objective_checkpoints_pending() {
             input: json!({"path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
         }],
     });
-    agent.history.push(Message {
-        role: "user".to_string(),
-        content: vec![Block::ToolResult {
-            tool_use_id: "call-edit".to_string(),
-            content: "edited src/lib.rs".to_string(),
-            is_error: Some(false),
-            metadata: ToolResultMetadata::default(),
-        }],
-    });
 
     let coverage = objective.assess_history(&agent.history);
     agent.sync_work_ledger_with_objective_coverage(&coverage);
@@ -3339,7 +3289,7 @@ fn approval_and_sandbox_profiles_enforce_policy() {
 }
 
 #[test]
-fn default_toolset_hides_specialized_tools_and_frugal_is_smaller() {
+fn default_and_frugal_toolsets_keep_core_capabilities() {
     let root = temp_test_dir("toolset-default-frugal");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
@@ -3371,12 +3321,20 @@ fn default_toolset_hides_specialized_tools_and_frugal_is_smaller() {
     agent.context_mode = ContextMode::Frugal;
     agent.refresh_tools_for_context();
     let frugal_names: HashSet<&str> = agent.tools.iter().map(|t| t.name).collect();
-    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Frugal);
-    assert!(frugal_names.len() < default_names.len());
-    assert!(!frugal_names.contains("http"));
+    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
+    assert!(frugal_names.is_superset(&default_names));
+    for name in ["jq", "fzf", "awk", "git_log", "csvkit"] {
+        assert!(
+            frugal_names.contains(name),
+            "full toolset should retain {name}"
+        );
+    }
+    assert!(frugal_names.contains("http"));
+    assert!(frugal_names.contains("git_commit"));
     assert!(frugal_names.contains("bash"));
     assert!(frugal_names.contains("git_diff"));
 
+    agent.tool_context_profile = ToolContextProfile::Default;
     agent.allowed.insert("jq".to_string());
     agent.allowed.insert("bash".to_string());
     agent.deny_tools.insert("csvkit".to_string());
@@ -5192,65 +5150,24 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(maybe_preserve_partial_stream(
         &blocks,
         &mut history,
-        ContextMode::Standard,
-        false,
+        ContextMode::Standard
     ));
     assert_eq!(history.len(), 1);
     assert!(!maybe_preserve_partial_stream(
         &blocks,
         &mut history,
-        ContextMode::Standard,
-        false,
+        ContextMode::Standard
     ));
     assert_eq!(history.len(), 1);
 
     let raw_tool_text = vec![Block::Text {
         text: "to=functions.bash {\"command\":\"cargo test\"}".to_string(),
     }];
-    let partial_tool_opener = vec![Block::Text {
-        text: "Preparing the call:\nto=".to_string(),
-    }];
-    let mut controlled_history = Vec::new();
-    assert!(maybe_preserve_partial_stream(
-        &partial_tool_opener,
-        &mut controlled_history,
-        ContextMode::Standard,
-        true,
-    ));
-    let controlled_text = assistant_text(&controlled_history);
-    assert!(controlled_text.contains("Malformed tool response suppressed"));
-    assert!(!controlled_text.contains("to="), "{controlled_text}");
-
-    let mixed_response = vec![
-        Block::Text {
-            text: "to=functions.write_file {\"path\":\"bad\"}".to_string(),
-        },
-        Block::ToolUse {
-            id: "call_valid".to_string(),
-            name: "write_file".to_string(),
-            input: json!({"path": "good.txt", "content": "ok"}),
-        },
-    ];
-    let sanitized = assistant_blocks_for_context(&mixed_response, ContextMode::Standard, true);
-    assert!(matches!(
-        sanitized.first(),
-        Some(Block::Text { text }) if text.contains("Malformed tool response suppressed")
-    ));
-    assert!(sanitized.iter().any(|block| matches!(
-        block,
-        Block::ToolUse { id, name, input }
-            if id == "call_valid"
-                && name == "write_file"
-                && input["path"] == "good.txt"
-    )));
-    assert!(!assistant_blocks_text(&sanitized).contains("bad"));
-
     let mut history = Vec::new();
     assert!(maybe_preserve_partial_stream(
         &raw_tool_text,
         &mut history,
-        ContextMode::Standard,
-        false,
+        ContextMode::Standard
     ));
     assert_eq!(history.len(), 1);
     assert!(matches!(
@@ -5262,8 +5179,7 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(maybe_preserve_partial_stream(
         &raw_tool_text,
         &mut history,
-        ContextMode::Frugal,
-        false,
+        ContextMode::Frugal
     ));
     assert_eq!(history.len(), 1);
     assert!(matches!(
@@ -5278,8 +5194,7 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(maybe_preserve_partial_stream(
         &multiline_raw_tool_text,
         &mut history,
-        ContextMode::Tiny,
-        false,
+        ContextMode::Tiny
     ));
     assert_eq!(history.len(), 1);
     assert!(matches!(
@@ -5287,33 +5202,19 @@ fn partial_stream_preserve_only_text_blocks() {
         Block::Text { text } if text.contains("tool call redacted") && !text.contains("command") && !text.contains("cargo test")
     ));
 
-    let xml_tool_text = vec![Block::Text {
-        text: "[tool call redacted; waiting for structured tool event] <function=bash>\n<parameter=command>ls /home/baks/.dext/shelves/research/packs/autoresearch/hooks/</parameter>\n<parameter=timeout>10</parameter>\n</function>\n</tool_call>".to_string(),
+    let xml_raw_tool_text = vec![Block::Text {
+        text: "before <tool_call>\n<function=bash>\n<parameter=command>cargo test</parameter>\n</tool_call> after".to_string(),
     }];
-    let mut controlled_history = Vec::new();
+    let mut history = Vec::new();
     assert!(maybe_preserve_partial_stream(
-        &xml_tool_text,
-        &mut controlled_history,
-        ContextMode::Standard,
-        true,
+        &xml_raw_tool_text,
+        &mut history,
+        ContextMode::Frugal
     ));
-    let controlled_text = assistant_text(&controlled_history);
-    assert!(controlled_text.contains("Malformed tool response suppressed"));
-    for leaked in [
-        "tool call redacted",
-        "<tool_call>",
-        "<function",
-        "<parameter",
-        "autoresearch/hooks",
-    ] {
-        assert!(!controlled_text.contains(leaked), "{controlled_text}");
-    }
-    let raw_xml = assistant_blocks_text(&xml_tool_text);
-    assert!(controlled_assistant_display_text(&raw_xml, ExecutionPolicy::Adaptive).is_none());
-    assert_eq!(
-        controlled_assistant_display_text(&raw_xml, ExecutionPolicy::Open).as_deref(),
-        Some(raw_xml.as_str())
-    );
+    assert!(matches!(
+        &history[0].content[0],
+        Block::Text { text } if text.contains("before") && text.contains("tool call redacted") && text.contains("after") && !text.contains("cargo test")
+    ));
 
     let tool_only = vec![Block::ToolUse {
         id: "call_1".to_string(),
@@ -5323,8 +5224,7 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(!maybe_preserve_partial_stream(
         &tool_only,
         &mut history,
-        ContextMode::Tiny,
-        false,
+        ContextMode::Tiny
     ));
 }
 
@@ -6365,8 +6265,10 @@ fn slash_tools_switches_specialized_tool_visibility() {
     assert!(agent.tools.iter().any(|t| t.name == "jq"));
 
     assert_eq!(handle_slash("/context frugal", &mut agent), Some(true));
+    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
+    assert!(agent.tools.iter().any(|t| t.name == "jq"));
     assert_eq!(handle_slash("/tools default", &mut agent), Some(true));
-    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Frugal);
+    assert_eq!(agent.tool_context_profile(), ToolContextProfile::Default);
     assert!(agent.tools.iter().all(|t| t.name != "jq"));
     let slash = drain_events(&mut rx)
         .into_iter()
@@ -6378,7 +6280,7 @@ fn slash_tools_switches_specialized_tool_visibility() {
         .join("\n");
     assert!(slash.contains("tools -> full"), "{slash}");
     assert!(slash.contains("context mode -> frugal"), "{slash}");
-    assert!(slash.contains("pins tools frugal"), "{slash}");
+    assert!(slash.contains("tools -> default"), "{slash}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -6427,6 +6329,100 @@ fn compose_system_parts_includes_recall_md() {
 }
 
 #[test]
+fn local_provider_defaults_to_frugal_without_changing_frontier_default() {
+    assert_eq!(
+        default_context_mode_for_provider("local", ApiProvider::OpenAi, "http://127.0.0.1:8080"),
+        ContextMode::Frugal
+    );
+    assert_eq!(
+        default_context_mode_for_provider("custom", ApiProvider::OpenAi, "http://localhost:9000"),
+        ContextMode::Frugal
+    );
+    assert_eq!(
+        default_context_mode_for_provider("openai", ApiProvider::OpenAi, "https://api.openai.com"),
+        ContextMode::Standard
+    );
+}
+
+#[test]
+fn provider_switches_update_only_automatic_context_mode() {
+    let root = temp_test_dir("automatic-context-provider-switch");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.context_mode_explicit = false;
+
+    let local = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "local")
+        .expect("local profile");
+    agent.apply_runtime_provider(ResolvedProviderConfig {
+        model: local.default_model.clone(),
+        profile: local,
+        api_key: String::new(),
+        key_source: "not-required".to_string(),
+        base_url: String::new(),
+        requires_api_key: false,
+    });
+    assert_eq!(agent.context_mode, ContextMode::Frugal);
+
+    let openai = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile");
+    agent.apply_runtime_provider(ResolvedProviderConfig {
+        model: openai.default_model.clone(),
+        profile: openai,
+        api_key: "test".to_string(),
+        key_source: "test".to_string(),
+        base_url: "https://api.openai.com".to_string(),
+        requires_api_key: true,
+    });
+    assert_eq!(agent.context_mode, ContextMode::Standard);
+
+    agent.set_context_mode(ContextMode::Tiny);
+    let local = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "local")
+        .expect("local profile");
+    agent.apply_runtime_provider(ResolvedProviderConfig {
+        model: local.default_model.clone(),
+        profile: local,
+        api_key: String::new(),
+        key_source: "not-required".to_string(),
+        base_url: String::new(),
+        requires_api_key: false,
+    });
+    assert_eq!(agent.context_mode, ContextMode::Tiny);
+    assert!(agent.context_mode_explicit);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn legacy_session_context_mode_preserves_nonstandard_as_explicit() {
+    let mut value = serde_json::to_value(SessionHeader::default()).expect("serialize header");
+    value
+        .as_object_mut()
+        .expect("header object")
+        .remove("context_mode_explicit");
+    value
+        .as_object_mut()
+        .expect("header object")
+        .insert("context_mode".to_string(), json!("tiny"));
+    let header = parse_session_header(&value.to_string()).expect("parse legacy tiny header");
+    assert_eq!(header.context_mode, ContextMode::Tiny);
+    assert!(header.context_mode_explicit);
+
+    value
+        .as_object_mut()
+        .expect("header object")
+        .insert("context_mode".to_string(), json!("standard"));
+    let header = parse_session_header(&value.to_string()).expect("parse legacy standard header");
+    assert_eq!(header.context_mode, ContextMode::Standard);
+    assert!(!header.context_mode_explicit);
+}
+
+#[test]
 fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
     assert_eq!(ContextMode::parse("tiny"), Some(ContextMode::Tiny));
     assert_eq!(ContextMode::parse("skinny"), Some(ContextMode::Tiny));
@@ -6450,7 +6446,7 @@ fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
     assert_eq!(ToolContextProfile::parse_selectable("frugal"), None);
     assert_eq!(
         ToolContextProfile::Full.effective(ContextMode::Frugal),
-        ToolContextProfile::Frugal
+        ToolContextProfile::Full
     );
     assert_eq!(
         ToolContextProfile::Frugal.effective(ContextMode::Standard),
@@ -6486,16 +6482,18 @@ fn systems_preserve_tool_protocol_guardrails_and_table_guidance() {
     let mut agent = test_agent(&root);
     agent.context_mode = ContextMode::Frugal;
     let (frugal_stable, _env) = agent.compose_system_parts();
+    assert!(frugal_stable.contains("Frugal workflow"), "{frugal_stable}");
     assert!(
-        frugal_stable.contains("actual provider tool calls"),
+        frugal_stable.contains("required input and observable output"),
         "{frugal_stable}"
     );
     assert!(
-        frugal_stable.contains("Never print raw tool syntax"),
+        frugal_stable.contains("repair only the failed step"),
         "{frugal_stable}"
     );
     assert!(
-        TINY_SYSTEM.contains("real tool calls only"),
+        TINY_SYSTEM.contains("required input and observable output")
+            && TINY_SYSTEM.contains("repair only the failed step"),
         "{TINY_SYSTEM}"
     );
     assert!(
@@ -6561,10 +6559,7 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
         history_char_budget_with_override(DEFAULT_LOCAL_MODEL, None, ContextMode::Tiny),
         32_000
     );
-    assert_eq!(
-        model_context_window(DEFAULT_LOCAL_MODEL),
-        DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
-    );
+    assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 200_000);
     assert_eq!(
         active_history_char_budget_with_override(DEFAULT_LOCAL_MODEL, None, ContextMode::Tiny),
         32_000
@@ -6797,23 +6792,21 @@ fn llama_context_parser_prefers_runtime_ctx_fields() {
 }
 
 #[test]
-fn local_llama_context_cache_overrides_builtin_local_default() {
+fn local_llama_context_cache_overrides_generic_fallback_for_arbitrary_alias() {
     let _guard = env_lock();
     unsafe {
         std::env::remove_var("DEXT_CONTEXT_WINDOW");
         std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
     }
     clear_cached_local_llama_context_windows();
-    assert_eq!(
-        model_context_window(DEFAULT_LOCAL_MODEL),
-        crate::provider::DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS
-    );
-    crate::provider::set_cached_local_llama_context_window(DEFAULT_LOCAL_MODEL, 30_000);
-    assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 30_000);
+    let model = "arbitrary-local-runtime-model";
+    assert_eq!(model_context_window(model), 200_000);
+    crate::provider::set_cached_local_llama_context_window(model, 30_000);
+    assert_eq!(model_context_window(model), 30_000);
     unsafe {
         std::env::set_var("DEXT_CONTEXT_WINDOW", "64000");
     }
-    assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 64_000);
+    assert_eq!(model_context_window(model), 64_000);
     unsafe {
         std::env::remove_var("DEXT_CONTEXT_WINDOW");
         std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
@@ -6863,12 +6856,14 @@ fn local_llama_runtime_probe_updates_model_context_window() -> Result<()> {
     );
     assert_eq!(tokens, Some(30_000));
     assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 30_000);
-    let _ = refresh_local_llama_context_window(
+    let custom_tokens = refresh_local_llama_context_window(
         "local",
         ApiProvider::OpenAi,
         &format!("http://{addr}"),
         "custom-local-probe",
     );
+    assert_eq!(custom_tokens, Some(30_000));
+    assert_eq!(model_context_window("custom-local-probe"), 30_000);
     server.join().expect("server thread");
     clear_cached_local_llama_context_windows();
     Ok(())
@@ -7104,7 +7099,6 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--tiny".to_string(),
         "--tool-context-profile=full".to_string(),
         "--tool-profile=default".to_string(),
-        "--execution-policy=bounded".to_string(),
         format!("@{}", task_file.display()),
         "tail".to_string(),
     ])?;
@@ -7122,7 +7116,6 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
     assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
     assert_eq!(opts.tool_context_profile, Some(ToolContextProfile::Full));
     assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
-    assert_eq!(opts.execution_policy, Some(ExecutionPolicy::Bounded));
     assert_eq!(
         opts.positional,
         vec!["from file".to_string(), "tail".to_string()]
@@ -7159,6 +7152,7 @@ fn tiny_context_mode_sets_distinct_system_prompt() {
 
     agent.set_context_mode(ContextMode::Tiny);
 
+    assert!(agent.context_mode_explicit);
     assert!(agent.context_mode.is_tiny());
     assert_eq!(agent.system, TINY_SYSTEM);
 
@@ -8147,126 +8141,6 @@ fn write_file_returns_diff_preview_and_summary() {
 }
 
 #[test]
-fn native_mutation_tools_report_identical_content_as_no_change() {
-    let root = temp_test_dir("native-mutation-no-change");
-    let root = std::fs::canonicalize(&root).unwrap();
-    let path = root.join("note.txt");
-    std::fs::write(&path, "same").unwrap();
-    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-    file.set_times(
-        std::fs::FileTimes::new()
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)),
-    )
-    .unwrap();
-    let modified_before = std::fs::metadata(&path).unwrap().modified().unwrap();
-
-    let write = execute_tool(
-        "write_file",
-        &json!({"path": "note.txt", "content": "same"}),
-        &root,
-    )
-    .expect("identical write_file should succeed");
-    assert!(write.starts_with("no changes to "), "{write}");
-
-    let edit = execute_tool(
-        "edit_file",
-        &json!({"path": "note.txt", "old_string": "same", "new_string": "same"}),
-        &root,
-    )
-    .expect("identical edit_file should succeed");
-    assert!(edit.starts_with("no changes to "), "{edit}");
-
-    let multi = execute_tool(
-        "multi_edit",
-        &json!({
-            "path": "note.txt",
-            "edits": [{"old_string": "same", "new_string": "same"}]
-        }),
-        &root,
-    )
-    .expect("identical multi_edit should succeed");
-    assert!(multi.starts_with("no changes to "), "{multi}");
-
-    let empty = execute_tool(
-        "write_file",
-        &json!({"path": "empty.txt", "content": ""}),
-        &root,
-    )
-    .expect("new empty file should be created");
-    assert!(empty.contains("wrote 0 bytes to"), "{empty}");
-    assert!(root.join("empty.txt").is_file());
-
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "same");
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().modified().unwrap(),
-        modified_before,
-        "byte-identical native mutations must not rewrite the file"
-    );
-    assert!(
-        orchestrator::successful_mutation_result_has_no_content_delta(
-            "write_file",
-            &json!({"path": "note.txt", "content": "same"}),
-            &write,
-        )
-    );
-    assert!(
-        !orchestrator::successful_mutation_result_has_no_content_delta(
-            "write_file",
-            &json!({"path": "empty.txt", "content": ""}),
-            &empty,
-        )
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn native_mutation_attempt_keys_include_payload_and_current_target_state() {
-    let root = temp_test_dir("native-mutation-attempt-key");
-    let root = std::fs::canonicalize(&root).unwrap();
-    let path = root.join("note.txt");
-    std::fs::write(&path, "same").unwrap();
-
-    let same = json!({"path": "note.txt", "content": "same"});
-    let different_payload = json!({"path": "note.txt", "content": "changed"});
-    let original_key = native_mutation_attempt_key(&root, "write_file", &same).unwrap();
-    assert_eq!(
-        original_key,
-        native_mutation_attempt_key(&root, "write_file", &same).unwrap()
-    );
-    assert_ne!(
-        original_key,
-        native_mutation_attempt_key(&root, "write_file", &different_payload).unwrap(),
-        "a materially different write to the same path must remain available"
-    );
-
-    let multi_a = json!({
-        "path": "note.txt",
-        "edits": [{"old_string": "same", "new_string": "same"}]
-    });
-    let multi_b = json!({
-        "path": "note.txt",
-        "edits": [{"old_string": "same", "new_string": "changed"}]
-    });
-    assert_ne!(
-        native_mutation_attempt_key(&root, "multi_edit", &multi_a),
-        native_mutation_attempt_key(&root, "multi_edit", &multi_b),
-        "multi_edit identity must include its edits"
-    );
-
-    std::fs::write(&path, "external change").unwrap();
-    assert_ne!(
-        original_key,
-        native_mutation_attempt_key(&root, "write_file", &same).unwrap(),
-        "the same payload must be allowed again after the target changes externally"
-    );
-    let write = execute_tool("write_file", &same, &root).expect("rewrite after external change");
-    assert!(!write.starts_with("no changes to "), "{write}");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "same");
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
 fn edit_file_returns_diff_and_summary() {
     let root = temp_test_dir("edit-file-diff");
     let root = std::fs::canonicalize(&root).unwrap();
@@ -8674,44 +8548,6 @@ fn global_model_override_respects_provider_compatibility() -> Result<()> {
 }
 
 #[test]
-fn retired_local_model_env_overrides_fall_back_to_current_local_default() -> Result<()> {
-    let _guard = env_lock();
-    let root = temp_test_dir("provider-local-retired-env");
-    unsafe {
-        std::env::set_var("DEXT_HOME", &root);
-        std::env::set_var("DEXT_PROVIDER", "local");
-        std::env::set_var("DEXT_MODEL", "qwen3-coder-next-ud-iq4_nl");
-        std::env::set_var("DEXT_MODEL_FORCE", "1");
-        std::env::remove_var("DEXT_MODEL_LOCAL");
-    }
-
-    let result = (|| -> Result<()> {
-        let resolved = resolve_runtime_provider(None, false)?;
-        assert_eq!(resolved.profile.id, "local");
-        assert_eq!(resolved.model, DEFAULT_LOCAL_MODEL);
-
-        unsafe {
-            std::env::remove_var("DEXT_MODEL");
-            std::env::set_var("DEXT_MODEL_LOCAL", "qwen3-coder-next-ud-iq4_nl");
-        }
-        let resolved = resolve_runtime_provider(None, false)?;
-        assert_eq!(resolved.profile.id, "local");
-        assert_eq!(resolved.model, DEFAULT_LOCAL_MODEL);
-        Ok(())
-    })();
-
-    unsafe {
-        std::env::remove_var("DEXT_HOME");
-        std::env::remove_var("DEXT_PROVIDER");
-        std::env::remove_var("DEXT_MODEL");
-        std::env::remove_var("DEXT_MODEL_LOCAL");
-        std::env::remove_var("DEXT_MODEL_FORCE");
-    }
-    let _ = std::fs::remove_dir_all(&root);
-    result
-}
-
-#[test]
 fn provider_default_model_persists_and_is_listed() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-default-model");
@@ -8875,6 +8711,9 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         assert_eq!(local.api_provider, ApiProvider::OpenAi);
         assert!(!local.requires_api_key);
         assert_eq!(local.default_model, DEFAULT_LOCAL_MODEL);
+        assert_eq!(local.models, vec![DEFAULT_LOCAL_MODEL.to_string()]);
+        assert!(local.model_context_windows.is_empty());
+        assert_eq!(local.context_window, None);
         Ok(())
     })();
 
@@ -8886,23 +8725,16 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
 }
 
 #[test]
-fn local_provider_merge_drops_retired_catalog_artifacts() {
+fn local_provider_merge_preserves_user_aliases_and_context() {
     let builtin = built_in_provider_profiles()
         .into_iter()
         .find(|p| p.id == "local")
         .expect("local profile");
     let mut stored = builtin.clone();
-    stored.default_model = "qwen3-coder-next-ud-iq4_nl".to_string();
+    stored.default_model = "custom-local-model".to_string();
     stored.models.push("qwen-local".to_string());
     stored.models.push("qwen2.5-coder-7b".to_string());
     stored.models.push("qwen3.5-9b".to_string());
-    stored
-        .models
-        .push("Qwen3.6-35B-A3B-Q4_K_M.gguf".to_string());
-    stored.models.push("qwen3-coder-next-ud-iq4_nl".to_string());
-    stored
-        .models
-        .push("Qwen3-Coder-Next-UD-IQ4_NL.gguf".to_string());
     stored.models.push("custom-local-model".to_string());
     stored.context_window = Some(4_096);
     stored
@@ -8910,33 +8742,16 @@ fn local_provider_merge_drops_retired_catalog_artifacts() {
         .insert("qwen-local".to_string(), 4_096);
     stored
         .model_context_windows
-        .insert("qwen3-coder-next-ud-iq4_nl".to_string(), 32_768);
-    stored
-        .model_context_windows
         .insert("custom-local-model".to_string(), 12_345);
 
     let merged = merge_provider_profile(builtin, stored);
-    assert_eq!(merged.default_model, DEFAULT_LOCAL_MODEL);
-    assert_eq!(
-        merged.context_window,
-        Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
-    );
-    assert!(!merged.models.iter().any(|m| m == "qwen-local"));
-    assert!(!merged.models.iter().any(|m| m == "qwen2.5-coder-7b"));
-    assert!(!merged.models.iter().any(|m| m == "qwen3.5-9b"));
-    assert!(
-        !merged
-            .models
-            .iter()
-            .any(|m| m == "qwen3-coder-next-ud-iq4_nl")
-    );
+    assert_eq!(merged.default_model, "custom-local-model");
+    assert_eq!(merged.context_window, Some(4_096));
+    assert!(merged.models.iter().any(|m| m == "qwen-local"));
+    assert!(merged.models.iter().any(|m| m == "qwen2.5-coder-7b"));
+    assert!(merged.models.iter().any(|m| m == "qwen3.5-9b"));
     assert!(merged.models.iter().any(|m| m == "custom-local-model"));
-    assert!(!merged.model_context_windows.contains_key("qwen-local"));
-    assert!(
-        !merged
-            .model_context_windows
-            .contains_key("qwen3-coder-next-ud-iq4_nl")
-    );
+    assert_eq!(merged.model_context_windows.get("qwen-local"), Some(&4_096));
     assert_eq!(
         merged.model_context_windows.get("custom-local-model"),
         Some(&12_345)
@@ -8959,7 +8774,7 @@ fn local_provider_merge_preserves_user_local_context_without_retired_artifacts_e
 }
 
 #[test]
-fn local_provider_merge_drops_context_when_it_belongs_to_retired_local_artifact() {
+fn local_provider_merge_preserves_context_for_old_local_alias() {
     let builtin = built_in_provider_profiles()
         .into_iter()
         .find(|p| p.id == "local")
@@ -8972,12 +8787,12 @@ fn local_provider_merge_drops_context_when_it_belongs_to_retired_local_artifact(
         .insert("qwen-local".to_string(), 123_456);
 
     let merged = merge_provider_profile(builtin, stored);
+    assert_eq!(merged.context_window, Some(123_456));
+    assert!(merged.models.iter().any(|m| m == "qwen-local"));
     assert_eq!(
-        merged.context_window,
-        Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
+        merged.model_context_windows.get("qwen-local"),
+        Some(&123_456)
     );
-    assert!(!merged.models.iter().any(|m| m == "qwen-local"));
-    assert!(!merged.model_context_windows.contains_key("qwen-local"));
 }
 
 #[test]
@@ -9205,67 +9020,6 @@ fn provider_selector_accepts_index_and_id() -> Result<()> {
 }
 
 #[test]
-fn retired_local_model_cannot_be_saved_as_local_default() -> Result<()> {
-    let _guard = env_lock();
-    let root = temp_test_dir("provider-local-retired-default");
-    unsafe {
-        std::env::set_var("DEXT_HOME", &root);
-    }
-
-    let result = (|| -> Result<()> {
-        let err = set_provider_default_model_in_catalog("local", "qwen3-coder-next-ud-iq4_nl")
-            .expect_err("retired bundled local model should be rejected");
-        assert!(format!("{err:#}").contains("has been retired"), "{err:#}");
-        let catalog = load_provider_catalog()?;
-        let local = find_provider_profile(&catalog, "local").context("local profile")?;
-        assert_eq!(local.default_model, DEFAULT_LOCAL_MODEL);
-        assert!(
-            !local
-                .models
-                .iter()
-                .any(|m| m == "qwen3-coder-next-ud-iq4_nl")
-        );
-        Ok(())
-    })();
-
-    unsafe {
-        std::env::remove_var("DEXT_HOME");
-    }
-    let _ = std::fs::remove_dir_all(&root);
-    result
-}
-
-#[test]
-fn retired_local_model_selectors_are_rejected() -> Result<()> {
-    let _guard = env_lock();
-    let root = temp_test_dir("provider-local-retired-selector");
-    unsafe {
-        std::env::set_var("DEXT_HOME", &root);
-    }
-
-    let result = (|| -> Result<()> {
-        let catalog = load_provider_catalog()?;
-        let store = load_auth_store()?;
-        for selector in [
-            "local/qwen3-coder-next-ud-iq4_nl",
-            "qwen/qwen3-coder-next-ud-iq4_nl",
-            "qwen3-coder-next-ud-iq4_nl",
-        ] {
-            let err = resolve_provider_model_selection(&catalog, &store, "local", selector)
-                .expect_err("retired bundled local model should be rejected");
-            assert!(format!("{err:#}").contains("has been retired"), "{err:#}");
-        }
-        Ok(())
-    })();
-
-    unsafe {
-        std::env::remove_var("DEXT_HOME");
-    }
-    let _ = std::fs::remove_dir_all(&root);
-    result
-}
-
-#[test]
 fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("provider-model-selection-auth");
@@ -9362,10 +9116,8 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
         assert!(!local.requires_api_key);
         assert_eq!(local.default_model, DEFAULT_LOCAL_MODEL);
         assert_eq!(local.models, vec![DEFAULT_LOCAL_MODEL.to_string()]);
-        assert_eq!(
-            local.context_window,
-            Some(crate::provider::DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS)
-        );
+        assert!(local.model_context_windows.is_empty());
+        assert_eq!(local.context_window, None);
         assert_eq!(resolve_active_provider_id(&catalog), "glm");
         Ok(())
     })();
@@ -10092,90 +9844,6 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         .into_iter()
         .find(|profile| profile.id == "openai")
         .expect("openai profile");
-    let local = built_in_provider_profiles()
-        .into_iter()
-        .find(|profile| profile.id == "local")
-        .expect("local profile");
-    let mut custom_local = openai.clone();
-    custom_local.id = "custom-local".to_string();
-    custom_local.base_url = "http://localhost:11434/v1".to_string();
-    custom_local.model_defaults = ModelSpec::default();
-    custom_local.model_specs.clear();
-    assert_eq!(
-        resolve_model_spec(&custom_local, "custom-model").execution_policy,
-        ExecutionPolicy::Adaptive
-    );
-    custom_local.model_defaults.execution_policy = Some(ExecutionPolicy::Open);
-    assert_eq!(
-        resolve_model_spec(&custom_local, "custom-model").execution_policy,
-        ExecutionPolicy::Open
-    );
-    let root = temp_test_dir("execution-policy-route-precedence");
-    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
-    let mut route_agent = test_agent(&root);
-    route_agent.provider_id = openai.id.clone();
-    route_agent.provider_profile = Some(openai.clone());
-    route_agent.api_provider = ApiProvider::OpenAi;
-    route_agent.base_url = "http://localhost:8080/v1".to_string();
-    route_agent.model = "gpt-5".to_string();
-    assert_eq!(
-        route_agent.effective_execution_policy(),
-        ExecutionPolicy::Adaptive
-    );
-    route_agent.base_url = "https://api.example.test/v1".to_string();
-    assert_eq!(
-        route_agent.effective_execution_policy(),
-        ExecutionPolicy::Open
-    );
-    route_agent.base_url = "http://localhost:8080/v1".to_string();
-    route_agent
-        .provider_profile
-        .as_mut()
-        .expect("profile")
-        .model_defaults
-        .execution_policy = Some(ExecutionPolicy::Open);
-    assert_eq!(
-        route_agent.effective_execution_policy(),
-        ExecutionPolicy::Open
-    );
-    route_agent.execution_policy_override = Some(ExecutionPolicy::Bounded);
-    assert_eq!(
-        route_agent.effective_execution_policy(),
-        ExecutionPolicy::Bounded
-    );
-    let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(
-        resolve_model_spec(&local, DEFAULT_LOCAL_MODEL).execution_policy,
-        ExecutionPolicy::Adaptive
-    );
-    assert_eq!(
-        resolve_model_spec(&chatgpt, "gpt-5.4").execution_policy,
-        ExecutionPolicy::Open
-    );
-    assert_eq!(
-        resolve_model_spec(&openai, "gpt-5").execution_policy,
-        ExecutionPolicy::Open
-    );
-    assert!(crate::provider::is_local_llama_provider(
-        "custom",
-        ApiProvider::OpenAi,
-        "http://127.8.9.10:8080/v1"
-    ));
-    assert!(crate::provider::is_local_llama_provider(
-        "custom",
-        ApiProvider::OpenAi,
-        "http://[::1]:8080/v1"
-    ));
-    assert!(!crate::provider::is_local_llama_provider(
-        "custom",
-        ApiProvider::OpenAi,
-        "https://localhost.example.com/v1"
-    ));
-    assert!(!crate::provider::is_local_llama_provider(
-        "custom",
-        ApiProvider::Anthropic,
-        "http://localhost:8080"
-    ));
     assert_eq!(
         normalize_provider_model_value(&chatgpt, "gpt-5.6"),
         "gpt-5.6-sol"
@@ -10215,7 +9883,6 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         .insert("fast".to_string(), "custom-fast".to_string());
     explicit.model_defaults.max_output_tokens = Some(1_234);
     explicit.model_defaults.capabilities.tools = Some(false);
-    explicit.model_defaults.execution_policy = Some(ExecutionPolicy::Bounded);
     explicit.model_specs.insert(
         "gpt-5.4".to_string(),
         ModelSpec {
@@ -10246,7 +9913,6 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
     let spec = resolve_model_spec(&explicit, "gpt-5.4");
     assert_eq!(spec.max_output_tokens, Some(1_234));
     assert!(!spec.tools);
-    assert_eq!(spec.execution_policy, ExecutionPolicy::Bounded);
     assert_eq!(
         spec.pricing.expect("explicit pricing").output_usd_per_mtok,
         4.0
@@ -10545,154 +10211,6 @@ fn claude_streaming_request_marks_stable_system_and_tools_cacheable() -> Result<
     assert_eq!(value["system"][0]["cache_control"]["type"], "ephemeral");
     assert!(value["system"][1].get("cache_control").is_none(), "{value}");
     assert_eq!(value["tools"][0]["cache_control"]["type"], "ephemeral");
-
-    let _ = std::fs::remove_dir_all(&root);
-    Ok(())
-}
-
-#[test]
-fn controlled_request_builder_preserves_open_payload_and_disables_tools_only_when_finalizing()
--> Result<()> {
-    let root = temp_test_dir("execution-policy-request-parity");
-    let root = std::fs::canonicalize(&root)?;
-    let mut agent = test_agent(&root);
-    agent.provider_id = "anthropic".to_string();
-    agent.api_provider = ApiProvider::Anthropic;
-    agent.model = "claude-sonnet-4-6".to_string();
-    let sys_blocks = [SystemBlock {
-        kind: "text",
-        text: "stable prompt",
-        cache_control: None,
-    }];
-    let wire_tools = vec![WireTool {
-        name: "read_file".to_string(),
-        description: "read".to_string(),
-        input_schema: json!({"type":"object","properties":{}}),
-        cache_control: None,
-    }];
-
-    let legacy = agent.build_streaming_request(
-        "stable prompt",
-        "runtime env",
-        &sys_blocks,
-        &wire_tools,
-        "unused",
-    )?;
-    let controlled_open = agent.build_streaming_request_controlled(
-        "stable prompt",
-        "runtime env",
-        &sys_blocks,
-        &wire_tools,
-        "unused",
-        ToolRequestMode::Auto,
-    )?;
-    assert_eq!(legacy, controlled_open);
-
-    let (_, finalized_body) = agent.build_streaming_request_controlled(
-        "stable prompt",
-        "runtime env",
-        &sys_blocks,
-        &wire_tools,
-        "unused",
-        ToolRequestMode::Disabled,
-    )?;
-    let finalized: Value = serde_json::from_slice(&finalized_body)?;
-    assert_eq!(finalized["tools"].as_array().map(Vec::len), Some(0));
-
-    let _ = std::fs::remove_dir_all(&root);
-    Ok(())
-}
-
-#[test]
-fn recovery_request_forces_structured_tool_call_on_supported_contracts() -> Result<()> {
-    let root = temp_test_dir("recovery-tool-choice-required");
-    let root = std::fs::canonicalize(&root)?;
-    let wire_tools = vec![WireTool {
-        name: "read_file".to_string(),
-        description: "read".to_string(),
-        input_schema: json!({"type":"object","properties":{}}),
-        cache_control: None,
-    }];
-    let sys_blocks = [SystemBlock {
-        kind: "text",
-        text: "stable prompt",
-        cache_control: None,
-    }];
-
-    // OpenAI-compatible contract: tool_choice must flip to "required".
-    let mut oai = test_agent(&root);
-    oai.provider_id = "deepseek".to_string();
-    oai.api_provider = ApiProvider::OpenAi;
-    oai.model = "deepseek-chat".to_string();
-    let (_, normal_body) = oai.build_streaming_request_controlled(
-        "stable prompt",
-        "runtime env",
-        &sys_blocks,
-        &wire_tools,
-        "unused",
-        ToolRequestMode::Auto,
-    )?;
-    let normal: Value = serde_json::from_slice(&normal_body)?;
-    assert!(normal.get("tool_choice").is_none(), "{normal}");
-    let (_, recovery_body) = oai.build_streaming_request_controlled(
-        "stable prompt",
-        "runtime env",
-        &sys_blocks,
-        &wire_tools,
-        "unused",
-        ToolRequestMode::Required,
-    )?;
-    let recovery: Value = serde_json::from_slice(&recovery_body)?;
-    assert_eq!(recovery["tool_choice"], "required", "{recovery}");
-
-    // Finalized state suppresses tools regardless of the recovery flag.
-    let (_, finalized_body) = oai.build_streaming_request_controlled(
-        "stable prompt",
-        "runtime env",
-        &sys_blocks,
-        &wire_tools,
-        "unused",
-        ToolRequestMode::Disabled,
-    )?;
-    let finalized: Value = serde_json::from_slice(&finalized_body)?;
-    assert_eq!(finalized["tools"].as_array().map(Vec::len), Some(0));
-    assert!(finalized.get("tool_choice").is_none(), "{finalized}");
-
-    // ChatGPT contract: tool_choice must override to "required".
-    let mut chatgpt = test_agent(&root);
-    chatgpt.provider_id = "chatgpt".to_string();
-    chatgpt.api_provider = ApiProvider::ChatGpt;
-    chatgpt.model = "gpt-5.6".to_string();
-    let (_, chatgpt_recovery_body) = chatgpt.build_streaming_request_controlled(
-        "stable prompt",
-        "runtime env",
-        &sys_blocks,
-        &wire_tools,
-        "dext-session",
-        ToolRequestMode::Required,
-    )?;
-    let chatgpt_recovery: Value = serde_json::from_slice(&chatgpt_recovery_body)?;
-    assert_eq!(
-        chatgpt_recovery["tool_choice"], "required",
-        "{chatgpt_recovery}"
-    );
-
-    // Anthropic contract carries no tool_choice field — recovery is
-    // prompt-driven only for that contract.
-    let mut claude = test_agent(&root);
-    claude.provider_id = "anthropic".to_string();
-    claude.api_provider = ApiProvider::Anthropic;
-    claude.model = "claude-sonnet-4-6".to_string();
-    let (_, claude_body) = claude.build_streaming_request_controlled(
-        "stable prompt",
-        "runtime env",
-        &sys_blocks,
-        &wire_tools,
-        "unused",
-        ToolRequestMode::Required,
-    )?;
-    let claude_value: Value = serde_json::from_slice(&claude_body)?;
-    assert!(claude_value.get("tool_choice").is_none(), "{claude_value}");
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -11058,9 +10576,6 @@ fn pseudo_tool_syntax_detection_marks_plain_text_invalid() {
     assert!(blocks_contain_pseudo_tool_syntax(&[Block::Text {
         text: "tool call: functions.write_file".to_string(),
     }]));
-    assert!(blocks_contain_pseudo_tool_syntax_or_start(&[Block::Text {
-        text: "to=".to_string(),
-    }]));
     assert!(!text_contains_pseudo_tool_syntax(
         "I will use the edit_file tool if needed."
     ));
@@ -11078,74 +10593,6 @@ fn pseudo_tool_syntax_detection_marks_plain_text_invalid() {
         "today=functions maybe"
     ));
     assert!(!text_line_looks_like_pseudo_tool_start("to=day plan"));
-    assert!(text_contains_pseudo_tool_syntax(
-        "[tool call redacted; waiting for structured tool event] <function=bash> <parameter=command>ls ~/.dext</parameter>"
-    ));
-}
-
-#[test]
-fn tool_call_empty_required_argument_detection_uses_schema_rules() {
-    assert!(tool_call_has_empty_required_arguments(
-        "edit_file",
-        &json!({})
-    ));
-    assert!(tool_call_has_empty_required_arguments(
-        "edit_file",
-        &json!({"path": " ", "old_string": "a", "new_string": "b"})
-    ));
-    assert!(tool_call_has_empty_required_arguments(
-        "write_file",
-        &json!({"path": "out.txt"})
-    ));
-    assert!(!tool_call_has_empty_required_arguments(
-        "write_file",
-        &json!({"path": "out.txt", "content": ""})
-    ));
-    assert!(!tool_call_has_empty_required_arguments(
-        "edit_file",
-        &json!({"path": "out.txt", "old_string": "a", "new_string": ""})
-    ));
-    assert!(!tool_call_has_empty_required_arguments(
-        "unknown_tool",
-        &json!({})
-    ));
-}
-
-#[test]
-fn controlled_completion_claims_require_mutation_and_repo_scope_is_respected() {
-    assert!(assistant_text_has_completion_claim(
-        "The report is written and saved. All issues fixed."
-    ));
-    assert!(assistant_text_has_completion_claim(
-        "I deleted the global hook."
-    ));
-    assert!(!assistant_text_has_completion_claim(
-        "I found the report and recommend updating it."
-    ));
-
-    let root = temp_test_dir("controlled-repo-scope");
-    let root = std::fs::canonicalize(&root).expect("canonical root");
-    assert!(!repo_scoped_external_mutation(
-        "write_file",
-        &json!({"path": root.join("local.txt"), "content": "ok"}),
-        &root,
-    ));
-    assert!(repo_scoped_external_mutation(
-        "write_file",
-        &json!({"path": "/home/example/.dext/packs/demo/PACK.md", "content": "bad"}),
-        &root,
-    ));
-    assert!(repo_scoped_external_mutation(
-        "bash",
-        &json!({"command": "rm ~/.dext/shelves/research/packs/autoresearch/phooks.json"}),
-        &root,
-    ));
-    assert!(!repo_scoped_external_mutation(
-        "bash",
-        &json!({"command": "ls ~/.dext/shelves/research/packs/autoresearch"}),
-        &root,
-    ));
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

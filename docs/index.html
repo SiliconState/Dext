@@ -436,7 +436,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>openai</code></td><td>OpenAI API</td><td>OpenAI</td><td>gpt-5</td><td>API Key (<code>OPENAI_API_KEY</code>)</td></tr>
 <tr><td><code>anthropic</code></td><td>Anthropic</td><td>Anthropic</td><td>claude-sonnet-4-5</td><td>API Key (<code>ANTHROPIC_API_KEY</code>)</td></tr>
 <tr><td><code>deepseek</code></td><td>DeepSeek</td><td>OpenAI</td><td>deepseek-chat</td><td>API Key (<code>DEEPSEEK_API_KEY</code>)</td></tr>
-<tr><td><code>local</code></td><td>Local llama.cpp</td><td>OpenAI</td><td>qwen3.6-35b-a3b-mtp-ud-q5_k_m</td><td>None; curated: qwen3.6-35b-a3b-mtp-ud-q5_k_m</td></tr>
+<tr><td><code>local</code></td><td>Local llama.cpp</td><td>OpenAI</td><td>qwen3.6-35b-a3b-mtp-ud-q5_k_m</td><td>None; accepts the server model alias, probes live context, and defaults to frugal context</td></tr>
 </table>
 <h3>Provider Resolution Chain</h3>
 <ol>
@@ -468,7 +468,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>Full</code></td><td>Complete tool descriptions and full JSON schemas</td><td>Full</td></tr>
 <tr><td><code>Lean</code> (default)</td><td>Compact one-liner descriptions, schemas without field descriptions</td><td>Stripped</td></tr>
 </table>
-<p>Controlled via <code>DEXT_TOOL_PROFILE</code>. Lean mode saves significant prompt tokens per turn. A separate toolset profile is selected by <code>--toolset</code> or <code>DEXT_TOOLSET</code>: <code>default</code> hides specialized tools, <code>full</code> exposes the complete catalog, and frugal/tiny context modes force the smaller frugal set.</p>
+<p>Controlled via <code>DEXT_TOOL_PROFILE</code>. Lean mode saves significant prompt tokens per turn. A separate toolset profile is selected by <code>--toolset</code> or <code>DEXT_TOOLSET</code>: <code>default</code> hides specialized tools and <code>full</code> exposes the complete catalog. Frugal/tiny reduce context and result budgets without overriding explicit toolset or schema selections.</p>
 <h3>Tool Classification</h3>
 <table>
 <tr><th>Category</th><th>Tools</th></tr>
@@ -845,7 +845,7 @@ description: One-line workflow summary
 <tr><td><code>dext session ...</code></td><td>Inspect/export/analyze project-scoped latest or named sessions</td></tr>
 <tr><td><code>dext --cd &lt;dir&gt;</code></td><td>Change working directory</td></tr>
 <tr><td><code>dext --no-session</code></td><td>Don't save session</td></tr>
-<tr><td><code>dext --frugal</code></td><td>Low-token mode (lean schemas, smaller toolset, reduced context, medium default effort)</td></tr>
+<tr><td><code>dext --frugal</code></td><td>Low-token mode (lean schemas, core tools, reduced context, medium default effort)</td></tr>
 <tr><td><code>dext --context-mode standard|frugal|tiny</code></td><td>Choose context/cap mode</td></tr>
 <tr><td><code>dext --toolset default|full</code></td><td>Choose provider-visible tool count profile</td></tr>
 <tr><td><code>dext --tool-profile lean|full</code></td><td>Choose provider tool schema verbosity</td></tr>
@@ -1063,7 +1063,7 @@ description: One-line workflow summary
 </ul>
 <h3>Local (llama.cpp)</h3>
 <ul>
-<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — Curated model <code>qwen3.6-35b-a3b-mtp-ud-q5_k_m</code>; Dext probes llama.cpp runtime context and falls back to the local context window</li>
+<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — accepts the configured server model alias; local providers default to frugal context and probe llama.cpp for the live runtime context window without model-specific built-in context values</li>
 </ul>
 </div>
 </section>

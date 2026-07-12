@@ -122,34 +122,6 @@ impl RequestContract {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ExecutionPolicy {
-    #[default]
-    Open,
-    Adaptive,
-    Bounded,
-}
-
-impl ExecutionPolicy {
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "open" | "frontier" => Some(Self::Open),
-            "adaptive" | "local" => Some(Self::Adaptive),
-            "bounded" | "strict" => Some(Self::Bounded),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Open => "open",
-            Self::Adaptive => "adaptive",
-            Self::Bounded => "bounded",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ModelCapabilities {
@@ -175,7 +147,6 @@ pub(crate) struct ModelSpec {
     pub(crate) effort_levels: Vec<String>,
     pub(crate) capabilities: ModelCapabilities,
     pub(crate) pricing: Option<ModelPricing>,
-    pub(crate) execution_policy: Option<ExecutionPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,15 +159,12 @@ pub(crate) struct ResolvedModelSpec {
     pub(crate) image_input: bool,
     pub(crate) prompt_cache: bool,
     pub(crate) pricing: Option<ModelPricing>,
-    pub(crate) execution_policy: ExecutionPolicy,
-    pub(crate) execution_policy_configured: bool,
     pub(crate) source: &'static str,
 }
 
 const PROVIDER_CATALOG_VERSION: u32 = 2;
 const AUTH_STORE_VERSION: u32 = 1;
 pub(crate) const DEFAULT_LOCAL_MODEL: &str = "qwen3.6-35b-a3b-mtp-ud-q5_k_m";
-pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS: u64 = 131_072;
 const LLAMA_CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(700);
 const LLAMA_CONTEXT_DISCOVERY_PATHS: &[&str] = &["/props", "/slots", "/v1/models", "/models"];
 
@@ -414,9 +382,6 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
         let provider_id = canonical_provider_id(&profile.id);
         let contract = request_contract_for_profile(profile);
         profile.model_defaults.max_output_tokens = Some(8_192);
-        if provider_id == "local" {
-            profile.model_defaults.execution_policy = Some(ExecutionPolicy::Adaptive);
-        }
         profile.model_defaults.capabilities = ModelCapabilities {
             tools: Some(true),
             reasoning: Some(true),
@@ -647,13 +612,9 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             requires_api_key: false,
             login_url: None,
             oauth_flow: None,
-            notes: Some("Local OpenAI-compatible llama.cpp server. Start exactly one llama-server on 127.0.0.1:8080 with alias qwen3.6-35b-a3b-mtp-ud-q5_k_m; no cloud credentials are used. On startup Dext probes llama.cpp for its runtime context and otherwise uses the local context fallback.".to_string()),
-            context_window: Some(DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS),
-            model_context_windows: {
-                let mut m = HashMap::new();
-                m.insert(DEFAULT_LOCAL_MODEL.to_string(), DEFAULT_LOCAL_CONTEXT_WINDOW_TOKENS);
-                m
-            },
+            notes: Some("Local OpenAI-compatible llama.cpp server. Start one server on 127.0.0.1:8080 and select its model alias; no cloud credentials are used. Dext probes llama.cpp for the live runtime context window.".to_string()),
+            context_window: None,
+            model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::OpenAiChatCompletions),
             model_aliases: HashMap::new(),
@@ -678,19 +639,10 @@ pub(crate) fn is_local_llama_provider(
     if api_provider != ApiProvider::OpenAi {
         return false;
     }
-    if canonical_provider_id(provider_id) == "local" {
-        return true;
-    }
-    reqwest::Url::parse(base_url.trim())
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .is_some_and(|host| {
-            let host = host.trim_start_matches('[').trim_end_matches(']');
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        })
+    let lower = base_url.trim().to_ascii_lowercase();
+    canonical_provider_id(provider_id) == "local"
+        || lower.contains("127.0.0.1")
+        || lower.contains("localhost")
 }
 
 fn local_llama_cache_key(base_url: &str, model: &str) -> String {
@@ -943,64 +895,15 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     Some(profile)
 }
 
-const RETIRED_BUNDLED_LOCAL_MODELS: &[&str] = &[
-    "qwen-local",
-    "qwen2.5-coder-7b",
-    "qwen3.5-9b",
-    "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
-    "Qwen3.5-9B-Q4_K_M.gguf",
-    "Qwen3.6-35B-A3B-Q4_K_M.gguf",
-    "qwen3-coder-next-ud-iq4_nl",
-    "Qwen3-Coder-Next-UD-IQ4_NL.gguf",
-];
-fn local_context_window_matches_retired_artifact(stored: &ProviderProfile, window: u64) -> bool {
-    stored
-        .model_context_windows
-        .iter()
-        .any(|(model, model_window)| {
-            *model_window == window && is_retired_bundled_local_model(model)
-        })
-}
-fn is_retired_bundled_local_model(model: &str) -> bool {
-    let model = model.trim();
-    !model.is_empty()
-        && RETIRED_BUNDLED_LOCAL_MODELS
-            .iter()
-            .any(|retired| model.eq_ignore_ascii_case(retired))
-}
-
-fn is_retired_local_model_for_profile(profile: &ProviderProfile, model: &str) -> bool {
-    canonical_provider_id(&profile.id) == "local" && is_retired_bundled_local_model(model)
-}
-
-fn reject_retired_local_model(profile: &ProviderProfile, model: &str) -> Result<()> {
-    if is_retired_local_model_for_profile(profile, model) {
-        anyhow::bail!(
-            "local model '{model}' has been retired from Dext's bundled local wiring; use {DEFAULT_LOCAL_MODEL} or another running local model alias."
-        );
-    }
-    Ok(())
-}
-
 pub(crate) fn merge_provider_profile(
     mut builtin: ProviderProfile,
     stored: ProviderProfile,
 ) -> ProviderProfile {
     let builtin_id = canonical_provider_id(&builtin.id);
-    let local_profile = builtin_id == "local";
     let stored_default = stored.default_model.trim();
-    let stored_default_retired = local_profile && is_retired_bundled_local_model(stored_default);
-    if !(stored_default.is_empty() || stored_default_retired) {
+    if !stored_default.is_empty() {
         builtin.default_model = normalize_provider_model_value(&builtin, stored_default);
     }
-    let drop_stored_context_window = local_profile
-        && stored
-            .context_window
-            .filter(|window| *window > 0)
-            .is_some_and(|window| {
-                stored_default_retired
-                    || local_context_window_matches_retired_artifact(&stored, window)
-            });
     if let Some(contract) = stored.request_contract {
         builtin.request_contract = Some(contract);
         builtin.api_provider = contract.api_provider();
@@ -1013,14 +916,12 @@ pub(crate) fn merge_provider_profile(
         merge_model_spec(builtin.model_specs.entry(model).or_default(), spec);
     }
 
-    if let Some(window) = stored.context_window.filter(|window| *window > 0)
-        && !drop_stored_context_window
-    {
+    if let Some(window) = stored.context_window.filter(|window| *window > 0) {
         builtin.context_window = Some(window);
     }
 
     for (model, window) in stored.model_context_windows {
-        if window == 0 || (local_profile && is_retired_bundled_local_model(&model)) {
+        if window == 0 {
             continue;
         }
         let key = normalize_provider_model_value(&builtin, &model).to_ascii_lowercase();
@@ -1074,7 +975,6 @@ pub(crate) fn merge_provider_profile(
             }
         })
         .filter(|model| !model.is_empty())
-        .filter(|model| !(local_profile && is_retired_bundled_local_model(model)))
         .filter(|model| {
             builtin_id == "chatgpt"
                 || model
@@ -1484,9 +1384,6 @@ fn merge_model_spec(base: &mut ModelSpec, overlay: ModelSpec) {
     if overlay.pricing.is_some() {
         base.pricing = overlay.pricing;
     }
-    if overlay.execution_policy.is_some() {
-        base.execution_policy = overlay.execution_policy;
-    }
 }
 
 fn normalize_model_spec(mut spec: ModelSpec) -> ModelSpec {
@@ -1525,9 +1422,6 @@ pub(crate) fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> Reso
         })
         .unwrap_or_else(|| defaults.effort_levels.clone());
     let contract = request_contract_for_profile(profile);
-    let configured_execution_policy = explicit
-        .and_then(|spec| spec.execution_policy)
-        .or(defaults.execution_policy);
     ResolvedModelSpec {
         context_window: explicit
             .and_then(|spec| spec.context_window)
@@ -1561,14 +1455,6 @@ pub(crate) fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> Reso
         pricing: explicit
             .and_then(|spec| spec.pricing.clone())
             .or_else(|| defaults.pricing.clone()),
-        execution_policy: configured_execution_policy.unwrap_or_else(|| {
-            if is_local_llama_provider(&profile.id, profile.api_provider, &profile.base_url) {
-                ExecutionPolicy::Adaptive
-            } else {
-                ExecutionPolicy::Open
-            }
-        }),
-        execution_policy_configured: configured_execution_policy.is_some(),
         source: if explicit.is_some() {
             "model"
         } else if profile.model_specs.is_empty() && profile.model_defaults == ModelSpec::default() {
@@ -1644,14 +1530,14 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
     );
     if let Ok(v) = std::env::var(&provider_env) {
         let t = normalize_provider_model_value(profile, &v);
-        if !t.is_empty() && !is_retired_local_model_for_profile(profile, &t) {
+        if !t.is_empty() {
             return t;
         }
     }
 
     if let Ok(v) = std::env::var("DEXT_MODEL") {
         let t = normalize_provider_model_value(profile, &v);
-        if !t.is_empty() && !is_retired_local_model_for_profile(profile, &t) {
+        if !t.is_empty() {
             let force = std::env::var("DEXT_MODEL_FORCE").ok().is_some_and(|raw| {
                 let low = raw.trim().to_ascii_lowercase();
                 !(low.is_empty() || low == "0" || low == "false" || low == "off" || low == "no")
@@ -1674,12 +1560,7 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
             }
         }
     }
-    let model = normalize_provider_model_value(profile, &profile.default_model);
-    if is_retired_local_model_for_profile(profile, &model) {
-        DEFAULT_LOCAL_MODEL.to_string()
-    } else {
-        model
-    }
+    normalize_provider_model_value(profile, &profile.default_model)
 }
 
 pub(crate) fn resolve_provider_base_url(profile: &ProviderProfile) -> String {
@@ -2214,7 +2095,6 @@ pub(crate) fn resolve_provider_model_selection(
                 if model.is_empty() {
                     anyhow::bail!("model selector cannot be empty");
                 }
-                reject_retired_local_model(&profile, &model)?;
                 if profile.requires_api_key && !provider_has_available_credentials(&profile, store)
                 {
                     anyhow::bail!(
@@ -2230,7 +2110,7 @@ pub(crate) fn resolve_provider_model_selection(
     let mut all_matches = Vec::new();
     for profile in &catalog.providers {
         let normalized = normalize_provider_model_value(profile, selector);
-        if normalized.is_empty() || is_retired_local_model_for_profile(profile, &normalized) {
+        if normalized.is_empty() {
             continue;
         }
         let matches_curated = curated_provider_models(profile)
@@ -2263,7 +2143,6 @@ pub(crate) fn resolve_provider_model_selection(
     if model.is_empty() {
         anyhow::bail!("model selector cannot be empty");
     }
-    reject_retired_local_model(&profile, &model)?;
     Ok(ProviderModelRef {
         provider_id: active_provider,
         model,
@@ -2753,7 +2632,6 @@ pub(crate) fn set_provider_default_model_in_catalog(provider_id: &str, model: &s
     };
 
     let normalized = normalize_provider_model_value(profile, model);
-    reject_retired_local_model(profile, &normalized)?;
     profile.default_model = normalized.clone();
     if !profile
         .models

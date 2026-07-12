@@ -40,7 +40,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 - `src/provider.rs`
   - Provider profile/catalog loading and normalization.
   - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, DeepSeek, and local OpenAI-compatible profiles.
-  - llama.cpp runtime context probing for the local provider, with a 131K fallback.
+  - live llama.cpp runtime context probing for the local provider; arbitrary server model aliases are supported without model-specific built-in context values.
   - API-key and OAuth login flows.
   - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs.
   - Model alias normalization and provider/model switching helpers.
@@ -97,7 +97,7 @@ Dext exposes a deliberately small default native tool set:
 - Tasks: `todo_read`, `todo_write`.
 - Optional browser recipe: `browser` only when enabled.
 
-The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`. Frugal/tiny context modes force an even smaller toolset and hide `http` unless the user switches back to standard mode.
+The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`. Frugal/tiny retain the default core tool capabilities while using lean schemas and smaller context/result budgets.
 
 Bash is intentionally transaction-like: Dext starts tool commands in their own process group and cleans that group after the shell exits or is interrupted, so shell backgrounding (`cmd &`), `nohup`, and `disown` are not a supported way to keep servers alive across tool calls. `setsid`-style detaches are also unsupported because they escape Dext cleanup. If the user explicitly needs a persistent local service, prefer OS supervision without adding a Dext daemon tool. On Linux with systemd, use `systemd-run --user --unit=dext-<name> --same-dir <cmd>`, inspect with `systemctl --user status dext-<name>`/`journalctl --user-unit dext-<name>`, and stop it with `systemctl --user stop dext-<name>` when finished. Keep unit names prefixed with `dext-`; on platforms without systemd, use the platform's native supervisor or avoid a persistent service.
 
@@ -156,8 +156,11 @@ recovery tools.
 
 ## Context modes
 
-- `standard`: normal caps and lean tool schemas by default.
-- `frugal`: lower prompt/history/tool caps, lean schemas, and deterministic compaction choices intended to reduce token spend.
+- `standard`: normal caps and lean tool schemas by default; this remains the default for frontier/cloud providers.
+- `frugal`: the automatic local-provider default; lower prompt/history/tool-result caps and deterministic compaction without removing core tool capabilities or overriding an explicit toolset/schema selection.
+- `tiny`: the smallest prompt/history variant for constrained local models.
+
+Frugal and tiny use a compact task-graph discipline for nontrivial work: steps have required inputs and observable outputs, independent reads can run in parallel, verified results are reused, and recovery repairs only the affected step. Dext intentionally does not maintain a graph runtime or impose local-only action locks, round ceilings, output suppression, or forced finalization.
 
 Compaction preserves recent tool evidence and summarizes older conversation when history approaches the model-aware context budget.
 

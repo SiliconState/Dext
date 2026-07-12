@@ -2637,10 +2637,7 @@ fn status_detail_spans(state: &TuiState) -> Vec<Span<'_>> {
         + ext.circuit_breaker_trips
         + ext.partial_delivery_hints
         + ext.http_retries
-        + ext.empty_tool_call_hints
-        + ext.adaptive_escalations
-        + ext.action_locks
-        + ext.forced_finalizations;
+        + ext.empty_tool_call_hints;
     if ext_total > 0 {
         spans.push(Span::styled(
             " · ext",
@@ -2653,9 +2650,6 @@ fn status_detail_spans(state: &TuiState) -> Vec<Span<'_>> {
             (ext.partial_delivery_hints, "ph", Color::Green),
             (ext.http_retries, "rt", Color::DarkGray),
             (ext.empty_tool_call_hints, "et", Color::Red),
-            (ext.adaptive_escalations, "ae", Color::Yellow),
-            (ext.action_locks, "al", Color::Red),
-            (ext.forced_finalizations, "ff", Color::LightRed),
         ];
         for (value, label, color) in counters {
             if value > 0 {
@@ -5354,9 +5348,7 @@ fn push_thinking_body_lines(
 fn welcome_context_description(mode: ContextMode) -> &'static str {
     match mode {
         ContextMode::Standard => "default schemas and caps",
-        ContextMode::Frugal => {
-            "lean schemas, smaller toolset, smaller caps, deterministic compaction"
-        }
+        ContextMode::Frugal => "lean schemas, core tools, smaller caps, deterministic compaction",
         ContextMode::Tiny => "lean schemas, smallest caps, deterministic compaction",
     }
 }
@@ -9103,7 +9095,7 @@ mod tests {
 
         assert_eq!(
             lines[3],
-            "context   frugal · lean schemas, smaller toolset, smaller caps, deterministic compaction"
+            "context   frugal · lean schemas, core tools, smaller caps, deterministic compaction"
         );
         assert!(!lines.iter().any(|line| line.starts_with("[context]")));
     }
@@ -11091,16 +11083,13 @@ mod tests {
             partial_delivery_hints: 1,
             http_retries: 4,
             empty_tool_call_hints: 6,
-            adaptive_escalations: 7,
-            action_locks: 8,
-            forced_finalizations: 9,
         };
         let rendered = status_detail_spans(&state)
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
         assert!(
-            rendered.contains("ext d2 cb3 sg1 ph1 rt4 et6 ae7 al8 ff9"),
+            rendered.contains("ext d2 cb3 sg1 ph1 rt4 et6"),
             "{rendered}"
         );
     }
@@ -11121,7 +11110,6 @@ mod tests {
             partial_delivery_hints: 0,
             http_retries: 0,
             empty_tool_call_hints: 0,
-            ..ExternalTelemetry::default()
         };
         let rendered = status_detail_spans(&state)
             .into_iter()
@@ -11133,9 +11121,6 @@ mod tests {
         assert!(!rendered.contains("ph0"), "{rendered}");
         assert!(!rendered.contains("rt0"), "{rendered}");
         assert!(!rendered.contains("et0"), "{rendered}");
-        assert!(!rendered.contains("ae0"), "{rendered}");
-        assert!(!rendered.contains("al0"), "{rendered}");
-        assert!(!rendered.contains("ff0"), "{rendered}");
     }
 
     #[test]

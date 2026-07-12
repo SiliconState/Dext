@@ -75,11 +75,11 @@ Credentials are stored in Dext state, not in the repository. Do not commit `.env
 
 ## Local Qwen / llama.cpp
 
-Dext includes a `local` provider for one OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. The curated local model id is `qwen3.6-35b-a3b-mtp-ud-q5_k_m`. On startup/provider switch, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) for the live runtime context window; if the probe misses, local context budgeting falls back to 131K tokens for Qwen3.6. Start exactly one server first, then select it:
+Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Local providers use frugal context by default unless you explicitly select `standard` or `tiny`. On startup and provider/model switches, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) and uses the live runtime context window for whichever model alias the server exposes. You can select any local alias; no model-specific context value is built into the local provider. Start one server first, then select its alias:
 
 ```bash
 dext auth provider local
-# or inside Dext:
+# or inside Dext, using the alias configured in llama-server:
 /model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
 /effort off
 ```
@@ -282,7 +282,7 @@ dext --budget '$2'
 dext --budget 200000t
 ```
 
-Frugal mode uses lean schemas, a smaller toolset, smaller caps, and more aggressive context reduction. Tiny mode keeps frugal's lean tools, uses a condensed prompt only for tiny, and caps history around 80% of the local model window (bounded 8k–32k chars). Standard mode and frugal mode keep the regular main-agent prompt. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
+Frugal mode uses lean schemas by default, keeps the selected toolset, applies smaller caps, and compacts context more aggressively. Tiny mode uses a condensed prompt and caps history around 80% of the detected model window (bounded 8k–32k chars). Explicit `--toolset` and `--tool-profile` choices remain available in every context mode. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
 
 `/usage`, `/status`, JSON output, and session headers report provider token usage after each completed model request. Anthropic-family responses use input/output/cache counters, OpenAI-compatible streaming requests ask for usage chunks, and local llama.cpp uses streamed `timings.cache_n/prompt_n/predicted_n` so cached-prefix reuse is counted separately from new prompt tokens. Dollar estimates use provider/model price tables or the `DEXT_*_USD_PER_MTOK` environment overrides listed below; local defaults to zero dollar cost.
 

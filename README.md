@@ -50,9 +50,9 @@ dext auth login glm <api-key>    # ZAI GLM key
 dext auth login openai <api-key> # OpenAI Platform key
 dext auth login anthropic <api-key>
 dext auth login deepseek <api-key>
-# Local llama.cpp/Qwen on 127.0.0.1:8080, no key. Start exactly one local model service first.
+# Local llama.cpp/Qwen on 127.0.0.1:8080, no key. Start one local model service first.
 dext auth provider local
-# local model choice: qwen3.6-35b-a3b-mtp-ud-q5_k_m
+# Dext uses the server's live context window and accepts its configured model alias.
 ```
 
 Start an interactive session:
@@ -73,7 +73,7 @@ Read a prompt from stdin:
 printf 'explain Cargo.toml\n' | dext -p
 ```
 
-Use low-token mode:
+Use low-token mode (local providers choose `frugal` automatically unless you explicitly select a mode):
 
 ```bash
 dext --frugal --effort off

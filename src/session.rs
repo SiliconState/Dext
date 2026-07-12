@@ -841,7 +841,12 @@ pub(crate) fn render_limited_lines(
 }
 
 pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
-    if let Ok(header) = serde_json::from_str::<SessionHeader>(line) {
+    if let Ok(mut header) = serde_json::from_str::<SessionHeader>(line) {
+        if !line.contains("\"context_mode_explicit\"")
+            && header.context_mode != crate::ContextMode::Standard
+        {
+            header.context_mode_explicit = true;
+        }
         return Ok(header);
     }
 
@@ -919,6 +924,12 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .as_str()
             .and_then(crate::ContextMode::parse)
             .unwrap_or_default(),
+        context_mode_explicit: meta["context_mode_explicit"].as_bool().unwrap_or_else(|| {
+            meta["context_mode"]
+                .as_str()
+                .and_then(crate::ContextMode::parse)
+                .is_some_and(|mode| mode != crate::ContextMode::Standard)
+        }),
         tool_context_profile: meta["tool_context_profile"]
             .as_str()
             .and_then(crate::ToolContextProfile::parse)
@@ -927,9 +938,6 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .as_str()
             .and_then(crate::ToolProfile::parse)
             .unwrap_or_default(),
-        execution_policy_override: meta["execution_policy_override"]
-            .as_str()
-            .and_then(crate::provider::ExecutionPolicy::parse),
         provenance: serde_json::from_value(meta["provenance"].clone()).unwrap_or_default(),
         work_ledger: serde_json::from_value(meta["work_ledger"].clone()).unwrap_or_default(),
         provider_health: serde_json::from_value(meta["provider_health"].clone())
