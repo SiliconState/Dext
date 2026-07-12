@@ -4,6 +4,7 @@
 /nul
 __pycache__/
 *.py[cod]
+*:Zone.Identifier
 /autoresearch.*
 /packopt.*
 
