@@ -3118,6 +3118,15 @@ fn sync_work_ledger_keeps_only_unresolved_objective_checkpoints_pending() {
             input: json!({"path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
         }],
     });
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::ToolResult {
+            tool_use_id: "call-edit".to_string(),
+            content: "edited src/lib.rs".to_string(),
+            is_error: Some(false),
+            metadata: ToolResultMetadata::default(),
+        }],
+    });
 
     let coverage = objective.assess_history(&agent.history);
     agent.sync_work_ledger_with_objective_coverage(&coverage);
@@ -5183,24 +5192,65 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(maybe_preserve_partial_stream(
         &blocks,
         &mut history,
-        ContextMode::Standard
+        ContextMode::Standard,
+        false,
     ));
     assert_eq!(history.len(), 1);
     assert!(!maybe_preserve_partial_stream(
         &blocks,
         &mut history,
-        ContextMode::Standard
+        ContextMode::Standard,
+        false,
     ));
     assert_eq!(history.len(), 1);
 
     let raw_tool_text = vec![Block::Text {
         text: "to=functions.bash {\"command\":\"cargo test\"}".to_string(),
     }];
+    let partial_tool_opener = vec![Block::Text {
+        text: "Preparing the call:\nto=".to_string(),
+    }];
+    let mut controlled_history = Vec::new();
+    assert!(maybe_preserve_partial_stream(
+        &partial_tool_opener,
+        &mut controlled_history,
+        ContextMode::Standard,
+        true,
+    ));
+    let controlled_text = assistant_text(&controlled_history);
+    assert!(controlled_text.contains("Malformed tool response suppressed"));
+    assert!(!controlled_text.contains("to="), "{controlled_text}");
+
+    let mixed_response = vec![
+        Block::Text {
+            text: "to=functions.write_file {\"path\":\"bad\"}".to_string(),
+        },
+        Block::ToolUse {
+            id: "call_valid".to_string(),
+            name: "write_file".to_string(),
+            input: json!({"path": "good.txt", "content": "ok"}),
+        },
+    ];
+    let sanitized = assistant_blocks_for_context(&mixed_response, ContextMode::Standard, true);
+    assert!(matches!(
+        sanitized.first(),
+        Some(Block::Text { text }) if text.contains("Malformed tool response suppressed")
+    ));
+    assert!(sanitized.iter().any(|block| matches!(
+        block,
+        Block::ToolUse { id, name, input }
+            if id == "call_valid"
+                && name == "write_file"
+                && input["path"] == "good.txt"
+    )));
+    assert!(!assistant_blocks_text(&sanitized).contains("bad"));
+
     let mut history = Vec::new();
     assert!(maybe_preserve_partial_stream(
         &raw_tool_text,
         &mut history,
-        ContextMode::Standard
+        ContextMode::Standard,
+        false,
     ));
     assert_eq!(history.len(), 1);
     assert!(matches!(
@@ -5212,7 +5262,8 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(maybe_preserve_partial_stream(
         &raw_tool_text,
         &mut history,
-        ContextMode::Frugal
+        ContextMode::Frugal,
+        false,
     ));
     assert_eq!(history.len(), 1);
     assert!(matches!(
@@ -5227,13 +5278,42 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(maybe_preserve_partial_stream(
         &multiline_raw_tool_text,
         &mut history,
-        ContextMode::Tiny
+        ContextMode::Tiny,
+        false,
     ));
     assert_eq!(history.len(), 1);
     assert!(matches!(
         &history[0].content[0],
         Block::Text { text } if text.contains("tool call redacted") && !text.contains("command") && !text.contains("cargo test")
     ));
+
+    let xml_tool_text = vec![Block::Text {
+        text: "[tool call redacted; waiting for structured tool event] <function=bash>\n<parameter=command>ls /home/baks/.dext/shelves/research/packs/autoresearch/hooks/</parameter>\n<parameter=timeout>10</parameter>\n</function>\n</tool_call>".to_string(),
+    }];
+    let mut controlled_history = Vec::new();
+    assert!(maybe_preserve_partial_stream(
+        &xml_tool_text,
+        &mut controlled_history,
+        ContextMode::Standard,
+        true,
+    ));
+    let controlled_text = assistant_text(&controlled_history);
+    assert!(controlled_text.contains("Malformed tool response suppressed"));
+    for leaked in [
+        "tool call redacted",
+        "<tool_call>",
+        "<function",
+        "<parameter",
+        "autoresearch/hooks",
+    ] {
+        assert!(!controlled_text.contains(leaked), "{controlled_text}");
+    }
+    let raw_xml = assistant_blocks_text(&xml_tool_text);
+    assert!(controlled_assistant_display_text(&raw_xml, ExecutionPolicy::Adaptive).is_none());
+    assert_eq!(
+        controlled_assistant_display_text(&raw_xml, ExecutionPolicy::Open).as_deref(),
+        Some(raw_xml.as_str())
+    );
 
     let tool_only = vec![Block::ToolUse {
         id: "call_1".to_string(),
@@ -5243,7 +5323,8 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(!maybe_preserve_partial_stream(
         &tool_only,
         &mut history,
-        ContextMode::Tiny
+        ContextMode::Tiny,
+        false,
     ));
 }
 
@@ -8066,6 +8147,126 @@ fn write_file_returns_diff_preview_and_summary() {
 }
 
 #[test]
+fn native_mutation_tools_report_identical_content_as_no_change() {
+    let root = temp_test_dir("native-mutation-no-change");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let path = root.join("note.txt");
+    std::fs::write(&path, "same").unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)),
+    )
+    .unwrap();
+    let modified_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    let write = execute_tool(
+        "write_file",
+        &json!({"path": "note.txt", "content": "same"}),
+        &root,
+    )
+    .expect("identical write_file should succeed");
+    assert!(write.starts_with("no changes to "), "{write}");
+
+    let edit = execute_tool(
+        "edit_file",
+        &json!({"path": "note.txt", "old_string": "same", "new_string": "same"}),
+        &root,
+    )
+    .expect("identical edit_file should succeed");
+    assert!(edit.starts_with("no changes to "), "{edit}");
+
+    let multi = execute_tool(
+        "multi_edit",
+        &json!({
+            "path": "note.txt",
+            "edits": [{"old_string": "same", "new_string": "same"}]
+        }),
+        &root,
+    )
+    .expect("identical multi_edit should succeed");
+    assert!(multi.starts_with("no changes to "), "{multi}");
+
+    let empty = execute_tool(
+        "write_file",
+        &json!({"path": "empty.txt", "content": ""}),
+        &root,
+    )
+    .expect("new empty file should be created");
+    assert!(empty.contains("wrote 0 bytes to"), "{empty}");
+    assert!(root.join("empty.txt").is_file());
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "same");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified_before,
+        "byte-identical native mutations must not rewrite the file"
+    );
+    assert!(
+        orchestrator::successful_mutation_result_has_no_content_delta(
+            "write_file",
+            &json!({"path": "note.txt", "content": "same"}),
+            &write,
+        )
+    );
+    assert!(
+        !orchestrator::successful_mutation_result_has_no_content_delta(
+            "write_file",
+            &json!({"path": "empty.txt", "content": ""}),
+            &empty,
+        )
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn native_mutation_attempt_keys_include_payload_and_current_target_state() {
+    let root = temp_test_dir("native-mutation-attempt-key");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let path = root.join("note.txt");
+    std::fs::write(&path, "same").unwrap();
+
+    let same = json!({"path": "note.txt", "content": "same"});
+    let different_payload = json!({"path": "note.txt", "content": "changed"});
+    let original_key = native_mutation_attempt_key(&root, "write_file", &same).unwrap();
+    assert_eq!(
+        original_key,
+        native_mutation_attempt_key(&root, "write_file", &same).unwrap()
+    );
+    assert_ne!(
+        original_key,
+        native_mutation_attempt_key(&root, "write_file", &different_payload).unwrap(),
+        "a materially different write to the same path must remain available"
+    );
+
+    let multi_a = json!({
+        "path": "note.txt",
+        "edits": [{"old_string": "same", "new_string": "same"}]
+    });
+    let multi_b = json!({
+        "path": "note.txt",
+        "edits": [{"old_string": "same", "new_string": "changed"}]
+    });
+    assert_ne!(
+        native_mutation_attempt_key(&root, "multi_edit", &multi_a),
+        native_mutation_attempt_key(&root, "multi_edit", &multi_b),
+        "multi_edit identity must include its edits"
+    );
+
+    std::fs::write(&path, "external change").unwrap();
+    assert_ne!(
+        original_key,
+        native_mutation_attempt_key(&root, "write_file", &same).unwrap(),
+        "the same payload must be allowed again after the target changes externally"
+    );
+    let write = execute_tool("write_file", &same, &root).expect("rewrite after external change");
+    assert!(!write.starts_with("no changes to "), "{write}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "same");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn edit_file_returns_diff_and_summary() {
     let root = temp_test_dir("edit-file-diff");
     let root = std::fs::canonicalize(&root).unwrap();
@@ -10383,7 +10584,7 @@ fn controlled_request_builder_preserves_open_payload_and_disables_tools_only_whe
         &sys_blocks,
         &wire_tools,
         "unused",
-        true,
+        ToolRequestMode::Auto,
     )?;
     assert_eq!(legacy, controlled_open);
 
@@ -10393,10 +10594,105 @@ fn controlled_request_builder_preserves_open_payload_and_disables_tools_only_whe
         &sys_blocks,
         &wire_tools,
         "unused",
-        false,
+        ToolRequestMode::Disabled,
     )?;
     let finalized: Value = serde_json::from_slice(&finalized_body)?;
     assert_eq!(finalized["tools"].as_array().map(Vec::len), Some(0));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn recovery_request_forces_structured_tool_call_on_supported_contracts() -> Result<()> {
+    let root = temp_test_dir("recovery-tool-choice-required");
+    let root = std::fs::canonicalize(&root)?;
+    let wire_tools = vec![WireTool {
+        name: "read_file".to_string(),
+        description: "read".to_string(),
+        input_schema: json!({"type":"object","properties":{}}),
+        cache_control: None,
+    }];
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "stable prompt",
+        cache_control: None,
+    }];
+
+    // OpenAI-compatible contract: tool_choice must flip to "required".
+    let mut oai = test_agent(&root);
+    oai.provider_id = "deepseek".to_string();
+    oai.api_provider = ApiProvider::OpenAi;
+    oai.model = "deepseek-chat".to_string();
+    let (_, normal_body) = oai.build_streaming_request_controlled(
+        "stable prompt",
+        "runtime env",
+        &sys_blocks,
+        &wire_tools,
+        "unused",
+        ToolRequestMode::Auto,
+    )?;
+    let normal: Value = serde_json::from_slice(&normal_body)?;
+    assert!(normal.get("tool_choice").is_none(), "{normal}");
+    let (_, recovery_body) = oai.build_streaming_request_controlled(
+        "stable prompt",
+        "runtime env",
+        &sys_blocks,
+        &wire_tools,
+        "unused",
+        ToolRequestMode::Required,
+    )?;
+    let recovery: Value = serde_json::from_slice(&recovery_body)?;
+    assert_eq!(recovery["tool_choice"], "required", "{recovery}");
+
+    // Finalized state suppresses tools regardless of the recovery flag.
+    let (_, finalized_body) = oai.build_streaming_request_controlled(
+        "stable prompt",
+        "runtime env",
+        &sys_blocks,
+        &wire_tools,
+        "unused",
+        ToolRequestMode::Disabled,
+    )?;
+    let finalized: Value = serde_json::from_slice(&finalized_body)?;
+    assert_eq!(finalized["tools"].as_array().map(Vec::len), Some(0));
+    assert!(finalized.get("tool_choice").is_none(), "{finalized}");
+
+    // ChatGPT contract: tool_choice must override to "required".
+    let mut chatgpt = test_agent(&root);
+    chatgpt.provider_id = "chatgpt".to_string();
+    chatgpt.api_provider = ApiProvider::ChatGpt;
+    chatgpt.model = "gpt-5.6".to_string();
+    let (_, chatgpt_recovery_body) = chatgpt.build_streaming_request_controlled(
+        "stable prompt",
+        "runtime env",
+        &sys_blocks,
+        &wire_tools,
+        "dext-session",
+        ToolRequestMode::Required,
+    )?;
+    let chatgpt_recovery: Value = serde_json::from_slice(&chatgpt_recovery_body)?;
+    assert_eq!(
+        chatgpt_recovery["tool_choice"], "required",
+        "{chatgpt_recovery}"
+    );
+
+    // Anthropic contract carries no tool_choice field — recovery is
+    // prompt-driven only for that contract.
+    let mut claude = test_agent(&root);
+    claude.provider_id = "anthropic".to_string();
+    claude.api_provider = ApiProvider::Anthropic;
+    claude.model = "claude-sonnet-4-6".to_string();
+    let (_, claude_body) = claude.build_streaming_request_controlled(
+        "stable prompt",
+        "runtime env",
+        &sys_blocks,
+        &wire_tools,
+        "unused",
+        ToolRequestMode::Required,
+    )?;
+    let claude_value: Value = serde_json::from_slice(&claude_body)?;
+    assert!(claude_value.get("tool_choice").is_none(), "{claude_value}");
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -10762,6 +11058,9 @@ fn pseudo_tool_syntax_detection_marks_plain_text_invalid() {
     assert!(blocks_contain_pseudo_tool_syntax(&[Block::Text {
         text: "tool call: functions.write_file".to_string(),
     }]));
+    assert!(blocks_contain_pseudo_tool_syntax_or_start(&[Block::Text {
+        text: "to=".to_string(),
+    }]));
     assert!(!text_contains_pseudo_tool_syntax(
         "I will use the edit_file tool if needed."
     ));
@@ -10779,6 +11078,74 @@ fn pseudo_tool_syntax_detection_marks_plain_text_invalid() {
         "today=functions maybe"
     ));
     assert!(!text_line_looks_like_pseudo_tool_start("to=day plan"));
+    assert!(text_contains_pseudo_tool_syntax(
+        "[tool call redacted; waiting for structured tool event] <function=bash> <parameter=command>ls ~/.dext</parameter>"
+    ));
+}
+
+#[test]
+fn tool_call_empty_required_argument_detection_uses_schema_rules() {
+    assert!(tool_call_has_empty_required_arguments(
+        "edit_file",
+        &json!({})
+    ));
+    assert!(tool_call_has_empty_required_arguments(
+        "edit_file",
+        &json!({"path": " ", "old_string": "a", "new_string": "b"})
+    ));
+    assert!(tool_call_has_empty_required_arguments(
+        "write_file",
+        &json!({"path": "out.txt"})
+    ));
+    assert!(!tool_call_has_empty_required_arguments(
+        "write_file",
+        &json!({"path": "out.txt", "content": ""})
+    ));
+    assert!(!tool_call_has_empty_required_arguments(
+        "edit_file",
+        &json!({"path": "out.txt", "old_string": "a", "new_string": ""})
+    ));
+    assert!(!tool_call_has_empty_required_arguments(
+        "unknown_tool",
+        &json!({})
+    ));
+}
+
+#[test]
+fn controlled_completion_claims_require_mutation_and_repo_scope_is_respected() {
+    assert!(assistant_text_has_completion_claim(
+        "The report is written and saved. All issues fixed."
+    ));
+    assert!(assistant_text_has_completion_claim(
+        "I deleted the global hook."
+    ));
+    assert!(!assistant_text_has_completion_claim(
+        "I found the report and recommend updating it."
+    ));
+
+    let root = temp_test_dir("controlled-repo-scope");
+    let root = std::fs::canonicalize(&root).expect("canonical root");
+    assert!(!repo_scoped_external_mutation(
+        "write_file",
+        &json!({"path": root.join("local.txt"), "content": "ok"}),
+        &root,
+    ));
+    assert!(repo_scoped_external_mutation(
+        "write_file",
+        &json!({"path": "/home/example/.dext/packs/demo/PACK.md", "content": "bad"}),
+        &root,
+    ));
+    assert!(repo_scoped_external_mutation(
+        "bash",
+        &json!({"command": "rm ~/.dext/shelves/research/packs/autoresearch/phooks.json"}),
+        &root,
+    ));
+    assert!(!repo_scoped_external_mutation(
+        "bash",
+        &json!({"command": "ls ~/.dext/shelves/research/packs/autoresearch"}),
+        &root,
+    ));
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

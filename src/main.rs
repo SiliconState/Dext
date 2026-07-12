@@ -307,6 +307,9 @@ fn text_line_looks_like_pseudo_tool_payload(line: &str) -> bool {
 fn pseudo_tool_line_opens_payload_block(line: &str) -> bool {
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("<tool_call") {
+        return !lower.contains("</tool_call>");
+    }
     if lower == "to=" || lower == "to =" {
         return true;
     }
@@ -330,9 +333,33 @@ fn pseudo_tool_line_opens_payload_block(line: &str) -> bool {
 pub(crate) fn redact_pseudo_tool_protocol_text(text: &str) -> String {
     let mut redacted = false;
     let mut redacting_payload = false;
+    let mut redacting_xml = false;
     let mut lines = Vec::new();
     let marker = pseudo_tool_redaction_marker();
     for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if redacting_xml {
+            if let Some(end) = lower.find("</tool_call>") {
+                redacting_xml = false;
+                let tail = line[end + "</tool_call>".len()..].trim();
+                if !tail.is_empty() {
+                    lines.push(tail.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(start) = lower.find("<tool_call") {
+            redacted = true;
+            let prefix = line[..start].trim_end();
+            if !prefix.is_empty() {
+                lines.push(prefix.to_string());
+            }
+            if lines.last().is_none_or(|previous| previous != marker) {
+                lines.push(marker.to_string());
+            }
+            redacting_xml = !lower[start..].contains("</tool_call>");
+            continue;
+        }
         if redacting_payload {
             if line.trim().is_empty() {
                 redacting_payload = false;
@@ -391,8 +418,31 @@ fn redact_pseudo_tool_protocol_blocks(blocks: &[Block]) -> Vec<Block> {
         .collect()
 }
 
-fn assistant_blocks_for_context(blocks: &[Block], context_mode: ContextMode) -> Vec<Block> {
-    if context_mode.is_frugal() {
+fn controlled_assistant_display_text(text: &str, policy: ExecutionPolicy) -> Option<String> {
+    (policy == ExecutionPolicy::Open).then(|| text.to_string())
+}
+
+fn suppressed_pseudo_tool_blocks(blocks: &[Block]) -> Vec<Block> {
+    let mut sanitized = vec![Block::Text {
+        text: "Malformed tool response suppressed; malformed text was not executed.".to_string(),
+    }];
+    sanitized.extend(
+        blocks
+            .iter()
+            .filter(|block| matches!(block, Block::ToolUse { .. }))
+            .cloned(),
+    );
+    sanitized
+}
+
+fn assistant_blocks_for_context(
+    blocks: &[Block],
+    context_mode: ContextMode,
+    suppress_pseudo_tool_text: bool,
+) -> Vec<Block> {
+    if suppress_pseudo_tool_text && blocks_contain_pseudo_tool_syntax_or_start(blocks) {
+        suppressed_pseudo_tool_blocks(blocks)
+    } else if context_mode.is_frugal() {
         redact_pseudo_tool_protocol_blocks(blocks)
     } else {
         blocks.to_vec()
@@ -403,6 +453,7 @@ fn maybe_preserve_partial_stream(
     blocks: &[Block],
     history: &mut Vec<Message>,
     context_mode: ContextMode,
+    suppress_pseudo_tool_text: bool,
 ) -> bool {
     if blocks.is_empty()
         || !blocks
@@ -411,7 +462,8 @@ fn maybe_preserve_partial_stream(
     {
         return false;
     }
-    let visible_blocks = assistant_blocks_for_context(blocks, context_mode);
+    let visible_blocks =
+        assistant_blocks_for_context(blocks, context_mode, suppress_pseudo_tool_text);
     if let Some(last) = history.last()
         && last.role == "assistant"
         && last.content == visible_blocks
@@ -964,6 +1016,34 @@ impl ReadFileCache {
 
 fn canonical_within(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
     canonicalize_tool_path(root, user_path)
+}
+
+fn native_mutation_attempt_key(root: &Path, name: &str, input: &Value) -> Option<String> {
+    if !matches!(name, "write_file" | "edit_file" | "multi_edit") {
+        return None;
+    }
+    let path = canonical_within(root, input["path"].as_str()?).ok()?;
+    let mut normalized_input = input.clone();
+    normalized_input["path"] = Value::String(path.to_string_lossy().into_owned());
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(normalized_input.to_string().as_bytes());
+    hasher.update([0]);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            hasher.update(b"present\0");
+            hasher.update(bytes);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update(b"missing");
+        }
+        Err(error) => {
+            hasher.update(b"unreadable\0");
+            hasher.update(error.kind().to_string().as_bytes());
+        }
+    }
+    Some(format!("{name}:{:x}", hasher.finalize()))
 }
 
 fn canonical_read_path(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
@@ -3103,6 +3183,39 @@ fn clamp_thinking_budget_below_max(budget_tokens: u32, max_tokens: u32) -> Optio
     Some(budget_tokens.min(ceiling.max(1)).min(strict_max))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRequestMode {
+    Disabled,
+    Auto,
+    Required,
+}
+
+impl ToolRequestMode {
+    fn tools_enabled(self) -> bool {
+        self != Self::Disabled
+    }
+
+    fn requires_tool_call(self) -> bool {
+        self == Self::Required
+    }
+}
+
+fn controlled_tool_request_mode(
+    policy: ExecutionPolicy,
+    finalizing: bool,
+    recovery_requested: bool,
+) -> ToolRequestMode {
+    if policy == ExecutionPolicy::Open {
+        ToolRequestMode::Auto
+    } else if finalizing {
+        ToolRequestMode::Disabled
+    } else if recovery_requested {
+        ToolRequestMode::Required
+    } else {
+        ToolRequestMode::Auto
+    }
+}
+
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
@@ -3145,6 +3258,8 @@ struct OaiRequest<'a> {
     max_tokens: u32,
     messages: Vec<OaiMessage>,
     tools: Vec<OaiTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OaiStreamOptions>,
@@ -7288,6 +7403,10 @@ fn execute_tool_with_cache(
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(format!("failed to read existing file for preview: {e}")),
             };
+            let unchanged = before.as_deref() == Some(content);
+            if unchanged {
+                return Ok(format!("no changes to {}", path.display()));
+            }
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -7317,6 +7436,9 @@ fn execute_tool_with_cache(
                 ));
             }
             let updated = content.replacen(old, new, 1);
+            if updated == content {
+                return Ok(format!("no changes to {}", path.display()));
+            }
             std::fs::write(&path, &updated).map_err(|e| format!("{e}"))?;
             Ok(edit_result_with_diff(1, &path, root, &content, &updated))
         }
@@ -7352,6 +7474,9 @@ fn execute_tool_with_cache(
                     }
                     content = content.replacen(old, new, 1);
                 }
+            }
+            if content == before {
+                return Ok(format!("no changes to {}", path.display()));
             }
             std::fs::write(&path, &content).map_err(|e| format!("{e}"))?;
             Ok(edit_result_with_diff(
@@ -13533,7 +13658,7 @@ impl Agent {
             sys_blocks,
             wire_tools,
             chatgpt_session_id,
-            true,
+            ToolRequestMode::Auto,
         )
     }
 
@@ -13544,7 +13669,7 @@ impl Agent {
         sys_blocks: &[SystemBlock<'_>],
         wire_tools: &[WireTool],
         chatgpt_session_id: &str,
-        tools_enabled: bool,
+        tool_mode: ToolRequestMode,
     ) -> Result<(String, Vec<u8>)> {
         let contract = self.request_contract();
         let effort = self.effective_thinking_effort();
@@ -13563,12 +13688,19 @@ impl Agent {
                     sys_stable,
                     chatgpt_session_id,
                     input,
-                    if tools_enabled {
+                    if tool_mode.tools_enabled() {
                         self.wire_tools_chatgpt()
                     } else {
                         Vec::new()
                     },
                 );
+                if tool_mode.requires_tool_call()
+                    && let Some(object) = body.as_object_mut()
+                    && object.contains_key("tools")
+                {
+                    object.insert("tool_choice".to_string(), json!("required"));
+                    object.insert("parallel_tool_calls".to_string(), json!(false));
+                }
                 if !self.model_supports_prompt_cache()
                     && let Some(object) = body.as_object_mut()
                 {
@@ -13583,7 +13715,7 @@ impl Agent {
                 // their implicit prefix caches on every tool round.
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
-                let oai_tools = if tools_enabled {
+                let oai_tools = if tool_mode.tools_enabled() {
                     self.wire_tools_oai()
                 } else {
                     Vec::new()
@@ -13606,11 +13738,14 @@ impl Agent {
                     &tool_names,
                     env_flag_default(LLAMA_TOOL_GRAMMAR_ENV, false),
                 );
+                let tool_choice =
+                    (tool_mode.requires_tool_call() && !oai_tools.is_empty()).then_some("required");
                 let body = OaiRequest {
                     model: &self.model,
                     max_tokens: max_output_tokens,
                     messages: oai_msgs,
                     tools: oai_tools,
+                    tool_choice,
                     stream: true,
                     stream_options,
                     reasoning_effort,
@@ -13682,7 +13817,11 @@ impl Agent {
                 append_runtime_env_block(&mut messages, sys_env);
                 let system = system_blocks_with_cache_control(sys_blocks, prompt_cache_enabled);
                 let tools = wire_tools_with_cache_control(
-                    if tools_enabled { wire_tools } else { &[] },
+                    if tool_mode.tools_enabled() {
+                        wire_tools
+                    } else {
+                        &[]
+                    },
                     prompt_cache_enabled,
                 );
                 let body = Request {
@@ -14385,6 +14524,7 @@ impl Agent {
                 max_tokens: summary_max_tokens,
                 messages,
                 tools: Vec::new(),
+                tool_choice: None,
                 stream: false,
                 stream_options: None,
                 reasoning_effort,
@@ -14864,8 +15004,12 @@ impl Agent {
         let mut action_contract_must_mutate = false;
         let mut action_contract_no_mutation_turns: u32 = 0;
         let mut implementation_fallback_emitted = false;
+        let mut successful_content_change_this_turn = false;
+        let mut successful_unchanged_mutation_this_turn = false;
+        let mut exhaustive_cleanup_verified = false;
         let mut last_retry_reason: Option<String> = None;
         let mut workaround_fired_this_turn = false;
+        let mut require_tool_call_next = false;
 
         self.set_work_phase(turn_state.phase().label());
         self.sink.emit(AgentEvent::Info(format!(
@@ -14974,15 +15118,20 @@ impl Agent {
                 cache_control: Some(CacheControl::for_prompt()),
             }];
             let mut stream_attempt: u32 = 0;
-            let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
+            let (mut blocks, stop_reason, mut usage) = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
+                let tool_mode = controlled_tool_request_mode(
+                    self.effective_execution_policy(),
+                    turn_state.should_finalize(),
+                    require_tool_call_next,
+                );
                 let (url, req_body) = self.build_streaming_request_controlled(
                     &sys_stable,
                     &sys_env,
                     &sys_blocks,
                     &wire_tools,
                     chatgpt_session_id.as_deref().unwrap_or("dext"),
-                    !turn_state.should_finalize(),
+                    tool_mode,
                 )?;
                 stream_attempt += 1;
                 let mut attempt: u32 = 0;
@@ -15205,14 +15354,9 @@ impl Agent {
                         }
                         if self.request_contract() == RequestContract::ChatGptResponses {
                             let partial_blocks = self.partial_chatgpt_stream_blocks();
-                            if maybe_preserve_partial_stream(
-                                &partial_blocks,
-                                &mut self.history,
-                                self.context_mode,
-                            ) {
-                                self.checkpoint_latest_session("after_partial_stream_preserve");
+                            if !partial_blocks.is_empty() {
                                 self.sink.emit(AgentEvent::Warn(
-                                    "provider closed the stream after partial text; preserved partial response instead of replaying the same turn".to_string(),
+                                    "provider closed the stream after partial text; preserving and classifying the partial response instead of replaying the same turn".to_string(),
                                 ));
                                 break 'stream_retry (
                                     partial_blocks,
@@ -15260,15 +15404,83 @@ impl Agent {
             }
 
             let assistant_response_text = assistant_blocks_text(&blocks);
-            let response_has_pseudo_tool =
-                blocks_contain_pseudo_tool_syntax_for_context(&blocks, self.context_mode);
-            if objective.apply_fixes_allowed()
-                && assistant_text_has_implementation_commitment(&assistant_response_text)
-            {
+            let response_has_pseudo_tool = blocks_contain_pseudo_tool_syntax_or_start(&blocks);
+            let response_has_tool_use = blocks
+                .iter()
+                .any(|block| matches!(block, Block::ToolUse { .. }));
+            let controlled_execution = self.effective_execution_policy() != ExecutionPolicy::Open;
+            let completion_claim_requires_content_change =
+                assistant_text_has_content_change_claim(&assistant_response_text);
+            let unchanged_target_explained = successful_unchanged_mutation_this_turn
+                && orchestrator::assistant_text_explains_unchanged_target(&assistant_response_text);
+            let completion_claim_supported = if completion_claim_requires_content_change {
+                successful_content_change_this_turn
+            } else {
+                successful_content_change_this_turn || unchanged_target_explained
+            };
+            let unverified_completion_claim = controlled_execution
+                && !response_has_tool_use
+                && objective.apply_fixes_allowed()
+                && assistant_text_has_completion_claim(&assistant_response_text)
+                && (!completion_claim_supported
+                    || objective.exhaustive_cleanup && !exhaustive_cleanup_verified)
+                && (!orchestrator::assistant_text_has_blocked_reason(&assistant_response_text)
+                    || completion_claim_requires_content_change);
+            if controlled_execution && response_has_pseudo_tool {
+                blocks = suppressed_pseudo_tool_blocks(&blocks);
+            } else if unverified_completion_claim {
+                blocks = vec![Block::Text {
+                    text:
+                        "Unsupported completion claim suppressed; no verified mutation supports it."
+                            .to_string(),
+                }];
+            } else if controlled_execution {
+                for block in &blocks {
+                    match block {
+                        Block::Text { text } | Block::PartialStream { text } => {
+                            self.sink.emit(AgentEvent::TextBlockComplete(text.clone()))
+                        }
+                        Block::Thinking { text, .. } => self
+                            .sink
+                            .emit(AgentEvent::ThinkingBlockComplete(text.clone())),
+                        _ => {}
+                    }
+                }
+            }
+            if controlled_execution && !response_has_pseudo_tool {
+                for (ordinal, block) in blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::ToolUse { .. }))
+                    .enumerate()
+                {
+                    let Block::ToolUse { id, name, input } = block else {
+                        continue;
+                    };
+                    let privileged = needs_permission(name) && !self.allowed.contains(name);
+                    if !privileged {
+                        self.sink.emit(AgentEvent::ToolCallPreview {
+                            call_id: normalize_tool_call_id(id, 0, ordinal),
+                            name: name.clone(),
+                            summary: summarize_call(name, input),
+                        });
+                    }
+                }
+            }
+            let implementation_commitment = objective.apply_fixes_allowed()
+                && assistant_text_has_implementation_commitment(&assistant_response_text);
+            if implementation_commitment {
                 action_contract_must_mutate = true;
+            } else if unchanged_target_explained {
+                action_contract_must_mutate = false;
+                action_contract_no_mutation_turns = 0;
             }
 
-            if maybe_preserve_partial_stream(&blocks, &mut self.history, self.context_mode) {
+            if maybe_preserve_partial_stream(
+                &blocks,
+                &mut self.history,
+                self.context_mode,
+                controlled_execution,
+            ) {
                 self.checkpoint_latest_session("after_assistant_message");
             } else {
                 // maybe_preserve_partial_stream skips messages that lack Text/PartialStream
@@ -15281,7 +15493,11 @@ impl Agent {
                 if has_tool_use {
                     self.history.push(Message {
                         role: "assistant".to_string(),
-                        content: assistant_blocks_for_context(&blocks, self.context_mode),
+                        content: assistant_blocks_for_context(
+                            &blocks,
+                            self.context_mode,
+                            controlled_execution,
+                        ),
                     });
                     self.checkpoint_latest_session("after_assistant_message");
                 }
@@ -15297,9 +15513,7 @@ impl Agent {
 
             let empty_call_count = tool_calls
                 .iter()
-                .filter(|(_, _, input)| {
-                    input.as_object().is_some_and(|m| m.is_empty()) || input.is_null()
-                })
+                .filter(|(_, name, input)| tool_call_has_empty_required_arguments(name, input))
                 .count();
             turn_state.record_empty_tool_calls(empty_call_count);
             let empty_tool_call_loop_note = turn_state.empty_tool_call_loop_note();
@@ -15317,22 +15531,98 @@ impl Agent {
                 {
                     action_contract_must_mutate = true;
                 }
-                if response_has_pseudo_tool {
-                    let note = pseudo_tool_runtime_note();
+                if controlled_execution && response_has_pseudo_tool {
+                    let recovery_note = turn_state.take_pseudo_tool_recovery_message();
+                    let tools_available = !turn_state.should_finalize();
+                    require_tool_call_next = tools_available;
+                    if let Some(halt) = turn_state.take_invalid_response_halt_message() {
+                        self.sink.emit(AgentEvent::Warn(halt.clone()));
+                        self.append_latest_log("invalid_response_halt", &halt);
+                        if let Some(message) = self
+                            .history
+                            .last_mut()
+                            .filter(|message| message.role == "assistant")
+                        {
+                            message.content.push(Block::Text { text: halt });
+                        }
+                        self.checkpoint_latest_session("after_invalid_response_halt");
+                        break;
+                    }
+                    let note =
+                        recovery_note.unwrap_or_else(|| pseudo_tool_runtime_note(tools_available));
+                    let recovery = note.starts_with("Malformed tool response suppressed again");
                     self.sink.emit(AgentEvent::Warn(note.clone()));
-                    self.append_latest_log("pseudo_tool_text", &note);
+                    self.append_latest_log(
+                        if recovery {
+                            "pseudo_tool_recovery"
+                        } else {
+                            "pseudo_tool_text"
+                        },
+                        &note,
+                    );
                     self.history.push(Message {
                         role: "user".to_string(),
                         content: vec![Block::Text {
                             text: format!("[runtime-note] {note}"),
                         }],
                     });
-                    self.checkpoint_latest_session("after_pseudo_tool_warning");
+                    self.checkpoint_latest_session(if recovery {
+                        "after_pseudo_tool_recovery"
+                    } else {
+                        "after_pseudo_tool_warning"
+                    });
                     continue;
                 }
-                if action_contract_must_mutate {
+                if unverified_completion_claim {
+                    let recovery_note = turn_state.take_unverified_completion_recovery_message();
+                    let tools_available = !turn_state.should_finalize();
+                    require_tool_call_next = tools_available;
+                    if let Some(halt) = turn_state.take_invalid_response_halt_message() {
+                        self.sink.emit(AgentEvent::Warn(halt.clone()));
+                        self.append_latest_log("invalid_response_halt", &halt);
+                        if let Some(message) = self
+                            .history
+                            .last_mut()
+                            .filter(|message| message.role == "assistant")
+                        {
+                            message.content.push(Block::Text { text: halt });
+                        }
+                        self.checkpoint_latest_session("after_invalid_response_halt");
+                        break;
+                    }
+                    let note = recovery_note
+                        .unwrap_or_else(|| unverified_completion_runtime_note(tools_available));
+                    let recovery = note.starts_with("runtime recovery:");
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log(
+                        if recovery {
+                            "unverified_completion_recovery"
+                        } else {
+                            "unverified_completion"
+                        },
+                        &note,
+                    );
+                    self.history.push(Message {
+                        role: "user".to_string(),
+                        content: vec![Block::Text {
+                            text: format!("[runtime-note] {note}"),
+                        }],
+                    });
+                    self.checkpoint_latest_session(if recovery {
+                        "after_unverified_completion_recovery"
+                    } else {
+                        "after_unverified_completion_warning"
+                    });
+                    continue;
+                }
+                if action_contract_must_mutate && !turn_state.should_finalize() {
+                    turn_state.record_response_nonprogress();
+                    if turn_state.should_finalize() {
+                        continue;
+                    }
                     action_contract_no_mutation_turns =
                         action_contract_no_mutation_turns.saturating_add(1);
+                    require_tool_call_next = controlled_execution;
                     let notes = self.action_contract_violation_runtime_notes(
                         action_contract_no_mutation_turns,
                         &mut implementation_fallback_emitted,
@@ -15363,29 +15653,41 @@ impl Agent {
                 }
                 let coverage = objective.assess_history(&self.history);
                 self.sync_work_ledger_with_objective_coverage(&coverage);
-                if !objective_warning_emitted && !coverage.unresolved.is_empty() {
-                    let reminder =
-                        orchestrator::objective_runtime_reminder_from_coverage(&coverage);
-                    self.sink.emit(AgentEvent::Warn(reminder.clone()));
-                    self.append_latest_log("objective_unresolved", &reminder);
-                    self.history.push(Message {
-                        role: "user".to_string(),
-                        content: vec![Block::Text {
-                            text: format!("[runtime-note] {reminder}"),
-                        }],
-                    });
-                    self.checkpoint_latest_session("after_objective_warning");
-                    objective_warning_emitted = true;
-                    if let Some((_, msg)) =
-                        turn_state.advance_phase(orchestrator::PhaseTrigger::FinalResponse)
-                    {
-                        self.set_work_phase(turn_state.phase().label());
-                        self.sink.emit(AgentEvent::Info(format!(
-                            "[phase:{}] {msg}",
-                            turn_state.phase().label()
-                        )));
+                if !coverage.unresolved.is_empty() {
+                    let retry_unresolved = if controlled_execution {
+                        if turn_state.should_finalize() {
+                            false
+                        } else {
+                            turn_state.record_response_nonprogress();
+                            true
+                        }
+                    } else {
+                        !objective_warning_emitted
+                    };
+                    if retry_unresolved {
+                        let reminder =
+                            orchestrator::objective_runtime_reminder_from_coverage(&coverage);
+                        self.sink.emit(AgentEvent::Warn(reminder.clone()));
+                        self.append_latest_log("objective_unresolved", &reminder);
+                        self.history.push(Message {
+                            role: "user".to_string(),
+                            content: vec![Block::Text {
+                                text: format!("[runtime-note] {reminder}"),
+                            }],
+                        });
+                        self.checkpoint_latest_session("after_objective_warning");
+                        objective_warning_emitted = true;
+                        if let Some((_, msg)) =
+                            turn_state.advance_phase(orchestrator::PhaseTrigger::FinalResponse)
+                        {
+                            self.set_work_phase(turn_state.phase().label());
+                            self.sink.emit(AgentEvent::Info(format!(
+                                "[phase:{}] {msg}",
+                                turn_state.phase().label()
+                            )));
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 if let Some((_, msg)) =
                     turn_state.advance_phase(orchestrator::PhaseTrigger::FinalResponse)
@@ -15425,6 +15727,8 @@ impl Agent {
                 break;
             }
 
+            turn_state.reset_protocol_response_streaks();
+            require_tool_call_next = false;
             turn_state.begin_tool_round();
 
             if self.interrupt.load(Ordering::SeqCst) {
@@ -15467,6 +15771,7 @@ impl Agent {
                 bulk_network: bool,
                 local_sudo_auth_needed: bool,
                 cache_key: Option<String>,
+                mutation_attempt_key: Option<String>,
                 bash_similarity_key: Option<String>,
                 plan: Plan,
             }
@@ -15480,22 +15785,37 @@ impl Agent {
                 let hosts = tool_policy::hosts_for_tool_call(&name, &input);
                 let bulk_network = tool_policy::looks_like_bulk_network_call(&name, &input);
                 let cache_key = orchestrator::network_cache_key(&name, &input);
+                let mutation_attempt_key =
+                    native_mutation_attempt_key(&self.sandbox_root, &name, &input);
                 let bash_similarity_key = if name == "bash" {
                     Some(orchestrator::normalize_bash_similarity_key(
                         input["command"].as_str().unwrap_or(""),
                     ))
-                } else if matches!(name.as_str(), "write_file" | "edit_file") {
-                    input["path"].as_str().map(|p| format!("{name}:{p}"))
                 } else {
-                    None
+                    mutation_attempt_key.clone()
                 };
 
                 let mut plan: Option<Plan> = None;
                 let mut local_sudo_auth_needed = false;
 
-                if let Some(msg) = turn_state.controlled_action_guard(&name, &input) {
+                if let Some(msg) = turn_state.controlled_action_guard_for_attempt(
+                    &name,
+                    &input,
+                    mutation_attempt_key.as_deref(),
+                ) {
                     plan = Some(Plan::Immediate {
                         content: msg,
+                        is_error: Some(true),
+                    });
+                }
+
+                if plan.is_none()
+                    && controlled_execution
+                    && objective.repo_scoped_mutation
+                    && repo_scoped_external_mutation(&name, &input, &self.sandbox_root)
+                {
+                    plan = Some(Plan::Immediate {
+                        content: "runtime scope guard: this request is scoped to the current repo/project, but the proposed mutation targets Dext user-global state outside it. Ask for explicit confirmation before changing the external path.".to_string(),
                         is_error: Some(true),
                     });
                 }
@@ -15658,12 +15978,6 @@ impl Agent {
 
                 let plan = plan.expect("plan must be set");
 
-                if matches!(plan, Plan::Builtin)
-                    && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
-                {
-                    self.work_ledger_note_file_change(&input);
-                }
-
                 // Create recovery checkpoint before write-risk mutations.
                 if matches!(plan, Plan::Builtin) {
                     self.maybe_create_tool_checkpoint(&name, &input);
@@ -15707,6 +16021,7 @@ impl Agent {
                     bulk_network,
                     local_sudo_auth_needed,
                     cache_key,
+                    mutation_attempt_key,
                     bash_similarity_key,
                     plan,
                 });
@@ -15915,7 +16230,11 @@ impl Agent {
             let mut batch_labels: Vec<String> = Vec::new();
             let mut results = Vec::new();
             let mut round_external_failures: usize = 0;
-            let mut mutation_succeeded = false;
+            let mut mutation_content_changed = false;
+            let mut unchanged_mutation_succeeded = false;
+            let mut mutation_attempted = false;
+            let mut cleanup_check_attempted = false;
+            let mut cleanup_checks_clean = true;
             for (idx, p) in plans.into_iter().enumerate() {
                 let PlannedCall {
                     tool_use_id,
@@ -15928,6 +16247,7 @@ impl Agent {
                     bulk_network: _bulk_network,
                     local_sudo_auth_needed: _local_sudo_auth_needed,
                     cache_key,
+                    mutation_attempt_key,
                     bash_similarity_key,
                     plan,
                 } = p;
@@ -15984,16 +16304,40 @@ impl Agent {
                 }
 
                 let ok = !is_error.unwrap_or(false);
-                if ok
-                    && ran_builtin
-                    && (ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
-                        || name == "bash"
-                            && input["command"]
-                                .as_str()
-                                .is_some_and(orchestrator::bash_command_likely_mutates_files))
+                let mutating_call = ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
+                    || name == "bash"
+                        && input["command"]
+                            .as_str()
+                            .is_some_and(orchestrator::bash_command_likely_mutates_files);
+                mutation_attempted |= mutating_call;
+                if ran_builtin
+                    && objective.exhaustive_cleanup
+                    && orchestrator::cleanup_check_candidate(&name, &input)
                 {
-                    mutation_succeeded = true;
-                    turn_state.mark_mutation_succeeded();
+                    cleanup_check_attempted = true;
+                    cleanup_checks_clean &=
+                        ok && orchestrator::cleanup_check_has_no_residue(&name, &input, &content);
+                }
+                let mutation_operation_completed = ok && ran_builtin && mutating_call;
+                let mutation_no_content_delta = mutation_operation_completed
+                    && orchestrator::successful_mutation_result_has_no_content_delta(
+                        &name, &input, &content,
+                    );
+                let mutation_changed = mutation_operation_completed && !mutation_no_content_delta;
+                if mutation_no_content_delta {
+                    unchanged_mutation_succeeded = true;
+                    successful_unchanged_mutation_this_turn = true;
+                }
+                if mutation_changed {
+                    mutation_content_changed = true;
+                    successful_content_change_this_turn = true;
+                    if matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit") {
+                        self.work_ledger_note_file_change(&input);
+                    }
+                    if objective.exhaustive_cleanup {
+                        exhaustive_cleanup_verified = false;
+                    }
+                    turn_state.mark_content_changed();
                 }
                 let privacy_redaction = self.privacy.apply_tool_output(&name, &input, content);
                 let redacted_count = privacy_redaction.counts.total();
@@ -16111,9 +16455,13 @@ impl Agent {
                     }
                 }
 
-                if let Some(note) =
-                    turn_state.record_controlled_outcome(&name, &input, &content, is_error)
-                {
+                if let Some(note) = turn_state.record_controlled_outcome_for_attempt(
+                    &name,
+                    &input,
+                    &content,
+                    is_error,
+                    mutation_attempt_key.as_deref(),
+                ) {
                     self.sink.emit(AgentEvent::Warn(note.clone()));
                     self.append_latest_log("execution_control", &note);
                     content.push_str("\n\n[runtime-control]\n");
@@ -16162,6 +16510,14 @@ impl Agent {
                 });
             }
 
+            if objective.exhaustive_cleanup {
+                if mutation_attempted {
+                    exhaustive_cleanup_verified = false;
+                } else if cleanup_check_attempted {
+                    exhaustive_cleanup_verified = cleanup_checks_clean;
+                }
+            }
+
             if runnable_indices.len() > 1 {
                 self.sink.emit(AgentEvent::ToolBatchEnd {
                     batch_id,
@@ -16189,6 +16545,20 @@ impl Agent {
                 break;
             }
 
+            if let Some(note) = turn_state.take_empty_tool_call_recovery_message() {
+                require_tool_call_next = true;
+                self.sink.emit(AgentEvent::Warn(note.clone()));
+                self.append_latest_log("empty_tool_call_recovery", &note);
+                self.history.push(Message {
+                    role: "user".to_string(),
+                    content: vec![Block::Text {
+                        text: format!("[runtime-note] {note}"),
+                    }],
+                });
+                self.checkpoint_latest_session("after_empty_tool_call_recovery");
+                continue;
+            }
+
             if let Some(halt) = turn_state.empty_tool_call_halt_message() {
                 self.sink.emit(AgentEvent::Warn(halt.clone()));
                 self.append_latest_log("empty_tool_call_halt", &halt);
@@ -16201,6 +16571,7 @@ impl Agent {
             }
 
             if let Some(note) = empty_tool_call_loop_note {
+                require_tool_call_next = true;
                 self.sink.emit(AgentEvent::Warn(note.clone()));
                 self.append_latest_log("empty_tool_call_loop", &note);
                 self.history.push(Message {
@@ -16213,12 +16584,18 @@ impl Agent {
                 continue;
             }
 
-            if mutation_succeeded {
+            if mutation_content_changed || unchanged_mutation_succeeded {
                 action_contract_must_mutate = false;
                 action_contract_no_mutation_turns = 0;
+                require_tool_call_next = false;
             } else if action_contract_must_mutate {
+                turn_state.record_response_nonprogress();
+                if turn_state.should_finalize() {
+                    continue;
+                }
                 action_contract_no_mutation_turns =
                     action_contract_no_mutation_turns.saturating_add(1);
+                require_tool_call_next = controlled_execution;
                 let notes = self.action_contract_violation_runtime_notes(
                     action_contract_no_mutation_turns,
                     &mut implementation_fallback_emitted,
@@ -16475,13 +16852,22 @@ impl Agent {
                             match dtype {
                                 "text_delta" => {
                                     if let Some(t) = delta["text"].as_str() {
-                                        self.sink.emit(AgentEvent::TextDelta(t.to_string()));
+                                        if self.effective_execution_policy()
+                                            == ExecutionPolicy::Open
+                                        {
+                                            self.sink.emit(AgentEvent::TextDelta(t.to_string()));
+                                        }
                                         pb.text.push_str(t);
                                     }
                                 }
                                 "thinking_delta" => {
                                     if let Some(t) = delta["thinking"].as_str() {
-                                        self.sink.emit(AgentEvent::ThinkingDelta(t.to_string()));
+                                        if self.effective_execution_policy()
+                                            == ExecutionPolicy::Open
+                                        {
+                                            self.sink
+                                                .emit(AgentEvent::ThinkingDelta(t.to_string()));
+                                        }
                                         pb.text.push_str(t);
                                     }
                                 }
@@ -16508,12 +16894,22 @@ impl Agent {
                         let idx = data["index"].as_u64().unwrap_or(0) as usize;
                         if let Some(pb) = blocks.get(&idx) {
                             if pb.kind == "text" {
-                                self.sink
-                                    .emit(AgentEvent::TextBlockComplete(pb.text.clone()));
+                                if let Some(visible) = controlled_assistant_display_text(
+                                    &pb.text,
+                                    self.effective_execution_policy(),
+                                ) {
+                                    self.sink.emit(AgentEvent::TextBlockComplete(visible));
+                                }
                             } else if pb.kind == "thinking" {
-                                self.sink
-                                    .emit(AgentEvent::ThinkingBlockComplete(pb.text.clone()));
-                            } else if pb.kind == "tool_use" {
+                                if let Some(visible) = controlled_assistant_display_text(
+                                    &pb.text,
+                                    self.effective_execution_policy(),
+                                ) {
+                                    self.sink.emit(AgentEvent::ThinkingBlockComplete(visible));
+                                }
+                            } else if pb.kind == "tool_use"
+                                && self.effective_execution_policy() == ExecutionPolicy::Open
+                            {
                                 let privileged =
                                     needs_permission(&pb.name) && !self.allowed.contains(&pb.name);
                                 if !privileged {
@@ -16630,7 +17026,9 @@ impl Agent {
                             self.partial_stream_text
                                 .get_or_insert_with(String::new)
                                 .push_str(content);
-                            self.sink.emit(AgentEvent::TextDelta(content.to_string()));
+                            if self.effective_execution_policy() == ExecutionPolicy::Open {
+                                self.sink.emit(AgentEvent::TextDelta(content.to_string()));
+                            }
                             text_buf.push_str(content);
                         }
                         if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -16686,19 +17084,24 @@ impl Agent {
         let mut blocks: Vec<Block> = Vec::new();
         if !text_buf.is_empty() {
             self.partial_stream_text = None;
-            self.sink
-                .emit(AgentEvent::TextBlockComplete(text_buf.clone()));
+            if let Some(visible) =
+                controlled_assistant_display_text(&text_buf, self.effective_execution_policy())
+            {
+                self.sink.emit(AgentEvent::TextBlockComplete(visible));
+            }
             blocks.push(Block::Text { text: text_buf });
         }
         for (idx, (id, name, args)) in tool_calls {
             let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
             let summary = summarize_call(&name, &input);
             let call_id = normalize_tool_call_id(&id, 0, idx);
-            self.sink.emit(AgentEvent::ToolCallPreview {
-                call_id,
-                name: name.clone(),
-                summary,
-            });
+            if self.effective_execution_policy() == ExecutionPolicy::Open {
+                self.sink.emit(AgentEvent::ToolCallPreview {
+                    call_id,
+                    name: name.clone(),
+                    summary,
+                });
+            }
             blocks.push(Block::ToolUse { id, name, input });
         }
         Ok((blocks, finish_reason, usage))
@@ -16792,7 +17195,9 @@ impl Agent {
                             self.partial_stream_text
                                 .get_or_insert_with(String::new)
                                 .push_str(delta);
-                            self.sink.emit(AgentEvent::TextDelta(delta.to_string()));
+                            if self.effective_execution_policy() == ExecutionPolicy::Open {
+                                self.sink.emit(AgentEvent::TextDelta(delta.to_string()));
+                            }
                             text_buf.push_str(delta);
                         }
                     }
@@ -16804,7 +17209,9 @@ impl Agent {
                             self.partial_stream_text
                                 .get_or_insert_with(String::new)
                                 .push_str(text);
-                            self.sink.emit(AgentEvent::TextDelta(text.to_string()));
+                            if self.effective_execution_policy() == ExecutionPolicy::Open {
+                                self.sink.emit(AgentEvent::TextDelta(text.to_string()));
+                            }
                             text_buf.push_str(text);
                         }
                     }
@@ -16816,7 +17223,8 @@ impl Agent {
                             if let Some(visible) = reasoning_summary_stream_delta(
                                 &reasoning_buf,
                                 &mut reasoning_emitted,
-                            ) {
+                            ) && self.effective_execution_policy() == ExecutionPolicy::Open
+                            {
                                 self.sink.emit(AgentEvent::ThinkingDelta(visible));
                             }
                         }
@@ -16830,7 +17238,8 @@ impl Agent {
                             if let Some(visible) = reasoning_summary_stream_delta(
                                 &reasoning_buf,
                                 &mut reasoning_emitted,
-                            ) {
+                            ) && self.effective_execution_policy() == ExecutionPolicy::Open
+                            {
                                 self.sink.emit(AgentEvent::ThinkingDelta(visible));
                             }
                         }
@@ -16942,8 +17351,11 @@ impl Agent {
         if !reasoning_buf.is_empty() {
             let reasoning = normalize_reasoning_summary_text(&reasoning_buf);
             if !reasoning.is_empty() {
-                self.sink
-                    .emit(AgentEvent::ThinkingBlockComplete(reasoning.clone()));
+                if let Some(visible) =
+                    controlled_assistant_display_text(&reasoning, self.effective_execution_policy())
+                {
+                    self.sink.emit(AgentEvent::ThinkingBlockComplete(visible));
+                }
                 blocks.push(Block::Thinking {
                     text: reasoning,
                     signature: None,
@@ -16952,8 +17364,11 @@ impl Agent {
         }
         if !text_buf.is_empty() {
             self.partial_stream_text = None;
-            self.sink
-                .emit(AgentEvent::TextBlockComplete(text_buf.clone()));
+            if let Some(visible) =
+                controlled_assistant_display_text(&text_buf, self.effective_execution_policy())
+            {
+                self.sink.emit(AgentEvent::TextBlockComplete(visible));
+            }
             blocks.push(Block::Text { text: text_buf });
         }
         for (idx, item_id) in tool_call_order.iter().enumerate() {
@@ -16971,11 +17386,13 @@ impl Agent {
                 call_id
             };
             let display_call_id = normalize_tool_call_id(&block_id, 0, idx);
-            self.sink.emit(AgentEvent::ToolCallPreview {
-                call_id: display_call_id,
-                name: name.clone(),
-                summary,
-            });
+            if self.effective_execution_policy() == ExecutionPolicy::Open {
+                self.sink.emit(AgentEvent::ToolCallPreview {
+                    call_id: display_call_id,
+                    name: name.clone(),
+                    summary,
+                });
+            }
             blocks.push(Block::ToolUse {
                 id: block_id,
                 name,
@@ -21436,12 +21853,25 @@ fn block_text(block: &Block) -> Option<&str> {
     }
 }
 
+fn protocol_block_text(block: &Block) -> Option<&str> {
+    match block {
+        Block::Text { text } | Block::PartialStream { text } | Block::Thinking { text, .. } => {
+            Some(text.as_str())
+        }
+        _ => None,
+    }
+}
+
 fn assistant_blocks_text(blocks: &[Block]) -> String {
     blocks
         .iter()
         .filter_map(block_text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn tool_call_has_empty_required_arguments(name: &str, input: &Value) -> bool {
+    !tool_policy::missing_required_tool_fields(name, input).is_empty()
 }
 
 fn assistant_text_has_implementation_commitment(text: &str) -> bool {
@@ -21477,6 +21907,102 @@ fn assistant_text_has_implementation_commitment(text: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
+fn assistant_text_has_content_change_claim(text: &str) -> bool {
+    let lower = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    !lower.is_empty()
+        && ([
+            "i deleted",
+            "i removed",
+            "i installed",
+            "i updated",
+            "i wrote",
+            "i saved",
+            "i fixed",
+            "has been deleted",
+            "has been removed",
+            "has been installed",
+            "has been updated",
+            "is written and saved",
+            "is complete and saved",
+            "is now installed",
+            "successfully deleted",
+            "successfully removed",
+            "successfully installed",
+            "successfully updated",
+            "successfully wrote",
+            "successfully saved",
+            "successfully fixed",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+            || lower.contains("all ")
+                && [" fixed", " resolved", " removed", " deleted", " updated"]
+                    .iter()
+                    .any(|needle| lower.contains(needle)))
+}
+
+fn assistant_text_has_completion_claim(text: &str) -> bool {
+    let lower = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    !lower.is_empty()
+        && ([
+            "i deleted",
+            "i removed",
+            "i installed",
+            "i updated",
+            "i wrote",
+            "i saved",
+            "i fixed",
+            "has been deleted",
+            "has been removed",
+            "has been installed",
+            "has been updated",
+            "is now installed",
+            "is written and saved",
+            "is complete and saved",
+            "successfully deleted",
+            "successfully removed",
+            "successfully installed",
+            "successfully updated",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+            || lower.contains("all ")
+                && [" fixed", " resolved", " removed", " deleted", " updated"]
+                    .iter()
+                    .any(|needle| lower.contains(needle)))
+}
+
+fn repo_scoped_external_mutation(name: &str, input: &Value, root: &Path) -> bool {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if matches!(name, "write_file" | "edit_file" | "multi_edit") {
+        return input["path"]
+            .as_str()
+            .and_then(|path| canonicalize_read_tool_path(&root, path).ok())
+            .is_some_and(|path| !path.starts_with(&root));
+    }
+    if name != "bash" {
+        return false;
+    }
+    let command = input["command"].as_str().unwrap_or("");
+    if !orchestrator::bash_command_likely_mutates_files(command) {
+        return false;
+    }
+    let dext_home = dext_state_dir();
+    let dext_home = dext_home.to_string_lossy();
+    command.contains(dext_home.as_ref())
+        || command.contains("~/.dext/")
+        || command.contains("$HOME/.dext/")
+        || command.contains("${HOME}/.dext/")
+}
+
 pub(crate) fn text_line_looks_like_pseudo_tool_start(line: &str) -> bool {
     let trimmed = line.trim_start();
     let lower = trimmed.to_ascii_lowercase();
@@ -21491,6 +22017,8 @@ pub(crate) fn text_line_looks_like_pseudo_tool_start(line: &str) -> bool {
         || lower.starts_with("multi_tool_use.")
         || lower.starts_with("<|tool")
         || lower.starts_with("<tool")
+        || lower.contains("<function=")
+        || lower.contains("<parameter=")
         || lower.starts_with("tool_use")
         || lower.starts_with("function_call")
         || compact.starts_with("{\"recipient")
@@ -21510,6 +22038,8 @@ pub(crate) fn text_line_looks_like_pseudo_tool_syntax(line: &str) -> bool {
         || lower.starts_with("multi_tool_use.")
         || lower.starts_with("<|tool")
         || lower.starts_with("<tool")
+        || lower.contains("<function=")
+        || lower.contains("<parameter=")
         || lower.starts_with("tool_use")
         || lower.starts_with("tool call:") && lower.contains("functions.")
         || lower.starts_with("function_call")
@@ -21528,10 +22058,12 @@ pub(crate) fn text_line_looks_like_pseudo_tool_syntax(line: &str) -> bool {
             && compact.contains("\"command\""))
 }
 
+#[cfg(test)]
 pub(crate) fn text_contains_pseudo_tool_syntax(text: &str) -> bool {
     text.lines().any(text_line_looks_like_pseudo_tool_syntax)
 }
 
+#[cfg(test)]
 fn text_contains_pseudo_tool_syntax_for_context(text: &str, context_mode: ContextMode) -> bool {
     if context_mode.is_frugal() {
         text.lines().any(|line| {
@@ -21543,25 +22075,21 @@ fn text_contains_pseudo_tool_syntax_for_context(text: &str, context_mode: Contex
     }
 }
 
+#[cfg(test)]
 fn blocks_contain_pseudo_tool_syntax(blocks: &[Block]) -> bool {
     blocks
         .iter()
-        .filter_map(block_text)
+        .filter_map(protocol_block_text)
         .any(text_contains_pseudo_tool_syntax)
 }
 
-fn blocks_contain_pseudo_tool_syntax_for_context(
-    blocks: &[Block],
-    context_mode: ContextMode,
-) -> bool {
-    if context_mode.is_frugal() {
-        blocks
-            .iter()
-            .filter_map(block_text)
-            .any(|text| text_contains_pseudo_tool_syntax_for_context(text, context_mode))
-    } else {
-        blocks_contain_pseudo_tool_syntax(blocks)
-    }
+fn blocks_contain_pseudo_tool_syntax_or_start(blocks: &[Block]) -> bool {
+    blocks.iter().filter_map(protocol_block_text).any(|text| {
+        text.lines().any(|line| {
+            text_line_looks_like_pseudo_tool_syntax(line)
+                || text_line_looks_like_pseudo_tool_start(line)
+        })
+    })
 }
 
 fn action_contract_runtime_note(no_mutation_turns: u32) -> String {
@@ -21571,8 +22099,22 @@ fn action_contract_runtime_note(no_mutation_turns: u32) -> String {
     )
 }
 
-fn pseudo_tool_runtime_note() -> String {
-    "runtime guidance: pseudo-tool syntax emitted as plain text is invalid progress. Use an actual provider tool_use block, or state a concise blocked reason if no tool can run.".to_string()
+fn pseudo_tool_runtime_note(tools_available: bool) -> String {
+    if tools_available {
+        "Malformed tool response suppressed; no tool ran. Retry with one native structured tool call with complete arguments, or return a supported final answer without tool syntax."
+    } else {
+        "Malformed tool response suppressed; no tool ran. Tools are disabled for bounded finalization; return the best supported result, label unresolved work, and emit no tool syntax."
+    }
+    .to_string()
+}
+
+fn unverified_completion_runtime_note(tools_available: bool) -> String {
+    if tools_available {
+        "runtime guidance: completion claim is unsupported because no successful mutation occurred in this turn. Use a real mutating tool call and verify its result, or state that the change is blocked."
+    } else {
+        "runtime guidance: completion claim is unsupported and bounded finalization has disabled tools. Return the supported partial result and explicitly label the unresolved mutation."
+    }
+    .to_string()
 }
 
 fn final_objective_warning_from_coverage(coverage: &orchestrator::ObjectiveCoverage) -> String {

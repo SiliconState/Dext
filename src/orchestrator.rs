@@ -94,11 +94,71 @@ impl TurnControlLevel {
     }
 }
 
+fn primary_tool_result_for_progress(content: &str) -> String {
+    let primary = content
+        .split("\n\n[hook:post_tool]")
+        .next()
+        .unwrap_or(content)
+        .split("\n\n[runtime-control]")
+        .next()
+        .unwrap_or(content);
+    primary
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("[runtime-note]"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn controlled_bash_action_key(command: &str) -> String {
+    let mut substantive = Vec::new();
+    for line in command.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !substantive.is_empty() {
+            substantive.push(line.to_string());
+            continue;
+        }
+        let mut candidate = line.trim_end_matches('\\').trim();
+        loop {
+            let setup = candidate.starts_with("set ")
+                || candidate.starts_with("cd ")
+                || candidate.starts_with("export ")
+                || candidate.starts_with("source ")
+                || candidate.starts_with(". ");
+            if !setup {
+                substantive.push(candidate.to_string());
+                break;
+            }
+            let Some((_, remainder)) = candidate.split_once("&&") else {
+                break;
+            };
+            candidate = remainder.trim_end_matches('\\').trim();
+            if candidate.is_empty() {
+                break;
+            }
+        }
+    }
+    let substantive = if substantive.is_empty() {
+        command.to_string()
+    } else {
+        substantive.join("\n")
+    };
+    substantive
+        .lines()
+        .map(normalize_bash_similarity_key)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
 fn controlled_action_family(tool_name: &str, input: &Value) -> String {
     match tool_name {
         "bash" => format!(
             "bash:{}",
-            normalize_bash_similarity_key(input["command"].as_str().unwrap_or(""))
+            controlled_bash_action_key(input["command"].as_str().unwrap_or(""))
         ),
         "browser" | "http" => {
             let url = input["args"]
@@ -152,6 +212,12 @@ pub(crate) struct TurnRuntimeState {
     finalization_note_emitted: bool,
     finalized_at_round: Option<usize>,
     finalization_halt_emitted: bool,
+    pseudo_tool_response_count: usize,
+    unverified_completion_count: usize,
+    invalid_response_count: usize,
+    post_finalize_invalid_response_count: usize,
+    invalid_response_halt_emitted: bool,
+    adaptive_recovery_epochs: usize,
     partial_delivery_hint_emitted: bool,
     total_auth_failure_events: usize,
     blocked_hosts: HashSet<String>,
@@ -182,6 +248,12 @@ impl Default for TurnRuntimeState {
             finalization_note_emitted: false,
             finalized_at_round: None,
             finalization_halt_emitted: false,
+            pseudo_tool_response_count: 0,
+            unverified_completion_count: 0,
+            invalid_response_count: 0,
+            post_finalize_invalid_response_count: 0,
+            invalid_response_halt_emitted: false,
+            adaptive_recovery_epochs: 0,
             partial_delivery_hint_emitted: false,
             total_auth_failure_events: 0,
             blocked_hosts: HashSet::new(),
@@ -256,6 +328,12 @@ impl TurnRuntimeState {
         self.finalization_note_emitted = false;
         self.finalized_at_round = None;
         self.finalization_halt_emitted = false;
+        self.pseudo_tool_response_count = 0;
+        self.unverified_completion_count = 0;
+        self.invalid_response_count = 0;
+        self.post_finalize_invalid_response_count = 0;
+        self.invalid_response_halt_emitted = false;
+        self.adaptive_recovery_epochs = 0;
     }
 
     pub(crate) fn begin_tool_round(&mut self) {
@@ -266,9 +344,14 @@ impl TurnRuntimeState {
         let limit_reached = match self.execution_policy {
             ExecutionPolicy::Open => false,
             ExecutionPolicy::Bounded => self.tool_rounds > 12,
-            ExecutionPolicy::Adaptive => self
-                .guarded_at_round
-                .is_some_and(|start| self.tool_rounds.saturating_sub(start) > 6),
+            ExecutionPolicy::Adaptive => {
+                if self.tool_rounds > 24 {
+                    self.force_terminal_finalize();
+                    return;
+                }
+                self.guarded_at_round
+                    .is_some_and(|start| self.tool_rounds.saturating_sub(start) > 6)
+            }
         };
         if limit_reached {
             self.force_finalize();
@@ -297,13 +380,95 @@ impl TurnRuntimeState {
             return None;
         }
         self.finalization_halt_emitted = true;
-        Some("runtime control halted this turn because the model continued issuing tool calls after tool execution was disabled. Existing supported results remain in the session; continue to request synthesis or switch provider/model.".to_string())
+        Some("runtime control halted this controlled turn because the model continued issuing tool calls after tool execution was disabled. Existing supported results remain in the session.".to_string())
+    }
+
+    pub(crate) fn take_pseudo_tool_recovery_message(&mut self) -> Option<String> {
+        if self.execution_policy == ExecutionPolicy::Open {
+            return None;
+        }
+        self.record_invalid_response();
+        self.pseudo_tool_response_count = self.pseudo_tool_response_count.saturating_add(1);
+        if self.pseudo_tool_response_count < 2 {
+            return None;
+        }
+        self.pseudo_tool_response_count = 0;
+        Some(if self.should_finalize() {
+            "Malformed tool response suppressed again; no tool ran. Tool execution is disabled for controlled finalization. Return the best supported result, label unresolved work, and emit no tool syntax."
+        } else {
+            "Malformed tool response suppressed again; no tool ran. Continue autonomously now: emit exactly one native structured tool call with complete arguments, or return a supported final answer with no tool syntax. Do not wait for user input."
+        }.to_string())
+    }
+
+    pub(crate) fn reset_protocol_response_streaks(&mut self) {
+        if self.execution_policy != ExecutionPolicy::Open {
+            self.pseudo_tool_response_count = 0;
+            self.unverified_completion_count = 0;
+        }
+    }
+
+    pub(crate) fn take_unverified_completion_recovery_message(&mut self) -> Option<String> {
+        if self.execution_policy == ExecutionPolicy::Open {
+            return None;
+        }
+        self.record_invalid_response();
+        self.unverified_completion_count = self.unverified_completion_count.saturating_add(1);
+        if self.unverified_completion_count < 2 {
+            return None;
+        }
+        self.unverified_completion_count = 0;
+        Some(if self.should_finalize() {
+            "runtime recovery: the completion claim is unsupported, and tool execution is disabled for controlled finalization. Return the best supported partial result. If a direct mutation succeeded with unchanged content, say the target was already correct; do not claim that bytes changed."
+        } else {
+            "runtime recovery: the completion claim is unsupported by the mutation evidence. Continue autonomously: if a direct mutation succeeded with unchanged content, report that the target was already correct and do not retry it; otherwise perform the required native structured mutation and verification. Do not wait for user input."
+        }.to_string())
+    }
+
+    fn record_invalid_response(&mut self) {
+        const INVALID_RESPONSE_LIMIT: usize = 4;
+        if self.should_finalize() {
+            self.post_finalize_invalid_response_count =
+                self.post_finalize_invalid_response_count.saturating_add(1);
+            return;
+        }
+        self.invalid_response_count = self.invalid_response_count.saturating_add(1);
+        self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+        if self.invalid_response_count >= INVALID_RESPONSE_LIMIT {
+            self.force_terminal_finalize();
+        }
+    }
+
+    pub(crate) fn record_response_nonprogress(&mut self) {
+        const RESPONSE_NONPROGRESS_LIMIT: usize = 4;
+        if self.execution_policy == ExecutionPolicy::Open {
+            return;
+        }
+        if self.should_finalize() {
+            self.post_finalize_invalid_response_count =
+                self.post_finalize_invalid_response_count.saturating_add(1);
+            return;
+        }
+        self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+        if self.no_progress_streak >= RESPONSE_NONPROGRESS_LIMIT {
+            self.force_finalize();
+        }
+    }
+
+    pub(crate) fn take_invalid_response_halt_message(&mut self) -> Option<String> {
+        if self.execution_policy == ExecutionPolicy::Open
+            || self.invalid_response_halt_emitted
+            || self.post_finalize_invalid_response_count == 0
+        {
+            return None;
+        }
+        self.invalid_response_halt_emitted = true;
+        Some("runtime control ended this controlled turn because the provider repeated an invalid assistant response after tool-disabled finalization. No additional tool ran; supported results remain available in the session.".to_string())
     }
 
     pub(crate) fn control_prompt(&self) -> Option<String> {
         (self.execution_policy != ExecutionPolicy::Open).then(|| {
             format!(
-                "## Execution control\npolicy={} state={} tool_rounds={} no_progress_streak={}\nTreat successful-but-unchanged results as no progress. A locked action must not be retried. In finalize state, return the best supported answer and label unresolved evidence.",
+                "## Execution control\npolicy={} state={} tool_rounds={} no_progress_streak={}\nA first successful direct-file result with unchanged content confirms the requested state; do not retry it or claim bytes changed. Repeated identical results are no progress. A locked action must not be retried. Never emit tool syntax as assistant text; use a structured tool call or state the blocker. Once you say you have enough evidence or will synthesize, synthesize next; make another collection call only when you name the specific unresolved fact it will answer. Do not claim a file was changed, installed, removed, or fixed unless a successful content-changing result supports it. For requests scoped to this repo/project, do not mutate user-global or external paths unless the user explicitly expands scope. In finalize state, return the best supported answer and label unresolved evidence.",
                 self.execution_policy.as_str(),
                 self.control_level.label(),
                 self.tool_rounds,
@@ -312,14 +477,26 @@ impl TurnRuntimeState {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn controlled_action_guard(&self, tool_name: &str, input: &Value) -> Option<String> {
+        self.controlled_action_guard_for_attempt(tool_name, input, None)
+    }
+
+    pub(crate) fn controlled_action_guard_for_attempt(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        attempt_key: Option<&str>,
+    ) -> Option<String> {
         if self.execution_policy == ExecutionPolicy::Open {
             return None;
         }
         if self.should_finalize() {
             return Some("runtime control: tool execution is disabled because this turn is finalizing. Return the best supported result and label unresolved evidence.".to_string());
         }
-        let family = controlled_action_family(tool_name, input);
+        let family = attempt_key
+            .map(str::to_string)
+            .unwrap_or_else(|| controlled_action_family(tool_name, input));
         self.blocked_action_families.contains(&family).then(|| {
             format!(
                 "runtime action lock: '{family}' is disabled for this turn after repeated failures. Use a materially different source/method or synthesize the supported partial result."
@@ -327,6 +504,7 @@ impl TurnRuntimeState {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn record_controlled_outcome(
         &mut self,
         tool_name: &str,
@@ -334,30 +512,51 @@ impl TurnRuntimeState {
         content: &str,
         is_error: Option<bool>,
     ) -> Option<String> {
+        self.record_controlled_outcome_for_attempt(tool_name, input, content, is_error, None)
+    }
+
+    pub(crate) fn record_controlled_outcome_for_attempt(
+        &mut self,
+        tool_name: &str,
+        input: &Value,
+        content: &str,
+        is_error: Option<bool>,
+        attempt_key: Option<&str>,
+    ) -> Option<String> {
         if self.execution_policy == ExecutionPolicy::Open {
             return None;
         }
-        let family = controlled_action_family(tool_name, input);
-        let lower = content.to_ascii_lowercase();
+        let family = attempt_key
+            .map(str::to_string)
+            .unwrap_or_else(|| controlled_action_family(tool_name, input));
+        let progress_content = primary_tool_result_for_progress(content);
+        let lower = progress_content.to_ascii_lowercase();
         let blocked = lower.contains("similarity guard")
             || lower.contains("runtime action lock")
             || lower.contains("tool retry budget exceeded");
         let failed = is_error.unwrap_or(false) || blocked;
+        let no_content_delta =
+            direct_mutation_result_has_no_content_delta(tool_name, &progress_content);
         let mut hasher = Sha256::new();
-        hasher.update(content.trim().as_bytes());
+        hasher.update(progress_content.as_bytes());
         let fingerprint = format!("{family}:{:x}", hasher.finalize());
-        let duplicate = !content.trim().is_empty() && !self.result_fingerprints.insert(fingerprint);
+        let duplicate =
+            !progress_content.is_empty() && !self.result_fingerprints.insert(fingerprint);
         let navigation_only = tool_name == "browser"
             && input["args"]
                 .as_array()
                 .and_then(|args| args.first())
                 .and_then(Value::as_str)
                 .is_some_and(|arg| matches!(arg, "navigate" | "open"));
-        let has_result = !content.trim().is_empty();
-        let productive = !failed && !duplicate && !navigation_only && has_result;
+        let has_result = !progress_content.is_empty();
+        let productive =
+            !failed && !duplicate && !navigation_only && !no_content_delta && has_result;
 
         if productive {
             self.no_progress_streak = 0;
+            self.invalid_response_count = 0;
+            self.post_finalize_invalid_response_count = 0;
+            self.adaptive_recovery_epochs = 0;
             self.action_failures.remove(&family);
             return None;
         }
@@ -396,13 +595,34 @@ impl TurnRuntimeState {
             && (self.no_progress_streak >= 5 || self.guard_block_count >= 2)
         {
             self.force_finalize();
-            notes.push("runtime control: repeated non-progress exhausted the guarded budget; collection is stopping and the next response must synthesize supported evidence.".to_string());
+            if self.should_finalize() {
+                notes.push("runtime control: repeated non-progress exhausted the bounded budget; tool collection is stopping and the next response must synthesize supported evidence.".to_string());
+            } else {
+                notes.push("runtime recovery: repeated non-progress exhausted this strategy epoch. Failed action families remain locked; continue autonomously with a materially different source or method.".to_string());
+            }
         }
 
         (!notes.is_empty()).then(|| notes.join("\n"))
     }
 
     fn force_finalize(&mut self) {
+        const MAX_ADAPTIVE_RECOVERY_EPOCHS: usize = 1;
+        if self.execution_policy == ExecutionPolicy::Adaptive
+            && self.adaptive_recovery_epochs < MAX_ADAPTIVE_RECOVERY_EPOCHS
+        {
+            self.adaptive_recovery_epochs = self.adaptive_recovery_epochs.saturating_add(1);
+            self.control_level = TurnControlLevel::Guarded;
+            self.guarded_at_round = Some(self.tool_rounds);
+            self.no_progress_streak = 0;
+            self.guard_block_count = 0;
+            self.telemetry.adaptive_escalations =
+                self.telemetry.adaptive_escalations.saturating_add(1);
+            return;
+        }
+        self.force_terminal_finalize();
+    }
+
+    fn force_terminal_finalize(&mut self) {
         if self.control_level != TurnControlLevel::Finalize {
             self.control_level = TurnControlLevel::Finalize;
             self.finalized_at_round = Some(self.tool_rounds);
@@ -439,7 +659,7 @@ impl TurnRuntimeState {
         hit
     }
 
-    pub(crate) fn mark_mutation_succeeded(&mut self) {
+    pub(crate) fn mark_content_changed(&mut self) {
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
     }
 
@@ -448,13 +668,18 @@ impl TurnRuntimeState {
         similarity_key: Option<&str>,
         command: Option<&str>,
     ) -> Option<String> {
+        if self.execution_policy == ExecutionPolicy::Open {
+            return None;
+        }
         let sim_key = similarity_key?;
         if let Some(cmd) = command
             && is_safe_repeated_validation_command(cmd)
         {
             return None;
         }
-        let is_file_tool = sim_key.contains("write_file:") || sim_key.contains("edit_file:");
+        let is_file_tool = ["write_file:", "edit_file:", "multi_edit:"]
+            .iter()
+            .any(|prefix| sim_key.starts_with(prefix));
         let similar_unproductive = self
             .bash_attempt_history
             .iter()
@@ -473,11 +698,11 @@ impl TurnRuntimeState {
             self.telemetry.similarity_blocks = self.telemetry.similarity_blocks.saturating_add(1);
             if is_file_tool {
                 Some(
-                    "file write similarity guard: this file operation is too similar to multiple earlier unproductive attempts this turn. Stop retrying the same file path and pivot strategy (check file content first, use a different approach, or ask the user).".to_string(),
+                    "file write similarity guard: this file operation repeats multiple earlier unproductive attempts this turn. Stop retrying the same operation and continue autonomously with a materially different edit, or synthesize the supported result.".to_string(),
                 )
             } else {
                 Some(
-                    "bash similarity guard: this command is too similar to multiple earlier unproductive attempts this turn. Stop looping on near-duplicates and pivot strategy (new source, new method, or ask user).".to_string(),
+                    "bash similarity guard: this command is too similar to multiple earlier unproductive attempts this turn. Stop looping on near-duplicates and continue autonomously with a different source or method, or synthesize the supported result.".to_string(),
                 )
             }
         } else {
@@ -502,7 +727,7 @@ impl TurnRuntimeState {
             self.telemetry.circuit_breaker_trips =
                 self.telemetry.circuit_breaker_trips.saturating_add(1);
             Some(format!(
-                "tool retry budget exceeded: {tool_name} has failed {} times with the same error ({}). Stop retrying this tool with the same arguments and pivot strategy (use a different tool, change approach, or ask the user).",
+                "tool retry budget exceeded: {tool_name} has failed {} times with the same error ({}). Stop retrying this tool with the same arguments; continue autonomously with a different tool or approach, or synthesize the supported result.",
                 entry.1, entry.0
             ))
         } else {
@@ -549,7 +774,9 @@ impl TurnRuntimeState {
 
     pub(crate) fn empty_tool_call_halt_message(&self) -> Option<String> {
         const EMPTY_HALT_THRESHOLD: usize = 8;
-        if self.empty_tool_call_note_emitted && self.empty_tool_call_streak >= EMPTY_HALT_THRESHOLD
+        if self.execution_policy != ExecutionPolicy::Adaptive
+            && self.empty_tool_call_note_emitted
+            && self.empty_tool_call_streak >= EMPTY_HALT_THRESHOLD
         {
             Some(format!(
                 "[halted: provider emitted empty tool arguments for {} consecutive tool rounds, even after a recovery hint. Stop this turn to avoid burning iterations; retry with smaller chunks or switch provider/model.]",
@@ -558,6 +785,22 @@ impl TurnRuntimeState {
         } else {
             None
         }
+    }
+
+    pub(crate) fn take_empty_tool_call_recovery_message(&mut self) -> Option<String> {
+        const EMPTY_RECOVERY_THRESHOLD: usize = 8;
+        if self.execution_policy != ExecutionPolicy::Adaptive
+            || !self.empty_tool_call_note_emitted
+            || self.empty_tool_call_streak < EMPTY_RECOVERY_THRESHOLD
+        {
+            return None;
+        }
+        let streak = self.empty_tool_call_streak;
+        self.empty_tool_call_streak = 0;
+        self.empty_tool_call_note_emitted = false;
+        Some(format!(
+            "runtime recovery: the provider emitted empty tool arguments for {streak} consecutive tool rounds. Continue autonomously using one small native structured call with all required parameters; for large writes, create a placeholder and use incremental edits under 4 KB. Do not wait for user input."
+        ))
     }
 
     pub(crate) fn blocked_host_guard(&self, hosts: &[String]) -> Option<String> {
@@ -645,9 +888,11 @@ impl TurnRuntimeState {
         }
 
         if let Some(sim_key) = input.bash_similarity_key {
+            let primary_content = primary_tool_result_for_progress(input.content);
             let productive = ok
                 && !auth_failure
-                && (input.content.trim().chars().count() >= 80
+                && !direct_mutation_result_has_no_content_delta(input.tool_name, &primary_content)
+                && (primary_content.chars().count() >= 80
                     || input
                         .command
                         .is_some_and(is_safe_repeated_validation_command));
@@ -686,6 +931,8 @@ pub(crate) struct ObjectiveTracker {
     pub(crate) summary: String,
     pub(crate) checkpoints: Vec<String>,
     pub(crate) apply_fixes_requested: bool,
+    pub(crate) repo_scoped_mutation: bool,
+    pub(crate) exhaustive_cleanup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -703,8 +950,11 @@ struct ObjectiveEvidence {
     bash_commands: Vec<String>,
     touched_paths: Vec<String>,
     tool_result_text: String,
-    mutation_count: usize,
+    content_change_count: usize,
+    unchanged_mutation_count: usize,
     commit_count: usize,
+    cleanup_verified: bool,
+    clean_cleanup_check_observed: bool,
 }
 
 fn normalized_words(text: &str) -> Vec<&str> {
@@ -800,7 +1050,13 @@ fn explicit_implementation_requested(lowered: &str) -> bool {
         &["fix", "them"],
         &["fix", "this"],
         &["fix", "the"],
+        &["fix", "all"],
         &["implement"],
+        &["install"],
+        &["remove"],
+        &["delete"],
+        &["scrub"],
+        &["uninstall"],
         &["patch"],
         &["merge"],
         &["go", "for", "it"],
@@ -874,6 +1130,8 @@ impl ObjectiveTracker {
                 summary: "(empty prompt)".to_string(),
                 checkpoints: Vec::new(),
                 apply_fixes_requested: false,
+                repo_scoped_mutation: false,
+                exhaustive_cleanup: false,
             };
         }
 
@@ -883,6 +1141,46 @@ impl ObjectiveTracker {
         let commit_requested = commit_requested_as_action(&words);
         let implementation_requested = explicit_implementation_requested(&lowered);
         let apply_fixes_requested = explicit_apply_fixes_requested(&lowered);
+        let explicitly_external_scope = [
+            "user-global",
+            "user global",
+            "global pack",
+            "outside this repo",
+            "outside this repository",
+            "outside this project",
+            "~/.dext",
+            ".dext/shelves",
+            ".dext/packs",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+        let repo_scoped_mutation = [
+            "this repo",
+            "this repository",
+            "this project",
+            "in the repo",
+            "in the repository",
+            "in the project",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+            && !explicitly_external_scope;
+        let exhaustive_cleanup = words.contains(&"all")
+            && words.iter().any(|word| {
+                matches!(
+                    *word,
+                    "fix"
+                        | "fixed"
+                        | "remove"
+                        | "removed"
+                        | "delete"
+                        | "deleted"
+                        | "resolve"
+                        | "resolved"
+                        | "scrub"
+                        | "cleanup"
+                )
+            });
         let mut checkpoints: Vec<String> = Vec::new();
 
         if any_word_starts_with(&words, &["plan"]) {
@@ -902,6 +1200,9 @@ impl ObjectiveTracker {
         }
         if any_word_starts_with(&words, &["test", "verif"]) {
             checkpoints.push("run verification checks".to_string());
+        }
+        if exhaustive_cleanup {
+            checkpoints.push("verify requested cleanup is complete".to_string());
         }
         if any_word_starts_with(&words, &["log", "document"]) {
             checkpoints.push("log decisions and follow-up improvements".to_string());
@@ -925,6 +1226,8 @@ impl ObjectiveTracker {
             summary,
             checkpoints,
             apply_fixes_requested,
+            repo_scoped_mutation,
+            exhaustive_cleanup,
         }
     }
 
@@ -987,9 +1290,15 @@ pub(crate) fn objective_runtime_reminder_from_coverage(coverage: &ObjectiveCover
 fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
     let mut evidence = ObjectiveEvidence::default();
     let start = objective_evidence_start(history);
+    let mut tool_calls: HashMap<String, (String, Value)> = HashMap::new();
 
     for msg in &history[start..] {
         let mut assistant_text_for_message = String::new();
+        let mut successful_calls: Vec<(String, Value, String)> = Vec::new();
+        let mut mutation_attempted_in_batch = false;
+        let mut cleanup_check_attempted = false;
+        let mut cleanup_checks_clean = true;
+        let mut clean_cleanup_check_observed = false;
         for block in &msg.content {
             match block {
                 crate::Block::Text { text } if msg.role == "assistant" => {
@@ -998,35 +1307,46 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
                     assistant_text_for_message.push_str(text);
                     assistant_text_for_message.push('\n');
                 }
-                crate::Block::ToolUse { name, input, .. } => {
-                    evidence.tool_names.insert(name.clone());
-                    match name.as_str() {
-                        "edit_file" | "multi_edit" | "write_file" => {
-                            evidence.mutation_count += 1;
-                            if let Some(path) = input["path"].as_str() {
-                                evidence.touched_paths.push(path.to_string());
-                            }
-                        }
-                        "git_commit" => {
-                            evidence.commit_count += 1;
-                        }
-                        "bash" => {
-                            if let Some(cmd) = input["command"].as_str() {
-                                if bash_command_likely_mutates_files(cmd) {
-                                    evidence.mutation_count += 1;
-                                }
-                                evidence.bash_commands.push(cmd.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
+                crate::Block::ToolUse { id, name, input } => {
+                    tool_calls.insert(id.clone(), (name.clone(), input.clone()));
                 }
-                crate::Block::ToolResult { content, .. } => {
-                    evidence.tool_result_text.push_str(content);
-                    evidence.tool_result_text.push('\n');
+                crate::Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    metadata,
+                } => {
+                    if let Some((name, input)) = tool_calls.remove(tool_use_id) {
+                        let succeeded = !is_error.unwrap_or(false)
+                            && metadata.exit_code.is_none_or(|code| code == 0);
+                        mutation_attempted_in_batch |= objective_call_mutates(&name, &input);
+                        if cleanup_check_candidate(&name, &input) {
+                            cleanup_check_attempted = true;
+                            let check_is_clean =
+                                succeeded && cleanup_check_has_no_residue(&name, &input, content);
+                            cleanup_checks_clean &= check_is_clean;
+                            clean_cleanup_check_observed |= check_is_clean;
+                        }
+                        if succeeded {
+                            successful_calls.push((name, input, content.clone()));
+                        }
+                    }
                 }
                 _ => {}
             }
+        }
+
+        let clean_check_in_batch =
+            !mutation_attempted_in_batch && cleanup_check_attempted && cleanup_checks_clean;
+        for (name, input, content) in successful_calls {
+            record_successful_objective_call(&mut evidence, &name, &input, &content);
+        }
+        if mutation_attempted_in_batch {
+            evidence.cleanup_verified = false;
+            evidence.clean_cleanup_check_observed = false;
+        } else if cleanup_check_attempted {
+            evidence.cleanup_verified = clean_check_in_batch;
+            evidence.clean_cleanup_check_observed |= clean_cleanup_check_observed;
         }
         if msg.role == "assistant" {
             evidence.final_assistant_text_raw = assistant_text_for_message;
@@ -1035,7 +1355,206 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
 
     evidence.assistant_text = normalize_token(&evidence.assistant_text_raw);
     evidence.tool_result_text = normalize_token(&evidence.tool_result_text);
+    if evidence.clean_cleanup_check_observed
+        && assistant_text_confirms_cleanup_verification(&evidence.final_assistant_text_raw)
+    {
+        evidence.cleanup_verified = true;
+    }
     evidence
+}
+
+fn assistant_text_confirms_cleanup_verification(text: &str) -> bool {
+    let normalized = normalize_token(text);
+    contains_any(
+        &normalized,
+        &[
+            "cleanup verification is complete",
+            "cleanup verification complete",
+            "verified cleanup is complete",
+        ],
+    )
+}
+
+fn objective_call_mutates(name: &str, input: &Value) -> bool {
+    matches!(name, "edit_file" | "multi_edit" | "write_file")
+        || name == "bash"
+            && input["command"]
+                .as_str()
+                .is_some_and(bash_command_likely_mutates_files)
+}
+
+fn direct_mutation_result_has_no_content_delta(name: &str, content: &str) -> bool {
+    matches!(name, "edit_file" | "multi_edit" | "write_file")
+        && content
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("no changes to ")
+}
+
+pub(crate) fn successful_mutation_result_has_no_content_delta(
+    name: &str,
+    input: &Value,
+    content: &str,
+) -> bool {
+    objective_call_mutates(name, input)
+        && direct_mutation_result_has_no_content_delta(
+            name,
+            &primary_tool_result_for_progress(content),
+        )
+}
+
+fn record_successful_objective_call(
+    evidence: &mut ObjectiveEvidence,
+    name: &str,
+    input: &Value,
+    content: &str,
+) {
+    evidence.tool_names.insert(name.to_string());
+    evidence.tool_result_text.push_str(content);
+    evidence.tool_result_text.push('\n');
+    match name {
+        "edit_file" | "multi_edit" | "write_file" => {
+            let no_content_delta =
+                successful_mutation_result_has_no_content_delta(name, input, content);
+            if no_content_delta {
+                evidence.unchanged_mutation_count += 1;
+            } else {
+                evidence.content_change_count += 1;
+                if let Some(path) = input["path"].as_str() {
+                    evidence.touched_paths.push(path.to_string());
+                }
+            }
+        }
+        "git_commit" => evidence.commit_count += 1,
+        "bash" => {
+            if let Some(command) = input["command"].as_str() {
+                if bash_command_likely_mutates_files(command) {
+                    evidence.content_change_count += 1;
+                }
+                evidence.bash_commands.push(command.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn cleanup_check_candidate(name: &str, input: &Value) -> bool {
+    match name {
+        "rg" | "fd" => true,
+        "bash" => {
+            let command = input["command"].as_str().unwrap_or("").to_ascii_lowercase();
+            !bash_command_likely_mutates_files(&command)
+                && ["rg ", "grep ", "find "]
+                    .iter()
+                    .any(|needle| command.contains(needle))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn cleanup_check_has_no_residue(name: &str, input: &Value, content: &str) -> bool {
+    if !cleanup_check_candidate(name, input) || cleanup_check_suppresses_matches(name, input) {
+        return false;
+    }
+    let primary = content
+        .split("\n\n[hook:post_tool]")
+        .next()
+        .unwrap_or(content)
+        .split("\n\n[runtime-control]")
+        .next()
+        .unwrap_or(content);
+    match name {
+        "rg" | "fd" => primary.trim().is_empty(),
+        "bash" => {
+            let command = input["command"].as_str().unwrap_or("").to_ascii_lowercase();
+            if !["rg ", "grep ", "find "]
+                .iter()
+                .any(|needle| command.contains(needle))
+            {
+                return false;
+            }
+            let Some((_, streams)) = primary.split_once("--- stdout ---\n") else {
+                return false;
+            };
+            let Some((stdout, stderr)) = streams.split_once("--- stderr ---\n") else {
+                return false;
+            };
+            if !stderr.trim().is_empty() {
+                return false;
+            }
+            let stdout = stdout.trim().to_ascii_lowercase();
+            stdout.is_empty()
+                || stdout.contains("nothing to commit, working tree clean")
+                || stdout.contains("working tree clean")
+        }
+        _ => false,
+    }
+}
+
+fn cleanup_check_suppresses_matches(name: &str, input: &Value) -> bool {
+    let native_suppresses = input["extra_args"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|arg| {
+            matches!(
+                arg,
+                "-q" | "--quiet"
+                    | "-L"
+                    | "--files-without-match"
+                    | "-v"
+                    | "--invert-match"
+                    | "--max-count=0"
+            )
+        });
+    if matches!(name, "rg" | "fd") {
+        return native_suppresses;
+    }
+    if name != "bash" {
+        return false;
+    }
+    let raw_command = input["command"].as_str().unwrap_or("");
+    let command = raw_command.to_ascii_lowercase();
+    let has_inverted_file_listing = raw_command
+        .split_whitespace()
+        .any(|arg| arg == "-L" || arg.starts_with("-") && arg.contains('L'));
+    let is_text_search = ["rg ", "grep "]
+        .iter()
+        .any(|needle| command.contains(needle));
+    let is_find = command.contains("find ");
+    let output_discarded = command.contains(" >/dev/null")
+        || command.contains(" > /dev/null")
+        || command.contains("2>/dev/null")
+        || command.contains("2> /dev/null")
+        || command.contains("&>/dev/null")
+        || command.contains("&> /dev/null")
+        || command.contains("head -n 0");
+    let find_uses_nonprinting_action = [
+        " -exec ",
+        " -execdir ",
+        " -ok ",
+        " -okdir ",
+        " -fprint",
+        " -fprintf",
+        " -fls",
+        " -quit",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle));
+    (is_text_search
+        && (has_inverted_file_listing
+            || command.contains(" --quiet")
+            || command.contains(" -q")
+            || command.contains(" --files-without-match")
+            || command.contains(" --invert-match")
+            || command.contains(" -v")
+            || command.contains(" --max-count=0")
+            || command.contains(" --no-messages")
+            || command.contains(" --silent")
+            || command.contains(" -s")))
+        || (is_find && find_uses_nonprinting_action)
+        || ((is_text_search || is_find) && output_discarded)
 }
 
 fn objective_evidence_start(history: &[crate::Message]) -> usize {
@@ -1095,11 +1614,14 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
             )
         }
         "implement requested changes" => {
-            evidence.mutation_count > 0
+            evidence.content_change_count > 0
+                || evidence.unchanged_mutation_count > 0
+                    && assistant_text_explains_unchanged_target(&evidence.final_assistant_text_raw)
                 || assistant_text_has_blocked_reason(&evidence.final_assistant_text_raw)
         }
         "clean up repository" => {
-            evidence.mutation_count > 0
+            evidence.content_change_count > 0
+                || evidence.cleanup_verified
                 || evidence.commit_count > 0
                 || assistant_text_has_blocked_reason(&evidence.final_assistant_text_raw)
         }
@@ -1126,13 +1648,11 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                     "mypy",
                 ],
             ) || contains_any(
-                &evidence.assistant_text,
-                &["verified", "tests passed", "test result", "checked with"],
-            ) || contains_any(
                 &evidence.tool_result_text,
                 &["test result: ok", "tests passed", "0 failed"],
             )
         }
+        "verify requested cleanup is complete" => evidence.cleanup_verified,
         "log decisions and follow-up improvements" => {
             evidence.tool_names.contains("todo_write")
                 || evidence
@@ -1154,7 +1674,9 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                 )
         }
         "deliver requested outcome with verifiable steps" => {
-            evidence.mutation_count > 0
+            evidence.content_change_count > 0
+                || evidence.unchanged_mutation_count > 0
+                    && assistant_text_explains_unchanged_target(&evidence.final_assistant_text_raw)
                 || evidence.commit_count > 0
                 || !evidence.bash_commands.is_empty()
                 || evidence.assistant_text_raw.trim().chars().count() >= 80
@@ -1308,6 +1830,22 @@ fn shell_redirection_likely_writes(command: &str) -> bool {
         }
     }
     false
+}
+
+pub(crate) fn assistant_text_explains_unchanged_target(text: &str) -> bool {
+    let normalized = normalize_token(text);
+    !normalized.is_empty()
+        && contains_any(
+            &normalized,
+            &[
+                "content unchanged",
+                "already correct",
+                "already matched",
+                "already in the requested state",
+                "requested state was already present",
+                "no change was needed",
+            ],
+        )
 }
 
 pub(crate) fn assistant_text_has_blocked_reason(text: &str) -> bool {
@@ -1857,6 +2395,44 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn tool_result_message(id: &str, content: &str, is_error: bool) -> crate::Message {
+        crate::Message {
+            role: "user".to_string(),
+            content: vec![crate::Block::ToolResult {
+                tool_use_id: id.to_string(),
+                content: content.to_string(),
+                is_error: is_error.then_some(true),
+                metadata: crate::ToolResultMetadata::default(),
+            }],
+        }
+    }
+
+    fn tool_use_message(id: &str, name: &str, input: Value) -> crate::Message {
+        crate::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::Block::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input,
+            }],
+        }
+    }
+
+    fn tool_results_message(results: &[(&str, &str, bool)]) -> crate::Message {
+        crate::Message {
+            role: "user".to_string(),
+            content: results
+                .iter()
+                .map(|(id, content, is_error)| crate::Block::ToolResult {
+                    tool_use_id: (*id).to_string(),
+                    content: (*content).to_string(),
+                    is_error: is_error.then_some(true),
+                    metadata: crate::ToolResultMetadata::default(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn objective_tracker_extracts_checkpoints() {
         let tracker = ObjectiveTracker::from_user_prompt(
@@ -1948,14 +2524,17 @@ mod tests {
             ]
         );
 
-        let history = vec![crate::Message {
-            role: "assistant".to_string(),
-            content: vec![crate::Block::ToolUse {
-                id: "tool-commit".to_string(),
-                name: "git_commit".to_string(),
-                input: json!({"message": "chore: commit reviewed changes"}),
-            }],
-        }];
+        let history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-commit".to_string(),
+                    name: "git_commit".to_string(),
+                    input: json!({"message": "chore: commit reviewed changes"}),
+                }],
+            },
+            tool_result_message("tool-commit", "committed", false),
+        ];
         let coverage = tracker.assess_history(&history);
         assert!(coverage.unresolved.is_empty(), "{coverage:?}");
     }
@@ -1976,14 +2555,17 @@ mod tests {
                 .any(|checkpoint| checkpoint == "commit requested changes")
         );
 
-        let history = vec![crate::Message {
-            role: "assistant".to_string(),
-            content: vec![crate::Block::ToolUse {
-                id: "tool-commit".to_string(),
-                name: "git_commit".to_string(),
-                input: json!({"message": "fix: existing work"}),
-            }],
-        }];
+        let history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-commit".to_string(),
+                    name: "git_commit".to_string(),
+                    input: json!({"message": "fix: existing work"}),
+                }],
+            },
+            tool_result_message("tool-commit", "committed", false),
+        ];
         let coverage = tracker.assess_history(&history);
         assert!(
             coverage
@@ -2043,6 +2625,7 @@ mod tests {
                     input: json!({"path": "src/provider.rs"}),
                 }],
             },
+            tool_result_message("tool-read", "provider source", false),
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::ToolUse {
@@ -2051,6 +2634,7 @@ mod tests {
                     input: json!({"path": "src/provider.rs", "old_string": "a", "new_string": "b"}),
                 }],
             },
+            tool_result_message("tool-edit", "applied edit", false),
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::ToolUse {
@@ -2076,6 +2660,7 @@ mod tests {
                     input: json!({"path": "MEMORY.md", "content": "documented fix"}),
                 }],
             },
+            tool_result_message("tool-log", "wrote MEMORY.md", false),
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::Text {
@@ -2109,14 +2694,21 @@ mod tests {
             coverage
         );
 
-        let bash_mutation_history = vec![crate::Message {
-            role: "assistant".to_string(),
-            content: vec![crate::Block::ToolUse {
-                id: "tool-bash-rm".to_string(),
-                name: "bash".to_string(),
-                input: json!({"command": "rm -f reports/*.json"}),
-            }],
-        }];
+        let bash_mutation_history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-bash-rm".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command": "rm -f reports/*.json"}),
+                }],
+            },
+            tool_result_message(
+                "tool-bash-rm",
+                "exit: 0\n--- stdout ---\n--- stderr ---\n",
+                false,
+            ),
+        ];
         let coverage = tracker.assess_history(&bash_mutation_history);
         assert!(
             coverage
@@ -2182,6 +2774,334 @@ mod tests {
     }
 
     #[test]
+    fn failed_denied_or_unmatched_mutations_do_not_satisfy_implementation() {
+        let tracker = ObjectiveTracker::from_user_prompt("Implement the requested fix");
+        let edit_input = json!({
+            "path": "src/main.rs",
+            "old_string": "a",
+            "new_string": "b"
+        });
+        let histories = [
+            vec![tool_use_message("missing", "edit_file", edit_input.clone())],
+            vec![
+                tool_use_message("denied", "edit_file", edit_input.clone()),
+                tool_result_message("denied", "permission denied by user", true),
+            ],
+            vec![
+                tool_use_message(
+                    "failed-bash",
+                    "bash",
+                    json!({"command": "rm -f reports/*.json"}),
+                ),
+                crate::Message {
+                    role: "user".to_string(),
+                    content: vec![crate::Block::ToolResult {
+                        tool_use_id: "failed-bash".to_string(),
+                        content: "exit: 1\n--- stdout ---\n--- stderr ---\nfailed".to_string(),
+                        is_error: None,
+                        metadata: crate::ToolResultMetadata {
+                            exit_code: Some(1),
+                            ..crate::ToolResultMetadata::default()
+                        },
+                    }],
+                },
+            ],
+            vec![
+                tool_use_message("unmatched", "edit_file", edit_input),
+                tool_result_message("different-id", "applied edit", false),
+            ],
+        ];
+
+        for history in histories {
+            let coverage = tracker.assess_history(&history);
+            assert!(
+                coverage
+                    .unresolved
+                    .iter()
+                    .any(|item| item == "implement requested changes"),
+                "{coverage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_cleanup_requires_a_clean_check_after_the_last_mutation() {
+        let tracker = ObjectiveTracker::from_user_prompt("Remove all generated reports");
+        let mut history = vec![
+            tool_use_message(
+                "check-before",
+                "rg",
+                json!({"pattern": "generated report", "path": "reports"}),
+            ),
+            tool_result_message("check-before", "", false),
+            tool_use_message("remove", "bash", json!({"command": "rm -f reports/*.json"})),
+            tool_result_message("remove", "exit: 0\n--- stdout ---\n--- stderr ---\n", false),
+        ];
+
+        let coverage = tracker.assess_history(&history);
+        assert!(
+            coverage
+                .unresolved
+                .iter()
+                .any(|item| item == "verify requested cleanup is complete"),
+            "{coverage:?}"
+        );
+
+        history.extend([
+            tool_use_message(
+                "check-after",
+                "fd",
+                json!({"pattern": "*.json", "path": "reports"}),
+            ),
+            tool_result_message("check-after", "", false),
+        ]);
+        let coverage = tracker.assess_history(&history);
+        assert!(
+            coverage
+                .satisfied
+                .iter()
+                .any(|item| item == "verify requested cleanup is complete"),
+            "{coverage:?}"
+        );
+
+        history.extend([
+            tool_use_message(
+                "later-mutation",
+                "write_file",
+                json!({"path": "reports/new.json", "content": "{}"}),
+            ),
+            tool_result_message("later-mutation", "wrote file", false),
+        ]);
+        let coverage = tracker.assess_history(&history);
+        assert!(
+            coverage
+                .unresolved
+                .iter()
+                .any(|item| item == "verify requested cleanup is complete"),
+            "{coverage:?}"
+        );
+    }
+
+    #[test]
+    fn exhaustive_cleanup_rejects_failed_dirty_or_same_batch_checks() {
+        let tracker = ObjectiveTracker::from_user_prompt("Remove all generated reports");
+        let mutation = [
+            tool_use_message("remove", "bash", json!({"command": "rm -f reports/*.json"})),
+            tool_result_message("remove", "exit: 0\n--- stdout ---\n--- stderr ---\n", false),
+        ];
+
+        let mut failed_check = mutation.to_vec();
+        failed_check.extend([
+            tool_use_message(
+                "failed-check",
+                "rg",
+                json!({"pattern": "generated report", "path": "reports"}),
+            ),
+            tool_result_message("failed-check", "search failed", true),
+        ]);
+        assert!(
+            tracker
+                .assess_history(&failed_check)
+                .unresolved
+                .iter()
+                .any(|item| item == "verify requested cleanup is complete")
+        );
+
+        let mut mixed_checks = mutation.to_vec();
+        mixed_checks.push(crate::Message {
+            role: "assistant".to_string(),
+            content: vec![
+                crate::Block::ToolUse {
+                    id: "clean-check".to_string(),
+                    name: "rg".to_string(),
+                    input: json!({"pattern": "generated report", "path": "reports"}),
+                },
+                crate::Block::ToolUse {
+                    id: "dirty-check".to_string(),
+                    name: "fd".to_string(),
+                    input: json!({"pattern": "*.json", "path": "reports"}),
+                },
+            ],
+        });
+        mixed_checks.push(tool_results_message(&[
+            ("clean-check", "", false),
+            ("dirty-check", "reports/stale.json", false),
+        ]));
+        assert!(
+            tracker
+                .assess_history(&mixed_checks)
+                .unresolved
+                .iter()
+                .any(|item| item == "verify requested cleanup is complete")
+        );
+
+        let same_batch = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    crate::Block::ToolUse {
+                        id: "batch-remove".to_string(),
+                        name: "bash".to_string(),
+                        input: json!({"command": "rm -f reports/*.json"}),
+                    },
+                    crate::Block::ToolUse {
+                        id: "batch-check".to_string(),
+                        name: "fd".to_string(),
+                        input: json!({"pattern": "*.json", "path": "reports"}),
+                    },
+                ],
+            },
+            tool_results_message(&[
+                (
+                    "batch-remove",
+                    "exit: 0\n--- stdout ---\n--- stderr ---\n",
+                    false,
+                ),
+                ("batch-check", "", false),
+            ]),
+        ];
+        assert!(
+            tracker
+                .assess_history(&same_batch)
+                .unresolved
+                .iter()
+                .any(|item| item == "verify requested cleanup is complete")
+        );
+    }
+
+    #[test]
+    fn exhaustive_cleanup_accepts_explicit_reconciliation_of_mixed_audit_results() {
+        let tracker = ObjectiveTracker::from_user_prompt("Remove all browser automation code");
+        let history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    crate::Block::ToolUse {
+                        id: "clean-source".to_string(),
+                        name: "rg".to_string(),
+                        input: json!({"pattern": "playwright|mcp", "path": "src"}),
+                    },
+                    crate::Block::ToolUse {
+                        id: "expected-docs".to_string(),
+                        name: "rg".to_string(),
+                        input: json!({"pattern": "MCP|browser automation", "path": "README.md"}),
+                    },
+                    crate::Block::ToolUse {
+                        id: "expected-ignore".to_string(),
+                        name: "rg".to_string(),
+                        input: json!({"pattern": "^target/$", "path": ".gitignore"}),
+                    },
+                ],
+            },
+            tool_results_message(&[
+                ("clean-source", "", false),
+                (
+                    "expected-docs",
+                    "3:No MCP runtime.\n156:Browser automation is omitted.",
+                    false,
+                ),
+                ("expected-ignore", "3:target/", false),
+            ]),
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::Text {
+                    text: "Cleanup verification is complete. Source searches were clean; README and ignore-file matches document the intentional exclusions.".to_string(),
+                }],
+            },
+        ];
+
+        let coverage = tracker.assess_history(&history);
+        assert!(
+            coverage
+                .satisfied
+                .iter()
+                .any(|item| item == "verify requested cleanup is complete"),
+            "{coverage:?}"
+        );
+    }
+
+    #[test]
+    fn cleanup_checks_reject_suppressed_or_unrelated_empty_results() {
+        assert!(!cleanup_check_has_no_residue("git_diff", &json!({}), ""));
+        assert!(!cleanup_check_has_no_residue(
+            "rg",
+            &json!({"pattern": "residue", "extra_args": ["--quiet"]}),
+            ""
+        ));
+        assert!(!cleanup_check_has_no_residue(
+            "bash",
+            &json!({"command": "grep -L residue reports/* || true"}),
+            "exit: 0\n--- stdout ---\n--- stderr ---\n"
+        ));
+        for command in [
+            "find reports -name '*.json' >/dev/null",
+            "find reports -name '*.json' -exec printf '%s\\n' {} \\;",
+            "find reports -name '*.json' -quit",
+        ] {
+            assert!(!cleanup_check_has_no_residue(
+                "bash",
+                &json!({"command": command}),
+                "exit: 0\n--- stdout ---\n--- stderr ---\n"
+            ));
+        }
+        assert!(cleanup_check_has_no_residue(
+            "bash",
+            &json!({"command": "find reports -name '*.json' -print"}),
+            "exit: 0\n--- stdout ---\n--- stderr ---\n"
+        ));
+    }
+
+    #[test]
+    fn unchanged_mutation_results_require_truthful_target_state_explanation() {
+        let tracker = ObjectiveTracker::from_user_prompt("Implement the requested fix");
+        for (name, input, result) in [
+            (
+                "write_file",
+                json!({"path": "src/main.rs", "content": "same"}),
+                "no changes to /repo/src/main.rs\n\n[hook:post_tool]\ndynamic hook output",
+            ),
+            (
+                "edit_file",
+                json!({"path": "src/main.rs", "old_string": "same", "new_string": "same"}),
+                "no changes to /repo/src/main.rs",
+            ),
+            (
+                "multi_edit",
+                json!({"path": "src/main.rs", "edits": [{"old_string": "same", "new_string": "same"}]}),
+                "no changes to /repo/src/main.rs",
+            ),
+        ] {
+            let mut history = vec![
+                tool_use_message("mutation", name, input),
+                tool_result_message("mutation", result, false),
+            ];
+            let coverage = tracker.assess_history(&history);
+            assert!(
+                coverage
+                    .unresolved
+                    .iter()
+                    .any(|item| item == "implement requested changes"),
+                "{name}: {coverage:?}"
+            );
+
+            history.push(crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::Text {
+                    text: "The target was already correct; content unchanged.".to_string(),
+                }],
+            });
+            let coverage = tracker.assess_history(&history);
+            assert!(
+                coverage
+                    .satisfied
+                    .iter()
+                    .any(|item| item == "implement requested changes"),
+                "{name}: {coverage:?}"
+            );
+        }
+    }
+
+    #[test]
     fn objective_runtime_reminder_lists_missing_checkpoints() {
         let tracker = ObjectiveTracker::from_user_prompt("Implement the fix and test it");
         let history = vec![
@@ -2193,6 +3113,7 @@ mod tests {
                     input: json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"}),
                 }],
             },
+            tool_result_message("tool-edit", "applied edit", false),
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::Text {
@@ -2353,7 +3274,7 @@ mod tests {
             "bulk should be allowed after a successful single-item probe"
         );
 
-        let mut state = TurnRuntimeState::new();
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
         let mut first = "short auth failure".to_string();
         state.record_external_outcome(ExternalOutcomeInput {
             tool_name: "bash",
@@ -2388,7 +3309,11 @@ mod tests {
         let similarity = state
             .bash_similarity_guard(Some("curl <url>"), Some("curl https://api.example.com"))
             .expect("similarity guard should trigger after repeated unproductive attempts");
-        assert!(similarity.contains("pivot strategy"), "{similarity}");
+        assert!(similarity.contains("continue autonomously"), "{similarity}");
+        assert!(
+            similarity.contains("different source or method"),
+            "{similarity}"
+        );
     }
 
     #[test]
@@ -2433,7 +3358,8 @@ mod tests {
         state.mark_partial_delivery_hint_emitted();
         assert!(!state.should_emit_partial_delivery_hint(2));
 
-        let mut validation_state = TurnRuntimeState::new();
+        let mut validation_state =
+            TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
         for _ in 0..4 {
             let mut output = "exit: 0".to_string();
             validation_state.record_external_outcome(ExternalOutcomeInput {
@@ -2454,7 +3380,8 @@ mod tests {
             "safe validation reruns should not trigger similarity guard"
         );
 
-        let mut stale_failure_state = TurnRuntimeState::new();
+        let mut stale_failure_state =
+            TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
         for _ in 0..3 {
             let mut output = "exit: 101\nlinker failed".to_string();
             stale_failure_state.record_external_outcome(ExternalOutcomeInput {
@@ -2476,7 +3403,7 @@ mod tests {
                 .is_some(),
             "repeated stale failures are blocked before edits"
         );
-        stale_failure_state.mark_mutation_succeeded();
+        stale_failure_state.mark_content_changed();
         assert!(
             stale_failure_state
                 .bash_similarity_guard(
@@ -2748,6 +3675,26 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_empty_tool_call_loop_recovers_without_halting() {
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+
+        for _ in 0..4 {
+            state.record_empty_tool_calls(1);
+        }
+        assert!(state.empty_tool_call_loop_note().is_some());
+        for _ in 0..4 {
+            state.record_empty_tool_calls(1);
+        }
+        assert!(state.empty_tool_call_halt_message().is_none());
+        let recovery = state
+            .take_empty_tool_call_recovery_message()
+            .expect("adaptive policy should recover after continued empty calls");
+        assert!(recovery.contains("Continue autonomously"), "{recovery}");
+        assert!(state.take_empty_tool_call_recovery_message().is_none());
+        assert!(state.empty_tool_call_halt_message().is_none());
+    }
+
+    #[test]
     fn execution_control_is_inert_for_open_policy() {
         let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Open);
         let input = json!({"command": "curl https://example.test/items"});
@@ -2759,12 +3706,30 @@ mod tests {
                     .is_none()
             );
         }
+        for _ in 0..3 {
+            let mut output = "no changes to /repo/src/lib.rs".to_string();
+            state.record_external_outcome(ExternalOutcomeInput {
+                tool_name: "write_file",
+                hosts: &[],
+                cache_key: None,
+                bash_similarity_key: Some("write_file:exact-state"),
+                command: None,
+                content: &mut output,
+                is_error: Some(false),
+            });
+        }
 
         assert_eq!(state.execution_policy(), ExecutionPolicy::Open);
         assert_eq!(state.control_level(), TurnControlLevel::Open);
         assert!(!state.should_finalize());
         assert!(state.control_prompt().is_none());
         assert!(state.controlled_action_guard("bash", &input).is_none());
+        assert!(
+            state
+                .bash_similarity_guard(Some("write_file:exact-state"), None)
+                .is_none(),
+            "open policy must remain exempt from similarity blocking"
+        );
     }
 
     #[test]
@@ -2811,6 +3776,195 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_mutation_successes_only_lock_the_exact_stateful_attempt() {
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        let input = json!({"path": "src/lib.rs", "content": "same"});
+        let exact_key = "write_file:payload-and-state-a";
+        let different_key = "write_file:payload-or-state-b";
+
+        for attempt in 1..=3 {
+            state.begin_tool_round();
+            let mut output = format!(
+                "no changes to /repo/src/lib.rs\n\n[hook:post_tool]\n{}",
+                "dynamic metadata ".repeat(attempt * 20)
+            );
+            state.record_external_outcome(ExternalOutcomeInput {
+                tool_name: "write_file",
+                hosts: &[],
+                cache_key: None,
+                bash_similarity_key: Some(exact_key),
+                command: None,
+                content: &mut output,
+                is_error: Some(false),
+            });
+            let note = state.record_controlled_outcome_for_attempt(
+                "write_file",
+                &input,
+                &output,
+                Some(false),
+                Some(exact_key),
+            );
+            if attempt == 2 {
+                assert!(note.as_deref().is_some_and(|text| text.contains("guarded")));
+            }
+        }
+
+        assert_eq!(state.control_level(), TurnControlLevel::Guarded);
+        assert!(
+            state
+                .controlled_action_guard_for_attempt("write_file", &input, Some(exact_key))
+                .is_some()
+        );
+        assert!(
+            state
+                .controlled_action_guard_for_attempt("write_file", &input, Some(different_key))
+                .is_none(),
+            "a different payload or pre-call target state must remain available"
+        );
+        assert!(state.bash_similarity_guard(Some(exact_key), None).is_some());
+        assert!(
+            state
+                .bash_similarity_guard(Some(different_key), None)
+                .is_none(),
+            "similarity guard must not generalize across mutation identities"
+        );
+        assert!(successful_mutation_result_has_no_content_delta(
+            "write_file",
+            &input,
+            "no changes to /repo/src/lib.rs\n\n[runtime-control]\ndynamic guard text"
+        ));
+    }
+
+    #[test]
+    fn objective_scope_and_exhaustive_cleanup_are_explicit() {
+        let repo = ObjectiveTracker::from_user_prompt(
+            "Scrub autoresearch from this repo. I do not want it called unless requested.",
+        );
+        assert!(repo.apply_fixes_allowed());
+        assert!(repo.repo_scoped_mutation);
+        assert!(!repo.exhaustive_cleanup);
+
+        let global = ObjectiveTracker::from_user_prompt(
+            "Remove the user-global pack from this project and ~/.dext/packs/demo",
+        );
+        assert!(global.apply_fixes_allowed());
+        assert!(!global.repo_scoped_mutation);
+
+        let all = ObjectiveTracker::from_user_prompt("Fix all ❌ and ⚠️ items");
+        assert!(all.apply_fixes_allowed());
+        assert!(all.exhaustive_cleanup);
+        assert!(
+            all.checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint == "verify requested cleanup is complete")
+        );
+    }
+
+    #[test]
+    fn controlled_bash_families_skip_setup_preambles_and_keep_operations_distinct() {
+        let check = json!({
+            "command": "cd /tmp/x_client && \\\nexport TOKEN=secret && \\\n./bin/x-client check 2>&1"
+        });
+        let search = json!({
+            "command": "cd /tmp/x_client && \\\nexport TOKEN=secret && \\\n./bin/x-client search \"from:zephyr_z9\" 2>&1"
+        });
+        assert_eq!(
+            controlled_action_family("bash", &check),
+            "bash:./bin/x-client check 2>&1"
+        );
+        assert_eq!(
+            controlled_action_family("bash", &search),
+            "bash:./bin/x-client search \"from:zephyr_z9\" 2>&1"
+        );
+        let one_line = json!({
+            "command": "cd /tmp/x_client && export TOKEN=secret && ./bin/x-client search \"robotics stocks\""
+        });
+        assert_eq!(
+            controlled_action_family("bash", &one_line),
+            "bash:./bin/x-client search \"robotics stocks\""
+        );
+
+        let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        for _ in 0..3 {
+            state.begin_tool_round();
+            state.record_controlled_outcome("bash", &check, "HTTP 401", Some(true));
+        }
+        assert!(state.controlled_action_guard("bash", &check).is_some());
+        assert!(state.controlled_action_guard("bash", &search).is_none());
+    }
+
+    #[test]
+    fn controlled_pseudo_tool_recovery_is_finite_while_open_remains_inert() {
+        let mut adaptive = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        assert!(
+            adaptive
+                .control_prompt()
+                .is_some_and(|prompt| prompt.contains("synthesize next"))
+        );
+        assert!(adaptive.take_pseudo_tool_recovery_message().is_none());
+        let recovery = adaptive
+            .take_pseudo_tool_recovery_message()
+            .expect("second controlled pseudo-tool response should trigger recovery");
+        assert!(recovery.contains("suppressed again"), "{recovery}");
+        assert!(recovery.contains("Continue autonomously"), "{recovery}");
+        assert!(adaptive.take_pseudo_tool_recovery_message().is_none());
+        let finalization = adaptive
+            .take_pseudo_tool_recovery_message()
+            .expect("fourth malformed response should enter finalization");
+        assert!(adaptive.should_finalize());
+        assert!(finalization.contains("disabled"), "{finalization}");
+        assert!(adaptive.take_pseudo_tool_recovery_message().is_none());
+        let halt = adaptive
+            .take_invalid_response_halt_message()
+            .expect("malformed response after finalization must terminate");
+        assert!(halt.contains("ended this controlled turn"), "{halt}");
+
+        let mut reset = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        assert!(reset.take_pseudo_tool_recovery_message().is_none());
+        reset.reset_protocol_response_streaks();
+        assert!(reset.take_pseudo_tool_recovery_message().is_none());
+
+        let mut open = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Open);
+        for _ in 0..20 {
+            assert!(open.take_pseudo_tool_recovery_message().is_none());
+            assert!(open.take_unverified_completion_recovery_message().is_none());
+        }
+        assert!(!open.should_finalize());
+        assert!(open.take_invalid_response_halt_message().is_none());
+    }
+
+    #[test]
+    fn controlled_unverified_completion_recovery_is_finite() {
+        let mut adaptive = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
+        assert!(
+            adaptive
+                .take_unverified_completion_recovery_message()
+                .is_none()
+        );
+        let recovery = adaptive
+            .take_unverified_completion_recovery_message()
+            .expect("second unsupported completion claim should trigger recovery");
+        assert!(recovery.contains("unsupported"), "{recovery}");
+        assert!(recovery.contains("Continue autonomously"), "{recovery}");
+        assert!(
+            adaptive
+                .take_unverified_completion_recovery_message()
+                .is_none()
+        );
+        let finalization = adaptive
+            .take_unverified_completion_recovery_message()
+            .expect("fourth unsupported claim should enter finalization");
+        assert!(adaptive.should_finalize());
+        assert!(finalization.contains("disabled"), "{finalization}");
+        assert!(
+            adaptive
+                .take_unverified_completion_recovery_message()
+                .is_none()
+        );
+        assert!(adaptive.take_invalid_response_halt_message().is_some());
+    }
+
+    #[test]
     fn policy_sync_and_steering_reset_only_reset_supervision_epoch() {
         let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
         let input = json!({"command": "curl https://example.test/items"});
@@ -2818,7 +3972,9 @@ mod tests {
             state.begin_tool_round();
             state.record_controlled_outcome("bash", &input, "failure", Some(true));
         }
-        assert!(state.should_finalize());
+        assert!(!state.should_finalize());
+        assert_eq!(state.control_level(), TurnControlLevel::Guarded);
+        assert!(state.controlled_action_guard("bash", &input).is_some());
         let telemetry = state.telemetry();
 
         state.reset_supervision_for_steering();
@@ -2859,7 +4015,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_policy_escalates_locks_and_finalizes_repeated_failures() {
+    fn adaptive_policy_escalates_locks_and_recovers_with_tools_enabled() {
         let mut state = TurnRuntimeState::with_execution_policy(ExecutionPolicy::Adaptive);
         let input = json!({"command": "curl https://example.test/items"});
 
@@ -2882,10 +4038,16 @@ mod tests {
             }
         }
 
-        assert_eq!(state.control_level(), TurnControlLevel::Finalize);
-        assert!(state.should_finalize());
-        assert!(state.take_finalization_note().is_some());
-        assert!(state.take_finalization_note().is_none());
+        assert_eq!(state.control_level(), TurnControlLevel::Guarded);
+        assert!(!state.should_finalize());
+        assert!(state.controlled_action_guard("bash", &input).is_some());
+        let different = json!({"path": "src", "pattern": "fallback"});
+        assert!(state.controlled_action_guard("rg", &different).is_none());
+        assert!(
+            state
+                .control_prompt()
+                .is_some_and(|prompt| prompt.contains("state=guarded"))
+        );
     }
 
     #[test]
