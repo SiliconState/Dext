@@ -1249,7 +1249,7 @@ impl TuiState {
         matches!(
             line,
             Line_::Assistant { .. } | Line_::Tool { .. } | Line_::Thinking(_)
-        )
+        ) || matches!(line, Line_::Info(text) if objective_status_text(text).is_some() || phase_status_text(text).is_some())
     }
 
     fn last_line_needs_history_spacing(&self) -> bool {
@@ -6576,10 +6576,16 @@ fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcrip
     let content_area = transcript_content_rect(transcript_area);
     let content_width = transcript_render_width(content_area.width);
     let live_text = transcript_live_indicator_text(state, content_width);
-    let live_lines = live_text
+    let mut live_lines = live_text
         .as_ref()
         .map(|text| cap_live_indicator_lines(collect_wrapped_lines(text, content_width)))
         .unwrap_or_default();
+    if !live_lines.is_empty()
+        && transcript_area.height as usize > live_lines.len()
+        && state.last_line_needs_history_spacing()
+    {
+        live_lines.insert(0, Line::from(""));
+    }
     let live_indicator_lines = live_lines.len();
     let viewport_height = transcript_area.height as usize;
 
@@ -10099,6 +10105,37 @@ mod tests {
     }
 
     #[test]
+    fn objective_phase_and_completed_work_render_as_separate_blocks() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::Info(
+            "[objective: inspect recent changes | checkpoints: verify outcome]".to_string(),
+        ));
+        state.queue(Line_::Info(
+            "[phase:discover] validate one representative source item before scaling".to_string(),
+        ));
+        state.queue(Line_::Thinking(
+            "Planning git status and log inspection".to_string(),
+        ));
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [
+                Line_::Info(_),
+                Line_::Blank,
+                Line_::Info(_),
+                Line_::Blank,
+                Line_::Thinking(_)
+            ]
+        ));
+    }
+
+    #[test]
     fn inserts_blank_between_work_map_and_next_transcript_block() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -12648,6 +12685,78 @@ mod tests {
         let wider_render_width = transcript_render_width(wider);
         let entry = state.render_cache.get(&key).expect("cache entry");
         assert!(entry.renders.contains_key(&wider_render_width));
+    }
+
+    #[test]
+    fn render_transcript_separates_live_planning_from_flushed_work_map_and_probe() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(6),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.verbose = true;
+        state.queue(Line_::WorkMap {
+            kind: WorkMapEventKind::Packet,
+            text: "Objective: inspect recent changes\nCheckpoints: verify outcome".to_string(),
+            waypoint_ids: Vec::new(),
+            selector: None,
+            selected: 0,
+        });
+        state.queue(Line_::Info(
+            "[phase:discover] validate one representative source item before scaling".to_string(),
+        ));
+        let width = current_transcript_pane_width(&mut terminal, &state).expect("pane width");
+        flush_pending_insert(&mut terminal, &mut state, width).expect("flush work map and probe");
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Line_::WorkMap { .. }, Line_::Blank, Line_::Info(_)]
+        ));
+
+        state.streaming_thinking = "**Planning git status and log inspection**".to_string();
+        let mut frame_area = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame_area = Some(area);
+                render_transcript(frame, &mut state, area);
+            })
+            .expect("draw transcript");
+
+        let live = state.live_indicator_text.as_ref().expect("live indicator");
+        assert!(flatten_lines(live)[1].contains("Planning git status"));
+        assert_eq!(state.live_indicator_lines, 3);
+        assert_eq!(state.live_indicator_top_padding, 3);
+        assert_eq!(state.live_indicator_line_layout, Some((3, 6)));
+        let area = frame_area.expect("frame area");
+        assert!(area.y > 0, "work map flush should offset inline viewport");
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        let separator_y = area.y + 3;
+        let planning_y = area.y + 5;
+        assert!(
+            row(separator_y).trim().is_empty(),
+            "expected separator row: {:?}",
+            row(separator_y)
+        );
+        assert!(
+            row(planning_y).contains("Planning git status"),
+            "{}",
+            row(planning_y)
+        );
     }
 
     #[test]

@@ -653,25 +653,6 @@ fn local_llama_cache_key(base_url: &str, model: &str) -> String {
     )
 }
 
-fn model_context_cache_key(model: &str) -> String {
-    model.trim().to_ascii_lowercase()
-}
-
-pub(crate) fn cached_local_llama_context_window(model: &str) -> Option<u64> {
-    local_llama_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&model_context_cache_key(model)).copied())
-        .filter(|tokens| *tokens > 0)
-}
-
-#[cfg(test)]
-pub(crate) fn set_cached_local_llama_context_window(model: &str, tokens: u64) {
-    if let Ok(mut cache) = local_llama_cache().lock() {
-        cache.insert(model_context_cache_key(model), tokens);
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn clear_cached_local_llama_context_windows() {
     if let Ok(mut cache) = local_llama_cache().lock() {
@@ -773,9 +754,6 @@ pub(crate) fn refresh_local_llama_context_window(
         .and_then(|cache| cache.get(&endpoint_key).copied())
         .filter(|tokens| *tokens > 0)
     {
-        if let Ok(mut cache) = local_llama_cache().lock() {
-            cache.insert(model_context_cache_key(model), tokens);
-        }
         return Some(tokens);
     }
 
@@ -786,7 +764,6 @@ pub(crate) fn refresh_local_llama_context_window(
     let tokens = fetch_llama_context_window(&client, base_url)?;
     if let Ok(mut cache) = local_llama_cache().lock() {
         cache.insert(endpoint_key, tokens);
-        cache.insert(model_context_cache_key(model), tokens);
     }
     Some(tokens)
 }

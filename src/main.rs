@@ -11100,16 +11100,16 @@ fn parse_model_context_hint_tokens(model: &str) -> Option<u64> {
 // catalog (providers.json) rather than hardcoded here.
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 
-pub(crate) fn model_context_window(model: &str) -> u64 {
-    if let Ok(raw) = std::env::var("DEXT_CONTEXT_WINDOW")
+fn configured_context_window_override() -> Option<u64> {
+    std::env::var("DEXT_CONTEXT_WINDOW")
         .or_else(|_| std::env::var("DEXT_CONTEXT_WINDOW_TOKENS"))
-        && let Ok(v) = raw.trim().parse::<u64>()
-        && v > 0
-    {
-        return v;
-    }
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|tokens| *tokens > 0)
+}
 
-    if let Some(tokens) = provider::cached_local_llama_context_window(model) {
+pub(crate) fn model_context_window(model: &str) -> u64 {
+    if let Some(tokens) = configured_context_window_override() {
         return tokens;
     }
 
@@ -11125,12 +11125,11 @@ pub(crate) fn model_context_window(model: &str) -> u64 {
 
     // Resolution order (first match wins):
     //   1. DEXT_CONTEXT_WINDOW / DEXT_CONTEXT_WINDOW_TOKENS env var (handled above).
-    //   2. llama.cpp runtime context cached from startup/provider switch.
-    //   3. Explicit per-model provider-catalog metadata.
-    //   4. Model-name suffix hint ("-128k", "-1m", etc).
-    //   5. Provider-catalog default.
-    //   6. Built-in family heuristics.
-    //   7. Hard fallback (200_000).
+    //   2. Explicit per-model provider-catalog metadata.
+    //   3. Model-name suffix hint ("-128k", "-1m", etc).
+    //   4. Provider-catalog default.
+    //   5. Built-in family heuristics.
+    //   6. Hard fallback (200_000).
     if let Some(tokens) = provider_catalog_context_window(model, false) {
         return tokens;
     }
@@ -11144,14 +11143,7 @@ pub(crate) fn model_context_window(model: &str) -> u64 {
 }
 
 fn model_context_window_for_profile(profile: Option<&ProviderProfile>, model: &str) -> u64 {
-    if let Ok(raw) = std::env::var("DEXT_CONTEXT_WINDOW")
-        .or_else(|_| std::env::var("DEXT_CONTEXT_WINDOW_TOKENS"))
-        && let Ok(value) = raw.trim().parse::<u64>()
-        && value > 0
-    {
-        return value;
-    }
-    if let Some(tokens) = provider::cached_local_llama_context_window(model) {
+    if let Some(tokens) = configured_context_window_override() {
         return tokens;
     }
     if let Some((profile, normalized)) = profile.map(|profile| {
@@ -11181,6 +11173,16 @@ fn model_context_window_for_profile(profile: Option<&ProviderProfile>, model: &s
         return builtin_family_context_window(model).unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
     }
     model_context_window(model)
+}
+
+fn runtime_context_window_for_profile(
+    profile: Option<&ProviderProfile>,
+    model: &str,
+    detected: Option<u64>,
+) -> u64 {
+    configured_context_window_override()
+        .or_else(|| detected.filter(|tokens| *tokens > 0))
+        .unwrap_or_else(|| model_context_window_for_profile(profile, model))
 }
 
 // Default per-request output token cap for streaming completions. Override with
@@ -11539,9 +11541,13 @@ impl Agent {
         let api_provider = request_contract_for_profile(&resolved.profile).api_provider();
         let base_url = resolved.base_url;
         let model = resolved.model;
-        let _ = refresh_local_llama_context_window(&provider_id, api_provider, &base_url, &model);
-        let context_window_tokens =
-            model_context_window_for_profile(Some(&resolved.profile), &model);
+        let detected_context_window =
+            refresh_local_llama_context_window(&provider_id, api_provider, &base_url, &model);
+        let context_window_tokens = runtime_context_window_for_profile(
+            Some(&resolved.profile),
+            &model,
+            detected_context_window,
+        );
 
         // If resolve_runtime_provider auto-rerouted away from a stale active
         // provider (e.g. chatgpt whose stored default_model actually belongs to
@@ -12020,8 +12026,11 @@ impl Agent {
             &self.base_url,
             &self.model,
         );
-        self.context_window_tokens =
-            model_context_window_for_profile(self.provider_profile.as_ref(), &self.model);
+        self.context_window_tokens = runtime_context_window_for_profile(
+            self.provider_profile.as_ref(),
+            &self.model,
+            updated,
+        );
         if let Some(percent) = self.compact_threshold_percent {
             self.compact_threshold_chars = Some(compact_threshold_chars_for_window(
                 self.context_window_tokens,
@@ -12185,6 +12194,7 @@ impl Agent {
         self.model = model.to_string();
         let provider_id = self.provider_id.clone();
         self.pin_model_for_provider(&provider_id, model);
+        self.refresh_context_window();
         self.refresh_tools_for_context();
     }
 
@@ -14078,6 +14088,7 @@ impl Agent {
         } = parse_session_header(header)?;
 
         self.model = model;
+        self.refresh_context_window();
         self.system = system;
         self.allowed = allowed.into_iter().collect();
         self.session_usage = usage;
@@ -16124,9 +16135,9 @@ impl Agent {
                     batch_labels.push(ui_summary.clone());
                 }
 
-                let ui_cap = orchestrator::adaptive_tool_ui_cap(
+                let ui_cap = orchestrator::adaptive_tool_ui_cap_for_window(
                     &self.last_request_usage,
-                    &self.model,
+                    self.context_window_tokens(),
                     TOOL_UI_CONTENT_CAP,
                 );
                 let ui_content = orchestrator::compress_tool_ui_content(&content, ui_cap);

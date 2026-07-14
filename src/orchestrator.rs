@@ -416,6 +416,12 @@ pub(crate) struct ObjectiveCoverage {
     pub(crate) unresolved: Vec<String>,
 }
 
+#[derive(Debug)]
+struct ObjectiveToolUse {
+    name: String,
+    input: Value,
+}
+
 #[derive(Debug, Default)]
 struct ObjectiveEvidence {
     assistant_text_raw: String,
@@ -423,10 +429,12 @@ struct ObjectiveEvidence {
     final_assistant_text_raw: String,
     tool_names: HashSet<String>,
     bash_commands: Vec<String>,
+    attempted_bash_commands: Vec<String>,
     touched_paths: Vec<String>,
     tool_result_text: String,
     mutation_count: usize,
     commit_count: usize,
+    tool_uses: HashMap<String, ObjectiveToolUse>,
 }
 
 fn normalized_words(text: &str) -> Vec<&str> {
@@ -679,12 +687,45 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
                     assistant_text_for_message.push_str(text);
                     assistant_text_for_message.push('\n');
                 }
-                crate::Block::ToolUse { name, input, .. } => {
-                    evidence.tool_names.insert(name.clone());
-                    match name.as_str() {
+                crate::Block::ToolUse { id, name, input } => {
+                    evidence.tool_uses.insert(
+                        id.clone(),
+                        ObjectiveToolUse {
+                            name: name.clone(),
+                            input: input.clone(),
+                        },
+                    );
+                }
+                crate::Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    metadata,
+                } => {
+                    let Some(tool_use) = evidence.tool_uses.remove(tool_use_id) else {
+                        continue;
+                    };
+                    let status = metadata.status.as_deref();
+                    if tool_use.name == "bash"
+                        && matches!(status, None | Some("ok" | "passed" | "failed"))
+                        && let Some(cmd) = tool_use.input["command"].as_str()
+                    {
+                        evidence.attempted_bash_commands.push(cmd.to_string());
+                    }
+                    let succeeded = !is_error.unwrap_or(false)
+                        && status.is_none_or(|status| {
+                            !matches!(status, "error" | "failed" | "denied" | "interrupted")
+                        });
+                    if !succeeded {
+                        continue;
+                    }
+                    evidence.tool_result_text.push_str(content);
+                    evidence.tool_result_text.push('\n');
+                    evidence.tool_names.insert(tool_use.name.clone());
+                    match tool_use.name.as_str() {
                         "edit_file" | "multi_edit" | "write_file" => {
                             evidence.mutation_count += 1;
-                            if let Some(path) = input["path"].as_str() {
+                            if let Some(path) = tool_use.input["path"].as_str() {
                                 evidence.touched_paths.push(path.to_string());
                             }
                         }
@@ -692,7 +733,7 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
                             evidence.commit_count += 1;
                         }
                         "bash" => {
-                            if let Some(cmd) = input["command"].as_str() {
+                            if let Some(cmd) = tool_use.input["command"].as_str() {
                                 if bash_command_likely_mutates_files(cmd) {
                                     evidence.mutation_count += 1;
                                 }
@@ -701,10 +742,6 @@ fn gather_objective_evidence(history: &[crate::Message]) -> ObjectiveEvidence {
                         }
                         _ => {}
                     }
-                }
-                crate::Block::ToolResult { content, .. } => {
-                    evidence.tool_result_text.push_str(content);
-                    evidence.tool_result_text.push('\n');
                 }
                 _ => {}
             }
@@ -790,7 +827,7 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
         }
         "run verification checks" => {
             commands_contain(
-                &evidence.bash_commands,
+                &evidence.attempted_bash_commands,
                 &[
                     "cargo test",
                     "cargo check",
@@ -1061,14 +1098,14 @@ fn adaptive_tool_cap_for_pressure(
     }
 }
 
-pub(crate) fn adaptive_tool_ui_cap(
+pub(crate) fn adaptive_tool_ui_cap_for_window(
     session_usage: &crate::Usage,
-    model: &str,
+    window_tokens: u64,
     default_cap: usize,
 ) -> usize {
     adaptive_tool_cap_for_pressure(
         session_usage,
-        crate::model_context_window(model),
+        window_tokens,
         default_cap,
         MIN_DYNAMIC_UI_CAP,
         4,
@@ -1541,6 +1578,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn successful_tool_result(tool_use_id: &str, content: &str) -> crate::Message {
+        crate::Message {
+            role: "user".to_string(),
+            content: vec![crate::Block::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: content.to_string(),
+                is_error: Some(false),
+                metadata: crate::ToolResultMetadata {
+                    status: Some("ok".to_string()),
+                    ..crate::ToolResultMetadata::default()
+                },
+            }],
+        }
+    }
+
+    fn failed_tool_result(tool_use_id: &str, content: &str) -> crate::Message {
+        crate::Message {
+            role: "user".to_string(),
+            content: vec![crate::Block::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: content.to_string(),
+                is_error: Some(true),
+                metadata: crate::ToolResultMetadata {
+                    status: Some("failed".to_string()),
+                    exit_code: Some(1),
+                    ..crate::ToolResultMetadata::default()
+                },
+            }],
+        }
+    }
+
     #[test]
     fn objective_tracker_extracts_checkpoints() {
         let tracker = ObjectiveTracker::from_user_prompt(
@@ -1632,14 +1700,17 @@ mod tests {
             ]
         );
 
-        let history = vec![crate::Message {
-            role: "assistant".to_string(),
-            content: vec![crate::Block::ToolUse {
-                id: "tool-commit".to_string(),
-                name: "git_commit".to_string(),
-                input: json!({"message": "chore: commit reviewed changes"}),
-            }],
-        }];
+        let history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-commit".to_string(),
+                    name: "git_commit".to_string(),
+                    input: json!({"message": "chore: commit reviewed changes"}),
+                }],
+            },
+            successful_tool_result("tool-commit", "committed as abc1234"),
+        ];
         let coverage = tracker.assess_history(&history);
         assert!(coverage.unresolved.is_empty(), "{coverage:?}");
     }
@@ -1660,14 +1731,17 @@ mod tests {
                 .any(|checkpoint| checkpoint == "commit requested changes")
         );
 
-        let history = vec![crate::Message {
-            role: "assistant".to_string(),
-            content: vec![crate::Block::ToolUse {
-                id: "tool-commit".to_string(),
-                name: "git_commit".to_string(),
-                input: json!({"message": "fix: existing work"}),
-            }],
-        }];
+        let history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-commit".to_string(),
+                    name: "git_commit".to_string(),
+                    input: json!({"message": "fix: existing work"}),
+                }],
+            },
+            successful_tool_result("tool-commit", "committed as abc1234"),
+        ];
         let coverage = tracker.assess_history(&history);
         assert!(
             coverage
@@ -1735,6 +1809,7 @@ mod tests {
                     input: json!({"path": "src/provider.rs", "old_string": "a", "new_string": "b"}),
                 }],
             },
+            successful_tool_result("tool-edit", "updated src/provider.rs"),
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::ToolUse {
@@ -1793,14 +1868,17 @@ mod tests {
             coverage
         );
 
-        let bash_mutation_history = vec![crate::Message {
-            role: "assistant".to_string(),
-            content: vec![crate::Block::ToolUse {
-                id: "tool-bash-rm".to_string(),
-                name: "bash".to_string(),
-                input: json!({"command": "rm -f reports/*.json"}),
-            }],
-        }];
+        let bash_mutation_history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-bash-rm".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command": "rm -f reports/*.json"}),
+                }],
+            },
+            successful_tool_result("tool-bash-rm", "exit: 0"),
+        ];
         let coverage = tracker.assess_history(&bash_mutation_history);
         assert!(
             coverage
@@ -1825,6 +1903,56 @@ mod tests {
                 .any(|item| item == "implement requested changes"),
             "{:?}",
             coverage
+        );
+    }
+
+    #[test]
+    fn failed_mutations_and_unpaired_commits_do_not_satisfy_objective_checkpoints() {
+        let tracker = ObjectiveTracker::from_user_prompt(
+            "fix the bug, run the tests, and commit the changes",
+        );
+        let history = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-edit".to_string(),
+                    name: "edit_file".to_string(),
+                    input: json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+                }],
+            },
+            failed_tool_result("tool-edit", "old_string not found"),
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-test".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({"command": "cargo test --release"}),
+                }],
+            },
+            failed_tool_result("tool-test", "test result: FAILED. 1 failed"),
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-commit".to_string(),
+                    name: "git_commit".to_string(),
+                    input: json!({"message": "fix: pending work"}),
+                }],
+            },
+        ];
+
+        let coverage = tracker.assess_history(&history);
+        for checkpoint in ["implement requested changes", "commit requested changes"] {
+            assert!(
+                coverage.unresolved.iter().any(|item| item == checkpoint),
+                "{checkpoint}: {coverage:?}"
+            );
+        }
+        assert!(
+            coverage
+                .satisfied
+                .iter()
+                .any(|item| item == "run verification checks"),
+            "{coverage:?}"
         );
     }
 
@@ -1877,6 +2005,7 @@ mod tests {
                     input: json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"}),
                 }],
             },
+            successful_tool_result("tool-edit", "updated src/main.rs"),
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::Text {
@@ -2381,7 +2510,7 @@ mod tests {
             cache_read: 0,
             cost_usd: None,
         };
-        let ui_cap = adaptive_tool_ui_cap(&usage, "demo-200k", 8_000);
+        let ui_cap = adaptive_tool_ui_cap_for_window(&usage, 200_000, 8_000);
         let result_cap = adaptive_tool_result_cap(&usage, "demo-200k", 12_000);
 
         assert!(ui_cap < 8_000, "ui cap should shrink");

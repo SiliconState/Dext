@@ -3083,6 +3083,14 @@ fn sync_work_ledger_keeps_only_unresolved_objective_checkpoints_pending() {
             input: json!({"path": "src/lib.rs", "old_string": "a", "new_string": "b"}),
         }],
     });
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block(
+            "call-edit",
+            "updated src/lib.rs",
+            Some(false),
+        )],
+    });
 
     let coverage = objective.assess_history(&agent.history);
     agent.sync_work_ledger_with_objective_coverage(&coverage);
@@ -6813,7 +6821,26 @@ fn llama_context_parser_prefers_runtime_ctx_fields() {
 }
 
 #[test]
-fn local_llama_context_cache_overrides_generic_fallback_for_arbitrary_alias() {
+fn detected_llama_context_does_not_override_explicit_environment_setting() {
+    let _guard = env_lock();
+    unsafe {
+        std::env::set_var("DEXT_CONTEXT_WINDOW", "64000");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+
+    assert_eq!(
+        runtime_context_window_for_profile(None, "arbitrary-local-model", Some(30_000)),
+        64_000
+    );
+
+    unsafe {
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+}
+
+#[test]
+fn local_llama_runtime_context_is_endpoint_scoped_not_model_global() -> Result<()> {
     let _guard = env_lock();
     unsafe {
         std::env::remove_var("DEXT_CONTEXT_WINDOW");
@@ -6822,17 +6849,34 @@ fn local_llama_context_cache_overrides_generic_fallback_for_arbitrary_alias() {
     clear_cached_local_llama_context_windows();
     let model = "arbitrary-local-runtime-model";
     assert_eq!(model_context_window(model), 200_000);
-    crate::provider::set_cached_local_llama_context_window(model, 30_000);
-    assert_eq!(model_context_window(model), 30_000);
-    unsafe {
-        std::env::set_var("DEXT_CONTEXT_WINDOW", "64000");
-    }
-    assert_eq!(model_context_window(model), 64_000);
-    unsafe {
-        std::env::remove_var("DEXT_CONTEXT_WINDOW");
-        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
-    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).expect("read request");
+        let body = r#"{"default_generation_settings":{"n_ctx":30000}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    });
+
+    let tokens = refresh_local_llama_context_window(
+        "local",
+        ApiProvider::OpenAi,
+        &format!("http://{addr}"),
+        model,
+    );
+    assert_eq!(tokens, Some(30_000));
+    assert_eq!(model_context_window(model), 200_000);
+    server.join().expect("server thread");
     clear_cached_local_llama_context_windows();
+    Ok(())
 }
 
 #[test]
@@ -6869,6 +6913,8 @@ fn local_llama_runtime_probe_updates_model_context_window() -> Result<()> {
         }
     });
 
+    let default_model_fallback = model_context_window(DEFAULT_LOCAL_MODEL);
+    let custom_model_fallback = model_context_window("custom-local-probe");
     let tokens = refresh_local_llama_context_window(
         "local",
         ApiProvider::OpenAi,
@@ -6876,7 +6922,10 @@ fn local_llama_runtime_probe_updates_model_context_window() -> Result<()> {
         DEFAULT_LOCAL_MODEL,
     );
     assert_eq!(tokens, Some(30_000));
-    assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 30_000);
+    assert_eq!(
+        model_context_window(DEFAULT_LOCAL_MODEL),
+        default_model_fallback
+    );
     let custom_tokens = refresh_local_llama_context_window(
         "local",
         ApiProvider::OpenAi,
@@ -6884,7 +6933,10 @@ fn local_llama_runtime_probe_updates_model_context_window() -> Result<()> {
         "custom-local-probe",
     );
     assert_eq!(custom_tokens, Some(30_000));
-    assert_eq!(model_context_window("custom-local-probe"), 30_000);
+    assert_eq!(
+        model_context_window("custom-local-probe"),
+        custom_model_fallback
+    );
     server.join().expect("server thread");
     clear_cached_local_llama_context_windows();
     Ok(())
