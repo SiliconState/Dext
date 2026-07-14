@@ -2067,10 +2067,17 @@ impl TuiState {
                     });
                 }
             }
-            AgentEvent::TurnEnd { .. } => {
-                self.push_debug_event("turn end");
+            AgentEvent::TurnEnd { failed, .. } => {
+                self.push_debug_event(if failed {
+                    "turn end · failed"
+                } else {
+                    "turn end"
+                });
                 self.compacting = false;
                 self.compacting_resume_busy = false;
+                if failed {
+                    self.turn_error_count = self.turn_error_count.saturating_add(1);
+                }
                 if let Some((tool_total, tool_summary)) = turn_tool_summary(&self.turn_tool_counts)
                 {
                     let elapsed = self
@@ -2086,9 +2093,9 @@ impl TuiState {
                     } else {
                         " · no errors".to_string()
                     };
+                    let tool_noun = if tool_total == 1 { "tool" } else { "tools" };
                     self.queue(Line_::Info(format!(
-                        "{} tools · {elapsed}{error_note} · {tool_summary}",
-                        tool_total,
+                        "{tool_total} {tool_noun} · {elapsed}{error_note} · {tool_summary}",
                     )));
                 }
                 self.agent_busy = false;
@@ -2366,12 +2373,12 @@ fn live_thinking_detail_line(
     let style = Style::default().fg(Color::Gray).bg(THINKING_BG);
     Line::from(vec![
         Span::styled(
-            "│ ",
+            "• ",
             Style::default().fg(Color::Indexed(244)).bg(THINKING_BG),
         ),
         Span::styled(
             clamp_chars(
-                &sanitize_live_indicator_detail(&detail, context_mode),
+                &strip_markdown_markers(&sanitize_live_indicator_detail(&detail, context_mode)),
                 max_cells,
             ),
             style,
@@ -5326,23 +5333,53 @@ fn push_density_separator(
 fn push_thinking_body_lines(
     lines: &mut Vec<Line<'static>>,
     body: &str,
-    border_style: Style,
+    marker_style: Style,
     thinking_style: Style,
     width: u16,
 ) {
     let max_width = width.max(1) as usize;
-    let prefix = "│ ";
-    let prefix_width = text_width(prefix);
-    let body_width = max_width.saturating_sub(prefix_width).max(1);
-    for raw in body.lines().filter(|line| !line.trim().is_empty()).take(20) {
-        let cleaned = strip_markdown_markers(raw);
-        for row in wrap_plain_words_visual(&cleaned, body_width) {
+    let bullet_prefix = "• ";
+    let continuation_prefix = "  ";
+    let body_width = max_width.saturating_sub(text_width(bullet_prefix)).max(1);
+    for paragraph in reasoning_paragraphs(body).into_iter().take(20) {
+        let cleaned = strip_markdown_markers(&paragraph);
+        for (index, row) in wrap_plain_words_visual(&cleaned, body_width)
+            .into_iter()
+            .enumerate()
+        {
             lines.push(Line::from(vec![
-                Span::styled(prefix.to_string(), border_style),
+                Span::styled(
+                    if index == 0 {
+                        bullet_prefix.to_string()
+                    } else {
+                        continuation_prefix.to_string()
+                    },
+                    marker_style,
+                ),
                 Span::styled(row, thinking_style),
             ]));
         }
     }
+}
+
+fn reasoning_paragraphs(body: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut current = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(current.join(" "));
+                current.clear();
+            }
+        } else {
+            current.push(line);
+        }
+    }
+    if !current.is_empty() {
+        paragraphs.push(current.join(" "));
+    }
+    paragraphs
 }
 
 fn welcome_context_description(mode: ContextMode) -> &'static str {
@@ -5957,20 +5994,16 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 .fg(Color::Gray)
                 .bg(THINKING_BG)
                 .add_modifier(Modifier::ITALIC);
-            let border_style = Style::default().fg(Color::Indexed(244)).bg(THINKING_BG);
-            push_thinking_body_lines(&mut lines, &sanitized, border_style, thinking_style, width);
-            let remaining = sanitized
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count()
-                .saturating_sub(20);
+            let marker_style = Style::default().fg(Color::Indexed(244)).bg(THINKING_BG);
+            push_thinking_body_lines(&mut lines, &sanitized, marker_style, thinking_style, width);
+            let remaining = reasoning_paragraphs(&sanitized).len().saturating_sub(20);
             if remaining > 0 {
                 push_prefixed_wrapped_spans(
                     &mut lines,
-                    "│ ",
-                    border_style,
+                    "  ",
+                    marker_style,
                     vec![Span::styled(
-                        format!("… ({remaining} more lines)"),
+                        format!("… ({remaining} more)"),
                         thinking_style,
                     )],
                     width,
@@ -7062,28 +7095,39 @@ fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         )));
-        let tail = rendered_thinking
-            .lines()
+        let paragraphs = reasoning_paragraphs(&rendered_thinking);
+        let mut thinking_rows = 0usize;
+        for paragraph in paragraphs
+            .iter()
             .rev()
             .take(3)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .collect::<Vec<_>>()
-            .join(" ");
-        for row in wrap_plain_words_visual(&tail, inner.saturating_sub(2).max(1))
-            .into_iter()
-            .take(4)
         {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    row,
-                    Style::default()
-                        .fg(Color::Gray)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]));
+            let cleaned = strip_markdown_markers(paragraph);
+            for (index, row) in wrap_plain_words_visual(&cleaned, inner.saturating_sub(2).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let prefix = if index == 0 { "• " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        row,
+                        Style::default()
+                            .fg(Color::Gray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+                thinking_rows += 1;
+                if thinking_rows == 4 {
+                    break;
+                }
+            }
+            if thinking_rows == 4 {
+                break;
+            }
         }
     }
     lines.push(Line::from(""));
@@ -9704,6 +9748,29 @@ mod tests {
     }
 
     #[test]
+    fn inspector_thinking_uses_bullets_without_an_inner_lane() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.streaming_thinking = "**First group**\n\n**Second group**".to_string();
+
+        let text = inspector_lines(&state, 80, 20);
+        let lines = flatten_lines(&text);
+        let thinking = lines
+            .iter()
+            .skip_while(|line| line.as_str() != "Thinking")
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(thinking, vec!["• First group", "• Second group"]);
+        assert!(thinking.iter().all(|line| !line.contains('│')));
+    }
+
+    #[test]
     fn status_spans_hide_frugal_and_tiny_context_mode_labels() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -9883,6 +9950,7 @@ mod tests {
 
         state.apply_event(AgentEvent::TurnEnd {
             usage: Usage::default(),
+            failed: false,
         });
 
         let summary = state
@@ -9904,6 +9972,40 @@ mod tests {
         assert!(summary.contains("1 request"), "{summary}");
         assert!(summary.contains("1 other call"), "{summary}");
         assert!(summary.contains(" · no errors"), "{summary}");
+    }
+
+    #[test]
+    fn failed_turn_end_counts_provider_error_in_tool_summary() {
+        let mut state = TuiState::new(
+            "gpt-5.6-sol".to_string(),
+            model_context_window("gpt-5.6-sol"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::TurnStart);
+        state.apply_event(AgentEvent::ToolCallResult {
+            call_id: "call-1".to_string(),
+            name: "http".to_string(),
+            ok: true,
+            preview: "GET service status".to_string(),
+            content: "ok".to_string(),
+        });
+        state.apply_event(AgentEvent::TurnEnd {
+            usage: Usage::default(),
+            failed: true,
+        });
+
+        let summary = state
+            .pending_insert
+            .iter()
+            .find_map(|line| match line {
+                Line_::Info(message) if message.starts_with("1 tool · ") => Some(message),
+                _ => None,
+            })
+            .expect("turn summary");
+        assert!(summary.contains(" · 1 error · "), "{summary}");
+        assert!(!summary.contains("no errors"), "{summary}");
     }
 
     #[test]
@@ -10221,6 +10323,27 @@ mod tests {
     }
 
     #[test]
+    fn grouped_thinking_renders_each_paragraph_as_a_bullet() {
+        let text = line_to_text(
+            &Line_::Thinking(
+                "**Planning HTTP pivot and verification**\n\n**Analyzing service control and stale props handling**\n\n**Reviewing CMake dist handling and UI polling**"
+                    .to_string(),
+            ),
+            80,
+        );
+        let lines = flatten_lines(&text);
+
+        assert_eq!(
+            lines,
+            vec![
+                "• Planning HTTP pivot and verification",
+                "• Analyzing service control and stale props handling",
+                "• Reviewing CMake dist handling and UI polling",
+            ]
+        );
+    }
+
+    #[test]
     fn thinking_block_wraps_inside_available_width() {
         let text = line_to_text(
             &Line_::Thinking("**Logging decisions and findings** ".repeat(12)),
@@ -10235,11 +10358,8 @@ mod tests {
             "thinking block lines must stay inside transcript width: {lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .skip(1)
-                .all(|line| line.starts_with("│ ") || line.starts_with("  ")),
-            "wrapped thinking lines should keep an internal lane prefix: {lines:?}"
+            lines.iter().skip(1).all(|line| line.starts_with("  ")),
+            "wrapped thinking lines should align under the bullet text: {lines:?}"
         );
     }
 
@@ -10278,6 +10398,11 @@ mod tests {
         );
         let style = span_style_for(&text, "xxx").expect("streaming thinking detail");
         assert_eq!(style.bg, Some(THINKING_BG));
+        assert!(
+            lines[1].starts_with("• "),
+            "live thinking detail: {lines:?}"
+        );
+        assert!(!lines[1].contains('│'), "live thinking detail: {lines:?}");
     }
 
     #[test]
@@ -10299,8 +10424,12 @@ mod tests {
             "thinking render must leave a guard column for terminal auto-wrap: {lines:?}"
         );
         assert!(
-            lines.iter().all(|line| line.starts_with("│ ")),
-            "wrapped thinking lines should stay in the internal lane: {lines:?}"
+            lines.first().is_some_and(|line| line.starts_with("• ")),
+            "thinking should start with a bullet: {lines:?}"
+        );
+        assert!(
+            lines.iter().skip(1).all(|line| line.starts_with("  ")),
+            "wrapped thinking should align under the bullet text: {lines:?}"
         );
     }
 
@@ -10314,7 +10443,7 @@ mod tests {
         assert_eq!(body_style.fg, Some(Color::Gray));
         assert_eq!(
             lines.first().map(String::as_str),
-            Some("│ checking the next step")
+            Some("• checking the next step")
         );
         assert!(
             lines.iter().all(|line| !line.contains('▸')),
@@ -10350,7 +10479,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_body_wraps_on_word_boundaries_with_stable_lane_prefix() {
+    fn thinking_body_wraps_on_word_boundaries_with_bullet_alignment() {
         let text = line_to_text(
             &Line_::Thinking("I need to keep working on fixing Clippy. It seems like I should read the SessionHeader struct and check its default nested provenance. I might be able to patch it directly, but I should inspect the imports too.".to_string()),
             74,
@@ -10358,17 +10487,17 @@ mod tests {
         let lines = flatten_lines(&text);
 
         assert!(
-            lines.iter().all(|line| line.starts_with("│ ")),
-            "thinking body lines should all stay in the vertical lane: {lines:?}"
+            lines.first().is_some_and(|line| line.starts_with("• ")),
+            "thinking body should start with one bullet: {lines:?}"
         );
         assert!(
-            lines.iter().all(|line| !line.starts_with("  ")),
-            "thinking body should not create hanging indent continuation rows: {lines:?}"
+            lines.iter().skip(1).all(|line| line.starts_with("  ")),
+            "continuation rows should align under the bullet text: {lines:?}"
         );
         assert!(
             !lines
                 .iter()
-                .any(|line| line.starts_with("│ ruct") || line.starts_with("│ d ")),
+                .any(|line| line.starts_with("  ruct") || line.starts_with("  d ")),
             "thinking body should avoid mid-word wrap fragments like the reported UX issue: {lines:?}"
         );
     }
@@ -10911,7 +11040,10 @@ mod tests {
         };
 
         state.apply_event(AgentEvent::UsageUpdate { turn, session });
-        state.apply_event(AgentEvent::TurnEnd { usage: turn });
+        state.apply_event(AgentEvent::TurnEnd {
+            usage: turn,
+            failed: false,
+        });
 
         assert_eq!(state.usage.input, 828_300);
         assert_eq!(state.usage.output, 5_400);

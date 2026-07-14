@@ -2194,7 +2194,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
             "chatgpt".to_string(),
             ProviderHealthState {
                 auth: "present".to_string(),
-                last_error: Some("HTTP 429".to_string()),
+                last_error: Some("HTTP 520 <unknown status code>: error code: 520".to_string()),
                 retry_after: Some(10),
                 mode: Some("chatgpt-responses".to_string()),
                 disabled_for_turn: true,
@@ -2331,6 +2331,12 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
                 .work_ledger
                 .files_changed
                 .contains(&"/tmp/scratch.py".to_string())
+        );
+        assert_eq!(
+            loaded.provider_health.providers["chatgpt"]
+                .last_error
+                .as_deref(),
+            Some("HTTP 520")
         );
         let header = saved.session_header();
         assert_eq!(
@@ -3611,6 +3617,7 @@ async fn read_only_sandbox_does_not_break_git_inspection() {
                 None,
                 SandboxProfile::ReadOnly,
                 None,
+                Vec::new(),
             )
             .await
         }
@@ -4444,6 +4451,18 @@ fn prepare_http_tool_request_parses_httpie_style_args() {
 }
 
 #[test]
+fn http_status_labels_and_errors_omit_reqwest_unknown_status_noise() {
+    assert_eq!(
+        http_status_label(reqwest::StatusCode::NOT_FOUND),
+        "404 Not Found"
+    );
+    let status_520 = reqwest::StatusCode::from_u16(520).expect("status 520");
+    assert_eq!(http_status_label(status_520), "520");
+    assert_eq!(http_status_error(status_520, ""), "HTTP 520");
+    assert_eq!(http_status_error(status_520, "error code: 520"), "HTTP 520");
+}
+
+#[test]
 fn http_extract_html_text_strips_script_and_decodes_entities() {
     let html = r#"
         <!doctype html><html><head><title>Docs &amp; Research</title><style>.x{}</style></head>
@@ -4555,6 +4574,7 @@ fn builtin_http_tool_blocks_redirect_to_link_local_metadata() {
             None,
             SandboxProfile::WorkspaceWrite,
             None,
+            Vec::new(),
         ));
 
     restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old);
@@ -4645,6 +4665,7 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
         None,
         SandboxProfile::WorkspaceWrite,
         None,
+        Vec::new(),
     )
     .await
     .expect("http request should succeed without xh installed");
@@ -7940,6 +7961,38 @@ fn sse_scan_handles_mixed_lf_and_crlf_delimiters() {
 }
 
 #[tokio::test]
+async fn bash_tool_receives_active_pack_environment() {
+    let root = temp_test_dir("bash-pack-env");
+    let pack_dir = root.join("pack");
+    std::fs::create_dir_all(&pack_dir).expect("pack dir");
+    let pack_dir_text = pack_dir.display().to_string();
+    let out = execute_builtin_call(
+        "bash".to_string(),
+        json!({"command": "printf '%s\\n%s\\n' \"$DEXT_PACK_DIR\" \"$DEXT_PACK_DEMO_DIR\""}),
+        root.clone(),
+        Arc::new(AtomicBool::new(false)),
+        None,
+        None,
+        None,
+        None,
+        SandboxProfile::WorkspaceWrite,
+        None,
+        vec![
+            ("DEXT_PACK_DIR".to_string(), pack_dir_text.clone()),
+            ("DEXT_PACK_DEMO_DIR".to_string(), pack_dir_text.clone()),
+        ],
+    )
+    .await
+    .expect("bash pack environment");
+
+    assert!(
+        out.contains(&format!("{pack_dir_text}\n{pack_dir_text}")),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn bash_tool_honors_input_timeout() {
     let root = temp_test_dir("bash-input-timeout");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -7954,6 +8007,7 @@ async fn bash_tool_honors_input_timeout() {
         None,
         SandboxProfile::WorkspaceWrite,
         None,
+        Vec::new(),
     )
     .await
     .expect_err("expected input timeout");
@@ -9979,6 +10033,81 @@ fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Resul
 }
 
 #[test]
+fn provider_health_render_removes_legacy_unknown_status_noise() {
+    let mut health = ProviderHealthLedger::default();
+    health.providers.insert(
+        "chatgpt".to_string(),
+        ProviderHealthState {
+            auth: "present".to_string(),
+            last_error: Some("HTTP 520 <unknown status code>: error code: 520".to_string()),
+            mode: Some("chatgpt-responses".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let rendered = render_provider_health_prompt(&health);
+    assert!(rendered.contains("last_error=HTTP 520"));
+    assert!(!rendered.contains("unknown status code"), "{rendered}");
+    assert!(!rendered.contains("error code: 520"), "{rendered}");
+}
+
+#[test]
+fn provider_health_turn_state_resets_and_success_clears_stale_errors() {
+    let root = temp_test_dir("provider-health-turn-reset");
+    let mut agent = test_agent(&root);
+    let key = agent.provider_health_key();
+    agent.provider_health.providers.insert(
+        key.clone(),
+        ProviderHealthState {
+            auth: "present".to_string(),
+            last_error: Some("HTTP 520: error code: 520".to_string()),
+            retry_after: Some(5),
+            mode: Some("chatgpt-responses".to_string()),
+            disabled_for_turn: true,
+            consecutive_server_errors: 2,
+        },
+    );
+
+    agent.begin_provider_turn();
+    let state = &agent.provider_health.providers[&key];
+    assert_eq!(state.retry_after, None);
+    assert!(!state.disabled_for_turn);
+    assert_eq!(state.consecutive_server_errors, 2);
+    assert!(state.last_error.is_some());
+
+    agent.record_provider_success();
+    assert!(!agent.provider_health.providers.contains_key(&key));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn provider_http_failure_handles_proxy_auth_and_cloudflare_errors() {
+    let root = temp_test_dir("provider-health-http-failure");
+    let mut agent = test_agent(&root);
+    let key = agent.provider_health_key();
+
+    agent.record_provider_http_failure(
+        reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        "proxy auth required",
+        None,
+    );
+    let state = &agent.provider_health.providers[&key];
+    assert_eq!(state.auth, "failed");
+    assert!(state.disabled_for_turn);
+
+    agent.record_provider_http_failure(
+        reqwest::StatusCode::from_u16(520).expect("status 520"),
+        "error code: 520",
+        None,
+    );
+    let state = &agent.provider_health.providers[&key];
+    assert_eq!(state.auth, "present");
+    assert_eq!(state.last_error.as_deref(), Some("HTTP 520"));
+    assert_eq!(state.consecutive_server_errors, 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn provider_health_key_and_picker_include_route_provenance() {
     let root = temp_test_dir("provider-health-route");
     let mut agent = test_agent(&root);
@@ -11043,7 +11172,7 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut request = [0u8; 1024];
         let _ = stream.read(&mut request);
-        let body = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning removal**\\n\\n<!-- \"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"-->**Planning masked login input**\\n\\n<!-- -->\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"ignored because delta already populated\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n";
+        let body = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning removal**\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning masked login input**\\n\\n<!-- \"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"-->**Verifying restored history**\\n\\n<!-- -->\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"ignored because delta already populated\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -11064,7 +11193,7 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
         matches!(
             blocks.first(),
             Some(Block::Thinking { text, .. })
-                if text == "**Planning removal**\n\n**Planning masked login input**"
+                if text == "**Planning removal**\n\n**Planning masked login input**\n\n**Verifying restored history**"
         ),
         "{blocks:?}"
     );
@@ -11085,12 +11214,12 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
         .collect::<String>();
     assert_eq!(
         streamed_thinking,
-        "**Planning removal**\n\n**Planning masked login input**"
+        "**Planning removal**\n\n**Planning masked login input**\n\n**Verifying restored history**"
     );
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::ThinkingBlockComplete(text)
-            if text == "**Planning removal**\n\n**Planning masked login input**"
+            if text == "**Planning removal**\n\n**Planning masked login input**\n\n**Verifying restored history**"
     )));
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -11111,6 +11240,34 @@ fn reasoning_summary_normalization_only_removes_empty_separator_comments() {
         "first  \n<!-- keep this -->\n`code  `\n"
     );
     assert_eq!(
+        normalize_reasoning_summary_text("**first**<!-- -->**second****third**"),
+        "**first**\n\n**second**\n\n**third**"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("**first****second****third**"),
+        "**first**\n\n**second**\n\n**third**"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("**first** **second**"),
+        "**first** **second**"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("**first** and **second**"),
+        "**first** and **second**"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("first\n\n<!-- -->  indented"),
+        "first\n\n  indented"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("`**first****second**`"),
+        "`**first****second**`"
+    );
+    assert_eq!(
+        normalize_reasoning_summary_text("paragraph\n\n`<!-- -->`"),
+        "paragraph\n\n`<!-- -->`"
+    );
+    assert_eq!(
         normalize_reasoning_summary_text("inline <!-- --> marker\n`<!-- -->`\n"),
         "inline <!-- --> marker\n`<!-- -->`\n"
     );
@@ -11126,8 +11283,7 @@ fn restored_chatgpt_reasoning_removes_only_empty_separator_comments() -> Result<
     let root = std::fs::canonicalize(&root)?;
     let chatgpt_path = root.join("chatgpt.jsonl");
     let anthropic_path = root.join("anthropic.jsonl");
-    let raw_thinking =
-        "**Planning removal**\n\n<!-- -->**Planning masked login input**\n\n<!-- -->";
+    let raw_thinking = "**Planning removal**<!-- -->**Planning masked login input****Verifying restored history**\n\n<!-- -->";
     let message = Message {
         role: "assistant".to_string(),
         content: vec![
@@ -11164,7 +11320,7 @@ fn restored_chatgpt_reasoning_removes_only_empty_separator_comments() -> Result<
     assert!(matches!(
         &agent.history[0].content[0],
         Block::Thinking { text, .. }
-            if text == "**Planning removal**\n\n**Planning masked login input**"
+            if text == "**Planning removal**\n\n**Planning masked login input**\n\n**Verifying restored history**"
     ));
     assert!(matches!(
         &agent.history[0].content[1],
@@ -12770,7 +12926,7 @@ fn compact_summary_thinking_budget_and_reasoning_fallbacks() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn openai_compact_summary_request_disables_local_thinking() {
+async fn frugal_local_compact_summary_calls_local_llm_and_disables_thinking() {
     let root = temp_test_dir("compact-summary-local-thinking");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -12825,6 +12981,7 @@ async fn openai_compact_summary_request_disables_local_thinking() {
     agent.api_key.clear();
     agent.base_url = format!("http://{addr}");
     agent.model = DEFAULT_LOCAL_MODEL.to_string();
+    agent.context_mode = ContextMode::Frugal;
     agent.thinking_effort = ThinkingEffort::High;
     let old = vec![Message {
         role: "user".to_string(),
@@ -12845,6 +13002,16 @@ async fn openai_compact_summary_request_disables_local_thinking() {
     assert!(value.get("reasoning_effort").is_none(), "{value}");
     assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
     assert_eq!(value["stream"], false);
+    assert_eq!(value["messages"][0]["role"], "system");
+    assert_eq!(value["messages"][0]["content"], COMPACT_SYSTEM);
+    let summary_prompt = value["messages"][1]["content"]
+        .as_str()
+        .expect("summary user prompt");
+    assert!(
+        summary_prompt.contains("[user] old context"),
+        "{summary_prompt}"
+    );
+    assert!(summary_prompt.contains("Recent state"), "{summary_prompt}");
 
     server.join().expect("server thread");
     let _ = std::fs::remove_dir_all(&root);

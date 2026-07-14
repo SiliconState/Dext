@@ -197,6 +197,8 @@ Inside a session:
 
 Conversational invocation also works when the message clearly asks to run/use a known pack, for example: `run autoresearch on reducing test runtime`.
 
+A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke helpers through paths such as `$DEXT_PACK_DIR/bin/helper.py`. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
+
 ## Git checkpoints, undo, and mutation previews
 
 When Dext is running inside a Git repository, approved write-risk tool calls can
@@ -368,7 +370,7 @@ Runtime controls:
 DEXT_NO_TUI=1
 DEXT_TRUST=0  # opt out of default startup trust mode
 DEXT_APPROVAL=ask
-DEXT_SANDBOX_PROFILE=workspace-write
+DEXT_SANDBOX_PROFILE=workspace-write  # permits writes in the sandbox and user home
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean

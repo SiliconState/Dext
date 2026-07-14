@@ -77,8 +77,9 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `src/shelves.rs`
   - Shelf registry with typed manifests (`shelf.json`).
-  - `ShelfManifest`, `PackManifest`, `Ability`, `Signal` types.
-  - Scope-precedence resolution and ability metadata injection.
+  - `ShelfManifest`, `PackManifest`, and provider-neutral ability metadata.
+  - Scope-precedence resolution and bounded context injection for manifest-only shelves.
+  - In-process shelf implementations can participate in the typed signal/effect loop; filesystem manifests do not register executable tools, commands, or arbitrary effect handlers.
 
 - `src/tool_policy.rs`
   - Tool input validation and command risk classification.
@@ -128,7 +129,7 @@ Dext has three safety layers:
 Profiles:
 
 - Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`.
-- Sandbox: `read-only`, `workspace-write`, `danger-full-access`.
+- Sandbox: `read-only`, `workspace-write`, `danger-full-access`. `workspace-write` permits writes below the sandbox root and the user's home directory so normal toolchain caches work; `read-only` still permits scratch/device writes required by ordinary commands.
 
 `--trust` is the default startup behavior and auto-approves gated tools. Use `--no-trust` or `DEXT_TRUST=0` to opt out.
 
@@ -157,7 +158,7 @@ recovery tools.
 ## Context modes
 
 - `standard`: normal caps and lean tool schemas by default; this remains the default for frontier/cloud providers.
-- `frugal`: the automatic local-provider default; lower prompt/history/tool-result caps and deterministic compaction without removing core tool capabilities or overriding an explicit toolset/schema selection.
+- `frugal`: the automatic local-provider default; lower prompt/history/tool-result caps and bounded LLM-backed compaction without removing core tool capabilities or overriding an explicit toolset/schema selection.
 - `tiny`: the smallest prompt/history variant for constrained local models.
 
 Frugal and tiny use a compact task-graph discipline for nontrivial work: steps have required inputs and observable outputs, independent reads can run in parallel, verified results are reused, and recovery repairs only the affected step. Dext intentionally does not maintain a graph runtime or impose local-only action locks, round ceilings, output suppression, or forced finalization.

@@ -219,22 +219,22 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h2 id="project-layout" class="collapsible-header">Project Layout</h2>
 <div class="collapsible-content">
 <table>
-<tr><th>File</th><th>Lines</th><th>Purpose</th></tr>
-<tr><td><code>src/main.rs</code></td><td>~18,000</td><td>Agent loop, HTTP provider, permissions, sandboxing, slash commands, CLI entry, eval</td></tr>
-<tr><td><code>src/main_tests.rs</code></td><td>~8,000</td><td>Unit and integration tests for main.rs</td></tr>
-<tr><td><code>src/tui.rs</code></td><td>~10,300</td><td>Ratatui inline TUI, permission prompts, transcript rendering</td></tr>
-<tr><td><code>src/provider.rs</code></td><td>~3,150</td><td>Provider catalog, auth, request shaping, model normalization</td></tr>
-<tr><td><code>src/session.rs</code></td><td>~770</td><td>Session/log persistence, project state locks, atomic I/O</td></tr>
-<tr><td><code>src/tools.rs</code></td><td>~490</td><td>Tool definitions, permission metadata, parallel-safe classification</td></tr>
-<tr><td><code>src/orchestrator.rs</code></td><td>~1,970</td><td>Work phases, similarity guards, objective tracking, adaptive caps</td></tr>
-<tr><td><code>src/git_checkpoints.rs</code></td><td>~630</td><td>Git-native recovery refs, /undo, sidecar files, pruning</td></tr>
-<tr><td><code>src/mutation_preview.rs</code></td><td>~229</td><td>In-memory line-level previews before applying file mutations</td></tr>
-<tr><td><code>src/memory_merge.rs</code></td><td>~542</td><td>Section-aware merge driver for MEMORY.md and recall.md</td></tr>
-<tr><td><code>src/packs.rs</code></td><td>~502</td><td>Pack discovery, invocation, conversational pack inference</td></tr>
-<tr><td><code>src/shelves.rs</code></td><td>~1,069</td><td>Typed shelf registry with abilities, signals, effects</td></tr>
-<tr><td><code>src/tool_policy.rs</code></td><td>~873</td><td>Command risk classification, input validation, bash guardrails</td></tr>
-<tr><td><code>benches/dext_bench.rs</code></td><td>~266</td><td>Criterion perf harness</td></tr>
-<tr><td><code>tests/tui_smoke.rs</code></td><td>~383</td><td>PTY-backed TUI smoke test</td></tr>
+<tr><th>File</th><th>Purpose</th></tr>
+<tr><td><code>src/main.rs</code></td><td>Agent loop, provider HTTP, permissions, sandboxing, slash commands, CLI entry, eval</td></tr>
+<tr><td><code>src/main_tests.rs</code></td><td>Unit and integration tests for main.rs</td></tr>
+<tr><td><code>src/tui.rs</code></td><td>Ratatui inline TUI, permission prompts, transcript rendering</td></tr>
+<tr><td><code>src/provider.rs</code></td><td>Provider catalog, auth, request shaping, model normalization</td></tr>
+<tr><td><code>src/session.rs</code></td><td>Session/log persistence, project state locks, atomic I/O</td></tr>
+<tr><td><code>src/tools.rs</code></td><td>Tool definitions, permission metadata, parallel-safe classification</td></tr>
+<tr><td><code>src/orchestrator.rs</code></td><td>Work phases, similarity guards, objective tracking, adaptive caps</td></tr>
+<tr><td><code>src/git_checkpoints.rs</code></td><td>Git-native recovery refs, /undo, sidecar files, pruning</td></tr>
+<tr><td><code>src/mutation_preview.rs</code></td><td>In-memory line-level previews before applying file mutations</td></tr>
+<tr><td><code>src/memory_merge.rs</code></td><td>Section-aware merge driver for MEMORY.md and recall.md</td></tr>
+<tr><td><code>src/packs.rs</code></td><td>Pack discovery, invocation, conversational pack inference</td></tr>
+<tr><td><code>src/shelves.rs</code></td><td>Typed shelf registry with ability metadata, signals, and effects</td></tr>
+<tr><td><code>src/tool_policy.rs</code></td><td>Command risk classification, input validation, bash guardrails</td></tr>
+<tr><td><code>benches/dext_bench.rs</code></td><td>Criterion performance harness</td></tr>
+<tr><td><code>tests/tui_smoke.rs</code></td><td>PTY-backed TUI smoke tests</td></tr>
 </table>
 </div>
 </section>
@@ -399,21 +399,24 @@ dext --frugal --effort off    # low-token mode</code></pre>
 ├── packs/                       # User-scoped packs
 └── projects/
     └── &lt;project-key&gt;/
-        ├── owner.lock.json      # Project state lock
-        ├── sessions/
-        │   ├── _latest.jsonl    # Auto-saved latest session
-        │   └── &lt;name&gt;.jsonl     # Named sessions
-        └── logs/
-            ├── latest.log       # Capped at 64KB
-            └── latest.log.1..N  # Rotated archives</code></pre>
+        └── sessions/
+            ├── &lt;name&gt;.jsonl     # Named session export
+            └── &lt;session-id&gt;/
+                ├── _latest.jsonl
+                ├── latest.log
+                ├── session.lock.json
+                ├── DEXT.todo.json
+                ├── artifacts/
+                ├── git-auth/
+                └── sudo/</code></pre>
 <h3>Project Key</h3>
 <p>Each project gets a stable key derived from its canonical path: <code>&lt;slug&gt;-&lt;FNV-1a-hash&gt;</code>. This ensures isolated state per project even with identical directory names.</p>
 <h3>Atomic Writes</h3>
-<p>All state files use atomic write via temp file + rename. On Windows, uses <code>MoveFileExW</code>; on Unix, uses <code>fs::rename</code>.</p>
-<h3>Project State Lock</h3>
-<p>A file-based lock (<code>owner.lock.json</code>) prevents concurrent Dext processes from corrupting project state. Lock records include PID/token ownership and are released through a cleanup registry. Stale locks (older than 24 hours) are auto-cleaned.</p>
+<p>Sensitive state writes use a temp-file-and-replace helper. On Windows the replacement uses <code>MoveFileExW</code>; on Unix it uses <code>fs::rename</code>. Session logs normally use private append writes while they remain below the cap.</p>
+<h3>Session State Lock</h3>
+<p>Each active session directory has a <code>session.lock.json</code> record containing PID, token, project, sandbox, and session identity. Matching locks are released through a cleanup registry; a lock is removed as stale only when its recorded process is no longer running.</p>
 <h3>Log Rotation</h3>
-<p><code>latest.log</code> is capped at 64KB. When exceeded, existing content is rotated to <code>latest.log.N</code> (configurable via <code>DEXT_LOG_ARCHIVES</code>, max 16).</p>
+<p>Each session's <code>latest.log</code> is capped at 64,000 bytes. <code>DEXT_LOG_ARCHIVES</code> may retain up to 16 rotated archives; the default is zero.</p>
 </div>
 </section>
 
@@ -693,11 +696,11 @@ description: One-line workflow summary
 <ul>
 <li>pack identity and source metadata</li>
 <li>paths for workflow and optional hooks</li>
-<li>pack-scoped env exports (<code>DEXT_PACK_DIR</code>, <code>DEXT_PACK_&lt;NAME&gt;_DIR</code>)</li>
+<li>pack-scoped environment names (<code>DEXT_PACK_DIR</code>, <code>DEXT_PACK_&lt;NAME&gt;_DIR</code>), which the runtime supplies to active-pack <code>bash</code> calls and hook processes</li>
 <li>full <code>PACK.md</code> workflow body</li>
 <li>explicit user task text</li>
 </ul>
-<p>This gives the model procedural guidance without changing core runtime policy.</p>
+<p>This gives the model procedural guidance without changing core runtime policy. The selected pack remains active for the session: its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Changing the sandbox root clears that active pack state.</p>
 
 <h3>Execution Paths</h3>
 <ul>
@@ -740,21 +743,21 @@ description: One-line workflow summary
 <tr><td><code>Exposure</code></td><td>Hidden / OnDemand / Visible model-facing exposure level</td></tr>
 </table>
 
-<h3>Signals and Effects Runtime</h3>
-<p>Shelves can receive lifecycle signals and emit effects:</p>
+<h3>Signal and Effect Types</h3>
+<p>The shelf module defines a typed signal/effect vocabulary for in-process shelf implementations. Filesystem <code>shelf.json</code> manifests are declarative metadata: a matching load/prompt hook declaration can opt declared context into bounded prompt injection, but manifests do not register executable tools or slash commands and do not supply arbitrary effect handlers.</p>
 <table>
 <tr><th>Signals</th><th>Typical Use</th></tr>
-<tr><td><code>load</code>, <code>prompt</code>, <code>tool(before|after)</code>, <code>turn(start|end)</code>, <code>compact</code>, <code>shutdown</code></td><td>Instrument workflows, context shaping, policy hooks</td></tr>
+<tr><td><code>load</code>, <code>prompt</code>, <code>tool(before|after)</code>, <code>turn(start|end)</code>, <code>compact</code>, <code>shutdown</code></td><td>Typed lifecycle vocabulary for in-process shelves</td></tr>
 </table>
 <table>
 <tr><th>Effects</th><th>Behavior</th></tr>
 <tr><td><code>note</code></td><td>Diagnostic annotation</td></tr>
 <tr><td><code>context</code></td><td>Inject prioritized context text</td></tr>
 <tr><td><code>block</code></td><td>Hard-stop signal flow with explicit reason</td></tr>
-<tr><td><code>rewrite_tool</code></td><td>Transform tool input payload before execution</td></tr>
-<tr><td><code>state</code></td><td>Persist shelf-scoped state key/value</td></tr>
+<tr><td><code>rewrite_tool</code></td><td>Typed input-rewrite effect for an in-process shelf; not executed from a static manifest</td></tr>
+<tr><td><code>state</code></td><td>Typed state effect for an in-process shelf; static manifests do not persist it</td></tr>
 </table>
-<p><code>Block</code> effects terminate flow early by design.</p>
+<p><code>Block</code> effects terminate in-process signal flow early. Static manifest shelves only produce context/note data for opted-in load or prompt signals.</p>
 
 <h3>Discovery and Scope Precedence</h3>
 <table>
@@ -853,7 +856,7 @@ description: One-line workflow summary
 <tr><td><code>dext --sandbox read-only|workspace-write|danger-full-access</code></td><td>Set sandbox profile</td></tr>
 <tr><td><code>dext --eval</code></td><td>Run eval harness</td></tr>
 <tr><td><code>dext --output json|stream-json</code></td><td>Machine-readable output</td></tr>
-<tr><td><code>dext --effort off|low|medium|high|xhigh</code></td><td>Thinking effort</td></tr>
+<tr><td><code>dext --effort off|low|medium|high|xhigh|max</code></td><td>Thinking effort</td></tr>
 <tr><td><code>dext --approval ask|auto-read|auto-write|never|always</code></td><td>Approval profile</td></tr>
 <tr><td><code>dext --no-trust</code></td><td>Opt out of default startup trust mode</td></tr>
 <tr><td><code>dext --budget &lt;amount&gt;</code></td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
@@ -899,7 +902,7 @@ description: One-line workflow summary
 <tr><td><code>/approval [profile]</code></td><td>Set approval profile</td></tr>
 <tr><td><code>/sandbox [path]</code></td><td>Show or change sandbox root</td></tr>
 <tr><td><code>/sandbox-profile [profile]</code></td><td>Set sandbox: read-only, workspace-write, danger-full-access</td></tr>
-<tr><td><code>/effort [level]</code></td><td>Set thinking effort: off, low, medium, high, xhigh</td></tr>
+<tr><td><code>/effort [level]</code></td><td>Set thinking effort: off, low, medium, high, xhigh, max</td></tr>
 <tr><td><code>/model [name]</code></td><td>Show or change model</td></tr>
 <tr><td><code>/provider [id]</code></td><td>Show or change provider</td></tr>
 <tr><td><code>/models</code></td><td>List available models</td></tr>
@@ -923,7 +926,6 @@ description: One-line workflow summary
 <tr><td><code>/pack list|inspect|run</code></td><td>Pack management</td></tr>
 <tr><td><code>/shelves</code></td><td>Show shelf registry</td></tr>
 <tr><td><code>/undo [--list|--apply|&lt;id&gt;]</code></td><td>Recovery checkpoint preview/apply management</td></tr>
-<tr><td><code>/memory check|register</code></td><td>Memory merge driver management</td></tr>
 </table>
 </div>
 </section>
@@ -1004,7 +1006,7 @@ description: One-line workflow summary
 <tr><td><code>DEXT_TOOL_PROFILE</code></td><td>lean</td><td>Tool schema profile: full, lean</td></tr>
 <tr><td><code>DEXT_MUTATION_PREVIEW</code></td><td>simple</td><td>Mutation preview mode: off, simple, git</td></tr>
 <tr><td><code>DEXT_APPROVAL</code></td><td>ask</td><td>Approval profile: ask, auto-read, auto-write, never, always</td></tr>
-<tr><td><code>DEXT_SANDBOX_PROFILE</code></td><td>workspace-write</td><td>Sandbox profile: read-only, workspace-write, danger-full-access</td></tr>
+<tr><td><code>DEXT_SANDBOX_PROFILE</code></td><td>workspace-write</td><td>Sandbox profile: read-only, workspace-write, danger-full-access. Workspace-write permits writes under the sandbox and user home for toolchain caches.</td></tr>
 <tr><td><code>DEXT_BUDGET_CAP</code></td><td>—</td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
 <tr><td><code>DEXT_CONTEXT_WINDOW_TOKENS</code></td><td>Profile default</td><td>Override context window size</td></tr>
 <tr><td><code>DEXT_CONTEXT_WINDOW</code></td><td>Profile default</td><td>Alias override for context window size</td></tr>

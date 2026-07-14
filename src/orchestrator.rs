@@ -1354,7 +1354,10 @@ pub(crate) fn classify_http_failure(status: u16, body: &str) -> RetryPlan {
         };
     }
 
-    if matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504) {
+    if matches!(
+        status,
+        408 | 425 | 429 | 500 | 502 | 503 | 504 | 520..=525 | 527
+    ) {
         return RetryPlan {
             kind: FailureKind::Transient,
             retry: true,
@@ -2208,6 +2211,18 @@ mod tests {
             FailureKind::Transient
         );
         assert!(classify_http_failure(429, "rate limited").retry);
+
+        assert_eq!(
+            classify_http_failure(520, "error code: 520").kind,
+            FailureKind::Transient
+        );
+        assert!(classify_http_failure(520, "error code: 520").retry);
+
+        assert_eq!(
+            classify_http_failure(526, "invalid SSL certificate").kind,
+            FailureKind::Permanent
+        );
+        assert!(!classify_http_failure(526, "invalid SSL certificate").retry);
 
         assert_eq!(
             classify_http_failure(418, "teapot").kind,

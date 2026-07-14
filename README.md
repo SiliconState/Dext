@@ -254,7 +254,7 @@ dext --pack autoresearch "improve this benchmark"
 dext --pack packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
 ```
 
-If a pack has `phooks.json`, Dext activates those hook templates for that invocation and passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to hook processes. Shelf packs use the same invocation path and remain regular source directories.
+If a pack has `phooks.json`, Dext activates those hook templates for the current session. While the pack is active, Dext passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to its `bash` tool commands and hook processes. Shelf packs use the same invocation path and remain regular source directories.
 
 ## Configuration and state
 
@@ -287,7 +287,7 @@ DEXT_SESSIONS_DIR=~/.dext/sessions
 DEXT_LOGS_DIR=~/.dext/logs
 DEXT_APPROVAL=ask
 DEXT_TRUST=0  # opt out of default startup trust mode
-DEXT_SANDBOX_PROFILE=workspace-write
+DEXT_SANDBOX_PROFILE=workspace-write  # permits writes in the sandbox and user home; use read-only for review-only tasks
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean

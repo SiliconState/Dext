@@ -64,9 +64,11 @@ Also scan untracked and ignored files before deciding what to preserve locally v
 
 ## Runtime safety notes
 
-- `--approval ask` is the conservative default for privileged tools.
+- The approval profile defaults to `ask`, but startup trust mode is enabled by
+  default and auto-approves gated tools. Use `--no-trust` or `DEXT_TRUST=0` when
+  interactive approval is required.
 - `--approval never` prevents privileged tool execution.
-- `--sandbox-profile read-only` (or `--sandbox read-only`) is recommended for review-only tasks.
+- `--sandbox-profile read-only` (or `--sandbox read-only`) is recommended for review-only tasks. The default `workspace-write` profile permits writes under the sandbox root and the user's home directory for toolchain caches.
 - `--trust` and `danger-full-access` are high-trust modes. Use only in controlled environments.
 - Dext Git checkpoints are best-effort local recovery aids. They may include
   file content in hidden refs or `.dext/checkpoints/` sidecars, and they do not

@@ -521,7 +521,11 @@ pub(crate) fn record_crash_event(event: &AgentEvent) {
             "steering:{messages}:{}",
             summarize_inline(preview, 80)
         )),
-        AgentEvent::TurnEnd { .. } => Some("turn_end".to_string()),
+        AgentEvent::TurnEnd { failed, .. } => Some(if *failed {
+            "turn_end:failed".to_string()
+        } else {
+            "turn_end".to_string()
+        }),
         _ => None,
     };
     let Some(label) = label else {
@@ -1578,6 +1582,7 @@ enum AgentEvent {
     },
     TurnEnd {
         usage: Usage,
+        failed: bool,
     },
     CompactStart,
     CompactEnd {
@@ -1713,7 +1718,7 @@ impl EventSink for ConsoleSink {
             AgentEvent::Error(s) => eprintln!("{s}"),
             AgentEvent::Slash(s) => println!("{s}"),
             AgentEvent::WorkMap { text, .. } => println!("{text}"),
-            AgentEvent::TurnEnd { usage } => {
+            AgentEvent::TurnEnd { usage, .. } => {
                 println!(
                     "{}",
                     dim(&format!("[usage: {}]", usage.line()), self.pretty)
@@ -1816,12 +1821,13 @@ impl EventSink for JsonSink {
                     stream_aborted: true,
                     ..
                 } => self.stream.text.clear(),
-                AgentEvent::TurnEnd { usage } => {
+                AgentEvent::TurnEnd { usage, failed } => {
                     Self::emit_json_line(&json!({
                         "event": "final",
                         "data": {
                             "text": self.stream.text,
                             "usage": usage,
+                            "failed": failed,
                         }
                     }));
                 }
@@ -3819,20 +3825,39 @@ pub(crate) fn normalize_reasoning_summary_text(text: &str) -> String {
             .filter(|ch| *ch == '\n')
             .count()
             >= 2;
+        let in_markdown_code = markdown_code_span_open(&normalized);
         let Some(end) = comment.find("-->") else {
-            if paragraph_separator && comment.trim().is_empty() {
+            let heading_separator = ends_with_reasoning_heading(&normalized);
+            if !in_markdown_code
+                && (paragraph_separator || heading_separator)
+                && comment.trim().is_empty()
+            {
                 normalized.truncate(normalized.trim_end().len());
             } else {
                 normalized.push_str(&remaining[start..]);
             }
-            return normalized;
+            return separate_adjacent_reasoning_headings(&normalized);
         };
         let after = &comment[end + "-->".len()..];
-        if paragraph_separator && comment[..end].trim().is_empty() {
+        let empty_heading_separator = !in_markdown_code
+            && comment[..end].trim().is_empty()
+            && ends_with_reasoning_heading(&normalized)
+            && (after.trim().is_empty() || after.trim_start().starts_with("**"));
+        if !in_markdown_code
+            && (paragraph_separator || empty_heading_separator)
+            && comment[..end].trim().is_empty()
+        {
+            normalized.truncate(normalized.trim_end().len());
             if after.trim().is_empty() {
-                normalized.truncate(normalized.trim_end().len());
-                return normalized;
+                return separate_adjacent_reasoning_headings(&normalized);
             }
+            normalized.push_str("\n\n");
+            remaining = if empty_heading_separator {
+                after.trim_start()
+            } else {
+                after
+            };
+            continue;
         } else {
             normalized.push_str("<!--");
             normalized.push_str(&comment[..end]);
@@ -3841,7 +3866,89 @@ pub(crate) fn normalize_reasoning_summary_text(text: &str) -> String {
         remaining = after;
     }
     normalized.push_str(remaining);
-    normalized
+    separate_adjacent_reasoning_headings(&normalized)
+}
+
+fn ends_with_reasoning_heading(text: &str) -> bool {
+    let line = text
+        .trim_end()
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    line.len() > 4
+        && line.starts_with("**")
+        && line.ends_with("**")
+        && !line[2..line.len() - 2].contains("**")
+}
+
+fn advance_markdown_code_delimiter(delimiter: &mut Option<usize>, text: &str) {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index] == b'`' {
+            index += 1;
+        }
+        let run = index - start;
+        match *delimiter {
+            None => *delimiter = Some(run),
+            Some(open) if open == run => *delimiter = None,
+            Some(_) => {}
+        }
+    }
+}
+
+fn markdown_code_span_open(text: &str) -> bool {
+    let mut delimiter = None;
+    advance_markdown_code_delimiter(&mut delimiter, text);
+    delimiter.is_some()
+}
+
+fn separate_adjacent_reasoning_headings(text: &str) -> String {
+    let mut separated = String::with_capacity(text.len());
+    let mut remaining = text;
+    let mut in_bold = false;
+    let mut bold_started_as_heading = false;
+    let mut code_delimiter = None;
+    while let Some(marker) = remaining.find("**") {
+        let before_marker = &remaining[..marker];
+        separated.push_str(before_marker);
+        advance_markdown_code_delimiter(&mut code_delimiter, before_marker);
+        if code_delimiter.is_none() && !in_bold {
+            bold_started_as_heading = separated
+                .rsplit('\n')
+                .next()
+                .is_none_or(|line| line.trim().is_empty());
+        }
+        separated.push_str("**");
+        remaining = &remaining[marker + 2..];
+        if code_delimiter.is_some() {
+            continue;
+        }
+        in_bold = !in_bold;
+        if !in_bold && bold_started_as_heading {
+            let whitespace_len = remaining
+                .find(|ch: char| !ch.is_whitespace())
+                .unwrap_or(remaining.len());
+            let whitespace = &remaining[..whitespace_len];
+            if remaining[whitespace_len..].starts_with("**")
+                && (whitespace.is_empty() || whitespace.contains('\n'))
+            {
+                let newline_count = whitespace.chars().filter(|ch| *ch == '\n').count();
+                for _ in 0..newline_count.max(2) {
+                    separated.push('\n');
+                }
+                remaining = &remaining[whitespace_len..];
+            }
+        }
+    }
+    separated.push_str(remaining);
+    separated
 }
 
 fn normalize_restored_chatgpt_reasoning(history: &mut [Message]) {
@@ -3860,6 +3967,15 @@ fn reasoning_summary_stream_delta(raw: &str, emitted: &mut String) -> Option<Str
         if raw.ends_with(partial_comment_start) && visible.ends_with(partial_comment_start) {
             visible.truncate(visible.len() - partial_comment_start.len());
             break;
+        }
+    }
+    while visible.ends_with([' ', '\t']) {
+        visible.pop();
+    }
+    if let Some(before_star) = visible.strip_suffix('*') {
+        let stable = before_star.trim_end();
+        if stable.ends_with("**") {
+            visible.truncate(stable.len());
         }
     }
     let delta = visible.strip_prefix(emitted.as_str())?.to_string();
@@ -5590,6 +5706,24 @@ fn extract_response_text(body: String, content_type: Option<&str>) -> String {
     }
 }
 
+fn http_status_label(status: reqwest::StatusCode) -> String {
+    match status.canonical_reason() {
+        Some(reason) => format!("{} {reason}", status.as_u16()),
+        None => status.as_u16().to_string(),
+    }
+}
+
+fn http_status_error(status: reqwest::StatusCode, text: &str) -> String {
+    let label = http_status_label(status);
+    let detail = text.trim();
+    if detail.is_empty() || detail.eq_ignore_ascii_case(&format!("error code: {}", status.as_u16()))
+    {
+        format!("HTTP {label}")
+    } else {
+        format!("HTTP {label}: {detail}")
+    }
+}
+
 fn format_http_request_error(err: reqwest::Error) -> String {
     let mut message = format!("HTTP request failed: {err}");
     let mut source = std::error::Error::source(&err);
@@ -5651,14 +5785,14 @@ async fn execute_http_tool_async(
 
     if status.is_success() {
         if body.trim().is_empty() {
-            Ok(format!("HTTP {status}"))
+            Ok(format!("HTTP {}", http_status_label(status)))
         } else {
             Ok(body)
         }
     } else if body.trim().is_empty() {
-        Err(format!("HTTP {status}"))
+        Err(format!("HTTP {}", http_status_label(status)))
     } else {
-        Err(format!("HTTP {status}\n{body}"))
+        Err(format!("HTTP {}\n{body}", http_status_label(status)))
     }
 }
 
@@ -8634,6 +8768,7 @@ async fn execute_builtin_call(
     git_credential: Option<LocalGitCredential>,
     sandbox_profile: SandboxProfile,
     live_output: Option<LiveToolOutput>,
+    pack_env: Vec<(String, String)>,
 ) -> std::result::Result<String, String> {
     if name == "bash" {
         let cmd = input["command"].as_str().unwrap_or("").to_string();
@@ -8652,10 +8787,10 @@ async fn execute_builtin_call(
             }
             _ => None,
         };
-        let extra_env = git_cred_runtime
-            .as_ref()
-            .map(|runtime| runtime.env.clone())
-            .unwrap_or_default();
+        let mut extra_env = pack_env;
+        if let Some(runtime) = git_cred_runtime.as_ref() {
+            extra_env.extend(runtime.env.clone());
+        }
         execute_bash_async_prepared(
             &guarded,
             &root,
@@ -9856,6 +9991,33 @@ fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
     out
 }
 
+fn normalize_http_status_noise(text: &str) -> String {
+    let normalized = text.replace(" <unknown status code>", "");
+    let Some(http) = normalized.strip_prefix("HTTP ") else {
+        return normalized;
+    };
+    let code = http
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if code.is_empty() {
+        return normalized;
+    }
+    let redundant = format!(": error code: {code}");
+    normalized
+        .strip_suffix(&redundant)
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+fn normalize_provider_health_errors(health: &mut ProviderHealthLedger) {
+    for state in health.providers.values_mut() {
+        if let Some(error) = &mut state.last_error {
+            *error = normalize_http_status_noise(error);
+        }
+    }
+}
+
 fn render_provider_health_prompt(health: &ProviderHealthLedger) -> String {
     let mut out = String::new();
     for (provider, state) in &health.providers {
@@ -9880,7 +10042,10 @@ fn render_provider_health_prompt(health: &ProviderHealthLedger) -> String {
             out.push_str("disabled_for_turn=true ");
         }
         if let Some(err) = &state.last_error {
-            out.push_str(&format!("last_error={} ", summarize_inline(err, 160)));
+            out.push_str(&format!(
+                "last_error={} ",
+                summarize_inline(&normalize_http_status_noise(err), 160)
+            ));
         }
         out.push('\n');
     }
@@ -13170,6 +13335,18 @@ impl Agent {
         true
     }
 
+    fn begin_provider_turn(&mut self) {
+        for state in self.provider_health.providers.values_mut() {
+            state.retry_after = None;
+            state.disabled_for_turn = false;
+        }
+    }
+
+    fn record_provider_success(&mut self) {
+        let health_key = self.provider_health_key();
+        self.provider_health.providers.remove(&health_key);
+    }
+
     fn record_provider_http_failure(
         &mut self,
         status: reqwest::StatusCode,
@@ -13183,21 +13360,21 @@ impl Agent {
             .providers
             .entry(health_key)
             .or_default();
-        state.auth = if matches!(status.as_u16(), 401 | 403) {
+        state.auth = if matches!(status.as_u16(), 401 | 403 | 407) {
             "failed".to_string()
         } else {
             "present".to_string()
         };
-        state.last_error = Some(format!("HTTP {status}: {}", summarize_inline(text, 220)));
+        state.last_error = Some(http_status_error(status, &summarize_inline(text, 220)));
         state.retry_after = retry_after;
         state.mode = Some(mode);
-        let is_server_error = matches!(status.as_u16(), 502..=504);
+        let is_server_error = matches!(status.as_u16(), 500 | 502..=504 | 520..=525 | 527);
         if is_server_error {
             state.consecutive_server_errors = state.consecutive_server_errors.saturating_add(1);
         } else {
             state.consecutive_server_errors = 0;
         }
-        state.disabled_for_turn = matches!(status.as_u16(), 401 | 403 | 429)
+        state.disabled_for_turn = matches!(status.as_u16(), 401 | 403 | 407 | 429)
             || (is_server_error
                 && state.consecutive_server_errors >= MAX_CONSECUTIVE_SERVER_ERRORS);
     }
@@ -13893,7 +14070,7 @@ impl Agent {
             tool_context_profile,
             tool_profile,
             work_ledger,
-            provider_health,
+            mut provider_health,
             track_origin,
             privacy,
             provenance,
@@ -13918,6 +14095,7 @@ impl Agent {
         self.budget_cap = budget_cap;
         self.budget_exhausted = false;
         self.work_ledger = work_ledger;
+        normalize_provider_health_errors(&mut provider_health);
         self.provider_health = provider_health;
         self.track_origin = track_origin;
         self.privacy = privacy;
@@ -14276,15 +14454,6 @@ impl Agent {
         old: &[Message],
         evidence: &str,
     ) -> Result<(String, Usage)> {
-        if self.context_mode.is_frugal() {
-            let summary = if evidence.trim().is_empty() {
-                "No prior deterministic resume evidence remained after compaction.".to_string()
-            } else {
-                format!("Deterministic resume evidence:\n{}", evidence.trim())
-            };
-            return Ok((summary, Usage::default()));
-        }
-
         let transcript = render_transcript_for_summary(old, self.context_mode);
         let user_text = compaction_user_text_with_evidence(&transcript, evidence);
         let summary_model = self.compact_summary_model();
@@ -14405,7 +14574,7 @@ impl Agent {
                 HTTP_ERROR_BODY_CAP,
                 "HTTP error body truncated.",
             );
-            anyhow::bail!("summary HTTP {status}: {text}");
+            anyhow::bail!("summary {}", http_status_error(status, &text));
         }
 
         if parse_mode == SummaryParse::ChatGptSse {
@@ -14476,7 +14645,7 @@ impl Agent {
                                     HTTP_ERROR_BODY_CAP,
                                     "HTTP error body truncated.",
                                 );
-                                anyhow::bail!("summary HTTP {retry_status}: {text}");
+                                anyhow::bail!("summary {}", http_status_error(retry_status, &text));
                             }
                             resp = retry_resp;
                             continue;
@@ -14720,15 +14889,18 @@ impl Agent {
 
     async fn chat(&mut self, user_input: String) -> Result<()> {
         self.interrupt.store(false, Ordering::SeqCst);
+        self.begin_provider_turn();
         self.sink.emit(AgentEvent::TurnStart);
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
         let result = self.chat_inner(user_input).await;
         if result.is_err() {
-            if self.interrupt.load(Ordering::SeqCst) {
+            let interrupted = self.interrupt.load(Ordering::SeqCst);
+            if interrupted {
                 self.sink.emit(AgentEvent::Interrupted);
             }
             self.sink.emit(AgentEvent::TurnEnd {
                 usage: Usage::default(),
+                failed: !interrupted,
             });
         }
         result
@@ -15004,26 +15176,30 @@ impl Agent {
                             }
 
                             if !plan.retry || attempt >= MAX_HTTP_ATTEMPTS {
+                                let error = http_status_error(status, &text);
                                 self.append_latest_log(
                                     "http_error",
-                                    &format!("kind={} HTTP {status}: {text}", plan.label()),
+                                    &format!("kind={} {error}", plan.label()),
                                 );
-                                anyhow::bail!("HTTP {status}: {text}");
+                                anyhow::bail!(error);
                             }
                             let wait = retry_after
                                 .unwrap_or_else(|| jittered_backoff_secs(1u64 << (attempt - 1)));
                             self.append_latest_log(
                                 "http_retry",
                                 &format!(
-                                    "attempt={attempt} kind={} status={status} wait={wait}s",
-                                    plan.label()
+                                    "attempt={attempt} kind={} status={} wait={wait}s",
+                                    plan.label(),
+                                    http_status_label(status)
                                 ),
                             );
-                            last_retry_reason = Some(format!("{} HTTP {status}", plan.label()));
+                            let retry_reason =
+                                format!("{} HTTP {}", plan.label(), http_status_label(status));
+                            last_retry_reason = Some(retry_reason.clone());
                             self.sink.emit(AgentEvent::HttpRetry {
                                 attempt,
                                 wait_secs: wait,
-                                reason: format!("{} HTTP {status}", plan.label()),
+                                reason: retry_reason,
                             });
                             turn_state.record_http_retry();
                             emit_external_telemetry(self.sink.as_mut(), &turn_state);
@@ -15086,7 +15262,10 @@ impl Agent {
                     );
                 }
                 match self.parse_stream_response(resp).await {
-                    Ok(result) => break 'stream_retry result,
+                    Ok(result) => {
+                        self.record_provider_success();
+                        break 'stream_retry result;
+                    }
                     Err(e)
                         if stream_error_body(&e)
                             .contains("runtime control changed active stream") =>
@@ -15701,6 +15880,7 @@ impl Agent {
                         let read_cache = read_cache.clone();
                         let session_id = self.session_id.clone();
                         let sandbox_profile = self.sandbox_profile;
+                        let pack_env = self.pack_hook_env.clone();
                         let git_credential = stored_git_credential_for_bash_call(
                             &n,
                             &inp,
@@ -15725,6 +15905,7 @@ impl Agent {
                                 git_credential,
                                 sandbox_profile,
                                 None,
+                                pack_env,
                             )
                             .await
                         });
@@ -15818,6 +15999,7 @@ impl Agent {
                         git_credential_for_call,
                         self.sandbox_profile,
                         live_output,
+                        self.pack_hook_env.clone(),
                     )
                     .await;
                     builtin_outputs.insert(idx, r);
@@ -16237,7 +16419,10 @@ impl Agent {
             )),
             compacted: Some(compacted_this_turn),
         });
-        self.sink.emit(AgentEvent::TurnEnd { usage: turn_usage });
+        self.sink.emit(AgentEvent::TurnEnd {
+            usage: turn_usage,
+            failed: false,
+        });
         Ok(())
     }
 

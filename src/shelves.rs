@@ -464,13 +464,21 @@ impl ShelfRegistry {
 
         let mut out = String::new();
         for (_, text) in items {
-            if !out.is_empty() && out.len() + text.len() + 1 > total_budget {
+            let separator_len = usize::from(!out.is_empty());
+            let remaining = total_budget
+                .saturating_sub(out.len())
+                .saturating_sub(separator_len);
+            if remaining == 0 {
                 break;
             }
-            if !out.is_empty() {
+            let capped = cap_chars_on_boundary(&text, remaining);
+            if capped.is_empty() {
+                break;
+            }
+            if separator_len != 0 {
                 out.push('\n');
             }
-            out.push_str(&text);
+            out.push_str(&capped);
         }
         (!out.is_empty()).then_some(out)
     }
@@ -577,11 +585,19 @@ fn cap_chars_on_boundary(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    let mut end = max_bytes;
+    const ELLIPSIS: &str = "…";
+    if max_bytes < ELLIPSIS.len() {
+        let mut end = max_bytes;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        return s[..end].to_string();
+    }
+    let mut end = max_bytes - ELLIPSIS.len();
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &s[..end])
+    format!("{}{}", &s[..end], ELLIPSIS)
 }
 
 struct ShelfManifestCandidate {
@@ -1136,6 +1152,24 @@ mod tests {
                 .collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn collect_context_respects_total_byte_budget() {
+        let mut shelf = context_shelf(true);
+        if let Ability::Context(context) = &mut shelf.manifest.packs[0].abilities[0] {
+            context.description = "é".repeat(200);
+            context.budget = 1_000;
+        }
+        let mut registry = ShelfRegistry::new();
+        registry.register(shelf);
+
+        let block = registry
+            .collect_context(&Signal::Load, &ShelfFrame::new("."), 17)
+            .expect("bounded context");
+        assert!(block.len() <= 17, "{} bytes: {block:?}", block.len());
+        assert!(block.is_char_boundary(block.len()));
+        assert!(!block.ends_with('\n'));
     }
 
     #[test]

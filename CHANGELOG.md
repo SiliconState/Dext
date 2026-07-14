@@ -53,3 +53,7 @@
   from the incoming side, and keep a clean trailing newline.
 - Mutation preview path handling enforces sandbox containment and avoids
   double-counting trailing new-file additions.
+- Active packs now expose `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to
+  subsequent `bash` tool calls as well as hook processes.
+- Shelf context aggregation now enforces the total byte budget, including
+  separators and UTF-8-safe ellipses.

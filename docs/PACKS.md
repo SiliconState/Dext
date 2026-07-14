@@ -82,7 +82,7 @@ Conversational invocation works when the message clearly references a known pack
 run autoresearch on improving this benchmark
 ```
 
-When a pack runs, Dext reads `PACK.md` as the initial agent context and sets `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` environment variables. If the pack has `phooks.json`, those hooks activate for the session.
+When a pack runs, Dext reads `PACK.md` as the initial agent context and activates that pack for the current session. It passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so helper commands can use `$DEXT_PACK_DIR/bin/helper.py`. If the pack has `phooks.json`, Dext adds those hooks to the session; changing the sandbox root clears active pack hooks and environment.
 
 ### Building a pack
 
@@ -92,7 +92,7 @@ When a pack runs, Dext reads `PACK.md` as the initial agent context and sets `DE
    Use project-local `packs/<name>/`, `.dext/packs/<name>/`, or `.dext/shelves/<shelf>/packs/<name>/` only when the user explicitly wants repo-scoped behavior.
 2. Create the directory and `PACK.md` with front matter.
 3. Write clear workflow instructions: setup, loop rules, helper commands, state files.
-4. Add helper scripts in `bin/` — called through `bash` via `$DEXT_PACK_DIR/bin/helper.py`.
+4. Add helper scripts in `bin/` — while the pack is active, call them through `bash` via `$DEXT_PACK_DIR/bin/helper.py`.
 5. Optionally add `phooks.json` for steering/validation hooks.
 6. Test locally:
 
@@ -179,8 +179,8 @@ Ability types:
 | Type | Purpose |
 |------|---------|
 | `tool` | Declares tool-like metadata with `schema`, `grants`, and `exposure`; it is registry metadata, not a provider-visible tool implementation. |
-| `command` | Declares a slash command |
-| `hook` | Declares hook signals the pack listens to |
+| `command` | Declares command metadata (`name`, `usage`, `description`); it does not register an executable slash command. |
+| `hook` | Declares signal interest. For manifest-only shelves, this opts declared context into load/prompt injection; it does not load executable hook code. |
 | `context` | Declares named context the pack provides |
 
 ### Shelf discovery
@@ -203,7 +203,7 @@ dext shelves    # CLI
 /shelves        # interactive
 ```
 
-Shelf metadata is injected into the model context as typed ability records, not as new provider tools. Tool abilities require `schema`, `grants`, and `exposure` (`hidden`, `on_demand`, or `visible`) so the registry can describe capability shape without executing it directly.
+Shelf metadata is injected into the model context as typed ability records, not as new provider tools or slash commands. Tool abilities require `schema`, `grants`, and `exposure` (`hidden`, `on_demand`, or `visible`) so the registry can describe capability shape without executing it directly. A manifest-only shelf can inject declared context when a matching load/prompt hook signal is present; executable signal effects require an in-process shelf implementation and are not a filesystem plugin API.
 
 ## Reference example
 
