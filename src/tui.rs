@@ -1234,22 +1234,13 @@ impl TuiState {
     fn queue(&mut self, line: Line_) {
         let is_transcript_block = Self::line_needs_history_spacing(&line);
         let is_steering = matches!(line, Line_::Steering(_));
-        let is_warning = matches!(line, Line_::Warn(_));
-        if is_warning
-            && matches!(
-                self.pending_insert.as_slice(),
-                [.., Line_::Warn(_), Line_::Blank]
-            )
-        {
-            self.pending_insert.pop();
-        }
         if ((is_transcript_block && self.last_line_needs_history_spacing()) || is_steering)
             && !self.pending_insert.ends_with(&[Line_::Blank])
         {
             self.pending_insert.push(Line_::Blank);
         }
         self.pending_insert.push(line);
-        if is_steering || is_warning {
+        if is_steering {
             self.pending_insert.push(Line_::Blank);
         }
     }
@@ -1269,7 +1260,7 @@ impl TuiState {
                 Self::line_needs_history_spacing(line)
                     || matches!(
                         line,
-                        Line_::WorkMap { .. } | Line_::SteeringDelivered { .. }
+                        Line_::Warn(_) | Line_::WorkMap { .. } | Line_::SteeringDelivered { .. }
                     )
                     || matches!(line, Line_::Info(text) if objective_status_text(text).is_some() || phase_status_text(text).is_some())
             })
@@ -10364,11 +10355,8 @@ mod tests {
             ));
             assert!(matches!(
                 state.pending_insert.as_slice(),
-                [
-                    Line_::Tool { name, .. },
-                    Line_::Warn(advisory),
-                    Line_::Blank
-                ] if name == "read_symbol" && advisory.starts_with("read_symbol expects")
+                [Line_::Tool { name, .. }, Line_::Warn(advisory)]
+                    if name == "read_symbol" && advisory.starts_with("read_symbol expects")
             ));
 
             state.queue(next);
@@ -10383,6 +10371,46 @@ mod tests {
                 ] if name == "read_symbol" && advisory.starts_with("read_symbol expects")
             ));
         }
+    }
+
+    #[test]
+    fn consecutive_warnings_stay_grouped_across_flushes() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(6),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let width = current_transcript_pane_width(&mut terminal, &state).expect("pane width");
+
+        state.apply_event(AgentEvent::Warn("first warning".to_string()));
+        flush_pending_insert(&mut terminal, &mut state, width).expect("flush first warning");
+        state.apply_event(AgentEvent::Warn("second warning".to_string()));
+        flush_pending_insert(&mut terminal, &mut state, width).expect("flush second warning");
+        state.queue(Line_::Thinking("Continuing after warnings".to_string()));
+        flush_pending_insert(&mut terminal, &mut state, width).expect("flush next block");
+
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [
+                Line_::Warn(first),
+                Line_::Warn(second),
+                Line_::Blank,
+                Line_::Thinking(_)
+            ] if first == "first warning" && second == "second warning"
+        ));
     }
 
     #[test]
@@ -12023,7 +12051,7 @@ mod tests {
                 assert_eq!(state.status, "slash command waits until idle");
                 assert!(matches!(
                     state.pending_insert.as_slice(),
-                    [Line_::Warn(s), Line_::Blank] if s.contains("not run while agent is busy")
+                    [Line_::Warn(s)] if s.contains("not run while agent is busy")
                 ));
             } else {
                 assert_eq!(
@@ -12271,7 +12299,7 @@ mod tests {
         assert_eq!(state.status, "local secret paste withheld");
         assert!(matches!(
             state.pending_insert.as_slice(),
-            [Line_::Warn(s), Line_::Blank] if s.contains("paste withheld")
+            [Line_::Warn(s)] if s.contains("paste withheld")
         ));
     }
 
