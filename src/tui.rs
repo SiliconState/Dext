@@ -1256,7 +1256,9 @@ impl TuiState {
         self.pending_insert
             .last()
             .or_else(|| self.transcript.last())
-            .is_some_and(Self::line_needs_history_spacing)
+            .is_some_and(|line| {
+                Self::line_needs_history_spacing(line) || matches!(line, Line_::WorkMap { .. })
+            })
     }
 
     fn scroll_transcript_by(&mut self, delta: isize) {
@@ -10093,6 +10095,54 @@ mod tests {
         assert!(matches!(
             state.pending_insert.as_slice(),
             [Line_::Tool { name, .. }, Line_::Blank, Line_::Thinking(_)] if name == "bash"
+        ));
+    }
+
+    #[test]
+    fn inserts_blank_between_work_map_and_next_transcript_block() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::WorkMap {
+            kind: WorkMapEventKind::Packet,
+            text: "Objective: finish cleanup\nprobe: validate one item\nFinal response: apply requested"
+                .to_string(),
+            waypoint_ids: Vec::new(),
+            selector: None,
+            selected: 0,
+        });
+        state.queue(Line_::Thinking(
+            "Reviewing git diff before commit".to_string(),
+        ));
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::WorkMap { .. }, Line_::Blank, Line_::Thinking(_)]
+        ));
+
+        state.pending_insert.clear();
+        state.queue(Line_::WorkMap {
+            kind: WorkMapEventKind::Packet,
+            text: "Final response: apply requested".to_string(),
+            waypoint_ids: Vec::new(),
+            selector: None,
+            selected: 0,
+        });
+        state.queue(tool_line(
+            "call_1",
+            "rg",
+            "rg: spacing",
+            Some(true),
+            "match",
+        ));
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::WorkMap { .. }, Line_::Blank, Line_::Tool { name, .. }] if name == "rg"
         ));
     }
 
