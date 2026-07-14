@@ -1234,13 +1234,15 @@ impl TuiState {
     fn queue(&mut self, line: Line_) {
         let is_transcript_block = Self::line_needs_history_spacing(&line);
         let is_steering = matches!(line, Line_::Steering(_));
+        let is_bash_advisory =
+            matches!(&line, Line_::Warn(text) if text.trim_start().starts_with("bash advisory:"));
         if ((is_transcript_block && self.last_line_needs_history_spacing()) || is_steering)
             && !self.pending_insert.ends_with(&[Line_::Blank])
         {
             self.pending_insert.push(Line_::Blank);
         }
         self.pending_insert.push(line);
-        if is_steering {
+        if is_steering || is_bash_advisory {
             self.pending_insert.push(Line_::Blank);
         }
     }
@@ -1249,7 +1251,7 @@ impl TuiState {
         matches!(
             line,
             Line_::Assistant { .. } | Line_::Tool { .. } | Line_::Thinking(_)
-        ) || matches!(line, Line_::Info(text) if objective_status_text(text).is_some() || phase_status_text(text).is_some())
+        )
     }
 
     fn last_line_needs_history_spacing(&self) -> bool {
@@ -1257,7 +1259,12 @@ impl TuiState {
             .last()
             .or_else(|| self.transcript.last())
             .is_some_and(|line| {
-                Self::line_needs_history_spacing(line) || matches!(line, Line_::WorkMap { .. })
+                Self::line_needs_history_spacing(line)
+                    || matches!(
+                        line,
+                        Line_::WorkMap { .. } | Line_::SteeringDelivered { .. }
+                    )
+                    || matches!(line, Line_::Info(text) if objective_status_text(text).is_some() || phase_status_text(text).is_some())
             })
     }
 
@@ -2178,6 +2185,8 @@ fn phase_status_text(line: &str) -> Option<String> {
     let phase = phase.trim();
     let msg = msg.trim();
     let phase_label = match phase {
+        "probe" => "Probe",
+        "scale" => "Scale",
         "discover" => "Discovery",
         "tool" | "tools" => "Tools",
         "fix" => "Applying changes",
@@ -2200,6 +2209,15 @@ fn objective_status_text(line: &str) -> Option<String> {
         .trim();
     if body.is_empty() {
         return None;
+    }
+    if let Some((objective, checkpoints)) = body.split_once(" | checkpoints:") {
+        let objective = objective.trim();
+        let checkpoints = checkpoints.trim();
+        if !objective.is_empty() && !checkpoints.is_empty() {
+            return Some(format!(
+                "Objective: {objective}\nCheckpoints: {checkpoints}"
+            ));
+        }
     }
     Some(format!("Objective: {body}"))
 }
@@ -5874,12 +5892,12 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 }
             } else if trimmed.starts_with("[objective:") {
                 if let Some(label) = objective_status_text(trimmed) {
-                    lines.push(Line::from(vec![Span::styled(
-                        label,
-                        Style::default()
-                            .fg(Color::Indexed(242))
-                            .add_modifier(Modifier::ITALIC),
-                    )]));
+                    let style = Style::default()
+                        .fg(Color::Indexed(242))
+                        .add_modifier(Modifier::ITALIC);
+                    for line in label.lines() {
+                        lines.push(Line::from(vec![Span::styled(line.to_string(), style)]));
+                    }
                 }
             } else if trimmed.starts_with("* provider '") && trimmed.contains(" models:") {
                 let body = trimmed.trim_start_matches("* ");
@@ -5981,7 +5999,7 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 Span::styled("↳ ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!(
-                        "queued for next response: {messages} {noun} — {}",
+                        "Queued for next response: {messages} {noun} — {}",
                         sanitize_display_text(preview)
                     ),
                     Style::default()
@@ -6022,6 +6040,22 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
         Line_::Blank => lines.push(Line::from("")),
     }
     Text::from(lines)
+}
+
+fn normalize_work_map_label(raw: &str) -> String {
+    let trimmed = raw.trim_start();
+    let indent = &raw[..raw.len() - trimmed.len()];
+    for (label, normalized) in [
+        ("objective:", "Objective:"),
+        ("checkpoints:", "Checkpoints:"),
+        ("probe:", "Probe:"),
+        ("final response:", "Final response:"),
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(label) {
+            return format!("{indent}{normalized}{rest}");
+        }
+    }
+    raw.to_string()
 }
 
 fn work_map_line_style(raw: &str, is_selected: bool) -> Style {
@@ -6083,16 +6117,17 @@ fn push_work_map_lines(
 
     let body_width = width.saturating_sub(2).max(1);
     for raw in sanitize_display_text(text).lines() {
+        let raw = normalize_work_map_label(raw);
         let trimmed = raw.trim_start();
         let is_selected = selected_id.is_some_and(|id| trimmed.starts_with(id));
-        let body_style = work_map_line_style(raw, is_selected);
+        let body_style = work_map_line_style(&raw, is_selected);
         let prefix_style = if is_selected {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else {
             Style::default().fg(Color::Cyan)
         };
         let prefix = if is_selected { "▶ " } else { "│ " };
-        for (idx, wrapped) in wrap_plain_visual(raw, body_width as usize)
+        for (idx, wrapped) in wrap_plain_visual(&raw, body_width as usize)
             .into_iter()
             .enumerate()
         {
@@ -6728,7 +6763,10 @@ fn help_overlay_text() -> Text<'static> {
         ("Ctx [████░░░░░░]", "last request context window usage"),
         ("Ctrl+T", "show exact token counters"),
         ("● / ⠋", "ready / busy spinner"),
-        ("Branch(name)", "git branch in sandbox"),
+        (
+            "Branch(master (dirty))",
+            "git branch and working tree state",
+        ),
     ];
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -9429,6 +9467,7 @@ mod tests {
         assert!(help.contains("Ctrl+O"), "{help}");
         assert!(help.contains("Ctrl+I"), "{help}");
         assert!(help.contains("Ctrl+T"), "{help}");
+        assert!(help.contains("Branch(master (dirty))"), "{help}");
     }
 
     #[test]
@@ -9504,7 +9543,6 @@ mod tests {
         let model_idx = rendered.find("test-model").expect("model");
         assert!(sandbox_idx < branch_idx, "{rendered}");
         assert!(branch_idx < model_idx, "{rendered}");
-        assert!(!rendered.contains("branch:"), "{rendered}");
     }
 
     #[test]
@@ -9528,7 +9566,7 @@ mod tests {
             .unwrap_or_else(|| panic!("sandbox not visible: {lines:?}"));
         assert!(line.contains(sandbox), "{line}");
         assert!(!line.contains("~/Documents/Projects/Le…"), "{line}");
-        assert!(line.contains("Branch(main)"), "{line}");
+        assert!(line.contains(" | Branch(main) │ GPT-5.5"), "{line}");
         assert!(
             line.find("Branch(main)").unwrap() < line.find("GPT-5.5").unwrap(),
             "{line}"
@@ -10105,7 +10143,16 @@ mod tests {
     }
 
     #[test]
-    fn objective_phase_and_completed_work_render_as_separate_blocks() {
+    fn steering_delivered_label_starts_with_capitalized_queued() {
+        let text = steering_delivered_text_for_test(1, "Capitalize acknowledgement", 80);
+        assert_eq!(
+            flatten_lines(&text),
+            vec!["↳ Queued for next response: 1 message — Capitalize acknowledgement"]
+        );
+    }
+
+    #[test]
+    fn objective_phase_stay_compact_before_next_work_block() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -10127,12 +10174,108 @@ mod tests {
             state.pending_insert.as_slice(),
             [
                 Line_::Info(_),
-                Line_::Blank,
                 Line_::Info(_),
                 Line_::Blank,
                 Line_::Thinking(_)
             ]
         ));
+    }
+
+    #[test]
+    fn objective_without_phase_is_separated_from_next_work_block() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::Info(
+            "[objective: inspect recent changes | checkpoints: verify outcome]".to_string(),
+        ));
+        state.queue(Line_::Thinking(
+            "Planning git status and log inspection".to_string(),
+        ));
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Info(_), Line_::Blank, Line_::Thinking(_)]
+        ));
+    }
+
+    #[test]
+    fn inserts_one_blank_after_steering_queue_before_next_transcript_block() {
+        let next_blocks = [
+            Line_::Thinking("Planning the next step".to_string()),
+            tool_line("call_1", "rg", "rg: steering spacing", Some(true), "match"),
+            Line_::Assistant {
+                text: "Applied the queued update.".to_string(),
+                dim_prefix: false,
+            },
+        ];
+
+        for next in next_blocks {
+            let mut state = TuiState::new(
+                "test-model".to_string(),
+                model_context_window("test-model"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            state.queue(Line_::SteeringDelivered {
+                messages: 1,
+                preview: "Tighten transcript spacing".to_string(),
+            });
+            state.queue(next);
+
+            assert_eq!(state.pending_insert.len(), 3);
+            assert!(matches!(
+                state.pending_insert.as_slice(),
+                [Line_::SteeringDelivered { .. }, Line_::Blank, _]
+            ));
+        }
+    }
+
+    #[test]
+    fn live_thinking_keeps_one_blank_after_steering_queue() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(6),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.queue(Line_::SteeringDelivered {
+            messages: 1,
+            preview: "Tighten transcript spacing".to_string(),
+        });
+        let width = current_transcript_pane_width(&mut terminal, &state).expect("pane width");
+        flush_pending_insert(&mut terminal, &mut state, width).expect("flush steering queue");
+        state.streaming_thinking = "Planning inspection of response rendering".to_string();
+
+        terminal
+            .draw(|frame| render_transcript(frame, &mut state, frame.area()))
+            .expect("draw transcript");
+
+        assert_eq!(state.live_indicator_lines, 3);
+        let live = state.live_indicator_text.as_ref().expect("live indicator");
+        assert!(
+            flatten_lines(live)
+                .join("\n")
+                .contains("Planning inspection")
+        );
     }
 
     #[test]
@@ -10181,6 +10324,58 @@ mod tests {
             state.pending_insert.as_slice(),
             [Line_::WorkMap { .. }, Line_::Blank, Line_::Tool { name, .. }] if name == "rg"
         ));
+    }
+
+    #[test]
+    fn bash_advisory_stays_with_tool_and_separates_next_block() {
+        let next_blocks = [
+            Line_::Thinking("Planning the next step".to_string()),
+            tool_line("call_2", "rg", "rg: next check", Some(true), "match"),
+            Line_::Assistant {
+                text: "Continuing after the advisory.".to_string(),
+                dim_prefix: false,
+            },
+        ];
+
+        for next in next_blocks {
+            let mut state = TuiState::new(
+                "test-model".to_string(),
+                model_context_window("test-model"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            state.queue(tool_line(
+                "call_1",
+                "bash",
+                "bash: cargo test one two",
+                Some(false),
+                "error: unexpected argument",
+            ));
+            state.queue(Line_::Warn(
+                "bash advisory: `cargo test` accepts one test filter before `--`; run separate tests or use one broader filter.".to_string(),
+            ));
+            assert!(matches!(
+                state.pending_insert.as_slice(),
+                [
+                    Line_::Tool { name, .. },
+                    Line_::Warn(advisory),
+                    Line_::Blank
+                ] if name == "bash" && advisory.starts_with("bash advisory:")
+            ));
+
+            state.queue(next);
+
+            assert!(matches!(
+                state.pending_insert.as_slice(),
+                [
+                    Line_::Tool { name, .. },
+                    Line_::Warn(advisory),
+                    Line_::Blank,
+                    _
+                ] if name == "bash" && advisory.starts_with("bash advisory:")
+            ));
+        }
     }
 
     #[test]
@@ -12723,7 +12918,7 @@ mod tests {
         flush_pending_insert(&mut terminal, &mut state, width).expect("flush work map and probe");
         assert!(matches!(
             state.transcript.as_slice(),
-            [Line_::WorkMap { .. }, Line_::Blank, Line_::Info(_)]
+            [Line_::WorkMap { .. }, Line_::Info(_)]
         ));
 
         state.streaming_thinking = "**Planning git status and log inspection**".to_string();
@@ -13350,17 +13545,53 @@ mod tests {
     }
 
     #[test]
+    fn phase_info_capitalizes_probe_label() {
+        let text = line_to_text(
+            &Line_::Info("[phase:probe] validate one representative source item".to_string()),
+            80,
+        );
+        let lines = flatten_lines(&text);
+        assert_eq!(
+            lines,
+            vec!["Probe: validate one representative source item".to_string()]
+        );
+    }
+
+    #[test]
     fn objective_info_renders_actual_objective() {
         let text = line_to_text(
             &Line_::Info("[objective: fix status bar | checkpoints: branch visible]".to_string()),
             100,
         );
-        let joined = flatten_lines(&text).join("\n");
-        assert!(
-            joined.contains("Objective: fix status bar | checkpoints: branch visible"),
-            "{joined}"
+        let lines = flatten_lines(&text);
+        assert_eq!(
+            lines,
+            vec![
+                "Objective: fix status bar".to_string(),
+                "Checkpoints: branch visible".to_string()
+            ]
         );
-        assert!(!joined.contains("agent objective noted"), "{joined}");
+    }
+
+    #[test]
+    fn work_map_labels_use_consistent_sentence_case() {
+        let text = line_to_text(
+            &Line_::WorkMap {
+                kind: WorkMapEventKind::Packet,
+                text: "objective: clean up labels\ncheckpoints: verify flow\nprobe: inspect output\nfinal response: summarize changes".to_string(),
+                waypoint_ids: Vec::new(),
+                selector: None,
+                selected: 0,
+            },
+            100,
+        );
+        let joined = flatten_lines(&text).join("\n");
+        for label in ["Objective:", "Checkpoints:", "Probe:", "Final response:"] {
+            assert!(joined.contains(label), "missing {label} in {joined}");
+        }
+        for label in ["objective:", "checkpoints:", "probe:", "final response:"] {
+            assert!(!joined.contains(label), "unexpected {label} in {joined}");
+        }
     }
 
     #[test]

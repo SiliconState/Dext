@@ -1567,7 +1567,7 @@ fn steering_delivery_line_includes_preview_and_queue_status() {
         .flat_map(|line| line.spans.iter())
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(rendered.contains("queued for next response"), "{rendered}");
+    assert!(rendered.contains("Queued for next response"), "{rendered}");
     assert!(rendered.contains("fix rg border overflow"), "{rendered}");
 }
 
