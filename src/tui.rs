@@ -1234,15 +1234,22 @@ impl TuiState {
     fn queue(&mut self, line: Line_) {
         let is_transcript_block = Self::line_needs_history_spacing(&line);
         let is_steering = matches!(line, Line_::Steering(_));
-        let is_bash_advisory =
-            matches!(&line, Line_::Warn(text) if text.trim_start().starts_with("bash advisory:"));
+        let is_warning = matches!(line, Line_::Warn(_));
+        if is_warning
+            && matches!(
+                self.pending_insert.as_slice(),
+                [.., Line_::Warn(_), Line_::Blank]
+            )
+        {
+            self.pending_insert.pop();
+        }
         if ((is_transcript_block && self.last_line_needs_history_spacing()) || is_steering)
             && !self.pending_insert.ends_with(&[Line_::Blank])
         {
             self.pending_insert.push(Line_::Blank);
         }
         self.pending_insert.push(line);
-        if is_steering || is_bash_advisory {
+        if is_steering || is_warning {
             self.pending_insert.push(Line_::Blank);
         }
     }
@@ -10327,7 +10334,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_advisory_stays_with_tool_and_separates_next_block() {
+    fn tool_advisory_stays_with_tool_and_separates_next_block() {
         let next_blocks = [
             Line_::Thinking("Planning the next step".to_string()),
             tool_line("call_2", "rg", "rg: next check", Some(true), "match"),
@@ -10347,13 +10354,13 @@ mod tests {
             );
             state.queue(tool_line(
                 "call_1",
-                "bash",
-                "bash: cargo test one two",
+                "read_symbol",
+                "read_symbol: phase_status_text",
                 Some(false),
-                "error: unexpected argument",
+                "symbol not found",
             ));
-            state.queue(Line_::Warn(
-                "bash advisory: `cargo test` accepts one test filter before `--`; run separate tests or use one broader filter.".to_string(),
+            state.apply_event(AgentEvent::Warn(
+                "read_symbol expects the exact symbol name, not a declaration".to_string(),
             ));
             assert!(matches!(
                 state.pending_insert.as_slice(),
@@ -10361,7 +10368,7 @@ mod tests {
                     Line_::Tool { name, .. },
                     Line_::Warn(advisory),
                     Line_::Blank
-                ] if name == "bash" && advisory.starts_with("bash advisory:")
+                ] if name == "read_symbol" && advisory.starts_with("read_symbol expects")
             ));
 
             state.queue(next);
@@ -10373,9 +10380,32 @@ mod tests {
                     Line_::Warn(advisory),
                     Line_::Blank,
                     _
-                ] if name == "bash" && advisory.starts_with("bash advisory:")
+                ] if name == "read_symbol" && advisory.starts_with("read_symbol expects")
             ));
         }
+    }
+
+    #[test]
+    fn runtime_control_advisory_separates_next_block() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::Warn(
+            "[runtime control] current provider stream stopped".to_string(),
+        ));
+        state.queue(Line_::Thinking(
+            "Restarting with updated runtime".to_string(),
+        ));
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Warn(advisory), Line_::Blank, Line_::Thinking(_)]
+                if advisory.starts_with("[runtime control]")
+        ));
     }
 
     #[test]
@@ -11993,7 +12023,7 @@ mod tests {
                 assert_eq!(state.status, "slash command waits until idle");
                 assert!(matches!(
                     state.pending_insert.as_slice(),
-                    [Line_::Warn(s)] if s.contains("not run while agent is busy")
+                    [Line_::Warn(s), Line_::Blank] if s.contains("not run while agent is busy")
                 ));
             } else {
                 assert_eq!(
@@ -12241,7 +12271,7 @@ mod tests {
         assert_eq!(state.status, "local secret paste withheld");
         assert!(matches!(
             state.pending_insert.as_slice(),
-            [Line_::Warn(s)] if s.contains("paste withheld")
+            [Line_::Warn(s), Line_::Blank] if s.contains("paste withheld")
         ));
     }
 
