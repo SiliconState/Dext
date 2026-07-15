@@ -43,7 +43,7 @@ fn temp_test_dir(label: &str) -> PathBuf {
     let temp_root = std::env::temp_dir();
     let dir = temp_root.join(unique);
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    std::fs::canonicalize(&dir).expect("canonical temp dir")
 }
 
 fn prepend_env_path(path: &Path) -> String {
