@@ -43,7 +43,7 @@ fn temp_test_dir(label: &str) -> PathBuf {
     let temp_root = std::env::temp_dir();
     let dir = temp_root.join(unique);
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    std::fs::canonicalize(&dir).expect("canonical temp dir")
 }
 
 fn prepend_env_path(path: &Path) -> String {
@@ -1499,7 +1499,7 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
     std::fs::write(
         &fake_sudo,
         format!(
-            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\nsid=$(ps -o sid= -p \"$$\" | tr -d '[:space:]')\nif [ -z \"$sid\" ]; then sid=$PPID; fi\nstate=\"$state_dir/$sid\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n  [ \"$pass\" = hunter2 ] || exit 1\n  : > \"$state\"\n  exit 0\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then exec \"$@\"; fi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
+            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\npgid=$(ps -o pgid= -p \"$$\" | tr -d '[:space:]')\nif [ -z \"$pgid\" ]; then pgid=$PPID; fi\nstate=\"$state_dir/$pgid\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n  [ \"$pass\" = hunter2 ] || exit 1\n  : > \"$state\"\n  exit 0\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then exec \"$@\"; fi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
         ),
     )
     .expect("write fake sudo");
