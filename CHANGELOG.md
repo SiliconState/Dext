@@ -39,6 +39,20 @@
   - `dext memory merge [--recall] <base> <ours> <theirs>` is the Git merge-driver
     entry point used after registration.
 
+### Security
+
+- Agent-run bash, external tools, hooks, diagnostics, and eval subprocesses now
+  remove credential-shaped environment variables by default. Trusted tools may
+  explicitly opt in with `DEXT_INHERIT_TOOL_CREDENTIALS=1`.
+- Linux Landlock and macOS Seatbelt profiles now hide unrelated home-directory
+  content and limit workspace-write access to the sandbox, scratch roots, and
+  explicit toolchain cache/package roots.
+- Checkpoint manifests and sidecars now use owner-private storage, reject
+  symlinked storage paths on Unix, add `/.dext/` to the repository-local Git
+  exclude, and automatically retain at most 20 checkpoints for seven days.
+- Added least-privilege CI, weekly `cargo audit`, and Cargo/GitHub Actions
+  Dependabot configuration.
+
 ### Fixed
 
 - Fixed `--tool-profile default`/`DEXT_TOOL_PROFILE=default` to select the documented default lean schema profile instead of expanding to full schemas.

@@ -1,12 +1,9 @@
 // OS-level filesystem sandboxing for tool subprocesses.
 //
 // This is defense-in-depth that backstops the heuristic command-risk
-// classifier and the path-validation layer: even if a command is
-// misclassified as read-only, the kernel still blocks writes outside the
-// permitted roots. It is best-effort by design — if the platform cannot
-// enforce confinement, command execution proceeds unsandboxed rather than
-// failing, and `describe()` reports the true status so it is never silently
-// assumed.
+// classifier and path validation. Unsupported platforms degrade to path
+// validation, but once a kernel mechanism is detected, rule/profile setup
+// failures stop the child instead of silently running it unconfined.
 //
 // Enforcement by platform:
 //   - Linux:   Landlock LSM (kernel >= 5.13 with the LSM enabled).
@@ -18,48 +15,246 @@
 // Profiles:
 //   - ReadOnly:        deny writes to the workspace, home, and system; only
 //                      scratch (temp dirs) and device nodes (/dev) stay
-//                      writable so heredocs and well-behaved filters work.
+//                      writable. Reads are allowed outside the user's home;
+//                      inside home, only the sandbox root, executable PATH
+//                      entries, packs, and toolchain cache roots are visible.
 //   - WorkspaceWrite:  additionally permit writes under the sandbox root and
-//                      the user's home directory. Home is allowed because
-//                      toolchains (cargo, npm, pip, go, ...) write per-user
-//                      caches outside the workspace; the boundary that matters
-//                      in write-mode is the system directories (/etc, /usr,
-//                      /bin, ...), which stay denied.
+//                      common per-user toolchain cache roots. Shell startup
+//                      files and unrelated home-directory content stay
+//                      read-only.
 //   - DangerFullAccess: no confinement.
 
 use std::path::{Path, PathBuf};
 
 use crate::SandboxProfile;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn sbpl_path(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    Some(path.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn sbpl_filter(path: &Path) -> Option<String> {
+    let escaped = sbpl_path(path)?;
+    let filter = if path.is_dir() { "subpath" } else { "literal" };
+    Some(format!("    ({filter} \"{escaped}\")\n"))
+}
+
+fn approved_environment_temp_dir() -> Option<PathBuf> {
+    let temp = std::fs::canonicalize(std::env::temp_dir()).ok()?;
+    #[cfg(target_os = "linux")]
+    let parents = ["/tmp", "/var/tmp", "/dev/shm"];
+    #[cfg(target_os = "macos")]
+    let parents = ["/private/tmp", "/private/var/tmp", "/private/var/folders"];
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let parents: [&str; 0] = [];
+    parents
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .any(|parent| temp.starts_with(parent))
+        .then_some(temp)
+}
+
 /// Paths that must stay writable under every profile: scratch space (heredocs,
-/// lock files) and the device nodes virtually all commands need — `/dev/null`,
-/// `/dev/tty`, the controlling terminal, etc. Denying `/dev/null` writes alone
-/// breaks `2>/dev/null`, git, and most build tools.
+/// lock files) and the small set of device nodes ordinary commands need.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn scratch_write_roots() -> Vec<PathBuf> {
-    let mut roots = vec![std::env::temp_dir()];
-    for p in ["/tmp", "/var/tmp", "/dev/shm", "/dev"] {
-        let path = PathBuf::from(p);
-        if path.is_dir() {
+    let mut roots = approved_environment_temp_dir()
+        .into_iter()
+        .collect::<Vec<_>>();
+    for path in [
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+    ] {
+        let path = PathBuf::from(path);
+        if path.exists() {
             roots.push(path);
         }
     }
     roots
 }
 
+fn sandbox_home_dir() -> PathBuf {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home);
+    }
+    crate::session::user_home_dir()
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn toolchain_write_roots() -> Vec<PathBuf> {
+    let home = sandbox_home_dir();
+    [
+        ".cache/pip",
+        ".cache/uv",
+        ".cache/go-build",
+        ".cache/node-gyp",
+        ".cache/pnpm",
+        ".cache/yarn",
+        ".cargo/git",
+        ".cargo/registry",
+        ".npm/_cacache",
+        ".npm/_logs",
+        ".pnpm-store",
+        ".yarn/berry/cache",
+        ".yarn/cache",
+        ".gradle/caches",
+        ".gradle/daemon",
+        ".gradle/wrapper",
+        ".m2/repository",
+        ".ivy2/cache",
+        ".ivy2/jars",
+        ".ivy2/local",
+        ".nuget/packages",
+        ".local/share/pnpm/store",
+        "go/pkg",
+    ]
+    .into_iter()
+    .map(|path| home.join(path))
+    .collect()
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn toolchain_read_roots() -> Vec<PathBuf> {
+    let home = sandbox_home_dir();
+    let mut roots = toolchain_write_roots();
+    roots.extend(
+        [
+            ".rustup",
+            ".pyenv",
+            ".nvm",
+            ".bun",
+            ".local/share/uv",
+            ".cargo/bin",
+            ".local/bin",
+            "bin",
+            "go/bin",
+        ]
+        .into_iter()
+        .map(|path| home.join(path)),
+    );
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn canonical_home_subpath(path: &Path, home: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(home).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    let canonical_home = std::fs::canonicalize(home).ok()?;
+    let canonical = std::fs::canonicalize(path).ok()?;
+    (canonical == canonical_home.join(relative)).then_some(canonical)
+}
+
+fn existing_safe_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let home = sandbox_home_dir();
+    let mut roots = paths
+        .into_iter()
+        .filter_map(|path| {
+            if path.starts_with(&home) {
+                canonical_home_subpath(&path, &home)
+            } else {
+                std::fs::canonicalize(path).ok()
+            }
+        })
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn canonical_explicit_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut roots = paths
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn home_safe_read_roots(root: &Path, extra_read_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let home = sandbox_home_dir();
+    let state = crate::session::dext_state_dir();
+    let mut inferred = toolchain_read_roots();
+    inferred.extend([
+        state.join("packs"),
+        state.join("shelves"),
+        home.join(".config/git"),
+        home.join(".gitconfig"),
+    ]);
+    if let Some(path) = std::env::var_os("PATH") {
+        inferred.extend(std::env::split_paths(&path).filter(|path| path.starts_with(&home)));
+    }
+    let mut roots = existing_safe_roots(inferred);
+    roots.extend(canonical_explicit_roots(
+        std::iter::once(root.to_path_buf()).chain(extra_read_roots.iter().cloned()),
+    ));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn linux_readable_roots(root: &Path, extra_read_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = [
+        "/bin",
+        "/etc",
+        "/lib",
+        "/lib64",
+        "/nix",
+        "/opt",
+        "/proc/cpuinfo",
+        "/proc/filesystems",
+        "/proc/meminfo",
+        "/proc/stat",
+        "/proc/sys/kernel/osrelease",
+        "/proc/sys/vm/overcommit_memory",
+        "/sbin",
+        "/snap",
+        "/sys",
+        "/usr",
+        "/var/cache",
+        "/var/lib/dpkg",
+        "/var/lib/rpm",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect::<Vec<_>>();
+    if let Some(path) = std::env::var_os("PATH") {
+        roots.extend(std::env::split_paths(&path));
+    }
+    roots.extend(scratch_write_roots());
+    roots.extend(home_safe_read_roots(root, extra_read_roots));
+    existing_safe_roots(roots)
+}
+
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 fn writable_roots(profile: SandboxProfile, root: &Path) -> Vec<PathBuf> {
     let mut roots = scratch_write_roots();
     if profile == SandboxProfile::WorkspaceWrite {
-        roots.push(root.to_path_buf());
-        // Toolchains (cargo, npm, pip, go, ...) write to per-user caches and
-        // config outside the workspace; without the home directory, common
-        // verification commands like `cargo test` fail to take their package
-        // cache lock. System directories (/etc, /usr, /bin, ...) stay denied —
-        // that is the boundary that matters for write-mode. The strict
-        // read-only profile excludes the home directory by design.
-        roots.push(crate::session::user_home_dir());
+        roots.extend(toolchain_write_roots());
     }
+    let mut roots = existing_safe_roots(roots);
+    if profile == SandboxProfile::WorkspaceWrite {
+        roots.extend(canonical_explicit_roots([root.to_path_buf()]));
+    }
+    roots.sort();
+    roots.dedup();
     roots
 }
 
@@ -77,14 +272,14 @@ pub(crate) fn tokio_command(
     program: &str,
     profile: SandboxProfile,
     root: &Path,
+    extra_read_roots: &[PathBuf],
 ) -> tokio::process::Command {
     #[cfg(target_os = "macos")]
     {
-        if confines(profile)
-            && let Some(profile_text) = macos::profile_text(profile, root)
-            && macos::sandbox_exec_available()
-        {
-            let mut cmd = tokio::process::Command::new("sandbox-exec");
+        if confines(profile) && macos::sandbox_exec_available() {
+            let profile_text = macos::profile_text(profile, root, extra_read_roots)
+                .unwrap_or_else(|| "(version 1)\n(deny default)\n".to_string());
+            let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
             cmd.arg("-p").arg(profile_text).arg(program);
             return cmd;
         }
@@ -94,10 +289,10 @@ pub(crate) fn tokio_command(
 
     #[cfg(target_os = "linux")]
     if confines(profile) {
-        linux::install_landlock_pre_exec(&mut cmd, profile, root);
+        linux::install_landlock_pre_exec(&mut cmd, profile, root, extra_read_roots);
     }
 
-    let _ = (profile, root);
+    let _ = (profile, root, extra_read_roots);
     cmd
 }
 
@@ -147,10 +342,11 @@ pub(crate) fn is_enforced() -> bool {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::writable_roots;
+    use super::{linux_readable_roots, writable_roots};
     use crate::SandboxProfile;
     use landlock::{
-        ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, path_beneath_rules,
+        ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+        path_beneath_rules,
     };
     use std::path::Path;
 
@@ -174,11 +370,13 @@ mod linux {
     /// Build a fully-populated Landlock ruleset (all filesystem fds opened) so
     /// that the only work left for the forked child is the `restrict_self`
     /// syscall. Building before fork avoids allocating between fork and execve.
-    fn build_ruleset(profile: SandboxProfile, root: &Path) -> Option<landlock::RulesetCreated> {
-        let writable: Vec<_> = writable_roots(profile, root)
-            .into_iter()
-            .filter(|p| p.exists())
-            .collect();
+    fn build_ruleset(
+        profile: SandboxProfile,
+        root: &Path,
+        extra_read_roots: &[std::path::PathBuf],
+    ) -> Option<landlock::RulesetCreated> {
+        let readable = linux_readable_roots(root, extra_read_roots);
+        let writable = writable_roots(profile, root);
 
         let abi = ABI::from(landlock_abi()? as i32);
         let created = Ruleset::default()
@@ -186,8 +384,7 @@ mod linux {
             .ok()?
             .create()
             .ok()?
-            // Reads are permitted everywhere; only writes are confined.
-            .add_rules(path_beneath_rules(["/"], AccessFs::from_read(abi)))
+            .add_rules(path_beneath_rules(&readable, AccessFs::from_read(abi)))
             .ok()?
             .add_rules(path_beneath_rules(&writable, AccessFs::from_all(abi)))
             .ok()?;
@@ -199,26 +396,32 @@ mod linux {
         cmd: &mut tokio::process::Command,
         profile: SandboxProfile,
         root: &Path,
+        extra_read_roots: &[std::path::PathBuf],
     ) {
         // Skip the work entirely if the kernel can't enforce Landlock.
         if landlock_abi().is_none() {
             return;
         }
-        let Some(ruleset) = build_ruleset(profile, root) else {
+        // Once a Landlock-capable kernel is detected, a requested confined
+        // profile must not silently run unconfined because rule construction or
+        // restriction failed.
+        let Some(ruleset) = build_ruleset(profile, root, extra_read_roots) else {
+            unsafe {
+                cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+            }
             return;
         };
 
-        // restrict_self consumes the ruleset and applies to the calling thread;
-        // after fork the child is single-threaded, and the restriction is
-        // preserved across execve. All errors are swallowed so a sandbox
-        // failure can never block command execution.
         let mut ruleset = Some(ruleset);
         unsafe {
             cmd.pre_exec(move || {
-                if let Some(rs) = ruleset.take() {
-                    let _ = rs.restrict_self();
+                let Some(ruleset) = ruleset.take() else {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                };
+                match ruleset.restrict_self() {
+                    Ok(status) if status.ruleset != RulesetStatus::NotEnforced => Ok(()),
+                    Ok(_) | Err(_) => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
                 }
-                Ok(())
             });
         }
     }
@@ -226,32 +429,46 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::writable_roots;
+    use super::{home_safe_read_roots, sandbox_home_dir, sbpl_filter, sbpl_path, writable_roots};
     use crate::SandboxProfile;
     use std::path::Path;
     use std::sync::OnceLock;
 
     pub(super) fn sandbox_exec_available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
-        *AVAILABLE.get_or_init(|| std::path::Path::new("/usr/bin/sandbox-exec").exists())
+        *AVAILABLE.get_or_init(|| std::path::Path::new("/usr/bin/sandbox-exec").is_file())
     }
 
-    fn escape_sbpl(path: &Path) -> String {
-        path.to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-    }
-
-    /// Generate a Seatbelt (SBPL) profile: allow everything, deny all writes,
-    /// then re-allow writes under the permitted roots. SBPL is last-match-wins.
-    pub(super) fn profile_text(profile: SandboxProfile, root: &Path) -> Option<String> {
-        let mut text = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
-        let mut allows = String::new();
-        for path in writable_roots(profile, root) {
-            let Ok(canonical) = std::fs::canonicalize(&path) else {
+    /// Generate a Seatbelt (SBPL) profile that hides unrelated files below the
+    /// user's home and limits writes to the selected profile's roots.
+    pub(super) fn profile_text(
+        profile: SandboxProfile,
+        root: &Path,
+        extra_read_roots: &[std::path::PathBuf],
+    ) -> Option<String> {
+        let home = std::fs::canonicalize(sandbox_home_dir()).ok()?;
+        let escaped_home = sbpl_path(&home)?;
+        let mut text = format!(
+            "(version 1)\n(allow default)\n(deny file-read* (subpath \"{escaped_home}\"))\n(deny file-write*)\n"
+        );
+        let mut reads = String::new();
+        for path in home_safe_read_roots(root, extra_read_roots) {
+            let Some(filter) = sbpl_filter(&path) else {
                 continue;
             };
-            allows.push_str(&format!("    (subpath \"{}\")\n", escape_sbpl(&canonical)));
+            reads.push_str(&filter);
+        }
+        if !reads.is_empty() {
+            text.push_str("(allow file-read*\n");
+            text.push_str(&reads);
+            text.push_str(")\n");
+        }
+        let mut allows = String::new();
+        for path in writable_roots(profile, root) {
+            let Some(filter) = sbpl_filter(&path) else {
+                continue;
+            };
+            allows.push_str(&filter);
         }
         // /dev/null and friends are needed by virtually every command.
         allows.push_str("    (literal \"/dev/null\")\n    (literal \"/dev/tty\")\n");
@@ -259,5 +476,108 @@ mod macos {
         text.push_str(&allows);
         text.push_str(")\n");
         Some(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "dext-sandbox-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create sandbox test directory");
+        path
+    }
+
+    #[test]
+    fn sbpl_paths_escape_syntax_and_reject_control_characters() {
+        assert_eq!(
+            sbpl_path(Path::new("/tmp/a\\b\"c")),
+            Some("/tmp/a\\\\b\\\"c".to_string())
+        );
+        assert_eq!(sbpl_path(Path::new("/tmp/line\nbreak")), None);
+    }
+
+    #[test]
+    fn sbpl_filters_distinguish_files_and_directories() {
+        let root = temp_dir("sbpl-filter");
+        let file = root.join("helper");
+        std::fs::write(&file, "helper").expect("write helper");
+
+        assert!(
+            sbpl_filter(&root)
+                .expect("directory filter")
+                .contains("(subpath ")
+        );
+        assert!(
+            sbpl_filter(&file)
+                .expect("file filter")
+                .contains("(literal ")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn home_read_roots_exclude_unrelated_project_session_state() {
+        let _guard = crate::test_env_lock().lock().expect("environment lock");
+        let old_home = std::env::var_os("HOME");
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let old_dext_home = std::env::var_os("DEXT_HOME");
+        let base = temp_dir("home-roots");
+        let home = base.join("home");
+        let state = home.join(".dext");
+        let root = home.join("workspace");
+        let extra = home.join("helpers/askpass");
+        for directory in [
+            state.join("packs"),
+            state.join("shelves"),
+            state.join("projects/other-session"),
+            root.clone(),
+            extra.parent().expect("extra parent").to_path_buf(),
+        ] {
+            std::fs::create_dir_all(directory).expect("create selected home root");
+        }
+        std::fs::write(&extra, "helper").expect("write helper");
+        let conflicting_userprofile = base.join("not-the-unix-home");
+        std::fs::create_dir_all(&conflicting_userprofile).expect("create conflicting userprofile");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("USERPROFILE", &conflicting_userprofile);
+            std::env::set_var("DEXT_HOME", &state);
+        }
+
+        assert_eq!(sandbox_home_dir(), home);
+        let roots = home_safe_read_roots(&root, std::slice::from_ref(&extra));
+        let writable = writable_roots(SandboxProfile::WorkspaceWrite, &home);
+        let canonical = |path: &Path| std::fs::canonicalize(path).expect("canonical test path");
+        assert!(roots.contains(&canonical(&root)));
+        assert!(writable.contains(&canonical(&home)));
+        assert!(roots.contains(&canonical(&state.join("packs"))));
+        assert!(roots.contains(&canonical(&state.join("shelves"))));
+        assert!(roots.contains(&canonical(&extra)));
+        assert!(!roots.contains(&canonical(&state.join("projects/other-session"))));
+
+        restore_env("HOME", old_home);
+        restore_env("USERPROFILE", old_userprofile);
+        restore_env("DEXT_HOME", old_dext_home);
+        let _ = std::fs::remove_dir_all(base);
     }
 }

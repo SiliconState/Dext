@@ -154,9 +154,12 @@ Use `dext-` prefixes for agent-started units so they are easy to inspect and sto
 Dext creates lightweight Git checkpoints before approved write-risk tool calls
 when the sandbox root is inside a Git repository, with direct file mutations
 receiving path-specific restore hints. Checkpoints live under hidden refs
-(`refs/dext/checkpoints/`) with local manifests in `.dext/checkpoints/`.
-They are best-effort safety snapshots for Dext edits; they do not replace normal
-commits, and they do not cover arbitrary external side effects.
+(`refs/dext/checkpoints/`) with private local manifests in `.dext/checkpoints/`.
+Checkpoint files use owner-only permissions on Unix, `.dext/` is added to the
+repository-local Git exclude file, and automatic retention keeps at most 20
+checkpoints for no longer than seven days. They are best-effort safety snapshots
+for Dext edits; they do not replace normal commits, and they do not cover
+arbitrary external side effects. Do not mirror-push `refs/dext/*`.
 
 Use undo commands to inspect or restore checkpointed paths:
 
@@ -258,7 +261,7 @@ If a pack has `phooks.json`, Dext activates those hook templates for the current
 
 ## Configuration and state
 
-Dext reads `.env` for local development if present, but `.env` is ignored and must never be committed. Prefer `dext auth login ...` for credentials.
+Dext reads `.env` for local development if present, but `.env` is ignored and must never be committed. Prefer `dext auth login ...` for credentials. Provider credentials loaded from `.env` or the parent shell are removed from agent-run subprocess environments by default; set `DEXT_INHERIT_TOOL_CREDENTIALS=1` only when a trusted tool explicitly needs them. Privacy redaction and sensitive-path guards are on by default; set `DEXT_PRIVACY=0` or use `/privacy off` only for controlled work.
 
 Useful environment variables:
 
@@ -287,7 +290,11 @@ DEXT_SESSIONS_DIR=~/.dext/sessions
 DEXT_LOGS_DIR=~/.dext/logs
 DEXT_APPROVAL=ask
 DEXT_TRUST=0  # opt out of default startup trust mode
-DEXT_SANDBOX_PROFILE=workspace-write  # permits writes in the sandbox and user home; use read-only for review-only tasks
+DEXT_PRIVACY=1  # default: redact sensitive output and block sensitive native reads
+# Explicit high-trust opt-in; otherwise *_API_KEY and token/credential vars are
+# removed from bash, external tools, hooks, diagnostics, and eval subprocesses.
+# DEXT_INHERIT_TOOL_CREDENTIALS=1
+DEXT_SANDBOX_PROFILE=workspace-write  # writes only in sandbox, scratch, and common toolchain caches
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean

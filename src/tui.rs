@@ -4057,6 +4057,7 @@ fn md_style_to_style(style: MdStyle) -> Style {
     Style {
         fg: style.fg.map(md_color_to_color),
         bg: style.bg.map(md_color_to_color),
+        underline_color: style.underline_color.map(md_color_to_color),
         add_modifier: md_modifier_to_modifier(style.add_modifier),
         sub_modifier: md_modifier_to_modifier(style.sub_modifier),
     }
@@ -6371,7 +6372,7 @@ fn insert_transcript_item<B: Backend>(
     item: &Line_,
     width: u16,
     tool_tint_parity: &mut bool,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     let render_width = transcript_render_width(width);
     let (text, height) = cached_transcript_render(state, item, width);
     let tint_bg = match item {
@@ -6404,7 +6405,7 @@ fn rebuild_transcript<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &mut TuiState,
     width: u16,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     terminal.clear()?;
     // mem::take instead of clone: rebuilds fire on resize/expand and the transcript can be
     // large. Nothing in the insert path reads state.transcript, so loaning it out is safe.
@@ -6430,7 +6431,7 @@ fn transcript_pane_width(area_width: u16, area_height: u16, state: &TuiState) ->
 fn current_transcript_pane_width<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &TuiState,
-) -> io::Result<u16> {
+) -> Result<u16, B::Error> {
     terminal.autoresize()?;
     let size = terminal.size()?;
     Ok(transcript_pane_width(size.width, size.height, state))
@@ -6440,7 +6441,7 @@ fn flush_pending_insert<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &mut TuiState,
     width: u16,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     if state.transcript_rendered_width != width && !state.transcript.is_empty() {
         state.transcript_needs_rebuild = true;
     }
@@ -6458,7 +6459,7 @@ fn flush_prepared_items<B: Backend>(
     state: &mut TuiState,
     items: &mut Vec<Line_>,
     width: u16,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     mark_retry_cycles(items);
     // Inline viewport output is real terminal scrollback: already-inserted lines cannot be
     // rewritten without appending another copy of the transcript. Keep grouping within the
@@ -9127,6 +9128,28 @@ mod tests {
             density_rank: 1,
             expanded: false,
         }
+    }
+
+    #[test]
+    fn markdown_style_conversion_preserves_all_style_fields() {
+        let style = MdStyle {
+            fg: Some(MdColor::Red),
+            bg: Some(MdColor::Blue),
+            underline_color: Some(MdColor::LightCyan),
+            add_modifier: MdModifier::BOLD | MdModifier::UNDERLINED,
+            sub_modifier: MdModifier::DIM,
+        };
+
+        let converted = md_style_to_style(style);
+
+        assert_eq!(converted.fg, Some(Color::Red));
+        assert_eq!(converted.bg, Some(Color::Blue));
+        assert_eq!(converted.underline_color, Some(Color::LightCyan));
+        assert_eq!(
+            converted.add_modifier,
+            Modifier::BOLD | Modifier::UNDERLINED
+        );
+        assert_eq!(converted.sub_modifier, Modifier::DIM);
     }
 
     #[test]

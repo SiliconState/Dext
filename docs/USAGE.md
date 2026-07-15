@@ -204,9 +204,11 @@ A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR`
 When Dext is running inside a Git repository, approved write-risk tool calls can
 create lightweight recovery checkpoints before the operation happens. Direct
 file mutations receive path-specific restore hints. Checkpoints use hidden refs
-under `refs/dext/checkpoints/` and local manifests under `.dext/checkpoints/`.
-They are intended for Dext write recovery, not as a
-replacement for commits.
+under `refs/dext/checkpoints/` and owner-private local manifests and sidecars
+under `.dext/checkpoints/` on Unix. Dext adds `/.dext/` to the repository-local
+Git exclude file and automatically retains at most 20 checkpoints for no longer
+than seven days. They are intended for Dext write recovery, not as a replacement
+for commits. Never mirror-push `refs/dext/*`.
 
 CLI undo commands:
 
@@ -352,6 +354,10 @@ DEEPSEEK_API_KEY=...
 CHATGPT_ACCESS_TOKEN=...
 ```
 
+Provider credentials are available to Dext's own HTTP client, but credential-shaped environment variables (`*_API_KEY`, `*_TOKEN`, `*_PASSWORD`, client secrets, cloud credentials, SSH agent variables, and related known names) are removed from agent-run bash, external tools, hooks, diagnostics, and eval subprocesses by default. Set `DEXT_INHERIT_TOOL_CREDENTIALS=1` only for a trusted tool that explicitly requires the parent credential environment.
+
+Privacy redaction and sensitive native-read path guards are enabled by default. Set `DEXT_PRIVACY=0` or use `/privacy off` only when raw local data is intentionally required. Kernel sandboxing also hides unrelated files below the user's home on supported Linux/macOS hosts; `workspace-write` exposes write access only to the sandbox, scratch roots, and common toolchain caches. `danger-full-access` intentionally disables this confinement.
+
 State and logs:
 
 ```bash
@@ -369,8 +375,10 @@ Runtime controls:
 ```bash
 DEXT_NO_TUI=1
 DEXT_TRUST=0  # opt out of default startup trust mode
+DEXT_PRIVACY=1  # default; set 0 only to allow raw sensitive paths/output
+# DEXT_INHERIT_TOOL_CREDENTIALS=1  # explicit high-trust subprocess opt-in
 DEXT_APPROVAL=ask
-DEXT_SANDBOX_PROFILE=workspace-write  # permits writes in the sandbox and user home
+DEXT_SANDBOX_PROFILE=workspace-write  # sandbox + scratch + toolchain cache writes
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean

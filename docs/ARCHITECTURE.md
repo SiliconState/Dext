@@ -129,7 +129,8 @@ Dext has three safety layers:
 Profiles:
 
 - Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`.
-- Sandbox: `read-only`, `workspace-write`, `danger-full-access`. `workspace-write` permits writes below the sandbox root and the user's home directory so normal toolchain caches work; `read-only` still permits scratch/device writes required by ordinary commands.
+- Sandbox: `read-only`, `workspace-write`, `danger-full-access`. On supported Linux/macOS hosts, confined profiles hide unrelated files below the user's home. `workspace-write` permits writes only under the sandbox root, scratch/device roots, and common per-user toolchain caches; `read-only` retains only required scratch/device writes.
+- Tool subprocesses remove credential-shaped environment variables by default. `DEXT_INHERIT_TOOL_CREDENTIALS=1` is an explicit high-trust opt-in for tools that require the parent credential environment.
 
 `--trust` is the default startup behavior and auto-approves gated tools. Use `--no-trust` or `DEXT_TRUST=0` to opt out.
 
@@ -139,9 +140,11 @@ Dext's Git-native recovery features are local runtime helpers, not
 provider-visible tools:
 
 - Before approved write-risk tool calls, Dext can create a checkpoint under
-  hidden refs (`refs/dext/checkpoints/`) plus local manifests in
-  `.dext/checkpoints/`. Direct file mutations receive path-specific restore
-  hints.
+  hidden refs (`refs/dext/checkpoints/`) plus owner-private manifests and
+  sidecars in `.dext/checkpoints/`. Dext adds `/.dext/` to the repository-local
+  Git exclude and automatically retains at most 20 checkpoints for seven days.
+  Direct file mutations receive path-specific restore hints. Never mirror-push
+  `refs/dext/*`.
 - `/undo` and `dext undo` list, preview, and apply checkpoint restores. Normal
   restore updates worktree paths only; moving `HEAD` requires an explicit
   reset-head mode.
@@ -174,6 +177,7 @@ cargo fmt
 cargo build --release
 cargo test --release
 cargo test --release --test tui_smoke -- --nocapture
+cargo audit --deny warnings
 ```
 
 The TUI smoke test launches the real compiled binary inside a pseudo-terminal and verifies banner/help/exit behavior without requiring a human terminal session.

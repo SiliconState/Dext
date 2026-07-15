@@ -2428,7 +2428,7 @@ struct PrivacyRedaction {
 impl Default for PrivacyPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             strict_paths: true,
             findings: PrivacyFindingCounts::default(),
         }
@@ -2439,11 +2439,9 @@ impl PrivacyPolicy {
     fn from_env() -> Self {
         let mut policy = Self::default();
         if let Ok(v) = std::env::var("DEXT_PRIVACY") {
-            policy.enabled = matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on" | "redact" | "strict"
-            );
-            if v.trim().eq_ignore_ascii_case("strict") {
+            let normalized = v.trim().to_ascii_lowercase();
+            policy.enabled = !matches!(normalized.as_str(), "0" | "false" | "no" | "off");
+            if normalized == "strict" {
                 policy.strict_paths = true;
             }
         }
@@ -2511,13 +2509,16 @@ impl PrivacyPolicy {
         redacted
     }
 
-    fn path_denial(&mut self, tool_name: &str, input: &Value) -> Option<String> {
+    fn path_denial(&mut self, tool_name: &str, input: &Value, root: &Path) -> Option<String> {
         if !(self.enabled && self.strict_paths && matches!(tool_name, "read_file" | "read_symbol"))
         {
             return None;
         }
         let path = input["path"].as_str()?;
-        if !privacy_sensitive_path(path) {
+        let resolved_sensitive = canonicalize_read_tool_path(root, path)
+            .ok()
+            .is_some_and(|resolved| privacy_sensitive_path(&resolved.to_string_lossy()));
+        if !privacy_sensitive_path(path) && !resolved_sensitive {
             return None;
         }
         self.findings.private_key = self.findings.private_key.saturating_add(1);
@@ -2820,27 +2821,41 @@ fn luhn_valid(digits: &str) -> bool {
 }
 
 fn privacy_sensitive_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    if lower.contains("secret")
-        || lower.contains("credential")
-        || lower.contains("private")
-        || lower.contains("id_rsa")
-        || lower.ends_with(".pem")
-        || lower.ends_with(".key")
-        || lower.ends_with(".p12")
-        || lower.ends_with(".pfx")
+    let path = Path::new(path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        file_name.as_str(),
+        ".env"
+            | ".git-credentials"
+            | ".netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | "auth.json"
+            | "credentials"
+            | "credentials.json"
+            | "id_dsa"
+            | "id_ecdsa"
+            | "id_ed25519"
+            | "id_rsa"
+            | "providers.json"
+    ) || file_name.ends_with(".pem")
+        || file_name.ends_with(".key")
+        || file_name.ends_with(".p12")
+        || file_name.ends_with(".pfx")
     {
         return true;
     }
-    Path::new(path)
-        .components()
-        .any(|component| match component {
-            Component::Normal(name) => {
-                let n = name.to_string_lossy().to_ascii_lowercase();
-                matches!(n.as_str(), ".env" | ".netrc" | "credentials" | "secrets")
-            }
-            _ => false,
-        })
+    path.components().any(|component| match component {
+        Component::Normal(name) => matches!(
+            name.to_string_lossy().to_ascii_lowercase().as_str(),
+            ".aws" | ".gnupg" | ".ssh" | "secrets"
+        ),
+        _ => false,
+    })
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -4263,10 +4278,82 @@ fn configure_tokio_process_group(_cmd: &mut tokio::process::Command) {}
 /// only hang the call until timeout; with these set, git instead fails in
 /// milliseconds with an explicit "terminal prompts disabled" error that the
 /// model can surface and Dext can react to with a local credential prompt.
-fn deny_interactive_prompt_env(cmd: &mut tokio::process::Command) {
+fn deny_interactive_prompt_env_std(cmd: &mut Command) {
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("SSH_ASKPASS_REQUIRE", "never")
         .env("GCM_INTERACTIVE", "never");
+}
+
+fn deny_interactive_prompt_env(cmd: &mut tokio::process::Command) {
+    deny_interactive_prompt_env_std(cmd.as_std_mut());
+}
+
+const TOOL_CREDENTIAL_ENV_INHERIT_FLAG: &str = "DEXT_INHERIT_TOOL_CREDENTIALS";
+
+fn tool_credential_env_key(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.ends_with("_API_KEY")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_PASSWORD")
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_SECRET_KEY")
+        || upper.ends_with("_PRIVATE_KEY")
+        || upper.ends_with("_ACCESS_KEY")
+        || upper.ends_with("_CLIENT_SECRET")
+        || upper.ends_with("_CREDENTIALS")
+        || upper.ends_with("_CONNECTION_STRING")
+        || matches!(
+            upper.as_str(),
+            "API_KEY"
+                | "TOKEN"
+                | "PASSWORD"
+                | "SECRET"
+                | "SECRET_KEY"
+                | "PRIVATE_KEY"
+                | "ACCESS_KEY"
+                | "CLIENT_SECRET"
+                | "CREDENTIALS"
+                | "CONNECTION_STRING"
+                | "AWS_ACCESS_KEY_ID"
+                | "AZURE_CLIENT_CERTIFICATE_PATH"
+                | "DOCKER_AUTH_CONFIG"
+                | "GH_TOKEN"
+                | "GITHUB_TOKEN"
+                | "GIT_ASKPASS"
+                | "GOOGLE_APPLICATION_CREDENTIALS"
+                | "KUBECONFIG"
+                | "MYSQL_PWD"
+                | "NETRC"
+                | "PGPASSFILE"
+                | "PGPASSWORD"
+                | "SSH_ASKPASS"
+                | "SSH_AUTH_SOCK"
+                | "SUDO_ASKPASS"
+        )
+}
+
+fn tool_children_inherit_credentials() -> bool {
+    env_flag_default(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, false)
+}
+
+fn scrub_tool_credentials_from_std_command(cmd: &mut Command) {
+    if tool_children_inherit_credentials() {
+        return;
+    }
+    let mut keys = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(cmd.get_envs().map(|(key, _)| key.to_os_string()))
+        .filter(|key| key.to_str().is_some_and(tool_credential_env_key))
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    for key in keys {
+        cmd.env_remove(key);
+    }
+}
+
+fn scrub_tool_credentials_from_tokio_command(cmd: &mut tokio::process::Command) {
+    scrub_tool_credentials_from_std_command(cmd.as_std_mut());
 }
 
 #[cfg(unix)]
@@ -4320,8 +4407,12 @@ fn run_sync_command_limited(
     use std::io::Write as _;
     use std::process::Stdio;
 
+    deny_interactive_prompt_env_std(&mut cmd);
+    scrub_tool_credentials_from_std_command(&mut cmd);
     if stdin_data.is_some() {
         cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_std_process_group(&mut cmd);
@@ -4337,8 +4428,12 @@ fn run_sync_command_limited(
 
     if let Some(data) = stdin_data
         && let Some(mut si) = child.stdin.take()
+        && let Err(error) = si.write_all(data.as_bytes())
     {
-        si.write_all(data.as_bytes()).map_err(|e| format!("{e}"))?;
+        terminate_std_child(&mut child);
+        let _ = out_handle.join();
+        let _ = err_handle.join();
+        return Err(format!("failed to write {spawn_label} stdin: {error}"));
     }
 
     let started = std::time::Instant::now();
@@ -4349,7 +4444,12 @@ fn run_sync_command_limited(
                 break status;
             }
             Ok(None) => {}
-            Err(e) => return Err(format!("wait failed: {e}")),
+            Err(e) => {
+                terminate_std_child(&mut child);
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(format!("wait failed: {e}"));
+            }
         }
         if started.elapsed() >= timeout {
             terminate_std_child(&mut child);
@@ -6206,6 +6306,8 @@ fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsRepor
 
     let started = std::time::Instant::now();
     let mut cmd = rust_analyzer_command()?;
+    deny_interactive_prompt_env_std(&mut cmd);
+    scrub_tool_credentials_from_std_command(&mut cmd);
     cmd.current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -8348,6 +8450,7 @@ fn start_git_credential_pipe_writer(path: PathBuf, payload: String) -> SudoPassw
 /// the FIFO, so it must outlive the tool call.
 struct GitCredentialHelperRuntime {
     env: Vec<(String, String)>,
+    sandbox_read_roots: Vec<PathBuf>,
     _pipe: SudoPasswordPipeRuntime,
 }
 
@@ -8399,7 +8502,11 @@ fn prepare_git_credential_helper(
         ),
         ("GIT_CONFIG_VALUE_4".to_string(), "always".to_string()),
     ];
-    Ok(GitCredentialHelperRuntime { env, _pipe: pipe })
+    Ok(GitCredentialHelperRuntime {
+        env,
+        sandbox_read_roots: vec![script, fifo],
+        _pipe: pipe,
+    })
 }
 
 #[cfg(not(unix))]
@@ -8484,6 +8591,7 @@ async fn execute_bash_async_with_timeout(
         sandbox_profile,
         None,
         &[],
+        &[],
     )
     .await
 }
@@ -8498,6 +8606,7 @@ async fn execute_bash_async_prepared(
     sandbox_profile: SandboxProfile,
     live_output: Option<LiveToolOutput>,
     extra_env: &[(String, String)],
+    extra_read_roots: &[PathBuf],
 ) -> std::result::Result<String, String> {
     let mut local_sudo_auth = local_sudo_auth;
     let _sudo_password_pipe = local_sudo_auth.as_mut().and_then(|auth| {
@@ -8517,7 +8626,17 @@ async fn execute_bash_async_prepared(
     } else {
         sandbox_profile
     };
-    let mut command = sandbox::tokio_command("bash", effective_profile, root);
+    let mut sandbox_read_roots = extra_read_roots.to_vec();
+    if let Some(auth) = local_sudo_auth.as_ref() {
+        sandbox_read_roots.push(auth.sudo_shim_dir.clone());
+        if let Some(askpass) = auth.askpass.as_ref() {
+            sandbox_read_roots.push(askpass.clone());
+        }
+        if let Some(fifo) = auth.password_fifo.as_ref() {
+            sandbox_read_roots.push(fifo.clone());
+        }
+    }
+    let mut command = sandbox::tokio_command("bash", effective_profile, root, &sandbox_read_roots);
     command
         .arg("-c")
         .arg(&bash_cmd)
@@ -8526,10 +8645,11 @@ async fn execute_bash_async_prepared(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    deny_interactive_prompt_env(&mut command);
     for (key, value) in extra_env {
         command.env(key, value);
     }
+    scrub_tool_credentials_from_tokio_command(&mut command);
+    deny_interactive_prompt_env(&mut command);
     if let Some(auth) = local_sudo_auth.as_ref() {
         let mut paths = vec![auth.sudo_shim_dir.clone()];
         if let Some(existing) = std::env::var_os("PATH") {
@@ -8584,7 +8704,12 @@ async fn execute_bash_async_prepared(
                 }
                 break s;
             }
-            ProcWaitOutcome::Exited(Err(e)) => return Err(format!("wait failed: {e}")),
+            ProcWaitOutcome::Exited(Err(e)) => {
+                terminate_tokio_child(&mut child).await;
+                let _ = out_task.await;
+                let _ = err_task.await;
+                return Err(format!("wait failed: {e}"));
+            }
             ProcWaitOutcome::Interrupt => {
                 terminate_tokio_child(&mut child).await;
                 let out = out_task.await.unwrap_or_default();
@@ -8636,16 +8761,19 @@ async fn execute_external_async(
 ) -> std::result::Result<String, String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut cmd = sandbox::tokio_command(bin, sandbox_profile, cwd);
+    let mut cmd = sandbox::tokio_command(bin, sandbox_profile, cwd, &[]);
     cmd.args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     deny_interactive_prompt_env(&mut cmd);
+    scrub_tool_credentials_from_tokio_command(&mut cmd);
     configure_tokio_process_group(&mut cmd);
     if stdin_data.is_some() {
         cmd.stdin(std::process::Stdio::piped());
+    } else {
+        cmd.stdin(std::process::Stdio::null());
     }
 
     let mut child = cmd
@@ -8660,10 +8788,12 @@ async fn execute_external_async(
 
     if let Some(data) = stdin_data
         && let Some(mut si) = child.stdin.take()
+        && let Err(error) = si.write_all(data.as_bytes()).await
     {
-        si.write_all(data.as_bytes())
-            .await
-            .map_err(|e| format!("{e}"))?;
+        terminate_tokio_child(&mut child).await;
+        let _ = out_task.await;
+        let _ = err_task.await;
+        return Err(format!("failed to write {bin} stdin: {error}"));
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
@@ -8687,7 +8817,12 @@ async fn execute_external_async(
                 }
                 break s;
             }
-            ProcWaitOutcome::Exited(Err(e)) => return Err(format!("wait failed: {e}")),
+            ProcWaitOutcome::Exited(Err(e)) => {
+                terminate_tokio_child(&mut child).await;
+                let _ = out_task.await;
+                let _ = err_task.await;
+                return Err(format!("wait failed: {e}"));
+            }
             ProcWaitOutcome::Interrupt => {
                 terminate_tokio_child(&mut child).await;
                 let out = out_task.await.unwrap_or_default();
@@ -8788,8 +8923,10 @@ async fn execute_builtin_call(
             _ => None,
         };
         let mut extra_env = pack_env;
+        let mut sandbox_read_roots = Vec::new();
         if let Some(runtime) = git_cred_runtime.as_ref() {
             extra_env.extend(runtime.env.clone());
+            sandbox_read_roots.extend(runtime.sandbox_read_roots.clone());
         }
         execute_bash_async_prepared(
             &guarded,
@@ -8800,19 +8937,16 @@ async fn execute_builtin_call(
             sandbox_profile,
             live_output,
             &extra_env,
+            &sandbox_read_roots,
         )
         .await
     } else if name == "http" {
         execute_http_tool_async(&input, interrupt, external_tool_timeout()).await
     } else if is_external_process_tool(&name) {
-        // Run unconfined: the browser recipe manages its own profile/cache dirs
-        // and needs network + broad access; git_diff/git_log are read-only
-        // inspection but git writes its index (.git/index) as bookkeeping, which
-        // would intermittently fail under the read-only profile for a repo
-        // outside the writable roots. Neither mutates the working tree, so this
-        // is security-neutral. The write-capable externals (awk, csvkit) and the
-        // rest stay confined.
-        let ext_profile = if matches!(name.as_str(), "browser" | "git_diff" | "git_log") {
+        // The browser recipe manages its own profile/cache directories and
+        // needs broad filesystem access. All other external tools, including
+        // read-only Git inspection, remain under the requested kernel profile.
+        let ext_profile = if name == "browser" {
             SandboxProfile::DangerFullAccess
         } else {
             sandbox_profile
@@ -12577,7 +12711,10 @@ impl Agent {
             self.checkpoint_ordinal,
         ) {
             Ok(Some(cp)) => self.append_latest_log("checkpoint", &format!("created {}", cp.id)),
-            Ok(None) => self.append_latest_log("checkpoint", "skipped unborn HEAD"),
+            Ok(None) => self.append_latest_log(
+                "checkpoint",
+                "skipped: no restorable repository state for this tool call",
+            ),
             Err(e) => self.append_latest_log("checkpoint", &format!("warning: {e}")),
         }
     }
@@ -15682,7 +15819,7 @@ impl Agent {
                 }
 
                 if plan.is_none()
-                    && let Some(msg) = self.privacy.path_denial(&name, &input)
+                    && let Some(msg) = self.privacy.path_denial(&name, &input, &self.sandbox_root)
                 {
                     plan = Some(Plan::Immediate {
                         content: msg,
@@ -22606,7 +22743,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_PRIVACY=0 to disable default output redaction and sensitive-path guards, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
         );
         return Ok(());
     }

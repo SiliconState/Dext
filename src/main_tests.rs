@@ -37,7 +37,11 @@ fn temp_test_dir(label: &str) -> PathBuf {
             .expect("clock drift")
             .as_nanos()
     );
-    let dir = std::env::temp_dir().join(unique);
+    #[cfg(unix)]
+    let temp_root = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let temp_root = std::env::temp_dir();
+    let dir = temp_root.join(unique);
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
@@ -174,6 +178,44 @@ fn git_checkpoint_sidecar_restores_untracked_file() {
     let cp = git_checkpoints::create_checkpoint(&root, "write_file", &["note.txt".to_string()], 1)
         .expect("create checkpoint")
         .expect("checkpoint exists");
+    assert_eq!(cp.paths_hint, vec!["note.txt"]);
+    let sidecar = root.join(".dext/checkpoints").join(&cp.id).join("note.txt");
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).expect("read sidecar"),
+        "before\n"
+    );
+    assert!(
+        std::fs::read_to_string(root.join(".git/info/exclude"))
+            .expect("read local exclude")
+            .lines()
+            .any(|line| line.trim() == "/.dext/"),
+        "checkpoint state must be locally excluded from Git"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let sidecar_mode = std::fs::metadata(&sidecar)
+            .expect("sidecar metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let manifest_mode = std::fs::metadata(root.join(".dext/checkpoints/manifest.txt"))
+            .expect("manifest metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let checkpoint_dir_mode = std::fs::metadata(root.join(".dext/checkpoints"))
+            .expect("checkpoint dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(sidecar_mode, 0o600, "sidecar mode {sidecar_mode:o}");
+        assert_eq!(manifest_mode, 0o600, "manifest mode {manifest_mode:o}");
+        assert_eq!(
+            checkpoint_dir_mode, 0o700,
+            "checkpoint directory mode {checkpoint_dir_mode:o}"
+        );
+    }
     std::fs::write(root.join("note.txt"), "after\n").expect("mutate untracked");
 
     git_checkpoints::restore_worktree(&root, &cp, git_checkpoints::RestoreMode::Worktree)
@@ -201,6 +243,319 @@ fn git_checkpoint_unborn_head_is_noop_before_and_after_mutation() {
             .expect("checkpoint after mutation");
     assert!(after.is_none());
     assert!(!root.join(".dext/checkpoints/manifest.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rejects_symlinked_storage_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-storage-symlink");
+    let outside = temp_test_dir("checkpoint-storage-symlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    symlink(&outside, root.join(".dext")).expect("symlink checkpoint root");
+
+    let error = match git_checkpoints::create_checkpoint(&root, "bash", &[], 1) {
+        Err(error) => error,
+        Ok(_) => panic!("symlinked checkpoint storage must be rejected"),
+    };
+    assert!(error.contains("not a real directory"), "{error}");
+    assert!(!outside.join("checkpoints").exists());
+    let refs = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/dext/checkpoints",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("list checkpoint refs");
+    assert!(refs.status.success());
+    assert!(refs.stdout.is_empty(), "checkpoint ref must not be created");
+
+    let _ = std::fs::remove_file(root.join(".dext"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn checkpoint_skips_external_hints_and_restore_ignores_them() {
+    let root = temp_test_dir("checkpoint-external-path");
+    let outside = temp_test_dir("checkpoint-external-target");
+    let outside_file = outside.join("keep.txt");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(&outside_file, "outside\n").expect("write outside");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let skipped = git_checkpoints::create_checkpoint(
+        &root,
+        "write_file",
+        &[outside_file.display().to_string()],
+        1,
+    )
+    .expect("external checkpoint hint is handled");
+    assert!(skipped.is_none(), "external paths are not Git-restorable");
+
+    let mut checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["tracked.txt".to_string()], 2)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    checkpoint.paths_hint = vec![outside_file.display().to_string()];
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("unsafe manifest path must fail before restore");
+    assert!(error.contains("unsafe checkpoint path"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&outside_file).expect("read outside"),
+        "outside\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rejects_symlinked_git_exclude() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-exclude-symlink");
+    let outside = temp_test_dir("checkpoint-exclude-symlink-target");
+    let outside_file = outside.join("exclude.txt");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(&outside_file, "keep\n").expect("write outside exclude");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    std::fs::remove_file(root.join(".git/info/exclude")).expect("remove local exclude");
+    symlink(&outside_file, root.join(".git/info/exclude")).expect("symlink local exclude");
+
+    let error = match git_checkpoints::create_checkpoint(&root, "bash", &[], 1) {
+        Err(error) => error,
+        Ok(_) => panic!("symlinked Git exclude must be rejected"),
+    };
+    assert!(error.contains("not a real file"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&outside_file).expect("read outside exclude"),
+        "keep\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rejects_symlinked_git_info_directory() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-info-symlink");
+    let outside = temp_test_dir("checkpoint-info-symlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    std::fs::remove_dir_all(root.join(".git/info")).expect("remove Git info directory");
+    symlink(&outside, root.join(".git/info")).expect("symlink Git info directory");
+
+    let error = match git_checkpoints::create_checkpoint(&root, "bash", &[], 1) {
+        Err(error) => error,
+        Ok(_) => panic!("symlinked Git info directory must be rejected"),
+    };
+    assert!(error.contains("escapes repository metadata"), "{error}");
+    assert!(!outside.join("exclude").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_restore_rejects_symlinked_sidecar_files() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-sidecar-symlink");
+    let outside = temp_test_dir("checkpoint-sidecar-symlink-target");
+    let outside_file = outside.join("secret.txt");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "before\n").expect("write untracked");
+    std::fs::write(&outside_file, "outside-secret\n").expect("write outside");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["note.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    let sidecar = root
+        .join(".dext/checkpoints")
+        .join(&checkpoint.id)
+        .join("note.txt");
+    std::fs::remove_file(&sidecar).expect("remove real sidecar");
+    symlink(&outside_file, &sidecar).expect("symlink sidecar");
+    std::fs::write(root.join("note.txt"), "after\n").expect("mutate note");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("unsafe sidecar must fail before restore");
+    assert!(error.contains("unsafe sidecar symlink"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).expect("read unchanged note"),
+        "after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside_file).expect("read outside"),
+        "outside-secret\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn checkpoint_restore_fails_closed_when_required_sidecar_is_missing() {
+    let root = temp_test_dir("checkpoint-sidecar-missing");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "before\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["note.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    assert!(checkpoint.includes_untracked_sidecar);
+    std::fs::remove_dir_all(root.join(".dext/checkpoints").join(&checkpoint.id))
+        .expect("remove sidecar");
+    std::fs::write(root.join("note.txt"), "after\n").expect("mutate note");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("missing sidecar must fail before restore");
+    assert!(error.contains("sidecar is missing"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).expect("read unchanged note"),
+        "after\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_restore_rejects_ref_oid_mismatch_before_mutation() {
+    let root = temp_test_dir("checkpoint-ref-mismatch");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["tracked.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    std::fs::write(root.join("tracked.txt"), "second\n").expect("write second");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "second"]);
+    git_ok(&root, &["update-ref", &checkpoint.ref_name, "HEAD"]);
+    std::fs::write(root.join("tracked.txt"), "current\n").expect("write current");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("tampered checkpoint ref must fail before restore");
+    assert!(error.contains("no longer matches"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read unchanged tracked file"),
+        "current\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_restore_refuses_to_replace_a_directory_with_absent_file_state() {
+    let root = temp_test_dir("checkpoint-file-became-directory");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["new.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    std::fs::create_dir(root.join("new.txt")).expect("replace target with directory");
+    std::fs::write(root.join("new.txt/keep.txt"), "keep\n").expect("write nested file");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("directory replacement must fail before restore");
+    assert!(error.contains("refusing to recursively remove"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("new.txt/keep.txt")).expect("read nested file"),
+        "keep\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_prune_creates_private_ignored_storage() {
+    let root = temp_test_dir("checkpoint-prune-storage");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    git_checkpoints::prune(&root, None, None).expect("prune empty checkpoint namespace");
+    assert!(
+        std::fs::read_to_string(root.join(".git/info/exclude"))
+            .expect("read exclude")
+            .lines()
+            .any(|line| line.trim() == "/.dext/")
+    );
+    assert!(root.join(".dext/checkpoints/manifest.txt").is_file());
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -239,6 +594,95 @@ fn checkpoint_snapshots_untracked_and_preview_names_created_files() {
         preview.contains("existing.txt"),
         "preview should name removed untracked file:\n{preview}"
     );
+}
+
+#[test]
+fn checkpoint_creation_enforces_retention_ceiling() {
+    let root = temp_test_dir("checkpoint-retention");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    for ordinal in 1..=25 {
+        git_checkpoints::create_checkpoint(&root, "bash", &[], ordinal)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    }
+
+    let checkpoints =
+        git_checkpoints::list_checkpoints(&root, usize::MAX).expect("list checkpoints");
+    assert_eq!(checkpoints.len(), 20, "checkpoint retention ceiling");
+    let refs = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/dext/checkpoints",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("list checkpoint refs");
+    assert!(
+        refs.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refs.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&refs.stdout).lines().count(), 20);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
+    let root = temp_test_dir("checkpoint-orphan-ref");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let orphan = "refs/dext/checkpoints/orphan";
+    git_ok(&root, &["update-ref", orphan, "HEAD"]);
+    let sibling = "refs/dext/checkpoints-sibling/keep";
+    git_ok(&root, &["update-ref", sibling, "HEAD"]);
+    let orphan_sidecar = root.join(".dext/checkpoints/orphan_sidecar");
+    std::fs::create_dir(&orphan_sidecar).expect("create orphan sidecar");
+    std::fs::write(orphan_sidecar.join("data"), "orphan\n").expect("write orphan sidecar");
+
+    let result = git_checkpoints::prune(&root, None, None).expect("prune checkpoints");
+    assert!(result.contains("pruned 1 checkpoint"), "{result}");
+    assert!(result.contains("1 orphan sidecar directory"), "{result}");
+    assert!(!orphan_sidecar.exists(), "orphan sidecar should be removed");
+    assert!(
+        Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", orphan])
+            .current_dir(&root)
+            .status()
+            .is_ok_and(|status| !status.success()),
+        "orphan checkpoint ref should be removed"
+    );
+    assert!(
+        Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", sibling])
+            .current_dir(&root)
+            .status()
+            .is_ok_and(|status| status.success()),
+        "manual prune must preserve sibling ref namespaces"
+    );
+    assert!(
+        Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", &checkpoint.ref_name])
+            .current_dir(&root)
+            .status()
+            .is_ok_and(|status| status.success()),
+        "manifest-backed checkpoint should remain"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1006,14 +1450,21 @@ fn sudo_command_shim_invokes_real_sudo_noninteractive_and_is_private() {
     real_perms.set_mode(0o700);
     std::fs::set_permissions(&real_sudo, real_perms).expect("chmod fake sudo");
 
-    // session_sudo_dir resolves through DEXT_HOME; hold the env lock so a
-    // concurrent test mutating it can't point the shim into a temp root that
-    // gets deleted before the shim is executed below.
+    // session_sudo_dir resolves through DEXT_HOME. Isolate the generated shim
+    // from shared user-global session state while serializing the env override.
     let _guard = env_lock();
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
     let bin_dir = write_sudo_command_shim(&root, "test-session", &real_sudo).expect("write shim");
+    restore_env_var("DEXT_HOME", old_dext_home);
     let shim = bin_dir.join("sudo");
     let output = Command::new(&shim).arg("true").output().expect("run shim");
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "-n\ntrue\n");
     assert_eq!(
         std::fs::metadata(&bin_dir)
@@ -1100,6 +1551,7 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
         SandboxProfile::ReadOnly,
         None,
         &[],
+        &[],
     )
     .await
     .expect("preauthed sudo command runs");
@@ -1111,6 +1563,155 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
         let _ = std::fs::remove_dir(dir);
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn tool_credential_env_key_matches_only_secret_variables() {
+    assert!(tool_credential_env_key("DEXT_API_KEY"));
+    assert!(tool_credential_env_key("acme_api_key"));
+    assert!(tool_credential_env_key("CHATGPT_ACCESS_TOKEN"));
+    assert!(tool_credential_env_key("AWS_SECRET_ACCESS_KEY"));
+    assert!(tool_credential_env_key("SECRET_KEY"));
+    assert!(tool_credential_env_key("TOKEN"));
+    assert!(!tool_credential_env_key("DEXT_BASE_URL"));
+    assert!(!tool_credential_env_key("DEXT_PACK_DEMO_DIR"));
+}
+
+#[test]
+fn sync_tool_children_scrub_credentials_unless_explicitly_enabled() {
+    let _guard = env_lock();
+    let old_api_key = std::env::var_os("SECURITY_TEST_API_KEY");
+    let old_access_token = std::env::var_os("CHATGPT_ACCESS_TOKEN");
+    let old_safe = std::env::var_os("SECURITY_TEST_SAFE");
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    unsafe {
+        std::env::set_var("SECURITY_TEST_API_KEY", "fake-api-key-fixture");
+        std::env::set_var("CHATGPT_ACCESS_TOKEN", "fake-access-token-fixture");
+        std::env::set_var("SECURITY_TEST_SAFE", "visible");
+        std::env::remove_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    }
+
+    let mut scrubbed = Command::new("bash");
+    scrubbed.arg("-c").arg(
+        "printf '%s|%s|%s' \"${SECURITY_TEST_API_KEY-unset}\" \"${CHATGPT_ACCESS_TOKEN-unset}\" \"${SECURITY_TEST_SAFE-unset}\"",
+    );
+    let (stdout, _, code) = run_sync_command_limited(
+        scrubbed,
+        None,
+        PROCESS_STREAM_CAPTURE_CAP,
+        "credential scrub test",
+        std::time::Duration::from_secs(5),
+    )
+    .expect("run scrubbed child");
+    assert_eq!(code, 0);
+    assert_eq!(stdout.render("stdout"), "unset|unset|visible");
+
+    unsafe {
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+    }
+    let mut inherited = Command::new("bash");
+    inherited
+        .arg("-c")
+        .arg("printf '%s|%s' \"${SECURITY_TEST_API_KEY-unset}\" \"${CHATGPT_ACCESS_TOKEN-unset}\"");
+    let (stdout, _, code) = run_sync_command_limited(
+        inherited,
+        None,
+        PROCESS_STREAM_CAPTURE_CAP,
+        "credential inheritance test",
+        std::time::Duration::from_secs(5),
+    )
+    .expect("run inherited child");
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.render("stdout"),
+        "fake-api-key-fixture|fake-access-token-fixture"
+    );
+
+    restore_env_var("SECURITY_TEST_API_KEY", old_api_key);
+    restore_env_var("CHATGPT_ACCESS_TOKEN", old_access_token);
+    restore_env_var("SECURITY_TEST_SAFE", old_safe);
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_tool_children_scrub_credentials_by_default() {
+    let _guard = env_lock();
+    let old_api_key = std::env::var_os("SECURITY_ASYNC_API_KEY");
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    unsafe {
+        std::env::set_var("SECURITY_ASYNC_API_KEY", "fake-async-api-key-fixture");
+        std::env::remove_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    }
+    let mut command = tokio::process::Command::new("bash");
+    command
+        .arg("-c")
+        .arg("printf '%s' \"${SECURITY_ASYNC_API_KEY-unset}\"");
+    scrub_tool_credentials_from_tokio_command(&mut command);
+    let output = command.output().await.expect("run async scrubbed child");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "unset");
+
+    restore_env_var("SECURITY_ASYNC_API_KEY", old_api_key);
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_tool_children_scrub_injected_only_credentials_and_prompt_overrides() {
+    let _guard = env_lock();
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    unsafe {
+        std::env::remove_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    }
+    let root = temp_test_dir("credential-injected-extra-env");
+    let root = std::fs::canonicalize(&root).expect("canonical root");
+    let output = execute_bash_async_prepared(
+        "printf '%s|%s' \"${INJECTED_ONLY_SECRET_KEY-unset}\" \"${GIT_TERMINAL_PROMPT-unset}\"",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        None,
+        SandboxProfile::DangerFullAccess,
+        None,
+        &[
+            (
+                "INJECTED_ONLY_SECRET_KEY".to_string(),
+                "fake-injected-secret".to_string(),
+            ),
+            ("GIT_TERMINAL_PROMPT".to_string(), "1".to_string()),
+        ],
+        &[],
+    )
+    .await
+    .expect("run bash with injected environment");
+    assert!(output.contains("unset|0"), "{output}");
+
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sync_tool_children_scrub_command_only_credentials() {
+    let _guard = env_lock();
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    unsafe {
+        std::env::remove_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    }
+    let mut command = Command::new("bash");
+    command
+        .arg("-c")
+        .arg("printf '%s' \"${INJECTED_ONLY_SECRET_KEY-unset}\"")
+        .env("INJECTED_ONLY_SECRET_KEY", "fake-command-only-secret");
+    let (stdout, _, code) = run_sync_command_limited(
+        command,
+        None,
+        PROCESS_STREAM_CAPTURE_CAP,
+        "command-only credential scrub test",
+        std::time::Duration::from_secs(5),
+    )
+    .expect("run scrubbed command");
+    assert_eq!(code, 0);
+    assert_eq!(stdout.render("stdout"), "unset");
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
 }
 
 #[test]
@@ -1295,6 +1896,7 @@ async fn bash_children_get_no_terminal_and_no_git_prompts() {
         None,
         SandboxProfile::WorkspaceWrite,
         None,
+        &[],
         &[],
     )
     .await
@@ -3244,9 +3846,32 @@ fn privacy_redacts_sensitive_tool_output_and_blocks_secret_paths() {
 
     let denial = agent
         .privacy
-        .path_denial("read_file", &json!({"path": ".env"}))
+        .path_denial("read_file", &json!({"path": ".env"}), &root)
         .expect("secret path blocked");
     assert!(denial.contains("blocked read_file"), "{denial}");
+
+    assert!(privacy_sensitive_path("/tmp/.ssh/config"));
+    assert!(privacy_sensitive_path("config/providers.json"));
+    assert!(privacy_sensitive_path("private.key"));
+    assert!(!privacy_sensitive_path("src/private_api.rs"));
+    assert!(!privacy_sensitive_path(
+        "docs/credential-safe-subprocesses.md"
+    ));
+    assert!(!privacy_sensitive_path("notes/secretary.md"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        std::fs::create_dir_all(root.join(".ssh")).expect("create sensitive directory");
+        std::fs::write(root.join(".ssh/config"), "Host example\n").expect("write sensitive file");
+        symlink(root.join(".ssh/config"), root.join("notes.txt")).expect("create benign alias");
+        let denial = agent
+            .privacy
+            .path_denial("read_file", &json!({"path": "notes.txt"}), &root)
+            .expect("symlink alias to sensitive path blocked");
+        assert!(denial.contains("notes.txt"), "{denial}");
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3580,11 +4205,9 @@ async fn sandbox_never_breaks_benign_commands() {
 
 #[tokio::test]
 async fn read_only_sandbox_does_not_break_git_inspection() {
-    // git_diff/git_log are read-only inspection, but git writes .git/index as
-    // bookkeeping, which would intermittently fail under the read-only profile
-    // for a repo outside the writable roots — so those tools run unconfined.
-    // The repo is placed under HOME (outside the scratch roots) to exercise that
-    // path where the kernel enforces; git inspection must still work.
+    // Git inspection stays confined like other external tools. The repository is
+    // placed under HOME, outside scratch roots, to exercise that path while
+    // confirming the sandbox root itself remains readable to Git.
     // Read HOME and create the repo under the env lock: other tests transiently
     // point HOME at a temp dir they later delete, which would otherwise pull the
     // repo out from under us. git below uses absolute paths / current_dir, so it
@@ -3681,28 +4304,26 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
     assert!(rename_out.contains("x"), "{rename_out}");
 
     if crate::sandbox::is_enforced() {
-        // Target a HOME-based path: normally writable by this user, but outside
-        // the workspace root and the scratch roots. The read-only profile must
-        // deny it; the workspace-write profile must ALLOW it, because toolchains
-        // (cargo, npm, ...) write per-user caches under HOME and would otherwise
-        // break. (The workspace root here lives under the system temp dir, so it
-        // would be a confounded target — HOME is not.)
-        // Read HOME + create the dir under the env lock; other tests transiently
-        // repoint HOME at a temp dir they delete. The bash writes below use the
-        // absolute escape path, so they are unaffected by later HOME changes.
-        let escape = {
+        // Target two HOME-based paths outside the workspace and scratch roots:
+        // an unrelated directory must stay read-only under WorkspaceWrite, while
+        // a standard toolchain cache remains writable.
+        let home_paths = {
             let _guard = env_lock();
             std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
                 .map(|home| {
-                    let escape_dir = std::path::PathBuf::from(home)
-                        .join(format!(".dext-sbx-test-{}", std::process::id()));
+                    let home = std::path::PathBuf::from(home);
+                    let escape_dir = home.join(format!(".dext-sbx-test-{}", std::process::id()));
+                    let cache_dir = home
+                        .join(".cache/pip")
+                        .join(format!("dext-sbx-test-{}", std::process::id()));
                     let _ = std::fs::create_dir_all(&escape_dir);
-                    escape_dir
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    (escape_dir, cache_dir)
                 })
         };
-        if let Some(escape_dir) = escape {
+        if let Some((escape_dir, cache_dir)) = home_paths {
             let escape_file = escape_dir.join("escape.txt");
             let escape_cmd = format!(
                 "echo pwned > {} 2>&1",
@@ -3726,6 +4347,34 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 "control: HOME-based path must be writable without a sandbox"
             );
 
+            // Control: the file is readable unsandboxed.
+            let readable = execute_bash_async_with_timeout(
+                &format!("cat {}", shell_single_quote(&escape_file.to_string_lossy())),
+                &root,
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_secs(5),
+                SandboxProfile::DangerFullAccess,
+            )
+            .await
+            .expect("unsandboxed HOME read should run");
+            assert!(readable.contains("pwned"), "{readable}");
+
+            for profile in [SandboxProfile::ReadOnly, SandboxProfile::WorkspaceWrite] {
+                let blocked_read = execute_bash_async_with_timeout(
+                    &format!("cat {}", shell_single_quote(&escape_file.to_string_lossy())),
+                    &root,
+                    Arc::new(AtomicBool::new(false)),
+                    std::time::Duration::from_secs(5),
+                    profile,
+                )
+                .await
+                .expect("sandboxed HOME read command should return output");
+                assert!(
+                    !blocked_read.contains("pwned"),
+                    "{profile:?} must hide unrelated HOME content: {blocked_read}"
+                );
+            }
+
             // Read-only denies the HOME write.
             let _ = std::fs::remove_file(&escape_file);
             let blocked = execute_bash_async_with_timeout(
@@ -3742,9 +4391,10 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 "read-only sandbox must block writes outside scratch roots: {blocked}"
             );
 
-            // Workspace-write allows the HOME write (toolchain caches).
+            // Workspace-write also denies unrelated HOME writes, preventing
+            // persistence through shell startup files and similar paths.
             let _ = std::fs::remove_file(&escape_file);
-            let _ = execute_bash_async_with_timeout(
+            let blocked = execute_bash_async_with_timeout(
                 &escape_cmd,
                 &root,
                 Arc::new(AtomicBool::new(false)),
@@ -3752,12 +4402,33 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 SandboxProfile::WorkspaceWrite,
             )
             .await
-            .expect("workspace-write HOME write should run");
+            .expect("workspace-write command runs even when HOME write is denied");
             assert!(
-                escape_file.exists(),
-                "workspace-write must allow HOME writes so toolchains work"
+                !escape_file.exists(),
+                "workspace-write sandbox must block unrelated HOME writes: {blocked}"
+            );
+
+            // Standard cache roots remain writable for cargo/npm/pip/etc.
+            let cache_file = cache_dir.join("cache.txt");
+            let cache_cmd = format!(
+                "echo cached > {} 2>&1",
+                shell_single_quote(&cache_file.to_string_lossy())
+            );
+            let cache_out = execute_bash_async_with_timeout(
+                &cache_cmd,
+                &root,
+                Arc::new(AtomicBool::new(false)),
+                std::time::Duration::from_secs(5),
+                SandboxProfile::WorkspaceWrite,
+            )
+            .await
+            .expect("workspace-write cache write should run");
+            assert!(
+                cache_file.exists(),
+                "workspace-write must allow toolchain cache writes: {cache_out}"
             );
             let _ = std::fs::remove_dir_all(&escape_dir);
+            let _ = std::fs::remove_dir_all(&cache_dir);
         }
 
         // Scratch writes (temp dir) must still succeed even under ReadOnly.
@@ -3783,6 +4454,65 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
         let _ = std::fs::remove_file(&scratch);
     }
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
+    if !crate::sandbox::is_enforced() {
+        return;
+    }
+    let _guard = env_lock();
+    let old_secret = std::env::var_os("SANDBOX_PARENT_ONLY_SECRET");
+    let old_pip_cache = std::env::var_os("PIP_CACHE_DIR");
+    let old_tmpdir = std::env::var_os("TMPDIR");
+    let root = temp_test_dir("sandbox-parent-env");
+    let home = crate::session::user_home_dir();
+    let escape_dir = home.join(format!(".dext-sbx-env-test-{}", std::process::id()));
+    let escape_file = escape_dir.join("escape.txt");
+    std::fs::create_dir_all(&escape_dir).expect("create escape directory");
+    unsafe {
+        std::env::set_var("SANDBOX_PARENT_ONLY_SECRET", "parent-secret-fixture");
+        std::env::set_var("PIP_CACHE_DIR", &escape_dir);
+        std::env::set_var("TMPDIR", &escape_dir);
+    }
+
+    let proc_output = execute_bash_async_with_timeout(
+        "tr '\\0' '\\n' < /proc/$PPID/environ 2>/dev/null || true",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        SandboxProfile::ReadOnly,
+    )
+    .await
+    .expect("sandboxed proc read command runs");
+    assert!(
+        !proc_output.contains("parent-secret-fixture"),
+        "sandbox exposed parent environment: {proc_output}"
+    );
+
+    let write_output = execute_bash_async_with_timeout(
+        &format!(
+            "printf escaped > {} 2>&1 || true",
+            shell_single_quote(&escape_file.to_string_lossy())
+        ),
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        SandboxProfile::WorkspaceWrite,
+    )
+    .await
+    .expect("sandboxed override write command runs");
+    assert!(
+        !escape_file.exists(),
+        "PIP_CACHE_DIR/TMPDIR must not widen writable roots: {write_output}"
+    );
+
+    restore_env_var("SANDBOX_PARENT_ONLY_SECRET", old_secret);
+    restore_env_var("PIP_CACHE_DIR", old_pip_cache);
+    restore_env_var("TMPDIR", old_tmpdir);
+    let _ = std::fs::remove_dir_all(&escape_dir);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3841,6 +4571,7 @@ async fn bash_runner_emits_live_output_deltas() {
         None,
         SandboxProfile::WorkspaceWrite,
         Some(live),
+        &[],
         &[],
     )
     .await

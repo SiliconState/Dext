@@ -146,7 +146,7 @@ fn spawn_dext_with_env(
         .env("TERM", "xterm-256color")
         .env("TERM_PROGRAM", "Apple_Terminal")
         .env("COLORTERM", "truecolor")
-        .env("LANG", "C.UTF-8")
+        .env("LANG", "C")
         .env("HOME", home)
         .env("DEXT_HOME", dext_home)
         .env("DEXT_APPROVAL", "never")

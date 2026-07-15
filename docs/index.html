@@ -554,8 +554,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <ol>
 <li><strong>Create</strong> — Before a tool executes, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;</code></li>
 <li><strong>Dirty state capture</strong> — If the worktree is dirty, <code>git stash create</code> captures a snapshot without touching the working tree or reflog</li>
-<li><strong>Untracked sidecar</strong> — For direct file tools, untracked files are saved to <code>.dext/checkpoints/&lt;id&gt;/</code></li>
-<li><strong>Manifest</strong> — Appended to <code>.dext/checkpoints/manifest.txt</code> (capped at 64 entries)</li>
+<li><strong>Untracked sidecar</strong> — For direct file tools, untracked files are saved to owner-private <code>.dext/checkpoints/&lt;id&gt;/</code> storage; symlinked storage paths are rejected on Unix</li>
+<li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude</li>
 </ol>
 <h3>Restore Modes</h3>
 <table>
@@ -566,7 +566,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>ResetHead</code></td><td>Hard reset HEAD to checkpoint's original HEAD</td></tr>
 </table>
 <h3>Pruning</h3>
-<p>Default: keep the 20 newest checkpoints and remove entries older than 168 hours (7 days). Pruning rebuilds local manifests and deletes associated sidecar checkpoint directories for bounded disk growth.</p>
+<p>Default: keep the 20 newest checkpoints and remove entries older than 168 hours (7 days). Pruning rebuilds local manifests, removes orphaned <code>refs/dext/checkpoints/*</code>, and deletes associated sidecar directories for bounded disk growth. Never mirror-push <code>refs/dext/*</code>.</p>
 <h3>Checkpoint Triggers</h3>
 <p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Other tools are checkpointed when <code>tool_policy::classify_command_risk()</code> returns Write or Danger (for example write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code>, non-GET <code>http</code>, or enabled <code>browser</code> actions).</p>
 </div>
@@ -1006,7 +1006,9 @@ description: One-line workflow summary
 <tr><td><code>DEXT_TOOL_PROFILE</code></td><td>lean</td><td>Tool schema profile: full, lean</td></tr>
 <tr><td><code>DEXT_MUTATION_PREVIEW</code></td><td>simple</td><td>Mutation preview mode: off, simple, git</td></tr>
 <tr><td><code>DEXT_APPROVAL</code></td><td>ask</td><td>Approval profile: ask, auto-read, auto-write, never, always</td></tr>
-<tr><td><code>DEXT_SANDBOX_PROFILE</code></td><td>workspace-write</td><td>Sandbox profile: read-only, workspace-write, danger-full-access. Workspace-write permits writes under the sandbox and user home for toolchain caches.</td></tr>
+<tr><td><code>DEXT_SANDBOX_PROFILE</code></td><td>workspace-write</td><td>Sandbox profile: read-only, workspace-write, danger-full-access. On supported Linux/macOS hosts, confined profiles hide unrelated home content; workspace-write permits writes only under the sandbox, scratch roots, and explicit toolchain cache/package roots.</td></tr>
+<tr><td><code>DEXT_PRIVACY</code></td><td>true</td><td>Redact sensitive tool output and block sensitive native-read paths; disable only for controlled work.</td></tr>
+<tr><td><code>DEXT_INHERIT_TOOL_CREDENTIALS</code></td><td>false</td><td>High-trust opt-in to pass credential-shaped parent environment variables to agent-run subprocesses.</td></tr>
 <tr><td><code>DEXT_BUDGET_CAP</code></td><td>—</td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
 <tr><td><code>DEXT_CONTEXT_WINDOW_TOKENS</code></td><td>Profile default</td><td>Override context window size</td></tr>
 <tr><td><code>DEXT_CONTEXT_WINDOW</code></td><td>Profile default</td><td>Alias override for context window size</td></tr>
@@ -1077,7 +1079,7 @@ description: One-line workflow summary
 <p>Provider catalog with merged built-in + custom profiles. Editable via <code>/provider</code> and <code>/model</code> commands. Auto-normalized on load.</p>
 <p>Catalog v2 profiles may set <code>request_contract</code> to <code>anthropic-messages</code>, <code>openai-chat-completions</code>, or <code>chatgpt-responses</code>. Optional <code>model_aliases</code>, <code>model_defaults</code>, and <code>model_specs</code> provide canonical model ids, limits, effort levels, capabilities, and pricing. Explicit per-model metadata wins; context hints in model names such as <code>-128k</code> and <code>[1m]</code> win over provider-wide context defaults. Built-in metadata only fills omissions, and v1 profile fields remain accepted. <code>DEXT_PROMPT_CACHE=on|off</code> overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.</p>
 <h3><code>auth.json</code> (~/.dext/auth.json)</h3>
-<p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types.</p>
+<p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types. Credential-shaped parent environment variables are removed from agent-run bash, external tools, hooks, diagnostics, and eval subprocesses unless <code>DEXT_INHERIT_TOOL_CREDENTIALS=1</code> is explicitly set.</p>
 <h3><code>DEXT.md</code> (project root)</h3>
 <p>Project-specific context injected into the system prompt. Auto-detected from the sandbox root.</p>
 <h3><code>MEMORY.md</code> (project root)</h3>
