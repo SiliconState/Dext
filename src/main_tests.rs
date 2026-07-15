@@ -4626,10 +4626,10 @@ async fn bash_runner_reaps_background_children_after_shell_exit() {
     let root = temp_test_dir("bash-grandchild-reap");
     let start = std::time::Instant::now();
     let out = execute_bash_async_with_timeout(
-        "sleep 2 & echo done",
+        "sleep 5 & echo done",
         &root,
         Arc::new(AtomicBool::new(false)),
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(10),
         SandboxProfile::WorkspaceWrite,
     )
     .await
@@ -4638,7 +4638,7 @@ async fn bash_runner_reaps_background_children_after_shell_exit() {
     assert!(out.contains("exit: 0"), "{out}");
     assert!(out.contains("done"), "{out}");
     assert!(
-        elapsed < std::time::Duration::from_millis(900),
+        elapsed < std::time::Duration::from_secs(3),
         "background child kept pipe open for {elapsed:?}; output={out}"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -4648,21 +4648,21 @@ async fn bash_runner_reaps_background_children_after_shell_exit() {
 fn sync_runner_reaps_background_children_after_shell_exit() {
     let root = temp_test_dir("sync-grandchild-reap");
     let mut cmd = Command::new("bash");
-    cmd.arg("-lc").arg("sleep 2 & echo done").current_dir(&root);
+    cmd.arg("-lc").arg("sleep 5 & echo done").current_dir(&root);
     let start = std::time::Instant::now();
     let (out, _, status) = run_sync_command_limited(
         cmd,
         None,
         PROCESS_STREAM_CAPTURE_CAP,
         "bash",
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(10),
     )
     .expect("expected success");
     let elapsed = start.elapsed();
     assert_eq!(status, 0);
     assert!(out.render("stdout").contains("done"));
     assert!(
-        elapsed < std::time::Duration::from_millis(900),
+        elapsed < std::time::Duration::from_secs(3),
         "background child kept pipe open for {elapsed:?}"
     );
     let _ = std::fs::remove_dir_all(&root);

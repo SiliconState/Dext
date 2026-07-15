@@ -1,9 +1,10 @@
 use std::fs;
+use std::hint::black_box;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use serde_json::{Value, json};
 
 const TEXT_TOOL_CAPTURE_CAP: usize = 10_000;
