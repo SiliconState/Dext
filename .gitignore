@@ -5,8 +5,6 @@
 __pycache__/
 *.py[cod]
 *:Zone.Identifier
-/autoresearch.*
-/packopt.*
 
 # Runtime/project state
 /.dext/

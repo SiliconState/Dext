@@ -96,7 +96,14 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Run release tests
+        if: runner.os != 'Windows'
         run: cargo test --release --locked --target ${{ matrix.target }}
+      - name: Run Windows release tests
+        if: runner.os == 'Windows'
+        run: cargo test --release --locked --target ${{ matrix.target }} -- --skip main_tests::fast_bash_command_returns_without_100ms_poll_tail
+      - name: Run Windows bash fast-path latency test in isolation
+        if: runner.os == 'Windows'
+        run: cargo test --release --locked --target ${{ matrix.target }} main_tests::fast_bash_command_returns_without_100ms_poll_tail -- --exact --nocapture
       - name: Run TUI smoke tests
         if: runner.os != 'Windows'
         run: cargo test --release --locked --target ${{ matrix.target }} --test tui_smoke -- --nocapture
@@ -114,8 +121,8 @@ jobs:
           COPYFILE_DISABLE=1 tar -C package -czf "dist/${archive}" dext README.md LICENSE
           tar -C verify -xzf "dist/${archive}"
           test "$(verify/dext --version)" = "dext ${version}"
-          DEXT_HOME="$PWD/verify-home" verify/dext pack inspect agent-browser \
-            | grep -F "pack: agent-browser"
+          DEXT_HOME="$PWD/verify-home" verify/dext pack list \
+            | grep -F "Packs  none found"
       - name: Package Windows archive and smoke test packaged binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -133,9 +140,9 @@ jobs:
             throw "packaged binary reported '$reported', expected 'dext $version'"
           }
           $env:DEXT_HOME = Join-Path $PWD "verify-home"
-          $pack = (& .\verify\dext.exe pack inspect agent-browser) -join "`n"
-          if (-not $pack.Contains("pack: agent-browser")) {
-            throw "packaged binary could not inspect embedded agent-browser pack"
+          $pack = (& .\verify\dext.exe pack list) -join "`n"
+          if (-not $pack.Contains("Packs  none found")) {
+            throw "packaged binary unexpectedly included pack content"
           }
       - name: Upload release archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -73,12 +73,6 @@ fn canonicalize_with_missing_ancestors(path: &Path) -> std::result::Result<PathB
 
 fn dext_global_pack_path_allowed(path: &Path) -> bool {
     let dext_home = dext_state_dir();
-    let direct_packs = canonicalize_with_missing_ancestors(&dext_home.join("packs"))
-        .unwrap_or_else(|_| canonicalize_or_clone(&dext_home.join("packs")));
-    if path.starts_with(&direct_packs) {
-        return true;
-    }
-
     let shelves = canonicalize_with_missing_ancestors(&dext_home.join("shelves"))
         .unwrap_or_else(|_| canonicalize_or_clone(&dext_home.join("shelves")));
     let Ok(relative) = path.strip_prefix(shelves) else {

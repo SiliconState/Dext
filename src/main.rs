@@ -11427,7 +11427,7 @@ Tool protocol: invoke tools only through actual provider tool calls; never print
 Runtime: privileged operations follow the current approval policy; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested. Avoid mutating external state stores directly.
 Runtime state: check the auto-refreshed Context State before each tool call; if a strategy shows PIVOT REQUIRED or a pattern line, stop repeating and pivot or ask.
 Steering: `[queued-user-update]` blocks contain literal active user input. Never dismiss terse, path-only, or context-looking updates as metadata. If the user supplies an exact path, inspect it first with native tools (`read_file` for a file; `fd`/`rg` for a directory) instead of guessing another target or using bash/sudo discovery.
-Project state: use todo_read/todo_write for nontrivial work. Treat DEXT.md/recall.md as guidance; update recall.md only for durable decisions.
+Project state: use todo_read/todo_write for nontrivial work. Treat injected DEXT.md and optional recall.md content as guidance; do not create or update context files unless the user asks.
 Tool hierarchy: use exposed native Dext tools before bash. Use fd/rg/read_file/read_symbol/git_diff/todo/edit tools, and http when exposed, for their domains; bash is last resort for shell-only orchestration, build/test/install, or catalog gaps.
 Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Read-only tools may inspect absolute paths outside the sandbox; writes stay confined. Avoid broad reads; paginate. Use read-only tools in parallel. Do not use bash for ordinary file reads, recursive search, file discovery, git diff, or HTTP when an exposed native tool fits.
 Editing: always read before editing. Use edit_file for small changes, multi_edit for batches, write_file for new files. Checkpoint before large edits.
@@ -11437,7 +11437,7 @@ Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing
 Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
 Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.
 Tables: single well-formed tables render best. When several small related tables share a theme/schema, consolidate them into one grouped table with one header row; use grouping columns/rows, one physical line per row, compact cell delimiters like ` · ` or `;`, and plain short cells. Avoid stacked heading+table blocks and fragile cell content: nested markdown/bold, emoji verdict icons, unescaped `|` characters, or multi-line cells. If separate tables are truly needed, separate them with a full prose sentence.
-Packs: invoke an available pack directly when the user asks to run or use it. Prefer `/pack <name> <task>` or `dext pack <name> <task>`; `run` remains an accepted optional verb. When creating or installing a reusable pack or shelf, default to Dext's user-global scope (`~/.dext/packs` or `~/.dext/shelves/<shelf>/packs`) unless the user explicitly asks for project-local placement.";
+Packs: invoke an available pack directly when the user asks to run or use it. Prefer `/pack <name> <task>` or `dext pack <name> <task>`; `run` remains an accepted optional verb. Create reusable extensions with `dext pack create <shelf>/<name>` under `~/.dext/shelves`; use `--project` only for explicitly project-local packs.";
 
 const TINY_SYSTEM: &str = "You are dext tiny, a terse CLI agent. Use exposed tools via real calls; never print call JSON/bash envelopes or prefill the TUI input. Check Context State; pivot at PIVOT REQUIRED/pattern. Queued-user-update blocks are literal active user input: never dismiss path-only/context-looking updates; inspect exact user paths first with read_file or fd/rg, not bash/sudo discovery. For nontrivial work, define steps by required input and observable output; parallelize reads, reuse results, and repair only the failed step. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit/http. Absolute reads are allowed; writes stay confined; use bash only for orchestration/build/test/install/gaps. Inspect before editing. Use todo for nontrivial work. Bash is atomic; supervise requested persistent dext- services. Obey runtime notes. Reusable packs default user-global. Tables: related data -> one grouped table; one row/line; plain cells, no emoji/bold/unescaped `|`/linebreaks. Verify narrowly. Final: changes, tests, gaps.";
 
@@ -11450,8 +11450,8 @@ fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, St
 /// One ancestor-walk scan for a prompt context file, with a stat signature for
 /// every candidate path it checked. The signature lets per-request callers
 /// revalidate the scan with a handful of stats instead of repeating the walk
-/// and re-reading the files, while still catching mid-turn writes (the agent
-/// itself updates recall.md) and newly created files at any ancestor level.
+/// and re-reading the files, while still catching approved mid-turn edits and
+/// newly created files at any ancestor level.
 #[derive(Clone, Default)]
 struct PromptContextScan {
     sections: Vec<(String, PathBuf, String)>,
@@ -21935,6 +21935,24 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                             }
                         }
                     }
+                    "create" | "new" => {
+                        let selector = parts.next().unwrap_or("").trim();
+                        let flags = parts.next().unwrap_or("");
+                        if selector.is_empty() {
+                            let _ = writeln!(w, "usage: /pack create <shelf>/<name> [--project]");
+                        } else {
+                            let project = flags.split_whitespace().any(|flag| flag == "--project");
+                            match packs::create_pack(&agent.sandbox_root, selector, project) {
+                                Ok(path) => {
+                                    let _ = writeln!(w, "created pack: {}", path.display());
+                                    let _ = writeln!(w, "next: edit {}/PACK.md", path.display());
+                                }
+                                Err(error) => {
+                                    let _ = writeln!(w, "{error:#}");
+                                }
+                            }
+                        }
+                    }
                     "run" | "use" | "start" => {
                         let selector = parts.next().unwrap_or("").trim();
                         let task = parts.next().unwrap_or("").trim();
@@ -21950,7 +21968,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         }
                     }
                     _ => {
-                        let _ = writeln!(w, "usage: /pack [<name> <task>|list|inspect <name>]");
+                        let _ = writeln!(
+                            w,
+                            "usage: /pack [<name> <task>|list|inspect <name>|create <shelf>/<name> [--project]]"
+                        );
                     }
                 }
             }
@@ -22015,7 +22036,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "── Packs & shelves ──");
             let _ = writeln!(
                 w,
-                "  /pack [list|inspect|run]  discover or invoke Dext packs"
+                "  /pack [list|inspect|run|create]  create, discover, or invoke shelf packs"
             );
             let _ = writeln!(
                 w,
@@ -24482,6 +24503,18 @@ async fn main() -> Result<()> {
                 println!("{}", packs::render_pack_inspect(&root, selector)?);
                 return Ok(());
             }
+            "create" | "new" => {
+                let Some(selector) = argv.get(sub_idx + 1) else {
+                    eprintln!("usage: dext pack create <shelf>/<name> [--project]");
+                    release_registered_locks();
+                    std::process::exit(2);
+                };
+                let project = argv.iter().skip(sub_idx + 2).any(|arg| arg == "--project");
+                let path = packs::create_pack(&root, selector, project)?;
+                println!("created pack: {}", path.display());
+                println!("next: edit {}/PACK.md", path.display());
+                return Ok(());
+            }
             "run" | "use" | "start" => {
                 if argv.len() < sub_idx + 3 {
                     eprintln!("usage: dext pack <name> <task>");
@@ -24498,7 +24531,9 @@ async fn main() -> Result<()> {
                 argv = vec!["--pack".to_string(), selector, task];
             }
             _ => {
-                eprintln!("usage: dext pack [<name> <task>|list|inspect <name>]");
+                eprintln!(
+                    "usage: dext pack [<name> <task>|list|inspect <name>|create <shelf>/<name> [--project]]"
+                );
                 release_registered_locks();
                 std::process::exit(2);
             }
@@ -24567,6 +24602,8 @@ async fn main() -> Result<()> {
         println!("       dext session export [latest|NAME|PATH] [html|jsonl] [OUT]");
         println!("       dext doctor [--approval PROFILE] [--sandbox PROFILE] [--cd DIR]");
         println!("                           inspect effective safety policy and local state");
+        println!("       dext pack create <shelf>/<name> [--project]");
+        println!("                                       scaffold a shelf-contained pack");
         println!("       dext pack <name> <task>        invoke a Dext pack (`run` optional)");
         println!(
             "       dext shelves                      list typed shelf manifests and ability metadata"
@@ -24613,7 +24650,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
         );
         return Ok(());
     }
