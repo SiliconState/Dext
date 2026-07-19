@@ -155,7 +155,8 @@
   declared credential values to hooks.
 - Shelf context aggregation now enforces the total byte budget, including
   separators and UTF-8-safe ellipses.
-- Windows CI and release jobs now run the remaining release tests serially to
-  prevent shared process/environment fixtures from racing and poisoning their
-  common lock. The scheduler-sensitive bash fast-path latency regression then
-  runs alone with its original `<90 ms` assertion unchanged.
+- Windows CI and release jobs now run the scheduler-sensitive bash fast-path
+  latency regression alone after the remaining release tests. Its original
+  `<90 ms` assertion remains unchanged.
+- The tool-call mock provider now consumes its bounded request body before
+  responding, preventing Windows resets caused by unread HTTP request data.

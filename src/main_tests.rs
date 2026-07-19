@@ -183,9 +183,30 @@ fn spawn_openai_tool_call_server(
             .expect("set tool-call request timeout");
         let mut request = Vec::new();
         let mut buf = [0u8; 1024];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let header_end = loop {
             let read = stream.read(&mut buf).expect("read tool-call request");
             assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&buf[..read]);
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        assert!(
+            content_length <= 1024 * 1024,
+            "tool-call request body too large"
+        );
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buf).expect("read tool-call request body");
+            assert!(read > 0, "client closed before request body completed");
             request.extend_from_slice(&buf[..read]);
         }
         let response = format!(

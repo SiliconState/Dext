@@ -36,9 +36,9 @@ jobs:
       - name: Run release tests
         if: runner.os != 'Windows'
         run: cargo test --release --locked
-      - name: Run Windows release tests serially
+      - name: Run Windows release tests
         if: runner.os == 'Windows'
-        run: cargo test --release --locked -- --test-threads=1 --skip main_tests::fast_bash_command_returns_without_100ms_poll_tail
+        run: cargo test --release --locked -- --skip main_tests::fast_bash_command_returns_without_100ms_poll_tail
       - name: Run Windows bash fast-path latency test in isolation
         if: runner.os == 'Windows'
         run: cargo test --release --locked main_tests::fast_bash_command_returns_without_100ms_poll_tail -- --exact --nocapture
