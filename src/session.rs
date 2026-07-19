@@ -2,14 +2,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::{
     DEFAULT_SYSTEM, LATEST_LOG_ARCHIVE_MAX, LATEST_LOG_CAP, LATEST_SESSION_NAME, LOG_DETAIL_CAP,
-    SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort, byte_prefix_at_char_boundary,
-    byte_suffix_at_char_boundary, cap_bytes_with_hint,
+    SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort,
+    byte_prefix_at_char_boundary, byte_suffix_at_char_boundary, cap_bytes_with_hint,
 };
 
 pub(crate) fn user_home_dir() -> PathBuf {
@@ -37,33 +36,60 @@ pub(crate) fn dext_state_dir() -> PathBuf {
 }
 
 fn canonicalize_with_missing_ancestors(path: &Path) -> std::result::Result<PathBuf, String> {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return Ok(canonical);
-    }
-
     let mut missing = Vec::new();
     let mut current = path;
     loop {
-        let name = current.file_name().ok_or("path has no filename")?;
-        missing.push(name.to_os_string());
-        let parent = current.parent().ok_or("path has no parent")?;
-        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
-            let mut resolved = canonical_parent;
-            for segment in missing.iter().rev() {
-                resolved.push(segment);
+        match std::fs::symlink_metadata(current) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(current).map_err(|error| {
+                    format!(
+                        "cannot resolve existing path component {}: {error}",
+                        current.display()
+                    )
+                })?;
+                for segment in missing.iter().rev() {
+                    resolved.push(segment);
+                }
+                return Ok(resolved);
             }
-            return Ok(resolved);
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = current.file_name().ok_or_else(|| {
+                    format!("path has no resolvable filename: {}", current.display())
+                })?;
+                missing.push(name.to_os_string());
+                current = current
+                    .parent()
+                    .ok_or_else(|| format!("path has no parent: {}", current.display()))?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect path component {}: {error}",
+                    current.display()
+                ));
+            }
         }
-        current = parent;
     }
 }
 
-fn dext_global_pack_roots() -> Vec<PathBuf> {
+fn dext_global_pack_path_allowed(path: &Path) -> bool {
     let dext_home = dext_state_dir();
-    [dext_home.join("packs"), dext_home.join("shelves")]
-        .into_iter()
-        .map(|path| canonicalize_or_clone(&path))
-        .collect()
+    let direct_packs = canonicalize_with_missing_ancestors(&dext_home.join("packs"))
+        .unwrap_or_else(|_| canonicalize_or_clone(&dext_home.join("packs")));
+    if path.starts_with(&direct_packs) {
+        return true;
+    }
+
+    let shelves = canonicalize_with_missing_ancestors(&dext_home.join("shelves"))
+        .unwrap_or_else(|_| canonicalize_or_clone(&dext_home.join("shelves")));
+    let Ok(relative) = path.strip_prefix(shelves) else {
+        return false;
+    };
+    let mut components = relative.components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && matches!(
+            components.next(),
+            Some(std::path::Component::Normal(component)) if component == "packs"
+        )
 }
 
 pub(crate) fn canonicalize_read_tool_path(
@@ -92,11 +118,7 @@ pub(crate) fn canonicalize_tool_path(
         root.join(expanded)
     };
     let canonical = canonicalize_with_missing_ancestors(&candidate)?;
-    if canonical.starts_with(&root)
-        || dext_global_pack_roots()
-            .into_iter()
-            .any(|allowed| canonical.starts_with(&allowed))
-    {
+    if canonical.starts_with(&root) || dext_global_pack_path_allowed(&canonical) {
         Ok(canonical)
     } else {
         Err(format!(
@@ -123,13 +145,8 @@ pub(crate) fn canonicalize_or_clone(path: &Path) -> PathBuf {
 }
 
 fn git_toplevel(root: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let out = crate::run_internal_git_command(root, &["rev-parse", "--show-toplevel"]).ok()?;
+    if !out.success() {
         return None;
     }
     let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -262,10 +279,12 @@ pub(crate) fn session_artifacts_dir(root: &Path, session_id: &str) -> PathBuf {
     session_state_dir(root, session_id).join("artifacts")
 }
 
+#[cfg(unix)]
 pub(crate) fn session_sudo_dir(root: &Path, session_id: &str) -> PathBuf {
     session_state_dir(root, session_id).join("sudo")
 }
 
+#[cfg(unix)]
 pub(crate) fn session_git_auth_dir(root: &Path, session_id: &str) -> PathBuf {
     session_state_dir(root, session_id).join("git-auth")
 }
@@ -841,18 +860,41 @@ pub(crate) fn render_limited_lines(
 }
 
 pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
-    if let Ok(mut header) = serde_json::from_str::<SessionHeader>(line) {
-        if !line.contains("\"context_mode_explicit\"")
-            && header.context_mode != crate::ContextMode::Standard
-        {
-            header.context_mode_explicit = true;
-        }
-        return Ok(header);
+    let meta: serde_json::Value = serde_json::from_str(line).context("bad session header")?;
+    let object = meta
+        .as_object()
+        .context("session header must be a JSON object")?;
+    let source_version = match object.get("version") {
+        None => 1,
+        Some(value) => value
+            .as_u64()
+            .and_then(|version| u32::try_from(version).ok())
+            .context("session header version must be a positive integer")?,
+    };
+    if source_version == 0 || source_version > SESSION_FORMAT_VERSION {
+        anyhow::bail!(
+            "unsupported session format version {source_version} (supported: 1-{SESSION_FORMAT_VERSION})"
+        );
     }
 
-    let meta: serde_json::Value = serde_json::from_str(line).context("bad session header")?;
+    match serde_json::from_value::<SessionHeader>(meta.clone()) {
+        Ok(mut header) => {
+            if !object.contains_key("context_mode_explicit")
+                && header.context_mode != crate::ContextMode::Standard
+            {
+                header.context_mode_explicit = true;
+            }
+            header.version = SESSION_FORMAT_VERSION;
+            return Ok(header);
+        }
+        Err(error) if source_version == SESSION_FORMAT_VERSION => {
+            return Err(error).context("invalid current session header");
+        }
+        Err(_) => {}
+    }
+
     Ok(SessionHeader {
-        version: meta["version"].as_u64().unwrap_or(1) as u32,
+        version: SESSION_FORMAT_VERSION,
         model: meta["model"].as_str().unwrap_or("glm-5.2[1m]").to_string(),
         system: meta["system"]
             .as_str()
@@ -907,6 +949,8 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .as_str()
             .and_then(crate::ApprovalProfile::parse)
             .unwrap_or_default(),
+        approval_policy_source: serde_json::from_value(meta["approval_policy_source"].clone())
+            .unwrap_or_default(),
         sandbox_profile: meta["sandbox_profile"]
             .as_str()
             .and_then(crate::SandboxProfile::parse)
@@ -916,10 +960,6 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         } else {
             serde_json::from_value(meta["budget_cap"].clone()).ok()
         },
-        browser_recipe: meta["browser_recipe"]
-            .as_str()
-            .and_then(crate::BrowserRecipe::parse)
-            .unwrap_or_default(),
         context_mode: meta["context_mode"]
             .as_str()
             .and_then(crate::ContextMode::parse)

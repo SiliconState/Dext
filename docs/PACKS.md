@@ -26,6 +26,7 @@ my-pack/
 ---
 name: my-pack
 description: What this pack does. Shown in pack listings.
+credential-env: [SERVICE_TOKEN] # optional; exact helper-only credential names
 ---
 
 # My pack
@@ -40,6 +41,7 @@ Front matter fields:
 |-------|----------|-------------|
 | `name` | no | Pack identifier. Defaults to directory name. |
 | `description` | no | One-line description for listings. |
+| `credential-env` | no | Comma-separated inline list of credential-shaped environment names required by this pack's own native `bin/` helper. Honored only for explicitly selected environment, user-global, and bundled pack sources; project-local declarations are ignored. Values are never added to prompts, hooks, logs, or sessions. Provider auth names are excluded. On Windows only `.exe`/`.com` helpers qualify; scripts run through Bash with declared credentials removed. |
 
 ### Discovery
 
@@ -53,7 +55,7 @@ Dext searches for packs in this precedence order. First match wins:
 6. `DEXT_PACKS_DIR` entries
 7. User `~/.dext/shelves/<shelf>/packs/<name>/`
 8. User `~/.dext/packs/<name>/`
-9. Bundled packs in the Dext repository
+9. Embedded bundled packs, materialized and byte-verified under `$DEXT_HOME/bundled-packs/<content-hash>/`. Existing `DEXT_HOME` ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix and reject symlink components.
 
 For reusable packs, default to user-global Dext scope: `~/.dext/packs/<name>/` for legacy packs or `~/.dext/shelves/<shelf>/packs/<name>/` for shelf packs. Use the project-local entries above only when the user explicitly asks for a repo-specific pack.
 
@@ -82,7 +84,7 @@ Conversational invocation works when the message clearly references a known pack
 run autoresearch on improving this benchmark
 ```
 
-When a pack runs, Dext reads `PACK.md` as the initial agent context and activates that pack for the current session. It passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so helper commands can use `$DEXT_PACK_DIR/bin/helper.py`. If the pack has `phooks.json`, Dext adds those hooks to the session; changing the sandbox root clears active pack hooks and environment.
+When a pack runs, Dext reads `PACK.md` as the initial agent context and activates that pack for the current session. It passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so helper commands can use `$DEXT_PACK_DIR/bin/helper.py`. An explicitly selected environment, user-global, or bundled pack may declare exact credential names in the inline `credential-env` front-matter list; matching inherited values are preserved only for a simple direct invocation of that active pack's own native `bin/` helper. On Windows only `.exe`/`.com` helpers qualify for direct credential inheritance; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and `/pack inspect` reports that restriction, so repository content cannot opt into parent credential inheritance. Credential values remain scrubbed from hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, and sessions, and provider-auth environment names are never eligible. If the pack has `phooks.json`, Dext adds those hooks to the session; changing the sandbox root clears active pack hooks and environment.
 
 ### Building a pack
 
@@ -207,19 +209,22 @@ Shelf metadata is injected into the model context as typed ability records, not 
 
 ## Reference example
 
-The bundled `autoresearch` pack implements an autonomous experiment loop, and `packopt` applies a SkillOpt-style loop to pack/skill documents. They ship in the repository as bundled examples, but reusable installations should normally go into user-global Dext scope (`~/.dext/...`) so they are callable from any project:
+The bundled `autoresearch` pack implements an autonomous experiment loop, `packopt` applies a SkillOpt-style loop to pack/skill documents, and `agent-browser` wraps the upstream Rust browser CLI without adding a provider-visible tool. Runtime-essential files for these packs are embedded in the Dext binary and materialized into a content-addressed `$DEXT_HOME/bundled-packs/` cache. Existing state-directory ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix, reject symlink components, and repair altered files/modes from embedded bytes. Cache failures are surfaced while project/user packs remain available. The repository copies remain the editable sources. Reusable custom installations should normally go into user-global Dext scope (`~/.dext/...`) so they are callable from any project:
 
 - `packs/autoresearch/PACK.md` — autoresearch workflow document
 - `packs/autoresearch/bin/autoresearch.py` — autoresearch helper script
 - `packs/autoresearch/phooks.json` — autoresearch steering hooks
 - `packs/packopt/PACK.md` — bounded-edit pack/skill optimization workflow
 - `packs/packopt/bin/packopt.py` — validation/log/rejected-memory helper
+- `packs/agent-browser/PACK.md` — rendered-page browser workflow and safety contract
+- `packs/agent-browser/bin/agent-browser` — bounded launcher for the upstream native Rust CLI
 
 Run it:
 
 ```bash
 dext pack run autoresearch "optimize the benchmark in this repo"
 dext pack run packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
+dext pack run agent-browser "inspect https://example.com"
 ```
 
 Inspect it to see a full pack structure:
@@ -227,4 +232,5 @@ Inspect it to see a full pack structure:
 ```bash
 dext pack inspect autoresearch
 dext pack inspect packopt
+dext pack inspect agent-browser
 ```

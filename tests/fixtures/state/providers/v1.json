@@ -1,0 +1,1 @@
+{"version":1,"active_provider":"local","providers":[{"id":"local","display_name":"Local fixture","api_provider":"openai","base_url":"http://127.0.0.1:8080/v1","default_model":"fixture-model","models":["fixture-model"],"env_vars":[],"requires_api_key":false}]}

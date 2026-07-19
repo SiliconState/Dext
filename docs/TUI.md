@@ -1,0 +1,78 @@
+# Terminal UI
+
+Dext's interactive interface is an inline Ratatui application in the regular terminal buffer. It preserves native terminal scrollback instead of taking over the alternate screen. The backend viewer is the only alternate-screen surface.
+
+## Behavior contract
+
+TUI and dependency changes must preserve these behaviors:
+
+- The main interface remains an inline viewport in the regular terminal buffer.
+- Completed transcript output remains in native terminal scrollback.
+- The settled banner, transcript, composer, status rows, expansion state, spacing, and styling do not change merely because dependencies changed.
+- Input and the viewport remain responsive while output streams and while the terminal is resized.
+- Resize replay is cohesive: no item-by-item reconstruction, whole-screen flash, cursor-query stall, or cursor-query timeout.
+- The backend viewer remains the only alternate-screen surface.
+
+A dependency update that violates this contract is rejected even if it compiles and unit tests pass.
+
+## Dependency stack
+
+The renderer dependencies are exact so unrelated lockfile refreshes cannot change terminal behavior:
+
+- `ratatui = 0.30.2`
+- `ratatui-core = 0.1.2`
+- `tui-markdown = 0.3.8`
+- `crossterm = 0.29.0`
+- `unicode-width = 0.2.2`
+
+## Ratatui compatibility patch
+
+Unmodified Ratatui 0.30.2 regressed Dext's inline experience. Its fallback `insert_before` path called the public `Terminal::clear`, which synchronously queried the terminal cursor. Crossterm serves that query through the same global event reader used by Dext's input thread, multiplying terminal round trips during transcript insertion and resize. Horizontal shrink also cleared the entire visible display, exposing replay as a flash.
+
+Enabling Ratatui's `scrolling-regions` feature was rejected because it changed settled rendering and expanded the backend dependency graph.
+
+Dext patches the exact upstream `ratatui-core 0.1.2` source through `[patch.crates-io]`. The patch is limited to three inline-terminal corrections:
+
+1. `Terminal::clear` preserves Ratatui's tracked cursor position instead of synchronously querying the backend.
+2. Fallback `insert_before` clears the viewport directly rather than calling the cursor-preserving public clear.
+3. Horizontal shrink avoids `ClearType::All` for inline viewports; the normal viewport clear and full next draw remain in place.
+
+The vendored source and hunk-level rationale live under `vendor/ratatui-core/`. This is a narrow compatibility patch, not a renderer fork. Remove it when a released upstream version satisfies the same regression gate without changing settled behavior.
+
+## Regression coverage
+
+Run the complete renderer gate after any TUI or terminal dependency change:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
+cargo audit --deny warnings
+cargo test -p ratatui-core --lib --locked
+cargo build --release --locked
+cargo test --release --locked
+cargo test --release --locked --test tui_smoke -- --nocapture
+```
+
+The PTY smoke suite exercises the real binary and requires:
+
+- banner and composer visibility at narrow and wide sizes;
+- editable input during live streaming;
+- process survival and responsive input through a populated-history resize burst;
+- zero whole-screen clears during inline resize;
+- cursor queries bounded by resize events rather than transcript size;
+- terminal-height-bounded replay chunks;
+- completed stream output and accepted input after resize, with a bounded 10-second completion wait so slower macOS CI hosts do not create false negatives.
+
+Before releasing a renderer/backend update, also perform a live WSL2 check because ConPTY latency and perceptual flicker cannot be fully modeled by the Linux PTY. Resize a populated streaming session repeatedly and reject any visible replay, flash, input stall, scrollback loss, or mode-switching change. Native Linux and tmux checks are also recommended when terminal behavior changes.
+
+## Dependency maintenance
+
+1. Change only the TUI dependency set and lockfile.
+2. Run the unmodified stack against the focused PTY resize test.
+3. If it fails, identify the smallest upstream boundary; do not compensate with a UI redesign.
+4. Prefer a released upstream fix. Otherwise refresh the exact vendored crate and reapply only the still-required patch.
+5. Run the complete renderer gate and live terminal checks.
+6. Compare the vendored patch with upstream and document each remaining hunk in `vendor/ratatui-core/DEXT_PATCH.md`.
+7. Remove obsolete patch hunks immediately when upstream behavior passes the gate.
+
+Performance changes such as stream burst coalescing require measured CPU/output evidence and must preserve immediate first paint after idle. They are separate from dependency maintenance.

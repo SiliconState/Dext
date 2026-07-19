@@ -85,7 +85,7 @@ $PYTHON "$PACK/bin/autoresearch.py" --cwd . scaffold \
 ## Setup workflow for Dext
 
 1. **Use the real project root as cwd.** Run helper commands with `--cwd <project-root>` and keep `autoresearch.*` artifacts in that root. If this pack is invoked from inside another pack/skill optimization, do not mix artifact families: `autoresearch.*` belongs to the measured project, while `packopt.*` or other optimizer artifacts belong to their own session.
-2. **Use browser automation if web research is needed.** When Dext exposes the `browser` tool, start with browser args `['skills','get','core','--full']`, then inspect pages with `['open', URL]`, `['snapshot']`, and `['get','text']`. If the browser tool is unavailable, ask before falling back to manual web commands.
+2. **Use the right web path.** Prefer Dext's native `http` tool for static documentation and text extraction. Rendered interaction belongs to the bundled `agent-browser` pack in a separate pack invocation; do not assume a native `browser` tool or runtime recipe exists. If the current run lacks an active browser helper, ask before falling back to manual browser commands.
 3. **Infer or ask once** for goal, benchmark command, primary metric/direction, files in scope, and constraints. If the user already supplied enough context, proceed.
 4. **Inspect the source deeply before changes.** Read the benchmark, hot files, configs, and existing tests. Do not start random edits.
 5. **Create a branch** named `autoresearch/<slug>-<date>` unless the user asks to reuse the current branch. If the project is not a git repository, do not block: record that limitation in `autoresearch.md`, avoid destructive edits, and use explicit file backups or patches for rollback.

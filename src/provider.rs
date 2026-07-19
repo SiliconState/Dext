@@ -4,7 +4,7 @@ use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -164,9 +164,13 @@ pub(crate) struct ResolvedModelSpec {
 
 const PROVIDER_CATALOG_VERSION: u32 = 2;
 const AUTH_STORE_VERSION: u32 = 1;
+const STATE_INSPECTION_MAX_BYTES: u64 = 1024 * 1024;
 pub(crate) const DEFAULT_LOCAL_MODEL: &str = "qwen3.6-35b-a3b-mtp-ud-q5_k_m";
 const LLAMA_CONTEXT_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(700);
 const LLAMA_CONTEXT_DISCOVERY_PATHS: &[&str] = &["/props", "/slots", "/v1/models", "/models"];
+
+const KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding";
+const KIMI_BUILTIN_PROFILE_MARKER: &str = "kimi-code";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OAuthFlow {
@@ -185,6 +189,8 @@ pub(crate) struct OAuthFlow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProviderProfile {
     pub(crate) id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) builtin: Option<String>,
     #[serde(default)]
     pub(crate) display_name: String,
     pub(crate) api_provider: ApiProvider,
@@ -240,6 +246,37 @@ pub(crate) fn default_provider_catalog_version() -> u32 {
     PROVIDER_CATALOG_VERSION
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderCatalogIntegrity {
+    Missing,
+    Valid {
+        version: u32,
+        legacy: bool,
+    },
+    InvalidSchema,
+    UnsupportedVersion {
+        version: u32,
+    },
+    Symlink,
+    NonRegular,
+    #[cfg(unix)]
+    UnsafeOwner,
+    #[cfg(unix)]
+    UnsafeMode {
+        mode: u32,
+    },
+    Unreadable,
+    TooLarge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderCatalogInspection {
+    pub(crate) path: PathBuf,
+    pub(crate) integrity: ProviderCatalogIntegrity,
+    pub(crate) active_provider: Option<String>,
+    pub(crate) provider_count: Option<usize>,
+}
+
 pub(crate) fn default_active_provider() -> String {
     "glm".to_string()
 }
@@ -280,6 +317,45 @@ pub(crate) fn default_auth_store_version() -> u32 {
     AUTH_STORE_VERSION
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthStoreFileSecurity {
+    Missing,
+    #[cfg(unix)]
+    Secure {
+        mode: u32,
+    },
+    #[cfg(unix)]
+    UnsafeMode {
+        mode: u32,
+    },
+    Symlink,
+    NonRegular,
+    #[cfg(unix)]
+    UnsafeOwner,
+    Unreadable,
+    #[cfg(windows)]
+    WindowsAclNotEvaluated,
+    #[cfg(not(any(unix, windows)))]
+    PermissionsNotEvaluated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthStoreIntegrity {
+    NotChecked,
+    Valid { version: u32, legacy: bool },
+    InvalidSchema,
+    UnsupportedVersion { version: u32 },
+    Unreadable,
+    TooLarge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthStoreInspection {
+    pub(crate) path: PathBuf,
+    pub(crate) security: AuthStoreFileSecurity,
+    pub(crate) integrity: AuthStoreIntegrity,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedProviderConfig {
     pub(crate) profile: ProviderProfile,
@@ -304,6 +380,7 @@ pub(crate) fn canonical_provider_id(raw: &str) -> String {
         "openai-codex" | "codex-openai" | "codex" => "chatgpt".to_string(),
         "chatgpt-plus" | "chatgpt-pro" => "chatgpt".to_string(),
         "claude" => "anthropic".to_string(),
+        "kimi-code" | "kimi-coding" | "kimi-membership" => "kimi".to_string(),
         "llama" | "llama.cpp" | "llamacpp" | "qwen" => "local".to_string(),
         other => other.to_string(),
     }
@@ -320,10 +397,47 @@ fn model_pricing(input: f64, output: f64, cache_read: f64, cache_create: f64) ->
     }
 }
 
+fn gpt_5_6_model_specs(include_unsuffixed_alias: bool) -> HashMap<String, ModelSpec> {
+    let spec = |pricing: ModelPricing| ModelSpec {
+        context_window: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        effort_levels: vec![
+            "none".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+            "xhigh".to_string(),
+        ],
+        capabilities: ModelCapabilities {
+            tools: Some(true),
+            reasoning: Some(true),
+            image_input: Some(true),
+            prompt_cache: Some(true),
+        },
+        pricing: Some(pricing),
+    };
+    let sol = spec(model_pricing(5.0, 30.0, 0.5, 6.25));
+    let mut specs = HashMap::from([
+        ("gpt-5.6-sol".to_string(), sol.clone()),
+        (
+            "gpt-5.6-terra".to_string(),
+            spec(model_pricing(2.5, 15.0, 0.25, 3.125)),
+        ),
+        (
+            "gpt-5.6-luna".to_string(),
+            spec(model_pricing(1.0, 6.0, 0.1, 1.25)),
+        ),
+    ]);
+    if include_unsuffixed_alias {
+        specs.insert("gpt-5.6".to_string(), sol);
+    }
+    specs
+}
+
 fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing> {
     let model = model.to_ascii_lowercase();
     match canonical_provider_id(provider_id).as_str() {
-        "local" => Some(model_pricing(0.0, 0.0, 0.0, 0.0)),
+        "local" | "kimi" => Some(model_pricing(0.0, 0.0, 0.0, 0.0)),
         "glm" => Some(model_pricing(1.0, 5.0, 0.1, 1.25)),
         "deepseek" if model.contains("reasoner") => Some(model_pricing(0.55, 2.19, 0.14, 0.55)),
         "deepseek" if model.contains("chat") => Some(model_pricing(0.27, 1.1, 0.07, 0.27)),
@@ -339,6 +453,16 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
             Some(model_pricing(1.0, 5.0, 0.1, 1.25))
         }
         "anthropic" if model.contains("haiku") => Some(model_pricing(0.8, 4.0, 0.08, 1.0)),
+        "openai" | "chatgpt" if model.starts_with("gpt-5.6-sol") => {
+            Some(model_pricing(5.0, 30.0, 0.5, 6.25))
+        }
+        "openai" | "chatgpt" if model == "gpt-5.6" => Some(model_pricing(5.0, 30.0, 0.5, 6.25)),
+        "openai" | "chatgpt" if model.starts_with("gpt-5.6-terra") => {
+            Some(model_pricing(2.5, 15.0, 0.25, 3.125))
+        }
+        "openai" | "chatgpt" if model.starts_with("gpt-5.6-luna") => {
+            Some(model_pricing(1.0, 6.0, 0.1, 1.25))
+        }
         "openai" | "chatgpt" if model.starts_with("gpt-5.4-mini") => {
             Some(model_pricing(0.25, 2.0, 0.025, 0.25))
         }
@@ -381,7 +505,9 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
     for profile in profiles {
         let provider_id = canonical_provider_id(&profile.id);
         let contract = request_contract_for_profile(profile);
-        profile.model_defaults.max_output_tokens = Some(8_192);
+        if profile.model_defaults.max_output_tokens.is_none() {
+            profile.model_defaults.max_output_tokens = Some(8_192);
+        }
         profile.model_defaults.capabilities = ModelCapabilities {
             tools: Some(true),
             reasoning: Some(true),
@@ -417,6 +543,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
     let mut profiles = vec![
         ProviderProfile {
             id: "glm".to_string(),
+            builtin: None,
             display_name: "ZAI GLM".to_string(),
             api_provider: ApiProvider::Anthropic,
             base_url: "https://api.z.ai/api/anthropic".to_string(),
@@ -459,12 +586,15 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
         },
         ProviderProfile {
             id: "chatgpt".to_string(),
+            builtin: None,
             display_name: "ChatGPT".to_string(),
             api_provider: ApiProvider::ChatGpt,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             default_model: "gpt-5.4".to_string(),
             models: vec![
                 "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-5.6-luna".to_string(),
                 "gpt-5.4".to_string(),
                 "gpt-5.4-mini".to_string(),
                 "gpt-5.5".to_string(),
@@ -511,15 +641,20 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "gpt-5.6-sol".to_string(),
             )]),
             model_defaults: ModelSpec::default(),
-            model_specs: HashMap::new(),
+            model_specs: gpt_5_6_model_specs(false),
         },
         ProviderProfile {
             id: "openai".to_string(),
+            builtin: None,
             display_name: "OpenAI API".to_string(),
             api_provider: ApiProvider::OpenAi,
             base_url: "https://api.openai.com".to_string(),
             default_model: "gpt-5".to_string(),
             models: vec![
+                "gpt-5.6".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-5.6-luna".to_string(),
                 "gpt-5".to_string(),
                 "gpt-5-mini".to_string(),
                 "gpt-4.1".to_string(),
@@ -534,7 +669,10 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             requires_api_key: true,
             login_url: Some("https://platform.openai.com/api-keys".to_string()),
             oauth_flow: None,
-            notes: Some("Use an OpenAI Platform API key (not ChatGPT OAuth).".to_string()),
+            notes: Some(
+                "Use an OpenAI Platform API key (not ChatGPT OAuth). GPT-5.6 is the official alias for GPT-5.6 Sol."
+                    .to_string(),
+            ),
             context_window: Some(400_000),
             model_context_windows: {
                 let mut m = HashMap::new();
@@ -548,10 +686,11 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             request_contract: Some(RequestContract::OpenAiChatCompletions),
             model_aliases: HashMap::new(),
             model_defaults: ModelSpec::default(),
-            model_specs: HashMap::new(),
+            model_specs: gpt_5_6_model_specs(true),
         },
         ProviderProfile {
             id: "anthropic".to_string(),
+            builtin: None,
             display_name: "Anthropic".to_string(),
             api_provider: ApiProvider::Anthropic,
             base_url: "https://api.anthropic.com".to_string(),
@@ -582,7 +721,63 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             model_specs: HashMap::new(),
         },
         ProviderProfile {
+            id: "kimi".to_string(),
+            builtin: Some(KIMI_BUILTIN_PROFILE_MARKER.to_string()),
+            display_name: "Kimi Code".to_string(),
+            api_provider: ApiProvider::Anthropic,
+            base_url: KIMI_CODE_BASE_URL.to_string(),
+            default_model: "k3".to_string(),
+            models: vec![
+                "k3".to_string(),
+                "k2p7".to_string(),
+                "kimi-for-coding".to_string(),
+                "kimi-for-coding-highspeed".to_string(),
+                "kimi-k2-thinking".to_string(),
+            ],
+            env_vars: vec!["KIMI_API_KEY".to_string()],
+            requires_api_key: true,
+            login_url: Some("https://www.kimi.com/code/console".to_string()),
+            oauth_flow: None,
+            notes: Some(
+                "Kimi Code plan provider. /login kimi opens the Kimi Code console to create an API key; KIMI_API_KEY is not the separately billed MOONSHOT_API_KEY."
+                    .to_string(),
+            ),
+            context_window: Some(262_144),
+            model_context_windows: HashMap::from([("k3".to_string(), 1_048_576)]),
+            model_effort_levels: HashMap::from([("k3".to_string(), vec!["max".to_string()])]),
+            request_contract: Some(RequestContract::AnthropicMessages),
+            model_aliases: HashMap::new(),
+            model_defaults: ModelSpec {
+                context_window: Some(262_144),
+                max_output_tokens: Some(32_768),
+                effort_levels: Vec::new(),
+                capabilities: ModelCapabilities {
+                    tools: Some(true),
+                    reasoning: Some(true),
+                    image_input: Some(true),
+                    prompt_cache: None,
+                },
+                pricing: None,
+            },
+            model_specs: HashMap::from([(
+                "k3".to_string(),
+                ModelSpec {
+                    context_window: Some(1_048_576),
+                    max_output_tokens: Some(131_072),
+                    effort_levels: vec!["max".to_string()],
+                    capabilities: ModelCapabilities {
+                        tools: Some(true),
+                        reasoning: Some(true),
+                        image_input: Some(true),
+                        prompt_cache: None,
+                    },
+                    pricing: None,
+                },
+            )]),
+        },
+        ProviderProfile {
             id: "deepseek".to_string(),
+            builtin: None,
             display_name: "DeepSeek".to_string(),
             api_provider: ApiProvider::OpenAi,
             base_url: "https://api.deepseek.com".to_string(),
@@ -603,6 +798,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
         },
         ProviderProfile {
             id: "local".to_string(),
+            builtin: None,
             display_name: "Local llama.cpp".to_string(),
             api_provider: ApiProvider::OpenAi,
             base_url: "http://127.0.0.1:8080".to_string(),
@@ -773,6 +969,9 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     if profile.id.trim().is_empty() {
         return None;
     }
+    profile.builtin = (profile.id == "kimi"
+        && profile.builtin.as_deref() == Some(KIMI_BUILTIN_PROFILE_MARKER))
+    .then(|| KIMI_BUILTIN_PROFILE_MARKER.to_string());
 
     let fallback_model = if profile.id == "local" {
         DEFAULT_LOCAL_MODEL
@@ -972,7 +1171,21 @@ pub(crate) fn merge_provider_profile(
     builtin
 }
 
-pub(crate) fn normalize_provider_catalog(mut catalog: ProviderCatalog) -> ProviderCatalog {
+fn validate_kimi_profile_provenance(catalog: &ProviderCatalog) -> Result<()> {
+    if let Some(profile) = catalog.providers.iter().find(|profile| {
+        canonical_provider_id(&profile.id) == "kimi"
+            && profile.builtin.as_deref() != Some(KIMI_BUILTIN_PROFILE_MARKER)
+    }) {
+        anyhow::bail!(
+            "provider id '{}' conflicts with the built-in Kimi Code provider; rename the custom profile before upgrading (reserved ids: kimi, kimi-code, kimi-coding, kimi-membership)",
+            profile.id
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_provider_catalog(mut catalog: ProviderCatalog) -> Result<ProviderCatalog> {
+    validate_kimi_profile_provenance(&catalog)?;
     let legacy_catalog = catalog.version < PROVIDER_CATALOG_VERSION;
     let mut stored_by_id: HashMap<String, ProviderProfile> = HashMap::new();
     let mut providers: Vec<ProviderProfile> = Vec::new();
@@ -1039,11 +1252,11 @@ pub(crate) fn normalize_provider_catalog(mut catalog: ProviderCatalog) -> Provid
             .unwrap_or_else(default_active_provider)
     };
 
-    ProviderCatalog {
+    Ok(ProviderCatalog {
         version: PROVIDER_CATALOG_VERSION,
         active_provider,
         providers,
-    }
+    })
 }
 
 pub(crate) fn default_provider_catalog() -> ProviderCatalog {
@@ -1052,33 +1265,290 @@ pub(crate) fn default_provider_catalog() -> ProviderCatalog {
         active_provider: default_active_provider(),
         providers: built_in_provider_profiles(),
     })
+    .expect("built-in provider catalog must be valid")
+}
+
+fn read_state_inspection_bytes(
+    path: &Path,
+    expected: &std::fs::Metadata,
+) -> std::result::Result<(Vec<u8>, std::fs::Metadata), bool> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(|_| false)?;
+    let opened = file.metadata().map_err(|_| false)?;
+    if !opened.is_file() {
+        return Err(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+            return Err(false);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = expected;
+
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(STATE_INSPECTION_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| false)?;
+    if bytes.len() as u64 > STATE_INSPECTION_MAX_BYTES {
+        Err(true)
+    } else {
+        Ok((bytes, opened))
+    }
+}
+
+pub(crate) fn inspect_provider_catalog() -> ProviderCatalogInspection {
+    let path = provider_catalog_path();
+    let empty = |integrity| ProviderCatalogInspection {
+        path: path.clone(),
+        integrity,
+        active_provider: None,
+        provider_count: None,
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ProviderCatalogInspection {
+                path,
+                integrity: ProviderCatalogIntegrity::Missing,
+                active_provider: Some(default_active_provider()),
+                provider_count: Some(built_in_provider_profiles().len()),
+            };
+        }
+        Err(_) => return empty(ProviderCatalogIntegrity::Unreadable),
+    };
+    if metadata.file_type().is_symlink() {
+        return empty(ProviderCatalogIntegrity::Symlink);
+    }
+    if !metadata.is_file() {
+        return empty(ProviderCatalogIntegrity::NonRegular);
+    }
+    if metadata.len() > STATE_INSPECTION_MAX_BYTES {
+        return empty(ProviderCatalogIntegrity::TooLarge);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if !runtime_state_owned_by_current_user(&metadata) {
+            return empty(ProviderCatalogIntegrity::UnsafeOwner);
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return empty(ProviderCatalogIntegrity::UnsafeMode { mode });
+        }
+    }
+    let (bytes, opened) = match read_state_inspection_bytes(&path, &metadata) {
+        Ok(result) => result,
+        Err(true) => return empty(ProviderCatalogIntegrity::TooLarge),
+        Err(false) => return empty(ProviderCatalogIntegrity::Unreadable),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if !runtime_state_owned_by_current_user(&opened) {
+            return empty(ProviderCatalogIntegrity::UnsafeOwner);
+        }
+        let mode = opened.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return empty(ProviderCatalogIntegrity::UnsafeMode { mode });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = &opened;
+    let raw = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(raw) => raw,
+        Err(_) => return empty(ProviderCatalogIntegrity::InvalidSchema),
+    };
+    if raw.is_array() {
+        return match serde_json::from_value::<Vec<ProviderProfile>>(raw) {
+            Ok(providers) => {
+                let normalized = match normalize_provider_catalog(ProviderCatalog {
+                    version: 1,
+                    active_provider: default_active_provider(),
+                    providers,
+                }) {
+                    Ok(catalog) => catalog,
+                    Err(_) => return empty(ProviderCatalogIntegrity::InvalidSchema),
+                };
+                ProviderCatalogInspection {
+                    path,
+                    integrity: ProviderCatalogIntegrity::Valid {
+                        version: 1,
+                        legacy: true,
+                    },
+                    active_provider: Some(normalized.active_provider),
+                    provider_count: Some(normalized.providers.len()),
+                }
+            }
+            Err(_) => empty(ProviderCatalogIntegrity::InvalidSchema),
+        };
+    }
+    let version = match raw.get("version") {
+        None => PROVIDER_CATALOG_VERSION,
+        Some(value) => match value.as_u64().and_then(|v| u32::try_from(v).ok()) {
+            Some(version) => version,
+            None => return empty(ProviderCatalogIntegrity::InvalidSchema),
+        },
+    };
+    if version == 0 || version > PROVIDER_CATALOG_VERSION {
+        return empty(ProviderCatalogIntegrity::UnsupportedVersion { version });
+    }
+    match serde_json::from_value::<ProviderCatalog>(raw) {
+        Ok(catalog) => {
+            let normalized = match normalize_provider_catalog(catalog) {
+                Ok(catalog) => catalog,
+                Err(_) => return empty(ProviderCatalogIntegrity::InvalidSchema),
+            };
+            ProviderCatalogInspection {
+                path,
+                integrity: ProviderCatalogIntegrity::Valid {
+                    version,
+                    legacy: version < PROVIDER_CATALOG_VERSION,
+                },
+                active_provider: Some(normalized.active_provider),
+                provider_count: Some(normalized.providers.len()),
+            }
+        }
+        Err(_) => empty(ProviderCatalogIntegrity::InvalidSchema),
+    }
+}
+
+#[cfg(unix)]
+fn runtime_state_owned_by_current_user(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    metadata.uid() == unsafe { libc::geteuid() }
+}
+
+fn read_runtime_state_file(path: &Path, secret: bool) -> Result<Option<String>> {
+    #[cfg(not(unix))]
+    let _ = secret;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting state file {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "state file must be a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > STATE_INSPECTION_MAX_BYTES {
+        anyhow::bail!(
+            "state file exceeds the {} byte limit: {}",
+            STATE_INSPECTION_MAX_BYTES,
+            path.display()
+        );
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening state file {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("validating open state file {}", path.display()))?;
+    if !opened.is_file() {
+        anyhow::bail!(
+            "opened state path is not a regular file: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            anyhow::bail!("state file changed while opening: {}", path.display());
+        }
+        if !runtime_state_owned_by_current_user(&opened) {
+            anyhow::bail!(
+                "state file is not owned by the current user: {}",
+                path.display()
+            );
+        }
+        let mode = opened.mode() & 0o777;
+        if secret && mode & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("repairing owner-only mode on {}", path.display()))?;
+        } else if !secret && mode & 0o022 != 0 {
+            anyhow::bail!(
+                "provider state has unsafe writable mode {mode:04o}; remove group/world write bits: {}",
+                path.display()
+            );
+        }
+    }
+
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(STATE_INSPECTION_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading state file {}", path.display()))?;
+    if bytes.len() as u64 > STATE_INSPECTION_MAX_BYTES {
+        anyhow::bail!(
+            "state file exceeds the {} byte limit: {}",
+            STATE_INSPECTION_MAX_BYTES,
+            path.display()
+        );
+    }
+    String::from_utf8(bytes)
+        .with_context(|| format!("state file is not valid UTF-8: {}", path.display()))
+        .map(Some)
 }
 
 pub(crate) fn load_provider_catalog() -> Result<ProviderCatalog> {
     let path = provider_catalog_path();
-    if !path.exists() {
+    let Some(text) = read_runtime_state_file(&path, false)? else {
         return Ok(default_provider_catalog());
-    }
+    };
+    let raw: Value = serde_json::from_str(&text).context("invalid provider catalog JSON")?;
 
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading provider catalog {}", path.display()))?;
-
-    let parsed = serde_json::from_str::<ProviderCatalog>(&text).or_else(|_| {
-        let providers = serde_json::from_str::<Vec<ProviderProfile>>(&text)?;
-        Ok::<ProviderCatalog, serde_json::Error>(ProviderCatalog {
-            version: PROVIDER_CATALOG_VERSION,
+    let catalog = if raw.is_array() {
+        ProviderCatalog {
+            version: 1,
             active_provider: default_active_provider(),
-            providers,
-        })
-    });
-
-    let catalog = parsed.context("invalid provider catalog JSON")?;
-    Ok(normalize_provider_catalog(catalog))
+            providers: serde_json::from_value(raw).context("invalid provider catalog JSON")?,
+        }
+    } else {
+        let version = raw
+            .get("version")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|version| u32::try_from(version).ok())
+                    .context("provider catalog version must be a positive integer")
+            })
+            .transpose()?
+            .unwrap_or(PROVIDER_CATALOG_VERSION);
+        if version == 0 || version > PROVIDER_CATALOG_VERSION {
+            anyhow::bail!(
+                "unsupported provider catalog version {version} (supported: 1-{PROVIDER_CATALOG_VERSION})"
+            );
+        }
+        serde_json::from_value::<ProviderCatalog>(raw).context("invalid provider catalog JSON")?
+    };
+    normalize_provider_catalog(catalog)
 }
 
 pub(crate) fn save_provider_catalog(catalog: &ProviderCatalog) -> Result<()> {
     let path = provider_catalog_path();
-    let normalized = normalize_provider_catalog(catalog.clone());
+    let normalized = normalize_provider_catalog(catalog.clone())?;
     let bytes = serde_json::to_vec_pretty(&normalized)?;
     atomic_write_bytes(&path, &bytes)?;
     Ok(())
@@ -1086,30 +1556,87 @@ pub(crate) fn save_provider_catalog(catalog: &ProviderCatalog) -> Result<()> {
 
 fn normalize_auth_store(mut store: AuthStore) -> AuthStore {
     store.version = AUTH_STORE_VERSION;
+    let mut entries = std::mem::take(&mut store.providers)
+        .into_iter()
+        .collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
     let mut providers = HashMap::new();
-    for (provider, credential) in store.providers {
+    for (provider, credential) in entries {
         let canonical = canonical_provider_id(&provider);
         if canonical.is_empty() {
             continue;
         }
-        providers.insert(canonical, credential);
+        if provider.trim().eq_ignore_ascii_case(&canonical) || !providers.contains_key(&canonical) {
+            providers.insert(canonical, credential);
+        }
     }
     store.providers = providers;
     store
 }
 
+#[cfg(test)]
+#[test]
+fn auth_store_normalization_prefers_canonical_id_over_aliases() {
+    let normalized = normalize_auth_store(AuthStore {
+        version: AUTH_STORE_VERSION,
+        providers: HashMap::from([
+            (
+                "codex".to_string(),
+                StoredCredential::ApiKey {
+                    key: "alias-key".to_string(),
+                },
+            ),
+            (
+                "ChatGPT".to_string(),
+                StoredCredential::ApiKey {
+                    key: "canonical-key".to_string(),
+                },
+            ),
+            (
+                "openai-codex".to_string(),
+                StoredCredential::ApiKey {
+                    key: "second-alias-key".to_string(),
+                },
+            ),
+        ]),
+    });
+
+    assert_eq!(normalized.providers.len(), 1);
+    assert!(matches!(
+        normalized.providers.get("chatgpt"),
+        Some(StoredCredential::ApiKey { key }) if key == "canonical-key"
+    ));
+}
+
+fn auth_store_declared_version(raw: &Value) -> Result<Option<u32>> {
+    if raw.get("providers").is_none() && raw.get("version").is_none() {
+        return Ok(None);
+    }
+    let version = raw
+        .get("version")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|version| u32::try_from(version).ok())
+                .context("auth store version must be a positive integer")
+        })
+        .transpose()?
+        .unwrap_or(AUTH_STORE_VERSION);
+    if version == 0 || version > AUTH_STORE_VERSION {
+        anyhow::bail!("unsupported auth store version {version} (supported: {AUTH_STORE_VERSION})");
+    }
+    Ok(Some(version))
+}
+
 pub(crate) fn load_auth_store() -> Result<AuthStore> {
     let path = auth_store_path();
-    if !path.exists() {
+    let Some(text) = read_runtime_state_file(&path, true)? else {
         return Ok(AuthStore::default());
-    }
-
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading auth store {}", path.display()))?;
+    };
 
     let raw: Value = serde_json::from_str(&text).context("invalid auth store JSON")?;
 
-    if raw.get("providers").is_some() {
+    if auth_store_declared_version(&raw)?.is_some() {
         let store: AuthStore = serde_json::from_value(raw).context("invalid auth store JSON")?;
         return Ok(normalize_auth_store(store));
     }
@@ -1120,13 +1647,12 @@ pub(crate) fn load_auth_store() -> Result<AuthStore> {
         .ok_or_else(|| anyhow::anyhow!("auth store must be a JSON object"))?;
 
     for (provider, value) in object {
-        let key = canonical_provider_id(provider);
-        if key.is_empty() {
+        if canonical_provider_id(provider).is_empty() {
             continue;
         }
 
         if let Some(cred) = parse_external_auth_credential(value) {
-            store.providers.insert(key, cred);
+            store.providers.insert(provider.clone(), cred);
             continue;
         }
 
@@ -1134,7 +1660,7 @@ pub(crate) fn load_auth_store() -> Result<AuthStore> {
             let trimmed = api_key.trim();
             if !trimmed.is_empty() {
                 store.providers.insert(
-                    key,
+                    provider.clone(),
                     StoredCredential::ApiKey {
                         key: trimmed.to_string(),
                     },
@@ -1146,12 +1672,181 @@ pub(crate) fn load_auth_store() -> Result<AuthStore> {
     Ok(normalize_auth_store(store))
 }
 
+pub(crate) fn inspect_auth_store() -> AuthStoreInspection {
+    let path = auth_store_path();
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return AuthStoreInspection {
+                path,
+                security: AuthStoreFileSecurity::Missing,
+                integrity: AuthStoreIntegrity::NotChecked,
+            };
+        }
+        Err(_) => {
+            return AuthStoreInspection {
+                path,
+                security: AuthStoreFileSecurity::Unreadable,
+                integrity: AuthStoreIntegrity::NotChecked,
+            };
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return AuthStoreInspection {
+            path,
+            security: AuthStoreFileSecurity::Symlink,
+            integrity: AuthStoreIntegrity::NotChecked,
+        };
+    }
+    if !metadata.is_file() {
+        return AuthStoreInspection {
+            path,
+            security: AuthStoreFileSecurity::NonRegular,
+            integrity: AuthStoreIntegrity::NotChecked,
+        };
+    }
+
+    #[cfg(unix)]
+    if !runtime_state_owned_by_current_user(&metadata) {
+        return AuthStoreInspection {
+            path,
+            security: AuthStoreFileSecurity::UnsafeOwner,
+            integrity: AuthStoreIntegrity::NotChecked,
+        };
+    }
+
+    #[cfg(unix)]
+    let security = {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            AuthStoreFileSecurity::Secure { mode }
+        } else {
+            AuthStoreFileSecurity::UnsafeMode { mode }
+        }
+    };
+    #[cfg(windows)]
+    let security = AuthStoreFileSecurity::WindowsAclNotEvaluated;
+    #[cfg(not(any(unix, windows)))]
+    let security = AuthStoreFileSecurity::PermissionsNotEvaluated;
+
+    if metadata.len() > STATE_INSPECTION_MAX_BYTES {
+        return AuthStoreInspection {
+            path,
+            security,
+            integrity: AuthStoreIntegrity::TooLarge,
+        };
+    }
+    let (bytes, opened) = match read_state_inspection_bytes(&path, &metadata) {
+        Ok(result) => result,
+        Err(too_large) => {
+            return AuthStoreInspection {
+                path,
+                security,
+                integrity: if too_large {
+                    AuthStoreIntegrity::TooLarge
+                } else {
+                    AuthStoreIntegrity::Unreadable
+                },
+            };
+        }
+    };
+    #[cfg(unix)]
+    if !runtime_state_owned_by_current_user(&opened) {
+        return AuthStoreInspection {
+            path,
+            security: AuthStoreFileSecurity::UnsafeOwner,
+            integrity: AuthStoreIntegrity::NotChecked,
+        };
+    }
+    #[cfg(unix)]
+    let security = {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = opened.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            AuthStoreFileSecurity::Secure { mode }
+        } else {
+            AuthStoreFileSecurity::UnsafeMode { mode }
+        }
+    };
+    #[cfg(not(unix))]
+    let _ = &opened;
+    let raw = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return AuthStoreInspection {
+                path,
+                security,
+                integrity: AuthStoreIntegrity::InvalidSchema,
+            };
+        }
+    };
+    let declared = match auth_store_declared_version(&raw) {
+        Ok(declared) => declared,
+        Err(_) => {
+            let integrity = raw
+                .get("version")
+                .and_then(Value::as_u64)
+                .and_then(|version| u32::try_from(version).ok())
+                .filter(|version| *version == 0 || *version > AUTH_STORE_VERSION)
+                .map_or(AuthStoreIntegrity::InvalidSchema, |version| {
+                    AuthStoreIntegrity::UnsupportedVersion { version }
+                });
+            return AuthStoreInspection {
+                path,
+                security,
+                integrity,
+            };
+        }
+    };
+    let valid_schema = if declared.is_some() {
+        serde_json::from_value::<AuthStore>(raw).is_ok()
+    } else {
+        raw.is_object()
+    };
+    let integrity = if valid_schema {
+        AuthStoreIntegrity::Valid {
+            version: declared.unwrap_or(AUTH_STORE_VERSION),
+            legacy: declared.is_none(),
+        }
+    } else {
+        AuthStoreIntegrity::InvalidSchema
+    };
+
+    AuthStoreInspection {
+        path,
+        security,
+        integrity,
+    }
+}
+
+fn verify_saved_auth_store(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("verifying saved auth store {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("saved auth store is not a regular file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "saved auth store has unsafe mode {mode:04o}; run chmod 600 {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn save_auth_store(store: &AuthStore) -> Result<()> {
     let path = auth_store_path();
     let normalized = normalize_auth_store(store.clone());
     let bytes = serde_json::to_vec_pretty(&normalized)?;
     atomic_write_secret(&path, &bytes)?;
-    Ok(())
+    verify_saved_auth_store(&path)
 }
 
 pub(crate) fn is_env_var_token(s: &str) -> bool {
@@ -1184,24 +1879,11 @@ pub(crate) fn resolve_secret_reference(spec: &str) -> Option<String> {
             return cached;
         }
 
-        let output = Command::new("bash").arg("-lc").arg(&key).output().ok()?;
-        if !output.status.success() {
-            if let Ok(mut m) = command_secret_cache().lock() {
-                m.insert(key, None);
-            }
-            return None;
+        let secret = crate::run_internal_secret_command(&key);
+        if let Ok(mut cache) = command_secret_cache().lock() {
+            cache.insert(key, secret.clone());
         }
-        let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if secret.is_empty() {
-            if let Ok(mut m) = command_secret_cache().lock() {
-                m.insert(key, None);
-            }
-            return None;
-        }
-        if let Ok(mut m) = command_secret_cache().lock() {
-            m.insert(key, Some(secret.clone()));
-        }
-        return Some(secret);
+        return secret;
     }
 
     if is_env_var_token(trimmed)
@@ -1277,15 +1959,18 @@ pub(crate) fn find_provider_profile(
         .cloned()
 }
 
-pub(crate) fn resolve_provider_api_key(
+fn dext_api_key_override() -> Option<(String, String)> {
+    let key = std::env::var("DEXT_API_KEY").ok()?;
+    let key = key.trim();
+    (!key.is_empty()).then(|| (key.to_string(), "env:DEXT_API_KEY".to_string()))
+}
+
+fn resolve_provider_credential(
     profile: &ProviderProfile,
     store: &AuthStore,
 ) -> Option<(String, String)> {
-    if let Ok(v) = std::env::var("DEXT_API_KEY") {
-        let t = v.trim().to_string();
-        if !t.is_empty() {
-            return Some((t, "env:DEXT_API_KEY".to_string()));
-        }
+    if let Some(credential) = dext_api_key_override() {
+        return Some(credential);
     }
 
     let canonical_id = canonical_provider_id(&profile.id);
@@ -1293,6 +1978,7 @@ pub(crate) fn resolve_provider_api_key(
         .providers
         .get(&profile.id)
         .or_else(|| store.providers.get(&canonical_id))
+        && !(canonical_id == "kimi" && matches!(entry, StoredCredential::OAuth { .. }))
         && let Some(secret) = entry.resolve_secret()
     {
         return Some((secret, format!("auth:{}", profile.id)));
@@ -1307,6 +1993,13 @@ pub(crate) fn resolve_provider_api_key(
         }
     }
     None
+}
+
+pub(crate) fn resolve_provider_api_key(
+    profile: &ProviderProfile,
+    store: &AuthStore,
+) -> Option<(String, String)> {
+    resolve_provider_credential(profile, store)
 }
 
 pub(crate) fn request_contract_for_profile(profile: &ProviderProfile) -> RequestContract {
@@ -1622,6 +2315,9 @@ pub(crate) fn normalize_chatgpt_model_slug(model: &str) -> String {
         "gpt54" => "gpt-5.4".to_string(),
         "gpt54mini" => "gpt-5.4-mini".to_string(),
         "gpt55" => "gpt-5.5".to_string(),
+        "gpt56" | "gpt56sol" => "gpt-5.6-sol".to_string(),
+        "gpt56terra" => "gpt-5.6-terra".to_string(),
+        "gpt56luna" => "gpt-5.6-luna".to_string(),
         "gpt53codex" => "gpt-5.3-codex".to_string(),
         "gpt53codexspark" => "gpt-5.3-codex-spark".to_string(),
         _ => canonical,
@@ -1640,10 +2336,19 @@ pub(crate) fn chatgpt_reasoning_effort(
     model: &str,
     effort: crate::ThinkingEffort,
 ) -> Option<&'static str> {
+    let raw = effort.as_str();
+    if model.starts_with("gpt-5.6") {
+        return Some(match effort {
+            crate::ThinkingEffort::Off => "none",
+            crate::ThinkingEffort::Low => "low",
+            crate::ThinkingEffort::Medium => "medium",
+            crate::ThinkingEffort::High => "high",
+            crate::ThinkingEffort::XHigh | crate::ThinkingEffort::Max => "xhigh",
+        });
+    }
     if effort == crate::ThinkingEffort::Off {
         return None;
     }
-    let raw = effort.as_str();
     if model.starts_with("gpt-5.2")
         || model.starts_with("gpt-5.3")
         || model.starts_with("gpt-5.4")
@@ -1748,10 +2453,18 @@ pub(crate) fn build_chatgpt_summary_request(
     body
 }
 
+pub(crate) fn is_official_kimi_profile(profile: &ProviderProfile, base_url: &str) -> bool {
+    profile.builtin.as_deref() == Some(KIMI_BUILTIN_PROFILE_MARKER)
+        && canonical_provider_id(&profile.id) == "kimi"
+        && request_contract_for_profile(profile) == RequestContract::AnthropicMessages
+        && base_url.trim_end_matches('/') == KIMI_CODE_BASE_URL
+}
+
 pub(crate) fn apply_provider_headers(
     req: RequestBuilder,
     contract: RequestContract,
     api_key: &str,
+    official_kimi: bool,
     session_id: Option<&str>,
 ) -> Result<RequestBuilder> {
     Ok(match contract.api_provider() {
@@ -1782,7 +2495,21 @@ pub(crate) fn apply_provider_headers(
             req
         }
         ApiProvider::Anthropic => {
-            let req = req.header("anthropic-version", ANTHROPIC_API_VERSION);
+            let mut req = req.header("anthropic-version", ANTHROPIC_API_VERSION);
+            if official_kimi {
+                let version = env!("CARGO_PKG_VERSION");
+                req = req
+                    .header("user-agent", format!("dext/{version}"))
+                    .header("x-msh-platform", "kimi_code_cli")
+                    .header("x-msh-version", version)
+                    .header("x-msh-device-name", kimi_device_name())
+                    .header(
+                        "x-msh-device-model",
+                        format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+                    )
+                    .header("x-msh-os-version", std::env::consts::OS)
+                    .header("x-msh-device-id", kimi_device_id()?);
+            }
             if api_key.trim().is_empty() {
                 req
             } else {
@@ -1926,10 +2653,17 @@ pub(crate) fn resolve_runtime_provider(
 
     let base_url = resolve_provider_base_url(&profile);
     let mut store = store;
-    let refreshed_token = refresh_oauth_credential_if_needed(&profile, &mut store)?;
-    let resolved_key = refreshed_token
-        .map(|token| (token, format!("auth:{} (refreshed)", profile.id)))
-        .or_else(|| resolve_provider_api_key(&profile, &store));
+    let explicit_api_key = dext_api_key_override();
+    let refreshed_token = if explicit_api_key.is_some() {
+        None
+    } else {
+        refresh_oauth_credential_if_needed(&profile, &mut store)?
+    };
+    let resolved_key = explicit_api_key
+        .or_else(|| {
+            refreshed_token.map(|token| (token, format!("auth:{} (refreshed)", profile.id)))
+        })
+        .or_else(|| resolve_provider_credential(&profile, &store));
 
     let (api_key, key_source) = match (profile.requires_api_key, resolved_key) {
         (_, Some((key, source))) => (key, source),
@@ -1971,6 +2705,7 @@ pub(crate) fn provider_auth_status(profile: &ProviderProfile, store: &AuthStore)
         .providers
         .get(&profile.id)
         .or_else(|| store.providers.get(&canonical))
+        && !(canonical == "kimi" && matches!(entry, StoredCredential::OAuth { .. }))
     {
         let state = if entry.resolve_secret().is_some() {
             "auth"
@@ -2236,10 +2971,8 @@ pub(crate) fn external_auth_path() -> PathBuf {
 pub(crate) fn parse_expiry_epoch_seconds(v: &Value) -> Option<u64> {
     let mut epoch = if let Some(n) = v.as_u64() {
         n
-    } else if let Some(s) = v.as_str() {
-        s.trim().parse::<u64>().ok()?
     } else {
-        return None;
+        v.as_str()?.trim().parse::<u64>().ok()?
     };
     if epoch > 1_000_000_000_000 {
         epoch /= 1000;
@@ -2444,6 +3177,24 @@ pub(crate) fn running_in_wsl() -> bool {
         .unwrap_or(false)
 }
 
+fn browser_launcher_timeout() -> Duration {
+    let seconds = std::env::var("DEXT_BROWSER_OPEN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=30).contains(seconds))
+        .unwrap_or(10);
+    Duration::from_secs(seconds)
+}
+
+fn run_browser_launcher(mut command: Command, label: &str) -> Result<crate::InternalCommandOutput> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::run_internal_command_limited(command, label, browser_launcher_timeout())
+        .map_err(anyhow::Error::msg)
+}
+
 pub(crate) fn open_url_in_browser(url: &str) -> Result<String> {
     if std::env::var("DEXT_SKIP_BROWSER_OPEN")
         .ok()
@@ -2470,41 +3221,31 @@ pub(crate) fn open_url_in_browser(url: &str) -> Result<String> {
     #[cfg(target_os = "windows")]
     {
         let powershell_cmd = format!("Start-Process '{}'", url.replace('\'', "''"));
-        let status = Command::new("powershell")
+        let mut command = Command::new("powershell");
+        command
             .args(["-NoProfile", "-Command", &powershell_cmd])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::null());
+        let output = run_browser_launcher(command, "powershell browser launcher")
             .context("failed to launch browser via powershell Start-Process")?;
-        if !status.success() {
-            anyhow::bail!(
-                "browser launcher exited with status {}",
-                status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "<signal>".to_string())
-            );
+        if !output.success() {
+            anyhow::bail!("browser launcher exited with status {}", output.code);
         }
-        return Ok("powershell Start-Process".to_string());
+        Ok("powershell Start-Process".to_string())
     }
     #[cfg(target_os = "macos")]
     {
-        let status = Command::new("open")
+        let mut command = Command::new("open");
+        command
             .arg(url)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::null());
+        let output = run_browser_launcher(command, "macOS browser launcher")
             .context("failed to launch browser via open")?;
-        if !status.success() {
-            anyhow::bail!(
-                "browser launcher exited with status {}",
-                status
-                    .code()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "<signal>".to_string())
-            );
+        if !output.success() {
+            anyhow::bail!("browser launcher exited with status {}", output.code);
         }
-        return Ok("open".to_string());
+        Ok("open".to_string())
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -2534,21 +3275,15 @@ pub(crate) fn open_url_in_browser(url: &str) -> Result<String> {
 
         let mut errors = Vec::new();
         for (bin, args) in launchers {
-            match Command::new(&bin)
+            let mut command = Command::new(&bin);
+            command
                 .args(&args)
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-            {
-                Ok(status) if status.success() => return Ok(bin),
-                Ok(status) => errors.push(format!(
-                    "{bin} exited {}",
-                    status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "<signal>".to_string())
-                )),
-                Err(e) => errors.push(format!("{bin}: {e}")),
+                .stderr(std::process::Stdio::null());
+            match run_browser_launcher(command, &format!("{bin} browser launcher")) {
+                Ok(output) if output.success() => return Ok(bin),
+                Ok(output) => errors.push(format!("{bin} exited {}", output.code)),
+                Err(error) => errors.push(format!("{bin}: {error}")),
             }
         }
 
@@ -3014,8 +3749,10 @@ fn clear_pending_oauth() {
     remove_pending_oauth_file(&path);
 }
 
-pub(crate) fn cancel_pending_oauth_login() {
+pub(crate) fn cancel_pending_oauth_login() -> bool {
+    let had_callback_login = pending_oauth_path().exists();
     clear_pending_oauth();
+    had_callback_login
 }
 
 #[derive(Debug, Clone)]
@@ -3188,6 +3925,74 @@ fn oauth_expires_at_from_response(body: &Value) -> Option<u64> {
     expires_in.map(|seconds| unix_timestamp_secs().saturating_add(seconds))
 }
 
+fn kimi_device_id_path() -> PathBuf {
+    dext_state_dir().join("kimi_device_id")
+}
+
+fn kimi_device_id_is_valid(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn kimi_device_id() -> Result<String> {
+    let path = kimi_device_id_path();
+    if let Ok(value) = std::fs::read_to_string(&path) {
+        let value = value.trim();
+        if kimi_device_id_is_valid(value) {
+            return Ok(value.to_string());
+        }
+    }
+
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).context("failed to generate Kimi device id")?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let value = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    );
+    let _ = atomic_write_secret(&path, value.as_bytes());
+    Ok(value)
+}
+
+fn kimi_ascii_header(value: &str) -> String {
+    let value = value
+        .chars()
+        .filter(|character| character.is_ascii() && !character.is_ascii_control())
+        .collect::<String>();
+    let value = value.trim();
+    if value.is_empty() {
+        "unknown".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn kimi_device_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| kimi_ascii_header(&value))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn exchange_oauth_code(
     token_url: &str,
     client_id: &str,
@@ -3282,6 +4087,9 @@ fn refresh_oauth_credential_if_needed(
     store: &mut AuthStore,
 ) -> Result<Option<String>> {
     let canonical = canonical_provider_id(&profile.id);
+    if canonical == "kimi" {
+        return Ok(None);
+    }
     let Some(StoredCredential::OAuth {
         access_token: _access_token,
         refresh_token,
@@ -3305,14 +4113,15 @@ fn refresh_oauth_credential_if_needed(
     let Some(refresh_token) = refresh_token else {
         return Ok(None);
     };
-    let oauth = profile.oauth_flow.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "provider '{}' has OAuth credential but no OAuth config",
-            profile.id
-        )
-    })?;
-    let refreshed =
-        exchange_oauth_refresh_token(&oauth.token_url, &oauth.client_id, &refresh_token)?;
+    let refreshed = {
+        let oauth = profile.oauth_flow.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider '{}' has OAuth credential but no OAuth config",
+                profile.id
+            )
+        })?;
+        exchange_oauth_refresh_token(&oauth.token_url, &oauth.client_id, &refresh_token)?
+    };
     let token = refreshed.access_token;
     store.providers.insert(
         canonical,
@@ -3738,7 +4547,7 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
                     println!("{}", login.message);
                     if login.awaiting_credentials {
                         println!(
-                            "then run: dext auth login {} <code|callback-url|token|json>",
+                            "then run: dext auth login {} <api-key|token|code|callback-url|json>",
                             login.provider_id
                         );
                     }
@@ -3759,7 +4568,7 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             println!("{}", login.message);
             if login.awaiting_credentials {
                 println!(
-                    "then run: dext auth login {} <code|callback-url|token|json>",
+                    "then run: dext auth login {} <api-key|token|code|callback-url|json>",
                     login.provider_id
                 );
             }
@@ -3775,5 +4584,52 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             eprintln!("unknown auth command: {other}. try `dext auth help`");
             Ok(Some(2))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_home(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "dext-provider-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create temp home");
+        path
+    }
+
+    #[test]
+    fn kimi_device_id_is_stable_uuid_and_ascii_headers_are_safe() -> Result<()> {
+        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let home = temp_home("device-id");
+        let old_home = std::env::var_os("DEXT_HOME");
+        unsafe { std::env::set_var("DEXT_HOME", &home) };
+
+        let result = (|| -> Result<()> {
+            let first = kimi_device_id()?;
+            let second = kimi_device_id()?;
+            assert_eq!(first, second);
+            assert_eq!(first.len(), 36);
+            assert_eq!(first.bytes().filter(|byte| *byte == b'-').count(), 4);
+            assert!(kimi_device_id_is_valid(&first));
+            assert_eq!(kimi_ascii_header(" h\u{00f4}st\n"), "hst");
+            assert_eq!(kimi_ascii_header("\n\t"), "unknown");
+            Ok(())
+        })();
+
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("DEXT_HOME", value),
+                None => std::env::remove_var("DEXT_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        result
     }
 }

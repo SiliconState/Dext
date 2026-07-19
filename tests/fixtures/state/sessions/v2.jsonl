@@ -1,0 +1,3 @@
+{"version":2,"model":"fixture-v2","system":"fixture-system","context_mode":"standard","allowed":[]}
+{"role":"assistant","content":[{"type":"tool_use","id":"fixture-call-v2","name":"read_file","input":{"path":"fixture.txt"}}]}
+{"role":"user","content":[{"type":"tool_result","tool_use_id":"fixture-call-v2","content":"synthetic result"}]}

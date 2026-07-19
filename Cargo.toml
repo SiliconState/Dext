@@ -3,6 +3,11 @@ name = "dext"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["vendor/ratatui-core"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "process", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
@@ -17,13 +22,22 @@ unicode-width = "=0.2.2"
 base64 = "0.22"
 sha2 = "0.11"
 getrandom = "0.4"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
-ratatui-core = "0.1.2"
-tui-markdown = { version = "0.3.7", default-features = false }
-crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+ratatui-core = "=0.1.2"
+tui-markdown = { version = "=0.3.8", default-features = false }
+crossterm = { version = "=0.29.0", features = ["event-stream"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
@@ -31,6 +45,9 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 [[bench]]
 name = "dext_bench"
 harness = false
+
+[patch.crates-io]
+ratatui-core = { path = "vendor/ratatui-core" }
 
 [profile.release]
 lto = false

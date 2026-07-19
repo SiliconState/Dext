@@ -8,7 +8,11 @@ mod provider;
 mod sandbox;
 mod session;
 mod shelves;
+mod sse;
+mod streaming;
+mod tool_journal;
 mod tool_policy;
+mod tool_round;
 mod tools;
 mod tui;
 
@@ -17,11 +21,11 @@ mod main_tests;
 
 use anyhow::{Context, Result};
 use provider::{
-    ANTHROPIC_API_VERSION, ApiProvider, ModelPricing, ProviderProfile, RequestContract,
-    ResolvedModelSpec, ResolvedProviderConfig, apply_provider_headers, auth_store_path,
-    build_chatgpt_request, build_chatgpt_summary_request, built_in_provider_profiles,
-    cancel_pending_oauth_login, canonical_provider_id, extract_oauth_code_from_callback,
-    find_provider_profile, handle_auth_cli, list_models_for_available_providers,
+    ApiProvider, ModelPricing, ProviderProfile, RequestContract, ResolvedModelSpec,
+    ResolvedProviderConfig, apply_provider_headers, auth_store_path, build_chatgpt_request,
+    build_chatgpt_summary_request, built_in_provider_profiles, cancel_pending_oauth_login,
+    canonical_provider_id, extract_oauth_code_from_callback, find_provider_profile,
+    handle_auth_cli, is_official_kimi_profile, list_models_for_available_providers,
     list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
     logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
     provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
@@ -30,19 +34,22 @@ use provider::{
     resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
+#[cfg(unix)]
+use session::session_sudo_dir;
 use session::{
-    SessionStateLock, append_log_event, atomic_write_bytes, canonicalize_read_tool_path,
-    canonicalize_tool_path, dext_state_dir, expand_user_path, latest_session_path,
+    SessionStateLock, append_log_event, atomic_write_bytes, atomic_write_secret,
+    canonicalize_read_tool_path, dext_state_dir, expand_user_path, latest_session_path,
     list_session_records_for_root, named_session_path_for_root, named_sessions_dir_for_root,
     new_session_id, parse_session_header, project_key, project_latest_session_path,
     release_registered_locks, remove_stale_session_state_lock, render_limited_csv,
     restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
     session_latest_session_path, session_state_lock_is_live, session_state_lock_path,
-    session_sudo_dir, session_todo_path, unix_timestamp_secs,
+    session_todo_path, unix_timestamp_secs,
 };
+use tool_round::{ToolRoundContext, ToolRoundOutcome};
 use tools::{
-    Tool, ToolProfile, is_external_process_tool, needs_permission, provider_tool_definitions,
-    should_parallelize_builtin_tools,
+    Tool, ToolProfile, is_external_process_tool, is_side_effect_capable_tool, needs_permission,
+    provider_tool_definitions, should_parallelize_builtin_tools,
 };
 
 #[cfg(test)]
@@ -70,17 +77,21 @@ const READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 16_000;
 const FRUGAL_READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 10_000;
 const PROCESS_STREAM_CAPTURE_CAP: usize = 6_000;
 const LIVE_OUTPUT_EVENT_QUEUE_CAP: usize = 256;
-const EDIT_MATCH_CONTEXT_LINES: usize = 2;
-const EDIT_MATCH_DISPLAY_LIMIT: usize = 8;
-const EDIT_MATCH_CONTEXT_CAP: usize = 6_000;
 const READ_SYMBOL_SUGGESTION_LIMIT: usize = 5;
 const CARGO_DIAGNOSTIC_SUMMARY_LIMIT: usize = 20;
+const LSP_DIAGNOSTIC_FILE_LIMIT: usize = 64;
+const LSP_DIAGNOSTIC_DIRECTORY_LIMIT: usize = 1_024;
+const LSP_DIAGNOSTIC_FILE_BYTE_CAP: u64 = 1_048_576;
+const LSP_DIAGNOSTIC_TOTAL_BYTE_CAP: u64 = 8_388_608;
 const HTTP_EXTRACT_INPUT_CAP: usize = 128_000;
 const HTTP_EXTRACT_OUTPUT_CAP: usize = 24_000;
 const HTTP_TOOL_REDIRECT_LIMIT: usize = 10;
 const HTTP_TOOL_ALLOW_LINK_LOCAL_ENV: &str = "DEXT_HTTP_ALLOW_LINK_LOCAL";
+const HTTP_TOOL_ALLOW_LOOPBACK_ENV: &str = "DEXT_HTTP_ALLOW_LOOPBACK";
+const HTTP_TOOL_ALLOW_PRIVATE_ENV: &str = "DEXT_HTTP_ALLOW_PRIVATE";
 const HOOK_OUTPUT_CAPTURE_CAP: usize = 4_000;
 const HTTP_ERROR_BODY_CAP: usize = 4_000;
+const PROVIDER_JSON_BODY_CAP: usize = 4 * 1024 * 1024;
 const PROJECT_CONTEXT_CAP: usize = 12_000;
 const FRUGAL_PROJECT_CONTEXT_CAP: usize = 6_000;
 const SUMMARY_TRANSCRIPT_CAP: usize = 24_000;
@@ -101,7 +112,7 @@ const GIT_AUTH_GUIDANCE: &str = "git needs credentials for an HTTPS remote. Ente
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
 pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "DEXT_ALLOW_BREAK_SYSTEM_PACKAGES";
 const AUTH_CIRCUIT_BREAKER_THRESHOLD: usize = 2;
-const TOOL_CATALOG_VERSION: u32 = 4;
+const TOOL_CATALOG_VERSION: u32 = 5;
 const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     ".git",
     ".hg",
@@ -123,6 +134,11 @@ const MAX_STREAM_ATTEMPTS: u32 = 4;
 // Inner per-request HTTP retry budget (distinct from the outer stream-restart
 // budget MAX_STREAM_ATTEMPTS, even though they currently share the value).
 const MAX_HTTP_ATTEMPTS: u32 = 4;
+const PROVIDER_CONNECT_TIMEOUT_SECS: u64 = 15;
+const PROVIDER_FIRST_BYTE_TIMEOUT_SECS: u64 = 180;
+const LOCAL_PROVIDER_FIRST_BYTE_TIMEOUT_SECS: u64 = 600;
+const PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+const LOCAL_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 // Consecutive 5xx responses from one provider before it is disabled for the turn.
 const MAX_CONSECUTIVE_SERVER_ERRORS: usize = 3;
 const DEFAULT_INPUT_USD_PER_MTOK: f64 = 1.0;
@@ -254,6 +270,109 @@ fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
     } else {
         anyhow::Error::new(e)
     }
+}
+
+#[derive(Debug)]
+enum ProviderTransportError {
+    Request(reqwest::Error),
+    FirstByteTimeout(std::time::Duration),
+}
+
+impl ProviderTransportError {
+    fn is_connect(&self) -> bool {
+        matches!(self, Self::Request(error) if error.is_connect())
+    }
+
+    fn is_timeout(&self) -> bool {
+        match self {
+            Self::FirstByteTimeout(_) => true,
+            Self::Request(error) => error.is_timeout(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) => write!(formatter, "{error}"),
+            Self::FirstByteTimeout(timeout) => write!(
+                formatter,
+                "provider first-byte timeout after {}s",
+                timeout.as_secs()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProviderTransportError {}
+
+async fn send_provider_request(
+    request: reqwest::RequestBuilder,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response> {
+    tokio::time::timeout(timeout, request.send())
+        .await
+        .map_err(|_| ProviderTransportError::FirstByteTimeout(timeout))?
+        .map_err(ProviderTransportError::Request)
+        .map_err(anyhow::Error::new)
+}
+
+async fn read_provider_body_limited(
+    response: reqwest::Response,
+    cap: usize,
+    idle_timeout: std::time::Duration,
+) -> Result<(Vec<u8>, bool)> {
+    use futures_util::StreamExt as _;
+
+    let mut body = Vec::with_capacity(cap.min(64 * 1024));
+    let mut stream = response.bytes_stream();
+    loop {
+        let next = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "provider response body idle timeout after {}s",
+                    idle_timeout.as_secs_f64()
+                )
+            })?;
+        let Some(chunk) = next else {
+            return Ok((body, false));
+        };
+        let chunk = chunk.map_err(stream_chunk_err)?;
+        let remaining = cap.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
+async fn read_provider_error_body(
+    response: reqwest::Response,
+    idle_timeout: std::time::Duration,
+) -> Result<String> {
+    let (bytes, truncated) =
+        read_provider_body_limited(response, HTTP_ERROR_BODY_CAP, idle_timeout).await?;
+    let mut body = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        body.push_str(&format!(
+            "\n\n…[truncated at the {HTTP_ERROR_BODY_CAP} byte provider error body cap]"
+        ));
+    }
+    Ok(body)
+}
+
+async fn read_provider_json_body(
+    response: reqwest::Response,
+    idle_timeout: std::time::Duration,
+) -> Result<Value> {
+    let (bytes, truncated) =
+        read_provider_body_limited(response, PROVIDER_JSON_BODY_CAP, idle_timeout).await?;
+    if truncated {
+        anyhow::bail!("provider summary response exceeded the {PROVIDER_JSON_BODY_CAP} byte limit");
+    }
+    serde_json::from_slice(&bytes).context("invalid provider summary response JSON")
 }
 
 async fn read_stream_next_chunk(
@@ -458,8 +577,14 @@ fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
         .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
 }
 
+fn panic_message_is_broken_pipe(message: &str) -> bool {
+    (message.starts_with("failed printing to stdout: ")
+        || message.starts_with("failed printing to stderr: "))
+        && message.contains("Broken pipe")
+}
+
 fn panic_info_is_broken_pipe(info: &std::panic::PanicHookInfo<'_>) -> bool {
-    panic_payload_text(info.payload()).is_some_and(|msg| msg.contains("Broken pipe"))
+    panic_payload_text(info.payload()).is_some_and(panic_message_is_broken_pipe)
 }
 
 #[derive(Default)]
@@ -473,42 +598,58 @@ fn crash_runtime_state() -> &'static Mutex<CrashRuntimeState> {
     STATE.get_or_init(|| Mutex::new(CrashRuntimeState::default()))
 }
 
+fn generated_session_id_from_path(path: &Path) -> Option<String> {
+    if path.file_stem()?.to_str()? != LATEST_SESSION_NAME || path.extension()?.to_str()? != "jsonl"
+    {
+        return None;
+    }
+    let candidate = path.parent()?.file_name()?.to_str()?;
+    let mut parts = candidate.split('-');
+    let timestamp = parts.next()?;
+    let pid = parts.next()?;
+    let nonce = parts.next()?;
+    if parts.next().is_some()
+        || timestamp.parse::<u64>().is_err()
+        || pid.parse::<u32>().is_err()
+        || nonce.len() != 12
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
 fn record_crash_session_id(path: &Path) {
+    let session_id = generated_session_id_from_path(path);
     if let Ok(mut state) = crash_runtime_state().lock() {
-        state.current_session_id = Some(path.display().to_string());
+        state.current_session_id = session_id;
     }
 }
 
-pub(crate) fn record_crash_event(event: &AgentEvent) {
-    let label = match event {
+fn crash_event_breadcrumb(event: &AgentEvent) -> Option<String> {
+    match event {
         AgentEvent::TurnStart => Some("turn_start".to_string()),
-        AgentEvent::ToolCallPreview { call_id, name, .. } => {
-            Some(format!("tool_preview:{name}:{call_id}"))
-        }
-        AgentEvent::ToolCallStart { call_id, name, .. } => {
-            Some(format!("tool_start:{name}:{call_id}"))
-        }
-        AgentEvent::ToolCallResult {
-            call_id, name, ok, ..
-        } => Some(format!("tool_result:{name}:{call_id}:ok={ok}")),
+        AgentEvent::ToolCallPreview { .. } => Some("tool_preview".to_string()),
+        AgentEvent::ToolCallStart { .. } => Some("tool_start".to_string()),
+        AgentEvent::ToolCallResult { ok, .. } => Some(format!("tool_result:ok={ok}")),
         AgentEvent::ToolOutputDelta { .. } => None,
-        AgentEvent::ToolBatchStart { batch_id, .. } => Some(format!("tool_batch_start:{batch_id}")),
-        AgentEvent::ToolBatchEnd { batch_id, .. } => Some(format!("tool_batch_end:{batch_id}")),
-        AgentEvent::HttpRetry {
-            attempt, reason, ..
+        AgentEvent::ToolBatchStart { call_ids, .. } => {
+            Some(format!("tool_batch_start:count={}", call_ids.len()))
+        }
+        AgentEvent::ToolBatchEnd {
+            call_ids, failed, ..
         } => Some(format!(
-            "http_retry:{attempt}:{}",
-            summarize_inline(reason, 80)
+            "tool_batch_end:count={}:failed={failed}",
+            call_ids.len()
         )),
+        AgentEvent::HttpRetry { attempt, .. } => Some(format!("http_retry:{attempt}")),
         AgentEvent::CompactStart => Some("compact_start".to_string()),
         AgentEvent::CompactEnd { before, after } => Some(format!("compact_end:{before}->{after}")),
-        AgentEvent::CompactFailed { message } => {
-            Some(format!("compact_failed:{}", summarize_inline(message, 80)))
-        }
+        AgentEvent::CompactFailed { .. } => Some("compact_failed".to_string()),
         AgentEvent::Interrupted => Some("interrupted".to_string()),
-        AgentEvent::RuntimeControl(s) => {
-            Some(format!("runtime_control:{}", summarize_inline(s, 80)))
-        }
+        AgentEvent::RuntimeControl(_) => Some("runtime_control".to_string()),
         AgentEvent::RuntimeControlApplied {
             commands,
             model_changed,
@@ -517,18 +658,20 @@ pub(crate) fn record_crash_event(event: &AgentEvent) {
         } => Some(format!(
             "runtime_control_applied:{commands}:model={model_changed}:effort={effort_changed}:abort={stream_aborted}"
         )),
-        AgentEvent::SteeringReceived { messages, preview } => Some(format!(
-            "steering:{messages}:{}",
-            summarize_inline(preview, 80)
-        )),
+        AgentEvent::SteeringReceived { messages, .. } => {
+            Some(format!("steering:messages={messages}"))
+        }
         AgentEvent::TurnEnd { failed, .. } => Some(if *failed {
             "turn_end:failed".to_string()
         } else {
             "turn_end".to_string()
         }),
         _ => None,
-    };
-    let Some(label) = label else {
+    }
+}
+
+pub(crate) fn record_crash_event(event: &AgentEvent) {
+    let Some(label) = crash_event_breadcrumb(event) else {
         return;
     };
     if let Ok(mut state) = crash_runtime_state().lock() {
@@ -540,13 +683,8 @@ pub(crate) fn record_crash_event(event: &AgentEvent) {
     }
 }
 
-fn write_crash_snapshot(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> {
-    let id = format!("crash-{}-{}", unix_timestamp_secs(), std::process::id());
-    let path = dext_state_dir().join("crashes").join(format!("{id}.json"));
-    let location = info
-        .location()
-        .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()));
-    let runtime = crash_runtime_state().lock().ok().map(|state| {
+fn crash_snapshot_body(id: &str, location: Option<(&str, u32, u32)>) -> Value {
+    let runtime = crash_runtime_state().try_lock().ok().map(|state| {
         json!({
             "current_session_id": state.current_session_id,
             "last_event_ids": state.last_event_ids,
@@ -554,22 +692,132 @@ fn write_crash_snapshot(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf>
             "active_modal": null,
         })
     });
-    let body = json!({
+    let parse_terminal_dimension = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+    };
+    let backtrace_enabled = std::env::var("RUST_BACKTRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "full"));
+    let location = location.map(|(file, line, column)| {
+        json!({
+            "file_sha256": sha256_hex_str(file),
+            "line": line,
+            "column": column,
+        })
+    });
+    json!({
         "id": id,
-        "panic": panic_payload_text(info.payload()).unwrap_or("unknown panic"),
+        "panic": "panic captured; free-form payload omitted",
         "location": location,
         "terminal": {
-            "columns": std::env::var("COLUMNS").ok(),
-            "lines": std::env::var("LINES").ok(),
+            "columns": parse_terminal_dimension("COLUMNS"),
+            "lines": parse_terminal_dimension("LINES"),
         },
         "pid": std::process::id(),
-        "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
         "runtime": runtime,
-        "backtrace": std::env::var("RUST_BACKTRACE").unwrap_or_default(),
-    });
-    let bytes = serde_json::to_vec_pretty(&body).ok()?;
-    atomic_write_bytes(&path, &bytes).ok()?;
-    Some(path)
+        "backtrace_enabled": backtrace_enabled,
+    })
+}
+
+fn ensure_private_crash_dir(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "crash directory is not a real directory: {}",
+                    path.display()
+                ),
+            ));
+        }
+        #[cfg(unix)]
+        Ok(metadata)
+            if {
+                use std::os::unix::fs::MetadataExt as _;
+                metadata.uid() != unsafe { libc::geteuid() }
+            } =>
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "crash directory is not owned by the current user",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder.create(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_private_crash_snapshot(path: &Path, body: &Value) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "crash path has no parent"))?;
+    ensure_private_crash_dir(parent)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "crash snapshot path is not a regular file: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let bytes = serde_json::to_vec_pretty(body).map_err(io::Error::other)?;
+    atomic_write_secret(path, &bytes)
+}
+
+fn new_crash_id() -> Option<String> {
+    let mut nonce = [0u8; 6];
+    getrandom::fill(&mut nonce).ok()?;
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Some(format!(
+        "crash-{}-{}-{nonce}",
+        unix_timestamp_secs(),
+        std::process::id()
+    ))
+}
+
+fn crash_snapshot_notice(id: &str) -> String {
+    format!("[dext crash snapshot id: {id}]")
+}
+
+fn write_crash_snapshot(info: &std::panic::PanicHookInfo<'_>) -> Option<String> {
+    let id = new_crash_id()?;
+    let path = dext_state_dir().join("crashes").join(format!("{id}.json"));
+    let location = info
+        .location()
+        .map(|loc| (loc.file(), loc.line(), loc.column()));
+    let body = crash_snapshot_body(&id, location);
+    write_private_crash_snapshot(&path, &body).ok()?;
+    Some(id)
 }
 
 fn byte_prefix_at_char_boundary(s: &str, max_bytes: usize) -> &str {
@@ -992,10 +1240,6 @@ impl ReadFileCache {
     }
 }
 
-fn canonical_within(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
-    canonicalize_tool_path(root, user_path)
-}
-
 fn canonical_read_path(root: &Path, user_path: &str) -> std::result::Result<PathBuf, String> {
     canonicalize_read_tool_path(root, user_path)
 }
@@ -1088,6 +1332,99 @@ impl ApprovalProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
+pub(crate) enum ApprovalPolicySource {
+    Cli,
+    DextApproval,
+    DextTrust,
+    #[default]
+    Default,
+}
+
+impl ApprovalPolicySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "CLI",
+            Self::DextApproval => "DEXT_APPROVAL",
+            Self::DextTrust => "DEXT_TRUST",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedApprovalPolicy {
+    profile: ApprovalProfile,
+    source: ApprovalPolicySource,
+    warnings: Vec<String>,
+}
+
+fn parse_strict_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn resolve_approval_policy(
+    cli_override: Option<ApprovalProfile>,
+    env_approval: Option<&str>,
+    env_trust: Option<&str>,
+) -> ResolvedApprovalPolicy {
+    let mut warnings = Vec::new();
+    if let Some(profile) = cli_override {
+        return ResolvedApprovalPolicy {
+            profile,
+            source: ApprovalPolicySource::Cli,
+            warnings,
+        };
+    }
+    if let Some(raw) = env_approval {
+        if let Some(profile) = ApprovalProfile::parse(raw) {
+            return ResolvedApprovalPolicy {
+                profile,
+                source: ApprovalPolicySource::DextApproval,
+                warnings,
+            };
+        }
+        warnings.push(
+            "invalid DEXT_APPROVAL; expected ask|auto-read|auto-write|never|always; ignoring it"
+                .to_string(),
+        );
+    }
+    if let Some(raw) = env_trust {
+        match parse_strict_env_bool(raw) {
+            Some(true) => {
+                return ResolvedApprovalPolicy {
+                    profile: ApprovalProfile::Always,
+                    source: ApprovalPolicySource::DextTrust,
+                    warnings,
+                };
+            }
+            Some(false) => {}
+            None => warnings.push(
+                "invalid DEXT_TRUST; expected 1/true/on/yes or 0/false/off/no; ignoring it"
+                    .to_string(),
+            ),
+        }
+    }
+    ResolvedApprovalPolicy {
+        profile: ApprovalProfile::Ask,
+        source: ApprovalPolicySource::Default,
+        warnings,
+    }
+}
+
+fn resolve_approval_policy_from_env(
+    cli_override: Option<ApprovalProfile>,
+) -> ResolvedApprovalPolicy {
+    let env_approval = std::env::var("DEXT_APPROVAL").ok();
+    let env_trust = std::env::var("DEXT_TRUST").ok();
+    resolve_approval_policy(cli_override, env_approval.as_deref(), env_trust.as_deref())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum SandboxProfile {
     ReadOnly,
     #[default]
@@ -1114,32 +1451,6 @@ impl SandboxProfile {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
             Self::DangerFullAccess => "danger-full-access",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum BrowserRecipe {
-    #[default]
-    Disabled,
-    AgentBrowser,
-}
-
-impl BrowserRecipe {
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" | "0" | "false" | "off" | "none" | "disabled" => Some(Self::Disabled),
-            "1" | "true" | "on" | "agent-browser" | "agent_browser" | "browser"
-            | "agentbrowser" => Some(Self::AgentBrowser),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Disabled => "off",
-            Self::AgentBrowser => "agent-browser",
         }
     }
 }
@@ -1193,7 +1504,7 @@ fn route_interactive_input_line(
     steering_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     pending_secret_send: &mut Option<String>,
 ) -> InteractiveInputRoute {
-    let trimmed = line.trim().to_string();
+    let trimmed = normalize_user_input_path(line.trim());
     if trimmed.is_empty() {
         *pending_secret_send = None;
         return InteractiveInputRoute::Dropped;
@@ -1745,7 +2056,11 @@ impl EventSink for ConsoleSink {
     }
 
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice {
-        prompt_permission(name, input, self.pretty)
+        resolve_console_permission(
+            io::stdin().is_terminal(),
+            io::stdout().is_terminal(),
+            || prompt_permission(name, input, self.pretty),
+        )
     }
 
     fn local_auth_prompt(&mut self, _tool: &str, message: &str) {
@@ -1842,8 +2157,8 @@ impl EventSink for JsonSink {
         }
     }
 
-    fn request_permission(&mut self, name: &str, input: &Value) -> Choice {
-        self.inner.request_permission(name, input)
+    fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+        Choice::Deny
     }
 
     fn local_auth_prompt(&mut self, tool: &str, message: &str) {
@@ -1985,6 +2300,7 @@ impl Drop for TerminalEchoGuard {
     }
 }
 
+#[cfg(unix)]
 fn trim_local_auth_secret_line(secret: &str) -> String {
     secret.trim_end_matches(['\r', '\n']).to_string()
 }
@@ -2116,7 +2432,11 @@ fn is_fresh_user_prompt_message(msg: &Message) -> bool {
     })
 }
 
-fn sanitize_anthropic_messages(messages: &[Message], preserve_thinking: bool) -> Vec<Message> {
+fn sanitize_anthropic_messages(
+    messages: &[Message],
+    preserve_thinking: bool,
+    allow_empty_thinking_signature: bool,
+) -> Vec<Message> {
     // Providers only require thinking blocks for the tool loop of the current
     // turn. Older turns' thinking is dead weight in every subsequent request,
     // so it is dropped at serialization time (history keeps the full record).
@@ -2149,7 +2469,9 @@ fn sanitize_anthropic_messages(messages: &[Message], preserve_thinking: bool) ->
                             metadata: ToolResultMetadata::default(),
                         }),
                         Block::Thinking { text, signature } => {
-                            let signature = signature.as_ref().filter(|sig| !sig.is_empty())?;
+                            let signature = signature.as_ref().filter(|signature| {
+                                allow_empty_thinking_signature || !signature.is_empty()
+                            })?;
                             preserve_thinking.then_some(Block::Thinking {
                                 text: text.clone(),
                                 signature: Some(signature.clone()),
@@ -2429,7 +2751,7 @@ impl Default for PrivacyPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            strict_paths: true,
+            strict_paths: false,
             findings: PrivacyFindingCounts::default(),
         }
     }
@@ -2442,6 +2764,7 @@ impl PrivacyPolicy {
             let normalized = v.trim().to_ascii_lowercase();
             policy.enabled = !matches!(normalized.as_str(), "0" | "false" | "no" | "off");
             if normalized == "strict" {
+                policy.enabled = true;
                 policy.strict_paths = true;
             }
         }
@@ -2449,20 +2772,28 @@ impl PrivacyPolicy {
     }
 
     fn mode_label(&self) -> &'static str {
-        if self.enabled { "redact" } else { "off" }
+        if !self.enabled {
+            "off"
+        } else if self.strict_paths {
+            "strict"
+        } else {
+            "redact"
+        }
     }
 
     fn prompt_status_line(&self) -> String {
-        if self.enabled {
-            "privacy=redact (tool outputs/session logs locally redact SSN, card, API key, private key, account-like numbers before model context)".to_string()
-        } else {
+        if !self.enabled {
             "privacy=off".to_string()
+        } else if self.strict_paths {
+            "privacy=strict (sensitive-looking native read paths are blocked; other tool output is redacted before model context/session logs)".to_string()
+        } else {
+            "privacy=redact (user-readable files remain readable; private keys, secret assignments, and labeled SSNs/cards/accounts are redacted before model context/session logs)".to_string()
         }
     }
 
     fn status_text(&self) -> String {
         let mut out = format!(
-            "privacy: {}\nstrict path guard: {}\nredacts: ssn, credit-card, api-key/token, private-key, account-like long numbers",
+            "privacy: {}\nstrict path guard: {}\nredacts: private keys, secret assignments, explicitly labeled SSNs/payment-card/account identifiers",
             self.mode_label(),
             if self.strict_paths { "on" } else { "off" }
         );
@@ -2494,7 +2825,7 @@ impl PrivacyPolicy {
 
     fn apply_tool_output(
         &mut self,
-        tool_name: &str,
+        _tool_name: &str,
         _input: &Value,
         content: String,
     ) -> PrivacyRedaction {
@@ -2503,29 +2834,102 @@ impl PrivacyPolicy {
             let summary = redacted.counts.summary();
             self.findings.add(&redacted.counts);
             redacted.text.push_str(&format!(
-                "\n\n[privacy] Redacted {summary} from {tool_name} output before model context/session logging. Raw values withheld."
+                "\n\n[privacy: redacted {summary}; raw values withheld]"
             ));
         }
         redacted
     }
 
     fn path_denial(&mut self, tool_name: &str, input: &Value, root: &Path) -> Option<String> {
-        if !(self.enabled && self.strict_paths && matches!(tool_name, "read_file" | "read_symbol"))
+        if !(self.enabled
+            && self.strict_paths
+            && matches!(
+                tool_name,
+                "read_file" | "read_symbol" | "fd" | "rg" | "jq" | "git_diff" | "git_log"
+            ))
         {
             return None;
         }
-        let path = input["path"].as_str()?;
+        let path = match tool_name {
+            "fd" | "rg" => input["path"].as_str().unwrap_or("."),
+            _ => input["path"].as_str()?,
+        };
         let resolved_sensitive = canonicalize_read_tool_path(root, path)
             .ok()
             .is_some_and(|resolved| privacy_sensitive_path(&resolved.to_string_lossy()));
-        if !privacy_sensitive_path(path) && !resolved_sensitive {
+        let sensitive_search_scope =
+            matches!(tool_name, "fd" | "rg") && privacy_sensitive_search_scope(tool_name, input);
+        if !privacy_sensitive_path(path) && !resolved_sensitive && !sensitive_search_scope {
             return None;
         }
         self.findings.private_key = self.findings.private_key.saturating_add(1);
-        Some(format!(
-            "[privacy] blocked {tool_name} for sensitive-looking path `{path}`. Raw file content withheld. Ask the user to disable `/privacy` or provide a sanitized excerpt if this read is necessary."
-        ))
+        if sensitive_search_scope && !privacy_sensitive_path(path) && !resolved_sensitive {
+            Some(format!(
+                "[privacy] blocked {tool_name} because strict path mode does not allow hidden, ignored, symlink-following, or sensitive-glob search scope. Raw file content and sensitive paths withheld. Use `/privacy on` for redaction-only reads, or `/privacy off` for raw reads."
+            ))
+        } else {
+            Some(format!(
+                "[privacy] blocked {tool_name} for sensitive-looking path `{path}` because strict path mode is enabled. Raw file content withheld. Use `/privacy on` for redaction-only reads, or `/privacy off` for raw reads."
+            ))
+        }
     }
+}
+
+fn privacy_sensitive_search_scope(tool_name: &str, input: &Value) -> bool {
+    if tool_name == "fd"
+        && input["pattern"]
+            .as_str()
+            .is_some_and(privacy_sensitive_path)
+    {
+        return true;
+    }
+    let args = str_array(&input["extra_args"]);
+    let mut expect_glob = false;
+    for arg in args {
+        if expect_glob {
+            if privacy_sensitive_path(&arg) {
+                return true;
+            }
+            expect_glob = false;
+            continue;
+        }
+        if matches!(arg.as_str(), "-g" | "--glob" | "--iglob") {
+            expect_glob = true;
+            continue;
+        }
+        if let Some(glob) = arg
+            .strip_prefix("--glob=")
+            .or_else(|| arg.strip_prefix("--iglob="))
+            && privacy_sensitive_path(glob)
+        {
+            return true;
+        }
+        if matches!(
+            arg.as_str(),
+            "-H" | "--hidden"
+                | "-L"
+                | "--follow"
+                | "-u"
+                | "-uu"
+                | "-uuu"
+                | "--no-ignore"
+                | "--no-ignore-vcs"
+                | "--no-ignore-global"
+                | "--no-ignore-parent"
+                | "--no-ignore-dot"
+                | "--no-ignore-exclude"
+                | "--no-ignore-files"
+        ) {
+            return true;
+        }
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg[1..].chars().any(|flag| matches!(flag, 'H' | 'L' | 'u'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl PrivacyFindingCounts {
@@ -2551,7 +2955,7 @@ impl PrivacyFindingCounts {
             parts.push(format!("{} SSN", self.ssn));
         }
         if self.credit_card > 0 {
-            parts.push(format!("{} card", self.credit_card));
+            parts.push(format!("{} payment-card", self.credit_card));
         }
         if self.api_key > 0 {
             parts.push(format!("{} API/token", self.api_key));
@@ -2560,7 +2964,7 @@ impl PrivacyFindingCounts {
             parts.push(format!("{} private-key/path", self.private_key));
         }
         if self.account_number > 0 {
-            parts.push(format!("{} account-like", self.account_number));
+            parts.push(format!("{} account identifier", self.account_number));
         }
         if parts.is_empty() {
             "0 items".to_string()
@@ -2574,19 +2978,25 @@ fn redact_sensitive_text(text: &str) -> PrivacyRedaction {
     let mut counts = PrivacyFindingCounts::default();
     let mut out = redact_private_key_blocks(text, &mut counts);
     out = redact_secret_assignments(&out, &mut counts);
-    out = redact_ssns(&out, &mut counts);
     out = redact_digit_sequences(&out, &mut counts);
     PrivacyRedaction { text: out, counts }
 }
 
 fn redact_private_key_blocks(text: &str, counts: &mut PrivacyFindingCounts) -> String {
+    if !text.contains("PRIVATE KEY-----") {
+        return text.to_string();
+    }
     let mut out = String::with_capacity(text.len());
     let mut in_key = false;
-    for line in text.lines() {
+    for segment in text.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_ending = &segment[line.len()..];
         let trimmed = line.trim();
         if !in_key && trimmed.starts_with("-----BEGIN ") && trimmed.contains("PRIVATE KEY-----") {
             counts.private_key = counts.private_key.saturating_add(1);
-            out.push_str("[REDACTED_PRIVATE_KEY]\n");
+            out.push_str("[REDACTED_PRIVATE_KEY]");
+            out.push_str(line_ending);
             in_key = true;
             continue;
         }
@@ -2596,57 +3006,167 @@ fn redact_private_key_blocks(text: &str, counts: &mut PrivacyFindingCounts) -> S
             }
             continue;
         }
-        out.push_str(line);
-        out.push('\n');
-    }
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
+        out.push_str(segment);
     }
     out
 }
 
 fn redact_secret_assignments(text: &str, counts: &mut PrivacyFindingCounts) -> String {
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        let secretish = [
-            "api_key",
-            "apikey",
-            "access_token",
-            "auth_token",
-            "bearer ",
-            "client_secret",
-            "secret_key",
-            "private_key",
-            "password",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle));
-        if secretish {
-            if let Some(pos) = line.find('=') {
-                counts.api_key = counts.api_key.saturating_add(1);
-                out.push_str(line[..=pos].trim_end());
-                out.push_str(" [REDACTED_SECRET]\n");
-                continue;
-            }
-            if let Some(pos) = line.find(':') {
-                counts.api_key = counts.api_key.saturating_add(1);
-                out.push_str(line[..=pos].trim_end());
-                out.push_str(" [REDACTED_SECRET]\n");
-                continue;
-            }
+    let mut spans = Vec::new();
+    let mut line_start = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        for (start, end) in secret_assignment_value_spans(line) {
+            counts.api_key = counts.api_key.saturating_add(1);
+            spans.push((
+                line_start.saturating_add(start),
+                line_start.saturating_add(end),
+                "[REDACTED_SECRET]",
+            ));
         }
-        out.push_str(line);
-        out.push('\n');
+        line_start = line_start.saturating_add(segment.len());
     }
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    out
+    redact_by_labeled_spans(text, spans)
 }
 
-fn redact_ssns(text: &str, counts: &mut PrivacyFindingCounts) -> String {
-    redact_by_byte_spans(text, find_ssn_spans(text, counts), "[REDACTED_SSN]")
+fn secret_assignment_value_spans(line: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut scan_from = 0usize;
+    while scan_from < line.len() {
+        let Some((delimiter_offset, ch)) = line[scan_from..]
+            .char_indices()
+            .find(|(_, ch)| matches!(ch, '=' | ':'))
+        else {
+            break;
+        };
+        let delimiter = scan_from.saturating_add(delimiter_offset);
+        scan_from = delimiter.saturating_add(ch.len_utf8());
+        if ch == '=' && line[delimiter..].starts_with("==") {
+            continue;
+        }
+        let prefix = line[..delimiter].trim_end();
+        let key = prefix
+            .rsplit(|ch: char| ch.is_whitespace() || matches!(ch, '{' | '[' | '(' | ',' | ';'))
+            .next()
+            .unwrap_or(prefix)
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
+        if !redaction_secret_key_name(key) {
+            continue;
+        }
+        let Some((start, end)) = secret_assignment_candidate_span(line, scan_from) else {
+            continue;
+        };
+        scan_from = end.max(scan_from);
+        if secret_assignment_value_looks_real(&line[start..end]) {
+            spans.push((start, end));
+        }
+    }
+    spans
+}
+
+fn secret_assignment_candidate_span(line: &str, value_start: usize) -> Option<(usize, usize)> {
+    let value = line.get(value_start..)?;
+    let leading_ws = value.len().saturating_sub(value.trim_start().len());
+    let mut start = value_start.saturating_add(leading_ws);
+    let first = line.get(start..)?.chars().next()?;
+    if matches!(first, '"' | '\'' | '`') {
+        start = start.saturating_add(first.len_utf8());
+        let mut escaped = false;
+        for (offset, ch) in line.get(start..)?.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == first {
+                return (offset > 0).then_some((start, start.saturating_add(offset)));
+            }
+        }
+        return None;
+    }
+
+    if line
+        .get(start..start.saturating_add("bearer".len()))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
+        && line
+            .get(start.saturating_add("bearer".len())..)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(char::is_whitespace)
+    {
+        start = start.saturating_add("bearer".len());
+        let rest = line.get(start..)?;
+        start = start.saturating_add(rest.len().saturating_sub(rest.trim_start().len()));
+    }
+
+    let end = line
+        .get(start..)?
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            (ch.is_whitespace() || matches!(ch, ',' | ';' | '&' | '}' | ']' | ')'))
+                .then_some(start.saturating_add(offset))
+        })
+        .unwrap_or(line.len());
+    (end > start).then_some((start, end))
+}
+
+fn redaction_secret_key_name(key: &str) -> bool {
+    let compact = compact_key_name(key);
+    matches!(
+        compact.as_str(),
+        "auth"
+            | "authorization"
+            | "passwd"
+            | "pwd"
+            | "password"
+            | "privatekey"
+            | "apikey"
+            | "accesstoken"
+            | "authtoken"
+            | "bearertoken"
+            | "clientsecret"
+            | "consumersecret"
+            | "secretkey"
+            | "awssecretaccesskey"
+    ) || compact.ends_with("apikey")
+        || compact.ends_with("accesstoken")
+        || compact.ends_with("authtoken")
+        || compact.ends_with("password")
+        || compact.ends_with("token")
+}
+
+fn secret_assignment_value_looks_real(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_end_matches([',', ';'])
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    let bearer = strip_bearer_token(value);
+    let candidate = bearer.unwrap_or(value);
+    if candidate.len() < 6 || candidate.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let lower = candidate.to_ascii_lowercase();
+    !matches!(
+        lower.as_str(),
+        "string"
+            | "str"
+            | "none"
+            | "null"
+            | "true"
+            | "false"
+            | "secret"
+            | "password"
+            | "token"
+            | "api-key"
+            | "apikey"
+            | "env_var_name"
+            | "!command"
+    ) && !lower.starts_with("[redacted")
+        && !lower.starts_with("<redacted")
+        && !lower.starts_with("example")
+        && !candidate.starts_with('$')
+        && !candidate.starts_with('<')
+        && !candidate.starts_with("env::")
+        && !candidate.starts_with("std::env")
 }
 
 fn redact_digit_sequences(text: &str, counts: &mut PrivacyFindingCounts) -> String {
@@ -2663,7 +3183,7 @@ fn redact_digit_sequences(text: &str, counts: &mut PrivacyFindingCounts) -> Stri
             }
             digits.push(ch);
             digit_count += 1;
-        } else if start.is_some() && matches!(ch, ' ' | '-' | '_' | '.') {
+        } else if start.is_some() && matches!(ch, ' ' | '-') {
             digits.push(ch);
         } else if let Some(s) = start.take() {
             classify_digit_span(text, s, idx, &digits, digit_count, &mut spans, counts);
@@ -2688,54 +3208,34 @@ fn redact_digit_sequences(text: &str, counts: &mut PrivacyFindingCounts) -> Stri
 fn classify_digit_span(
     text: &str,
     start: usize,
-    end: usize,
+    _end: usize,
     raw_digits: &str,
     digit_count: usize,
     spans: &mut Vec<(usize, usize, &'static str)>,
     counts: &mut PrivacyFindingCounts,
 ) {
-    if digit_count < 9 {
+    let raw_digits = raw_digits.trim_end_matches([' ', '-']);
+    let end = start.saturating_add(raw_digits.len());
+    if digit_count < 9
+        || !byte_boundary_ok(text.as_bytes(), start, end)
+        || numeric_span_touches_decimal(text, start, end)
+    {
         return;
     }
     let digits: String = raw_digits.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digit_count == 9 && looks_like_ssn_context(text, start) {
+    if digit_count == 9 && looks_like_ssn_context(text, start) && valid_ssn_digits(&digits) {
         counts.ssn = counts.ssn.saturating_add(1);
         spans.push((start, end, "[REDACTED_SSN]"));
-    } else if (13..=19).contains(&digit_count) && luhn_valid(&digits) {
+    } else if (13..=19).contains(&digit_count)
+        && luhn_valid(&digits)
+        && looks_like_card_context(text, start)
+    {
         counts.credit_card = counts.credit_card.saturating_add(1);
         spans.push((start, end, "[REDACTED_CARD]"));
-    } else if (10..=17).contains(&digit_count) && looks_like_account_context(text, start) {
+    } else if (9..=34).contains(&digit_count) && looks_like_account_context(text, start) {
         counts.account_number = counts.account_number.saturating_add(1);
         spans.push((start, end, "[REDACTED_ACCOUNT]"));
     }
-}
-
-fn find_ssn_spans(text: &str, counts: &mut PrivacyFindingCounts) -> Vec<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut spans = Vec::new();
-    let mut i = 0usize;
-    while i + 11 <= bytes.len() {
-        if bytes[i].is_ascii_digit()
-            && bytes[i + 1].is_ascii_digit()
-            && bytes[i + 2].is_ascii_digit()
-            && bytes[i + 3] == b'-'
-            && bytes[i + 4].is_ascii_digit()
-            && bytes[i + 5].is_ascii_digit()
-            && bytes[i + 6] == b'-'
-            && bytes[i + 7].is_ascii_digit()
-            && bytes[i + 8].is_ascii_digit()
-            && bytes[i + 9].is_ascii_digit()
-            && bytes[i + 10].is_ascii_digit()
-            && byte_boundary_ok(bytes, i, i + 11)
-        {
-            counts.ssn = counts.ssn.saturating_add(1);
-            spans.push((i, i + 11));
-            i += 11;
-        } else {
-            i += 1;
-        }
-    }
-    spans
 }
 
 fn byte_boundary_ok(bytes: &[u8], start: usize, end: usize) -> bool {
@@ -2743,24 +3243,6 @@ fn byte_boundary_ok(bytes: &[u8], start: usize, end: usize) -> bool {
     let after = bytes.get(end).copied();
     !before.is_some_and(|b| b.is_ascii_alphanumeric())
         && !after.is_some_and(|b| b.is_ascii_alphanumeric())
-}
-
-fn redact_by_byte_spans(text: &str, spans: Vec<(usize, usize)>, replacement: &str) -> String {
-    if spans.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0usize;
-    for (start, end) in spans {
-        if start < last {
-            continue;
-        }
-        out.push_str(&text[last..start]);
-        out.push_str(replacement);
-        last = end;
-    }
-    out.push_str(&text[last..]);
-    out
 }
 
 fn redact_by_labeled_spans(text: &str, mut spans: Vec<(usize, usize, &'static str)>) -> String {
@@ -2782,23 +3264,103 @@ fn redact_by_labeled_spans(text: &str, mut spans: Vec<(usize, usize, &'static st
     out
 }
 
+fn normalized_numeric_label_before(text: &str, start: usize) -> String {
+    let line_prefix = text[..start]
+        .rsplit_once('\n')
+        .map_or(&text[..start], |(_, line)| line);
+    let suffix = byte_suffix_at_char_boundary(line_prefix, 64);
+    let normalized: String = suffix
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn numeric_label_matches(text: &str, start: usize, labels: &[&str]) -> bool {
+    let label = normalized_numeric_label_before(text, start);
+    labels.iter().any(|candidate| {
+        label == *candidate
+            || label
+                .strip_suffix(candidate)
+                .is_some_and(|prefix| prefix.ends_with(' '))
+    })
+}
+
 fn looks_like_ssn_context(text: &str, start: usize) -> bool {
-    let prefix = byte_suffix_at_char_boundary(&text[..start], 32).to_ascii_lowercase();
-    prefix.contains("ssn") || prefix.contains("social security")
+    numeric_label_matches(
+        text,
+        start,
+        &["ssn", "social security", "social security number"],
+    )
+}
+
+fn looks_like_card_context(text: &str, start: usize) -> bool {
+    numeric_label_matches(
+        text,
+        start,
+        &[
+            "card",
+            "card number",
+            "cardnumber",
+            "credit card",
+            "credit card number",
+            "creditcard",
+            "creditcardnumber",
+            "debit card",
+            "payment card",
+            "pan",
+        ],
+    )
 }
 
 fn looks_like_account_context(text: &str, start: usize) -> bool {
-    let context = byte_suffix_at_char_boundary(&text[..start], 40).to_ascii_lowercase();
-    [
-        "account",
-        "acct",
-        "routing",
-        "iban",
-        "member id",
-        "customer id",
-    ]
-    .iter()
-    .any(|needle| context.contains(needle))
+    numeric_label_matches(
+        text,
+        start,
+        &[
+            "account",
+            "account number",
+            "accountnumber",
+            "acct",
+            "acct number",
+            "acctnumber",
+            "routing",
+            "routing number",
+            "routingnumber",
+            "iban",
+            "member id",
+            "memberid",
+            "customer id",
+            "customerid",
+        ],
+    )
+}
+
+fn numeric_span_touches_decimal(text: &str, start: usize, end: usize) -> bool {
+    text[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '.' | '_'))
+        || text[end..]
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, '.' | '_'))
+}
+
+fn valid_ssn_digits(digits: &str) -> bool {
+    if digits.len() != 9 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let area = digits[..3].parse::<u16>().unwrap_or(0);
+    let group = digits[3..5].parse::<u8>().unwrap_or(0);
+    let serial = digits[5..].parse::<u16>().unwrap_or(0);
+    (1..=899).contains(&area) && area != 666 && group != 0 && serial != 0
 }
 
 fn luhn_valid(digits: &str) -> bool {
@@ -2920,7 +3482,16 @@ pub(crate) struct WireTool {
     cache_control: Option<CacheControl>,
 }
 
-fn openai_reasoning_effort(effort: ThinkingEffort) -> Option<&'static str> {
+fn openai_reasoning_effort(model: &str, effort: ThinkingEffort) -> Option<&'static str> {
+    if model.trim().to_ascii_lowercase().starts_with("gpt-5.6") {
+        return Some(match effort {
+            ThinkingEffort::Off => "none",
+            ThinkingEffort::Low => "low",
+            ThinkingEffort::Medium => "medium",
+            ThinkingEffort::High => "high",
+            ThinkingEffort::XHigh | ThinkingEffort::Max => "xhigh",
+        });
+    }
     match effort {
         ThinkingEffort::Off => None,
         ThinkingEffort::Low => Some("low"),
@@ -3181,6 +3752,29 @@ struct AnthropicOutputConfig {
     effort: String,
 }
 
+fn openai_uses_max_completion_tokens(provider_id: &str, model: &str) -> bool {
+    if canonical_provider_id(provider_id) != "openai" {
+        return false;
+    }
+    let model = model.trim().to_ascii_lowercase();
+    model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+}
+
+fn oai_output_token_caps(
+    provider_id: &str,
+    model: &str,
+    tokens: u32,
+) -> (Option<u32>, Option<u32>) {
+    if openai_uses_max_completion_tokens(provider_id, model) {
+        (None, Some(tokens))
+    } else {
+        (Some(tokens), None)
+    }
+}
+
 #[derive(Serialize)]
 struct OaiStreamOptions {
     include_usage: bool,
@@ -3189,7 +3783,10 @@ struct OaiStreamOptions {
 #[derive(Serialize)]
 struct OaiRequest<'a> {
     model: &'a str,
-    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     messages: Vec<OaiMessage>,
     tools: Vec<OaiTool>,
     stream: bool,
@@ -3444,6 +4041,15 @@ impl UsagePricing {
         Self::new(0.0, 0.0, 0.0, 0.0)
     }
 
+    fn scaled(self, input: f64, output: f64) -> Self {
+        Self::new(
+            self.input * input,
+            self.output * output,
+            self.cache_read * input,
+            self.cache_create * input,
+        )
+    }
+
     fn estimate(self, usage: Usage) -> f64 {
         let per_mtok = 1_000_000.0;
         (usage.input as f64 / per_mtok) * self.input
@@ -3507,6 +4113,42 @@ fn usage_pricing_for(
     usage_pricing_from_env(base)
 }
 
+fn pricing_env_override_is_set() -> bool {
+    [
+        "DEXT_INPUT_USD_PER_MTOK",
+        "DEXT_OUTPUT_USD_PER_MTOK",
+        "DEXT_CACHE_READ_USD_PER_MTOK",
+        "DEXT_CACHE_CREATE_USD_PER_MTOK",
+    ]
+    .into_iter()
+    .any(|name| env_f64(name).is_some())
+}
+
+fn gpt_5_6_long_context_pricing(
+    provider_id: &str,
+    model: &str,
+    usage: Usage,
+    pricing: UsagePricing,
+) -> UsagePricing {
+    if matches!(
+        canonical_provider_id(provider_id).as_str(),
+        "openai" | "chatgpt"
+    ) && normalize_price_model(model).starts_with("gpt-5.6")
+        && usage.total_input_tokens() > 272_000
+        && !pricing_env_override_is_set()
+        && openai_pricing(&normalize_price_model(model)).is_some_and(|official| {
+            pricing.input == official.input
+                && pricing.output == official.output
+                && pricing.cache_read == official.cache_read
+                && pricing.cache_create == official.cache_create
+        })
+    {
+        pricing.scaled(2.0, 1.5)
+    } else {
+        pricing
+    }
+}
+
 fn usage_with_current_pricing(
     mut usage: Usage,
     provider_id: &str,
@@ -3523,6 +4165,7 @@ fn usage_with_current_pricing(
             || usage_pricing_for(provider_id, api_provider, base_url, model),
             |pricing| usage_pricing_from_env(UsagePricing::from(pricing)),
         );
+        let pricing = gpt_5_6_long_context_pricing(provider_id, model, usage, pricing);
         usage.cost_usd = Some(pricing.estimate(usage));
     }
     usage
@@ -3533,7 +4176,13 @@ fn normalize_price_model(model: &str) -> String {
 }
 
 fn openai_pricing(model: &str) -> Option<UsagePricing> {
-    if model.starts_with("gpt-5.4-mini") {
+    if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
+        Some(UsagePricing::new(5.0, 30.0, 0.5, 6.25))
+    } else if model.starts_with("gpt-5.6-terra") {
+        Some(UsagePricing::new(2.5, 15.0, 0.25, 3.125))
+    } else if model.starts_with("gpt-5.6-luna") {
+        Some(UsagePricing::new(1.0, 6.0, 0.1, 1.25))
+    } else if model.starts_with("gpt-5.4-mini") {
         Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
     } else if model.starts_with("gpt-5.4") {
         Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
@@ -3745,88 +4394,6 @@ fn parse_token_count(raw: &str) -> Option<u64> {
     (tokens.is_finite() && tokens >= 1.0 && tokens <= u64::MAX as f64).then_some(tokens as u64)
 }
 
-#[derive(Default)]
-struct PartialBlock {
-    kind: String,
-    text: String,
-    id: String,
-    name: String,
-    input_json: String,
-    thinking_signature: Option<String>,
-    redacted_data: String,
-}
-
-impl PartialBlock {
-    fn finalize(self) -> Option<Block> {
-        match self.kind.as_str() {
-            "text" => Some(Block::Text { text: self.text }),
-            "thinking" => {
-                let signature = self.thinking_signature.filter(|sig| !sig.is_empty());
-                (!self.text.is_empty() || signature.is_some()).then_some(Block::Thinking {
-                    text: self.text,
-                    signature,
-                })
-            }
-            "redacted_thinking" => {
-                (!self.redacted_data.is_empty()).then_some(Block::RedactedThinking {
-                    data: self.redacted_data,
-                })
-            }
-            "tool_use" => Some(Block::ToolUse {
-                id: self.id,
-                name: self.name,
-                input: parse_tool_input_json(&self.input_json),
-            }),
-            _ => None,
-        }
-    }
-}
-
-fn parse_tool_input_json(raw: &str) -> Value {
-    if raw.trim().is_empty() {
-        return Value::Object(Default::default());
-    }
-    let mut input: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
-    if let Value::String(s) = &input
-        && let Ok(decoded) = serde_json::from_str::<Value>(s)
-    {
-        input = decoded;
-    }
-    if input.is_null() {
-        Value::Object(Default::default())
-    } else {
-        input
-    }
-}
-
-fn is_meaningful_tool_input(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Object(map) => !map.is_empty(),
-        Value::Array(items) => !items.is_empty(),
-        Value::String(s) => !s.trim().is_empty(),
-        _ => true,
-    }
-}
-
-fn set_tool_input_json_if_meaningful(dst: &mut String, input: &Value) {
-    if !is_meaningful_tool_input(input) {
-        return;
-    }
-    *dst = match input {
-        Value::String(s) => s.clone(),
-        _ => input.to_string(),
-    };
-}
-
-fn append_tool_input_json_fragment(dst: &mut String, fragment: &str) {
-    let trimmed = dst.trim();
-    if trimmed == "{}" || trimmed == "[]" {
-        dst.clear();
-    }
-    dst.push_str(fragment);
-}
-
 pub(crate) fn normalize_reasoning_summary_text(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     let mut remaining = text;
@@ -3996,41 +4563,6 @@ fn reasoning_summary_stream_delta(raw: &str, emitted: &mut String) -> Option<Str
     let delta = visible.strip_prefix(emitted.as_str())?.to_string();
     *emitted = visible;
     (!delta.is_empty()).then_some(delta)
-}
-
-// Finds the earliest SSE event delimiter in `buf` starting the scan at
-// `from.saturating_sub(3)` so a CRLF boundary straddling prior scan state is
-// still discovered. Returns (delimiter_start_index, delimiter_len) where
-// delimiter_len is 2 for LF/LF and 4 for CRLF/CRLF.
-fn find_sse_delimiter(buf: &[u8], from: usize) -> Option<(usize, usize)> {
-    let start = from.saturating_sub(3);
-    let slice = &buf[start..];
-    let mut i = 0;
-    while i + 1 < slice.len() {
-        if slice[i] == b'\n' && slice[i + 1] == b'\n' {
-            return Some((start + i, 2));
-        }
-        if i + 3 < slice.len()
-            && slice[i] == b'\r'
-            && slice[i + 1] == b'\n'
-            && slice[i + 2] == b'\r'
-            && slice[i + 3] == b'\n'
-        {
-            return Some((start + i, 4));
-        }
-        i += 1;
-    }
-    None
-}
-
-// Convenience wrapper used by tests: returns (event_text, bytes_consumed)
-// where bytes_consumed includes the delimiter. Picks the earliest delimiter
-// rather than preferring LF over CRLF by code-order.
-#[cfg(test)]
-fn next_sse_event(buf: &[u8]) -> Option<(String, usize)> {
-    let (end, sep_len) = find_sse_delimiter(buf, 0)?;
-    let text = String::from_utf8_lossy(&buf[..end]).into_owned();
-    Some((text, end + sep_len))
 }
 
 const EXTERNAL_TOOL_TIMEOUT_SECS: u64 = 60;
@@ -4232,6 +4764,114 @@ where
     capture
 }
 
+const PACK_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED_PACK_CREDENTIAL]";
+
+struct SecretByteRedactor {
+    patterns: Vec<Vec<u8>>,
+    pending: Vec<u8>,
+    max_pattern_len: usize,
+}
+
+impl SecretByteRedactor {
+    fn new(patterns: Vec<Vec<u8>>) -> Self {
+        let patterns = patterns
+            .into_iter()
+            .filter(|pattern| !pattern.is_empty())
+            .collect::<Vec<_>>();
+        let max_pattern_len = patterns.iter().map(Vec::len).max().unwrap_or(0);
+        Self {
+            patterns,
+            pending: Vec::new(),
+            max_pattern_len,
+        }
+    }
+
+    fn push<F>(&mut self, bytes: &[u8], mut emit: F)
+    where
+        F: FnMut(&[u8]),
+    {
+        self.pending.extend_from_slice(bytes);
+        self.drain(false, &mut emit);
+    }
+
+    fn finish<F>(&mut self, mut emit: F)
+    where
+        F: FnMut(&[u8]),
+    {
+        self.drain(true, &mut emit);
+    }
+
+    fn drain<F>(&mut self, finish: bool, emit: &mut F)
+    where
+        F: FnMut(&[u8]),
+    {
+        loop {
+            let found = self
+                .patterns
+                .iter()
+                .filter_map(|pattern| {
+                    self.pending
+                        .windows(pattern.len())
+                        .position(|window| window == pattern)
+                        .map(|position| (position, pattern.len()))
+                })
+                .min_by_key(|(position, length)| (*position, std::cmp::Reverse(*length)));
+            if let Some((position, length)) = found {
+                let candidate = &self.pending[position..];
+                let could_extend = !finish
+                    && self.patterns.iter().any(|pattern| {
+                        pattern.len() > candidate.len() && pattern.starts_with(candidate)
+                    });
+                if could_extend {
+                    emit(&self.pending[..position]);
+                    self.pending.drain(..position);
+                    break;
+                }
+                emit(&self.pending[..position]);
+                emit(PACK_CREDENTIAL_REDACTION);
+                self.pending.drain(..position + length);
+                continue;
+            }
+
+            let keep = if finish {
+                0
+            } else {
+                self.max_pattern_len.saturating_sub(1)
+            };
+            let emit_len = self.pending.len().saturating_sub(keep);
+            if emit_len > 0 {
+                emit(&self.pending[..emit_len]);
+                self.pending.drain(..emit_len);
+            }
+            break;
+        }
+    }
+}
+
+async fn collect_async_limited_redacted<R>(
+    mut reader: R,
+    cap: usize,
+    secret_values: Vec<Vec<u8>>,
+) -> LimitedByteCapture
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut capture = LimitedByteCapture::new(cap);
+    let mut redactor = SecretByteRedactor::new(secret_values);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => redactor.push(&buf[..n], |bytes| capture.push(bytes)),
+            Err(_) => break,
+        }
+    }
+    redactor.finish(|bytes| capture.push(bytes));
+    capture
+}
+
 // Children run in a new *session*, not merely a new process group: setsid()
 // also detaches them from Dext's controlling terminal, so nothing they spawn
 // can read from or paint over the TUI via /dev/tty (git credential prompts
@@ -4243,10 +4883,12 @@ where
 #[cfg(unix)]
 fn detach_session_pre_exec() -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
     || {
-        unsafe {
-            if libc::setsid() == -1 {
-                let _ = libc::setpgid(0, 0);
-            }
+        let setsid_result = unsafe { libc::setsid() };
+        if setsid_result != -1 {
+            return Ok(());
+        }
+        if unsafe { libc::setpgid(0, 0) } == -1 {
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
@@ -4260,7 +4902,13 @@ fn configure_std_process_group(cmd: &mut Command) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn configure_std_process_group(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn configure_std_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
@@ -4270,8 +4918,217 @@ fn configure_tokio_process_group(cmd: &mut tokio::process::Command) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn configure_tokio_process_group(cmd: &mut tokio::process::Command) {
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn configure_tokio_process_group(_cmd: &mut tokio::process::Command) {}
+
+#[cfg(windows)]
+fn resume_windows_process(pid: u32) -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
+                Thread32Next,
+            },
+            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut present = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while present {
+        if entry.th32OwnerProcessID == pid {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    CloseHandle(snapshot);
+                }
+                return Err(error);
+            }
+            let resumed = unsafe { ResumeThread(thread) };
+            let error = (resumed == u32::MAX).then(io::Error::last_os_error);
+            unsafe {
+                CloseHandle(thread);
+                CloseHandle(snapshot);
+            }
+            return error.map_or(Ok(()), Err);
+        }
+        present = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "suspended child thread was not found",
+    ))
+}
+
+struct ChildProcessTree {
+    #[cfg(unix)]
+    pid: u32,
+    #[cfg(windows)]
+    job: usize,
+}
+
+impl ChildProcessTree {
+    fn for_std(child: &std::process::Child) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self { pid: child.id() })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            Self::for_windows_process(child.as_raw_handle() as _, child.id())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    fn for_tokio(child: &tokio::process::Child) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            child
+                .id()
+                .map(|pid| Self { pid })
+                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))
+        }
+        #[cfg(windows)]
+        {
+            let process = child
+                .raw_handle()
+                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))?;
+            let pid = child
+                .id()
+                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))?;
+            Self::for_windows_process(process as _, pid)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    #[cfg(windows)]
+    fn for_windows_process(
+        process: windows_sys::Win32::Foundation::HANDLE,
+        pid: u32,
+    ) -> io::Result<Self> {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            },
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if configured == 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(error);
+        }
+        if unsafe { AssignProcessToJobObject(job, process) } == 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(error);
+        }
+        if let Err(error) = resume_windows_process(pid) {
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(error);
+        }
+        Ok(Self { job: job as usize })
+    }
+
+    fn terminate_after_root_exit(&self) {
+        #[cfg(unix)]
+        {
+            signal_process_group(self.pid, libc::SIGTERM);
+            signal_process_group(self.pid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
+        }
+    }
+
+    fn terminate_std_child(&self, child: &mut std::process::Child) {
+        #[cfg(unix)]
+        {
+            signal_process_group(self.pid, libc::SIGTERM);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            signal_process_group(self.pid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    async fn terminate_tokio_child(&self, child: &mut tokio::process::Child) {
+        #[cfg(unix)]
+        {
+            signal_process_group(self.pid, libc::SIGTERM);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            signal_process_group(self.pid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+}
+
+impl Drop for ChildProcessTree {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.job as _);
+        }
+    }
+}
 
 /// Forbid interactive credential prompting in tool children. They have no
 /// usable terminal (see detach_session_pre_exec), so a git/ssh prompt could
@@ -4329,6 +5186,8 @@ fn tool_credential_env_key(name: &str) -> bool {
                 | "SSH_ASKPASS"
                 | "SSH_AUTH_SOCK"
                 | "SUDO_ASKPASS"
+                | "X_CONSUMER_KEY"
+                | "X_CT0"
         )
 }
 
@@ -4336,14 +5195,234 @@ fn tool_children_inherit_credentials() -> bool {
     env_flag_default(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, false)
 }
 
-fn scrub_tool_credentials_from_std_command(cmd: &mut Command) {
-    if tool_children_inherit_credentials() {
-        return;
+fn pack_credential_env_name_allowed(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 128
+        && chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && tool_credential_env_key(name)
+        && !name.to_ascii_uppercase().starts_with("DEXT_")
+}
+
+fn provider_credential_env_names() -> HashSet<String> {
+    let mut names = built_in_provider_profiles()
+        .into_iter()
+        .flat_map(|profile| profile.env_vars)
+        .map(|name| name.to_ascii_uppercase())
+        .collect::<HashSet<_>>();
+    if let Ok(catalog) = load_provider_catalog() {
+        names.extend(
+            catalog
+                .providers
+                .into_iter()
+                .flat_map(|profile| profile.env_vars)
+                .map(|name| name.to_ascii_uppercase()),
+        );
     }
+    names
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackHelperInvocation {
+    executable: PathBuf,
+    args: Vec<String>,
+}
+
+fn strict_simple_command_words(command: &str) -> Option<Vec<String>> {
+    if command.is_empty()
+        || command
+            .chars()
+            .any(|ch| matches!(ch, ';' | '\n' | '\r' | '&' | '|' | '<' | '>' | '`' | '#'))
+        || command.contains("$(")
+    {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut word_started = false;
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            word_started = true;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => {
+                escaped = true;
+                word_started = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                word_started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                word_started = true;
+            }
+            ch if ch.is_whitespace() && !in_single && !in_double => {
+                if word_started {
+                    words.push(std::mem::take(&mut current));
+                    word_started = false;
+                }
+            }
+            ch if ch.is_control() => return None,
+            _ => {
+                current.push(ch);
+                word_started = true;
+            }
+        }
+    }
+    if escaped || in_single || in_double {
+        return None;
+    }
+    if word_started {
+        words.push(current);
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+fn pack_helper_supports_direct_spawn_on(executable: &Path, windows: bool) -> bool {
+    !windows
+        || executable.extension().is_some_and(|extension| {
+            let extension = extension.to_string_lossy();
+            extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+        })
+}
+
+fn pack_helper_supports_direct_spawn(executable: &Path) -> bool {
+    pack_helper_supports_direct_spawn_on(executable, cfg!(windows))
+}
+
+fn active_pack_helper_invocation(
+    command: &str,
+    extra_env: &[(String, String)],
+) -> Option<PackHelperInvocation> {
+    let command = command
+        .strip_prefix(tool_policy::BASH_PIPEFAIL_PREFIX)
+        .unwrap_or(command);
+    let pack_dir = extra_env
+        .iter()
+        .find(|(key, _)| key == "DEXT_PACK_DIR")
+        .map(|(_, value)| Path::new(value))?;
+    let words = strict_simple_command_words(command)?;
+    let executable = words.first()?;
+    if words.iter().skip(1).any(|word| {
+        word.chars().any(|ch| {
+            matches!(
+                ch,
+                '$' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '(' | ')'
+            )
+        })
+    }) {
+        return None;
+    }
+    let helper_path = if let Some(helper) = executable
+        .strip_prefix("$DEXT_PACK_DIR/bin/")
+        .or_else(|| executable.strip_prefix("${DEXT_PACK_DIR}/bin/"))
+    {
+        if helper.is_empty()
+            || helper.contains('/')
+            || !helper
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        {
+            return None;
+        }
+        pack_dir.join("bin").join(helper)
+    } else {
+        if executable.contains('$') {
+            return None;
+        }
+        let executable = Path::new(executable);
+        if !executable.is_absolute() || executable.file_name().is_none() {
+            return None;
+        }
+        executable.to_path_buf()
+    };
+    let canonical_pack_dir = std::fs::canonicalize(pack_dir).ok()?;
+    let pack_bin = std::fs::canonicalize(pack_dir.join("bin")).ok()?;
+    if pack_bin.parent() != Some(canonical_pack_dir.as_path()) {
+        return None;
+    }
+    let executable = std::fs::canonicalize(helper_path).ok()?;
+    if !executable.is_file() || executable.parent() != Some(pack_bin.as_path()) {
+        return None;
+    }
+    if !pack_helper_supports_direct_spawn(&executable) {
+        return None;
+    }
+    Some(PackHelperInvocation {
+        executable,
+        args: words.into_iter().skip(1).collect(),
+    })
+}
+
+fn configured_pack_credential_env(extra_env: &[(String, String)]) -> Vec<String> {
+    let mut names = extra_env
+        .iter()
+        .find(|(key, _)| key == "DEXT_PACK_CREDENTIAL_ENV")
+        .map(|(_, value)| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| pack_credential_env_name_allowed(name))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn allowed_pack_credential_env(extra_env: &[(String, String)]) -> Vec<String> {
+    let provider_env = provider_credential_env_names();
+    configured_pack_credential_env(extra_env)
+        .into_iter()
+        .filter(|name| !provider_env.contains(&name.to_ascii_uppercase()))
+        .collect()
+}
+
+fn declared_pack_credential_values(names: &[String]) -> Vec<Vec<u8>> {
+    let mut values = names
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(|value| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+                value.as_os_str().as_bytes().to_vec()
+            }
+            #[cfg(not(unix))]
+            {
+                value.to_string_lossy().as_bytes().to_vec()
+            }
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    values.dedup();
+    values
+}
+
+fn scrub_credentials_from_std_command_unconditionally_except(
+    cmd: &mut Command,
+    allowed: &[String],
+) {
     let mut keys = std::env::vars_os()
         .map(|(key, _)| key)
         .chain(cmd.get_envs().map(|(key, _)| key.to_os_string()))
-        .filter(|key| key.to_str().is_some_and(tool_credential_env_key))
+        .filter(|key| {
+            key.to_str().is_some_and(|name| {
+                tool_credential_env_key(name) && !allowed.iter().any(|allowed| allowed == name)
+            })
+        })
         .collect::<Vec<_>>();
     keys.sort();
     keys.dedup();
@@ -4352,8 +5431,63 @@ fn scrub_tool_credentials_from_std_command(cmd: &mut Command) {
     }
 }
 
+fn scrub_tool_credentials_from_std_command(cmd: &mut Command) {
+    if !tool_children_inherit_credentials() {
+        scrub_credentials_from_std_command_unconditionally_except(cmd, &[]);
+    }
+}
+
+pub(crate) fn scrub_credentials_from_std_command_unconditionally(cmd: &mut Command) {
+    scrub_credentials_from_std_command_unconditionally_except(cmd, &[]);
+}
+
 fn scrub_tool_credentials_from_tokio_command(cmd: &mut tokio::process::Command) {
     scrub_tool_credentials_from_std_command(cmd.as_std_mut());
+}
+
+const INTERNAL_STARTUP_ENV_VARS: &[&str] = &[
+    "BASH_ENV",
+    "BASHOPTS",
+    "CLASSPATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "ENV",
+    "GCONV_PATH",
+    "JAVA_TOOL_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "KSH_ENV",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PERL5LIB",
+    "PERL5OPT",
+    "PROMPT_COMMAND",
+    "PYTHONHOME",
+    "PYTHONINSPECT",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "RUBYLIB",
+    "RUBYOPT",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTC_WRAPPER",
+    "SHELLOPTS",
+    "ZDOTDIR",
+    "_JAVA_OPTIONS",
+];
+
+fn scrub_startup_env_from_std_command(cmd: &mut Command) {
+    for name in INTERNAL_STARTUP_ENV_VARS {
+        cmd.env_remove(name);
+    }
+}
+
+pub(crate) fn harden_internal_command_env(cmd: &mut Command) {
+    deny_interactive_prompt_env_std(cmd);
+    scrub_credentials_from_std_command_unconditionally(cmd);
+    scrub_startup_env_from_std_command(cmd);
 }
 
 #[cfg(unix)]
@@ -4364,50 +5498,27 @@ fn signal_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
-fn terminate_process_group_after_exit(pid: u32) {
-    #[cfg(unix)]
-    {
-        signal_process_group(pid, libc::SIGTERM);
-        signal_process_group(pid, libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
-}
-
-fn terminate_std_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id();
-        signal_process_group(pid, libc::SIGTERM);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        signal_process_group(pid, libc::SIGKILL);
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-async fn terminate_tokio_child(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        signal_process_group(pid, libc::SIGTERM);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        signal_process_group(pid, libc::SIGKILL);
-    }
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-}
-
-fn run_sync_command_limited(
+fn run_sync_command_limited_with_scratch(
     mut cmd: Command,
     stdin_data: Option<&str>,
     capture_cap: usize,
     spawn_label: &str,
     timeout: std::time::Duration,
+    scratch: Option<sandbox::PrivateScratch>,
 ) -> std::result::Result<(LimitedByteCapture, LimitedByteCapture, i32), String> {
     use std::io::Write as _;
     use std::process::Stdio;
 
+    let scratch = match scratch {
+        Some(scratch) => scratch,
+        None => sandbox::PrivateScratch::create()
+            .map_err(|error| format!("create private temp for {spawn_label}: {error}"))?,
+    };
+    cmd.env("TMPDIR", &scratch.path)
+        .env("TMP", &scratch.path)
+        .env("TEMP", &scratch.path);
     deny_interactive_prompt_env_std(&mut cmd);
+    scrub_startup_env_from_std_command(&mut cmd);
     scrub_tool_credentials_from_std_command(&mut cmd);
     if stdin_data.is_some() {
         cmd.stdin(Stdio::piped());
@@ -4419,18 +5530,49 @@ fn run_sync_command_limited(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {spawn_label}: {e}"))?;
-    let child_pid = child.id();
+    let process_tree = match ChildProcessTree::for_std(&child) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "failed to guard {spawn_label} process tree: {error}"
+            ));
+        }
+    };
 
-    let stdout = child.stdout.take().ok_or("stdout not piped")?;
-    let stderr = child.stderr.take().ok_or("stderr not piped")?;
-    let out_handle = std::thread::spawn(move || collect_sync_limited(stdout, capture_cap));
-    let err_handle = std::thread::spawn(move || collect_sync_limited(stderr, capture_cap));
+    let streams = (child.stdout.take(), child.stderr.take());
+    let (Some(stdout), Some(stderr)) = streams else {
+        process_tree.terminate_std_child(&mut child);
+        return Err(format!("{spawn_label} did not provide piped output"));
+    };
+    let out_handle = match std::thread::Builder::new()
+        .name("dext-child-stdout".to_string())
+        .spawn(move || collect_sync_limited(stdout, capture_cap))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            process_tree.terminate_std_child(&mut child);
+            return Err(format!("start {spawn_label} stdout reader: {error}"));
+        }
+    };
+    let err_handle = match std::thread::Builder::new()
+        .name("dext-child-stderr".to_string())
+        .spawn(move || collect_sync_limited(stderr, capture_cap))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            process_tree.terminate_std_child(&mut child);
+            let _ = out_handle.join();
+            return Err(format!("start {spawn_label} stderr reader: {error}"));
+        }
+    };
 
     if let Some(data) = stdin_data
         && let Some(mut si) = child.stdin.take()
         && let Err(error) = si.write_all(data.as_bytes())
     {
-        terminate_std_child(&mut child);
+        process_tree.terminate_std_child(&mut child);
         let _ = out_handle.join();
         let _ = err_handle.join();
         return Err(format!("failed to write {spawn_label} stdin: {error}"));
@@ -4440,19 +5582,19 @@ fn run_sync_command_limited(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                terminate_process_group_after_exit(child_pid);
+                process_tree.terminate_after_root_exit();
                 break status;
             }
             Ok(None) => {}
             Err(e) => {
-                terminate_std_child(&mut child);
+                process_tree.terminate_std_child(&mut child);
                 let _ = out_handle.join();
                 let _ = err_handle.join();
                 return Err(format!("wait failed: {e}"));
             }
         }
         if started.elapsed() >= timeout {
-            terminate_std_child(&mut child);
+            process_tree.terminate_std_child(&mut child);
             let out = out_handle
                 .join()
                 .map_err(|_| "stdout reader panicked".to_string())??;
@@ -4466,7 +5608,7 @@ fn run_sync_command_limited(
                 err.render("stderr"),
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(10));
     };
 
     let out = out_handle
@@ -4478,13 +5620,247 @@ fn run_sync_command_limited(
     Ok((out, err, status.code().unwrap_or(-1)))
 }
 
+fn run_sync_command_limited(
+    cmd: Command,
+    stdin_data: Option<&str>,
+    capture_cap: usize,
+    spawn_label: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<(LimitedByteCapture, LimitedByteCapture, i32), String> {
+    run_sync_command_limited_with_scratch(cmd, stdin_data, capture_cap, spawn_label, timeout, None)
+}
+
+fn internal_secret_command_timeout() -> std::time::Duration {
+    let seconds = std::env::var("DEXT_SECRET_COMMAND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=30).contains(seconds))
+        .unwrap_or(5);
+    std::time::Duration::from_secs(seconds)
+}
+
+fn internal_git_timeout() -> std::time::Duration {
+    let seconds = std::env::var("DEXT_INTERNAL_GIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=300).contains(seconds))
+        .unwrap_or(60);
+    std::time::Duration::from_secs(seconds)
+}
+
+const INTERNAL_COMMAND_CAPTURE_CAP: usize = 16 * 1024 * 1024;
+
+pub(crate) struct InternalCommandOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) code: i32,
+}
+
+impl InternalCommandOutput {
+    pub(crate) fn success(&self) -> bool {
+        self.code == 0
+    }
+}
+
+pub(crate) fn run_internal_command_limited(
+    mut cmd: Command,
+    label: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<InternalCommandOutput, String> {
+    harden_internal_command_env(&mut cmd);
+    let (stdout, stderr, code) =
+        run_sync_command_limited(cmd, None, INTERNAL_COMMAND_CAPTURE_CAP, label, timeout)?;
+    if stdout.truncated || stderr.truncated {
+        return Err(format!(
+            "{label} output exceeded the {} byte safety limit (stdout observed {}, stderr observed {})",
+            INTERNAL_COMMAND_CAPTURE_CAP, stdout.observed_bytes, stderr.observed_bytes
+        ));
+    }
+    Ok(InternalCommandOutput {
+        stdout: stdout.head,
+        stderr: stderr.head,
+        code,
+    })
+}
+
+fn internal_git_null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+fn scrub_git_env_from_std_command(cmd: &mut Command) {
+    let mut git_env = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(cmd.get_envs().map(|(key, _)| key.to_os_string()))
+        .filter(|key| {
+            key.to_str()
+                .is_some_and(|name| name.to_ascii_uppercase().starts_with("GIT_"))
+        })
+        .collect::<Vec<_>>();
+    git_env.sort();
+    git_env.dedup();
+    for key in git_env {
+        cmd.env_remove(key);
+    }
+}
+
+fn internal_git_command(cwd: &Path, args: &[&str], filter_drivers: &[String]) -> Command {
+    let mut cmd = Command::new("git");
+    let null_device = internal_git_null_device();
+    cmd.arg("--no-pager")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg(format!("core.hooksPath={null_device}"))
+        .arg("-c")
+        .arg("credential.helper=")
+        .arg("-c")
+        .arg("protocol.allow=never");
+    for driver in filter_drivers {
+        for setting in ["clean", "smudge", "process"] {
+            cmd.arg("-c").arg(format!("filter.{driver}.{setting}="));
+        }
+        cmd.arg("-c").arg(format!("filter.{driver}.required=false"));
+    }
+    cmd.args(args).current_dir(cwd);
+    scrub_git_env_from_std_command(&mut cmd);
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_device)
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_PAGER", "cat");
+    cmd
+}
+
+fn git_commit_filter_drivers(cwd: &Path) -> std::result::Result<Vec<String>, String> {
+    let args = ["config", "--null", "--name-only", "--list"];
+    let mut command = Command::new("git");
+    command
+        .args(["--no-pager", "--no-optional-locks"])
+        .args(args)
+        .current_dir(cwd);
+    scrub_git_env_from_std_command(&mut command);
+    let output = run_internal_command_limited(
+        command,
+        "git effective config --name-only --list",
+        internal_git_timeout(),
+    )?;
+    git_filter_drivers_from_output(&output)
+}
+
+fn git_filter_drivers_from_output(
+    output: &InternalCommandOutput,
+) -> std::result::Result<Vec<String>, String> {
+    const MAX_FILTER_DRIVERS: usize = 256;
+    if !output.success() {
+        return Err(format!(
+            "git config enumeration failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut drivers = Vec::new();
+    for raw in output.stdout.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let key = std::str::from_utf8(raw)
+            .map_err(|_| "Git configuration contains a non-UTF-8 key".to_string())?;
+        let lower = key.to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((_, setting)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if !matches!(setting, "clean" | "smudge" | "process" | "required") {
+            continue;
+        }
+        let driver_end = key.len().saturating_sub(setting.len() + 1);
+        let driver = key
+            .get("filter.".len()..driver_end)
+            .ok_or_else(|| format!("invalid Git filter key: {key:?}"))?;
+        if driver.is_empty()
+            || driver.len() > 1024
+            || driver
+                .chars()
+                .any(|ch| ch.is_control() || matches!(ch, '=' | '\0'))
+        {
+            return Err(format!("unsafe Git filter driver name: {driver:?}"));
+        }
+        drivers.push(driver.to_string());
+    }
+    drivers.sort();
+    drivers.dedup();
+    if drivers.len() > MAX_FILTER_DRIVERS {
+        return Err(format!(
+            "Git repository defines too many filter drivers ({} > {MAX_FILTER_DRIVERS})",
+            drivers.len()
+        ));
+    }
+    Ok(drivers)
+}
+
+fn internal_git_filter_drivers(cwd: &Path) -> std::result::Result<Vec<String>, String> {
+    let args = ["config", "--null", "--name-only", "--list"];
+    let output = run_internal_command_limited(
+        internal_git_command(cwd, &args, &[]),
+        "git config --name-only --list",
+        internal_git_timeout(),
+    )?;
+    git_filter_drivers_from_output(&output)
+}
+
+pub(crate) fn run_internal_git_command(
+    cwd: &Path,
+    args: &[&str],
+) -> std::result::Result<InternalCommandOutput, String> {
+    let filter_drivers = internal_git_filter_drivers(cwd)?;
+    let label = format!("git {}", args.join(" "));
+    run_internal_command_limited(
+        internal_git_command(cwd, args, &filter_drivers),
+        &label,
+        internal_git_timeout(),
+    )
+}
+
+pub(crate) fn run_internal_secret_command(command: &str) -> Option<String> {
+    const SECRET_COMMAND_OUTPUT_CAP: usize = 16 * 1024;
+
+    let mut child = Command::new(bash_executable_path());
+    child
+        .arg("-c")
+        .arg(command)
+        .env_remove("BASH_ENV")
+        .env_remove("ENV");
+    deny_interactive_prompt_env_std(&mut child);
+    scrub_credentials_from_std_command_unconditionally(&mut child);
+    let (stdout, _stderr, code) = run_sync_command_limited(
+        child,
+        None,
+        SECRET_COMMAND_OUTPUT_CAP,
+        "provider secret command",
+        internal_secret_command_timeout(),
+    )
+    .ok()?;
+    if code != 0 || stdout.truncated {
+        return None;
+    }
+    let secret = stdout.render("provider secret command stdout");
+    let secret = secret.trim();
+    (!secret.is_empty()).then(|| secret.to_string())
+}
+
 fn run_external(
     bin: &str,
     args: &[String],
     stdin_data: Option<&str>,
     cwd: &Path,
 ) -> std::result::Result<String, String> {
-    let mut cmd = Command::new(bin);
+    let executable = if bin.eq_ignore_ascii_case("bash") {
+        bash_executable_path()
+    } else {
+        PathBuf::from(bin)
+    };
+    let mut cmd = Command::new(executable);
     cmd.args(args);
     cmd.current_dir(cwd);
     let (out, err, status) = run_sync_command_limited(
@@ -4510,6 +5886,51 @@ fn timeout_from_env(var: &str, fallback_secs: u64) -> std::time::Duration {
         })
         .unwrap_or(fallback_secs);
     std::time::Duration::from_secs(secs)
+}
+
+fn provider_timeout_from_env(var: &str, fallback_secs: u64) -> std::time::Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(fallback_secs);
+    std::time::Duration::from_secs(secs)
+}
+
+fn provider_connect_timeout() -> std::time::Duration {
+    provider_timeout_from_env(
+        "DEXT_PROVIDER_CONNECT_TIMEOUT_SECS",
+        PROVIDER_CONNECT_TIMEOUT_SECS,
+    )
+}
+
+fn provider_first_byte_timeout(local: bool) -> std::time::Duration {
+    provider_timeout_from_env(
+        "DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS",
+        if local {
+            LOCAL_PROVIDER_FIRST_BYTE_TIMEOUT_SECS
+        } else {
+            PROVIDER_FIRST_BYTE_TIMEOUT_SECS
+        },
+    )
+}
+
+fn provider_stream_idle_timeout(local: bool) -> std::time::Duration {
+    provider_timeout_from_env(
+        "DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS",
+        if local {
+            LOCAL_PROVIDER_STREAM_IDLE_TIMEOUT_SECS
+        } else {
+            PROVIDER_STREAM_IDLE_TIMEOUT_SECS
+        },
+    )
+}
+
+fn build_provider_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(provider_connect_timeout())
+        .build()
+        .expect("build provider HTTP client")
 }
 
 fn external_tool_timeout() -> std::time::Duration {
@@ -4543,27 +5964,15 @@ fn max_concurrent_builtins() -> usize {
         .unwrap_or(MAX_CONCURRENT_BUILTINS_DEFAULT)
 }
 
-fn unique_temp_dir(label: &str) -> PathBuf {
-    let unique = format!(
-        "dext-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock drift")
-            .as_nanos()
-    );
-    std::env::temp_dir().join(unique)
-}
-
 fn git_unified_diff(before: &str, after: &str, path: &Path, root: &Path) -> Option<String> {
     if before == after {
         return None;
     }
 
     let relative = path.strip_prefix(root).ok()?;
-    let temp_dir = unique_temp_dir("edit-diff");
-    let before_path = temp_dir.join("before").join(relative);
-    let after_path = temp_dir.join("after").join(relative);
+    let scratch = sandbox::PrivateScratch::create().ok()?;
+    let before_path = scratch.path.join("before").join(relative);
+    let after_path = scratch.path.join("after").join(relative);
 
     let write_result = (|| -> std::result::Result<(), String> {
         if let Some(parent) = before_path.parent() {
@@ -4577,22 +5986,27 @@ fn git_unified_diff(before: &str, after: &str, path: &Path, root: &Path) -> Opti
         Ok(())
     })();
     if write_result.is_err() {
-        let _ = std::fs::remove_dir_all(&temp_dir);
         return None;
     }
 
-    let args = vec![
-        "diff".to_string(),
-        "--no-index".to_string(),
-        "--no-color".to_string(),
-        "--text".to_string(),
-        "--unified=3".to_string(),
-        before_path.to_string_lossy().into_owned(),
-        after_path.to_string_lossy().into_owned(),
+    let before_arg = normalized_path_text(&before_path);
+    let after_arg = normalized_path_text(&after_path);
+    let args = [
+        "diff",
+        "--no-index",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--text",
+        "--unified=3",
+        before_arg.as_str(),
+        after_arg.as_str(),
     ];
-    let out = run_external("git", &args, None, root).ok();
-    let _ = std::fs::remove_dir_all(&temp_dir);
-    let out = out?;
+    let output = run_internal_git_command(root, &args).ok()?;
+    if !matches!(output.code, 0 | 1) {
+        return None;
+    }
+    let out = String::from_utf8_lossy(&output.stdout);
 
     let mut body = String::new();
     for line in out.lines() {
@@ -4684,6 +6098,42 @@ fn checkpoint_debounce() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+const BASH_PATH_ENV: &str = "DEXT_BASH_PATH";
+
+fn bash_executable_path() -> PathBuf {
+    if let Some(path) = std::env::var_os(BASH_PATH_ENV).filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    #[cfg(windows)]
+    if let Some(path) = windows_bash_executable_on_path() {
+        return path;
+    }
+    PathBuf::from("bash")
+}
+
+#[cfg(windows)]
+fn windows_bash_executable_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    windows_bash_executable_from_path(&path)
+}
+
+#[cfg(any(windows, test))]
+fn windows_bash_executable_from_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|dir| dir.join("bash.exe"))
+        .find(|candidate| {
+            if !candidate.is_file() {
+                return false;
+            }
+            let normalized = candidate
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            !normalized.ends_with("/windows/system32/bash.exe")
+                && !normalized.contains("/microsoft/windowsapps/bash.exe")
+        })
+}
+
 fn find_binary_on_path(name: &str) -> Option<PathBuf> {
     let Ok(path_var) = std::env::var("PATH") else {
         return None;
@@ -4738,31 +6188,44 @@ fn default_discovery_excludes_enabled(extra: &[String]) -> bool {
     })
 }
 
-fn add_default_fd_excludes(extra: &mut Vec<String>) {
+fn search_root_is_within_excluded_dir(search_root: &Path, excluded: &str) -> bool {
+    search_root.components().any(|component| {
+        matches!(component, Component::Normal(name) if name == std::ffi::OsStr::new(excluded))
+    })
+}
+
+fn default_discovery_excludes_for(search_root: &Path) -> impl Iterator<Item = &'static str> + '_ {
+    DEFAULT_DISCOVERY_EXCLUDES
+        .iter()
+        .copied()
+        .filter(|dir| !search_root_is_within_excluded_dir(search_root, dir))
+}
+
+fn add_default_fd_excludes(extra: &mut Vec<String>, search_root: &Path) {
     if !default_discovery_excludes_enabled(extra) {
         return;
     }
-    for dir in DEFAULT_DISCOVERY_EXCLUDES {
+    for dir in default_discovery_excludes_for(search_root) {
         extra.push("--exclude".to_string());
-        extra.push((*dir).to_string());
+        extra.push(dir.to_string());
     }
 }
 
-fn add_default_rg_excludes(args: &mut Vec<String>, extra: &[String]) {
+fn add_default_rg_excludes(args: &mut Vec<String>, extra: &[String], search_root: &Path) {
     if !default_discovery_excludes_enabled(extra) {
         return;
     }
-    for dir in DEFAULT_DISCOVERY_EXCLUDES {
+    for dir in default_discovery_excludes_for(search_root) {
         args.push("--glob".to_string());
         args.push(format!("!**/{dir}/**"));
     }
 }
 
-fn add_default_grep_excludes(args: &mut Vec<String>, extra: &[String]) {
+fn add_default_grep_excludes(args: &mut Vec<String>, extra: &[String], search_root: &Path) {
     if !default_discovery_excludes_enabled(extra) {
         return;
     }
-    for dir in DEFAULT_DISCOVERY_EXCLUDES {
+    for dir in default_discovery_excludes_for(search_root) {
         args.push(format!("--exclude-dir={dir}"));
     }
 }
@@ -4830,9 +6293,8 @@ fn build_fd_find_fallback_args(search_root: &Path, pattern: &str, extra: &[Strin
     let mut find_type = "f".to_string();
     let mut name_globs: Vec<String> = Vec::new();
     let mut exclude_globs: Vec<String> = if default_discovery_excludes_enabled(extra) {
-        DEFAULT_DISCOVERY_EXCLUDES
-            .iter()
-            .flat_map(|dir| fd_exclude_path_patterns(dir))
+        default_discovery_excludes_for(search_root)
+            .flat_map(fd_exclude_path_patterns)
             .collect()
     } else {
         Vec::new()
@@ -4981,6 +6443,16 @@ fn translate_exclude_globs_for_rg(extra: Vec<String>) -> Vec<String> {
     out
 }
 
+fn validate_search_tool_extra_args(
+    name: &str,
+    extra: &[String],
+) -> std::result::Result<(), String> {
+    if let Some(issue) = tool_policy::search_tool_extra_args_issue(name, extra) {
+        return Err(format!("blocked {name} extra_args: {issue}"));
+    }
+    Ok(())
+}
+
 fn translate_grep_glob_arg(glob: &str, out: &mut Vec<String>) {
     if let Some(exclude) = glob.strip_prefix('!') {
         let trimmed = exclude.trim().trim_end_matches('/');
@@ -5052,9 +6524,11 @@ fn prepare_external_tool(
             let user_path = input["path"].as_str().unwrap_or(".");
             let search_root = canonical_read_path(root, user_path)?;
             let extra = str_array(&input["extra_args"]);
+            validate_search_tool_extra_args("fd", &extra)?;
             if binary_on_path("fd") {
                 let mut args: Vec<String> = extra;
-                add_default_fd_excludes(&mut args);
+                add_default_fd_excludes(&mut args, &search_root);
+                args.push("--".to_string());
                 args.push(pattern.to_string());
                 args.push(search_root.to_string_lossy().to_string());
                 Ok(("fd".to_string(), args, None))
@@ -5068,17 +6542,24 @@ fn prepare_external_tool(
             let user_path = input["path"].as_str().unwrap_or(".");
             let search_root = canonical_read_path(root, user_path)?;
             let extra = str_array(&input["extra_args"]);
+            validate_search_tool_extra_args("rg", &extra)?;
             if binary_on_path("rg") {
-                let mut args: Vec<String> = vec!["--line-number".into(), "--no-heading".into()];
-                add_default_rg_excludes(&mut args, &extra);
+                let mut args: Vec<String> = vec![
+                    "--no-config".into(),
+                    "--line-number".into(),
+                    "--no-heading".into(),
+                ];
+                add_default_rg_excludes(&mut args, &extra, &search_root);
                 args.extend(translate_exclude_globs_for_rg(extra));
+                args.push("--".to_string());
                 args.push(pattern.to_string());
                 args.push(search_root.to_string_lossy().to_string());
                 Ok(("rg".to_string(), args, None))
             } else {
                 let mut args: Vec<String> = vec!["-rn".into(), "-E".into(), "--color=never".into()];
-                add_default_grep_excludes(&mut args, &extra);
+                add_default_grep_excludes(&mut args, &extra, &search_root);
                 args.extend(translate_extra_args_for_grep(&extra));
+                args.push("--".to_string());
                 args.push(pattern.to_string());
                 args.push(search_root.to_string_lossy().to_string());
                 Ok(("grep".to_string(), args, None))
@@ -5117,53 +6598,70 @@ fn prepare_external_tool(
             ))
         }
         "awk" | "csvkit" => {
+            let raw_args = input["args"].as_array().ok_or("args must be an array")?;
+            if raw_args.iter().any(|arg| !arg.is_string()) {
+                return Err("args must contain only strings".to_string());
+            }
             let args = str_array(&input["args"]);
             let stdin = input["stdin"].as_str().map(String::from);
             let (bin, final_args): (String, Vec<String>) = match name {
-                "csvkit" => {
-                    let sub = input["subcommand"]
-                        .as_str()
-                        .ok_or("missing subcommand")?
-                        .to_string();
-                    (sub, args)
+                "awk" => {
+                    if let Some(issue) = tool_policy::awk_args_issue(&args) {
+                        return Err(format!("blocked awk args: {issue}"));
+                    }
+                    ("awk".to_string(), args)
                 }
-                other => (other.to_string(), args),
+                "csvkit" => {
+                    let sub = input["subcommand"].as_str().ok_or("missing subcommand")?;
+                    if !tool_policy::csvkit_subcommand_allowed(sub) {
+                        return Err(format!("unsupported csvkit subcommand '{sub}'"));
+                    }
+                    (sub.to_string(), args)
+                }
+                _ => unreachable!("matched awk or csvkit"),
             };
             Ok((bin, final_args, stdin))
         }
-        "browser" => {
-            let args = str_array(&input["args"]);
-            let stdin = input["stdin"].as_str().map(String::from);
-            Ok(("agent-browser".to_string(), args, stdin))
-        }
         "git_diff" => {
-            let mut args = vec!["diff".to_string()];
-            if input["stat"].as_bool().unwrap_or(false) {
+            let mut args = safe_git_inspection_args("diff");
+            args.push("--no-ext-diff".to_string());
+            args.push("--no-textconv".to_string());
+            let stat = optional_git_bool(input, "git_diff", "stat", false)?;
+            if stat {
                 args.push("--stat".to_string());
             }
-            if input["staged"].as_bool().unwrap_or(false) {
+            let staged = optional_git_bool(input, "git_diff", "staged", false)?;
+            if staged {
                 args.push("--cached".to_string());
             }
-            if let Some(commit) = input["commit"].as_str() {
+            if let Some(commit) = optional_git_string(input, "git_diff", "commit")? {
+                validate_git_revision(commit)?;
                 args.push(commit.to_string());
             }
-            if let Some(path) = input["path"].as_str() {
+            if let Some(path) = optional_git_string(input, "git_diff", "path")? {
                 args.push("--".to_string());
-                args.push(path.to_string());
+                args.push(git_tool_pathspec(root, "git_diff", path)?);
             }
             Ok(("git".to_string(), args, None))
         }
         "git_log" => {
-            let count = input["count"].as_u64().unwrap_or(10).min(50);
-            let oneline = input["oneline"].as_bool().unwrap_or(true);
-            let mut args = vec!["log".to_string()];
+            let count = match input.get("count") {
+                None | Some(Value::Null) => 10,
+                Some(Value::Number(count)) => count
+                    .as_u64()
+                    .ok_or("git_log count must be a non-negative integer")?
+                    .min(50),
+                Some(_) => return Err("git_log count must be an integer".to_string()),
+            };
+            let oneline = optional_git_bool(input, "git_log", "oneline", true)?;
+            let mut args = safe_git_inspection_args("log");
             if oneline {
                 args.push("--oneline".to_string());
             }
             args.push(format!("-{count}"));
-            if let Some(path) = input["path"].as_str() {
+            if let Some(path) = optional_git_string(input, "git_log", "path")? {
                 args.push("--".to_string());
-                args.push(path.to_string());
+                args.push(git_tool_pathspec(root, "git_log", path)?);
             }
             Ok(("git".to_string(), args, None))
         }
@@ -5175,41 +6673,30 @@ fn prepare_external_tool_fallback(
     name: &str,
     input: &Value,
     root: &Path,
-) -> (String, Vec<String>, Option<String>) {
+) -> std::result::Result<(String, Vec<String>, Option<String>), String> {
     match name {
         "rg" => {
             let pattern = input["pattern"].as_str().unwrap_or("");
             let user_path = input["path"].as_str().unwrap_or(".");
-            let search_root =
-                canonical_read_path(root, user_path).unwrap_or_else(|_| root.to_path_buf());
+            let search_root = canonical_read_path(root, user_path)?;
             let extra = str_array(&input["extra_args"]);
             let mut args: Vec<String> = vec!["-rn".into(), "-E".into(), "--color=never".into()];
-            add_default_grep_excludes(&mut args, &extra);
+            add_default_grep_excludes(&mut args, &extra, &search_root);
             args.extend(translate_extra_args_for_grep(&extra));
+            args.push("--".to_string());
             args.push(pattern.to_string());
             args.push(search_root.to_string_lossy().to_string());
-            ("grep".to_string(), args, None)
+            Ok(("grep".to_string(), args, None))
         }
         "fd" => {
             let pattern = input["pattern"].as_str().unwrap_or("");
             let user_path = input["path"].as_str().unwrap_or(".");
-            let search_root =
-                canonical_read_path(root, user_path).unwrap_or_else(|_| root.to_path_buf());
+            let search_root = canonical_read_path(root, user_path)?;
             let extra = str_array(&input["extra_args"]);
             let args = build_fd_find_fallback_args(&search_root, pattern, &extra);
-            ("find".to_string(), args, None)
+            Ok(("find".to_string(), args, None))
         }
-        _ => {
-            let (bin, args, stdin) =
-                prepare_external_tool(name, input, root).unwrap_or_else(|_| {
-                    (
-                        "echo".to_string(),
-                        vec!["unsupported fallback".to_string()],
-                        None,
-                    )
-                });
-            (bin, args, stdin)
-        }
+        _ => prepare_external_tool(name, input, root),
     }
 }
 
@@ -5258,15 +6745,20 @@ fn http_tool_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+fn build_http_tool_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        // Proxy-side DNS would bypass the resolver checks below, so the
+        // security-scoped built-in client must connect directly.
+        .no_proxy()
+        .dns_resolver(Arc::new(HttpToolResolver))
+        .redirect(http_tool_redirect_policy())
+        .build()
+        .expect("build http tool client")
+}
+
 fn http_tool_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .dns_resolver(Arc::new(HttpToolResolver))
-            .redirect(http_tool_redirect_policy())
-            .build()
-            .expect("build http tool client")
-    })
+    CLIENT.get_or_init(build_http_tool_client)
 }
 
 struct HttpToolResolver;
@@ -5284,9 +6776,7 @@ impl reqwest::dns::Resolve for HttpToolResolver {
             }
 
             if let Some(ip) = http_tool_host_ip_literal(&host) {
-                if !http_tool_allow_link_local()
-                    && let Some(reason) = http_tool_blocked_ip_reason(ip)
-                {
+                if let Some(reason) = http_tool_blocked_ip_reason(ip) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!("host '{host}' is {ip} ({reason})"),
@@ -5307,9 +6797,7 @@ impl reqwest::dns::Resolve for HttpToolResolver {
             .map_err(|e| io::Error::other(format!("HTTP DNS resolver task failed: {e}")))?
             .map_err(|e| io::Error::other(format!("HTTP DNS lookup for {host} failed: {e}")))?;
 
-            if !http_tool_allow_link_local()
-                && let Some(reason) = http_tool_blocked_addrs_reason(&host, &addrs)
-            {
+            if let Some(reason) = http_tool_blocked_addrs_reason(&host, &addrs) {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason).into());
             }
 
@@ -5322,13 +6810,18 @@ fn http_tool_allow_link_local() -> bool {
     env_flag_default(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, false)
 }
 
+fn http_tool_allow_loopback() -> bool {
+    env_flag_default(HTTP_TOOL_ALLOW_LOOPBACK_ENV, false)
+}
+
+fn http_tool_allow_private() -> bool {
+    env_flag_default(HTTP_TOOL_ALLOW_PRIVATE_ENV, false)
+}
+
 fn validate_http_tool_destination(url: &reqwest::Url) -> std::result::Result<(), String> {
-    if http_tool_allow_link_local() {
-        return Ok(());
-    }
     if let Some(reason) = http_tool_blocked_destination_reason(url) {
         Err(format!(
-            "{reason}; set {HTTP_TOOL_ALLOW_LINK_LOCAL_ENV}=1 to allow link-local/metadata HTTP targets"
+            "{reason}; trusted-network overrides: {HTTP_TOOL_ALLOW_LOOPBACK_ENV}=1 (loopback), {HTTP_TOOL_ALLOW_PRIVATE_ENV}=1 (private/CGNAT), {HTTP_TOOL_ALLOW_LINK_LOCAL_ENV}=1 (link-local/metadata)"
         ))
     } else {
         Ok(())
@@ -5337,7 +6830,7 @@ fn validate_http_tool_destination(url: &reqwest::Url) -> std::result::Result<(),
 
 fn http_tool_blocked_destination_reason(url: &reqwest::Url) -> Option<String> {
     let host = url.host_str()?;
-    if http_tool_metadata_host(host) {
+    if !http_tool_allow_link_local() && http_tool_metadata_host(host) {
         return Some(format!("host '{host}' is a cloud metadata alias"));
     }
     if let Some(ip) = http_tool_host_ip_literal(host) {
@@ -5371,16 +6864,24 @@ fn http_tool_blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => http_tool_blocked_ipv4_reason(v4),
         IpAddr::V6(v6) => {
+            if v6.is_unspecified() && !http_tool_allow_loopback() {
+                return Some("IPv6 unspecified/local address");
+            }
             if let Some(v4) = http_tool_ipv6_embedded_ipv4(v6)
                 && http_tool_blocked_ipv4_reason(v4).is_some()
             {
-                return Some("IPv4-embedded IPv6 metadata/link-local address");
+                return Some("IPv4-embedded IPv6 blocked address");
             }
             let first = v6.segments()[0];
-            if first & 0xffc0 == 0xfe80 {
+            if v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
+                return (!http_tool_allow_link_local()).then_some("AWS IPv6 metadata address");
+            }
+            if v6.is_loopback() && !http_tool_allow_loopback() {
+                Some("IPv6 loopback address")
+            } else if first & 0xfe00 == 0xfc00 && !http_tool_allow_private() {
+                Some("IPv6 unique-local address")
+            } else if first & 0xffc0 == 0xfe80 && !http_tool_allow_link_local() {
                 Some("IPv6 link-local address")
-            } else if v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
-                Some("AWS IPv6 metadata address")
             } else {
                 None
             }
@@ -5388,11 +6889,25 @@ fn http_tool_blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
     }
 }
 
+fn http_tool_ipv4_is_shared(v4: Ipv4Addr) -> bool {
+    let [first, second, _, _] = v4.octets();
+    first == 100 && (64..=127).contains(&second)
+}
+
 fn http_tool_blocked_ipv4_reason(v4: Ipv4Addr) -> Option<&'static str> {
-    if v4.is_link_local() {
+    if v4 == Ipv4Addr::new(100, 100, 100, 200) {
+        return (!http_tool_allow_link_local()).then_some("cloud metadata address");
+    }
+    if v4.is_unspecified() && !http_tool_allow_loopback() {
+        Some("IPv4 unspecified/local address")
+    } else if v4.is_loopback() && !http_tool_allow_loopback() {
+        Some("IPv4 loopback address")
+    } else if v4.is_link_local() && !http_tool_allow_link_local() {
         Some("IPv4 link-local address")
-    } else if v4 == Ipv4Addr::new(100, 100, 100, 200) {
-        Some("cloud metadata address")
+    } else if v4.is_private() && !http_tool_allow_private() {
+        Some("IPv4 private address")
+    } else if http_tool_ipv4_is_shared(v4) && !http_tool_allow_private() {
+        Some("IPv4 shared/CGNAT address")
     } else {
         None
     }
@@ -6050,11 +7565,13 @@ fn file_uri_to_display_path(uri: &str, root: &Path) -> String {
         return uri.to_string();
     };
     let decoded = percent_decode_uri_path(rest);
-    let path = PathBuf::from(decoded);
-    path.strip_prefix(root)
-        .unwrap_or(path.as_path())
-        .display()
-        .to_string()
+    #[cfg(windows)]
+    let decoded = decoded
+        .strip_prefix('/')
+        .filter(|path| matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic()))
+        .unwrap_or(&decoded)
+        .to_string();
+    display_path_relative(Path::new(&decoded), root)
 }
 
 fn percent_decode_uri_path(raw: &str) -> String {
@@ -6210,7 +7727,7 @@ fn percent_encode_uri_path(raw: &str) -> String {
 
 fn file_uri_from_path(path: &Path) -> String {
     let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let display = absolute.to_string_lossy().replace('\\', "/");
+    let display = normalized_path_text(&absolute);
     if cfg!(windows) {
         format!(
             "file:///{}",
@@ -6227,25 +7744,63 @@ fn write_lsp_message<W: Write>(writer: &mut W, value: &Value) -> std::io::Result
     writer.flush()
 }
 
+const LSP_HEADER_LINE_CAP: usize = 8 * 1024;
+const LSP_HEADER_TOTAL_CAP: usize = 64 * 1024;
+const LSP_MESSAGE_BODY_CAP: usize = 4 * 1024 * 1024;
+const LSP_MESSAGE_QUEUE_CAP: usize = 4;
+
 fn read_lsp_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
     let mut content_length = None;
+    let mut header_bytes = 0usize;
     loop {
         let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
+        let bytes = reader
+            .take((LSP_HEADER_LINE_CAP + 1) as u64)
+            .read_line(&mut line)?;
         if bytes == 0 {
             return Ok(None);
+        }
+        if bytes > LSP_HEADER_LINE_CAP {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LSP header line exceeds safety limit",
+            ));
+        }
+        header_bytes = header_bytes.saturating_add(bytes);
+        if header_bytes > LSP_HEADER_TOTAL_CAP {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LSP headers exceed safety limit",
+            ));
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
         if let Some(raw) = trimmed.to_ascii_lowercase().strip_prefix("content-length:") {
-            content_length = raw.trim().parse::<usize>().ok();
+            let parsed = raw.trim().parse::<usize>().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid LSP content length",
+                )
+            })?;
+            if content_length.replace(parsed).is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "duplicate LSP content length",
+                ));
+            }
         }
     }
     let Some(len) = content_length else {
         return Ok(None);
     };
+    if len > LSP_MESSAGE_BODY_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "LSP message body exceeds safety limit",
+        ));
+    }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body)?;
     Ok(Some(String::from_utf8_lossy(&body).to_string()))
@@ -6259,42 +7814,172 @@ fn rust_analyzer_unavailable_output(raw: &str) -> bool {
         || lower.contains("failed to spawn rust-analyzer")
 }
 
-fn rust_analyzer_command() -> Option<Command> {
-    find_binary_on_path("rust-analyzer").map(Command::new)
+fn diagnostics_command(
+    program: &Path,
+    root: &Path,
+) -> std::result::Result<sandbox::SandboxedStdCommand, String> {
+    let mut command = sandbox::std_command_offline(program, SandboxProfile::ReadOnly, root, &[])
+        .map_err(|error| format!("prepare offline diagnostics sandbox: {error}"))?;
+    if let Some(scratch) = command.scratch_path().map(Path::to_path_buf) {
+        command.env("CARGO_TARGET_DIR", scratch.join("cargo-target"));
+    }
+    command.env("CARGO_NET_OFFLINE", "true");
+    harden_internal_command_env(&mut command);
+    Ok(command)
 }
 
-fn collect_rust_files_for_diagnostics(dir: &Path, out: &mut Vec<PathBuf>, max_files: usize) {
-    if out.len() >= max_files {
+fn rust_analyzer_command(root: &Path) -> Option<sandbox::SandboxedStdCommand> {
+    let binary = find_binary_on_path("rust-analyzer")?;
+    diagnostics_command(&binary, root).ok()
+}
+
+fn diagnostics_source_file(path: &Path, root: &Path) -> Option<(PathBuf, String)> {
+    let link_metadata = std::fs::symlink_metadata(path).ok()?;
+    if link_metadata.file_type().is_symlink()
+        || !link_metadata.is_file()
+        || link_metadata.len() > LSP_DIAGNOSTIC_FILE_BYTE_CAP
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if link_metadata.nlink() != 1 {
+            return None;
+        }
+    }
+
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !canonical.starts_with(root) {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&canonical).ok()?;
+    let opened_metadata = file.metadata().ok()?;
+    if !opened_metadata.is_file()
+        || opened_metadata.len() > LSP_DIAGNOSTIC_FILE_BYTE_CAP
+        || opened_metadata.len() != link_metadata.len()
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened_metadata.nlink() != 1
+            || opened_metadata.dev() != link_metadata.dev()
+            || opened_metadata.ino() != link_metadata.ino()
+        {
+            return None;
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+    file.take(LSP_DIAGNOSTIC_FILE_BYTE_CAP + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > LSP_DIAGNOSTIC_FILE_BYTE_CAP {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    Some((canonical, text))
+}
+
+fn collect_rust_files_for_diagnostics(
+    dir: &Path,
+    root: &Path,
+    out: &mut Vec<(PathBuf, String)>,
+    visited_dirs: &mut usize,
+    total_bytes: &mut u64,
+) {
+    if out.len() >= LSP_DIAGNOSTIC_FILE_LIMIT
+        || *visited_dirs >= LSP_DIAGNOSTIC_DIRECTORY_LIMIT
+        || *total_bytes >= LSP_DIAGNOSTIC_TOTAL_BYTE_CAP
+    {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    if !canonical_dir.starts_with(root) {
+        return;
+    }
+    *visited_dirs += 1;
+
+    let Ok(entries) = std::fs::read_dir(&canonical_dir) else {
         return;
     };
     let mut entries: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .collect();
     entries.sort();
     for path in entries {
-        if out.len() >= max_files {
+        if out.len() >= LSP_DIAGNOSTIC_FILE_LIMIT
+            || *visited_dirs >= LSP_DIAGNOSTIC_DIRECTORY_LIMIT
+            || *total_bytes >= LSP_DIAGNOSTIC_TOTAL_BYTE_CAP
+        {
             return;
         }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if matches!(name, "target" | ".git" | ".dext") {
             continue;
         }
-        if path.is_dir() {
-            collect_rust_files_for_diagnostics(&path, out, max_files);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_rust_files_for_diagnostics(&path, root, out, visited_dirs, total_bytes);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+            && let Some((canonical, text)) = diagnostics_source_file(&path, root)
+        {
+            let bytes = text.len() as u64;
+            if total_bytes.saturating_add(bytes) <= LSP_DIAGNOSTIC_TOTAL_BYTE_CAP {
+                *total_bytes += bytes;
+                out.push((canonical, text));
+            }
         }
     }
 }
 
-fn rust_files_for_diagnostics(root: &Path, max_files: usize) -> Vec<PathBuf> {
+fn rust_files_for_diagnostics(root: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    collect_rust_files_for_diagnostics(&root.join("src"), &mut out, max_files);
+    let mut visited_dirs = 0;
+    let mut total_bytes = 0;
+    collect_rust_files_for_diagnostics(
+        &root.join("src"),
+        &root,
+        &mut out,
+        &mut visited_dirs,
+        &mut total_bytes,
+    );
     if out.is_empty() {
-        collect_rust_files_for_diagnostics(root, &mut out, max_files);
+        collect_rust_files_for_diagnostics(
+            &root,
+            &root,
+            &mut out,
+            &mut visited_dirs,
+            &mut total_bytes,
+        );
     }
     out
 }
@@ -6305,34 +7990,62 @@ fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsRepor
     }
 
     let started = std::time::Instant::now();
-    let mut cmd = rust_analyzer_command()?;
-    deny_interactive_prompt_env_std(&mut cmd);
-    scrub_tool_credentials_from_std_command(&mut cmd);
-    cmd.current_dir(root)
+    let mut sandboxed = rust_analyzer_command(root)?;
+    sandboxed
+        .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_std_process_group(&mut cmd);
+    configure_std_process_group(&mut sandboxed);
+    let (mut cmd, _scratch) = sandboxed.into_parts();
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return None,
     };
-    let child_pid = child.id();
-
-    let stdout = child.stdout.take()?;
-    let stderr = child.stderr.take()?;
-    let mut stdin = child.stdin.take()?;
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        while let Ok(Some(body)) = read_lsp_message(&mut reader) {
-            if tx.send(body).is_err() {
-                break;
-            }
+    let process_tree = match ChildProcessTree::for_std(&child) {
+        Ok(process_tree) => process_tree,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
         }
-    });
-    let stderr_handle =
-        std::thread::spawn(move || collect_sync_limited(stderr, PROCESS_STREAM_CAPTURE_CAP));
+    };
+
+    let streams = (child.stdout.take(), child.stderr.take(), child.stdin.take());
+    let (Some(stdout), Some(stderr), Some(mut stdin)) = streams else {
+        process_tree.terminate_std_child(&mut child);
+        return None;
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(LSP_MESSAGE_QUEUE_CAP);
+    let stdout_handle = match std::thread::Builder::new()
+        .name("dext-lsp-stdout".to_string())
+        .spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            while let Ok(Some(body)) = read_lsp_message(&mut reader) {
+                if tx.send(body).is_err() {
+                    break;
+                }
+            }
+        }) {
+        Ok(handle) => handle,
+        Err(_) => {
+            drop(rx);
+            process_tree.terminate_std_child(&mut child);
+            return None;
+        }
+    };
+    let stderr_handle = match std::thread::Builder::new()
+        .name("dext-lsp-stderr".to_string())
+        .spawn(move || collect_sync_limited(stderr, PROCESS_STREAM_CAPTURE_CAP))
+    {
+        Ok(handle) => handle,
+        Err(_) => {
+            drop(rx);
+            process_tree.terminate_std_child(&mut child);
+            let _ = stdout_handle.join();
+            return None;
+        }
+    };
 
     let root_uri = file_uri_from_path(root);
     let workspace_name = root
@@ -6357,28 +8070,30 @@ fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsRepor
         )
         .is_err()
     {
-        terminate_std_child(&mut child);
+        drop(stdin);
+        drop(rx);
+        process_tree.terminate_std_child(&mut child);
+        let _ = stdout_handle.join();
+        let _ = stderr_handle.join();
         return None;
     }
-    for path in rust_files_for_diagnostics(root, 64) {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let uri = file_uri_from_path(&path);
-            let _ = write_lsp_message(
-                &mut stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didOpen",
-                    "params": {
-                        "textDocument": {
-                            "uri": uri,
-                            "languageId": "rust",
-                            "version": 1,
-                            "text": text
-                        }
+    for (path, text) in rust_files_for_diagnostics(root) {
+        let uri = file_uri_from_path(&path);
+        let _ = write_lsp_message(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "rust",
+                        "version": 1,
+                        "text": text
                     }
-                }),
-            );
-        }
+                }
+            }),
+        );
     }
 
     let timeout = timeout_from_env("DEXT_LSP_DIAGNOSTICS_TIMEOUT_SECS", 20);
@@ -6409,7 +8124,8 @@ fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsRepor
     );
     let _ = write_lsp_message(&mut stdin, &json!({"jsonrpc": "2.0", "method": "exit"}));
     drop(stdin);
-    terminate_process_group_after_exit(child_pid);
+    drop(rx);
+    process_tree.terminate_after_root_exit();
     let _ = child.kill();
     let _ = child.wait();
     let _ = stdout_handle.join();
@@ -6444,15 +8160,31 @@ fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsRepor
 
 fn run_cargo_check_diagnostics(root: &Path) -> WorkflowDiagnosticsReport {
     let started = std::time::Instant::now();
-    let mut cmd = Command::new("cargo");
-    cmd.args(["check", "--message-format=json", "--quiet"])
-        .current_dir(root);
-    let result = run_sync_command_limited(
+    let sandboxed = match diagnostics_command(Path::new("cargo"), root) {
+        Ok(mut command) => {
+            command
+                .args(["check", "--message-format=json", "--quiet"])
+                .current_dir(root);
+            command
+        }
+        Err(error) => {
+            return WorkflowDiagnosticsReport {
+                source: "cargo check".to_string(),
+                status: "failed".to_string(),
+                diagnostics: Vec::new(),
+                raw_output: error,
+                duration: started.elapsed(),
+            };
+        }
+    };
+    let (cmd, scratch) = sandboxed.into_parts();
+    let result = run_sync_command_limited_with_scratch(
         cmd,
         None,
         PROCESS_STREAM_CAPTURE_CAP,
         "cargo check diagnostics",
         timeout_from_env("DEXT_DIAGNOSTICS_TIMEOUT_SECS", 120),
+        scratch,
     );
     match result {
         Ok((stdout, stderr, code)) => {
@@ -6831,81 +8563,32 @@ fn source_line_at<'a>(content: &'a str, starts: &[usize], idx: usize) -> Option<
     Some(line.strip_suffix('\r').unwrap_or(line))
 }
 
+fn normalized_path_text(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", rest.replace('\\', "/"))
+    } else {
+        raw.strip_prefix(r"\\?\").unwrap_or(&raw).replace('\\', "/")
+    }
+}
+
 fn display_path_relative(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
+    if let Ok(relative) = path.strip_prefix(root) {
+        return normalized_path_text(relative);
+    }
+    let path = normalized_path_text(path);
+    let root = normalized_path_text(root);
+    path.strip_prefix(&root)
+        .and_then(|relative| relative.strip_prefix('/'))
+        .unwrap_or(&path)
         .to_string()
 }
 
-fn source_line_col_for_byte(content: &str, starts: &[usize], byte_idx: usize) -> (usize, usize) {
-    if starts.is_empty() {
-        return (1, 1);
-    }
-    let byte_idx = byte_idx.min(content.len());
-    let line_idx = starts
-        .partition_point(|start| *start <= byte_idx)
-        .saturating_sub(1)
-        .min(starts.len().saturating_sub(1));
-    let column = content[starts[line_idx]..byte_idx].chars().count() + 1;
-    (line_idx + 1, column)
-}
-
-fn render_old_string_match_locations(
-    path: &Path,
-    root: &Path,
-    content: &str,
-    old: &str,
-    count: usize,
-) -> String {
-    use std::fmt::Write as _;
-
-    let display = display_path_relative(path, root);
-    let starts = source_line_starts(content);
-    let mut capture = LimitedTextCapture::new(EDIT_MATCH_CONTEXT_CAP);
-    capture.try_push_unit(&format!(
-        "old_string appears {count} times in {} — must be unique\n",
-        path.display()
-    ));
-    if starts.is_empty() {
-        return capture.finish("Retry with a non-empty unique old_string.");
-    }
-
-    let mut shown = 0usize;
-    for (match_idx, (byte_idx, _)) in content
-        .match_indices(old)
-        .take(EDIT_MATCH_DISPLAY_LIMIT)
-        .enumerate()
-    {
-        let (line_no, column) = source_line_col_for_byte(content, &starts, byte_idx);
-        let line_idx = line_no.saturating_sub(1);
-        let start = line_idx.saturating_sub(EDIT_MATCH_CONTEXT_LINES);
-        let end = line_idx
-            .saturating_add(EDIT_MATCH_CONTEXT_LINES)
-            .min(starts.len().saturating_sub(1));
-        let mut block = String::new();
-        let _ = writeln!(
-            block,
-            "match {}: {display}:{line_no}:{column}",
-            match_idx + 1
-        );
-        for idx in start..=end {
-            if let Some(line) = source_line_at(content, &starts, idx) {
-                let marker = if idx == line_idx { '>' } else { ' ' };
-                let _ = writeln!(block, "{marker} {}\t{line}", idx + 1);
-            }
-        }
-        if !capture.try_push_unit(&block) {
-            break;
-        }
-        shown += 1;
-    }
-    if count > shown {
-        let _ = capture.try_push_unit(&format!("… {} more matches not shown\n", count - shown));
-    }
-    capture.finish(
-        "Use read_file around a listed location, then retry with a larger unique old_string.",
-    )
+fn portable_path_is_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    Path::new(path).is_absolute()
+        || matches!(bytes.first(), Some(b'/') | Some(b'\\'))
+        || matches!(bytes, [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
 }
 
 fn identifier_prefix(text: &str) -> Option<&str> {
@@ -7334,7 +9017,8 @@ fn tool_result_context_cap(
 
 #[cfg(test)]
 fn execute_tool(name: &str, input: &Value, root: &Path) -> std::result::Result<String, String> {
-    execute_tool_with_cache(name, input, root, None, None)
+    let prepared_mutation = mutation_preview::prepare_tool_mutation(name, input, root)?;
+    execute_tool_with_cache(name, input, root, None, None, prepared_mutation)
 }
 
 fn todo_status_counts(items: &[Value]) -> (usize, usize, usize) {
@@ -7411,6 +9095,7 @@ fn execute_tool_with_cache(
     root: &Path,
     read_cache: Option<&Arc<Mutex<ReadFileCache>>>,
     session_id: Option<&str>,
+    prepared_mutation: Option<mutation_preview::PreparedMutation>,
 ) -> std::result::Result<String, String> {
     match name {
         "read_file" => {
@@ -7542,112 +9227,46 @@ fn execute_tool_with_cache(
             ))
         }
         "write_file" => {
-            let path_str = input["path"].as_str().ok_or("missing path")?;
-            let content = input["content"].as_str().ok_or("missing content")?;
-            let path = canonical_within(root, path_str)?;
-            let before = match std::fs::read_to_string(&path) {
-                Ok(existing) => Some(existing),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(format!("failed to read existing file for preview: {e}")),
-            };
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent).map_err(|e| format!("{e}"))?;
-            }
-            std::fs::write(&path, content).map_err(|e| format!("{e}"))?;
+            let prepared = prepared_mutation
+                .ok_or("internal error: write_file dispatch is missing its prepared mutation")?;
+            let path = prepared.path().to_path_buf();
+            let before = (!prepared.is_new_file()).then(|| prepared.before_text().to_string());
+            let after = prepared.after_text().to_string();
+            mutation_preview::apply_prepared_mutation(root, &prepared)?;
             Ok(write_file_result_with_diff(
                 &path,
                 root,
                 before.as_deref(),
-                content,
+                &after,
             ))
         }
         "edit_file" => {
-            let path_str = input["path"].as_str().ok_or("missing path")?;
-            let old = input["old_string"].as_str().ok_or("missing old_string")?;
-            let new = input["new_string"].as_str().ok_or("missing new_string")?;
-            let path = canonical_within(root, path_str)?;
-            let content = std::fs::read_to_string(&path).map_err(|e| format!("{e}"))?;
-            let count = content.matches(old).count();
-            if count == 0 {
-                return Err(format!("old_string not found in {}", path.display()));
-            }
-            if count > 1 {
-                return Err(render_old_string_match_locations(
-                    &path, root, &content, old, count,
-                ));
-            }
-            let updated = content.replacen(old, new, 1);
-            std::fs::write(&path, &updated).map_err(|e| format!("{e}"))?;
-            Ok(edit_result_with_diff(1, &path, root, &content, &updated))
+            let prepared = prepared_mutation
+                .ok_or("internal error: edit_file dispatch is missing its prepared mutation")?;
+            let path = prepared.path().to_path_buf();
+            let before = prepared.before_text().to_string();
+            let after = prepared.after_text().to_string();
+            mutation_preview::apply_prepared_mutation(root, &prepared)?;
+            Ok(edit_result_with_diff(1, &path, root, &before, &after))
         }
         "multi_edit" => {
-            let path_str = input["path"].as_str().ok_or("missing path")?;
             let edits = input["edits"].as_array().ok_or("missing edits array")?;
-            let path = canonical_within(root, path_str)?;
-            let before = std::fs::read_to_string(&path).map_err(|e| format!("{e}"))?;
-            let mut content = before.clone();
-            for (i, edit) in edits.iter().enumerate() {
-                let old = edit["old_string"]
-                    .as_str()
-                    .ok_or_else(|| format!("edit[{i}]: missing old_string"))?;
-                let new = edit["new_string"]
-                    .as_str()
-                    .ok_or_else(|| format!("edit[{i}]: missing new_string"))?;
-                let replace_all = edit["replace_all"].as_bool().unwrap_or(false);
-                if replace_all {
-                    if !content.contains(old) {
-                        return Err(format!("edit[{i}]: old_string not found"));
-                    }
-                    content = content.replace(old, new);
-                } else {
-                    let count = content.matches(old).count();
-                    if count == 0 {
-                        return Err(format!("edit[{i}]: old_string not found"));
-                    }
-                    if count > 1 {
-                        return Err(format!(
-                            "edit[{i}]: {}",
-                            render_old_string_match_locations(&path, root, &content, old, count)
-                        ));
-                    }
-                    content = content.replacen(old, new, 1);
-                }
-            }
-            std::fs::write(&path, &content).map_err(|e| format!("{e}"))?;
+            let prepared = prepared_mutation
+                .ok_or("internal error: multi_edit dispatch is missing its prepared mutation")?;
+            let path = prepared.path().to_path_buf();
+            let before = prepared.before_text().to_string();
+            let after = prepared.after_text().to_string();
+            mutation_preview::apply_prepared_mutation(root, &prepared)?;
             Ok(edit_result_with_diff(
                 edits.len(),
                 &path,
                 root,
                 &before,
-                &content,
+                &after,
             ))
         }
         "bash" => Err("bash must go through execute_bash_async".to_string()),
-        "git_commit" => {
-            let message = input["message"].as_str().ok_or("missing message")?;
-            let all = input["all"].as_bool().unwrap_or(false);
-            let paths: Vec<String> = input["paths"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            if all {
-                run_external("git", &["add".to_string(), "-A".to_string()], None, root)?;
-            } else if !paths.is_empty() {
-                let mut add_args = vec!["add".to_string()];
-                add_args.extend(paths);
-                run_external("git", &add_args, None, root)?;
-            }
-
-            let commit_args = vec!["commit".to_string(), "-m".to_string(), message.to_string()];
-            run_external("git", &commit_args, None, root)
-        }
+        "git_commit" => Err("git_commit must go through execute_git_commit_async".to_string()),
         "todo_read" => {
             let project_todo_path = root.join("DEXT.todo.json");
             let session_todo_path = session_id.map(|id| session_todo_path(root, id));
@@ -7703,7 +9322,7 @@ fn execute_tool_with_cache(
             let (bin, args, stdin) = prepare_external_tool(name, input, root)?;
             match run_external(&bin, &args, stdin.as_deref(), root) {
                 Err(e) if should_retry_external_tool_with_fallback(name, &bin, &e) => {
-                    let (bin2, args2, stdin2) = prepare_external_tool_fallback(name, input, root);
+                    let (bin2, args2, stdin2) = prepare_external_tool_fallback(name, input, root)?;
                     run_external(&bin2, &args2, stdin2.as_deref(), root)
                 }
                 other => other,
@@ -8609,6 +10228,11 @@ async fn execute_bash_async_prepared(
     extra_read_roots: &[PathBuf],
 ) -> std::result::Result<String, String> {
     let mut local_sudo_auth = local_sudo_auth;
+    let pack_helper = if local_sudo_auth.is_none() {
+        active_pack_helper_invocation(cmd, extra_env)
+    } else {
+        None
+    };
     let _sudo_password_pipe = local_sudo_auth.as_mut().and_then(|auth| {
         let fifo = auth.password_fifo.clone()?;
         let password = auth.password.take()?;
@@ -8636,10 +10260,25 @@ async fn execute_bash_async_prepared(
             sandbox_read_roots.push(fifo.clone());
         }
     }
-    let mut command = sandbox::tokio_command("bash", effective_profile, root, &sandbox_read_roots);
+    let mut command = if let Some(invocation) = pack_helper.as_ref() {
+        let executable = invocation
+            .executable
+            .to_str()
+            .ok_or_else(|| "pack helper path is not valid UTF-8".to_string())?;
+        let mut command =
+            sandbox::tokio_command(executable, effective_profile, root, &sandbox_read_roots)
+                .map_err(|error| format!("prepare sandbox for pack helper: {error}"))?;
+        command.args(&invocation.args);
+        command
+    } else {
+        let bash = bash_executable_path();
+        let mut command =
+            sandbox::tokio_command(&bash, effective_profile, root, &sandbox_read_roots)
+                .map_err(|error| format!("prepare bash sandbox: {error}"))?;
+        command.arg("-c").arg(&bash_cmd);
+        command
+    };
     command
-        .arg("-c")
-        .arg(&bash_cmd)
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -8648,7 +10287,25 @@ async fn execute_bash_async_prepared(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    scrub_tool_credentials_from_tokio_command(&mut command);
+    let configured_pack_credentials = configured_pack_credential_env(extra_env);
+    let allowed_credentials = if pack_helper.is_some() {
+        allowed_pack_credential_env(extra_env)
+    } else {
+        Vec::new()
+    };
+    let credential_values = declared_pack_credential_values(&allowed_credentials);
+    if pack_helper.is_some() {
+        scrub_credentials_from_std_command_unconditionally_except(
+            command.as_std_mut(),
+            &allowed_credentials,
+        );
+    } else {
+        scrub_tool_credentials_from_tokio_command(&mut command);
+        for name in configured_pack_credentials {
+            command.env_remove(name);
+        }
+    }
+    scrub_startup_env_from_std_command(command.as_std_mut());
     deny_interactive_prompt_env(&mut command);
     if let Some(auth) = local_sudo_auth.as_ref() {
         let mut paths = vec![auth.sudo_shim_dir.clone()];
@@ -8665,23 +10322,50 @@ async fn execute_bash_async_prepared(
     }
     configure_tokio_process_group(&mut command);
     let mut child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-    let child_pid = child.id();
+    let process_tree = match ChildProcessTree::for_tokio(&child) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(format!("failed to guard bash process tree: {error}"));
+        }
+    };
 
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
 
-    let out_task = tokio::spawn(collect_async_limited_live(
-        stdout,
-        PROCESS_STREAM_CAPTURE_CAP,
-        live_output.clone(),
-        "stdout",
-    ));
-    let err_task = tokio::spawn(collect_async_limited_live(
-        stderr,
-        PROCESS_STREAM_CAPTURE_CAP,
-        live_output,
-        "stderr",
-    ));
+    let (out_task, err_task) = if credential_values.is_empty() {
+        (
+            tokio::spawn(collect_async_limited_live(
+                stdout,
+                PROCESS_STREAM_CAPTURE_CAP,
+                live_output.clone(),
+                "stdout",
+            )),
+            tokio::spawn(collect_async_limited_live(
+                stderr,
+                PROCESS_STREAM_CAPTURE_CAP,
+                live_output,
+                "stderr",
+            )),
+        )
+    } else {
+        // Credential-bearing helpers are intentionally not live-streamed: a
+        // secret may span arbitrary pipe chunks, so only the streaming byte
+        // redactor may release their output to the UI/model/session pipeline.
+        (
+            tokio::spawn(collect_async_limited_redacted(
+                stdout,
+                PROCESS_STREAM_CAPTURE_CAP,
+                credential_values.clone(),
+            )),
+            tokio::spawn(collect_async_limited_redacted(
+                stderr,
+                PROCESS_STREAM_CAPTURE_CAP,
+                credential_values,
+            )),
+        )
+    };
     let deadline = tokio::time::Instant::now() + timeout;
 
     let status = loop {
@@ -8699,19 +10383,17 @@ async fn execute_bash_async_prepared(
         };
         match outcome {
             ProcWaitOutcome::Exited(Ok(s)) => {
-                if let Some(pid) = child_pid {
-                    terminate_process_group_after_exit(pid);
-                }
+                process_tree.terminate_after_root_exit();
                 break s;
             }
             ProcWaitOutcome::Exited(Err(e)) => {
-                terminate_tokio_child(&mut child).await;
+                process_tree.terminate_tokio_child(&mut child).await;
                 let _ = out_task.await;
                 let _ = err_task.await;
                 return Err(format!("wait failed: {e}"));
             }
             ProcWaitOutcome::Interrupt => {
-                terminate_tokio_child(&mut child).await;
+                process_tree.terminate_tokio_child(&mut child).await;
                 let out = out_task.await.unwrap_or_default();
                 let err = err_task.await.unwrap_or_default();
                 let msg = format!(
@@ -8722,7 +10404,7 @@ async fn execute_bash_async_prepared(
                 return Err(msg);
             }
             ProcWaitOutcome::Timeout => {
-                terminate_tokio_child(&mut child).await;
+                process_tree.terminate_tokio_child(&mut child).await;
                 let out = out_task.await.unwrap_or_default();
                 let err = err_task.await.unwrap_or_default();
                 let msg = format!(
@@ -8750,25 +10432,46 @@ async fn execute_bash_async_prepared(
     Ok(prepend_cargo_json_diagnostics_summary(body, root))
 }
 
-async fn execute_external_async(
+#[derive(Clone, Copy)]
+struct ExternalExecutionPolicy {
+    timeout: std::time::Duration,
+    sandbox_profile: SandboxProfile,
+    allow_tool_credentials: bool,
+}
+
+async fn execute_external_async_status(
     bin: &str,
     args: &[String],
     stdin_data: Option<&str>,
     cwd: &Path,
     interrupt: Arc<AtomicBool>,
-    timeout: std::time::Duration,
-    sandbox_profile: SandboxProfile,
-) -> std::result::Result<String, String> {
+    policy: ExternalExecutionPolicy,
+) -> std::result::Result<(String, String, i32), String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut cmd = sandbox::tokio_command(bin, sandbox_profile, cwd, &[]);
+    let executable = if bin.eq_ignore_ascii_case("bash") {
+        bash_executable_path()
+    } else {
+        PathBuf::from(bin)
+    };
+    let mut cmd = sandbox::tokio_command(&executable, policy.sandbox_profile, cwd, &[])
+        .map_err(|error| format!("prepare sandbox for {bin}: {error}"))?;
     cmd.args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    let is_git = bin.eq_ignore_ascii_case("git");
+    if is_git {
+        scrub_git_env_from_std_command(cmd.as_std_mut());
+    }
     deny_interactive_prompt_env(&mut cmd);
-    scrub_tool_credentials_from_tokio_command(&mut cmd);
+    scrub_startup_env_from_std_command(cmd.as_std_mut());
+    if policy.allow_tool_credentials && !is_git {
+        scrub_tool_credentials_from_tokio_command(&mut cmd);
+    } else {
+        scrub_credentials_from_std_command_unconditionally(cmd.as_std_mut());
+    }
     configure_tokio_process_group(&mut cmd);
     if stdin_data.is_some() {
         cmd.stdin(std::process::Stdio::piped());
@@ -8779,7 +10482,14 @@ async fn execute_external_async(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {bin}: {e} (is it on PATH?)"))?;
-    let child_pid = child.id();
+    let process_tree = match ChildProcessTree::for_tokio(&child) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(format!("failed to guard {bin} process tree: {error}"));
+        }
+    };
 
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
@@ -8790,13 +10500,13 @@ async fn execute_external_async(
         && let Some(mut si) = child.stdin.take()
         && let Err(error) = si.write_all(data.as_bytes()).await
     {
-        terminate_tokio_child(&mut child).await;
+        process_tree.terminate_tokio_child(&mut child).await;
         let _ = out_task.await;
         let _ = err_task.await;
         return Err(format!("failed to write {bin} stdin: {error}"));
     }
 
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + policy.timeout;
     let status = loop {
         let outcome: ProcWaitOutcome = tokio::select! {
             biased;
@@ -8812,19 +10522,17 @@ async fn execute_external_async(
         };
         match outcome {
             ProcWaitOutcome::Exited(Ok(s)) => {
-                if let Some(pid) = child_pid {
-                    terminate_process_group_after_exit(pid);
-                }
+                process_tree.terminate_after_root_exit();
                 break s;
             }
             ProcWaitOutcome::Exited(Err(e)) => {
-                terminate_tokio_child(&mut child).await;
+                process_tree.terminate_tokio_child(&mut child).await;
                 let _ = out_task.await;
                 let _ = err_task.await;
                 return Err(format!("wait failed: {e}"));
             }
             ProcWaitOutcome::Interrupt => {
-                terminate_tokio_child(&mut child).await;
+                process_tree.terminate_tokio_child(&mut child).await;
                 let out = out_task.await.unwrap_or_default();
                 let err = err_task.await.unwrap_or_default();
                 return Err(format!(
@@ -8834,12 +10542,12 @@ async fn execute_external_async(
                 ));
             }
             ProcWaitOutcome::Timeout => {
-                terminate_tokio_child(&mut child).await;
+                process_tree.terminate_tokio_child(&mut child).await;
                 let out = out_task.await.unwrap_or_default();
                 let err = err_task.await.unwrap_or_default();
                 return Err(format!(
                     "timed out after {}s running {bin}\n--- stdout ---\n{}--- stderr ---\n{}",
-                    timeout.as_secs(),
+                    policy.timeout.as_secs(),
                     out.render("stdout"),
                     err.render("stderr"),
                 ));
@@ -8849,15 +10557,260 @@ async fn execute_external_async(
 
     let out = out_task.await.unwrap_or_default();
     let err = err_task.await.unwrap_or_default();
-    format_process_output(
+    Ok((
         out.render("stdout"),
         err.render("stderr"),
         status.code().unwrap_or(-1),
-    )
+    ))
+}
+
+async fn execute_external_async(
+    bin: &str,
+    args: &[String],
+    stdin_data: Option<&str>,
+    cwd: &Path,
+    interrupt: Arc<AtomicBool>,
+    policy: ExternalExecutionPolicy,
+) -> std::result::Result<String, String> {
+    let (stdout, stderr, status) =
+        execute_external_async_status(bin, args, stdin_data, cwd, interrupt, policy).await?;
+    format_process_output(stdout, stderr, status)
+}
+
+fn optional_git_bool(
+    input: &Value,
+    tool: &str,
+    field: &str,
+    default: bool,
+) -> std::result::Result<bool, String> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!("{tool} {field} must be a boolean")),
+    }
+}
+
+fn optional_git_string<'a>(
+    input: &'a Value,
+    tool: &str,
+    field: &str,
+) -> std::result::Result<Option<&'a str>, String> {
+    match input.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("{tool} {field} must be a string")),
+    }
+}
+
+fn safe_git_inspection_args(command: &str) -> Vec<String> {
+    vec![
+        "--no-pager".to_string(),
+        "--no-optional-locks".to_string(),
+        "--literal-pathspecs".to_string(),
+        "-c".to_string(),
+        "core.fsmonitor=false".to_string(),
+        "-c".to_string(),
+        "credential.helper=".to_string(),
+        "-c".to_string(),
+        "protocol.allow=never".to_string(),
+        command.to_string(),
+    ]
+}
+
+fn validate_git_revision(revision: &str) -> std::result::Result<(), String> {
+    if revision.is_empty() || revision.starts_with('-') || revision.chars().any(char::is_control) {
+        return Err("git_diff commit must be a non-option ref or revision range".to_string());
+    }
+    Ok(())
+}
+
+fn lexically_normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(name) => normalized.push(name),
+        }
+    }
+    Some(normalized)
+}
+
+fn git_tool_pathspec(root: &Path, tool: &str, path: &str) -> std::result::Result<String, String> {
+    if path.trim().is_empty() || path.chars().any(char::is_control) {
+        return Err(format!(
+            "{tool} path must not be empty or contain control characters"
+        ));
+    }
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("canonicalize active project {}: {error}", root.display()))?;
+    let expanded = expand_user_path(path);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        canonical_root.join(expanded)
+    };
+    let normalized = lexically_normalize_absolute_path(&candidate)
+        .ok_or_else(|| format!("{tool} path escapes the active project: {path}"))?;
+    let relative = normalized.strip_prefix(&canonical_root).map_err(|_| {
+        format!(
+            "{tool} path is outside the active project: {}",
+            normalized.display()
+        )
+    })?;
+
+    let components = relative.components().collect::<Vec<_>>();
+    let mut ancestor = canonical_root;
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        let Component::Normal(name) = component else {
+            return Err(format!("{tool} path is not repository-relative: {path}"));
+        };
+        ancestor.push(name);
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!(
+                    "{tool} path has a non-directory or symlinked ancestor: {}",
+                    ancestor.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(format!(
+                    "inspect {tool} path ancestor {}: {error}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+
+    if relative.as_os_str().is_empty() {
+        Ok(".".to_string())
+    } else {
+        Ok(normalized_path_text(relative))
+    }
+}
+
+fn git_commit_pathspecs(root: &Path, paths: &[String]) -> std::result::Result<Vec<String>, String> {
+    paths
+        .iter()
+        .map(|path| git_tool_pathspec(root, "git_commit", path))
+        .collect()
+}
+
+async fn execute_git_commit_async(
+    input: &Value,
+    root: &Path,
+    interrupt: Arc<AtomicBool>,
+    sandbox_profile: SandboxProfile,
+    git_hooks_approved: bool,
+) -> std::result::Result<String, String> {
+    let message = input["message"].as_str().ok_or("missing message")?;
+    if message.trim().is_empty() || message.contains('\0') || message.len() > 64 * 1024 {
+        return Err(
+            "git_commit message must be non-empty, NUL-free, and at most 64 KiB".to_string(),
+        );
+    }
+    let all = optional_git_bool(input, "git_commit", "all", false)?;
+    let paths = match input.get("paths") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(paths)) if paths.iter().all(Value::is_string) => paths
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(Value::Array(_)) => {
+            return Err("git_commit paths must contain only strings".to_string());
+        }
+        Some(_) => return Err("git_commit paths must be an array".to_string()),
+    };
+    let pathspecs = git_commit_pathspecs(root, &paths)?;
+    let filter_drivers = git_commit_filter_drivers(root)?;
+    let mut base_args = vec![
+        "--no-pager".to_string(),
+        "--no-optional-locks".to_string(),
+        "--literal-pathspecs".to_string(),
+        "-c".to_string(),
+        "core.fsmonitor=false".to_string(),
+        "-c".to_string(),
+        "credential.helper=".to_string(),
+        "-c".to_string(),
+        "protocol.allow=never".to_string(),
+        "-c".to_string(),
+        "commit.gpgSign=false".to_string(),
+    ];
+    if !git_hooks_approved {
+        base_args.extend([
+            "-c".to_string(),
+            format!("core.hooksPath={}", internal_git_null_device()),
+        ]);
+    }
+    for driver in filter_drivers {
+        for setting in ["clean", "smudge", "process"] {
+            base_args.extend(["-c".to_string(), format!("filter.{driver}.{setting}=")]);
+        }
+        base_args.extend(["-c".to_string(), format!("filter.{driver}.required=false")]);
+    }
+
+    let mut stage_args = base_args.clone();
+    if all {
+        stage_args.extend([
+            "add".to_string(),
+            "-A".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ]);
+    } else if pathspecs.is_empty() {
+        stage_args.extend([
+            "add".to_string(),
+            "-u".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ]);
+    } else {
+        stage_args.extend(["add".to_string(), "--".to_string()]);
+        stage_args.extend(pathspecs);
+    }
+    let policy = ExternalExecutionPolicy {
+        timeout: external_tool_timeout(),
+        sandbox_profile,
+        allow_tool_credentials: false,
+    };
+    let (stage_stdout, stage_stderr, stage_code) =
+        execute_external_async_status("git", &stage_args, None, root, interrupt.clone(), policy)
+            .await?;
+    if stage_code != 0 {
+        return Err(format!(
+            "git staging failed (exit {stage_code}):\n{}",
+            merge_process_output_with_status(stage_stdout, stage_stderr, stage_code)
+        ));
+    }
+
+    let mut commit_args = base_args;
+    commit_args.extend(["commit".to_string(), "-m".to_string(), message.to_string()]);
+    let (commit_stdout, commit_stderr, commit_code) =
+        execute_external_async_status("git", &commit_args, None, root, interrupt, policy).await?;
+    if commit_code != 0 {
+        return Err(format!(
+            "git commit failed (exit {commit_code}):\n{}",
+            merge_process_output_with_status(commit_stdout, commit_stderr, commit_code)
+        ));
+    }
+    Ok(merge_process_output_with_status(
+        commit_stdout,
+        commit_stderr,
+        commit_code,
+    ))
 }
 
 fn should_retry_external_tool_with_fallback(name: &str, bin: &str, err: &str) -> bool {
-    if name == "browser" || bin == "grep" || bin == "find" {
+    if bin == "grep" || bin == "find" {
         return false;
     }
     if err.contains("failed to spawn") {
@@ -8901,7 +10854,9 @@ async fn execute_builtin_call(
     session_id: Option<String>,
     local_sudo_auth: Option<LocalSudoAuth>,
     git_credential: Option<LocalGitCredential>,
+    prepared_mutation: Option<mutation_preview::PreparedMutation>,
     sandbox_profile: SandboxProfile,
+    git_hooks_approved: bool,
     live_output: Option<LiveToolOutput>,
     pack_env: Vec<(String, String)>,
 ) -> std::result::Result<String, String> {
@@ -8942,15 +10897,17 @@ async fn execute_builtin_call(
         .await
     } else if name == "http" {
         execute_http_tool_async(&input, interrupt, external_tool_timeout()).await
+    } else if name == "git_commit" {
+        execute_git_commit_async(
+            &input,
+            &root,
+            interrupt,
+            sandbox_profile,
+            git_hooks_approved,
+        )
+        .await
     } else if is_external_process_tool(&name) {
-        // The browser recipe manages its own profile/cache directories and
-        // needs broad filesystem access. All other external tools, including
-        // read-only Git inspection, remain under the requested kernel profile.
-        let ext_profile = if name == "browser" {
-            SandboxProfile::DangerFullAccess
-        } else {
-            sandbox_profile
-        };
+        let ext_profile = sandbox_profile;
         let (bin, args, stdin) = prepare_external_tool(&name, &input, &root)?;
         let result = execute_external_async(
             &bin,
@@ -8958,21 +10915,27 @@ async fn execute_builtin_call(
             stdin.as_deref(),
             &root,
             interrupt.clone(),
-            external_tool_timeout(),
-            ext_profile,
+            ExternalExecutionPolicy {
+                timeout: external_tool_timeout(),
+                sandbox_profile: ext_profile,
+                allow_tool_credentials: true,
+            },
         )
         .await;
         match result {
             Err(e) if should_retry_external_tool_with_fallback(&name, &bin, &e) => {
-                let (bin2, args2, stdin2) = prepare_external_tool_fallback(&name, &input, &root);
+                let (bin2, args2, stdin2) = prepare_external_tool_fallback(&name, &input, &root)?;
                 execute_external_async(
                     &bin2,
                     &args2,
                     stdin2.as_deref(),
                     &root,
                     interrupt,
-                    external_tool_timeout(),
-                    ext_profile,
+                    ExternalExecutionPolicy {
+                        timeout: external_tool_timeout(),
+                        sandbox_profile: ext_profile,
+                        allow_tool_credentials: true,
+                    },
                 )
                 .await
             }
@@ -8986,6 +10949,7 @@ async fn execute_builtin_call(
                 &root,
                 read_cache.as_ref(),
                 session_id.as_deref(),
+                prepared_mutation,
             )
         })
         .await
@@ -9232,10 +11196,6 @@ fn summarize_call(name: &str, input: &Value) -> String {
             format!("fzf: query=\"{query}\" items={items}")
         }
         "http" => format!("http: {}", summarize_args(&input["args"], 120)),
-        "browser" => format!(
-            "browser: agent-browser {}",
-            summarize_args(&input["args"], 120)
-        ),
         "awk" => format!("awk: {}", summarize_args(&input["args"], 120)),
         "csvkit" => {
             let sub = input["subcommand"].as_str().unwrap_or("?");
@@ -9246,6 +11206,162 @@ fn summarize_call(name: &str, input: &Value) -> String {
             format!("{name}: {compact}")
         }
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ToolJournalRecovery {
+    not_started: usize,
+    uncertain: usize,
+    recovered_terminal: usize,
+}
+
+impl ToolJournalRecovery {
+    fn total(&self) -> usize {
+        self.not_started + self.uncertain + self.recovered_terminal
+    }
+
+    fn warning(&self) -> String {
+        format!(
+            "[resume recovery] reconciled {} pending tool call(s): {} not started, {} uncertain, {} terminal with original output unavailable; no call was replayed",
+            self.total(),
+            self.not_started,
+            self.uncertain,
+            self.recovered_terminal
+        )
+    }
+}
+
+fn reconcile_pending_tool_calls(
+    history: &mut Vec<Message>,
+    journal_entries: Option<&[tool_journal::ToolJournalEntry]>,
+) -> Result<ToolJournalRecovery> {
+    let mut paired_counts: HashMap<String, usize> = HashMap::new();
+    for tool_use_id in history
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            Block::ToolResult { tool_use_id, .. } => Some(tool_use_id),
+            _ => None,
+        })
+    {
+        *paired_counts.entry(tool_use_id.clone()).or_default() += 1;
+    }
+    let mut pending = Vec::new();
+    for block in history.iter().flat_map(|message| message.content.iter()) {
+        if let Block::ToolUse { id, name, input } = block {
+            let paired = paired_counts.entry(id.clone()).or_default();
+            if *paired > 0 {
+                *paired -= 1;
+            } else {
+                pending.push((id.clone(), name.clone(), input.clone()));
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Ok(ToolJournalRecovery::default());
+    }
+
+    let entries = journal_entries.unwrap_or_default();
+    let mut recovery = ToolJournalRecovery::default();
+    let mut results = Vec::with_capacity(pending.len());
+    for (call_id, tool_name, input) in pending {
+        let input_sha256 = tool_journal::input_sha256(&input)?;
+        let matched = entries.iter().rev().find(|entry| {
+            entry.call_id == call_id
+                && entry.tool_name == tool_name
+                && entry.input_sha256 == input_sha256
+        });
+        let (content, status) = match matched.map(|entry| entry.status) {
+            None => {
+                recovery.not_started += 1;
+                (
+                    format!(
+                        "[resume recovery] {tool_name} was not started: no durable start fence exists. Review current state before making a new call."
+                    ),
+                    "not_started".to_string(),
+                )
+            }
+            Some(tool_journal::ToolJournalStatus::Started) => {
+                recovery.uncertain += 1;
+                (
+                    format!(
+                        "[resume recovery] {tool_name} has an uncertain outcome: execution started but no terminal journal state was saved. Inspect side effects before deciding whether to retry; Dext did not replay it."
+                    ),
+                    "uncertain".to_string(),
+                )
+            }
+            Some(terminal) => {
+                recovery.recovered_terminal += 1;
+                let terminal = terminal.as_str();
+                (
+                    format!(
+                        "[resume recovery] {tool_name} reached journal status {terminal}, but its original output was not saved in the transcript. Inspect current state before making a new call; Dext did not replay it."
+                    ),
+                    format!("recovered_{terminal}"),
+                )
+            }
+        };
+        results.push(Block::ToolResult {
+            tool_use_id: call_id,
+            content,
+            is_error: Some(true),
+            metadata: ToolResultMetadata {
+                status: Some(status),
+                ..ToolResultMetadata::default()
+            },
+        });
+    }
+    history.push(Message {
+        role: "user".to_string(),
+        content: results,
+    });
+    Ok(recovery)
+}
+
+fn tool_journal_summary(name: &str, _input: &Value) -> String {
+    summarize_inline(
+        &format!("{name}: approved side-effect-capable call"),
+        TOOL_SUMMARY_CHAR_CAP,
+    )
+}
+
+fn tool_journal_terminal_status(
+    name: &str,
+    outcome: &std::result::Result<String, String>,
+) -> tool_journal::ToolJournalStatus {
+    if outcome
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.to_ascii_lowercase().contains("interrupt"))
+    {
+        return tool_journal::ToolJournalStatus::Interrupted;
+    }
+    match outcome {
+        Err(_) => tool_journal::ToolJournalStatus::Failed,
+        Ok(output)
+            if name == "bash"
+                && parse_bash_exit_code(output).is_some_and(|exit_code| exit_code != 0) =>
+        {
+            tool_journal::ToolJournalStatus::Failed
+        }
+        Ok(_) => tool_journal::ToolJournalStatus::Completed,
+    }
+}
+
+fn persist_tool_journal_terminal(
+    root: &Path,
+    session_id: &str,
+    record_id: Option<&str>,
+    name: &str,
+    outcome: &std::result::Result<String, String>,
+) -> Option<String> {
+    let record_id = record_id?;
+    let status = tool_journal_terminal_status(name, outcome);
+    tool_journal::finish(root, session_id, record_id, status)
+        .err()
+        .map(|error| {
+            format!("tool journal terminal update failed for {name} ({record_id}): {error:#}")
+        })
 }
 
 fn json_byte_len(v: &Value) -> usize {
@@ -9277,6 +11393,17 @@ fn json_byte_len(v: &Value) -> usize {
     }
 }
 
+fn resolve_console_permission(
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    prompt: impl FnOnce() -> Choice,
+) -> Choice {
+    if !stdin_is_terminal || !stdout_is_terminal {
+        return Choice::Deny;
+    }
+    prompt()
+}
+
 fn prompt_permission(name: &str, input: &Value, pretty: bool) -> Choice {
     let marker = accent("▶", pretty);
     let hint = dim("[y=once / a=always / N]", pretty);
@@ -9297,22 +11424,22 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding assistant running as 
 
 Use only tools exposed in the current API tool list. Do not assume unavailable tools exist.
 Tool protocol: invoke tools only through actual provider tool calls; never print raw `to=functions.*`, `tool_use`, function-call JSON, or bash command envelopes as assistant text.
-Runtime: privileged ops are auto-approved; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested. Avoid mutating external state stores directly.
+Runtime: privileged operations follow the current approval policy; if approval is denied, ask the user. Do not use the unsafe pip flag unless requested. Avoid mutating external state stores directly.
 Runtime state: check the auto-refreshed Context State before each tool call; if a strategy shows PIVOT REQUIRED or a pattern line, stop repeating and pivot or ask.
+Steering: `[queued-user-update]` blocks contain literal active user input. Never dismiss terse, path-only, or context-looking updates as metadata. If the user supplies an exact path, inspect it first with native tools (`read_file` for a file; `fd`/`rg` for a directory) instead of guessing another target or using bash/sudo discovery.
 Project state: use todo_read/todo_write for nontrivial work. Treat DEXT.md/recall.md as guidance; update recall.md only for durable decisions.
 Tool hierarchy: use exposed native Dext tools before bash. Use fd/rg/read_file/read_symbol/git_diff/todo/edit tools, and http when exposed, for their domains; bash is last resort for shell-only orchestration, build/test/install, or catalog gaps.
 Discovery: prefer fd for files, rg for content. Use rg first for symbols, then read_symbol/focused read_file. Read-only tools may inspect absolute paths outside the sandbox; writes stay confined. Avoid broad reads; paginate. Use read-only tools in parallel. Do not use bash for ordinary file reads, recursive search, file discovery, git diff, or HTTP when an exposed native tool fits.
 Editing: always read before editing. Use edit_file for small changes, multi_edit for batches, write_file for new files. Checkpoint before large edits.
 Git: inspect status/diff before editing tracked files. Use git_diff for diffs and git_commit (not raw git) for commits. Use bash git log only when history is needed and no git_log tool is exposed.
 Shell: preserve pipefail in bash. Treat bash calls as atomic: Dext cleans the tool process group after each call, so do not use shell backgrounding, nohup, or disown for persistence; setsid-style detaches are unsupported because they escape Dext cleanup. For requested persistent local services, use an OS supervisor when available (Linux: systemd-run --user with dext- unit, inspect/stop via systemctl --user). Exposed Dext tools like rg/fd/http/git_diff are API tools, not shell binaries. Prefer arrays/heredocs for quoting. Inspect stderr even on exit 0. Obey [runtime-note] advisories in tool results before choosing the next tool. Validate external sources before scaling. On auth failures, ask for credentials.
-Browser: if browser_recipe=agent-browser, use the browser tool only when useful; start with browser args ['skills','get','core','--full'].
 Verification: narrowest checks first, realistic timeouts. Prefer stdlib/existing test runners. Compare structured outputs semantically. Rerun suites only if code changed.
 Context: keep tool output small. Preserve exact paths/commands/decisions. Avoid rereading just-written files; prefer compile/test checks. Summarize large logs, share partial results early.
 Communication: be terse. Report what changed, verification results, gaps. No narrative unless checkpointing.
 Tables: single well-formed tables render best. When several small related tables share a theme/schema, consolidate them into one grouped table with one header row; use grouping columns/rows, one physical line per row, compact cell delimiters like ` · ` or `;`, and plain short cells. Avoid stacked heading+table blocks and fragile cell content: nested markdown/bold, emoji verdict icons, unescaped `|` characters, or multi-line cells. If separate tables are truly needed, separate them with a full prose sentence.
-Packs: when creating or installing a reusable pack or shelf, default to Dext's user-global scope (`~/.dext/packs` or `~/.dext/shelves/<shelf>/packs`) unless the user explicitly asks for project-local placement.";
+Packs: invoke an available pack directly when the user asks to run or use it. Prefer `/pack <name> <task>` or `dext pack <name> <task>`; `run` remains an accepted optional verb. When creating or installing a reusable pack or shelf, default to Dext's user-global scope (`~/.dext/packs` or `~/.dext/shelves/<shelf>/packs`) unless the user explicitly asks for project-local placement.";
 
-const TINY_SYSTEM: &str = "You are dext tiny: terse CLI agent. Use exposed tools only. Tool protocol: real tool calls only; never print raw to=functions/tool_use/function-call JSON/bash envelopes or prefill the TUI input. Check Context State; pivot at PIVOT REQUIRED or repeated-action pattern. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit/http; read-only absolute paths ok, writes confined; bash only for shell orchestration, build/test/install, or gaps. Inspect before edits. Keep output small. Use todo for nontrivial work. Bash is atomic; supervised dext- services only for requested persistence. Obey [runtime-note] advisories. Reusable packs default user-global unless asked otherwise. Tables: related data -> one grouped table; one row/line; plain cells, no emoji/bold/unescaped `|`/linebreaks; prose between unrelated tables. Verify narrowly. Final: changed, tests, gaps.";
+const TINY_SYSTEM: &str = "You are dext tiny, a terse CLI agent. Use exposed tools via real calls; never print call JSON/bash envelopes or prefill the TUI input. Check Context State; pivot at PIVOT REQUIRED/pattern. Queued-user-update blocks are literal active user input: never dismiss path-only/context-looking updates; inspect exact user paths first with read_file or fd/rg, not bash/sudo discovery. For nontrivial work, define steps by required input and observable output; parallelize reads, reuse results, and repair only the failed step. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit/http. Absolute reads are allowed; writes stay confined; use bash only for orchestration/build/test/install/gaps. Inspect before editing. Use todo for nontrivial work. Bash is atomic; supervise requested persistent dext- services. Obey runtime notes. Reusable packs default user-global. Tables: related data -> one grouped table; one row/line; plain cells, no emoji/bold/unescaped `|`/linebreaks. Verify narrowly. Final: changes, tests, gaps.";
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
 
@@ -9502,6 +11629,8 @@ const FRUGAL_COMPACT_PRESERVE_TOOL_BYTES: usize = 8_000;
 const COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 1_000;
 const FRUGAL_COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 360;
 
+const HOOKS_APPROVAL_NAME: &str = "hooks";
+
 #[derive(Deserialize, Clone, Default)]
 struct Hook {
     #[serde(rename = "match")]
@@ -9520,6 +11649,10 @@ struct Hooks {
 }
 
 impl Hooks {
+    fn is_empty(&self) -> bool {
+        self.pre_tool.is_empty() && self.post_tool.is_empty() && self.user_prompt.is_empty()
+    }
+
     fn load(root: &Path) -> Self {
         let path = std::env::var("DEXT_HOOKS_FILE")
             .map(PathBuf::from)
@@ -9550,6 +11683,7 @@ impl Hooks {
         env: &[(&str, &str)],
         extra_env: &[(String, String)],
         root: &Path,
+        sandbox_profile: SandboxProfile,
     ) -> Vec<(String, i32)> {
         let hooks: &[Hook] = match phase {
             "pre_tool" => &self.pre_tool,
@@ -9565,20 +11699,39 @@ impl Hooks {
             {
                 continue;
             }
-            let mut cmd = Command::new("bash");
-            cmd.arg("-c").arg(&h.command).current_dir(root);
+            let hook_profile = if sandbox_profile == SandboxProfile::ReadOnly {
+                SandboxProfile::ReadOnly
+            } else {
+                SandboxProfile::WorkspaceWrite
+            };
+            let bash = bash_executable_path();
+            let sandboxed = match sandbox::std_command(&bash, hook_profile, root, &[]) {
+                Ok(command) => command,
+                Err(error) => {
+                    out.push((format!("prepare hook sandbox: {error}"), -1));
+                    continue;
+                }
+            };
+            let (mut cmd, scratch) = sandboxed.into_parts();
+            cmd.arg("--noprofile")
+                .arg("--norc")
+                .arg("-c")
+                .arg(&h.command)
+                .current_dir(root);
             for (k, v) in env {
                 cmd.env(k, v);
             }
             for (k, v) in extra_env {
                 cmd.env(k, v);
             }
-            match run_sync_command_limited(
+            scrub_credentials_from_std_command_unconditionally(&mut cmd);
+            match run_sync_command_limited_with_scratch(
                 cmd,
                 None,
                 HOOK_OUTPUT_CAPTURE_CAP,
                 "hook command",
                 hook_timeout(),
+                scratch,
             ) {
                 Ok((stdout, stderr, code)) => {
                     let combined = merge_process_output_with_status(
@@ -9667,8 +11820,11 @@ fn default_context_mode_for_provider(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum ContextMode {
     #[default]
+    #[serde(alias = "standard")]
     Standard,
+    #[serde(alias = "frugal")]
     Frugal,
+    #[serde(alias = "tiny")]
     Tiny,
 }
 
@@ -9767,7 +11923,6 @@ const DEFAULT_TOOL_NAMES: &[&str] = &[
     "fd",
     "rg",
     "http",
-    "browser",
     "git_diff",
     "git_commit",
     "todo_read",
@@ -9796,10 +11951,9 @@ fn render_tools_status(agent: &Agent) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "tools: {} (schemas {}, browser {})",
+        "tools: {} (schemas {})",
         agent.tool_context_profile().as_str(),
-        agent.wire_tool_profile().as_str(),
-        agent.browser_recipe().as_str()
+        agent.wire_tool_profile().as_str()
     );
     let _ = writeln!(out, "usage: /tools [status|default|full]");
     let _ = writeln!(
@@ -9843,9 +11997,6 @@ fn render_tools_status(agent: &Agent) -> String {
             hidden_specialized.join(", ")
         );
     }
-    if agent.browser_recipe() == BrowserRecipe::Disabled {
-        let _ = writeln!(out, "browser: off (separate /browser agent-browser opt-in)");
-    }
     out.trim_end().to_string()
 }
 
@@ -9861,18 +12012,12 @@ fn handle_tools_command(agent: &mut Agent, arg: &str) -> ToolsCommandResult {
                 ToolContextProfile::parse_selectable(raw).unwrap_or(ToolContextProfile::Default);
             agent.tool_context_profile = profile.effective(agent.context_mode);
             agent.refresh_tools_for_context();
-            let browser_note = if agent.browser_recipe() == BrowserRecipe::Disabled {
-                "; browser off"
-            } else {
-                ""
-            };
             ToolsCommandResult {
                 output: format!(
-                    "tools -> {} ({} exposed; schemas {}{})",
+                    "tools -> {} ({} exposed; schemas {})",
                     agent.tool_context_profile().as_str(),
                     agent.tools.len(),
                     agent.wire_tool_profile().as_str(),
-                    browser_note
                 ),
             }
         }
@@ -9960,6 +12105,8 @@ struct SessionProvenance {
     model: String,
     thinking_effort: ThinkingEffort,
     approval_profile: ApprovalProfile,
+    #[serde(default)]
+    approval_policy_source: ApprovalPolicySource,
     sandbox_profile: SandboxProfile,
     system_prompt_hash: String,
     dext_md_hash: Option<String>,
@@ -10009,11 +12156,11 @@ struct SessionHeader {
     #[serde(default)]
     approval_profile: ApprovalProfile,
     #[serde(default)]
+    approval_policy_source: ApprovalPolicySource,
+    #[serde(default)]
     sandbox_profile: SandboxProfile,
     #[serde(default)]
     budget_cap: Option<BudgetCap>,
-    #[serde(default)]
-    browser_recipe: BrowserRecipe,
     #[serde(default)]
     context_mode: ContextMode,
     #[serde(default)]
@@ -10051,9 +12198,9 @@ impl Default for SessionHeader {
             compact_threshold_chars: None,
             compact_threshold_percent: None,
             approval_profile: ApprovalProfile::default(),
+            approval_policy_source: ApprovalPolicySource::default(),
             sandbox_profile: SandboxProfile::default(),
             budget_cap: None,
-            browser_recipe: BrowserRecipe::default(),
             context_mode: ContextMode::default(),
             context_mode_explicit: false,
             tool_context_profile: ToolContextProfile::default(),
@@ -10277,7 +12424,6 @@ fn context_strategy_for_tool(name: &str, input: &Value) -> Option<ContextStrateg
     match name {
         "git_diff" if input["stat"].as_bool().unwrap_or(false) => Some(ContextStrategy::GitStatus),
         "http" => Some(ContextStrategy::HttpUrlHunt),
-        "browser" => Some(ContextStrategy::HttpUrlHunt),
         "bash" => {
             let command = input["command"].as_str().unwrap_or("");
             if command_looks_like_git_status(command) {
@@ -10654,6 +12800,9 @@ fn is_provider_tool_result_id_bug(text: &str) -> bool {
 fn parse_compact_slash(line: &str) -> Option<Result<CompactSlash, &'static str>> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix("/compact")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
     let arg = rest.trim();
     if rest.is_empty() || arg.is_empty() {
         return Some(Ok(CompactSlash::RunNow));
@@ -10708,8 +12857,102 @@ fn is_active_runtime_control_command(text: &str) -> bool {
     parse_active_runtime_control_sequence(text).is_some()
 }
 
+fn slash_command_name(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let cmd = rest.split_whitespace().next()?;
+    matches!(
+        cmd,
+        "pack"
+            | "packs"
+            | "shelf"
+            | "shelves"
+            | "help"
+            | "?"
+            | "version"
+            | "quit"
+            | "exit"
+            | "reset"
+            | "tools"
+            | "history"
+            | "system"
+            | "allow"
+            | "revoke"
+            | "allowed"
+            | "trust"
+            | "privacy"
+            | "approval"
+            | "approval-profile"
+            | "preview"
+            | "sandbox-profile"
+            | "budget"
+            | "browser-recipe"
+            | "sandbox"
+            | "model"
+            | "providers"
+            | "provider"
+            | "models"
+            | "login"
+            | "logout"
+            | "auth"
+            | "effort"
+            | "think"
+            | "thinking"
+            | "context"
+            | "context-mode"
+            | "tool-profile"
+            | "tools-profile"
+            | "compact"
+            | "usage"
+            | "status"
+            | "tokens"
+            | "diagnostics"
+            | "diag"
+            | "save"
+            | "export"
+            | "map"
+            | "packet"
+            | "focus"
+            | "tracks"
+            | "branches"
+            | "track"
+            | "resume"
+            | "sessions"
+            | "session"
+            | "hooks"
+            | "undo"
+            | "plan"
+    )
+    .then_some(cmd)
+}
+
 fn is_slash_command(text: &str) -> bool {
-    text.trim_start().starts_with('/')
+    slash_command_name(text).is_some()
+}
+
+fn normalize_user_input_path(text: &str) -> String {
+    let trimmed = text.trim();
+    let normalized = trimmed.replace('\\', "/");
+    if !normalized.starts_with("//") {
+        return trimmed.to_string();
+    }
+    let path = normalized.trim_start_matches('/');
+    let mut components = path.split('/');
+    let server = components.next().unwrap_or_default();
+    if !matches!(
+        server.to_ascii_lowercase().as_str(),
+        "wsl.localhost" | "wsl$"
+    ) {
+        return trimmed.to_string();
+    }
+    let Some(_distro) = components.next().filter(|part| !part.is_empty()) else {
+        return trimmed.to_string();
+    };
+    let rest = components.collect::<Vec<_>>().join("/");
+    if rest.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{rest}")
+    }
 }
 
 fn unsupported_busy_slash_message(text: &str) -> String {
@@ -11524,23 +13767,48 @@ fn compact_threshold_settings_path() -> PathBuf {
     dext_state_dir().join("settings.json")
 }
 
-fn load_compact_threshold_percent_setting() -> Option<u8> {
-    let text = std::fs::read_to_string(compact_threshold_settings_path()).ok()?;
-    let json: Value = serde_json::from_str(&text).ok()?;
-    json["compact_threshold_percent"]
+fn load_compact_threshold_percent_setting() -> Result<Option<u8>> {
+    let path = compact_threshold_settings_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading compact settings {}", path.display()));
+        }
+    };
+    let json: Value = serde_json::from_str(&text)
+        .with_context(|| format!("invalid compact settings JSON: {}", path.display()))?;
+    let object = json
+        .as_object()
+        .context("compact settings must be a JSON object")?;
+    let Some(value) = object.get("compact_threshold_percent") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let percent = value
         .as_u64()
-        .and_then(|v| u8::try_from(v).ok())
-        .filter(|v| (1..=100).contains(v))
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| (1..=100).contains(value))
+        .context("compact_threshold_percent must be an integer from 1 through 100")?;
+    Ok(Some(percent))
 }
 
 fn save_compact_threshold_percent_setting(percent: Option<u8>) -> Result<()> {
     let path = compact_threshold_settings_path();
-    let mut json = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .unwrap_or_else(|| json!({}));
+    let mut json = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<Value>(&text)
+            .with_context(|| format!("invalid compact settings JSON: {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading compact settings {}", path.display()));
+        }
+    };
     if !json.is_object() {
-        json = json!({});
+        anyhow::bail!("compact settings must be a JSON object");
     }
     if let Some(percent) = percent.filter(|v| (1..=100).contains(v)) {
         json["compact_threshold_percent"] = json!(percent);
@@ -11553,24 +13821,14 @@ fn save_compact_threshold_percent_setting(percent: Option<u8>) -> Result<()> {
 }
 
 pub(crate) fn git_summary(root: &Path) -> Option<String> {
-    let branch_out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !branch_out.status.success() {
+    let branch_out = run_internal_git_command(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    if !branch_out.success() {
         return None;
     }
     let branch = String::from_utf8_lossy(&branch_out.stdout)
         .trim()
         .to_string();
-    let status_out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
+    let status_out = run_internal_git_command(root, &["status", "--porcelain"]).ok()?;
     let dirty = !status_out.stdout.is_empty();
     Some(format!("{branch}{}", if dirty { " (dirty)" } else { "" }))
 }
@@ -11623,8 +13881,8 @@ struct Agent {
     compact_threshold_percent: Option<u8>,
     context_window_tokens: u64,
     approval_profile: ApprovalProfile,
+    approval_policy_source: ApprovalPolicySource,
     sandbox_profile: SandboxProfile,
-    browser_recipe: BrowserRecipe,
     context_mode: ContextMode,
     context_mode_explicit: bool,
     tool_context_profile: ToolContextProfile,
@@ -11754,19 +14012,14 @@ impl Agent {
 
         let pretty = io::stdout().is_terminal();
         let git_context = git_summary(&sandbox_root);
-        let browser_recipe = std::env::var("DEXT_BROWSER_RECIPE")
-            .ok()
-            .and_then(|v| BrowserRecipe::parse(&v))
-            .unwrap_or_default();
         let tool_profile = ToolProfile::from_env();
         let budget_cap = BudgetCap::from_env();
         let tool_context_profile = ToolContextProfile::from_env().effective(context_mode);
         let tools: Vec<Tool> = provider_tool_definitions()
             .into_iter()
-            .filter(|t| browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser")
             .filter(|t| tool_name_allowed_in_profile(t.name, tool_context_profile))
             .collect();
-        let compact_threshold_percent = load_compact_threshold_percent_setting();
+        let compact_threshold_percent = load_compact_threshold_percent_setting()?;
         Ok(Self {
             client: Arc::new(OnceLock::new()),
             provider_id,
@@ -11811,8 +14064,8 @@ impl Agent {
             compact_threshold_percent,
             context_window_tokens,
             approval_profile: ApprovalProfile::default(),
+            approval_policy_source: ApprovalPolicySource::default(),
             sandbox_profile: SandboxProfile::default(),
-            browser_recipe,
             context_mode,
             context_mode_explicit,
             tool_context_profile,
@@ -12005,6 +14258,24 @@ impl Agent {
             );
             self.set_context_mode_automatic(mode);
         }
+    }
+
+    fn official_kimi_model(&self) -> Option<&str> {
+        self.provider_profile
+            .as_ref()
+            .filter(|profile| is_official_kimi_profile(profile, &self.base_url))
+            .map(|_| self.model.trim())
+    }
+
+    fn kimi_model_uses_adaptive_thinking(&self) -> bool {
+        self.official_kimi_model()
+            .is_some_and(|model| model.eq_ignore_ascii_case("k3"))
+    }
+
+    fn kimi_model_allows_empty_thinking_signature(&self) -> bool {
+        self.official_kimi_model().is_some_and(|model| {
+            model.eq_ignore_ascii_case("k3") || model.eq_ignore_ascii_case("kimi-for-coding")
+        })
     }
 
     fn request_contract(&self) -> RequestContract {
@@ -12295,6 +14566,16 @@ impl Agent {
     }
 
     fn set_approval_profile(&mut self, profile: ApprovalProfile) -> usize {
+        self.set_resolved_approval_profile(profile, ApprovalPolicySource::Cli)
+    }
+
+    fn set_resolved_approval_profile(
+        &mut self,
+        profile: ApprovalProfile,
+        source: ApprovalPolicySource,
+    ) -> usize {
+        let profile_changed = self.approval_profile != profile;
+        self.approval_policy_source = source;
         self.approval_profile = profile;
         let privileged: Vec<String> = self
             .tools
@@ -12312,10 +14593,19 @@ impl Agent {
                 changed += 1;
             }
         }
+        if profile != ApprovalProfile::Always && self.allowed.remove(DIAGNOSTICS_APPROVAL_NAME) {
+            changed += 1;
+        }
+        if profile_changed && self.allowed.remove(HOOKS_APPROVAL_NAME) {
+            changed += 1;
+        }
         changed
     }
 
     fn set_sandbox_profile(&mut self, profile: SandboxProfile) {
+        if self.sandbox_profile != profile {
+            self.allowed.remove(HOOKS_APPROVAL_NAME);
+        }
         self.sandbox_profile = profile;
     }
 
@@ -12470,19 +14760,6 @@ impl Agent {
         }
     }
 
-    fn set_browser_recipe(&mut self, recipe: BrowserRecipe) {
-        self.browser_recipe = recipe;
-        self.refresh_tools_for_context();
-        if recipe == BrowserRecipe::AgentBrowser && self.approval_profile == ApprovalProfile::Always
-        {
-            self.allowed.insert("browser".to_string());
-        }
-        if recipe != BrowserRecipe::AgentBrowser {
-            self.allowed.remove("browser");
-            self.deny_tools.remove("browser");
-        }
-    }
-
     pub(crate) fn trust_mode_active(&self) -> bool {
         self.approval_profile == ApprovalProfile::Always
     }
@@ -12502,10 +14779,6 @@ impl Agent {
 
     pub(crate) fn sandbox_profile(&self) -> SandboxProfile {
         self.sandbox_profile
-    }
-
-    pub(crate) fn browser_recipe(&self) -> BrowserRecipe {
-        self.browser_recipe
     }
 
     pub(crate) fn thinking_effort(&self) -> ThinkingEffort {
@@ -12570,7 +14843,7 @@ impl Agent {
     /// Pre-warm the TCP+TLS connection to the provider API by sending a
     /// lightweight request. The actual API call will reuse the warm connection.
     fn prewarm_connection(&self) {
-        let client = self.client.get_or_init(reqwest::Client::new).clone();
+        let client = self.client.get_or_init(build_provider_http_client).clone();
         let url = provider_request_url(&self.base_url, self.request_contract());
         // Fire-and-forget HEAD request to warm TLS
         std::mem::drop(tokio::spawn(async move {
@@ -12583,7 +14856,23 @@ impl Agent {
     }
 
     fn http_client(&self) -> &reqwest::Client {
-        self.client.get_or_init(reqwest::Client::new)
+        self.client.get_or_init(build_provider_http_client)
+    }
+
+    fn local_provider_transport(&self) -> bool {
+        provider::is_local_llama_provider(
+            &self.provider_id,
+            self.route_api_provider(),
+            &self.base_url,
+        )
+    }
+
+    fn first_byte_timeout(&self) -> std::time::Duration {
+        provider_first_byte_timeout(self.local_provider_transport())
+    }
+
+    fn stream_idle_timeout(&self) -> std::time::Duration {
+        provider_stream_idle_timeout(self.local_provider_transport())
     }
 
     async fn interrupt_aware_sleep(&mut self, secs: u64) -> AppliedRuntimeControls {
@@ -12616,9 +14905,14 @@ impl Agent {
     }
 
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
-        self.pack_hook_env.clear();
-        self.active_pack_hook_paths.clear();
-        self.suppress_pack_activation = false;
+        let root = std::fs::canonicalize(&root)
+            .with_context(|| format!("canonicalizing sandbox root {}", root.display()))?;
+        if !std::fs::metadata(&root)
+            .with_context(|| format!("reading sandbox root metadata {}", root.display()))?
+            .is_dir()
+        {
+            anyhow::bail!("sandbox root is not a directory: {}", root.display());
+        }
         let next_lock_path = session_state_lock_path(&root, &self.session_id);
         let same_session = self
             .state_lock
@@ -12633,6 +14927,13 @@ impl Agent {
             None
         };
 
+        let root_changed = self.sandbox_root != root;
+        self.pack_hook_env.clear();
+        self.active_pack_hook_paths.clear();
+        if root_changed {
+            self.allowed.clear();
+        }
+        self.suppress_pack_activation = false;
         self.sandbox_root = root;
         self.shelf_registry = shelves::ShelfRegistry::discover(&self.sandbox_root);
         self.hooks = Hooks::load(&self.sandbox_root);
@@ -12650,11 +14951,23 @@ impl Agent {
     fn activate_pack_hooks(&mut self, pack: &packs::PackInfo) {
         let path = pack.path.display().to_string();
         let env_name = pack.env_var_name();
-        self.pack_hook_env
-            .retain(|(key, _)| key != &env_name && key != "DEXT_PACK_DIR");
+        self.pack_hook_env.retain(|(key, _)| {
+            key != &env_name && key != "DEXT_PACK_DIR" && key != "DEXT_PACK_CREDENTIAL_ENV"
+        });
         self.pack_hook_env
             .push(("DEXT_PACK_DIR".to_string(), path.clone()));
         self.pack_hook_env.push((env_name, path));
+        let credential_env = pack
+            .credential_env
+            .iter()
+            .filter(|name| pack_credential_env_name_allowed(name))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        if !credential_env.is_empty() {
+            self.pack_hook_env
+                .push(("DEXT_PACK_CREDENTIAL_ENV".to_string(), credential_env));
+        }
         if let Some(phooks) = &pack.phooks_path {
             let key = std::fs::canonicalize(phooks).unwrap_or_else(|_| phooks.clone());
             if self.active_pack_hook_paths.insert(key) {
@@ -12678,17 +14991,6 @@ impl Agent {
         )));
         let prompt = packs::pack_prompt(&pack, task)?;
         self.chat(prompt).await
-    }
-
-    fn browser_recipe_hint(&self) -> Option<String> {
-        if self.browser_recipe != BrowserRecipe::AgentBrowser {
-            return None;
-        }
-        if binary_on_path("agent-browser") {
-            Some("browser recipe enabled: use the browser tool with args like ['skills','get','core','--full'] or ['open','https://example.com'] when useful.".to_string())
-        } else {
-            Some("browser recipe requested, but agent-browser is not on PATH; install it or disable with /browser off.".to_string())
-        }
     }
 
     fn maybe_create_tool_checkpoint(&mut self, name: &str, input: &Value) {
@@ -12719,48 +15021,6 @@ impl Agent {
         }
     }
 
-    fn compute_mutation_preview(&self, name: &str, input: &Value) -> Option<String> {
-        let root = &self.sandbox_root;
-        match name {
-            "write_file" => {
-                let path_str = input["path"].as_str()?;
-                let content = input["content"].as_str()?;
-                match mutation_preview::preview_write_file(root, path_str, content) {
-                    Ok(p) => Some(format_preview(&p)),
-                    Err(_) => None,
-                }
-            }
-            "edit_file" => {
-                let path_str = input["path"].as_str()?;
-                let old = input["old_string"].as_str()?;
-                let new = input["new_string"].as_str()?;
-                match mutation_preview::preview_edit_file(root, path_str, old, new) {
-                    Ok(p) => Some(format_preview(&p)),
-                    Err(e) => Some(format!("preview error: {e}")),
-                }
-            }
-            "multi_edit" => {
-                let path_str = input["path"].as_str()?;
-                let edits_arr = input["edits"].as_array()?;
-                let edits: Vec<_> = edits_arr
-                    .iter()
-                    .filter_map(|e| {
-                        Some(mutation_preview::MultiEdit {
-                            old_string: e["old_string"].as_str()?.to_string(),
-                            new_string: e["new_string"].as_str()?.to_string(),
-                            replace_all: e["replace_all"].as_bool().unwrap_or(false),
-                        })
-                    })
-                    .collect();
-                match mutation_preview::preview_multi_edit(root, path_str, &edits) {
-                    Ok(p) => Some(format_preview(&p)),
-                    Err(e) => Some(format!("preview error: {e}")),
-                }
-            }
-            _ => None,
-        }
-    }
-
     fn tool_auto_approved(&self, name: &str, input: &Value) -> bool {
         if self.allowed.contains(name) {
             return true;
@@ -12778,15 +15038,6 @@ impl Agent {
     }
 
     fn sandbox_policy_denial(&self, name: &str, input: &Value) -> Option<String> {
-        if name == "browser" {
-            if self.browser_recipe != BrowserRecipe::AgentBrowser {
-                return Some("browser tool is disabled. Enable with /browser agent-browser or --browser agent-browser before using browser automation.".to_string());
-            }
-            if !binary_on_path("agent-browser") {
-                return Some("agent-browser is not on PATH; install it or disable browser recipe with /browser off.".to_string());
-            }
-            return None;
-        }
         let risk = tool_policy::classify_command_risk(name, input);
         match self.sandbox_profile {
             SandboxProfile::DangerFullAccess | SandboxProfile::WorkspaceWrite => None,
@@ -13116,12 +15367,6 @@ impl Agent {
             if let Some(cap) = self.budget_cap {
                 env.push_str(&format!("budget_cap={}\n", cap.line()));
             }
-            if self.browser_recipe != BrowserRecipe::Disabled {
-                env.push_str(&format!(
-                    "browser_recipe={}\n",
-                    self.browser_recipe.as_str()
-                ));
-            }
             if let Some(pack_summary) = cached_pack_summary.clone() {
                 env.push_str("\n## Dext packs\n");
                 env.push_str(&cap_bytes_with_hint(
@@ -13251,12 +15496,6 @@ impl Agent {
         if let Some(cap) = self.budget_cap {
             env.push_str(&format!("budget_cap={}\n", cap.line()));
         }
-        if self.browser_recipe != BrowserRecipe::Disabled {
-            env.push_str(&format!(
-                "browser_recipe={}\n",
-                self.browser_recipe.as_str()
-            ));
-        }
         if let Some(pack_summary) = cached_pack_summary {
             env.push_str("\n## Dext packs\n");
             env.push_str(&cap_bytes_with_hint(
@@ -13318,10 +15557,9 @@ impl Agent {
 
     fn cleaned_work_ledger(&self) -> WorkLedger {
         let mut ledger = self.work_ledger.clone();
-        ledger.files_changed.retain(|path| {
-            let p = Path::new(path);
-            !p.is_absolute() && !path.starts_with(".dext/")
-        });
+        ledger
+            .files_changed
+            .retain(|path| !portable_path_is_absolute(path) && !path.starts_with(".dext/"));
         if ledger.pending.is_empty() && ledger.in_progress.is_empty() && !ledger.done.is_empty() {
             ledger.next_actions.clear();
             if matches!(
@@ -13338,8 +15576,7 @@ impl Agent {
         let Some(path) = input["path"].as_str() else {
             return;
         };
-        let p = Path::new(path);
-        if p.is_absolute() || path.starts_with(".dext/") {
+        if portable_path_is_absolute(path) || path.starts_with(".dext/") {
             return;
         }
         if !self.work_ledger.files_changed.iter().any(|p| p == path) {
@@ -13447,6 +15684,8 @@ impl Agent {
         };
         let progress = format!(
             "[queued-user-update] The user sent this while you were working. This is active scope, not an aside. \
+             The text under `User update` is literal user-authored task input, even when it is only a path or resembles runtime/context metadata; never dismiss or reinterpret it as generated status. \
+             If the user supplies an exact path, inspect that path first with native tools (`read_file` for a file; `fd`/`rg` for a directory), not guessed alternatives, bash discovery, or sudo. \
              You must explicitly address it in your next assistant response and say what changed, what you did about it, or why it is blocked. \
              If it adds/removes work, update any active todo list before continuing. Do not let the final answer omit this queued update.\n\n\
              Progress: completed {iterations} iterations, {tool_count} tool calls so far. \
@@ -13566,7 +15805,6 @@ impl Agent {
         let profile = self.tool_context_profile();
         self.tools = provider_tool_definitions()
             .into_iter()
-            .filter(|t| self.browser_recipe == BrowserRecipe::AgentBrowser || t.name != "browser")
             .filter(|t| tool_name_allowed_in_profile(t.name, profile))
             .collect();
         let exposed: HashSet<&str> = self.tools.iter().map(|t| t.name).collect();
@@ -13655,7 +15893,6 @@ impl Agent {
                             if let Block::ToolResult {
                                 tool_use_id,
                                 content,
-                                is_error: _,
                                 ..
                             } = b
                             {
@@ -13866,7 +16103,7 @@ impl Agent {
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
-                let reasoning_effort = openai_reasoning_effort(effort);
+                let reasoning_effort = openai_reasoning_effort(&self.model, effort);
                 let stream_options = (!provider::is_local_llama_provider(
                     &self.provider_id,
                     self.route_api_provider(),
@@ -13884,9 +16121,12 @@ impl Agent {
                     &tool_names,
                     env_flag_default(LLAMA_TOOL_GRAMMAR_ENV, false),
                 );
+                let (max_tokens, max_completion_tokens) =
+                    oai_output_token_caps(&self.provider_id, &self.model, max_output_tokens);
                 let body = OaiRequest {
                     model: &self.model,
-                    max_tokens: max_output_tokens,
+                    max_tokens,
+                    max_completion_tokens,
                     messages: oai_msgs,
                     tools: oai_tools,
                     stream: true,
@@ -13919,9 +16159,10 @@ impl Agent {
                         .flatten()
                     });
                 let (thinking, output_config) = if let Some(effort) = configured_effort {
+                    let kimi_adaptive = self.kimi_model_uses_adaptive_thinking();
                     (
                         Some(AnthropicThinking {
-                            kind: "enabled",
+                            kind: if kimi_adaptive { "adaptive" } else { "enabled" },
                             budget_tokens: None,
                             display: None,
                         }),
@@ -13954,7 +16195,11 @@ impl Agent {
                     )
                 };
                 let history = self.provider_context_history();
-                let messages = sanitize_anthropic_messages(history, thinking.is_some());
+                let messages = sanitize_anthropic_messages(
+                    history,
+                    thinking.is_some(),
+                    self.kimi_model_allows_empty_thinking_signature(),
+                );
                 let prompt_cache_enabled = self.model_supports_prompt_cache();
                 let mut messages = anthropic_wire_messages(&messages, prompt_cache_enabled)?;
                 append_runtime_env_block(&mut messages, sys_env);
@@ -13995,7 +16240,12 @@ impl Agent {
         let system_details = self.compose_system_details();
         let composed_system = format!("{}\n\n{}", system_details.stable, system_details.env);
         let provenance = self.session_provenance_from(&system_details, &composed_system);
-        let mut allowed: Vec<String> = self.allowed.iter().cloned().collect();
+        let mut allowed: Vec<String> = self
+            .allowed
+            .iter()
+            .filter(|name| name.as_str() != HOOKS_APPROVAL_NAME)
+            .cloned()
+            .collect();
         allowed.sort();
         let mut exposed_tools: Vec<String> =
             self.tools.iter().map(|t| t.name.to_string()).collect();
@@ -14031,9 +16281,9 @@ impl Agent {
             compact_threshold_chars: self.compact_threshold_override(),
             compact_threshold_percent: self.compact_threshold_override_percent(),
             approval_profile: self.approval_profile,
+            approval_policy_source: self.approval_policy_source,
             sandbox_profile: self.sandbox_profile,
             budget_cap: self.budget_cap,
-            browser_recipe: self.browser_recipe,
             context_mode: self.context_mode,
             context_mode_explicit: self.context_mode_explicit,
             tool_context_profile: self.tool_context_profile(),
@@ -14093,6 +16343,7 @@ impl Agent {
             model: self.model.clone(),
             thinking_effort: self.thinking_effort,
             approval_profile: self.approval_profile,
+            approval_policy_source: self.approval_policy_source,
             sandbox_profile: self.sandbox_profile,
             system_prompt_hash: sha256_hex_str(system_prompt),
             dext_md_hash,
@@ -14209,9 +16460,9 @@ impl Agent {
             compact_threshold_chars,
             compact_threshold_percent,
             approval_profile,
+            approval_policy_source,
             sandbox_profile,
             budget_cap,
-            browser_recipe,
             context_mode,
             context_mode_explicit,
             tool_context_profile,
@@ -14224,10 +16475,35 @@ impl Agent {
             ..
         } = parse_session_header(header)?;
 
+        let mut hist: Vec<Message> = Vec::new();
+        for (i, line) in lines.enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            hist.push(
+                serde_json::from_str(line)
+                    .with_context(|| format!("bad message on line {}", i + 2))?,
+            );
+        }
+        if provenance.api_provider == ApiProvider::ChatGpt {
+            normalize_restored_chatgpt_reasoning(&mut hist);
+        }
+        let source_journal = tool_journal::load_for_session_file(path)
+            .context("loading source session tool journal")?;
+        let recovery = reconcile_pending_tool_calls(&mut hist, source_journal.as_deref())?;
+        if let Some(saved_sandbox) = sandbox.as_deref() {
+            let restored = std::fs::canonicalize(saved_sandbox)
+                .with_context(|| format!("restoring saved sandbox {saved_sandbox}"))?;
+            self.set_sandbox_root(restored)?;
+        }
+
         self.model = model;
         self.refresh_context_window();
         self.system = system;
-        self.allowed = allowed.into_iter().collect();
+        self.allowed = allowed
+            .into_iter()
+            .filter(|name| name != HOOKS_APPROVAL_NAME)
+            .collect();
         self.session_usage = usage;
         self.thinking_effort = thinking_effort;
         self.compact_threshold_percent =
@@ -14239,6 +16515,7 @@ impl Agent {
             })
             .or_else(|| compact_threshold_chars.filter(|v| *v > 0));
         self.approval_profile = approval_profile;
+        self.approval_policy_source = approval_policy_source;
         self.sandbox_profile = sandbox_profile;
         self.budget_cap = budget_cap;
         self.budget_exhausted = false;
@@ -14260,28 +16537,20 @@ impl Agent {
         self.set_context_mode_automatic(restored_context_mode);
         self.tool_context_profile = tool_context_profile.effective(restored_context_mode);
         self.tool_profile = tool_profile;
-        self.set_browser_recipe(browser_recipe);
-        if let Some(saved_sandbox) = sandbox.as_deref()
-            && let Ok(restored) = std::fs::canonicalize(saved_sandbox)
-        {
-            self.set_sandbox_root(restored)?;
-        }
-
-        let mut hist: Vec<Message> = Vec::new();
-        for (i, line) in lines.enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            hist.push(
-                serde_json::from_str(line)
-                    .with_context(|| format!("bad message on line {}", i + 2))?,
-            );
-        }
-        if provenance.api_provider == ApiProvider::ChatGpt {
-            normalize_restored_chatgpt_reasoning(&mut hist);
-        }
+        self.refresh_tools_for_context();
         self.history = hist;
         self.clear_pending_login();
+        if recovery.total() > 0 {
+            let warning = recovery.warning();
+            self.sink.emit(AgentEvent::Warn(warning.clone()));
+            self.append_latest_log("tool_journal_recovery", &warning);
+            if self.session_enabled {
+                self.save_latest_session()
+                    .context("persisting reconciled tool results before provider use")?;
+                self.last_checkpoint_at = Some(std::time::Instant::now());
+                self.last_checkpoint_signature = Some((self.history.len(), self.history_chars()));
+            }
+        }
         Ok(path.to_path_buf())
     }
 
@@ -14634,9 +16903,15 @@ impl Agent {
                     .body(bytes),
                 self.request_contract(),
                 &self.api_key,
+                self.provider_profile
+                    .as_ref()
+                    .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
                 None,
             )?;
-            (req.send().await?, SummaryParse::ChatGptSse)
+            (
+                send_provider_request(req, self.first_byte_timeout()).await?,
+                SummaryParse::ChatGptSse,
+            )
         } else if request_contract == RequestContract::OpenAiChatCompletions {
             let reasoning_effort = None;
             let messages = vec![
@@ -14653,9 +16928,12 @@ impl Agent {
                     tool_call_id: None,
                 },
             ];
+            let (max_tokens, max_completion_tokens) =
+                oai_output_token_caps(&self.provider_id, &summary_model, summary_max_tokens);
             let body = OaiRequest {
                 model: &summary_model,
-                max_tokens: summary_max_tokens,
+                max_tokens,
+                max_completion_tokens,
                 messages,
                 tools: Vec::new(),
                 stream: false,
@@ -14679,7 +16957,10 @@ impl Agent {
             if !self.api_key.trim().is_empty() {
                 req = req.header("authorization", format!("Bearer {}", self.api_key));
             }
-            (req.send().await?, SummaryParse::OpenAi)
+            (
+                send_provider_request(req, self.first_byte_timeout()).await?,
+                SummaryParse::OpenAi,
+            )
         } else {
             let messages = vec![json!({
                 "role": "user",
@@ -14700,28 +16981,32 @@ impl Agent {
                 thinking: None,
                 output_config: None,
             };
-            let mut req = self
-                .http_client()
-                .post(provider_request_url(
-                    &self.base_url,
-                    self.request_contract(),
-                ))
-                .header("anthropic-version", ANTHROPIC_API_VERSION)
-                .header("content-type", "application/json")
-                .json(&body);
-            if !self.api_key.trim().is_empty() {
-                req = req.header("x-api-key", &self.api_key);
-            }
-            (req.send().await?, SummaryParse::Anthropic)
+            let req = apply_provider_headers(
+                self.http_client()
+                    .post(provider_request_url(
+                        &self.base_url,
+                        self.request_contract(),
+                    ))
+                    .header("content-type", "application/json")
+                    .json(&body),
+                self.request_contract(),
+                &self.api_key,
+                self.provider_profile
+                    .as_ref()
+                    .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
+                None,
+            )?;
+            (
+                send_provider_request(req, self.first_byte_timeout()).await?,
+                SummaryParse::Anthropic,
+            )
         };
 
         let status = resp.status();
         if !status.is_success() {
-            let text = cap_bytes_with_hint(
-                resp.text().await.unwrap_or_default(),
-                HTTP_ERROR_BODY_CAP,
-                "HTTP error body truncated.",
-            );
+            let text = read_provider_error_body(resp, self.stream_idle_timeout())
+                .await
+                .unwrap_or_default();
             anyhow::bail!("summary {}", http_status_error(status, &text));
         }
 
@@ -14783,16 +17068,21 @@ impl Agent {
                                     .body(bytes),
                                 self.request_contract(),
                                 &self.api_key,
+                                self.provider_profile.as_ref().is_some_and(|profile| {
+                                    is_official_kimi_profile(profile, &self.base_url)
+                                }),
                                 None,
                             )?;
-                            let retry_resp = req.send().await?;
+                            let retry_resp =
+                                send_provider_request(req, self.first_byte_timeout()).await?;
                             let retry_status = retry_resp.status();
                             if !retry_status.is_success() {
-                                let text = cap_bytes_with_hint(
-                                    retry_resp.text().await.unwrap_or_default(),
-                                    HTTP_ERROR_BODY_CAP,
-                                    "HTTP error body truncated.",
-                                );
+                                let text = read_provider_error_body(
+                                    retry_resp,
+                                    self.stream_idle_timeout(),
+                                )
+                                .await
+                                .unwrap_or_default();
                                 anyhow::bail!("summary {}", http_status_error(retry_status, &text));
                             }
                             resp = retry_resp;
@@ -14804,7 +17094,7 @@ impl Agent {
             }
         }
 
-        let json: Value = resp.json().await?;
+        let json = read_provider_json_body(resp, self.stream_idle_timeout()).await?;
         match parse_mode {
             SummaryParse::ChatGptSse => unreachable!("handled above"),
             SummaryParse::OpenAi => {
@@ -14866,6 +17156,30 @@ impl Agent {
         };
         self.checkpoint_latest_session(checkpoint_label);
         compacted
+    }
+
+    // Recovery path for provider-side context overflow (the provider knows its
+    // real window; our declared window can be wrong, e.g. ChatGPT-Codex backends
+    // enforcing a smaller limit than the model's documented API window). Compact
+    // in place and report whether the history actually shrank so the caller can
+    // resend instead of failing the turn.
+    async fn compact_for_context_overflow(&mut self, source: &str, body: &str) -> bool {
+        let before_chars = self.history_chars();
+        self.append_latest_log(
+            "context_overflow_compact",
+            &format!(
+                "source={source} history_chars={before_chars} body={}",
+                summarize_inline(body, 240)
+            ),
+        );
+        self.sink.emit(AgentEvent::Warn(
+            "[context overflow] provider rejected the request as larger than the model context window; compacting history and retrying"
+                .to_string(),
+        ));
+        match self.compact().await {
+            Ok(()) => self.history_chars() < before_chars,
+            Err(_) => false,
+        }
     }
 
     async fn compact(&mut self) -> Result<()> {
@@ -15059,6 +17373,7 @@ impl Agent {
         // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
         // walks, pack discovery) on the first request of the turn.
         self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
+        let turn_id = format!("turn-{}-{}", unix_timestamp_secs(), self.prompt_scan_epoch);
         self.git_context = git_summary(&self.sandbox_root);
         if !self.suppress_pack_activation
             && let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input)
@@ -15077,17 +17392,27 @@ impl Agent {
                 user_input = packs::pack_prompt(&invocation.pack, &invocation.task)?;
             }
         }
+        let mut hooks_approval_decided = !self.hooks.is_empty();
+        let mut hooks_approved = hooks_approved(self);
+        if !hooks_approved && !self.hooks.is_empty() {
+            self.sink.emit(AgentEvent::Info(
+                "hooks skipped: shell hook execution was not approved for this turn".to_string(),
+            ));
+        }
         let hook_env = [("DEXT_USER_INPUT", user_input.as_str())];
-        for (out, _code) in self.hooks.fire(
-            "user_prompt",
-            "",
-            &hook_env,
-            &self.pack_hook_env,
-            &self.sandbox_root,
-        ) {
-            let t = out.trim();
-            if !t.is_empty() {
-                user_input.push_str(&format!("\n\n[hook:user_prompt]\n{t}"));
+        if hooks_approved {
+            for (out, _code) in self.hooks.fire(
+                "user_prompt",
+                "",
+                &hook_env,
+                &self.pack_hook_env,
+                &self.sandbox_root,
+                self.sandbox_profile(),
+            ) {
+                let t = out.trim();
+                if !t.is_empty() {
+                    user_input.push_str(&format!("\n\n[hook:user_prompt]\n{t}"));
+                }
             }
         }
 
@@ -15122,7 +17447,6 @@ impl Agent {
         let mut turn_usage = Usage::default();
         let mut denied_signatures: HashSet<String> = HashSet::new();
         let mut turn_state = orchestrator::TurnRuntimeState::new();
-        let read_cache = self.read_cache.clone();
         let mut objective_warning_emitted = false;
         let mut steering_final_followup_emitted = false;
         let mut action_contract_must_mutate = false;
@@ -15159,11 +17483,6 @@ impl Agent {
                 self.provider_id,
                 self.provider_id
             );
-        }
-
-        if let Some(hint) = self.browser_recipe_hint() {
-            self.sink
-                .emit(AgentEvent::Info(format!("[browser] {hint}")));
         }
 
         if self
@@ -15220,6 +17539,10 @@ impl Agent {
                 cache_control: Some(CacheControl::for_prompt()),
             }];
             let mut stream_attempt: u32 = 0;
+            let mut provider_workaround_used = false;
+            // One compaction attempt per request round: if the provider still
+            // reports overflow after compacting, surface the error normally.
+            let mut context_overflow_compact_attempted = false;
             let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
                 let (url, req_body) = self.build_streaming_request(
@@ -15231,7 +17554,6 @@ impl Agent {
                 )?;
                 stream_attempt += 1;
                 let mut attempt: u32 = 0;
-                let mut provider_workaround_used = false;
                 let resp = loop {
                     attempt += 1;
                     let mut builder = self
@@ -15249,6 +17571,9 @@ impl Agent {
                         builder.body(req_body.clone()),
                         self.request_contract(),
                         &self.api_key,
+                        self.provider_profile.as_ref().is_some_and(|profile| {
+                            is_official_kimi_profile(profile, &self.base_url)
+                        }),
                         chatgpt_session_id.as_deref(),
                     )?;
                     let applied = try_apply_runtime_controls_for_stream(self);
@@ -15261,6 +17586,9 @@ impl Agent {
                     }
                     let mut interrupt_ticker =
                         tokio::time::interval(std::time::Duration::from_millis(25));
+                    let first_byte_timeout = self.first_byte_timeout();
+                    let first_byte_deadline = tokio::time::sleep(first_byte_timeout);
+                    tokio::pin!(first_byte_deadline);
                     let send = req.send();
                     tokio::pin!(send);
                     let res = loop {
@@ -15284,7 +17612,12 @@ impl Agent {
                                 }
                                 continue;
                             },
-                            res = &mut send => break res,
+                            res = &mut send => {
+                                break res.map_err(ProviderTransportError::Request)
+                            },
+                            _ = &mut first_byte_deadline => {
+                                break Err(ProviderTransportError::FirstByteTimeout(first_byte_timeout))
+                            },
                         }
                     };
                     match res {
@@ -15297,11 +17630,9 @@ impl Agent {
                                 .get("retry-after")
                                 .and_then(|v| v.to_str().ok())
                                 .and_then(|s| s.parse::<u64>().ok());
-                            let text = cap_bytes_with_hint(
-                                r.text().await.unwrap_or_default(),
-                                HTTP_ERROR_BODY_CAP,
-                                "HTTP error body truncated.",
-                            );
+                            let text = read_provider_error_body(r, self.stream_idle_timeout())
+                                .await
+                                .unwrap_or_default();
                             self.record_provider_http_failure(status, &text, retry_after);
                             let plan = orchestrator::classify_http_failure(code, &text);
 
@@ -15320,7 +17651,17 @@ impl Agent {
                                 "[provider workaround] recovered from tool_result parsing bug; retrying request"
                                     .to_string(),
                             ));
-                                continue;
+                                continue 'stream_retry;
+                            }
+
+                            if !context_overflow_compact_attempted
+                                && matches!(code, 400 | 413)
+                                && orchestrator::stream_error_is_context_overflow(&text)
+                            {
+                                context_overflow_compact_attempted = true;
+                                if self.compact_for_context_overflow("http", &text).await {
+                                    continue 'stream_retry;
+                                }
                             }
 
                             if !plan.retry || attempt >= MAX_HTTP_ATTEMPTS {
@@ -15428,7 +17769,23 @@ impl Agent {
                         let body = stream_error_body(&e);
                         self.record_provider_stream_failure(&body);
                         let plan = orchestrator::classify_stream_error(&body);
-                        if plan.retry && stream_attempt < MAX_STREAM_ATTEMPTS {
+                        let visible_text_streamed = self
+                            .partial_stream_text
+                            .as_deref()
+                            .is_some_and(|text| !text.is_empty());
+                        if !context_overflow_compact_attempted
+                            && !visible_text_streamed
+                            && orchestrator::stream_error_is_context_overflow(&body)
+                        {
+                            context_overflow_compact_attempted = true;
+                            if self.compact_for_context_overflow("stream", &body).await {
+                                continue 'stream_retry;
+                            }
+                        }
+                        if plan.retry
+                            && !visible_text_streamed
+                            && stream_attempt < MAX_STREAM_ATTEMPTS
+                        {
                             let wait = jittered_backoff_secs(1u64 << (stream_attempt - 1));
                             self.append_latest_log(
                                 "stream_retry",
@@ -15585,16 +17942,24 @@ impl Agent {
                 if action_contract_must_mutate {
                     action_contract_no_mutation_turns =
                         action_contract_no_mutation_turns.saturating_add(1);
-                    let notes = self.action_contract_violation_runtime_notes(
-                        action_contract_no_mutation_turns,
-                        &mut implementation_fallback_emitted,
-                    );
-                    if self.push_runtime_notes(
-                        notes,
-                        "action_contract_violation",
-                        "after_action_contract_warning",
-                    ) {
-                        continue;
+                    if action_contract_should_retry(action_contract_no_mutation_turns) {
+                        let notes = self.action_contract_violation_runtime_notes(
+                            action_contract_no_mutation_turns,
+                            &mut implementation_fallback_emitted,
+                        );
+                        if self.push_runtime_notes(
+                            notes,
+                            "action_contract_violation",
+                            "after_action_contract_warning",
+                        ) {
+                            continue;
+                        }
+                    } else {
+                        action_contract_must_mutate = false;
+                        let note =
+                            action_contract_retry_halted_note(action_contract_no_mutation_turns);
+                        self.sink.emit(AgentEvent::Warn(note.clone()));
+                        self.append_latest_log("action_contract_retry_halted", &note);
                     }
                 }
                 if self.inject_queued_steering(
@@ -15677,739 +18042,28 @@ impl Agent {
                 break;
             }
 
-            if self.interrupt.load(Ordering::SeqCst) {
-                self.append_latest_log("tool_round_interrupted", "before tool execution");
-                let results: Vec<Block> = tool_calls
-                    .into_iter()
-                    .map(|(id, _, _)| Block::ToolResult {
-                        tool_use_id: id,
-                        content: "interrupted by user before tool execution".to_string(),
-                        is_error: Some(true),
-                        metadata: ToolResultMetadata {
-                            status: Some("interrupted".to_string()),
-                            ..ToolResultMetadata::default()
-                        },
-                    })
-                    .collect();
-                self.history.push(Message {
-                    role: "user".to_string(),
-                    content: results,
-                });
-                anyhow::bail!("interrupted by user");
-            }
-
-            enum Plan {
-                Immediate {
-                    content: String,
-                    is_error: Option<bool>,
-                },
-                Builtin,
-            }
-
-            struct PlannedCall {
-                tool_use_id: String,
-                event_call_id: String,
-                name: String,
-                input: Value,
-                input_str: String,
-                summary: String,
-                hosts: Vec<String>,
-                bulk_network: bool,
-                local_sudo_auth_needed: bool,
-                cache_key: Option<String>,
-                bash_similarity_key: Option<String>,
-                plan: Plan,
-            }
-
-            let mut plans: Vec<PlannedCall> = Vec::new();
-            for (ordinal, (id, name, input)) in tool_calls.into_iter().enumerate() {
-                let event_call_id = normalize_tool_call_id(&id, 0, ordinal);
-                let input_str = input.to_string();
-                let summary = summarize_call(&name, &input);
-                let call_sig = format!("{name}\n{input_str}");
-                let hosts = tool_policy::hosts_for_tool_call(&name, &input);
-                let bulk_network = tool_policy::looks_like_bulk_network_call(&name, &input);
-                let cache_key = orchestrator::network_cache_key(&name, &input);
-                let bash_similarity_key = if name == "bash" {
-                    Some(orchestrator::normalize_bash_similarity_key(
-                        input["command"].as_str().unwrap_or(""),
-                    ))
-                } else if matches!(name.as_str(), "write_file" | "edit_file") {
-                    input["path"].as_str().map(|p| format!("{name}:{p}"))
-                } else {
-                    None
-                };
-
-                let mut plan: Option<Plan> = None;
-                let mut local_sudo_auth_needed = false;
-
-                if let Err(msg) = tool_policy::validate_tool_input(&name, &input) {
-                    if let Some(budget_msg) = turn_state.tool_retry_guard(&name, &msg) {
-                        emit_external_telemetry(self.sink.as_mut(), &turn_state);
-                        plan = Some(Plan::Immediate {
-                            content: budget_msg,
-                            is_error: Some(true),
-                        });
-                    } else {
-                        plan = Some(Plan::Immediate {
-                            content: msg,
-                            is_error: Some(true),
-                        });
-                    }
-                }
-
-                if plan.is_none()
-                    && let Some((cached_content, cached_error)) =
-                        turn_state.dedupe_guard(cache_key.as_deref())
-                {
-                    emit_external_telemetry(self.sink.as_mut(), &turn_state);
-                    plan = Some(Plan::Immediate {
-                        content: cached_content,
-                        is_error: cached_error,
-                    });
-                }
-
-                if plan.is_none()
-                    && let Some(msg) = turn_state.bash_similarity_guard(
-                        bash_similarity_key.as_deref(),
-                        input["command"].as_str(),
-                    )
-                {
-                    emit_external_telemetry(self.sink.as_mut(), &turn_state);
-                    plan = Some(Plan::Immediate {
-                        content: msg,
-                        is_error: Some(true),
-                    });
-                }
-
-                if plan.is_none()
-                    && let Some(msg) = turn_state.blocked_host_guard(&hosts)
-                {
-                    plan = Some(Plan::Immediate {
-                        content: msg,
-                        is_error: Some(true),
-                    });
-                }
-
-                if plan.is_none()
-                    && let Some(msg) = turn_state.feasibility_guard(&hosts, bulk_network)
-                {
-                    plan = Some(Plan::Immediate {
-                        content: msg,
-                        is_error: Some(true),
-                    });
-                }
-
-                if plan.is_none()
-                    && let Some(msg) = self.sandbox_policy_denial(&name, &input)
-                {
-                    plan = Some(Plan::Immediate {
-                        content: msg,
-                        is_error: Some(true),
-                    });
-                }
-
-                if plan.is_none()
-                    && let Some(reason) = self.shelf_tool_denial(&name, &input)
-                {
-                    plan = Some(Plan::Immediate {
-                        content: format!("shelf policy blocked {name}: {reason}"),
-                        is_error: Some(true),
-                    });
-                }
-
-                if plan.is_none()
-                    && let Some(msg) = self.privacy.path_denial(&name, &input, &self.sandbox_root)
-                {
-                    plan = Some(Plan::Immediate {
-                        content: msg,
-                        is_error: Some(true),
-                    });
-                }
-
-                if plan.is_none() {
-                    let approved = if self.deny_tools.contains(&name)
-                        || denied_signatures.contains(&call_sig)
-                        || (needs_permission(&name)
-                            && self.approval_profile == ApprovalProfile::Never)
-                    {
-                        false
-                    } else if needs_permission(&name) && !self.tool_auto_approved(&name, &input) {
-                        // Show mutation preview for direct file tools before asking permission
-                        if self.preview_mode != MutationPreviewMode::Off
-                            && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
-                            && let Some(preview) = self.compute_mutation_preview(&name, &input)
-                        {
-                            self.sink.emit(AgentEvent::Info(preview));
-                        }
-                        match self.sink.request_permission(&name, &input) {
-                            Choice::Once => true,
-                            Choice::Always => {
-                                self.allowed.insert(name.clone());
-                                true
-                            }
-                            Choice::Deny => false,
-                        }
-                    } else {
-                        true
-                    };
-
-                    if !approved {
-                        denied_signatures.insert(call_sig.clone());
-                        plan = Some(Plan::Immediate {
-                            content: "permission denied by user — do not retry this tool call; ask the user instead".to_string(),
-                            is_error: Some(true),
-                        });
-                    } else {
-                        let pre_env = [
-                            ("DEXT_TOOL_NAME", name.as_str()),
-                            ("DEXT_TOOL_INPUT", input_str.as_str()),
-                        ];
-                        let mut blocked: Option<String> = None;
-                        for (out, code) in self.hooks.fire(
-                            "pre_tool",
-                            &name,
-                            &pre_env,
-                            &self.pack_hook_env,
-                            &self.sandbox_root,
-                        ) {
-                            if code != 0 {
-                                blocked = Some(format!(
-                                    "pre_tool hook blocked (exit {code}):\n{}",
-                                    out.trim()
-                                ));
-                                break;
-                            }
-                        }
-                        plan = Some(match blocked {
-                            Some(msg) => Plan::Immediate {
-                                content: msg,
-                                is_error: Some(true),
-                            },
-                            None => {
-                                local_sudo_auth_needed = name == "bash"
-                                    && tool_policy::command_invokes_sudo(
-                                        input["command"].as_str().unwrap_or(""),
-                                    );
-                                Plan::Builtin
-                            }
-                        });
-                    }
-                }
-
-                let plan = plan.expect("plan must be set");
-
-                if matches!(plan, Plan::Builtin)
-                    && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
-                {
-                    self.work_ledger_note_file_change(&input);
-                }
-
-                // Create recovery checkpoint before write-risk mutations.
-                if matches!(plan, Plan::Builtin) {
-                    self.maybe_create_tool_checkpoint(&name, &input);
-                }
-
-                if matches!(plan, Plan::Builtin)
-                    && bulk_network
-                    && let Some((_, msg)) =
-                        turn_state.advance_phase(orchestrator::PhaseTrigger::ScaleCollection)
-                {
-                    self.set_work_phase(turn_state.phase().label());
-                    self.sink.emit(AgentEvent::Info(format!(
-                        "[phase:{}] {msg}",
-                        turn_state.phase().label()
-                    )));
-                }
-                if matches!(plan, Plan::Builtin)
-                    && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
-                    && let Some((_, msg)) =
-                        turn_state.advance_phase(if objective.apply_fixes_allowed() {
-                            orchestrator::PhaseTrigger::Fix
-                        } else {
-                            orchestrator::PhaseTrigger::DeliverableWrite
-                        })
-                {
-                    self.set_work_phase(turn_state.phase().label());
-                    self.sink.emit(AgentEvent::Info(format!(
-                        "[phase:{}] {msg}",
-                        turn_state.phase().label()
-                    )));
-                }
-
-                plans.push(PlannedCall {
-                    tool_use_id: id,
-                    event_call_id,
-                    name,
-                    input,
-                    input_str,
-                    summary,
-                    hosts,
-                    bulk_network,
-                    local_sudo_auth_needed,
-                    cache_key,
-                    bash_similarity_key,
-                    plan,
-                });
-            }
-
-            let runnable_indices: Vec<usize> = plans
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, p)| {
-                    if matches!(p.plan, Plan::Builtin) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
+            let round = self
+                .execute_tool_round(ToolRoundContext {
+                    tool_calls,
+                    iterations,
+                    turn_id: turn_id.clone(),
+                    objective_apply_fixes_allowed: objective.apply_fixes_allowed(),
+                    turn_state: &mut turn_state,
+                    denied_signatures,
+                    hooks_approval_decided,
+                    hooks_approved,
                 })
-                .collect();
-            let runnable_set: HashSet<usize> = runnable_indices.iter().copied().collect();
-            let batch_id = format!("batch-{iterations}");
-            if runnable_indices.len() > 1 {
-                let call_ids: Vec<String> = runnable_indices
-                    .iter()
-                    .map(|idx| plans[*idx].event_call_id.clone())
-                    .collect();
-                let labels: Vec<String> = runnable_indices
-                    .iter()
-                    .map(|idx| plans[*idx].summary.clone())
-                    .collect();
-                self.sink.emit(AgentEvent::ToolBatchStart {
-                    batch_id: batch_id.clone(),
-                    call_ids,
-                    labels,
-                });
-            }
-
-            let builtin_indices: Vec<usize> = plans
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, p)| {
-                    if matches!(p.plan, Plan::Builtin) {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let mut builtin_started_at: HashMap<usize, std::time::Instant> = HashMap::new();
-            // Calls that executed while a git credential was installed: only
-            // their auth failures mean the credential itself was rejected.
-            let mut builtin_git_cred_used: HashSet<usize> = HashSet::new();
-            let builtin_names: Vec<&str> = builtin_indices
-                .iter()
-                .map(|idx| plans[*idx].name.as_str())
-                .collect();
-            let parallel_builtin_round = should_parallelize_builtin_tools(&builtin_names);
-
-            let mut builtin_outputs: HashMap<usize, std::result::Result<String, String>> =
-                HashMap::new();
-            if parallel_builtin_round {
-                let builtin_handles: Vec<(
-                    usize,
-                    tokio::task::JoinHandle<std::result::Result<String, String>>,
-                )> = builtin_indices
-                    .iter()
-                    .map(|idx| {
-                        let root = self.sandbox_root.clone();
-                        let n = plans[*idx].name.clone();
-                        let inp = plans[*idx].input.clone();
-                        let summary = plans[*idx].summary.clone();
-                        self.sink.emit(AgentEvent::ToolCallStart {
-                            call_id: plans[*idx].event_call_id.clone(),
-                            name: n.clone(),
-                            summary: summary.clone(),
-                        });
-                        self.append_latest_log("tool_start", &summary);
-                        builtin_started_at.insert(*idx, std::time::Instant::now());
-                        let interrupt = self.interrupt.clone();
-                        let sem = self.builtin_semaphore.clone();
-                        let read_cache = read_cache.clone();
-                        let session_id = self.session_id.clone();
-                        let sandbox_profile = self.sandbox_profile;
-                        let pack_env = self.pack_hook_env.clone();
-                        let git_credential = stored_git_credential_for_bash_call(
-                            &n,
-                            &inp,
-                            self.git_credential.as_ref(),
-                        );
-                        if git_credential.is_some() {
-                            builtin_git_cred_used.insert(*idx);
-                        }
-                        let handle = tokio::spawn(async move {
-                            let _permit = match sem.acquire_owned().await {
-                                Ok(p) => p,
-                                Err(e) => return Err(format!("builtin semaphore closed: {e}")),
-                            };
-                            execute_builtin_call(
-                                n,
-                                inp,
-                                root,
-                                interrupt,
-                                Some(read_cache),
-                                Some(session_id),
-                                None,
-                                git_credential,
-                                sandbox_profile,
-                                None,
-                                pack_env,
-                            )
-                            .await
-                        });
-                        (*idx, handle)
-                    })
-                    .collect();
-
-                for (idx, handle) in builtin_handles {
-                    let r = match handle.await {
-                        Ok(v) => v,
-                        Err(e) => Err(format!("task panic: {e}")),
-                    };
-                    builtin_outputs.insert(idx, r);
-                }
-            } else {
-                for idx in builtin_indices {
-                    let root = self.sandbox_root.clone();
-                    let n = plans[idx].name.clone();
-                    let inp = plans[idx].input.clone();
-                    let summary = plans[idx].summary.clone();
-                    let session_id = self.session_id.clone();
-                    let local_sudo_auth_needed = plans[idx].local_sudo_auth_needed;
-                    self.sink.emit(AgentEvent::ToolCallStart {
-                        call_id: plans[idx].event_call_id.clone(),
-                        name: n.clone(),
-                        summary: summary.clone(),
-                    });
-                    self.append_latest_log("tool_start", &summary);
-                    builtin_started_at.insert(idx, std::time::Instant::now());
-                    let mut local_sudo_auth = if local_sudo_auth_needed {
-                        match prepare_local_sudo_auth(&root, &session_id).await {
-                            Ok(auth) => auth,
-                            Err(e) => {
-                                builtin_outputs.insert(idx, Err(e));
-                                continue;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(auth) = local_sudo_auth.as_mut()
-                        && auth.preauth_required
-                    {
-                        let message = SUDO_AUTH_GUIDANCE.to_string();
-                        match self.sink.request_local_auth_secret("bash", &message) {
-                            LocalAuthSecret::Secret(password) => {
-                                match create_sudo_password_fifo(&root, &session_id) {
-                                    Ok(fifo) => {
-                                        auth.password_fifo = Some(fifo);
-                                        auth.password = Some(password);
-                                    }
-                                    Err(e) => {
-                                        let mut password = password;
-                                        clear_secret_string(&mut password);
-                                        builtin_outputs.insert(idx, Err(e));
-                                        continue;
-                                    }
-                                }
-                            }
-                            LocalAuthSecret::Canceled => {
-                                builtin_outputs.insert(
-                                    idx,
-                                    Err("sudo authentication canceled by user".to_string()),
-                                );
-                                continue;
-                            }
-                            LocalAuthSecret::Unavailable => {
-                                self.sink.local_auth_prompt("bash", SUDO_AUTH_GUIDANCE);
-                            }
-                        }
-                    }
-                    let live_output = live_output_for_tool(
-                        self.sink.as_ref(),
-                        &plans[idx].event_call_id,
-                        &n,
-                        &inp,
-                    );
-                    let git_credential_for_call =
-                        stored_git_credential_for_bash_call(&n, &inp, self.git_credential.as_ref());
-                    if git_credential_for_call.is_some() {
-                        builtin_git_cred_used.insert(idx);
-                    }
-                    let r = execute_builtin_call(
-                        n,
-                        inp,
-                        root,
-                        self.interrupt.clone(),
-                        Some(read_cache.clone()),
-                        Some(session_id),
-                        local_sudo_auth,
-                        git_credential_for_call,
-                        self.sandbox_profile,
-                        live_output,
-                        self.pack_hook_env.clone(),
-                    )
-                    .await;
-                    builtin_outputs.insert(idx, r);
-                }
-            }
-
-            let mut batch_failed = 0usize;
-            let mut batch_call_ids: Vec<String> = Vec::new();
-            let mut batch_labels: Vec<String> = Vec::new();
-            let mut results = Vec::new();
-            let mut round_external_failures: usize = 0;
-            let mut mutation_succeeded = false;
-            for (idx, p) in plans.into_iter().enumerate() {
-                let PlannedCall {
-                    tool_use_id,
-                    event_call_id,
-                    name,
-                    input,
-                    input_str,
-                    summary,
-                    hosts,
-                    bulk_network: _bulk_network,
-                    local_sudo_auth_needed: _local_sudo_auth_needed,
-                    cache_key,
-                    bash_similarity_key,
-                    plan,
-                } = p;
-
-                let started_at = builtin_started_at.remove(&idx);
-                let ran_builtin = matches!(plan, Plan::Builtin);
-                let ui_summary = summary.clone();
-                let mut followup_warnings: Vec<String> = Vec::new();
-                let mut provider_runtime_notes: Vec<String> = Vec::new();
-                if let Some(advisory) = tool_policy::tool_input_advisory(&name, &input) {
-                    followup_warnings.push(advisory.clone());
-                    provider_runtime_notes.push(advisory);
-                }
-
-                let (mut content, is_error) = match plan {
-                    Plan::Immediate { content, is_error } => (content, is_error),
-                    Plan::Builtin => match builtin_outputs.remove(&idx).unwrap() {
-                        Ok(s) => {
-                            if name == "bash" {
-                                let failed = parse_bash_exit_code(&s).is_some_and(|code| code != 0);
-                                (s, failed.then_some(true))
-                            } else {
-                                (s, None)
-                            }
-                        }
-                        Err(e) => (e, Some(true)),
-                    },
-                };
-
-                if name == "bash" && output_indicates_git_credential_failure(&content) {
-                    let ran_with_credential = builtin_git_cred_used.contains(&idx);
-                    let failure_hosts = git_credential_hosts_for_failure(&hosts, &content);
-                    content.push_str(
-                        &self.handle_git_credential_failure(ran_with_credential, failure_hosts),
-                    );
-                }
-
-                let post_env = [
-                    ("DEXT_TOOL_NAME", name.as_str()),
-                    ("DEXT_TOOL_INPUT", input_str.as_str()),
-                    ("DEXT_TOOL_RESULT", content.as_str()),
-                ];
-                for (out, _code) in self.hooks.fire(
-                    "post_tool",
-                    &name,
-                    &post_env,
-                    &self.pack_hook_env,
-                    &self.sandbox_root,
-                ) {
-                    let t = out.trim();
-                    if !t.is_empty() {
-                        content.push_str(&format!("\n\n[hook:post_tool]\n{t}"));
-                    }
-                }
-
-                let ok = !is_error.unwrap_or(false);
-                if ok
-                    && ran_builtin
-                    && (ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
-                        || name == "bash"
-                            && input["command"]
-                                .as_str()
-                                .is_some_and(orchestrator::bash_command_likely_mutates_files))
-                {
-                    mutation_succeeded = true;
-                    turn_state.mark_mutation_succeeded();
-                }
-                let privacy_redaction = self.privacy.apply_tool_output(&name, &input, content);
-                let redacted_count = privacy_redaction.counts.total();
-                content = privacy_redaction.text;
-                if redacted_count > 0 {
-                    followup_warnings.push(format!(
-                        "privacy redacted {} from {name} output before model context",
-                        privacy_redaction.counts.summary()
-                    ));
-                }
-                let observation =
-                    turn_state.record_external_outcome(orchestrator::ExternalOutcomeInput {
-                        tool_name: &name,
-                        hosts: &hosts,
-                        cache_key: cache_key.as_deref(),
-                        bash_similarity_key: bash_similarity_key.as_deref(),
-                        command: input["command"].as_str(),
-                        content: &mut content,
-                        is_error,
-                    });
-                emit_external_telemetry(self.sink.as_mut(), &turn_state);
-                round_external_failures =
-                    round_external_failures.saturating_add(observation.round_external_failures);
-                followup_warnings.extend(observation.followup_warnings);
-                insert_runtime_notes(&mut content, &provider_runtime_notes);
-
-                if runnable_set.contains(&idx) {
-                    if !ok {
-                        batch_failed = batch_failed.saturating_add(1);
-                    }
-                    batch_call_ids.push(event_call_id.clone());
-                    batch_labels.push(ui_summary.clone());
-                }
-
-                let ui_cap = orchestrator::adaptive_tool_ui_cap_for_window(
-                    &self.last_request_usage,
-                    self.context_window_tokens(),
-                    TOOL_UI_CONTENT_CAP,
-                );
-                let ui_content = orchestrator::compress_tool_ui_content(&content, ui_cap);
-                self.sink.emit(AgentEvent::ToolCallResult {
-                    call_id: event_call_id.clone(),
-                    name: name.clone(),
-                    ok,
-                    preview: ui_summary.clone(),
-                    content: ui_content,
-                });
-                for warning in followup_warnings {
-                    self.sink.emit(AgentEvent::Warn(warning));
-                }
-                self.append_latest_log(
-                    if ok { "tool_ok" } else { "tool_error" },
-                    &format!("{} :: {}", ui_summary, content),
-                );
-                let verification_command =
-                    if ran_builtin && matches!(name.as_str(), "bash" | "csvkit") {
-                        if name == "bash" {
-                            serde_json::from_str::<Value>(&input_str)
-                                .ok()
-                                .and_then(|v| v["command"].as_str().map(String::from))
-                        } else {
-                            Some(ui_summary.clone())
-                        }
-                    } else {
-                        None
-                    };
-                let is_verification_result = verification_command
-                    .as_deref()
-                    .is_some_and(looks_like_verification_command);
-                let mut artifact_display: Option<String> = None;
-                let mut verification_status: Option<String> = None;
-                if is_verification_result {
-                    let command = verification_command.clone().unwrap_or_default();
-                    let duration = started_at
-                        .map(|t| t.elapsed())
-                        .unwrap_or_else(|| std::time::Duration::from_millis(0));
-                    let exit_code = parse_tool_exit_code(&name, ok, &content);
-                    let status = if ok && exit_code.unwrap_or(0) == 0 {
-                        "passed"
-                    } else {
-                        "failed"
-                    };
-                    let artifact = write_verification_artifact(
-                        &self.sandbox_root,
-                        &self.session_id,
-                        VerificationArtifactSpec {
-                            name: &ui_summary,
-                            command: &command,
-                            output: &content,
-                            exit_code,
-                            duration,
-                            status,
-                        },
-                    );
-                    artifact_display = artifact.as_ref().map(|p| p.display().to_string());
-                    verification_status = Some(status.to_string());
-                    self.work_ledger.verification.push(VerificationRecord {
-                        name: ui_summary.clone(),
-                        command: command.clone(),
-                        status: status.to_string(),
-                        exit_code,
-                        duration_ms: millis_u64(duration),
-                        artifact: artifact_display.clone(),
-                        validates: Vec::new(),
-                    });
-                    if self.work_ledger.verification.len() > 24 {
-                        let excess = self.work_ledger.verification.len() - 24;
-                        self.work_ledger.verification.drain(0..excess);
-                    }
-                    if let Some(path) = artifact_display.as_deref() {
-                        self.append_latest_log(
-                            "verification",
-                            &format!("{status} {ui_summary} artifact={path}"),
-                        );
-                    }
-                }
-                let dynamic_result_cap = tool_result_context_cap_with_window(
-                    &name,
-                    &input,
-                    &self.last_request_usage,
-                    &self.model,
-                    Some(self.context_window_tokens()),
-                    self.context_mode,
-                );
-                let result_status = verification_status
-                    .unwrap_or_else(|| if ok { "ok" } else { "error" }.to_string());
-                let exit_code = parse_tool_exit_code(&name, ok, &content);
-                let result_duration_ms = started_at.map(|t| millis_u64(t.elapsed()));
-                let result_artifact = artifact_display.clone();
-                let result_hint = if let Some(path) = result_artifact.as_deref() {
-                    format!("Full verification output saved as a structured artifact: {path}")
-                } else {
-                    "Full verification output saved as a structured artifact; see verification ledger.".to_string()
-                };
-                results.push(Block::ToolResult {
-                    tool_use_id,
-                    content: if is_verification_result {
-                        cap_bytes_head_tail_with_hint(content, dynamic_result_cap, &result_hint)
-                    } else if matches!(name.as_str(), "bash" | "awk" | "csvkit") {
-                        cap_bytes_head_tail_with_hint(
-                            content,
-                            dynamic_result_cap,
-                            TOOL_OUTPUT_NARROW_HINT,
-                        )
-                    } else {
-                        cap_tool_output_with_cap(content, dynamic_result_cap)
-                    },
-                    is_error,
-                    metadata: ToolResultMetadata {
-                        status: Some(result_status),
-                        exit_code,
-                        duration_ms: result_duration_ms,
-                        artifact: result_artifact,
-                    },
-                });
-            }
-
-            if runnable_indices.len() > 1 {
-                self.sink.emit(AgentEvent::ToolBatchEnd {
-                    batch_id,
-                    call_ids: batch_call_ids,
-                    labels: batch_labels,
-                    failed: batch_failed,
-                });
-            }
-
-            let squashed_results = squash_identical_error_result_content(results);
-            self.history.push(Message {
-                role: "user".to_string(),
-                content: squashed_results,
-            });
-            self.checkpoint_latest_session("after_tool_results");
+                .await?;
+            let ToolRoundOutcome {
+                mutation_succeeded,
+                external_failures: round_external_failures,
+                denied_signatures: next_denied_signatures,
+                hooks_approval_decided: next_hooks_approval_decided,
+                hooks_approved: next_hooks_approved,
+            } = round;
+            denied_signatures = next_denied_signatures;
+            hooks_approval_decided = next_hooks_approval_decided;
+            hooks_approved = next_hooks_approved;
 
             if let Some(halt) = turn_state.empty_tool_call_halt_message() {
                 self.sink.emit(AgentEvent::Warn(halt.clone()));
@@ -16441,16 +18095,23 @@ impl Agent {
             } else if action_contract_must_mutate {
                 action_contract_no_mutation_turns =
                     action_contract_no_mutation_turns.saturating_add(1);
-                let notes = self.action_contract_violation_runtime_notes(
-                    action_contract_no_mutation_turns,
-                    &mut implementation_fallback_emitted,
-                );
-                if self.push_runtime_notes(
-                    notes,
-                    "action_contract_violation",
-                    "after_action_contract_warning",
-                ) {
-                    continue;
+                if action_contract_should_retry(action_contract_no_mutation_turns) {
+                    let notes = self.action_contract_violation_runtime_notes(
+                        action_contract_no_mutation_turns,
+                        &mut implementation_fallback_emitted,
+                    );
+                    if self.push_runtime_notes(
+                        notes,
+                        "action_contract_violation",
+                        "after_action_contract_warning",
+                    ) {
+                        continue;
+                    }
+                } else {
+                    action_contract_must_mutate = false;
+                    let note = action_contract_retry_halted_note(action_contract_no_mutation_turns);
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("action_contract_retry_halted", &note);
                 }
             }
 
@@ -16581,10 +18242,13 @@ impl Agent {
                  + Unpin
              ),
         interrupted_msg: &str,
+        idle_timeout: std::time::Duration,
     ) -> Result<Option<bytes::Bytes>> {
         use futures_util::StreamExt;
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+        let idle_deadline = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle_deadline);
         loop {
             if self.interrupt.load(Ordering::SeqCst) {
                 anyhow::bail!("{interrupted_msg}");
@@ -16604,6 +18268,107 @@ impl Agent {
                     }
                 }
                 _ = ticker.tick() => {}
+                _ = &mut idle_deadline => {
+                    anyhow::bail!(
+                        "transient stream transport error: provider stream idle timeout after {}s",
+                        idle_timeout.as_secs()
+                    );
+                }
+            }
+        }
+    }
+
+    async fn read_provider_stream(
+        &mut self,
+        resp: reqwest::Response,
+        contract: RequestContract,
+    ) -> Result<(Vec<Block>, Option<String>, Usage)> {
+        let preserve_timing_cache = contract == RequestContract::OpenAiChatCompletions
+            && provider::is_local_llama_provider(
+                &self.provider_id,
+                self.route_api_provider(),
+                &self.base_url,
+            );
+        let mut decoder = streaming::SseDecoder::new(STREAM_EVENT_BUFFER_CAP);
+        let mut parser = streaming::ProviderStreamParser::new(contract, preserve_timing_cache);
+        let mut stream = resp.bytes_stream();
+        let idle_timeout = self.stream_idle_timeout();
+
+        while let Some(chunk) = self
+            .read_stream_next_chunk(&mut stream, "interrupted by user", idle_timeout)
+            .await?
+        {
+            for frame in decoder.push(&chunk)? {
+                self.emit_stream_updates(parser.push_frame(frame)?);
+            }
+        }
+        for frame in decoder.finish()? {
+            self.emit_stream_updates(parser.push_frame(frame)?);
+        }
+
+        let parsed = parser.finish()?;
+        if parsed.unknown_events > 0 {
+            self.append_latest_log(
+                "stream_unknown_events",
+                &format!(
+                    "contract={} count={}",
+                    contract.as_str(),
+                    parsed.unknown_events
+                ),
+            );
+        }
+        if contract != RequestContract::AnthropicMessages {
+            for block in &parsed.blocks {
+                match block {
+                    Block::Thinking { text, .. }
+                        if contract == RequestContract::ChatGptResponses =>
+                    {
+                        self.sink
+                            .emit(AgentEvent::ThinkingBlockComplete(text.clone()));
+                    }
+                    Block::Text { text } => {
+                        self.sink.emit(AgentEvent::TextBlockComplete(text.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (idx, block) in parsed.blocks.iter().enumerate() {
+            let Block::ToolUse { id, name, input } = block else {
+                continue;
+            };
+            let privileged = needs_permission(name) && !self.allowed.contains(name);
+            if contract == RequestContract::AnthropicMessages && privileged {
+                continue;
+            }
+            self.sink.emit(AgentEvent::ToolCallPreview {
+                call_id: normalize_tool_call_id(id, 0, idx),
+                name: name.clone(),
+                summary: summarize_call(name, input),
+            });
+        }
+        self.partial_stream_text = None;
+        Ok((parsed.blocks, parsed.stop_reason, parsed.usage))
+    }
+
+    fn emit_stream_updates(&mut self, updates: Vec<streaming::StreamUpdate>) {
+        for update in updates {
+            match update {
+                streaming::StreamUpdate::TextDelta(text) => {
+                    self.partial_stream_text
+                        .get_or_insert_with(String::new)
+                        .push_str(&text);
+                    self.sink.emit(AgentEvent::TextDelta(text));
+                }
+                streaming::StreamUpdate::TextBlockComplete(text) => {
+                    self.sink.emit(AgentEvent::TextBlockComplete(text));
+                }
+                streaming::StreamUpdate::ThinkingDelta(text) => {
+                    self.sink.emit(AgentEvent::ThinkingDelta(text));
+                }
+                streaming::StreamUpdate::ThinkingBlockComplete(text) => {
+                    self.sink.emit(AgentEvent::ThinkingBlockComplete(text));
+                }
             }
         }
     }
@@ -16612,321 +18377,16 @@ impl Agent {
         &mut self,
         resp: reqwest::Response,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        use std::collections::BTreeMap;
-
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut scan_cursor: usize = 0;
-        let mut blocks: BTreeMap<usize, PartialBlock> = BTreeMap::new();
-        let mut stop_reason: Option<String> = None;
-        let mut usage = Usage::default();
-
-        while let Some(chunk) = self
-            .read_stream_next_chunk(&mut stream, "interrupted by user")
-            .await?
-        {
-            buf.extend_from_slice(&chunk);
-
-            loop {
-                let Some((end, sep_len)) = find_sse_delimiter(&buf, scan_cursor) else {
-                    scan_cursor = buf.len();
-                    break;
-                };
-                if end > STREAM_EVENT_BUFFER_CAP {
-                    anyhow::bail!(
-                        "stream event exceeded {} bytes before a delimiter; aborting to avoid unbounded buffering",
-                        STREAM_EVENT_BUFFER_CAP
-                    );
-                }
-                let raw: Vec<u8> = buf.drain(..end + sep_len).collect();
-                scan_cursor = 0;
-                let event_text = String::from_utf8_lossy(&raw[..end]);
-
-                let mut event_name = String::new();
-                let mut data_lines: Vec<&str> = Vec::new();
-                for line in event_text.lines() {
-                    if let Some(rest) = line.strip_prefix("event:") {
-                        event_name = rest.trim().to_string();
-                    } else if let Some(rest) = line.strip_prefix("data:") {
-                        data_lines.push(rest.trim_start());
-                    }
-                }
-                if data_lines.is_empty() {
-                    continue;
-                }
-                let data_str = data_lines.join("\n");
-                let data: Value = match serde_json::from_str(&data_str) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                match event_name.as_str() {
-                    "message_start" => {
-                        usage = Usage::parse(&data["message"]["usage"]);
-                    }
-                    "content_block_start" => {
-                        let idx = data["index"].as_u64().unwrap_or(0) as usize;
-                        let cb = &data["content_block"];
-                        let kind = cb["type"].as_str().unwrap_or("").to_string();
-                        let mut pb = PartialBlock {
-                            kind: kind.clone(),
-                            ..Default::default()
-                        };
-                        if kind == "tool_use" {
-                            pb.id = cb["id"].as_str().unwrap_or("").to_string();
-                            pb.name = cb["name"].as_str().unwrap_or("").to_string();
-                            if let Some(input) = cb.get("input") {
-                                set_tool_input_json_if_meaningful(&mut pb.input_json, input);
-                            }
-                        } else if kind == "thinking" {
-                            if let Some(t) = cb["thinking"].as_str() {
-                                pb.text.push_str(t);
-                            }
-                            if let Some(sig) = cb["signature"].as_str() {
-                                pb.thinking_signature = Some(sig.to_string());
-                            }
-                        } else if kind == "redacted_thinking"
-                            && let Some(data) = cb["data"].as_str()
-                        {
-                            pb.redacted_data.push_str(data);
-                        }
-                        blocks.insert(idx, pb);
-                    }
-                    "content_block_delta" => {
-                        let idx = data["index"].as_u64().unwrap_or(0) as usize;
-                        let delta = &data["delta"];
-                        let dtype = delta["type"].as_str().unwrap_or("");
-                        if let Some(pb) = blocks.get_mut(&idx) {
-                            match dtype {
-                                "text_delta" => {
-                                    if let Some(t) = delta["text"].as_str() {
-                                        self.sink.emit(AgentEvent::TextDelta(t.to_string()));
-                                        pb.text.push_str(t);
-                                    }
-                                }
-                                "thinking_delta" => {
-                                    if let Some(t) = delta["thinking"].as_str() {
-                                        self.sink.emit(AgentEvent::ThinkingDelta(t.to_string()));
-                                        pb.text.push_str(t);
-                                    }
-                                }
-                                "signature_delta" => {
-                                    if let Some(sig) = delta["signature"].as_str() {
-                                        pb.thinking_signature = Some(sig.to_string());
-                                    }
-                                }
-                                "redacted_thinking_delta" | "data_delta" => {
-                                    if let Some(data) = delta["data"].as_str() {
-                                        pb.redacted_data.push_str(data);
-                                    }
-                                }
-                                "input_json_delta" => {
-                                    if let Some(pj) = delta["partial_json"].as_str() {
-                                        append_tool_input_json_fragment(&mut pb.input_json, pj);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    "content_block_stop" => {
-                        let idx = data["index"].as_u64().unwrap_or(0) as usize;
-                        if let Some(pb) = blocks.get(&idx) {
-                            if pb.kind == "text" {
-                                self.sink
-                                    .emit(AgentEvent::TextBlockComplete(pb.text.clone()));
-                            } else if pb.kind == "thinking" {
-                                self.sink
-                                    .emit(AgentEvent::ThinkingBlockComplete(pb.text.clone()));
-                            } else if pb.kind == "tool_use" {
-                                let privileged =
-                                    needs_permission(&pb.name) && !self.allowed.contains(&pb.name);
-                                if !privileged {
-                                    let preview_input = parse_tool_input_json(&pb.input_json);
-                                    let summary = summarize_call(&pb.name, &preview_input);
-                                    let call_id = normalize_tool_call_id(&pb.id, 0, idx);
-                                    self.sink.emit(AgentEvent::ToolCallPreview {
-                                        call_id,
-                                        name: pb.name.clone(),
-                                        summary,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    "message_delta" => {
-                        if let Some(sr) = data["delta"]["stop_reason"].as_str() {
-                            stop_reason = Some(sr.to_string());
-                        }
-                        if let Some(u) = data.get("usage") {
-                            let parsed = Usage::parse(u);
-                            if parsed.output > 0 {
-                                usage.output = parsed.output;
-                            }
-                            if parsed.input > 0 || parsed.cache_create > 0 || parsed.cache_read > 0
-                            {
-                                usage.input = parsed.input;
-                                usage.cache_create = parsed.cache_create;
-                                usage.cache_read = parsed.cache_read;
-                            }
-                            if parsed.cost_usd.is_some() {
-                                usage.cost_usd = parsed.cost_usd;
-                            }
-                        }
-                    }
-                    "message_stop" => {}
-                    "error" => {
-                        anyhow::bail!("stream error: {}", data);
-                    }
-                    _ => {}
-                }
-            }
-
-            if buf.len() > STREAM_EVENT_BUFFER_CAP {
-                anyhow::bail!(
-                    "stream buffer exceeded {} bytes without an event boundary; aborting to avoid unbounded buffering",
-                    STREAM_EVENT_BUFFER_CAP
-                );
-            }
-        }
-
-        let finalized: Vec<Block> = blocks
-            .into_values()
-            .filter_map(|pb| pb.finalize())
-            .collect();
-        Ok((finalized, stop_reason, usage))
+        self.read_provider_stream(resp, RequestContract::AnthropicMessages)
+            .await
     }
 
     async fn read_stream_oai(
         &mut self,
         resp: reqwest::Response,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut scan_cursor: usize = 0;
-        let mut text_buf = String::new();
-        let mut tool_calls: std::collections::BTreeMap<usize, (String, String, String)> =
-            std::collections::BTreeMap::new();
-        let mut usage = Usage::default();
-        let mut finish_reason: Option<String> = None;
-
-        while let Some(chunk) = self
-            .read_stream_next_chunk(&mut stream, "interrupted by user")
-            .await?
-        {
-            buf.extend_from_slice(&chunk);
-
-            loop {
-                let Some((end, sep_len)) = find_sse_delimiter(&buf, scan_cursor) else {
-                    scan_cursor = buf.len();
-                    break;
-                };
-                let raw: Vec<u8> = buf.drain(..end + sep_len).collect();
-                scan_cursor = 0;
-                let event_text = String::from_utf8_lossy(&raw[..end]);
-
-                let mut data_line: Option<&str> = None;
-                for line in event_text.lines() {
-                    if let Some(rest) = line.strip_prefix("data:") {
-                        data_line = Some(rest.trim());
-                        break;
-                    }
-                }
-                let data_str = match data_line {
-                    Some(d) => d,
-                    None => continue,
-                };
-                if data_str == "[DONE]" {
-                    break;
-                }
-                let data: Value = match serde_json::from_str(data_str) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                let choices = &data["choices"];
-                if let Some(arr) = choices.as_array() {
-                    for choice in arr {
-                        let delta = &choice["delta"];
-                        if let Some(reason) = choice["finish_reason"].as_str() {
-                            finish_reason = Some(reason.to_string());
-                        }
-                        if let Some(content) = delta["content"].as_str() {
-                            self.partial_stream_text
-                                .get_or_insert_with(String::new)
-                                .push_str(content);
-                            self.sink.emit(AgentEvent::TextDelta(content.to_string()));
-                            text_buf.push_str(content);
-                        }
-                        if let Some(tcs) = delta["tool_calls"].as_array() {
-                            for tc in tcs {
-                                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
-                                let entry = tool_calls.entry(idx).or_insert_with(|| {
-                                    (
-                                        tc["id"].as_str().unwrap_or("").to_string(),
-                                        tc["function"]["name"].as_str().unwrap_or("").to_string(),
-                                        String::new(),
-                                    )
-                                });
-                                if let Some(id) = tc["id"].as_str() {
-                                    entry.0 = id.to_string();
-                                }
-                                if let Some(name) = tc["function"]["name"].as_str() {
-                                    entry.1 = name.to_string();
-                                }
-                                if let Some(args) = tc["function"]["arguments"].as_str() {
-                                    entry.2.push_str(args);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(timings_usage) =
-                    data.get("timings").and_then(Usage::parse_openai_timings)
-                {
-                    usage = timings_usage;
-                } else if let Some(u) = data.get("usage") {
-                    let parsed = Usage::parse_openai(u);
-                    let keep_local_timings = provider::is_local_llama_provider(
-                        &self.provider_id,
-                        self.route_api_provider(),
-                        &self.base_url,
-                    ) && usage.cache_read > 0
-                        && parsed.cache_read == 0;
-                    if !keep_local_timings {
-                        usage = parsed;
-                    }
-                }
-            }
-
-            if buf.len() > STREAM_EVENT_BUFFER_CAP {
-                anyhow::bail!(
-                    "stream buffer exceeded {} bytes without an event boundary",
-                    STREAM_EVENT_BUFFER_CAP
-                );
-            }
-        }
-
-        let mut blocks: Vec<Block> = Vec::new();
-        if !text_buf.is_empty() {
-            self.partial_stream_text = None;
-            self.sink
-                .emit(AgentEvent::TextBlockComplete(text_buf.clone()));
-            blocks.push(Block::Text { text: text_buf });
-        }
-        for (idx, (id, name, args)) in tool_calls {
-            let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
-            let summary = summarize_call(&name, &input);
-            let call_id = normalize_tool_call_id(&id, 0, idx);
-            self.sink.emit(AgentEvent::ToolCallPreview {
-                call_id,
-                name: name.clone(),
-                summary,
-            });
-            blocks.push(Block::ToolUse { id, name, input });
-        }
-        Ok((blocks, finish_reason, usage))
+        self.read_provider_stream(resp, RequestContract::OpenAiChatCompletions)
+            .await
     }
 
     fn partial_chatgpt_stream_blocks(&mut self) -> Vec<Block> {
@@ -16945,269 +18405,8 @@ impl Agent {
         &mut self,
         resp: reqwest::Response,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut scan_cursor: usize = 0;
-        let mut text_buf = String::new();
-        let mut reasoning_buf = String::new();
-        let mut reasoning_emitted = String::new();
-        let mut usage = Usage::default();
-        let mut finish_reason: Option<String> = None;
-        // Keyed by item_id (fc_...). Value: (name, arguments_json, call_id).
-        // item_id is what SSE delta/done events carry; call_id is what we store on Block
-        // so tool results can pair back to the call.
-        let mut tool_calls: std::collections::BTreeMap<String, (String, String, String)> =
-            std::collections::BTreeMap::new();
-        let mut tool_call_order: Vec<String> = Vec::new();
-
-        while let Some(chunk) = self
-            .read_stream_next_chunk(&mut stream, "interrupted by user")
-            .await?
-        {
-            buf.extend_from_slice(&chunk);
-
-            loop {
-                let Some((end, sep_len)) = find_sse_delimiter(&buf, scan_cursor) else {
-                    scan_cursor = buf.len();
-                    break;
-                };
-                let raw: Vec<u8> = buf.drain(..end + sep_len).collect();
-                scan_cursor = 0;
-                let event_text = String::from_utf8_lossy(&raw[..end]);
-
-                let mut data_line: Option<&str> = None;
-                for line in event_text.lines() {
-                    if let Some(rest) = line.strip_prefix("data:") {
-                        data_line = Some(rest.trim());
-                        break;
-                    }
-                }
-                let data_str = match data_line {
-                    Some(d) => d,
-                    None => continue,
-                };
-                if data_str == "[DONE]" {
-                    finish_reason.get_or_insert_with(|| "completed".to_string());
-                    break;
-                }
-                let data: Value = match serde_json::from_str(data_str) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                let event_type = data["type"].as_str().unwrap_or("");
-                match event_type {
-                    "error" => {
-                        let message = data["message"]
-                            .as_str()
-                            .or_else(|| data["error"]["message"].as_str())
-                            .unwrap_or("ChatGPT Codex request failed");
-                        anyhow::bail!("{message}");
-                    }
-                    "response.failed" => {
-                        let message = data["response"]["error"]["message"]
-                            .as_str()
-                            .unwrap_or("ChatGPT Codex response failed");
-                        anyhow::bail!("{message}");
-                    }
-                    "response.output_text.delta" => {
-                        if let Some(delta) = data["delta"].as_str()
-                            && !delta.is_empty()
-                        {
-                            self.partial_stream_text
-                                .get_or_insert_with(String::new)
-                                .push_str(delta);
-                            self.sink.emit(AgentEvent::TextDelta(delta.to_string()));
-                            text_buf.push_str(delta);
-                        }
-                    }
-                    "response.output_text.done" => {
-                        if text_buf.is_empty()
-                            && let Some(text) = data["text"].as_str()
-                            && !text.is_empty()
-                        {
-                            self.partial_stream_text
-                                .get_or_insert_with(String::new)
-                                .push_str(text);
-                            self.sink.emit(AgentEvent::TextDelta(text.to_string()));
-                            text_buf.push_str(text);
-                        }
-                    }
-                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                        if let Some(delta) = data["delta"].as_str()
-                            && !delta.is_empty()
-                        {
-                            reasoning_buf.push_str(delta);
-                            if let Some(visible) = reasoning_summary_stream_delta(
-                                &reasoning_buf,
-                                &mut reasoning_emitted,
-                            ) {
-                                self.sink.emit(AgentEvent::ThinkingDelta(visible));
-                            }
-                        }
-                    }
-                    "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
-                        if reasoning_buf.is_empty()
-                            && let Some(text) = data["text"].as_str()
-                            && !text.is_empty()
-                        {
-                            reasoning_buf.push_str(text);
-                            if let Some(visible) = reasoning_summary_stream_delta(
-                                &reasoning_buf,
-                                &mut reasoning_emitted,
-                            ) {
-                                self.sink.emit(AgentEvent::ThinkingDelta(visible));
-                            }
-                        }
-                    }
-                    "response.output_item.added" => {
-                        let item = &data["item"];
-                        if item["type"].as_str() == Some("function_call") {
-                            let item_id = item["id"].as_str().unwrap_or("").to_string();
-                            let call_id = item["call_id"].as_str().unwrap_or("").to_string();
-                            let name = item["name"].as_str().unwrap_or("").to_string();
-                            if !item_id.is_empty() {
-                                let entry =
-                                    tool_calls.entry(item_id.clone()).or_insert_with(|| {
-                                        tool_call_order.push(item_id.clone());
-                                        (String::new(), String::new(), String::new())
-                                    });
-                                if entry.0.is_empty() && !name.is_empty() {
-                                    entry.0 = name;
-                                }
-                                if entry.2.is_empty() && !call_id.is_empty() {
-                                    entry.2 = call_id;
-                                }
-                            }
-                        }
-                    }
-                    "response.function_call_arguments.delta" => {
-                        let item_id = data["item_id"]
-                            .as_str()
-                            .or_else(|| data["id"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !item_id.is_empty() {
-                            let entry = tool_calls.entry(item_id.clone()).or_insert_with(|| {
-                                tool_call_order.push(item_id.clone());
-                                (String::new(), String::new(), String::new())
-                            });
-                            if let Some(args) = data["delta"].as_str() {
-                                entry.1.push_str(args);
-                            }
-                        }
-                    }
-                    "response.function_call_arguments.done" => {
-                        let item_id = data["item_id"]
-                            .as_str()
-                            .or_else(|| data["id"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !item_id.is_empty() {
-                            let entry = tool_calls.entry(item_id.clone()).or_insert_with(|| {
-                                tool_call_order.push(item_id.clone());
-                                (String::new(), String::new(), String::new())
-                            });
-                            if let Some(args) = data["arguments"].as_str() {
-                                entry.1 = args.to_string();
-                            }
-                        }
-                    }
-                    "response.completed" | "response.done" | "response.incomplete" => {
-                        if let Some(status) = data["response"]["status"].as_str() {
-                            finish_reason = Some(status.to_string());
-                        }
-                        if let Some(u) = data["response"].get("usage") {
-                            usage = Usage::parse_openai(u);
-                        } else if let Some(timings_usage) =
-                            data.get("timings").and_then(Usage::parse_openai_timings)
-                        {
-                            usage = timings_usage;
-                        }
-                        for output in data["response"]["output"].as_array().into_iter().flatten() {
-                            if output["type"].as_str() == Some("function_call") {
-                                let item_id = output["id"].as_str().unwrap_or("").to_string();
-                                let call_id = output["call_id"].as_str().unwrap_or("").to_string();
-                                let name = output["name"].as_str().unwrap_or("").to_string();
-                                let arguments =
-                                    output["arguments"].as_str().unwrap_or("").to_string();
-                                if item_id.is_empty() {
-                                    continue;
-                                }
-                                let entry =
-                                    tool_calls.entry(item_id.clone()).or_insert_with(|| {
-                                        tool_call_order.push(item_id.clone());
-                                        (String::new(), String::new(), String::new())
-                                    });
-                                if !name.is_empty() {
-                                    entry.0 = name;
-                                }
-                                if !arguments.is_empty() {
-                                    entry.1 = arguments;
-                                }
-                                if !call_id.is_empty() {
-                                    entry.2 = call_id;
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if buf.len() > STREAM_EVENT_BUFFER_CAP {
-                anyhow::bail!(
-                    "stream buffer exceeded {} bytes without an event boundary",
-                    STREAM_EVENT_BUFFER_CAP
-                );
-            }
-        }
-
-        let mut blocks: Vec<Block> = Vec::new();
-        if !reasoning_buf.is_empty() {
-            let reasoning = normalize_reasoning_summary_text(&reasoning_buf);
-            if !reasoning.is_empty() {
-                self.sink
-                    .emit(AgentEvent::ThinkingBlockComplete(reasoning.clone()));
-                blocks.push(Block::Thinking {
-                    text: reasoning,
-                    signature: None,
-                });
-            }
-        }
-        if !text_buf.is_empty() {
-            self.partial_stream_text = None;
-            self.sink
-                .emit(AgentEvent::TextBlockComplete(text_buf.clone()));
-            blocks.push(Block::Text { text: text_buf });
-        }
-        for (idx, item_id) in tool_call_order.iter().enumerate() {
-            let Some((name, args, call_id)) = tool_calls.remove(item_id) else {
-                continue;
-            };
-            let input: Value = serde_json::from_str(&args).unwrap_or_else(|_| json!({}));
-            let summary = summarize_call(&name, &input);
-            // Store call_id (not item_id) on the Block — it's the id the server uses to
-            // pair `function_call_output.call_id` back to the original call. Fall back to
-            // item_id only if the server somehow didn't emit a call_id.
-            let block_id = if call_id.is_empty() {
-                item_id.clone()
-            } else {
-                call_id
-            };
-            let display_call_id = normalize_tool_call_id(&block_id, 0, idx);
-            self.sink.emit(AgentEvent::ToolCallPreview {
-                call_id: display_call_id,
-                name: name.clone(),
-                summary,
-            });
-            blocks.push(Block::ToolUse {
-                id: block_id,
-                name,
-                input,
-            });
-        }
-        Ok((blocks, finish_reason, usage))
+        self.read_provider_stream(resp, RequestContract::ChatGptResponses)
+            .await
     }
 }
 
@@ -18572,12 +19771,6 @@ fn render_work_map_packet_with_mode(
             "- Carry focus withholds prior raw history and carries only the requested ledger categories plus selected waypoints."
         );
     }
-    if map.header.browser_recipe == BrowserRecipe::AgentBrowser {
-        let _ = writeln!(
-            out,
-            "- Agent browser is available for browser/web interaction tasks."
-        );
-    }
     out
 }
 
@@ -19395,82 +20588,636 @@ fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
     }
 }
 
-fn handle_doctor_cli(root: &Path) -> i32 {
-    let (report, _warnings) = doctor_report(root);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorLevel {
+    Ok,
+    Info,
+    Warn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorFinding {
+    level: DoctorLevel,
+    label: String,
+    detail: String,
+}
+
+impl DoctorFinding {
+    fn ok(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            level: DoctorLevel::Ok,
+            label: label.into(),
+            detail: detail.into(),
+        }
+    }
+
+    fn info(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            level: DoctorLevel::Info,
+            label: label.into(),
+            detail: detail.into(),
+        }
+    }
+
+    fn warn(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            level: DoctorLevel::Warn,
+            label: label.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+fn render_doctor_findings(findings: &[DoctorFinding]) -> (String, usize) {
+    let mut out = String::from("dext doctor — environment and capability check\n\n");
+    let mut warnings = 0usize;
+    for finding in findings {
+        let mark = match finding.level {
+            DoctorLevel::Ok => "ok  ",
+            DoctorLevel::Info => "info",
+            DoctorLevel::Warn => {
+                warnings += 1;
+                "warn"
+            }
+        };
+        out.push_str(&format!("[{mark}] {}: {}\n", finding.label, finding.detail));
+    }
+    if warnings == 0 {
+        out.push_str("\nall checks passed\n");
+    } else {
+        out.push_str(&format!(
+            "\n{warnings} warning(s); see [warn] lines above\n"
+        ));
+    }
+    (out, warnings)
+}
+
+fn handle_doctor_cli(args: &[String], root: &Path) -> i32 {
+    let opts = match parse_cli_options(args.to_vec()) {
+        Ok(opts) if opts.positional.is_empty() => opts,
+        Ok(_) => {
+            eprintln!("usage: dext doctor [--approval PROFILE] [--sandbox PROFILE] [--cd DIR]");
+            return 2;
+        }
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            return 2;
+        }
+    };
+    let root = opts
+        .cd
+        .as_deref()
+        .unwrap_or(root)
+        .canonicalize()
+        .unwrap_or_else(|_| opts.cd.unwrap_or_else(|| root.to_path_buf()));
+    let (report, _warnings) =
+        doctor_report_with_overrides(&root, opts.approval_policy_override, opts.sandbox_profile);
     print!("{report}");
     0
 }
 
-/// Build the `dext doctor` report text and the count of warnings it contains.
-/// Kept separate from printing so it can be asserted in tests.
-fn doctor_report(root: &Path) -> (String, usize) {
-    let out = std::cell::RefCell::new(String::new());
-    let warnings = std::cell::Cell::new(0usize);
-    let line = |ok: bool, label: &str, detail: String| {
-        let mark = if ok { "ok  " } else { "warn" };
-        if !ok {
-            warnings.set(warnings.get() + 1);
-        }
-        out.borrow_mut()
-            .push_str(&format!("[{mark}] {label}: {detail}\n"));
-    };
-
-    out.borrow_mut()
-        .push_str("dext doctor — environment and capability check\n\n");
-
-    line(
-        true,
-        "version",
-        format!(
-            "dext {} ({} {})",
-            env!("CARGO_PKG_VERSION"),
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ),
-    );
-    line(true, "cwd", root.display().to_string());
-
-    // OS-level sandbox enforcement.
-    line(
+#[cfg(test)]
+fn sandbox_doctor_status(profile: SandboxProfile) -> (bool, String) {
+    if profile == SandboxProfile::DangerFullAccess {
+        return (
+            true,
+            "profile danger-full-access; kernel confinement intentionally disabled".to_string(),
+        );
+    }
+    (
         sandbox::is_enforced(),
-        "sandbox",
-        if sandbox::is_enforced() {
-            sandbox::describe()
-        } else {
-            format!("{} (path-validation still applies)", sandbox::describe())
-        },
-    );
+        format!("profile {}: {}", profile.as_str(), sandbox::describe()),
+    )
+}
 
-    // Terminal.
-    line(
-        true,
+fn doctor_read_json(path: &Path, max_bytes: u64) -> std::result::Result<Option<Value>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("state metadata is unreadable".to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("state path is not a regular file".to_string());
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "state exceeds the {max_bytes}-byte inspection bound"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)
+        .map_err(|_| "state file is unreadable".to_string())?
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "state file is unreadable".to_string())?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "state exceeds the {max_bytes}-byte inspection bound"
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| "state contains invalid JSON".to_string())
+}
+
+fn doctor_latest_session_path(root: &Path) -> std::result::Result<PathBuf, String> {
+    const SESSION_ENTRY_LIMIT: usize = 256;
+    let sessions_dir = session::latest_sessions_dir(root);
+    let legacy = session::project_latest_session_path(root);
+    match std::fs::symlink_metadata(&sessions_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("latest-session directory is a symlink".to_string());
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err("latest-session path is not a directory".to_string());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(legacy),
+        Err(_) => return Err("latest-session directory metadata is unreadable".to_string()),
+    }
+    let mut newest = match std::fs::symlink_metadata(&legacy) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("latest-session path is a symlink".to_string());
+        }
+        Ok(metadata) if metadata.is_file() => metadata
+            .modified()
+            .ok()
+            .map(|modified| (modified, legacy.clone())),
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err("latest-session metadata is unreadable".to_string()),
+    };
+    let entries = match std::fs::read_dir(&sessions_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(legacy),
+        Err(_) => return Err("latest-session directory is unreadable".to_string()),
+    };
+    let mut inspected = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|_| "latest-session directory is unreadable".to_string())?;
+        inspected += 1;
+        if inspected > SESSION_ENTRY_LIMIT {
+            return Err(format!(
+                "latest-session directory exceeds the {SESSION_ENTRY_LIMIT}-entry inspection bound"
+            ));
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|_| "latest-session entry metadata is unreadable".to_string())?;
+        if file_type.is_symlink() {
+            return Err("latest-session directory contains a symlinked session entry".to_string());
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path().join(format!("{LATEST_SESSION_NAME}.jsonl"));
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("latest-session metadata is unreadable".to_string()),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err("latest-session path is a symlink".to_string());
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(modified) = metadata.modified().ok() else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_none_or(|(current, _)| modified >= *current)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    Ok(newest.map(|(_, path)| path).unwrap_or(legacy))
+}
+
+fn doctor_latest_session(root: &Path, findings: &mut Vec<DoctorFinding>) -> Option<PathBuf> {
+    const HEADER_MAX_BYTES: u64 = 256 * 1024;
+    let path = match doctor_latest_session_path(root) {
+        Ok(path) => path,
+        Err(error) => {
+            findings.push(DoctorFinding::warn("latest session", error));
+            return None;
+        }
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            findings.push(DoctorFinding::info("latest session", "none"));
+            return None;
+        }
+        Err(_) => {
+            findings.push(DoctorFinding::warn(
+                "latest session",
+                "metadata is unreadable",
+            ));
+            return Some(path);
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        findings.push(DoctorFinding::warn(
+            "latest session",
+            "path is not a regular file",
+        ));
+        return Some(path);
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&path).and_then(|file| {
+        file.take(HEADER_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| ())
+    });
+    if read.is_err() {
+        findings.push(DoctorFinding::warn(
+            "latest session",
+            "header is unreadable",
+        ));
+        return Some(path);
+    }
+    let line_end = bytes.iter().position(|byte| *byte == b'\n');
+    if line_end.is_none() && bytes.len() as u64 > HEADER_MAX_BYTES {
+        findings.push(DoctorFinding::warn(
+            "latest session",
+            "header exceeds the 262144-byte inspection bound",
+        ));
+        return Some(path);
+    }
+    let line = &bytes[..line_end.unwrap_or(bytes.len())];
+    let source_version = serde_json::from_slice::<Value>(line)
+        .ok()
+        .and_then(|value| value.get("version").cloned())
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1);
+    match std::str::from_utf8(line)
+        .map_err(|_| ())
+        .and_then(|line| parse_session_header(line).map_err(|_| ()))
+    {
+        Ok(_) => findings.push(DoctorFinding::ok(
+            "latest session",
+            if source_version < SESSION_FORMAT_VERSION as u64 {
+                format!(
+                    "valid legacy v{source_version}; migrates in memory to v{SESSION_FORMAT_VERSION}"
+                )
+            } else {
+                format!("valid v{source_version}")
+            },
+        )),
+        Err(_) => findings.push(DoctorFinding::warn(
+            "latest session",
+            "invalid or unsupported header; resume will fail closed",
+        )),
+    }
+    Some(path)
+}
+
+fn doctor_todo_path(root: &Path, latest_session: Option<&Path>) -> PathBuf {
+    let sessions_dir = session::latest_sessions_dir(root);
+    if let Some(parent) = latest_session.and_then(Path::parent)
+        && parent != sessions_dir
+        && parent.parent() == Some(sessions_dir.as_path())
+    {
+        return parent.join("DEXT.todo.json");
+    }
+    root.join("DEXT.todo.json")
+}
+
+fn doctor_state_findings(
+    root: &Path,
+    latest_session: Option<&Path>,
+    findings: &mut Vec<DoctorFinding>,
+) {
+    const JSON_MAX_BYTES: u64 = 256 * 1024;
+    let todo_path = doctor_todo_path(root, latest_session);
+    match doctor_read_json(&todo_path, JSON_MAX_BYTES) {
+        Ok(None) => findings.push(DoctorFinding::info("latest todo", "none")),
+        Ok(Some(Value::Array(items))) => {
+            let valid = items.iter().all(|item| {
+                item.get("text").and_then(Value::as_str).is_some()
+                    && item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .is_none_or(|status| {
+                            matches!(status, "pending" | "in_progress" | "completed")
+                        })
+            });
+            if valid {
+                let (pending, in_progress, completed) = todo_status_counts(&items);
+                findings.push(DoctorFinding::ok(
+                    "latest todo",
+                    format!(
+                        "valid; pending={pending}, in_progress={in_progress}, completed={completed}"
+                    ),
+                ));
+            } else {
+                findings.push(DoctorFinding::warn(
+                    "latest todo",
+                    "invalid item schema or status",
+                ));
+            }
+        }
+        Ok(Some(_)) => findings.push(DoctorFinding::warn("latest todo", "expected a JSON array")),
+        Err(error) => findings.push(DoctorFinding::warn("latest todo", error)),
+    }
+
+    match doctor_read_json(&compact_threshold_settings_path(), JSON_MAX_BYTES) {
+        Ok(None) => findings.push(DoctorFinding::info("settings", "none; using defaults")),
+        Ok(Some(Value::Object(settings))) => {
+            let valid = settings
+                .get("compact_threshold_percent")
+                .is_none_or(|value| {
+                    value.is_null()
+                        || value
+                            .as_u64()
+                            .is_some_and(|percent| (1..=100).contains(&percent))
+                });
+            if valid {
+                findings.push(DoctorFinding::ok("settings", "valid compact settings"));
+            } else {
+                findings.push(DoctorFinding::warn(
+                    "settings",
+                    "compact_threshold_percent must be an integer from 1 through 100",
+                ));
+            }
+        }
+        Ok(Some(_)) => findings.push(DoctorFinding::warn("settings", "expected a JSON object")),
+        Err(error) => findings.push(DoctorFinding::warn("settings", error)),
+    }
+
+    match latest_session {
+        None => findings.push(DoctorFinding::info("tool journal", "no source session")),
+        Some(path) => match tool_journal::load_for_session_file(path) {
+            Ok(None) => findings.push(DoctorFinding::info("tool journal", "none")),
+            Ok(Some(entries)) => {
+                let unresolved = entries
+                    .iter()
+                    .filter(|entry| entry.status == tool_journal::ToolJournalStatus::Started)
+                    .count();
+                if unresolved == 0 {
+                    findings.push(DoctorFinding::ok(
+                        "tool journal",
+                        format!(
+                            "valid; {} bounded record(s), no uncertain calls",
+                            entries.len()
+                        ),
+                    ));
+                } else {
+                    findings.push(DoctorFinding::warn(
+                        "tool journal",
+                        format!(
+                            "{unresolved} unresolved/uncertain call(s); inspect effects before retrying"
+                        ),
+                    ));
+                }
+            }
+            Err(_) => findings.push(DoctorFinding::warn(
+                "tool journal",
+                "invalid, unsafe, or unreadable source-session journal",
+            )),
+        },
+    }
+}
+
+fn doctor_provider_findings(findings: &mut Vec<DoctorFinding>) {
+    let catalog = provider::inspect_provider_catalog();
+    use provider::ProviderCatalogIntegrity as CatalogIntegrity;
+    match catalog.integrity {
+        CatalogIntegrity::Missing => findings.push(DoctorFinding::info(
+            "provider catalog",
+            format!(
+                "missing; using {} built-in provider(s)",
+                catalog.provider_count.unwrap_or_default()
+            ),
+        )),
+        CatalogIntegrity::Valid { version, legacy } => findings.push(DoctorFinding::ok(
+            "provider catalog",
+            if legacy {
+                format!("valid legacy v{version}; migrates in memory")
+            } else {
+                format!(
+                    "valid v{version}; {} provider(s)",
+                    catalog.provider_count.unwrap_or_default()
+                )
+            },
+        )),
+        CatalogIntegrity::UnsupportedVersion { version } => findings.push(DoctorFinding::warn(
+            "provider catalog",
+            format!("unsupported version {version}"),
+        )),
+        CatalogIntegrity::TooLarge => findings.push(DoctorFinding::warn(
+            "provider catalog",
+            "exceeds the 1048576-byte inspection bound",
+        )),
+        CatalogIntegrity::InvalidSchema => findings.push(DoctorFinding::warn(
+            "provider catalog",
+            "invalid JSON or schema",
+        )),
+        CatalogIntegrity::Symlink | CatalogIntegrity::NonRegular => findings.push(
+            DoctorFinding::warn("provider catalog", "path is not a regular file"),
+        ),
+        #[cfg(unix)]
+        CatalogIntegrity::UnsafeOwner => findings.push(DoctorFinding::warn(
+            "provider catalog",
+            "file is not owned by the current user",
+        )),
+        #[cfg(unix)]
+        CatalogIntegrity::UnsafeMode { mode } => findings.push(DoctorFinding::warn(
+            "provider catalog",
+            format!("unsafe writable mode {mode:04o}; remove group/world write bits"),
+        )),
+        CatalogIntegrity::Unreadable => findings.push(DoctorFinding::warn(
+            "provider catalog",
+            "file is unreadable",
+        )),
+    }
+    match catalog.active_provider {
+        Some(active) => findings.push(DoctorFinding::info("active provider", active)),
+        None => findings.push(DoctorFinding::warn(
+            "active provider",
+            "unavailable until provider catalog is repaired",
+        )),
+    }
+
+    let auth = provider::inspect_auth_store();
+    use provider::AuthStoreFileSecurity as AuthSecurity;
+    use provider::AuthStoreIntegrity as AuthIntegrity;
+    match auth.integrity {
+        AuthIntegrity::Valid { version, legacy } => findings.push(DoctorFinding::ok(
+            "auth store",
+            if legacy {
+                format!("valid legacy v{version}; migrates in memory")
+            } else {
+                format!("valid v{version}")
+            },
+        )),
+        AuthIntegrity::NotChecked if matches!(auth.security, AuthSecurity::Missing) => findings
+            .push(DoctorFinding::info(
+                "auth store",
+                "missing; use `dext auth login <provider>` when credentials are required",
+            )),
+        AuthIntegrity::NotChecked => findings.push(DoctorFinding::warn(
+            "auth store",
+            "integrity not checked because the path is unsafe or unreadable",
+        )),
+        AuthIntegrity::UnsupportedVersion { version } => findings.push(DoctorFinding::warn(
+            "auth store",
+            format!("unsupported version {version}"),
+        )),
+        AuthIntegrity::InvalidSchema => {
+            findings.push(DoctorFinding::warn("auth store", "invalid JSON or schema"))
+        }
+        AuthIntegrity::Unreadable => {
+            findings.push(DoctorFinding::warn("auth store", "file is unreadable"))
+        }
+        AuthIntegrity::TooLarge => findings.push(DoctorFinding::warn(
+            "auth store",
+            "exceeds the 1048576-byte inspection bound",
+        )),
+    }
+    match auth.security {
+        AuthSecurity::Missing => {
+            findings.push(DoctorFinding::info("auth permissions", "file absent"))
+        }
+        #[cfg(unix)]
+        AuthSecurity::Secure { mode } => findings.push(DoctorFinding::ok(
+            "auth permissions",
+            format!("owner-only mode {mode:04o}"),
+        )),
+        #[cfg(unix)]
+        AuthSecurity::UnsafeMode { mode } => findings.push(DoctorFinding::warn(
+            "auth permissions",
+            format!(
+                "unsafe mode {mode:04o}; run `chmod 600 {}`",
+                auth.path.display()
+            ),
+        )),
+        AuthSecurity::Symlink => findings.push(DoctorFinding::warn(
+            "auth permissions",
+            "auth path is a symlink; replace it with an owner-only regular file",
+        )),
+        AuthSecurity::NonRegular => findings.push(DoctorFinding::warn(
+            "auth permissions",
+            "auth path is not a regular file",
+        )),
+        #[cfg(unix)]
+        AuthSecurity::UnsafeOwner => findings.push(DoctorFinding::warn(
+            "auth permissions",
+            "auth file is not owned by the current user",
+        )),
+        AuthSecurity::Unreadable => findings.push(DoctorFinding::warn(
+            "auth permissions",
+            "auth path metadata is unreadable",
+        )),
+        #[cfg(windows)]
+        AuthSecurity::WindowsAclNotEvaluated => findings.push(DoctorFinding::info(
+            "auth permissions",
+            "Windows ACLs are not evaluated; keep the profile directory private",
+        )),
+        #[cfg(not(any(unix, windows)))]
+        AuthSecurity::PermissionsNotEvaluated => findings.push(DoctorFinding::info(
+            "auth permissions",
+            "file permissions are not evaluated on this platform",
+        )),
+    }
+}
+
+#[cfg(test)]
+fn doctor_report(root: &Path) -> (String, usize) {
+    doctor_report_with_overrides(root, None, None)
+}
+
+fn doctor_report_with_overrides(
+    root: &Path,
+    approval_override: Option<ApprovalProfile>,
+    sandbox_override: Option<SandboxProfile>,
+) -> (String, usize) {
+    let mut findings = vec![
+        DoctorFinding::ok(
+            "version",
+            format!(
+                "dext {} ({} {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        ),
+        DoctorFinding::info("cwd", root.display().to_string()),
+    ];
+
+    let approval = resolve_approval_policy_from_env(approval_override);
+    findings.push(DoctorFinding::info(
+        "approval policy",
+        format!(
+            "{} (source {})",
+            approval.profile.as_str(),
+            approval.source.as_str()
+        ),
+    ));
+    for warning in approval.warnings {
+        findings.push(DoctorFinding::warn("approval environment", warning));
+    }
+
+    let sandbox_profile = sandbox_override
+        .or_else(|| {
+            std::env::var("DEXT_SANDBOX_PROFILE")
+                .ok()
+                .and_then(|value| SandboxProfile::parse(&value))
+        })
+        .unwrap_or_default();
+    findings.push(DoctorFinding::info(
+        "sandbox",
+        format!("effective profile {}", sandbox_profile.as_str()),
+    ));
+    if sandbox_profile == SandboxProfile::DangerFullAccess {
+        findings.push(DoctorFinding::info(
+            "sandbox kernel",
+            "intentionally disabled by danger-full-access",
+        ));
+    } else if sandbox::is_enforced() {
+        findings.push(DoctorFinding::ok("sandbox kernel", sandbox::describe()));
+    } else {
+        findings.push(DoctorFinding::warn(
+            "sandbox kernel",
+            format!(
+                "not enforced for {}; native path guards remain, subprocesses are unconfined",
+                sandbox::describe()
+            ),
+        ));
+    }
+
+    findings.push(DoctorFinding::info(
         "terminal",
         if io::stdout().is_terminal() {
-            "interactive tty".to_string()
+            "interactive tty"
         } else {
-            "non-tty (piped/redirected)".to_string()
+            "non-tty (piped/redirected)"
         },
-    );
+    ));
 
-    // Git repo.
-    let in_git = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    line(
-        true,
-        "git repo",
-        if in_git {
-            "yes (checkpoints/undo available)".to_string()
-        } else {
-            "no (Git checkpoints disabled)".to_string()
-        },
-    );
+    let in_git = match git_checkpoints::repo_root(root) {
+        Ok(Some(_)) => {
+            findings.push(DoctorFinding::ok(
+                "git repo",
+                "yes (checkpoints/undo available)",
+            ));
+            true
+        }
+        Ok(None) => {
+            findings.push(DoctorFinding::info(
+                "git repo",
+                "no (Git checkpoints disabled)",
+            ));
+            false
+        }
+        Err(_) => {
+            findings.push(DoctorFinding::warn("git repo", "Git inspection failed"));
+            false
+        }
+    };
 
-    // Tool binaries. bash/git are required; the rest are optional native tools.
     for (name, required) in [
         ("bash", true),
         ("git", true),
@@ -19481,118 +21228,65 @@ fn doctor_report(root: &Path) -> (String, usize) {
         ("fzf", false),
         ("in2csv", false),
     ] {
-        let present = binary_on_path(name);
-        let detail = if present {
-            "on PATH".to_string()
+        if binary_on_path(name) {
+            findings.push(DoctorFinding::ok(format!("tool {name}"), "on PATH"));
         } else if required {
-            "MISSING (required)".to_string()
+            findings.push(DoctorFinding::warn(
+                format!("tool {name}"),
+                "MISSING (required)",
+            ));
         } else {
-            "not found (native tool falls back to bash where possible)".to_string()
-        };
-        line(present || !required, &format!("tool {name}"), detail);
-    }
-
-    // Providers and auth.
-    match (
-        provider::load_provider_catalog(),
-        provider::load_auth_store(),
-    ) {
-        (Ok(catalog), Ok(store)) => {
-            let active = provider::resolve_active_provider_id(&catalog);
-            line(true, "active provider", active.clone());
-            let mut any_auth = false;
-            for profile in &catalog.providers {
-                let status = provider::provider_auth_status(profile, &store);
-                let authed = status.starts_with("auth")
-                    || status.starts_with("env:")
-                    || status == "not-required";
-                if authed {
-                    any_auth = true;
-                }
-                let marker = if provider::canonical_provider_id(&profile.id)
-                    == provider::canonical_provider_id(&active)
-                {
-                    "* "
-                } else {
-                    "  "
-                };
-                out.borrow_mut()
-                    .push_str(&format!("       {marker}{:<10} {}\n", profile.id, status));
-            }
-            if !any_auth {
-                warnings.set(warnings.get() + 1);
-                out.borrow_mut().push_str(
-                    "[warn] no provider has resolvable credentials; run `dext auth login <provider>`\n",
-                );
-            }
-
-            // Local llama reachability probe for any local provider.
-            if let Some(local) = catalog.providers.iter().find(|p| {
-                provider::is_local_llama_provider(
-                    &p.id,
-                    p.api_provider,
-                    &provider::resolve_provider_base_url(p),
-                )
-            }) {
-                let base = provider::resolve_provider_base_url(local);
-                let model = provider::resolve_provider_model(local);
-                match provider::refresh_local_llama_context_window(
-                    &local.id,
-                    local.api_provider,
-                    &base,
-                    &model,
-                ) {
-                    Some(ctx) => line(
-                        true,
-                        "local llama",
-                        format!("reachable at {base} (context {ctx} tokens)"),
-                    ),
-                    None => line(
-                        false,
-                        "local llama",
-                        format!(
-                            "configured ({base}) but not reachable; start llama-server if you use the local provider"
-                        ),
-                    ),
-                }
-            }
-        }
-        _ => {
-            line(
-                false,
-                "providers",
-                "could not load provider catalog/auth store".to_string(),
-            );
+            findings.push(DoctorFinding::info(
+                format!("tool {name}"),
+                "not found (optional)",
+            ));
         }
     }
 
-    // Active session locks under this project.
-    let lock_count = std::fs::read_dir(session::latest_sessions_dir(root))
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().join(SESSION_STATE_LOCK_NAME).exists())
-                .count()
-        })
-        .unwrap_or(0);
-    line(
-        true,
-        "session locks",
-        if lock_count == 0 {
-            "none".to_string()
-        } else {
-            format!("{lock_count} held (stale ones clear on next clean start)")
-        },
-    );
+    doctor_provider_findings(&mut findings);
+    let latest_session = doctor_latest_session(root, &mut findings);
+    doctor_state_findings(root, latest_session.as_deref(), &mut findings);
 
-    let warnings = warnings.get();
-    let summary = if warnings == 0 {
-        "\nall checks passed\n".to_string()
-    } else {
-        format!("\n{warnings} warning(s); see [warn] lines above\n")
+    let latest_session_dir = latest_session
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|parent| *parent != session::latest_sessions_dir(root));
+    let session_lock_detail = match (latest_session.as_ref(), latest_session_dir) {
+        (_, Some(dir)) if dir.join(SESSION_STATE_LOCK_NAME).exists() => {
+            "latest session lock present"
+        }
+        (Some(_), _) => "none on latest session",
+        (None, _) => "not applicable without a selected latest session",
     };
-    out.borrow_mut().push_str(&summary);
-    (out.into_inner(), warnings)
+    findings.push(DoctorFinding::info("session locks", session_lock_detail));
+
+    if in_git {
+        match git_checkpoints::inspect_checkpoints(root, 64) {
+            Ok(checkpoints) if checkpoints.is_empty() => findings.push(DoctorFinding::info(
+                "checkpoints",
+                "supported; no Dext checkpoints",
+            )),
+            Ok(checkpoints) => findings.push(DoctorFinding::ok(
+                "checkpoints",
+                format!(
+                    "supported; {} recent checkpoint(s), latest {}",
+                    checkpoints.len(),
+                    checkpoints[0].id
+                ),
+            )),
+            Err(_) => findings.push(DoctorFinding::warn(
+                "checkpoints",
+                "metadata or refs are invalid/unreadable",
+            )),
+        }
+    } else {
+        findings.push(DoctorFinding::info(
+            "checkpoints",
+            "unavailable outside a Git worktree",
+        ));
+    }
+
+    render_doctor_findings(&findings)
 }
 
 /// A compact, safe continuation packet for handing work to another agent or a
@@ -19665,17 +21359,45 @@ fn render_session_brief(
     out
 }
 
+const SESSION_PRUNE_ENTRY_LIMIT: usize = 65_536;
+
 fn collect_session_lock_paths(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session prune root is not a regular directory",
+        ));
     }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_session_lock_paths(&path, out)?;
-        } else if path.file_name().and_then(|s| s.to_str()) == Some(SESSION_STATE_LOCK_NAME) {
-            out.push(path);
+
+    let mut inspected = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            inspected += 1;
+            if inspected > SESSION_PRUNE_ENTRY_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session prune traversal exceeds safety limit",
+                ));
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && path.file_name().and_then(|s| s.to_str()) == Some(SESSION_STATE_LOCK_NAME)
+            {
+                out.push(path);
+            }
         }
     }
     Ok(())
@@ -19702,10 +21424,17 @@ fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<(
     let mut candidates = Vec::new();
     let mut kept = 0usize;
     for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => {
+                kept += 1;
+                continue;
+            }
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
             continue;
         }
+        let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if name_str == current_key {
@@ -19785,18 +21514,41 @@ fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<(
 }
 
 fn walkdir_jsonl_count(dir: &Path) -> std::io::Result<usize> {
-    if !dir.exists() {
-        return Ok(0);
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session directory is not a regular directory",
+        ));
     }
+
     let mut count = 0;
-    let stack = vec![dir.to_path_buf()];
-    let mut current = stack;
-    while let Some(d) = current.pop() {
-        for entry in std::fs::read_dir(&d)?.flatten() {
+    let mut inspected = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            inspected += 1;
+            if inspected > SESSION_PRUNE_ENTRY_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session prune traversal exceeds safety limit",
+                ));
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
-                current.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+            {
                 count += 1;
             }
         }
@@ -20044,11 +21796,90 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
     }
 }
 
+const DIAGNOSTICS_APPROVAL_NAME: &str = "diagnostics";
+
+fn hooks_approved(agent: &mut Agent) -> bool {
+    if agent.hooks.is_empty() {
+        return false;
+    }
+    if agent.approval_profile == ApprovalProfile::Never {
+        return false;
+    }
+    if agent.allowed.contains(HOOKS_APPROVAL_NAME) {
+        return true;
+    }
+    let input = json!({
+        "operation": "run project, active-pack, or repository Git hooks for this turn",
+        "phases": ["user_prompt", "pre_tool", "post_tool", "git_commit hooks"],
+        "risk": "executes hook programs selected by project, pack, or Git configuration; hooks are credential-isolated, bounded, and confined to the active workspace"
+    });
+    match agent.sink.request_permission(HOOKS_APPROVAL_NAME, &input) {
+        Choice::Once => true,
+        Choice::Always => {
+            agent.allowed.insert(HOOKS_APPROVAL_NAME.to_string());
+            true
+        }
+        Choice::Deny => false,
+    }
+}
+
+fn git_commit_hooks_approved(agent: &mut Agent) -> bool {
+    if agent.approval_profile == ApprovalProfile::Never {
+        return false;
+    }
+    if agent.allowed.contains(HOOKS_APPROVAL_NAME) {
+        return true;
+    }
+    let input = json!({
+        "operation": "allow repository Git hooks during built-in git_commit for this turn",
+        "phases": ["pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "post-rewrite"],
+        "risk": format!(
+            "executes hook programs selected by repository configuration; credentials and startup injection variables are removed, output and runtime are bounded, and the current {} sandbox profile applies",
+            agent.sandbox_profile().as_str()
+        )
+    });
+    match agent.sink.request_permission(HOOKS_APPROVAL_NAME, &input) {
+        Choice::Once => true,
+        Choice::Always => {
+            agent.allowed.insert(HOOKS_APPROVAL_NAME.to_string());
+            true
+        }
+        Choice::Deny => false,
+    }
+}
+
+fn diagnostics_approved(agent: &mut Agent) -> bool {
+    if agent.approval_profile == ApprovalProfile::Never {
+        return false;
+    }
+    if agent.approval_profile == ApprovalProfile::Always
+        || agent.allowed.contains(DIAGNOSTICS_APPROVAL_NAME)
+    {
+        return true;
+    }
+    let input = json!({
+        "operation": "run project diagnostics",
+        "executables": ["rust-analyzer", "cargo check"],
+        "risk": "executes project build scripts and procedural macros in a read-only sandbox"
+    });
+    match agent
+        .sink
+        .request_permission(DIAGNOSTICS_APPROVAL_NAME, &input)
+    {
+        Choice::Once => true,
+        Choice::Always => {
+            agent.allowed.insert(DIAGNOSTICS_APPROVAL_NAME.to_string());
+            true
+        }
+        Choice::Deny => false,
+    }
+}
+
 fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
     use std::fmt::Write as _;
     let mut ui_update = SlashUiUpdate::None;
     let line = line.trim();
-    if !line.starts_with('/') {
+    if !is_slash_command(line) {
         return None;
     }
     let mut parts = line[1..].splitn(2, char::is_whitespace);
@@ -20073,47 +21904,54 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
             let mut parts = pack_arg.splitn(3, char::is_whitespace);
             let sub = parts.next().unwrap_or("").trim();
-            match sub {
-                "" | "list" | "ls" => {
-                    let (_, inline_verbose) = list_render::take_verbose(pack_arg);
-                    let verbose = leading_verbose || inline_verbose;
-                    let _ = write!(
-                        w,
-                        "{}",
-                        packs::render_pack_listing_opts(&agent.sandbox_root, verbose)
-                    );
-                }
-                "inspect" | "info" | "show" => {
-                    let selector = parts.next().unwrap_or("").trim();
-                    if selector.is_empty() {
-                        let _ = writeln!(w, "usage: /pack inspect <name>");
-                    } else {
-                        match packs::render_pack_inspect(&agent.sandbox_root, selector) {
-                            Ok(text) => {
-                                let _ = write!(w, "{text}");
-                            }
-                            Err(e) => {
-                                let _ = writeln!(w, "{e:#}");
+            if let Some((selector, task)) = packs::pack_invocation_args(pack_arg) {
+                let _ = writeln!(
+                    w,
+                    "pack invocation is async; run `/pack {selector} {task}` from the interactive loop or `dext pack {selector} {task}`"
+                );
+            } else {
+                match sub {
+                    "" | "list" | "ls" => {
+                        let (_, inline_verbose) = list_render::take_verbose(pack_arg);
+                        let verbose = leading_verbose || inline_verbose;
+                        let _ = write!(
+                            w,
+                            "{}",
+                            packs::render_pack_listing_opts(&agent.sandbox_root, verbose)
+                        );
+                    }
+                    "inspect" | "info" | "show" => {
+                        let selector = parts.next().unwrap_or("").trim();
+                        if selector.is_empty() {
+                            let _ = writeln!(w, "usage: /pack inspect <name>");
+                        } else {
+                            match packs::render_pack_inspect(&agent.sandbox_root, selector) {
+                                Ok(text) => {
+                                    let _ = write!(w, "{text}");
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(w, "{e:#}");
+                                }
                             }
                         }
                     }
-                }
-                "run" | "use" | "start" => {
-                    let selector = parts.next().unwrap_or("").trim();
-                    let task = parts.next().unwrap_or("").trim();
-                    if selector.is_empty() {
-                        let _ = writeln!(w, "usage: /pack run <name> <task>");
-                    } else if task.is_empty() {
-                        let _ = writeln!(w, "usage: /pack run {selector} <task>");
-                    } else {
-                        let _ = writeln!(
-                            w,
-                            "pack run is async; use /pack run from the interactive loop, or `dext pack run {selector} {task}`"
-                        );
+                    "run" | "use" | "start" => {
+                        let selector = parts.next().unwrap_or("").trim();
+                        let task = parts.next().unwrap_or("").trim();
+                        if selector.is_empty() {
+                            let _ = writeln!(w, "usage: /pack run <name> <task>");
+                        } else if task.is_empty() {
+                            let _ = writeln!(w, "usage: /pack run {selector} <task>");
+                        } else {
+                            let _ = writeln!(
+                                w,
+                                "pack run is async; use /pack run from the interactive loop, or `dext pack run {selector} {task}`"
+                            );
+                        }
                     }
-                }
-                _ => {
-                    let _ = writeln!(w, "usage: /pack [list|inspect <name>|run <name> <task>]");
+                    _ => {
+                        let _ = writeln!(w, "usage: /pack [<name> <task>|list|inspect <name>]");
+                    }
                 }
             }
         }
@@ -20155,7 +21993,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /privacy [on|off|status]  redact sensitive tool output before model context"
+                "  /privacy [on|strict|off|status]  redact sensitive tool output before model context"
             );
             let _ = writeln!(
                 w,
@@ -20182,10 +22020,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(
                 w,
                 "  /shelves                  list typed shelf manifests and ability metadata"
-            );
-            let _ = writeln!(
-                w,
-                "  /browser [off|agent-browser|agentbrowser] optional browser automation recipe"
             );
             let _ = writeln!(
                 w,
@@ -20371,8 +22205,9 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "allow" => {
             if arg.is_empty() {
                 let _ = writeln!(w, "usage: /allow <tool>");
-            } else if !agent.tools.iter().any(|t| t.name == arg) {
-                let _ = writeln!(w, "no such tool: {arg}");
+            } else if !agent.tools.iter().any(|t| t.name == arg) && arg != DIAGNOSTICS_APPROVAL_NAME
+            {
+                let _ = writeln!(w, "no such tool or operation: {arg}");
             } else {
                 agent.allowed.insert(arg.to_string());
                 let _ = writeln!(w, "auto-approving: {arg}");
@@ -20389,7 +22224,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let mut v: Vec<String> = agent
                 .allowed
                 .iter()
-                .filter(|name| agent.tools.iter().any(|tool| tool.name == name.as_str()))
+                .filter(|name| {
+                    name.as_str() == DIAGNOSTICS_APPROVAL_NAME
+                        || agent.tools.iter().any(|tool| tool.name == name.as_str())
+                })
                 .cloned()
                 .collect();
             if v.is_empty() {
@@ -20412,6 +22250,11 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 };
                 let _ = writeln!(w, "trust: {mode}");
                 let _ = writeln!(w, "approval profile: {}", agent.approval_profile().as_str());
+                let _ = writeln!(
+                    w,
+                    "approval source: {}",
+                    agent.approval_policy_source.as_str()
+                );
                 let _ = writeln!(
                     w,
                     "danger zone: privileged tools run without per-call confirmation"
@@ -20441,28 +22284,44 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             "" | "status" => {
                 let _ = writeln!(w, "{}", agent.privacy.status_text());
             }
-            "on" | "redact" | "strict" => {
+            "on" | "redact" => {
                 agent.privacy.enabled = true;
-                agent.privacy.strict_paths = true;
+                agent.privacy.strict_paths = false;
                 let _ = writeln!(w, "privacy -> redact");
                 let _ = writeln!(
                     w,
-                    "raw sensitive-looking tool output will be withheld before model context/session logging"
+                    "user-readable files remain readable; detected secrets in tool output are withheld before model context/session logging"
+                );
+                agent.checkpoint_latest_session("privacy_changed");
+            }
+            "strict" => {
+                agent.privacy.enabled = true;
+                agent.privacy.strict_paths = true;
+                let _ = writeln!(w, "privacy -> strict");
+                let _ = writeln!(
+                    w,
+                    "sensitive-looking native read paths are blocked and detected secrets in tool output are redacted"
                 );
                 agent.checkpoint_latest_session("privacy_changed");
             }
             "off" | "none" | "disabled" => {
                 agent.privacy.enabled = false;
+                agent.privacy.strict_paths = false;
                 let _ = writeln!(w, "privacy -> off");
                 agent.checkpoint_latest_session("privacy_changed");
             }
             _ => {
-                let _ = writeln!(w, "usage: /privacy [on|off|status]");
+                let _ = writeln!(w, "usage: /privacy [on|strict|off|status]");
             }
         },
         "approval" | "approval-profile" => {
             if arg.is_empty() || arg == "status" {
                 let _ = writeln!(w, "approval profile: {}", agent.approval_profile().as_str());
+                let _ = writeln!(
+                    w,
+                    "approval source: {}",
+                    agent.approval_policy_source.as_str()
+                );
                 let _ = writeln!(w, "profiles: ask, auto-read, auto-write, never, always");
             } else if let Some(profile) = ApprovalProfile::parse(arg) {
                 let changed = agent.set_approval_profile(profile);
@@ -20529,22 +22388,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 let _ = writeln!(w, "budget cap -> {}", cap.line());
             } else {
                 let _ = writeln!(w, "usage: /budget [off|$0.25|0.25|200k tokens]");
-            }
-        }
-        "browser" | "browser-recipe" => {
-            if arg.is_empty() || arg == "status" {
-                let _ = writeln!(w, "browser recipe: {}", agent.browser_recipe().as_str());
-                if let Some(hint) = agent.browser_recipe_hint() {
-                    let _ = writeln!(w, "{hint}");
-                }
-            } else if let Some(recipe) = BrowserRecipe::parse(arg) {
-                agent.set_browser_recipe(recipe);
-                let _ = writeln!(w, "browser recipe -> {}", recipe.as_str());
-                if let Some(hint) = agent.browser_recipe_hint() {
-                    let _ = writeln!(w, "{hint}");
-                }
-            } else {
-                let _ = writeln!(w, "usage: /browser [off|agent-browser|agentbrowser]");
             }
         }
         "sandbox" => {
@@ -20638,9 +22481,11 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         },
         "login" => {
             if arg.eq_ignore_ascii_case("cancel") {
-                cancel_pending_oauth_login();
+                let cancelled_oauth = cancel_pending_oauth_login();
                 if let Some(provider) = agent.clear_pending_login() {
                     let _ = writeln!(w, "cancelled pending login for {provider}");
+                } else if cancelled_oauth {
+                    let _ = writeln!(w, "cancelled pending OAuth login");
                 } else {
                     let _ = writeln!(w, "no login is waiting for credentials");
                 }
@@ -20669,12 +22514,12 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                             if awaiting {
                                 agent.set_pending_login_provider(Some(provider_id));
                                 format!(
-                                    "{}\nAfter authenticating, paste the callback URL (http://localhost:...), authorization code, or access token here. /login cancel aborts.\nactive -> {}",
+                                    "{}\nPaste the API key/token, callback URL, or authorization code here when ready. /login cancel aborts.\nactive -> {}",
                                     login.message,
                                     agent.provider_status_line()
                                 )
                             } else {
-                                cancel_pending_oauth_login();
+                                let _ = cancel_pending_oauth_login();
                                 agent.clear_pending_login();
                                 format!(
                                     "{}\nactive -> {}",
@@ -20702,7 +22547,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let provider = arg.split_whitespace().next().filter(|s| !s.is_empty());
             match logout_provider(provider).inspect(|_| {
                 if provider.is_none() || provider == agent.pending_login_provider.as_deref() {
-                    cancel_pending_oauth_login();
+                    let _ = cancel_pending_oauth_login();
                     agent.clear_pending_login();
                 }
                 let _ = agent.reload_provider(None, false);
@@ -20881,8 +22726,21 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "toolset: {}", agent.tool_context_profile().as_str());
             let _ = writeln!(w, "compact threshold: {}", agent.compact_threshold_chars());
             let _ = writeln!(w, "approval profile: {}", agent.approval_profile().as_str());
+            let _ = writeln!(
+                w,
+                "approval source: {}",
+                agent.approval_policy_source.as_str()
+            );
+            let _ = writeln!(
+                w,
+                "durable session: {}",
+                if agent.session_enabled {
+                    "on (side-effect crash recovery available)"
+                } else {
+                    "off (side-effect crash recovery unavailable)"
+                }
+            );
             let _ = writeln!(w, "sandbox profile: {}", agent.sandbox_profile().as_str());
-            let _ = writeln!(w, "browser recipe: {}", agent.browser_recipe().as_str());
             let ledger = agent.work_ledger_prompt();
             if !ledger.trim().is_empty() {
                 let _ = writeln!(w, "work ledger:\n{}", ledger.trim_end());
@@ -20897,37 +22755,44 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = write!(w, "{report}");
         }
         "diagnostics" | "diag" => {
-            let report = run_workflow_diagnostics(&agent.sandbox_root);
-            let errors = report
-                .diagnostics
-                .iter()
-                .filter(|d| d.severity == "error")
-                .count();
-            let warnings = report
-                .diagnostics
-                .iter()
-                .filter(|d| d.severity == "warning")
-                .count();
-            agent
-                .work_ledger
-                .diagnostics
-                .push(WorkflowDiagnosticRecord {
-                    source: report.source.clone(),
-                    status: report.status.clone(),
-                    summary: workflow_diagnostic_summary(&report),
-                    errors,
-                    warnings,
-                    duration_ms: millis_u64(report.duration),
-                });
-            if agent.work_ledger.diagnostics.len() > 12 {
-                let excess = agent.work_ledger.diagnostics.len() - 12;
-                agent.work_ledger.diagnostics.drain(0..excess);
+            if !diagnostics_approved(agent) {
+                let _ = writeln!(
+                    w,
+                    "permission denied: diagnostics execute project code; approve once or always to run"
+                );
+            } else {
+                let report = run_workflow_diagnostics(&agent.sandbox_root);
+                let errors = report
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == "error")
+                    .count();
+                let warnings = report
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity == "warning")
+                    .count();
+                agent
+                    .work_ledger
+                    .diagnostics
+                    .push(WorkflowDiagnosticRecord {
+                        source: report.source.clone(),
+                        status: report.status.clone(),
+                        summary: workflow_diagnostic_summary(&report),
+                        errors,
+                        warnings,
+                        duration_ms: millis_u64(report.duration),
+                    });
+                if agent.work_ledger.diagnostics.len() > 12 {
+                    let excess = agent.work_ledger.diagnostics.len() - 12;
+                    agent.work_ledger.diagnostics.drain(0..excess);
+                }
+                let _ = write!(
+                    w,
+                    "{}",
+                    render_workflow_diagnostics(&report, SLASH_TEXT_CAP)
+                );
             }
-            let _ = write!(
-                w,
-                "{}",
-                render_workflow_diagnostics(&report, SLASH_TEXT_CAP)
-            );
         }
         "save" => {
             if arg.is_empty() {
@@ -21612,6 +23477,7 @@ fn final_objective_warning(
 }
 
 const ACTION_CONTRACT_MUTATING_TOOL_NAMES: &[&str] = &["edit_file", "multi_edit", "write_file"];
+const ACTION_CONTRACT_MAX_NO_MUTATION_RESPONSES: u32 = 3;
 
 fn block_text(block: &Block) -> Option<&str> {
     match block {
@@ -21748,9 +23614,19 @@ fn blocks_contain_pseudo_tool_syntax_for_context(
     }
 }
 
+fn action_contract_should_retry(no_mutation_turns: u32) -> bool {
+    no_mutation_turns < ACTION_CONTRACT_MAX_NO_MUTATION_RESPONSES
+}
+
+fn action_contract_retry_halted_note(no_mutation_turns: u32) -> String {
+    format!(
+        "runtime guidance: stopped forcing action-contract retries after {no_mutation_turns} assistant responses without a successful file mutation; preserving the latest response to prevent an unbounded provider loop."
+    )
+}
+
 fn action_contract_runtime_note(no_mutation_turns: u32) -> String {
     format!(
-        "runtime guidance: action contract active because the assistant committed to implement/apply changes. This is invalid progress after {no_mutation_turns} assistant response(s) without a successful file mutation. Keep looping; next assistant message must use a real file-mutating tool_use ({} or a bash command that mutates files). Text-only blocked statements do not clear this contract.",
+        "runtime guidance: action contract active because the assistant committed to implement/apply changes. This is invalid progress after {no_mutation_turns} assistant response(s) without a successful file mutation. Retry with a real file-mutating tool_use ({} or a bash command that mutates files). Text-only blocked statements do not clear this contract.",
         ACTION_CONTRACT_MUTATING_TOOL_NAMES.join("|")
     )
 }
@@ -21770,15 +23646,25 @@ fn run_eval_shell_command(
     root: &Path,
     command: &str,
 ) -> std::result::Result<(i32, String, String), String> {
-    let mut cmd = Command::new("bash");
-    cmd.arg("-lc").arg(command).current_dir(root);
+    let bash = bash_executable_path();
+    let mut sandboxed = sandbox::std_command(&bash, SandboxProfile::ReadOnly, root, &[])
+        .map_err(|error| format!("prepare eval sandbox: {error}"))?;
+    sandboxed
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(command)
+        .current_dir(root);
+    harden_internal_command_env(&mut sandboxed);
+    let (cmd, scratch) = sandboxed.into_parts();
     let started_at = std::time::Instant::now();
-    let (stdout, stderr, code) = run_sync_command_limited(
+    let (stdout, stderr, code) = run_sync_command_limited_with_scratch(
         cmd,
         None,
         PROCESS_STREAM_CAPTURE_CAP,
         "eval command",
         timeout_from_env("DEXT_EVAL_TIMEOUT_SECS", 15),
+        scratch,
     )?;
     let duration = started_at.elapsed();
     let stdout = stdout.render("stdout");
@@ -22150,15 +24036,12 @@ pub(crate) struct CliOptions {
     pub(crate) resume_selector: Option<String>,
     pub(crate) no_session: bool,
     pub(crate) no_tui: bool,
-    pub(crate) trust_mode: bool,
-    pub(crate) no_trust_mode: bool,
+    pub(crate) approval_policy_override: Option<ApprovalProfile>,
     pub(crate) output: OutputMode,
     pub(crate) cd: Option<PathBuf>,
     pub(crate) fork: bool,
     pub(crate) budget_cap: Option<BudgetCap>,
-    pub(crate) approval_profile: Option<ApprovalProfile>,
     pub(crate) sandbox_profile: Option<SandboxProfile>,
-    pub(crate) browser_recipe: Option<BrowserRecipe>,
     pub(crate) thinking_effort: Option<ThinkingEffort>,
     pub(crate) context_mode: Option<ContextMode>,
     pub(crate) tool_context_profile: Option<ToolContextProfile>,
@@ -22174,15 +24057,12 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut resume_selector: Option<String> = None;
     let mut no_session = false;
     let mut no_tui = false;
-    let mut trust_mode = false;
-    let mut no_trust_mode = false;
+    let mut approval_policy_override: Option<ApprovalProfile> = None;
     let mut output = OutputMode::Text;
     let mut cd: Option<PathBuf> = None;
     let mut fork = false;
     let mut budget_cap: Option<BudgetCap> = None;
-    let mut approval_profile: Option<ApprovalProfile> = None;
     let mut sandbox_profile: Option<SandboxProfile> = None;
-    let mut browser_recipe: Option<BrowserRecipe> = None;
     let mut thinking_effort: Option<ThinkingEffort> = None;
     let mut context_mode: Option<ContextMode> = None;
     let mut tool_context_profile: Option<ToolContextProfile> = None;
@@ -22197,14 +24077,8 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--resume" => resume_latest = true,
             "--no-session" => no_session = true,
             "--no-tui" => no_tui = true,
-            "--trust" => {
-                trust_mode = true;
-                no_trust_mode = false;
-            }
-            "--no-trust" => {
-                no_trust_mode = true;
-                trust_mode = false;
-            }
+            "--trust" => approval_policy_override = Some(ApprovalProfile::Always),
+            "--no-trust" => approval_policy_override = Some(ApprovalProfile::Ask),
             "--fork" => fork = true,
             "--frugal" => {
                 context_mode = Some(ContextMode::Frugal);
@@ -22283,7 +24157,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                 let value = argv.get(i).ok_or_else(|| {
                     anyhow::anyhow!("--approval requires ask|auto-read|auto-write|never|always")
                 })?;
-                approval_profile = Some(ApprovalProfile::parse(value).ok_or_else(|| {
+                approval_policy_override = Some(ApprovalProfile::parse(value).ok_or_else(|| {
                     anyhow::anyhow!("invalid --approval '{value}' (expected ask|auto-read|auto-write|never|always)")
                 })?);
             }
@@ -22325,18 +24199,6 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     cd = Some(PathBuf::from(value));
                 }
             }
-            "--browser" | "--browser-recipe" => {
-                i += 1;
-                let value = argv.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--browser requires off|agent-browser|agentbrowser")
-                })?;
-                browser_recipe = Some(BrowserRecipe::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid --browser '{value}' (expected off|agent-browser|agentbrowser)"
-                    )
-                })?);
-            }
-            "--agent-browser" => browser_recipe = Some(BrowserRecipe::AgentBrowser),
             "--effort" | "--thinking-effort" => {
                 i += 1;
                 let value = argv.get(i).ok_or_else(|| {
@@ -22442,7 +24304,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .strip_prefix("--approval=")
                     .or_else(|| arg.strip_prefix("--approval-profile="))
                     .unwrap_or_default();
-                approval_profile = Some(ApprovalProfile::parse(value).ok_or_else(|| {
+                approval_policy_override = Some(ApprovalProfile::parse(value).ok_or_else(|| {
                     anyhow::anyhow!("invalid approval profile '{value}' (expected ask|auto-read|auto-write|never|always)")
                 })?);
             }
@@ -22474,17 +24336,6 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     cd = Some(PathBuf::from(value));
                 }
             }
-            _ if arg.starts_with("--browser=") || arg.starts_with("--browser-recipe=") => {
-                let value = arg
-                    .strip_prefix("--browser=")
-                    .or_else(|| arg.strip_prefix("--browser-recipe="))
-                    .unwrap_or_default();
-                browser_recipe = Some(BrowserRecipe::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid browser recipe '{value}' (expected off|agent-browser|agentbrowser)"
-                    )
-                })?);
-            }
             _ if arg.starts_with('@') => {
                 let path = arg.trim_start_matches('@');
                 let content = std::fs::read_to_string(path)
@@ -22503,15 +24354,12 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         resume_selector,
         no_session,
         no_tui,
-        trust_mode,
-        no_trust_mode,
+        approval_policy_override,
         output,
         cd,
         fork,
         budget_cap,
-        approval_profile,
         sandbox_profile,
-        browser_recipe,
         thinking_effort,
         context_mode,
         tool_context_profile,
@@ -22529,6 +24377,14 @@ fn env_flag_default(name: &str, default: bool) -> bool {
         }
         Err(_) => default,
     }
+}
+
+fn load_user_dotenv_from(path: &Path) {
+    let _ = dotenvy::from_path(path);
+}
+
+fn load_user_dotenv() {
+    load_user_dotenv_from(&dext_state_dir().join(".env"));
 }
 
 fn autosave_latest(agent: &mut Agent) {
@@ -22563,9 +24419,15 @@ fn fixup_path() {
     }
 }
 
+fn parse_pack_cli_invocation(argv: &[String], sub_idx: usize) -> Option<(String, String)> {
+    let raw = argv.get(sub_idx..)?.join(" ");
+    packs::pack_invocation_args(&raw)
+        .map(|(selector, task)| (selector.to_string(), task.to_string()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    load_user_dotenv();
     fixup_path();
 
     let default_panic = std::panic::take_hook();
@@ -22575,8 +24437,8 @@ async fn main() -> Result<()> {
         if panic_info_is_broken_pipe(info) {
             std::process::exit(0);
         }
-        if let Some(path) = write_crash_snapshot(info) {
-            eprintln!("[dext crash snapshot: {}]", path.display());
+        if let Some(id) = write_crash_snapshot(info) {
+            eprintln!("{}", crash_snapshot_notice(&id));
         }
         default_panic(info);
     }));
@@ -22622,7 +24484,7 @@ async fn main() -> Result<()> {
             }
             "run" | "use" | "start" => {
                 if argv.len() < sub_idx + 3 {
-                    eprintln!("usage: dext pack run <name> <task>");
+                    eprintln!("usage: dext pack <name> <task>");
                     release_registered_locks();
                     std::process::exit(2);
                 }
@@ -22631,8 +24493,12 @@ async fn main() -> Result<()> {
                 forwarded.insert(1, argv[sub_idx + 1].clone());
                 argv = forwarded;
             }
+            _ if parse_pack_cli_invocation(&argv, sub_idx).is_some() => {
+                let (selector, task) = parse_pack_cli_invocation(&argv, sub_idx).unwrap();
+                argv = vec!["--pack".to_string(), selector, task];
+            }
             _ => {
-                eprintln!("usage: dext pack [list|inspect <name>|run <name> <task>]");
+                eprintln!("usage: dext pack [<name> <task>|list|inspect <name>]");
                 release_registered_locks();
                 std::process::exit(2);
             }
@@ -22681,7 +24547,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."))
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from("."));
-        let code = handle_doctor_cli(&root);
+        let code = handle_doctor_cli(&argv[1..], &root);
         release_registered_locks();
         std::process::exit(code);
     }
@@ -22699,15 +24565,20 @@ async fn main() -> Result<()> {
         println!("       dext session tracks");
         println!("       dext session track open [latest|NAME|PATH] @wNN [name]");
         println!("       dext session export [latest|NAME|PATH] [html|jsonl] [OUT]");
-        println!("       dext doctor           check environment, sandbox, providers, and tools");
-        println!("       dext pack list|inspect|run ...  discover or invoke Dext packs");
+        println!("       dext doctor [--approval PROFILE] [--sandbox PROFILE] [--cd DIR]");
+        println!("                           inspect effective safety policy and local state");
+        println!("       dext pack <name> <task>        invoke a Dext pack (`run` optional)");
         println!(
             "       dext shelves                      list typed shelf manifests and ability metadata"
         );
         println!("       dext --pack NAME TASK  invoke a pack in one-shot mode");
         println!("       dext session analyze|grep|failures|verify-log|decisions [session]");
-        println!("       dext --no-session     run without autosaved session/log writes");
-        println!("       dext --fork           resume latest into an isolated, unsaved branch");
+        println!(
+            "       dext --no-session     disable session/log writes and side-effect crash recovery"
+        );
+        println!(
+            "       dext --fork           resume into an unsaved branch without side-effect crash recovery"
+        );
         println!("       dext --cd DIR         use DIR as sandbox/cwd");
         println!("       dext --output json|stream-json  emit machine-readable output");
         println!(
@@ -22716,7 +24587,6 @@ async fn main() -> Result<()> {
         println!("       dext --approval ask|auto-read|auto-write|never|always");
         println!("       dext --preview off|simple|git  mutation preview mode");
         println!("       dext --sandbox read-only|workspace-write|danger-full-access");
-        println!("       dext --browser agent-browser    add optional browser automation recipe");
         println!(
             "       dext --effort off|low|medium|high|xhigh|max  set provider reasoning effort"
         );
@@ -22731,8 +24601,8 @@ async fn main() -> Result<()> {
             "       dext --tool-profile lean|full  choose provider tool schema verbosity (default lean)"
         );
         println!("       dext --eval [NAME]    run eval harness (optionally a single case)");
-        println!("       dext --trust          auto-approve privileged tools");
-        println!("       dext --no-trust       opt out of default trust mode");
+        println!("       dext --trust          opt into auto-approval for privileged tools");
+        println!("       dext --no-trust       explicitly select the default ask profile");
         println!("       dext auth ...         provider/model/auth management commands");
         println!("       dext undo --list      list recent Dext checkpoints");
         println!("       dext undo --preview <id>  non-interactive preview");
@@ -22743,7 +24613,7 @@ async fn main() -> Result<()> {
         println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_SANDBOX, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_TRUST=0 to opt out of default trust, DEXT_PRIVACY=0 to disable default output redaction and sensitive-path guards, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_APPROVAL, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR, DEXT_BROWSER_RECIPE"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_PACKS_DIR, DEXT_SHELVES_DIR"
         );
         return Ok(());
     }
@@ -22754,8 +24624,10 @@ async fn main() -> Result<()> {
         std::process::exit(if ok { 0 } else { 1 });
     }
     let opts = parse_cli_options(argv.clone())?;
-    let trust_mode =
-        opts.trust_mode || (!opts.no_trust_mode && env_flag_default("DEXT_TRUST", true));
+    let approval_policy = resolve_approval_policy_from_env(opts.approval_policy_override);
+    for warning in &approval_policy.warnings {
+        eprintln!("[approval warning] {warning}");
+    }
 
     let one_shot_task: Option<String> = if !opts.positional.is_empty() {
         Some(opts.positional.join(" "))
@@ -22774,12 +24646,6 @@ async fn main() -> Result<()> {
 
     let mut agent = Agent::new_with_sandbox(opts.cd.clone(), !opts.no_session && !opts.fork)?;
     agent.prewarm_connection();
-    if let Some(profile) = std::env::var("DEXT_APPROVAL")
-        .ok()
-        .and_then(|v| ApprovalProfile::parse(&v))
-    {
-        agent.set_approval_profile(profile);
-    }
     if let Some(profile) = std::env::var("DEXT_SANDBOX_PROFILE")
         .ok()
         .and_then(|v| SandboxProfile::parse(&v))
@@ -22789,14 +24655,8 @@ async fn main() -> Result<()> {
     if let Some(cap) = opts.budget_cap {
         agent.set_budget_cap(Some(cap));
     }
-    if let Some(profile) = opts.approval_profile {
-        agent.set_approval_profile(profile);
-    }
     if let Some(profile) = opts.sandbox_profile {
         agent.set_sandbox_profile(profile);
-    }
-    if let Some(recipe) = opts.browser_recipe {
-        agent.set_browser_recipe(recipe);
     }
     if let Some(effort) = opts.thinking_effort {
         agent.set_thinking_effort(effort);
@@ -22856,7 +24716,7 @@ async fn main() -> Result<()> {
                 if !opts.output.is_json() {
                     if opts.fork {
                         eprintln!(
-                            "[forked {} messages from {}; autosave disabled]",
+                            "[forked {} messages from {}; autosave and side-effect crash recovery disabled]",
                             agent.history.len(),
                             path.display()
                         );
@@ -22876,23 +24736,26 @@ async fn main() -> Result<()> {
             }
         }
     }
-    if trust_mode {
-        let _ = agent.set_trust_mode(true);
-    }
+    agent.set_resolved_approval_profile(approval_policy.profile, approval_policy.source);
     if !opts.output.is_json() {
+        eprintln!(
+            "[approval] profile {} (source {})",
+            approval_policy.profile.as_str(),
+            approval_policy.source.as_str()
+        );
         if let Some(cap) = agent.budget_cap {
             eprintln!("[budget] cap {}", cap.line());
         }
         if agent.sandbox_profile() != SandboxProfile::WorkspaceWrite {
             eprintln!("[sandbox] profile {}", agent.sandbox_profile().as_str());
         }
+        if agent.sandbox_profile() != SandboxProfile::DangerFullAccess && !sandbox::is_enforced() {
+            eprintln!("[sandbox warning] {}", sandbox::describe());
+        }
         if agent.tool_context_profile() != ToolContextProfile::Default
             && !agent.context_mode.is_frugal()
         {
             eprintln!("[tools] toolset {}", agent.tool_context_profile().as_str());
-        }
-        if agent.browser_recipe() != BrowserRecipe::Disabled {
-            eprintln!("[browser] recipe {}", agent.browser_recipe().as_str());
         }
     }
 
@@ -22979,7 +24842,7 @@ async fn main() -> Result<()> {
     agent.install_steering(steer_rx, steer_tx.clone());
     if opts.fork {
         println!(
-            "fork: autosave disabled; use /save <name> or /export [path] to keep this branch."
+            "fork: autosave and side-effect crash recovery disabled; use /save <name> or /export [path] to keep this branch."
         );
     }
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -23152,20 +25015,12 @@ async fn main() -> Result<()> {
                 .trim_start_matches("/packs")
                 .trim_start_matches("/pack")
                 .trim();
-            let mut parts = raw.splitn(3, char::is_whitespace);
-            let sub = parts.next().unwrap_or("");
-            if matches!(sub, "run" | "use" | "start") {
-                let selector = parts.next().unwrap_or("").trim();
-                let task = parts.next().unwrap_or("").trim();
-                if selector.is_empty() || task.is_empty() {
-                    println!("usage: /pack run <name> <task>");
-                } else {
-                    agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    if let Err(e) = agent.run_pack(selector, task).await {
-                        eprintln!("[pack error] {e:#}");
-                    }
-                    agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Some((selector, task)) = packs::pack_invocation_args(raw) {
+                agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Err(e) = agent.run_pack(selector, task).await {
+                    eprintln!("[pack error] {e:#}");
                 }
+                agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                 autosave_latest(&mut agent);
                 continue;
             }

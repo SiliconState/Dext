@@ -7,14 +7,11 @@ use crossterm::event::{
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{TerminalOptions, Viewport};
-use ratatui_core::layout::Alignment as MdAlignment;
-use ratatui_core::style::{Color as MdColor, Modifier as MdModifier, Style as MdStyle};
-use ratatui_core::text::Text as MdText;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -33,13 +30,16 @@ use crate::{
     HISTORY_CHAR_BUDGET_END_TURN_PERCENT, LocalAuthSecret, ThinkingEffort, Usage, WorkMapEventKind,
     canonical_provider_id, clear_secret_string, git_summary, handle_slash,
     history_char_budget_with_window, load_auth_store, load_provider_catalog, model_context_window,
-    orchestrator::ExternalTelemetry, parse_active_runtime_control_sequence, parse_compact_slash,
-    provider_auth_status, pseudo_tool_redaction_marker, redact_pseudo_tool_protocol_text,
-    resolve_active_provider_id, summarize_call, text_line_looks_like_pseudo_tool_syntax,
+    orchestrator::ExternalTelemetry, packs, parse_active_runtime_control_sequence,
+    parse_compact_slash, provider_auth_status, pseudo_tool_redaction_marker,
+    redact_pseudo_tool_protocol_text, resolve_active_provider_id, summarize_call,
+    text_line_looks_like_pseudo_tool_syntax,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
 const RENDER_CACHE_MAX_ENTRIES: usize = 2048;
+const RENDER_CACHE_MAX_WIDTHS_PER_ENTRY: usize = 2;
+const RENDER_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const VIEWPORT_HEIGHT: u16 = 10;
 const COLLAPSED_PREVIEW_LINES: usize = 4;
 const TOOL_DENSITY_SEPARATOR_EVERY: usize = 10;
@@ -58,6 +58,8 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 const LIVE_BACKEND_RING_CAP: usize = 256_000;
 const LIVE_BACKEND_MAX_TOOLS: usize = 8;
 const LIVE_OUTPUT_DRAIN_BATCH: usize = 32;
+const RESIZE_REPLAY_QUIET: Duration = Duration::from_millis(120);
+const RESIZE_REPLAY_MAX_LATENCY: Duration = Duration::from_millis(360);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ToolChunk {
@@ -372,11 +374,6 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         name: "/budget",
         args: "[cap|off]",
         help: "show/set spend cap",
-    },
-    SlashCmd {
-        name: "/browser",
-        args: "[off|agent-browser|agentbrowser]",
-        help: "optional browser recipe",
     },
     SlashCmd {
         name: "/sandbox",
@@ -739,8 +736,13 @@ fn slash_completions(input: &str) -> Vec<SlashCompletion> {
 }
 
 struct CachedTranscriptRender {
-    renders: HashMap<u16, Text<'static>>,
-    heights: HashMap<u16, u16>,
+    renders: HashMap<u16, CachedTranscriptVariant>,
+}
+
+struct CachedTranscriptVariant {
+    text: Text<'static>,
+    height: u16,
+    weight: usize,
 }
 
 struct TranscriptLayoutState {
@@ -762,6 +764,7 @@ struct TuiState {
     pending_insert: Vec<Line_>,
     transcript: Vec<Line_>,
     render_cache: HashMap<u64, CachedTranscriptRender>,
+    render_cache_weight: usize,
     transcript_rendered_width: u16,
     transcript_scroll_offset: usize,
     transcript_hover_expandable: Option<usize>,
@@ -872,6 +875,7 @@ impl TuiState {
             pending_insert: Vec::new(),
             transcript: Vec::new(),
             render_cache: HashMap::new(),
+            render_cache_weight: 0,
             transcript_rendered_width: 0,
             transcript_scroll_offset: 0,
             transcript_hover_expandable: None,
@@ -1233,14 +1237,16 @@ impl TuiState {
 
     fn queue(&mut self, line: Line_) {
         let is_transcript_block = Self::line_needs_history_spacing(&line);
-        let is_steering = matches!(line, Line_::Steering(_));
-        if ((is_transcript_block && self.last_line_needs_history_spacing()) || is_steering)
+        let needs_trailing_blank =
+            matches!(line, Line_::PermissionResult { .. } | Line_::Steering(_));
+        if is_transcript_block
+            && self.last_line_needs_history_spacing()
             && !self.pending_insert.ends_with(&[Line_::Blank])
         {
             self.pending_insert.push(Line_::Blank);
         }
         self.pending_insert.push(line);
-        if is_steering {
+        if needs_trailing_blank {
             self.pending_insert.push(Line_::Blank);
         }
     }
@@ -1943,8 +1949,6 @@ impl TuiState {
                 last_retry_reason,
                 workaround_fired,
                 context_mode,
-                tool_profile: _,
-                compacted: _,
                 ..
             } => {
                 self.push_debug_event(format!(
@@ -2959,12 +2963,16 @@ fn transcript_item_should_dim(item: &Line_, state: &TuiState) -> bool {
         || state.pending_local_auth.is_some()
 }
 
-fn replace_last_permission_entry(items: &mut [Line_], replacement: Line_) -> bool {
+fn replace_last_permission_entry(items: &mut Vec<Line_>, replacement: Line_) -> bool {
     if let Some(idx) = items
         .iter()
         .rposition(|item| matches!(item, Line_::PermissionPrompt { .. }))
     {
+        let resolved = matches!(replacement, Line_::PermissionResult { .. });
         items[idx] = replacement;
+        if resolved && !matches!(items.get(idx + 1), Some(Line_::Blank)) {
+            items.insert(idx + 1, Line_::Blank);
+        }
         true
     } else {
         false
@@ -3957,136 +3965,60 @@ fn abstract_input_with_spans(input: &str, spans: &[InputPreviewSpan]) -> Option<
 struct DextMarkdownStyleSheet;
 
 impl MarkdownStyleSheet for DextMarkdownStyleSheet {
-    fn heading(&self, level: u8) -> MdStyle {
+    fn heading(&self, level: u8) -> Style {
         match level {
-            1 => MdStyle::default()
-                .fg(MdColor::LightCyan)
-                .add_modifier(MdModifier::BOLD),
-            2 => MdStyle::default()
-                .fg(MdColor::Cyan)
-                .add_modifier(MdModifier::BOLD),
-            3 => MdStyle::default()
-                .fg(MdColor::LightCyan)
-                .add_modifier(MdModifier::BOLD),
-            _ => MdStyle::default()
-                .fg(MdColor::Gray)
-                .add_modifier(MdModifier::BOLD),
+            1 => Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+            2 => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            3 => Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
         }
     }
 
-    fn code(&self) -> MdStyle {
-        MdStyle::default()
+    fn code(&self) -> Style {
+        Style::default()
     }
 
-    fn link(&self) -> MdStyle {
-        MdStyle::default()
-            .fg(MdColor::LightBlue)
-            .add_modifier(MdModifier::UNDERLINED)
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::UNDERLINED)
     }
 
-    fn blockquote(&self) -> MdStyle {
-        MdStyle::default().fg(MdColor::Green)
+    fn blockquote(&self) -> Style {
+        Style::default().fg(Color::Green)
     }
 
-    fn heading_meta(&self) -> MdStyle {
-        MdStyle::default().fg(MdColor::DarkGray)
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(Color::DarkGray)
     }
 
-    fn metadata_block(&self) -> MdStyle {
-        MdStyle::default().fg(MdColor::Gray)
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(Color::Gray)
     }
 }
 
-fn md_color_to_color(color: MdColor) -> Color {
-    match color {
-        MdColor::Reset => Color::Reset,
-        MdColor::Black => Color::Black,
-        MdColor::Red => Color::Red,
-        MdColor::Green => Color::Green,
-        MdColor::Yellow => Color::Yellow,
-        MdColor::Blue => Color::Blue,
-        MdColor::Magenta => Color::Magenta,
-        MdColor::Cyan => Color::Cyan,
-        MdColor::Gray => Color::Gray,
-        MdColor::DarkGray => Color::DarkGray,
-        MdColor::LightRed => Color::LightRed,
-        MdColor::LightGreen => Color::LightGreen,
-        MdColor::LightYellow => Color::LightYellow,
-        MdColor::LightBlue => Color::LightBlue,
-        MdColor::LightMagenta => Color::LightMagenta,
-        MdColor::LightCyan => Color::LightCyan,
-        MdColor::White => Color::Reset,
-        MdColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
-        MdColor::Indexed(i) => Color::Indexed(i),
-    }
-}
-
-fn md_modifier_to_modifier(modifier: MdModifier) -> Modifier {
-    let mut out = Modifier::empty();
-    if modifier.contains(MdModifier::BOLD) {
-        out |= Modifier::BOLD;
-    }
-    if modifier.contains(MdModifier::DIM) {
-        out |= Modifier::DIM;
-    }
-    if modifier.contains(MdModifier::ITALIC) {
-        out |= Modifier::ITALIC;
-    }
-    if modifier.contains(MdModifier::UNDERLINED) {
-        out |= Modifier::UNDERLINED;
-    }
-    if modifier.contains(MdModifier::SLOW_BLINK) {
-        out |= Modifier::SLOW_BLINK;
-    }
-    if modifier.contains(MdModifier::RAPID_BLINK) {
-        out |= Modifier::RAPID_BLINK;
-    }
-    if modifier.contains(MdModifier::REVERSED) {
-        out |= Modifier::REVERSED;
-    }
-    if modifier.contains(MdModifier::HIDDEN) {
-        out |= Modifier::HIDDEN;
-    }
-    if modifier.contains(MdModifier::CROSSED_OUT) {
-        out |= Modifier::CROSSED_OUT;
-    }
-    out
-}
-
-fn md_style_to_style(style: MdStyle) -> Style {
-    Style {
-        fg: style.fg.map(md_color_to_color),
-        bg: style.bg.map(md_color_to_color),
-        underline_color: style.underline_color.map(md_color_to_color),
-        add_modifier: md_modifier_to_modifier(style.add_modifier),
-        sub_modifier: md_modifier_to_modifier(style.sub_modifier),
-    }
-}
-
-fn md_alignment_to_alignment(alignment: MdAlignment) -> Alignment {
-    match alignment {
-        MdAlignment::Left => Alignment::Left,
-        MdAlignment::Center => Alignment::Center,
-        MdAlignment::Right => Alignment::Right,
-    }
-}
-
-fn text_to_static(text: MdText<'_>) -> Text<'static> {
+fn text_to_static(text: Text<'_>) -> Text<'static> {
     Text {
-        alignment: text.alignment.map(md_alignment_to_alignment),
-        style: md_style_to_style(text.style),
+        alignment: text.alignment,
+        style: text.style,
         lines: text
             .lines
             .into_iter()
             .map(|line| Line {
-                style: md_style_to_style(line.style),
-                alignment: line.alignment.map(md_alignment_to_alignment),
+                style: line.style,
+                alignment: line.alignment,
                 spans: line
                     .spans
                     .into_iter()
-                    .map(|span| {
-                        Span::styled(span.content.into_owned(), md_style_to_style(span.style))
-                    })
+                    .map(|span| Span::styled(span.content.into_owned(), span.style))
                     .collect(),
             })
             .collect(),
@@ -6258,19 +6190,49 @@ fn render_tool_content_body(
     }
 }
 
-fn text_visual_height(text: &Text, width: u16) -> u16 {
-    let w = width.max(1) as usize;
-    let mut h: u16 = 0;
-    for line in &text.lines {
-        let cells: usize = line
-            .spans
+fn borrowed_text_lines<'a>(text: &'a Text<'_>, line_start: usize, line_end: usize) -> Text<'a> {
+    Text {
+        alignment: text.alignment,
+        style: text.style,
+        lines: text.lines[line_start..line_end]
             .iter()
-            .map(|s| text_width(s.content.as_ref()))
-            .sum();
-        let rows = if cells == 0 { 1 } else { cells.div_ceil(w) };
-        h = h.saturating_add(rows as u16);
+            .map(|line| Line {
+                style: line.style,
+                alignment: line.alignment,
+                spans: line
+                    .spans
+                    .iter()
+                    .map(|span| Span::styled(span.content.as_ref(), span.style))
+                    .collect(),
+            })
+            .collect(),
     }
-    h.max(1)
+}
+
+fn text_visual_height(text: &Text, width: u16) -> u16 {
+    let borrowed = borrowed_text_lines(text, 0, text.lines.len());
+    Paragraph::new(borrowed)
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1))
+        .clamp(1, u16::MAX as usize) as u16
+}
+
+fn text_render_weight(text: &Text<'_>) -> usize {
+    text.lines.iter().fold(0usize, |weight, line| {
+        line.spans.iter().fold(
+            weight.saturating_add(std::mem::size_of::<Line<'static>>()),
+            |weight, span| {
+                weight
+                    .saturating_add(std::mem::size_of::<Span<'static>>())
+                    .saturating_add(span.content.len())
+            },
+        )
+    })
+}
+
+fn clear_render_cache(state: &mut TuiState) {
+    state.render_cache.clear();
+    state.render_cache_weight = 0;
 }
 
 fn cached_transcript_render(
@@ -6292,31 +6254,56 @@ fn cached_transcript_render(
     }
 
     let key = line_cache_key(item);
-    // The cache is keyed by content hash and the transcript only grows, so without a cap it
-    // retains a rendered copy of every line ever inserted. A full clear is safe: this is pure
-    // memoization and rebuilds repopulate lazily, touching each item at most once per pass.
     if state.render_cache.len() >= RENDER_CACHE_MAX_ENTRIES
         && !state.render_cache.contains_key(&key)
     {
-        state.render_cache.clear();
+        clear_render_cache(state);
     }
-    let entry = state
+    if let Some(cached) = state
         .render_cache
-        .entry(key)
-        .or_insert_with(|| CachedTranscriptRender {
-            renders: HashMap::new(),
-            heights: HashMap::new(),
-        });
+        .get(&key)
+        .and_then(|entry| entry.renders.get(&render_width))
+    {
+        let mut text = cached.text.clone();
+        if transcript_item_should_dim(item, state) {
+            dim_text(&mut text);
+        }
+        return (text, cached.height);
+    }
 
-    let text = entry
-        .renders
-        .entry(render_width)
-        .or_insert_with(|| line_to_text(item, render_width))
-        .clone();
-    let height = *entry
-        .heights
-        .entry(render_width)
-        .or_insert_with(|| text_visual_height(&text, render_width));
+    if let Some(entry) = state.render_cache.get_mut(&key)
+        && entry.renders.len() >= RENDER_CACHE_MAX_WIDTHS_PER_ENTRY
+    {
+        let removed_weight = entry.renders.drain().fold(0usize, |weight, (_, cached)| {
+            weight.saturating_add(cached.weight)
+        });
+        state.render_cache_weight = state.render_cache_weight.saturating_sub(removed_weight);
+    }
+
+    let text = line_to_text(item, render_width);
+    let height = text_visual_height(&text, render_width);
+    let weight = text_render_weight(&text);
+    if weight <= RENDER_CACHE_MAX_BYTES {
+        if state.render_cache_weight.saturating_add(weight) > RENDER_CACHE_MAX_BYTES {
+            clear_render_cache(state);
+        }
+        state
+            .render_cache
+            .entry(key)
+            .or_insert_with(|| CachedTranscriptRender {
+                renders: HashMap::new(),
+            })
+            .renders
+            .insert(
+                render_width,
+                CachedTranscriptVariant {
+                    text: text.clone(),
+                    height,
+                    weight,
+                },
+            );
+        state.render_cache_weight = state.render_cache_weight.saturating_add(weight);
+    }
 
     let mut text = text;
     if transcript_item_should_dim(item, state) {
@@ -6366,38 +6353,209 @@ fn next_transcript_tint(item: &Line_, tool_tint_parity: &mut bool) -> Option<Col
     }
 }
 
-fn insert_transcript_item<B: Backend>(
+struct TranscriptResizeReplay {
+    observed_width: Option<u16>,
+    last_change: Instant,
+    last_replay: Instant,
+    burst_active: bool,
+}
+
+impl TranscriptResizeReplay {
+    fn new(now: Instant) -> Self {
+        Self {
+            observed_width: None,
+            last_change: now,
+            last_replay: now,
+            burst_active: false,
+        }
+    }
+
+    fn should_replay(
+        &mut self,
+        width: u16,
+        rendered_width: u16,
+        has_transcript: bool,
+        now: Instant,
+    ) -> bool {
+        if !has_transcript {
+            self.observed_width = Some(width);
+            self.last_change = now;
+            self.last_replay = now;
+            self.burst_active = false;
+            return true;
+        }
+
+        if self.observed_width != Some(width) {
+            let leading_edge = !self.burst_active;
+            self.observed_width = Some(width);
+            self.last_change = now;
+            self.burst_active = true;
+            if leading_edge || now.duration_since(self.last_replay) >= RESIZE_REPLAY_MAX_LATENCY {
+                self.last_replay = now;
+                return true;
+            }
+            return false;
+        }
+
+        if self.burst_active && now.duration_since(self.last_change) >= RESIZE_REPLAY_QUIET {
+            self.burst_active = false;
+            if rendered_width != width {
+                self.last_replay = now;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+struct PreparedTranscriptRender {
+    text: Arc<Text<'static>>,
+    line_start: usize,
+    line_end: usize,
+    scroll: u16,
+    height: u16,
+    tint_bg: Option<Color>,
+}
+
+fn insert_prepared_transcript<B: Backend>(
     terminal: &mut Terminal<B>,
-    state: &mut TuiState,
-    item: &Line_,
-    width: u16,
-    tool_tint_parity: &mut bool,
+    items: Vec<PreparedTranscriptRender>,
+    render_width: u16,
+    height: u16,
 ) -> Result<(), B::Error> {
-    let render_width = transcript_render_width(width);
-    let (text, height) = cached_transcript_render(state, item, width);
-    let tint_bg = match item {
-        Line_::Thinking(_) => Some(THINKING_BG),
-        Line_::Steering(_) => Some(STEERING_BG),
-        _ => next_transcript_tint(item, tool_tint_parity),
-    };
-    terminal.insert_before(height, |buf| {
-        let area = Rect {
-            width: render_width.min(buf.area.width),
-            ..buf.area
-        };
-        let para = Paragraph::new(text).wrap(Wrap { trim: false });
-        Widget::render(para, area, buf);
-        if let Some(bg) = tint_bg {
-            for y in area.top()..area.bottom() {
-                for x in area.left()..area.right() {
-                    let cell = &mut buf[(x, y)];
-                    if cell.bg == Color::Reset {
-                        cell.bg = bg;
+    terminal.insert_before(height, move |buf| {
+        let mut y = buf.area.y;
+        for item in items {
+            let area = Rect {
+                y,
+                width: render_width.min(buf.area.width),
+                height: item.height,
+                ..buf.area
+            };
+            let text = borrowed_text_lines(item.text.as_ref(), item.line_start, item.line_end);
+            let para = Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((item.scroll, 0));
+            Widget::render(para, area, buf);
+            if let Some(bg) = item.tint_bg {
+                for row in area.top()..area.bottom() {
+                    for x in area.left()..area.right() {
+                        let cell = &mut buf[(x, row)];
+                        if cell.bg == Color::Reset {
+                            cell.bg = bg;
+                        }
                     }
                 }
             }
+            y = y.saturating_add(item.height);
         }
     })?;
+    Ok(())
+}
+
+fn flush_prepared_transcript<B: Backend>(
+    terminal: &mut Terminal<B>,
+    items: &mut Vec<PreparedTranscriptRender>,
+    render_width: u16,
+    height: &mut u16,
+) -> Result<(), B::Error> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let chunk_height = std::mem::take(height);
+    insert_prepared_transcript(terminal, std::mem::take(items), render_width, chunk_height)
+}
+
+fn insert_transcript_items<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut TuiState,
+    items: &[Line_],
+    width: u16,
+    tool_tint_parity: &mut bool,
+) -> Result<(), B::Error> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let render_width = transcript_render_width(width);
+    let chunk_rows = terminal.size()?.height.max(1);
+    let mut chunk = Vec::new();
+    let mut chunk_height = 0u16;
+
+    for item in items {
+        let (text, height) = cached_transcript_render(state, item, width);
+        let tint_bg = match item {
+            Line_::Thinking(_) => Some(THINKING_BG),
+            Line_::Steering(_) => Some(STEERING_BG),
+            _ => next_transcript_tint(item, tool_tint_parity),
+        };
+        let text = Arc::new(text);
+        if height <= chunk_rows {
+            if chunk_height.saturating_add(height) > chunk_rows {
+                flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)?;
+            }
+            chunk.push(PreparedTranscriptRender {
+                line_start: 0,
+                line_end: text.lines.len(),
+                text,
+                scroll: 0,
+                height,
+                tint_bg,
+            });
+            chunk_height = chunk_height.saturating_add(height);
+            if chunk_height >= chunk_rows {
+                flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)?;
+            }
+            continue;
+        }
+
+        if text.lines.is_empty() {
+            if chunk_height >= chunk_rows {
+                flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)?;
+            }
+            chunk.push(PreparedTranscriptRender {
+                text,
+                line_start: 0,
+                line_end: 0,
+                scroll: 0,
+                height: 1,
+                tint_bg,
+            });
+            chunk_height = chunk_height.saturating_add(1);
+            continue;
+        }
+
+        for line_index in 0..text.lines.len() {
+            let line_text = borrowed_text_lines(text.as_ref(), line_index, line_index + 1);
+            let line_height = text_visual_height(&line_text, render_width);
+            let mut scroll = 0u16;
+            while scroll < line_height {
+                if chunk_height >= chunk_rows {
+                    flush_prepared_transcript(
+                        terminal,
+                        &mut chunk,
+                        render_width,
+                        &mut chunk_height,
+                    )?;
+                }
+                let segment_height = line_height
+                    .saturating_sub(scroll)
+                    .min(chunk_rows.saturating_sub(chunk_height));
+                chunk.push(PreparedTranscriptRender {
+                    text: text.clone(),
+                    line_start: line_index,
+                    line_end: line_index + 1,
+                    scroll,
+                    height: segment_height,
+                    tint_bg,
+                });
+                chunk_height = chunk_height.saturating_add(segment_height);
+                scroll = scroll.saturating_add(segment_height);
+            }
+        }
+    }
+
+    flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)?;
     Ok(())
 }
 
@@ -6412,10 +6570,13 @@ fn rebuild_transcript<B: Backend>(
     let items = std::mem::take(&mut state.transcript);
     sync_last_expandable(state, &items);
     let mut tool_tint_parity = false;
-    for item in &items {
-        insert_transcript_item(terminal, state, item, width, &mut tool_tint_parity)?;
-    }
+    let rebuild_result =
+        insert_transcript_items(terminal, state, &items, width, &mut tool_tint_parity);
     state.transcript = items;
+    if let Err(err) = rebuild_result {
+        state.transcript_needs_rebuild = true;
+        return Err(err);
+    }
     state.tool_tint_parity = tool_tint_parity;
     state.transcript_rendered_width = width;
     state.transcript_needs_rebuild = false;
@@ -6428,13 +6589,47 @@ fn transcript_pane_width(area_width: u16, area_height: u16, state: &TuiState) ->
         .width
 }
 
+fn terminal_has_render_area<B: Backend>(terminal: &Terminal<B>) -> Result<bool, B::Error> {
+    let size = terminal.size()?;
+    Ok(size.width > 0 && size.height > 0)
+}
+
 fn current_transcript_pane_width<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &TuiState,
 ) -> Result<u16, B::Error> {
+    if !terminal_has_render_area(terminal)? {
+        return Ok(0);
+    }
     terminal.autoresize()?;
     let size = terminal.size()?;
     Ok(transcript_pane_width(size.width, size.height, state))
+}
+
+fn flush_pending_insert_for_width<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut TuiState,
+    width: u16,
+    replay_width_change: bool,
+) -> Result<(), B::Error> {
+    if !terminal_has_render_area(terminal)? {
+        return Ok(());
+    }
+    let width_changed = state.transcript_rendered_width != width && !state.transcript.is_empty();
+    if state.transcript_needs_rebuild || (width_changed && replay_width_change) {
+        rebuild_transcript(terminal, state, width)?;
+    }
+    if width_changed && state.transcript_rendered_width != width {
+        return Ok(());
+    }
+
+    let raw: Vec<Line_> = std::mem::take(&mut state.pending_insert);
+    let mut items: Vec<Line_> = merge_consecutive_tools(raw);
+    if let Err(err) = flush_prepared_items(terminal, state, &mut items, width) {
+        state.pending_insert = items;
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn flush_pending_insert<B: Backend>(
@@ -6442,16 +6637,7 @@ fn flush_pending_insert<B: Backend>(
     state: &mut TuiState,
     width: u16,
 ) -> Result<(), B::Error> {
-    if state.transcript_rendered_width != width && !state.transcript.is_empty() {
-        state.transcript_needs_rebuild = true;
-    }
-    if state.transcript_needs_rebuild {
-        rebuild_transcript(terminal, state, width)?;
-    }
-
-    let raw: Vec<Line_> = std::mem::take(&mut state.pending_insert);
-    let mut items: Vec<Line_> = merge_consecutive_tools(raw);
-    flush_prepared_items(terminal, state, &mut items, width)
+    flush_pending_insert_for_width(terminal, state, width, true)
 }
 
 fn flush_prepared_items<B: Backend>(
@@ -6488,9 +6674,7 @@ fn flush_prepared_items<B: Backend>(
     }
 
     let mut tool_tint_parity = state.tool_tint_parity;
-    for item in items.iter() {
-        insert_transcript_item(terminal, state, item, width, &mut tool_tint_parity)?;
-    }
+    insert_transcript_items(terminal, state, items, width, &mut tool_tint_parity)?;
     state.tool_tint_parity = tool_tint_parity;
     state.transcript.append(items);
     state.transcript_rendered_width = width;
@@ -8294,7 +8478,7 @@ fn handle_key(
         }
         (KeyCode::Enter, _) => {
             state.work_map = None;
-            let text = state.input.clone();
+            let text = crate::normalize_user_input_path(&state.input);
             if text.trim().is_empty() {
                 return;
             }
@@ -8494,6 +8678,7 @@ fn handle_key(
     }
 }
 
+#[cfg(unix)]
 const KEYBOARD_ENHANCEMENT_ENV: &str = "DEXT_KEYBOARD_ENHANCEMENT";
 
 #[cfg(unix)]
@@ -8663,7 +8848,9 @@ async fn run_backend_viewer(
     let mut last_tick = Instant::now();
 
     while state.backend_viewer_open && !state.quit {
-        terminal.draw(|f| render_backend_viewer(f, state))?;
+        if terminal_has_render_area(&terminal)? {
+            terminal.draw(|f| render_backend_viewer(f, state))?;
+        }
         let timeout = tick
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::ZERO);
@@ -8784,7 +8971,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 FromTui::Submit(text) => {
-                    if text.starts_with('/') {
+                    if crate::is_slash_command(&text) {
                         let trimmed = text.trim();
                         if let Some(parsed) = parse_compact_slash(trimmed) {
                             match parsed {
@@ -8845,16 +9032,8 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                                 .trim_start_matches("/packs")
                                 .trim_start_matches("/pack")
                                 .trim();
-                            let mut parts = raw.splitn(3, char::is_whitespace);
-                            let sub = parts.next().unwrap_or("");
-                            if matches!(sub, "run" | "use" | "start") {
-                                let selector = parts.next().unwrap_or("").trim();
-                                let task = parts.next().unwrap_or("").trim();
-                                if selector.is_empty() || task.is_empty() {
-                                    agent.sink.emit(AgentEvent::Slash(
-                                        "usage: /pack run <name> <task>".into(),
-                                    ));
-                                } else if let Err(e) = agent.run_pack(selector, task).await {
+                            if let Some((selector, task)) = packs::pack_invocation_args(raw) {
+                                if let Err(e) = agent.run_pack(selector, task).await {
                                     agent
                                         .sink
                                         .emit(AgentEvent::Error(format!("[pack error] {e:#}")));
@@ -8908,9 +9087,11 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                     agent.checkpoint_latest_session("outer_loop_autosave");
                 }
                 FromTui::LoginCancel => {
-                    crate::cancel_pending_oauth_login();
+                    let cancelled_oauth = crate::cancel_pending_oauth_login();
                     let message = if let Some(provider) = agent.clear_pending_login() {
                         format!("cancelled pending login for {provider}")
+                    } else if cancelled_oauth {
+                        "cancelled pending OAuth login".to_string()
                     } else {
                         "no login is waiting for credentials".to_string()
                     };
@@ -8943,6 +9124,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
 
     let tick = Duration::from_millis(80);
     let mut last_tick = Instant::now();
+    let mut resize_replay = TranscriptResizeReplay::new(last_tick);
 
     while !state.quit {
         if state.backend_viewer_open {
@@ -8964,10 +9146,18 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         }
 
         state.refresh_git_branch();
-        let width = current_transcript_pane_width(&mut terminal, &state)?;
-        flush_pending_insert(&mut terminal, &mut state, width)?;
-        terminal.draw(|f| draw(f, &mut state))?;
-        state.frame_count = state.frame_count.wrapping_add(1);
+        if terminal_has_render_area(&terminal)? {
+            let width = current_transcript_pane_width(&mut terminal, &state)?;
+            let replay_width_change = resize_replay.should_replay(
+                width,
+                state.transcript_rendered_width,
+                !state.transcript.is_empty(),
+                Instant::now(),
+            );
+            flush_pending_insert_for_width(&mut terminal, &mut state, width, replay_width_change)?;
+            terminal.draw(|f| draw(f, &mut state))?;
+            state.frame_count = state.frame_count.wrapping_add(1);
+        }
         let timeout = tick
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::ZERO);
@@ -9045,10 +9235,12 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
             state.apply_event(e);
         }
     }
-    if let Ok(width) = current_transcript_pane_width(&mut terminal, &state) {
-        let _ = flush_pending_insert(&mut terminal, &mut state, width);
+    if terminal_has_render_area(&terminal).unwrap_or(false) {
+        if let Ok(width) = current_transcript_pane_width(&mut terminal, &state) {
+            let _ = flush_pending_insert(&mut terminal, &mut state, width);
+        }
+        let _ = terminal.draw(|f| draw(f, &mut state));
     }
-    let _ = terminal.draw(|f| draw(f, &mut state));
 
     drop(key_rx);
     let _ = key_kill_tx.send(());
@@ -9128,28 +9320,6 @@ mod tests {
             density_rank: 1,
             expanded: false,
         }
-    }
-
-    #[test]
-    fn markdown_style_conversion_preserves_all_style_fields() {
-        let style = MdStyle {
-            fg: Some(MdColor::Red),
-            bg: Some(MdColor::Blue),
-            underline_color: Some(MdColor::LightCyan),
-            add_modifier: MdModifier::BOLD | MdModifier::UNDERLINED,
-            sub_modifier: MdModifier::DIM,
-        };
-
-        let converted = md_style_to_style(style);
-
-        assert_eq!(converted.fg, Some(Color::Red));
-        assert_eq!(converted.bg, Some(Color::Blue));
-        assert_eq!(converted.underline_color, Some(Color::LightCyan));
-        assert_eq!(
-            converted.add_modifier,
-            Modifier::BOLD | Modifier::UNDERLINED
-        );
-        assert_eq!(converted.sub_modifier, Modifier::DIM);
     }
 
     #[test]
@@ -9571,7 +9741,7 @@ mod tests {
         let mut state = TuiState::new(
             "gpt-5.5".to_string(),
             model_context_window("gpt-5.5"),
-            "/home/abaka/Documents/Projects/Learn/Finance".to_string(),
+            "/home/fixture-user/Documents/Projects/Learn/Finance".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
@@ -10222,6 +10392,97 @@ mod tests {
             state.pending_insert.as_slice(),
             [Line_::Info(_), Line_::Blank, Line_::Thinking(_)]
         ));
+    }
+
+    #[test]
+    fn steering_input_has_no_leading_blank_and_one_trailing_blank() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(tool_line(
+            "call_1",
+            "rg",
+            "rg: steering spacing",
+            Some(true),
+            "match",
+        ));
+        state.queue(Line_::Steering("Tighten transcript spacing".to_string()));
+
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [
+                Line_::Tool { .. },
+                Line_::Steering(message),
+                Line_::Blank
+            ] if message == "Tighten transcript spacing"
+        ));
+    }
+
+    #[test]
+    fn resolved_approval_has_one_blank_before_next_block() {
+        for (key, approved) in [('y', true), ('n', false)] {
+            let mut state = TuiState::new(
+                "test-model".to_string(),
+                model_context_window("test-model"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            state.queue(Line_::PermissionPrompt {
+                tool: "bash".to_string(),
+                command: "echo ok".to_string(),
+                tier: PermissionTier::Read,
+                risk: crate::tool_policy::CommandRisk::Read,
+            });
+            let (permission_tx, permission_rx) = std::sync::mpsc::sync_channel(1);
+            state.pending_perm = Some(PendingPermission {
+                tool: "bash".to_string(),
+                audit_label: "echo ok".to_string(),
+                tier: PermissionTier::Read,
+                responder: permission_tx,
+            });
+            let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (runtime_tx, _runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+            let interrupt = Arc::new(AtomicBool::new(false));
+
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::empty()),
+                &agent_tx,
+                &runtime_tx,
+                &steering_tx,
+                &interrupt,
+            );
+            state.queue(tool_line(
+                "call_1",
+                "bash",
+                "bash: echo ok",
+                Some(true),
+                "ok",
+            ));
+
+            let permission_response = permission_rx.try_recv().expect("permission response");
+            assert!(matches!(
+                (permission_response, approved),
+                (Choice::Once, true) | (Choice::Deny, false)
+            ));
+            assert!(matches!(
+                state.pending_insert.as_slice(),
+                [
+                    Line_::PermissionResult {
+                        approved: result,
+                        ..
+                    },
+                    Line_::Blank,
+                    Line_::Tool { .. }
+                ] if *result == approved
+            ));
+        }
     }
 
     #[test]
@@ -11353,7 +11614,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_render_cache_tracks_multiple_widths() {
+    fn transcript_render_cache_bounds_width_variants() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -11366,16 +11627,50 @@ mod tests {
             dim_prefix: false,
         };
 
-        let (_, h40) = cached_transcript_render(&mut state, &item, 40);
-        let (_, h80) = cached_transcript_render(&mut state, &item, 80);
-
-        assert!(h40 >= 1);
-        assert!(h80 >= 1);
+        for width in [40, 80, 120] {
+            let (_, height) = cached_transcript_render(&mut state, &item, width);
+            assert!(height >= 1);
+        }
 
         let key = line_cache_key(&item);
         let entry = state.render_cache.get(&key).expect("cache entry");
-        assert_eq!(entry.heights.len(), 2);
-        assert_eq!(entry.renders.len(), 2);
+        assert_eq!(entry.renders.len(), 1);
+        let cached = entry
+            .renders
+            .get(&transcript_render_width(120))
+            .expect("latest width variant");
+        assert!(cached.height >= 1);
+        assert!(cached.weight > 0);
+        assert_eq!(cached.weight, text_render_weight(&cached.text));
+        assert_eq!(state.render_cache_weight, cached.weight);
+    }
+
+    #[test]
+    fn render_cache_weight_stays_consistent_when_width_variants_are_evicted() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let item = Line_::Assistant {
+            text: "cache weight invariant ".repeat(16),
+            dim_prefix: false,
+        };
+
+        for width in 20..80 {
+            cached_transcript_render(&mut state, &item, width);
+            let summed = state
+                .render_cache
+                .values()
+                .flat_map(|entry| entry.renders.values())
+                .fold(0usize, |weight, cached| {
+                    weight.saturating_add(cached.weight)
+                });
+            assert_eq!(state.render_cache_weight, summed);
+            assert!(state.render_cache_weight <= RENDER_CACHE_MAX_BYTES);
+        }
     }
 
     #[test]
@@ -12085,7 +12380,7 @@ mod tests {
                 assert_eq!(state.status, "queued for next safe boundary");
                 assert!(matches!(
                     state.pending_insert.as_slice(),
-                    [Line_::Blank, Line_::Steering(s), Line_::Blank] if s == input
+                    [Line_::Steering(s), Line_::Blank] if s == input
                 ));
             }
             assert!(submit_rx.try_recv().is_err());
@@ -12822,7 +13117,7 @@ mod tests {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
             model_context_window("glm-5.1"),
-            "/home/abaka/Documents/Projects/dext".to_string(),
+            "/home/fixture-user/Documents/Projects/dext".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
@@ -12865,7 +13160,7 @@ mod tests {
             ThinkingEffort::Medium,
         );
         let banner = welcome_banner(
-            "/home/abaka/Documents/Projects/dext",
+            "/home/fixture-user/Documents/Projects/dext",
             "test-model",
             ThinkingEffort::Medium,
             ContextMode::Tiny,
@@ -12899,6 +13194,271 @@ mod tests {
         assert!(matches!(state.transcript[1], Line_::Tool { .. }));
         assert!(matches!(state.transcript[2], Line_::Tool { .. }));
         assert!(!state.transcript_needs_rebuild);
+    }
+
+    #[test]
+    fn failed_pending_insert_keeps_logical_transcript_state() {
+        use ratatui::backend::{ClearType, TestBackend, WindowSize};
+        use ratatui::buffer::Cell;
+        use ratatui::layout::{Position, Size};
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        struct FailClearBackend {
+            inner: TestBackend,
+        }
+
+        impl Backend for FailClearBackend {
+            type Error = io::Error;
+
+            fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+            where
+                I: Iterator<Item = (u16, u16, &'a Cell)>,
+            {
+                self.inner.draw(content).map_err(|error| match error {})
+            }
+
+            fn append_lines(&mut self, n: u16) -> io::Result<()> {
+                self.inner.append_lines(n).map_err(|error| match error {})
+            }
+
+            fn hide_cursor(&mut self) -> io::Result<()> {
+                self.inner.hide_cursor().map_err(|error| match error {})
+            }
+
+            fn show_cursor(&mut self) -> io::Result<()> {
+                self.inner.show_cursor().map_err(|error| match error {})
+            }
+
+            fn get_cursor_position(&mut self) -> io::Result<Position> {
+                self.inner
+                    .get_cursor_position()
+                    .map_err(|error| match error {})
+            }
+
+            fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+                self.inner
+                    .set_cursor_position(position)
+                    .map_err(|error| match error {})
+            }
+
+            fn clear(&mut self) -> io::Result<()> {
+                self.inner.clear().map_err(|error| match error {})
+            }
+
+            fn clear_region(&mut self, _clear_type: ClearType) -> io::Result<()> {
+                Err(io::Error::other("injected clear failure"))
+            }
+
+            fn size(&self) -> io::Result<Size> {
+                self.inner.size().map_err(|error| match error {})
+            }
+
+            fn window_size(&mut self) -> io::Result<WindowSize> {
+                self.inner.window_size().map_err(|error| match error {})
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.inner.flush().map_err(|error| match error {})
+            }
+        }
+
+        let backend = FailClearBackend {
+            inner: TestBackend::new(80, 20),
+        };
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::Assistant {
+            text: "must remain pending".to_string(),
+            dim_prefix: false,
+        });
+
+        let error = flush_pending_insert(&mut terminal, &mut state, 80)
+            .expect_err("injected clear failure must escape");
+
+        assert!(error.to_string().contains("injected clear failure"));
+        assert!(state.transcript.is_empty());
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Assistant { text, .. }] if text == "must remain pending"
+        ));
+    }
+
+    #[test]
+    fn zero_sized_terminal_defers_pending_insert_until_recovery() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(80, 0);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::Assistant {
+            text: "defer while minimized".to_string(),
+            dim_prefix: false,
+        });
+
+        flush_pending_insert_for_width(&mut terminal, &mut state, 1, true)
+            .expect("zero-sized flush must defer");
+        assert!(state.transcript.is_empty());
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Assistant { text, .. }] if text == "defer while minimized"
+        ));
+
+        terminal.backend_mut().resize(80, 20);
+        terminal.autoresize().expect("restore terminal size");
+        let width = current_transcript_pane_width(&mut terminal, &state).expect("restored width");
+        flush_pending_insert_for_width(&mut terminal, &mut state, width, true)
+            .expect("flush after restore");
+        assert!(state.pending_insert.is_empty());
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [Line_::Assistant { text, .. }] if text == "defer while minimized"
+        ));
+    }
+
+    #[test]
+    fn transcript_height_matches_word_wrapping() {
+        let text = Text::from("123456 123456 123456");
+        assert_eq!(text_visual_height(&text, 10), 3);
+    }
+
+    #[test]
+    fn transcript_chunking_preserves_long_wrapped_output() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let terminal = || {
+            Terminal::with_options(
+                TestBackend::new(50, 12),
+                TerminalOptions {
+                    viewport: Viewport::Inline(6),
+                },
+            )
+            .expect("terminal")
+        };
+        let cases = [
+            (0..80)
+                .map(|index| format!("line {index:02} with enough text to verify wrapped chunks"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (0..240)
+                .map(|index| format!("word{index:03}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ];
+
+        for source in cases {
+            let item = Line_::Assistant {
+                text: source,
+                dim_prefix: false,
+            };
+            let mut reference_terminal = terminal();
+            let mut reference_state = TuiState::new(
+                "test-model".to_string(),
+                model_context_window("test-model"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            let width = current_transcript_pane_width(&mut reference_terminal, &reference_state)
+                .expect("reference width");
+            let render_width = transcript_render_width(width);
+            let (text, height) = cached_transcript_render(&mut reference_state, &item, width);
+            reference_terminal
+                .insert_before(height, |buf| {
+                    let area = Rect {
+                        width: render_width.min(buf.area.width),
+                        ..buf.area
+                    };
+                    Widget::render(Paragraph::new(text).wrap(Wrap { trim: false }), area, buf);
+                })
+                .expect("reference insert");
+
+            let mut chunked_terminal = terminal();
+            let mut chunked_state = TuiState::new(
+                "test-model".to_string(),
+                model_context_window("test-model"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            let mut tint = false;
+            insert_transcript_items(
+                &mut chunked_terminal,
+                &mut chunked_state,
+                std::slice::from_ref(&item),
+                width,
+                &mut tint,
+            )
+            .expect("chunked insert");
+
+            assert_eq!(
+                chunked_terminal.backend().scrollback(),
+                reference_terminal.backend().scrollback()
+            );
+            assert_eq!(
+                chunked_terminal.backend().buffer(),
+                reference_terminal.backend().buffer()
+            );
+        }
+    }
+
+    #[test]
+    fn resize_replay_uses_leading_trailing_and_forced_bounds() {
+        let start = Instant::now();
+        let mut replay = TranscriptResizeReplay::new(start);
+
+        assert!(replay.should_replay(100, 120, true, start));
+        assert!(!replay.should_replay(90, 100, true, start + Duration::from_millis(25)));
+        assert!(!replay.should_replay(80, 100, true, start + Duration::from_millis(80)));
+        assert!(!replay.should_replay(80, 100, true, start + Duration::from_millis(150)));
+        assert!(replay.should_replay(80, 100, true, start + Duration::from_millis(200)));
+
+        let mut continuous = TranscriptResizeReplay::new(start);
+        assert!(continuous.should_replay(100, 120, true, start));
+        assert!(!continuous.should_replay(90, 100, true, start + Duration::from_millis(100)));
+        assert!(!continuous.should_replay(80, 100, true, start + Duration::from_millis(200)));
+        assert!(continuous.should_replay(70, 100, true, start + RESIZE_REPLAY_MAX_LATENCY));
+        assert!(!continuous.should_replay(
+            60,
+            70,
+            true,
+            start + RESIZE_REPLAY_MAX_LATENCY + Duration::from_millis(25),
+        ));
+    }
+
+    #[test]
+    fn resize_replay_without_history_never_defers_viewport_work() {
+        let start = Instant::now();
+        let mut replay = TranscriptResizeReplay::new(start);
+
+        assert!(replay.should_replay(80, 0, false, start));
+        assert!(replay.should_replay(70, 0, false, start + Duration::from_millis(10)));
+        assert!(!replay.burst_active);
     }
 
     #[test]
@@ -12947,7 +13507,10 @@ mod tests {
             let entry = state.render_cache.get(&key).expect("cache entry");
             assert!(entry.renders.contains_key(&wide_render_width));
             assert!(entry.renders.contains_key(&narrow_render_width));
-            assert!(entry.heights[&narrow_render_width] >= entry.heights[&wide_render_width]);
+            assert!(
+                entry.renders[&narrow_render_width].height
+                    >= entry.renders[&wide_render_width].height
+            );
         }
 
         terminal.backend_mut().resize(110, 20);
@@ -12961,6 +13524,63 @@ mod tests {
         let wider_render_width = transcript_render_width(wider);
         let entry = state.render_cache.get(&key).expect("cache entry");
         assert!(entry.renders.contains_key(&wider_render_width));
+    }
+
+    #[test]
+    fn pending_insert_waits_for_settled_transcript_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::Assistant {
+            text: "first block".to_string(),
+            dim_prefix: false,
+        });
+        let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
+        flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
+
+        terminal.backend_mut().resize(50, 20);
+        let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
+        state.queue(Line_::Assistant {
+            text: "queued during resize".to_string(),
+            dim_prefix: false,
+        });
+        state.input = "live resize".to_string();
+        state.cursor = state.input.len();
+        flush_pending_insert_for_width(&mut terminal, &mut state, narrow, false)
+            .expect("deferred resize flush");
+        let mut frame_width = 0;
+        terminal
+            .draw(|frame| {
+                frame_width = frame.area().width;
+                draw(frame, &mut state);
+            })
+            .expect("draw latest viewport width");
+        assert_eq!(frame_width, 50);
+        assert_eq!(state.input_area.width, 50);
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.pending_insert.len(), 2);
+        assert_eq!(state.transcript_rendered_width, wide);
+
+        flush_pending_insert_for_width(&mut terminal, &mut state, narrow, true)
+            .expect("settled resize flush");
+        assert!(state.pending_insert.is_empty());
+        assert_eq!(state.transcript.len(), 3);
+        assert_eq!(state.transcript_rendered_width, narrow);
     }
 
     #[test]
@@ -13052,7 +13672,7 @@ mod tests {
         let mut state = TuiState::new(
             "glm-5.1".to_string(),
             model_context_window("glm-5.1"),
-            "/home/abaka/Documents/Projects/dext".to_string(),
+            "/home/fixture-user/Documents/Projects/dext".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
@@ -13680,7 +14300,7 @@ mod tests {
         let mut state = TuiState::new(
             "gpt-5.4".to_string(),
             model_context_window("gpt-5.4"),
-            "/home/abaka/Documents/Projects/Dext".to_string(),
+            "/home/fixture-user/Documents/Projects/Dext".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );

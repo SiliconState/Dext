@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,6 +26,174 @@ fn tui_smoke_launches_real_binary_in_pty() {
 fn tui_smoke_launches_narrow_and_wide_terminals() {
     run_tui_smoke(TUI_NARROW_COLS, TUI_NARROW_ROWS, false);
     run_tui_smoke(TUI_WIDE_COLS, TUI_WIDE_ROWS, false);
+}
+
+#[test]
+fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
+    let temp = TempDir::new("dext-tui-resize").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&sandbox).expect("sandbox");
+    fs::create_dir_all(&dext_home).expect("dext home");
+    fs::create_dir_all(&home).expect("home");
+
+    let (mock_base_url, release_stream, mock_server) = spawn_slow_openai_server();
+    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).expect("open pty");
+    let mut child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &dext_home,
+        &home,
+        &[
+            ("DEXT_PROVIDER", "local"),
+            ("DEXT_BASE_URL", mock_base_url.as_str()),
+            ("DEXT_MODEL", "mock-model"),
+            ("DEXT_MODEL_FORCE", "1"),
+        ],
+    )
+    .expect("spawn dext in pty");
+    assert_visible(&mut pty, &mut child, "Dext v", Duration::from_secs(5));
+
+    const TRANSCRIPT_BLOCKS: usize = 24;
+    // Each submitted command contributes a separator, a three-row user card,
+    // and one rendered slash-result row. The streaming prompt contributes the
+    // same separator/card rows before the resize begins.
+    const ROWS_PER_SUBMITTED_COMMAND: usize = 5;
+    const STREAMING_PROMPT_ROWS: usize = 4;
+    const BANNER_ROW_BUDGET: usize = 12;
+    for expected in 1..=TRANSCRIPT_BLOCKS {
+        let command = format!("/compact {expected}%\r");
+        let output = format!("compact threshold set to {expected}%");
+        pty.write_all_retry(command.as_bytes())
+            .expect("send fixture command");
+        let found = pty
+            .wait_for(&mut child, &output, Duration::from_secs(5))
+            .expect("wait for fixture output");
+        assert!(
+            found,
+            "fixture block {expected} did not render; visible tail:\n{}",
+            tail(&pty.visible_text(), 3000)
+        );
+    }
+
+    pty.write_all_retry(b"Answer exactly: streaming-first streaming-last\r")
+        .expect("start streaming fixture");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "streaming-first",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/compact 7")
+        .expect("type while stream is live");
+
+    pty.pump_for(&mut child, Duration::from_millis(160))
+        .expect("settle populated transcript");
+    let before_resize = pty.terminal_io_counts();
+
+    let resize_burst = [
+        (100, 32),
+        (92, 30),
+        (84, 27),
+        (TUI_NARROW_COLS, TUI_NARROW_ROWS),
+    ];
+    for (index, (cols, rows)) in resize_burst.into_iter().enumerate() {
+        pty.resize(&child, cols, rows).expect("resize burst step");
+        if index == 1 {
+            pty.write_all_retry(b"%")
+                .expect("continue typing during resize burst");
+        }
+        pty.pump_for(&mut child, Duration::from_millis(25))
+            .expect("pump resize burst step");
+    }
+    pty.pump_for(&mut child, Duration::from_millis(500))
+        .expect("settle narrow resize burst");
+    let narrow_resize = pty.terminal_io_counts() - before_resize;
+    eprintln!("narrow resize terminal I/O: {narrow_resize:?}");
+    assert!(
+        narrow_resize.dsr_queries <= resize_burst.len().saturating_add(1),
+        "resize burst issued more than one cursor query per OS resize: {narrow_resize:?}"
+    );
+    assert_eq!(
+        narrow_resize.clear_all, 0,
+        "narrow resize cleared the whole inline screen: {narrow_resize:?}"
+    );
+    let rendered_row_budget = TRANSCRIPT_BLOCKS
+        .saturating_mul(ROWS_PER_SUBMITTED_COMMAND)
+        .saturating_add(STREAMING_PROMPT_ROWS)
+        .saturating_add(BANNER_ROW_BUDGET);
+    let narrow_clear_bound = resize_clear_after_bound(
+        rendered_row_budget,
+        2,
+        usize::from(TUI_NARROW_ROWS),
+        resize_burst.len(),
+    );
+    assert!(
+        narrow_resize.clear_after_cursor <= narrow_clear_bound,
+        "narrow resize exceeded its two-replay, terminal-height chunk bound ({narrow_clear_bound}): {narrow_resize:?}"
+    );
+
+    let before_wide = pty.terminal_io_counts();
+    pty.resize(&child, TUI_WIDE_COLS, TUI_WIDE_ROWS)
+        .expect("resize wide");
+    pty.pump_for(&mut child, Duration::from_millis(500))
+        .expect("settle wide resize");
+    let wide_resize = pty.terminal_io_counts() - before_wide;
+    eprintln!("wide resize terminal I/O: {wide_resize:?}");
+    assert!(
+        wide_resize.dsr_queries <= 3,
+        "wide resize issued transcript-proportional cursor queries: {wide_resize:?}"
+    );
+    assert_eq!(
+        wide_resize.clear_all, 0,
+        "wide resize cleared the whole inline screen: {wide_resize:?}"
+    );
+    let wide_clear_bound =
+        resize_clear_after_bound(rendered_row_budget, 1, usize::from(TUI_WIDE_ROWS), 1);
+    assert!(
+        wide_resize.clear_after_cursor <= wide_clear_bound,
+        "wide resize exceeded its single-replay, terminal-height chunk bound ({wide_clear_bound}): {wide_resize:?}"
+    );
+
+    assert!(
+        child.try_wait().expect("query child status").is_none(),
+        "TUI exited during resize; visible tail:\n{}",
+        tail(&pty.visible_text(), 3000)
+    );
+    release_stream.send(()).expect("release mock stream");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "streaming-final",
+        Duration::from_secs(10),
+    );
+    pty.pump_for(&mut child, Duration::from_millis(800))
+        .expect("settle completed streaming turn");
+    pty.write_all_retry(b"\r")
+        .expect("submit input assembled during resize");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "compact threshold set to 7%",
+        Duration::from_secs(3),
+    );
+    assert!(
+        child.try_wait().expect("query child status").is_none(),
+        "TUI exited during resize; visible tail:\n{}",
+        tail(&pty.visible_text(), 3000)
+    );
+
+    pty.write_all_retry(b"\x04").expect("send raw Ctrl+D");
+    let status =
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).expect("wait for dext exit");
+    assert!(
+        status.success(),
+        "visible tail:\n{}",
+        tail(&pty.visible_text(), 3000)
+    );
+    assert_no_crash_text(&pty.visible_text());
+    mock_server.join().expect("mock server thread");
 }
 
 #[test]
@@ -119,6 +288,101 @@ fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
         "stale truncation/debug artifact visible at {cols}x{rows}:\n{}",
         tail(&visible, 3000)
     );
+}
+
+fn spawn_slow_openai_server() -> (
+    String,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock OpenAI server");
+    let address = listener.local_addr().expect("mock server address");
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut saw_chat_request = false;
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                break;
+            };
+            if serve_mock_openai_request(stream, &release_rx) {
+                saw_chat_request = true;
+                break;
+            }
+        }
+        assert!(saw_chat_request, "mock server never received chat request");
+    });
+    (format!("http://{address}"), release_tx, server)
+}
+
+fn serve_mock_openai_request(
+    mut stream: TcpStream,
+    release: &std::sync::mpsc::Receiver<()>,
+) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set mock request timeout");
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut buf).expect("read mock request headers");
+        assert!(read > 0, "client closed before mock request headers");
+        request.extend_from_slice(&buf[..read]);
+    }
+    let content_length = String::from_utf8_lossy(&request)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    let body_start = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .unwrap_or(request.len());
+    while request.len().saturating_sub(body_start) < content_length {
+        let read = stream.read(&mut buf).expect("read mock request body");
+        assert!(read > 0, "client closed before mock request body");
+        request.extend_from_slice(&buf[..read]);
+    }
+
+    if !String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions ") {
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .expect("write mock discovery response");
+        return false;
+    }
+
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        )
+        .expect("write mock response headers");
+    let first_frame = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\n",
+        serde_json::to_string("streaming-first").expect("encode mock delta")
+    );
+    stream
+        .write_all(first_frame.as_bytes())
+        .expect("write first stream delta");
+    stream.flush().expect("flush first stream delta");
+    release
+        .recv_timeout(Duration::from_secs(10))
+        .expect("test did not release mock stream");
+    stream
+        .write_all(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\" streaming-last streaming-final verified output remains responsive after the populated-history resize burst and preserves editable input\"},\"finish_reason\":null}]}\n\n",
+        )
+        .expect("write delayed stream delta");
+    stream
+        .write_all(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        )
+        .expect("finish mock stream");
+    stream.flush().expect("flush final stream delta");
+    true
 }
 
 fn spawn_dext(pty: &Pty, sandbox: &Path, dext_home: &Path, home: &Path) -> io::Result<Child> {
@@ -227,17 +491,63 @@ fn assert_no_crash_text(visible: &str) {
     }
 }
 
+fn resize_clear_after_bound(
+    rendered_row_budget: usize,
+    replay_count: usize,
+    chunk_rows: usize,
+    resize_events: usize,
+) -> usize {
+    let chunks_per_replay = rendered_row_budget.div_ceil(chunk_rows.max(1));
+    replay_count
+        .saturating_mul(chunks_per_replay.saturating_add(1))
+        .saturating_add(resize_events)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalIoCounts {
+    dsr_queries: usize,
+    clear_all: usize,
+    clear_after_cursor: usize,
+    clear_current_line: usize,
+}
+
+impl std::ops::Sub for TerminalIoCounts {
+    type Output = Self;
+
+    fn sub(self, earlier: Self) -> Self {
+        Self {
+            dsr_queries: self.dsr_queries.saturating_sub(earlier.dsr_queries),
+            clear_all: self.clear_all.saturating_sub(earlier.clear_all),
+            clear_after_cursor: self
+                .clear_after_cursor
+                .saturating_sub(earlier.clear_after_cursor),
+            clear_current_line: self
+                .clear_current_line
+                .saturating_sub(earlier.clear_current_line),
+        }
+    }
+}
+
 struct Pty {
     master: File,
     slave: File,
     capture: Vec<u8>,
+    dsr_queries: usize,
 }
 
 impl Pty {
     fn open(cols: u16, rows: u16) -> io::Result<Self> {
         let mut master = -1;
         let mut slave = -1;
+        #[cfg(target_os = "macos")]
         let mut winsize = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let winsize = libc::winsize {
             ws_row: rows,
             ws_col: cols,
             ws_xpixel: 0,
@@ -249,7 +559,16 @@ impl Pty {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut winsize,
+                {
+                    #[cfg(target_os = "macos")]
+                    {
+                        &mut winsize
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        &winsize
+                    }
+                },
             )
         };
         if rc == -1 {
@@ -262,6 +581,7 @@ impl Pty {
             master,
             slave,
             capture: Vec::new(),
+            dsr_queries: 0,
         })
     }
 
@@ -301,6 +621,52 @@ impl Pty {
         }
     }
 
+    fn pump_for(&mut self, child: &mut Child, duration: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + duration;
+        loop {
+            self.read_available()?;
+            self.answer_cursor_position_queries()?;
+            if let Some(status) = child.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "dext exited while pumping PTY: {status}; visible tail: {}",
+                    tail(&self.visible_text(), 1000)
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn resize(&self, child: &Child, cols: u16, rows: u16) -> io::Result<()> {
+        let winsize = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let rc = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGWINCH) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn terminal_io_counts(&self) -> TerminalIoCounts {
+        TerminalIoCounts {
+            dsr_queries: self.dsr_queries,
+            clear_all: count_bytes(&self.capture, b"\x1b[2J"),
+            clear_after_cursor: count_bytes(&self.capture, b"\x1b[J")
+                + count_bytes(&self.capture, b"\x1b[0J"),
+            clear_current_line: count_bytes(&self.capture, b"\x1b[2K"),
+        }
+    }
+
     fn answer_cursor_position_queries(&mut self) -> io::Result<()> {
         let query = b"\x1b[6n";
         let mut cleaned = Vec::with_capacity(self.capture.len());
@@ -316,6 +682,7 @@ impl Pty {
             }
         }
         self.capture = cleaned;
+        self.dsr_queries = self.dsr_queries.saturating_add(replies);
         for _ in 0..replies {
             self.write_all_retry(b"\x1b[1;1R")?;
         }
@@ -365,6 +732,16 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
 }
 
 fn strip_ansi(input: &str) -> String {

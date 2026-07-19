@@ -1,0 +1,204 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-tag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Match tag to package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          expected = f"v{version}"
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+              raise SystemExit(f"release tag must have form vX.Y.Z, got {tag!r}")
+          if tag != expected:
+              raise SystemExit(f"release tag {tag!r} does not match Cargo.toml package version {version!r}")
+          print(f"validated {tag}")
+          PY
+
+  quality:
+    needs: validate-tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
+      - name: Test Ratatui compatibility patch
+        run: cargo test -p ratatui-core --lib --locked
+      - name: Compile benchmarks
+        run: cargo bench --no-run --locked
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.0 --locked
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings
+
+  build:
+    needs: [validate-tag, quality]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Run release tests
+        run: cargo test --release --locked --target ${{ matrix.target }}
+      - name: Run TUI smoke tests
+        if: runner.os != 'Windows'
+        run: cargo test --release --locked --target ${{ matrix.target }} --test tui_smoke -- --nocapture
+      - name: Package Unix archive and smoke test packaged binary
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="dext-${GITHUB_REF_NAME}-${TARGET}.tar.gz"
+          mkdir -p package dist verify
+          cp "target/${TARGET}/release/dext" README.md LICENSE package/
+          COPYFILE_DISABLE=1 tar -C package -czf "dist/${archive}" dext README.md LICENSE
+          tar -C verify -xzf "dist/${archive}"
+          test "$(verify/dext --version)" = "dext ${version}"
+          DEXT_HOME="$PWD/verify-home" verify/dext pack inspect agent-browser \
+            | grep -F "pack: agent-browser"
+      - name: Package Windows archive and smoke test packaged binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          $target = "${{ matrix.target }}"
+          $archive = "dext-$($env:GITHUB_REF_NAME)-$target.zip"
+          New-Item -ItemType Directory -Force package, dist, verify | Out-Null
+          Copy-Item -Path "target\$target\release\dext.exe", README.md, LICENSE -Destination package
+          Compress-Archive -Path package\* -DestinationPath "dist\$archive"
+          Expand-Archive -Path "dist\$archive" -DestinationPath verify
+          $reported = (& .\verify\dext.exe --version).Trim()
+          if ($reported -ne "dext $version") {
+            throw "packaged binary reported '$reported', expected 'dext $version'"
+          }
+          $env:DEXT_HOME = Join-Path $PWD "verify-home"
+          $pack = (& .\verify\dext.exe pack inspect agent-browser) -join "`n"
+          if (-not $pack.Contains("pack: agent-browser")) {
+            throw "packaged binary could not inspect embedded agent-browser pack"
+          }
+      - name: Upload release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/dext-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate and verify deterministic checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          export LC_ALL=C
+          mapfile -d '' archives < <(
+            find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+              -printf '%f\0' | sort -z
+          )
+          if [[ "${#archives[@]}" -ne 4 ]]; then
+            printf 'expected 4 release archives, found %s\n' "${#archives[@]}" >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Verify release archive attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          while read -r _ archive; do
+            gh attestation verify "dist/${archive}" --repo "$GITHUB_REPOSITORY"
+          done < dist/SHA256SUMS
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Dext $GITHUB_REF_NAME" \
+            --generate-notes

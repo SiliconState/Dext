@@ -1,32 +1,168 @@
 // OS-level filesystem sandboxing for tool subprocesses.
 //
 // This is defense-in-depth that backstops the heuristic command-risk
-// classifier and path validation. Unsupported platforms degrade to path
-// validation, but once a kernel mechanism is detected, rule/profile setup
+// classifier and native-tool path validation. Unsupported platforms keep native
+// path guards, but tool subprocesses run unconfined; once a kernel mechanism is
 // failures stop the child instead of silently running it unconfined.
 //
 // Enforcement by platform:
 //   - Linux:   Landlock LSM (kernel >= 5.13 with the LSM enabled).
 //   - macOS:   Seatbelt via `sandbox-exec` wrapping.
 //   - Windows: not enforced at the kernel level here (AppContainer would
-//              break common Git-Bash installs); writes are still confined by
-//              the path-validation layer. Use WSL for kernel-enforced bash.
+//              break common Git-Bash installs); native tool path guards remain,
+//              but shell/external subprocesses are unconfined. Use WSL for
+//              kernel-enforced bash.
 //
 // Profiles:
-//   - ReadOnly:        deny writes to the workspace, home, and system; only
-//                      scratch (temp dirs) and device nodes (/dev) stay
-//                      writable. Reads are allowed outside the user's home;
-//                      inside home, only the sandbox root, executable PATH
-//                      entries, packs, and toolchain cache roots are visible.
+//   - ReadOnly:        allow every read the Dext process user can perform, but
+//                      deny writes except to scratch roots and required device
+//                      nodes.
 //   - WorkspaceWrite:  additionally permit writes under the sandbox root and
-//                      common per-user toolchain cache roots. Shell startup
-//                      files and unrelated home-directory content stay
-//                      read-only.
+//                      common per-user toolchain cache roots.
 //   - DangerFullAccess: no confinement.
 
+use std::ffi::OsStr;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use crate::SandboxProfile;
+
+pub(crate) struct PrivateScratch {
+    pub(crate) path: PathBuf,
+}
+
+impl PrivateScratch {
+    pub(crate) fn create() -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        let bases = [PathBuf::from("/tmp"), PathBuf::from("/var/tmp")];
+        #[cfg(target_os = "macos")]
+        let bases = [std::env::temp_dir(), PathBuf::from("/private/tmp")];
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let bases = [std::env::temp_dir()];
+
+        for base in bases {
+            let Ok(base) = std::fs::canonicalize(base) else {
+                continue;
+            };
+            for _ in 0..16 {
+                let mut nonce = [0u8; 16];
+                if getrandom::fill(&mut nonce).is_err() {
+                    return Err(std::io::Error::other(
+                        "could not generate sandbox scratch nonce",
+                    ));
+                }
+                let nonce = nonce
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let path = base.join(format!("dext-sandbox-{}-{nonce}", std::process::id()));
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(false);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt as _;
+                    builder.mode(0o700);
+                }
+                match builder.create(&path) {
+                    Ok(()) => {
+                        let validation = (|| -> std::io::Result<PathBuf> {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                                let metadata = std::fs::symlink_metadata(&path)?;
+                                if metadata.file_type().is_symlink()
+                                    || !metadata.is_dir()
+                                    || metadata.uid() != unsafe { libc::geteuid() }
+                                {
+                                    return Err(std::io::Error::other(
+                                        "sandbox scratch directory failed ownership validation",
+                                    ));
+                                }
+                                std::fs::set_permissions(
+                                    &path,
+                                    std::fs::Permissions::from_mode(0o700),
+                                )?;
+                            }
+                            let canonical = std::fs::canonicalize(&path)?;
+                            if canonical.parent() != Some(base.as_path()) {
+                                return Err(std::io::Error::other(
+                                    "sandbox scratch directory escaped its base",
+                                ));
+                            }
+                            Ok(canonical)
+                        })();
+                        match validation {
+                            Ok(path) => return Ok(Self { path }),
+                            Err(error) => {
+                                let _ = std::fs::remove_dir_all(&path);
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+        Err(std::io::Error::other(
+            "could not create private sandbox scratch directory",
+        ))
+    }
+}
+
+impl Drop for PrivateScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+pub(crate) struct SandboxedCommand {
+    command: tokio::process::Command,
+    _scratch: Option<PrivateScratch>,
+}
+
+pub(crate) struct SandboxedStdCommand {
+    command: std::process::Command,
+    scratch: Option<PrivateScratch>,
+}
+
+impl SandboxedStdCommand {
+    pub(crate) fn scratch_path(&self) -> Option<&Path> {
+        self.scratch.as_ref().map(|scratch| scratch.path.as_path())
+    }
+
+    pub(crate) fn into_parts(self) -> (std::process::Command, Option<PrivateScratch>) {
+        (self.command, self.scratch)
+    }
+}
+
+impl Deref for SandboxedStdCommand {
+    type Target = std::process::Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for SandboxedStdCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
+
+impl Deref for SandboxedCommand {
+    type Target = tokio::process::Command;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
+}
+
+impl DerefMut for SandboxedCommand {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.command
+    }
+}
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn sbpl_path(path: &Path) -> Option<String> {
@@ -44,42 +180,14 @@ fn sbpl_filter(path: &Path) -> Option<String> {
     Some(format!("    ({filter} \"{escaped}\")\n"))
 }
 
-fn approved_environment_temp_dir() -> Option<PathBuf> {
-    let temp = std::fs::canonicalize(std::env::temp_dir()).ok()?;
-    #[cfg(target_os = "linux")]
-    let parents = ["/tmp", "/var/tmp", "/dev/shm"];
-    #[cfg(target_os = "macos")]
-    let parents = ["/private/tmp", "/private/var/tmp", "/private/var/folders"];
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let parents: [&str; 0] = [];
-    parents
-        .into_iter()
-        .filter_map(|path| std::fs::canonicalize(path).ok())
-        .any(|parent| temp.starts_with(parent))
-        .then_some(temp)
-}
-
-/// Paths that must stay writable under every profile: scratch space (heredocs,
-/// lock files) and the small set of device nodes ordinary commands need.
+/// Paths that must stay writable under every profile: the per-command private
+/// scratch directory and the small set of device nodes ordinary commands need.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-fn scratch_write_roots() -> Vec<PathBuf> {
-    let mut roots = approved_environment_temp_dir()
-        .into_iter()
-        .collect::<Vec<_>>();
-    for path in [
-        "/tmp",
-        "/var/tmp",
-        "/dev/shm",
-        "/dev/null",
-        "/dev/zero",
-        "/dev/random",
-        "/dev/urandom",
-        "/dev/tty",
-    ] {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            roots.push(path);
-        }
+fn scratch_write_roots(scratch: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![scratch.to_path_buf()];
+    let null = PathBuf::from("/dev/null");
+    if null.exists() {
+        roots.push(null);
     }
     roots
 }
@@ -125,30 +233,6 @@ fn toolchain_write_roots() -> Vec<PathBuf> {
     .collect()
 }
 
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-fn toolchain_read_roots() -> Vec<PathBuf> {
-    let home = sandbox_home_dir();
-    let mut roots = toolchain_write_roots();
-    roots.extend(
-        [
-            ".rustup",
-            ".pyenv",
-            ".nvm",
-            ".bun",
-            ".local/share/uv",
-            ".cargo/bin",
-            ".local/bin",
-            "bin",
-            "go/bin",
-        ]
-        .into_iter()
-        .map(|path| home.join(path)),
-    );
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
 fn canonical_home_subpath(path: &Path, home: &Path) -> Option<PathBuf> {
     let relative = path.strip_prefix(home).ok()?;
     if relative.as_os_str().is_empty() {
@@ -187,65 +271,8 @@ fn canonical_explicit_roots(paths: impl IntoIterator<Item = PathBuf>) -> Vec<Pat
 }
 
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-fn home_safe_read_roots(root: &Path, extra_read_roots: &[PathBuf]) -> Vec<PathBuf> {
-    let home = sandbox_home_dir();
-    let state = crate::session::dext_state_dir();
-    let mut inferred = toolchain_read_roots();
-    inferred.extend([
-        state.join("packs"),
-        state.join("shelves"),
-        home.join(".config/git"),
-        home.join(".gitconfig"),
-    ]);
-    if let Some(path) = std::env::var_os("PATH") {
-        inferred.extend(std::env::split_paths(&path).filter(|path| path.starts_with(&home)));
-    }
-    let mut roots = existing_safe_roots(inferred);
-    roots.extend(canonical_explicit_roots(
-        std::iter::once(root.to_path_buf()).chain(extra_read_roots.iter().cloned()),
-    ));
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-#[cfg(target_os = "linux")]
-fn linux_readable_roots(root: &Path, extra_read_roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut roots = [
-        "/bin",
-        "/etc",
-        "/lib",
-        "/lib64",
-        "/nix",
-        "/opt",
-        "/proc/cpuinfo",
-        "/proc/filesystems",
-        "/proc/meminfo",
-        "/proc/stat",
-        "/proc/sys/kernel/osrelease",
-        "/proc/sys/vm/overcommit_memory",
-        "/sbin",
-        "/snap",
-        "/sys",
-        "/usr",
-        "/var/cache",
-        "/var/lib/dpkg",
-        "/var/lib/rpm",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .collect::<Vec<_>>();
-    if let Some(path) = std::env::var_os("PATH") {
-        roots.extend(std::env::split_paths(&path));
-    }
-    roots.extend(scratch_write_roots());
-    roots.extend(home_safe_read_roots(root, extra_read_roots));
-    existing_safe_roots(roots)
-}
-
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
-fn writable_roots(profile: SandboxProfile, root: &Path) -> Vec<PathBuf> {
-    let mut roots = scratch_write_roots();
+fn writable_roots(profile: SandboxProfile, root: &Path, scratch: &Path) -> Vec<PathBuf> {
+    let mut roots = scratch_write_roots(scratch);
     if profile == SandboxProfile::WorkspaceWrite {
         roots.extend(toolchain_write_roots());
     }
@@ -264,36 +291,174 @@ fn confines(profile: SandboxProfile) -> bool {
     !matches!(profile, SandboxProfile::DangerFullAccess)
 }
 
+pub(crate) fn std_command(
+    program: impl AsRef<OsStr>,
+    profile: SandboxProfile,
+    root: &Path,
+    extra_read_roots: &[PathBuf],
+) -> std::io::Result<SandboxedStdCommand> {
+    std_command_inner(program.as_ref(), profile, root, extra_read_roots, false)
+}
+
+pub(crate) fn std_command_offline(
+    program: impl AsRef<OsStr>,
+    profile: SandboxProfile,
+    root: &Path,
+    extra_read_roots: &[PathBuf],
+) -> std::io::Result<SandboxedStdCommand> {
+    std_command_inner(program.as_ref(), profile, root, extra_read_roots, true)
+}
+
+fn std_command_inner(
+    program: &OsStr,
+    profile: SandboxProfile,
+    root: &Path,
+    extra_read_roots: &[PathBuf],
+    offline: bool,
+) -> std::io::Result<SandboxedStdCommand> {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if offline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "offline subprocess confinement is unavailable on this platform",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if offline && confines(profile) && linux::landlock_abi().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "offline read-only subprocess confinement requires Landlock",
+        ));
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        ))
+    ))]
+    if offline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "offline subprocess confinement is unavailable on this Linux architecture",
+        ));
+    }
+
+    let scratch = Some(PrivateScratch::create()?);
+
+    #[cfg(target_os = "macos")]
+    let mut command = if confines(profile) && macos::sandbox_exec_available() {
+        let scratch_path = scratch
+            .as_ref()
+            .map(|scratch| scratch.path.as_path())
+            .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
+        let profile_text =
+            macos::profile_text(profile, root, extra_read_roots, scratch_path, offline)
+                .ok_or_else(|| std::io::Error::other("could not build macOS sandbox profile"))?;
+        let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
+        command.arg("-p").arg(profile_text).arg(program);
+        command
+    } else if offline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "offline subprocess confinement requires sandbox-exec",
+        ));
+    } else {
+        std::process::Command::new(program)
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let mut command = std::process::Command::new(program);
+
+    #[cfg(target_os = "linux")]
+    {
+        if confines(profile) {
+            let scratch_path = scratch
+                .as_ref()
+                .map(|scratch| scratch.path.as_path())
+                .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
+            linux::install_landlock_pre_exec_std(
+                &mut command,
+                profile,
+                root,
+                extra_read_roots,
+                scratch_path,
+            );
+        }
+        if offline {
+            linux::install_offline_pre_exec_std(&mut command);
+        }
+    }
+
+    if let Some(scratch) = scratch.as_ref() {
+        command
+            .env("TMPDIR", &scratch.path)
+            .env("TMP", &scratch.path)
+            .env("TEMP", &scratch.path);
+    }
+    let _ = (profile, root, extra_read_roots, offline);
+    Ok(SandboxedStdCommand { command, scratch })
+}
+
 /// Build a tokio Command for `program` with OS-level confinement applied for
 /// the given profile. Subsequent `.arg()` calls on the returned command append
 /// the program's own arguments (on macOS the real program is wrapped, but the
 /// argument ordering is preserved so callers do not need to special-case it).
 pub(crate) fn tokio_command(
-    program: &str,
+    program: impl AsRef<OsStr>,
     profile: SandboxProfile,
     root: &Path,
     extra_read_roots: &[PathBuf],
-) -> tokio::process::Command {
-    #[cfg(target_os = "macos")]
-    {
-        if confines(profile) && macos::sandbox_exec_available() {
-            let profile_text = macos::profile_text(profile, root, extra_read_roots)
-                .unwrap_or_else(|| "(version 1)\n(deny default)\n".to_string());
-            let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
-            cmd.arg("-p").arg(profile_text).arg(program);
-            return cmd;
-        }
-    }
+) -> std::io::Result<SandboxedCommand> {
+    let program = program.as_ref();
+    let scratch = Some(PrivateScratch::create()?);
 
-    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(target_os = "macos")]
+    let mut command = if confines(profile) && macos::sandbox_exec_available() {
+        let scratch_path = scratch
+            .as_ref()
+            .map(|scratch| scratch.path.as_path())
+            .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
+        let profile_text =
+            macos::profile_text(profile, root, extra_read_roots, scratch_path, false)
+                .ok_or_else(|| std::io::Error::other("could not build macOS sandbox profile"))?;
+        let mut command = tokio::process::Command::new("/usr/bin/sandbox-exec");
+        command.arg("-p").arg(profile_text).arg(program);
+        command
+    } else {
+        tokio::process::Command::new(program)
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let mut command = tokio::process::Command::new(program);
 
     #[cfg(target_os = "linux")]
     if confines(profile) {
-        linux::install_landlock_pre_exec(&mut cmd, profile, root, extra_read_roots);
+        let scratch_path = scratch
+            .as_ref()
+            .map(|scratch| scratch.path.as_path())
+            .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
+        linux::install_landlock_pre_exec(
+            &mut command,
+            profile,
+            root,
+            extra_read_roots,
+            scratch_path,
+        );
     }
 
+    if let Some(scratch) = scratch.as_ref() {
+        command
+            .env("TMPDIR", &scratch.path)
+            .env("TMP", &scratch.path)
+            .env("TEMP", &scratch.path);
+    }
     let _ = (profile, root, extra_read_roots);
-    cmd
+    Ok(SandboxedCommand {
+        command,
+        _scratch: scratch,
+    })
 }
 
 /// Human-readable description of the active enforcement mechanism, for
@@ -305,7 +470,7 @@ pub(crate) fn describe() -> String {
             Some(abi) if abi >= 1 => {
                 format!("Linux Landlock (kernel ABI v{abi}, enforced)")
             }
-            _ => "Linux: Landlock unavailable (kernel lacks the LSM); path-validation only"
+            _ => "Linux: Landlock unavailable (kernel lacks the LSM); tool subprocesses are unconfined, native path guards only"
                 .to_string(),
         }
     }
@@ -314,12 +479,12 @@ pub(crate) fn describe() -> String {
         if macos::sandbox_exec_available() {
             "macOS Seatbelt (sandbox-exec, enforced)".to_string()
         } else {
-            "macOS: sandbox-exec not found; path-validation only".to_string()
+            "macOS: sandbox-exec not found; tool subprocesses are unconfined, native path guards only".to_string()
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        "this platform: no kernel sandbox; path-validation only (use WSL for enforced bash)"
+        "this platform: no kernel sandbox; tool subprocesses are unconfined, native path guards only (use WSL for enforced bash)"
             .to_string()
     }
 }
@@ -342,11 +507,10 @@ pub(crate) fn is_enforced() -> bool {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{linux_readable_roots, writable_roots};
+    use super::writable_roots;
     use crate::SandboxProfile;
     use landlock::{
-        ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
-        path_beneath_rules,
+        ABI, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, path_beneath_rules,
     };
     use std::path::Path;
 
@@ -373,23 +537,150 @@ mod linux {
     fn build_ruleset(
         profile: SandboxProfile,
         root: &Path,
-        extra_read_roots: &[std::path::PathBuf],
+        scratch: &Path,
     ) -> Option<landlock::RulesetCreated> {
-        let readable = linux_readable_roots(root, extra_read_roots);
-        let writable = writable_roots(profile, root);
-
+        let writable = writable_roots(profile, root, scratch);
         let abi = ABI::from(landlock_abi()? as i32);
+        let write_access = AccessFs::from_write(abi);
         let created = Ruleset::default()
-            .handle_access(AccessFs::from_all(abi))
+            .handle_access(write_access)
             .ok()?
             .create()
             .ok()?
-            .add_rules(path_beneath_rules(&readable, AccessFs::from_read(abi)))
-            .ok()?
-            .add_rules(path_beneath_rules(&writable, AccessFs::from_all(abi)))
+            .add_rules(path_beneath_rules(&writable, write_access))
             .ok()?;
 
         Some(created)
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    fn install_offline_filter() -> std::io::Result<()> {
+        const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+        const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+        #[cfg(target_arch = "x86_64")]
+        const AUDIT_ARCH: u32 = 0xc000_003e;
+        #[cfg(target_arch = "aarch64")]
+        const AUDIT_ARCH: u32 = 0xc000_00b7;
+        #[cfg(target_arch = "riscv64")]
+        const AUDIT_ARCH: u32 = 0xc000_00f3;
+        #[cfg(target_arch = "x86_64")]
+        const FIRST_FORBIDDEN_ABI_NR: u32 = 0x4000_0000;
+        #[cfg(not(target_arch = "x86_64"))]
+        const FIRST_FORBIDDEN_ABI_NR: u32 = u32::MAX;
+
+        let statement = |code: u16, k: u32| libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let jump = |code: u16, k: u32, jt: u8, jf: u8| libc::sock_filter { code, jt, jf, k };
+        let load = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+        let equal = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+        let at_least = (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16;
+        let ret = (libc::BPF_RET | libc::BPF_K) as u16;
+        let deny = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let mut filter = [
+            statement(load, SECCOMP_DATA_ARCH_OFFSET),
+            jump(equal, AUDIT_ARCH, 1, 0),
+            statement(ret, libc::SECCOMP_RET_KILL_PROCESS),
+            statement(load, SECCOMP_DATA_NR_OFFSET),
+            jump(at_least, FIRST_FORBIDDEN_ABI_NR, 0, 1),
+            statement(ret, libc::SECCOMP_RET_KILL_PROCESS),
+            jump(equal, libc::SYS_socket as u32, 0, 1),
+            statement(ret, deny),
+            jump(equal, libc::SYS_io_uring_setup as u32, 0, 1),
+            statement(ret, deny),
+            jump(equal, libc::SYS_pidfd_getfd as u32, 0, 1),
+            statement(ret, deny),
+            jump(equal, libc::SYS_ptrace as u32, 0, 1),
+            statement(ret, deny),
+            statement(ret, libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as libc::c_ushort,
+            filter: filter.as_mut_ptr(),
+        };
+
+        let no_new_privileges = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if no_new_privileges != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let restricted = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &program as *const libc::sock_fprog,
+            )
+        };
+        if restricted != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
+    pub(super) fn install_offline_pre_exec_std(cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt as _;
+
+        unsafe {
+            cmd.pre_exec(install_offline_filter);
+        }
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    pub(super) fn install_offline_pre_exec_std(cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt as _;
+
+        unsafe {
+            cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
+    }
+
+    pub(super) fn install_landlock_pre_exec_std(
+        cmd: &mut std::process::Command,
+        profile: SandboxProfile,
+        root: &Path,
+        extra_read_roots: &[std::path::PathBuf],
+        scratch: &Path,
+    ) {
+        use std::os::unix::process::CommandExt as _;
+
+        if landlock_abi().is_none() {
+            return;
+        }
+        let _ = extra_read_roots;
+        let Some(ruleset) = build_ruleset(profile, root, scratch) else {
+            unsafe {
+                cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+            }
+            return;
+        };
+
+        let mut ruleset = Some(ruleset);
+        unsafe {
+            cmd.pre_exec(move || {
+                let Some(ruleset) = ruleset.take() else {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                };
+                match ruleset.restrict_self() {
+                    Ok(status) if status.ruleset != RulesetStatus::NotEnforced => Ok(()),
+                    Ok(_) | Err(_) => Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                }
+            });
+        }
     }
 
     pub(super) fn install_landlock_pre_exec(
@@ -397,6 +688,7 @@ mod linux {
         profile: SandboxProfile,
         root: &Path,
         extra_read_roots: &[std::path::PathBuf],
+        scratch: &Path,
     ) {
         // Skip the work entirely if the kernel can't enforce Landlock.
         if landlock_abi().is_none() {
@@ -405,7 +697,8 @@ mod linux {
         // Once a Landlock-capable kernel is detected, a requested confined
         // profile must not silently run unconfined because rule construction or
         // restriction failed.
-        let Some(ruleset) = build_ruleset(profile, root, extra_read_roots) else {
+        let _ = extra_read_roots;
+        let Some(ruleset) = build_ruleset(profile, root, scratch) else {
             unsafe {
                 cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
             }
@@ -429,7 +722,7 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{home_safe_read_roots, sandbox_home_dir, sbpl_filter, sbpl_path, writable_roots};
+    use super::{sbpl_filter, writable_roots};
     use crate::SandboxProfile;
     use std::path::Path;
     use std::sync::OnceLock;
@@ -439,39 +732,35 @@ mod macos {
         *AVAILABLE.get_or_init(|| std::path::Path::new("/usr/bin/sandbox-exec").is_file())
     }
 
-    /// Generate a Seatbelt (SBPL) profile that hides unrelated files below the
-    /// user's home and limits writes to the selected profile's roots.
+    /// Generate a Seatbelt (SBPL) profile that preserves reads and limits
+    /// writes to the selected profile's roots.
     pub(super) fn profile_text(
         profile: SandboxProfile,
         root: &Path,
-        extra_read_roots: &[std::path::PathBuf],
+        _extra_read_roots: &[std::path::PathBuf],
+        scratch: &Path,
+        offline: bool,
     ) -> Option<String> {
-        let home = std::fs::canonicalize(sandbox_home_dir()).ok()?;
-        let escaped_home = sbpl_path(&home)?;
-        let mut text = format!(
-            "(version 1)\n(allow default)\n(deny file-read* (subpath \"{escaped_home}\"))\n(deny file-write*)\n"
-        );
-        let mut reads = String::new();
-        for path in home_safe_read_roots(root, extra_read_roots) {
-            let Some(filter) = sbpl_filter(&path) else {
-                continue;
-            };
-            reads.push_str(&filter);
-        }
-        if !reads.is_empty() {
-            text.push_str("(allow file-read*\n");
-            text.push_str(&reads);
-            text.push_str(")\n");
+        let mut text = "(version 1)\n(allow default)\n(deny file-write*)\n".to_string();
+        if offline {
+            text.push_str("(deny network*)\n");
         }
         let mut allows = String::new();
-        for path in writable_roots(profile, root) {
-            let Some(filter) = sbpl_filter(&path) else {
-                continue;
-            };
-            allows.push_str(&filter);
+        for path in writable_roots(profile, root, scratch) {
+            let mut aliases = vec![path.clone()];
+            if let Ok(relative) = path.strip_prefix("/private") {
+                let alias = Path::new("/").join(relative);
+                if alias.starts_with("/var") || alias.starts_with("/tmp") {
+                    aliases.push(alias);
+                }
+            }
+            for alias in aliases {
+                let Some(filter) = sbpl_filter(&alias) else {
+                    continue;
+                };
+                allows.push_str(&filter);
+            }
         }
-        // /dev/null and friends are needed by virtually every command.
-        allows.push_str("    (literal \"/dev/null\")\n    (literal \"/dev/tty\")\n");
         text.push_str("(allow file-write*\n");
         text.push_str(&allows);
         text.push_str(")\n");
@@ -482,15 +771,6 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
-        unsafe {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -536,48 +816,369 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn home_read_roots_exclude_unrelated_project_session_state() {
+    fn private_scratch_is_owned_private_and_removed_on_drop() {
+        let path = {
+            let scratch = PrivateScratch::create().expect("create private scratch");
+            let path = scratch.path.clone();
+            let metadata = std::fs::symlink_metadata(&path).expect("scratch metadata");
+            assert!(metadata.is_dir());
+            assert!(!metadata.file_type().is_symlink());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            path
+        };
+        assert!(
+            !path.exists(),
+            "dropping the scratch guard must remove {}",
+            path.display()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn offline_socket_probe_child() {
+        if std::env::var_os("DEXT_OFFLINE_SOCKET_PROBE").is_none() {
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        for (domain, socket_type) in [
+            (libc::AF_INET, libc::SOCK_STREAM),
+            (libc::AF_INET, libc::SOCK_DGRAM),
+            (libc::AF_INET6, libc::SOCK_STREAM),
+            (libc::AF_INET6, libc::SOCK_DGRAM),
+        ] {
+            let fd = unsafe { libc::socket(domain, socket_type, 0) };
+            if fd >= 0 {
+                unsafe {
+                    libc::close(fd);
+                }
+                panic!("offline child created network socket domain={domain} type={socket_type}");
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "offline socket failure must be an explicit sandbox denial"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            for address in ["127.0.0.1:9", "[::1]:9"] {
+                let error = std::net::TcpStream::connect(address)
+                    .expect_err("offline child opened a TCP connection");
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "offline TCP failure must be an explicit sandbox denial for {address}: {error}"
+                );
+            }
+            for address in ["127.0.0.1:0", "[::1]:0"] {
+                let error = std::net::UdpSocket::bind(address)
+                    .expect_err("offline child bound a UDP socket");
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "offline UDP failure must be an explicit sandbox denial for {address}: {error}"
+                );
+            }
+        }
+        println!("offline socket probe passed");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn offline_command_denies_tcp_and_udp_after_exec() {
+        if !is_enforced() {
+            eprintln!("skipping offline socket enforcement matrix: {}", describe());
+            return;
+        }
+        let root = temp_dir("offline-network");
+        let current_exe = std::env::current_exe().expect("locate test executable");
+        let mut command = std_command_offline(&current_exe, SandboxProfile::ReadOnly, &root, &[])
+            .expect("prepare offline child");
+        let output = command
+            .arg("--exact")
+            .arg("sandbox::tests::offline_socket_probe_child")
+            .arg("--nocapture")
+            .env("DEXT_OFFLINE_SOCKET_PROBE", "1")
+            .output()
+            .expect("run offline child");
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("offline socket probe passed"),
+            "captured pipe output must remain available"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sandbox_adversarial_write_matrix_enforces_profile_boundaries() {
+        if !is_enforced() {
+            eprintln!("skipping sandbox adversarial write matrix: {}", describe());
+            return;
+        }
+
         let _guard = crate::test_env_lock().lock().expect("environment lock");
         let old_home = std::env::var_os("HOME");
-        let old_userprofile = std::env::var_os("USERPROFILE");
-        let old_dext_home = std::env::var_os("DEXT_HOME");
-        let base = temp_dir("home-roots");
+        let base = temp_dir("adversarial-write-matrix");
+        let workspace = base.join("workspace");
         let home = base.join("home");
-        let state = home.join(".dext");
-        let root = home.join("workspace");
-        let extra = home.join("helpers/askpass");
-        for directory in [
-            state.join("packs"),
-            state.join("shelves"),
-            state.join("projects/other-session"),
-            root.clone(),
-            extra.parent().expect("extra parent").to_path_buf(),
-        ] {
-            std::fs::create_dir_all(directory).expect("create selected home root");
+        let cache = home.join(".cache/pip");
+        for directory in [&workspace, &home, &cache] {
+            std::fs::create_dir_all(directory).expect("create matrix directory");
         }
-        std::fs::write(&extra, "helper").expect("write helper");
-        let conflicting_userprofile = base.join("not-the-unix-home");
-        std::fs::create_dir_all(&conflicting_userprofile).expect("create conflicting userprofile");
         unsafe {
             std::env::set_var("HOME", &home);
-            std::env::set_var("USERPROFILE", &conflicting_userprofile);
-            std::env::set_var("DEXT_HOME", &state);
         }
 
-        assert_eq!(sandbox_home_dir(), home);
-        let roots = home_safe_read_roots(&root, std::slice::from_ref(&extra));
-        let writable = writable_roots(SandboxProfile::WorkspaceWrite, &home);
-        let canonical = |path: &Path| std::fs::canonicalize(path).expect("canonical test path");
-        assert!(roots.contains(&canonical(&root)));
-        assert!(writable.contains(&canonical(&home)));
-        assert!(roots.contains(&canonical(&state.join("packs"))));
-        assert!(roots.contains(&canonical(&state.join("shelves"))));
-        assert!(roots.contains(&canonical(&extra)));
-        assert!(!roots.contains(&canonical(&state.join("projects/other-session"))));
+        let workspace_target = workspace.join("workspace.txt");
+        let cache_target = cache.join("cache.txt");
+        let parent_target = base.join("parent.txt");
+        let home_target = home.join("home.txt");
+        let shared_temp_target = PathBuf::from("/tmp").join(format!(
+            "dext-sandbox-shared-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let symlink_target = base.join("symlink-target.txt");
+        let symlink_path = workspace.join("escape-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&symlink_target, &symlink_path).expect("create matrix symlink");
 
-        restore_env("HOME", old_home);
-        restore_env("USERPROFILE", old_userprofile);
-        restore_env("DEXT_HOME", old_dext_home);
+        struct WriteCase<'a> {
+            label: &'a str,
+            requested: &'a Path,
+            observed: &'a Path,
+            read_only: bool,
+            workspace_write: bool,
+        }
+
+        let cases = [
+            WriteCase {
+                label: "workspace",
+                requested: &workspace_target,
+                observed: &workspace_target,
+                read_only: false,
+                workspace_write: true,
+            },
+            WriteCase {
+                label: "toolchain-cache",
+                requested: &cache_target,
+                observed: &cache_target,
+                read_only: false,
+                workspace_write: true,
+            },
+            WriteCase {
+                label: "workspace-parent",
+                requested: &parent_target,
+                observed: &parent_target,
+                read_only: false,
+                workspace_write: false,
+            },
+            WriteCase {
+                label: "home",
+                requested: &home_target,
+                observed: &home_target,
+                read_only: false,
+                workspace_write: false,
+            },
+            WriteCase {
+                label: "shared-temp",
+                requested: &shared_temp_target,
+                observed: &shared_temp_target,
+                read_only: false,
+                workspace_write: false,
+            },
+            WriteCase {
+                label: "symlink-escape",
+                requested: &symlink_path,
+                observed: &symlink_target,
+                read_only: false,
+                workspace_write: false,
+            },
+        ];
+
+        for case in &cases {
+            std::fs::write(case.requested, b"control")
+                .unwrap_or_else(|error| panic!("control write failed for {}: {error}", case.label));
+            assert!(
+                case.observed.exists(),
+                "control did not create {}",
+                case.label
+            );
+            std::fs::remove_file(case.observed).expect("remove matrix control target");
+        }
+
+        for profile in [SandboxProfile::ReadOnly, SandboxProfile::WorkspaceWrite] {
+            for case in &cases {
+                let _ = std::fs::remove_file(case.observed);
+                let mut command =
+                    std_command("bash", profile, &workspace, &[]).expect("prepare matrix command");
+                let output = command
+                    .current_dir(&workspace)
+                    .arg("-c")
+                    .arg("printf matrix > \"$1\" 2>/dev/null")
+                    .arg("--")
+                    .arg(case.requested)
+                    .output()
+                    .expect("run matrix command");
+                let should_write = match profile {
+                    SandboxProfile::ReadOnly => case.read_only,
+                    SandboxProfile::WorkspaceWrite => case.workspace_write,
+                    SandboxProfile::DangerFullAccess => unreachable!(),
+                };
+                assert_eq!(
+                    output.status.success(),
+                    should_write,
+                    "{} under {profile:?}: status={} stderr={} ({})",
+                    case.label,
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr),
+                    describe()
+                );
+                assert_eq!(
+                    case.observed.exists(),
+                    should_write,
+                    "{} under {profile:?} had unexpected filesystem result ({})",
+                    case.label,
+                    describe()
+                );
+            }
+        }
+
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_file(shared_temp_target);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn confined_command_uses_one_private_temp_directory_and_cleans_it_up() {
+        let root = temp_dir("private-temp-command");
+        let mut command = tokio_command("bash", SandboxProfile::ReadOnly, &root, &[])
+            .expect("prepare confined command");
+        let output = command
+            .arg("-c")
+            .arg(
+                "test \"$TMPDIR\" = \"$TMP\" && test \"$TMPDIR\" = \"$TEMP\" && \
+                 file=$(mktemp \"$TMPDIR/dext.XXXXXX\") && test -f \"$file\" && printf '%s\\n' \"$TMPDIR\"",
+            )
+            .output()
+            .await
+            .expect("run confined command");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let scratch = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        assert!(scratch.is_dir(), "scratch must live through command output");
+        assert!(
+            scratch
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("dext-sandbox-")),
+            "unexpected scratch path: {}",
+            scratch.display()
+        );
+        drop(command);
+        assert!(
+            !scratch.exists(),
+            "scratch must be removed after the command wrapper is dropped"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn writable_roots_exclude_unrelated_home_content() {
+        let _guard = crate::test_env_lock().lock().expect("environment lock");
+        let old_home = std::env::var_os("HOME");
+        let base = temp_dir("writable-roots");
+        let home = base.join("home");
+        let root = home.join("workspace");
+        let cache = home.join(".cache/pip");
+        let unrelated = home.join(".dext/projects/other-session");
+        for directory in [&root, &cache, &unrelated] {
+            std::fs::create_dir_all(directory).expect("create test directory");
+        }
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let scratch = base.join("scratch");
+        let inherited_temp = base.join("inherited-temp");
+        std::fs::create_dir_all(&scratch).expect("create scratch directory");
+        std::fs::create_dir_all(&inherited_temp).expect("create inherited temp directory");
+        let old_tmpdir = std::env::var_os("TMPDIR");
+        unsafe {
+            std::env::set_var("TMPDIR", &inherited_temp);
+        }
+
+        let read_only = writable_roots(SandboxProfile::ReadOnly, &root, &scratch);
+        let workspace_write = writable_roots(SandboxProfile::WorkspaceWrite, &root, &scratch);
+        let canonical = |path: &Path| std::fs::canonicalize(path).expect("canonical test path");
+        assert!(read_only.contains(&canonical(&scratch)));
+        assert!(workspace_write.contains(&canonical(&scratch)));
+        assert!(!read_only.contains(&canonical(&root)));
+        assert!(workspace_write.contains(&canonical(&root)));
+        assert!(workspace_write.contains(&canonical(&cache)));
+        assert!(!workspace_write.contains(&canonical(&unrelated)));
+        assert!(!workspace_write.contains(&canonical(&inherited_temp)));
+        for shared_temp in ["/tmp", "/var/tmp", "/dev/shm"] {
+            if let Ok(shared_temp) = std::fs::canonicalize(shared_temp) {
+                assert!(
+                    !workspace_write.contains(&shared_temp),
+                    "confinement must not permit shared temp root {}",
+                    shared_temp.display()
+                );
+            }
+        }
+        for device in ["/dev/tty", "/dev/ptmx"] {
+            if let Ok(device) = std::fs::canonicalize(device) {
+                assert!(
+                    !workspace_write.contains(&device),
+                    "confinement must not permit output that bypasses capture: {}",
+                    device.display()
+                );
+            }
+        }
+        if let Ok(dev_pts) = std::fs::canonicalize("/dev/pts") {
+            assert!(
+                !workspace_write.contains(&dev_pts),
+                "confinement must not permit writing arbitrary pseudo-terminals"
+            );
+        }
+
+        unsafe {
+            match old_tmpdir {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
         let _ = std::fs::remove_dir_all(base);
     }
 }
