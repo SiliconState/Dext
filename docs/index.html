@@ -485,7 +485,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>src/orchestrator.rs</code></td><td>Work phases, similarity guards, objective tracking, adaptive caps</td></tr>
 <tr><td><code>src/git_checkpoints.rs</code></td><td>Git-native recovery refs, /undo, sidecar files, pruning</td></tr>
 <tr><td><code>src/mutation_preview.rs</code></td><td>In-memory line-level previews before applying file mutations</td></tr>
-<tr><td><code>src/memory_merge.rs</code></td><td>Section-aware merge driver for MEMORY.md and recall.md</td></tr>
+<tr><td><code>src/memory_merge.rs</code></td><td>Optional explicit merge helpers for MEMORY.md and recall.md</td></tr>
 <tr><td><code>src/packs.rs</code></td><td>Pack discovery, invocation, conversational pack inference</td></tr>
 <tr><td><code>src/shelves.rs</code></td><td>Typed shelf registry with ability metadata, signals, and effects</td></tr>
 <tr><td><code>src/tool_policy.rs</code></td><td>Command risk classification, input validation, bash guardrails</td></tr>
@@ -526,7 +526,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <rect class="box box-accent" x="560" y="22" width="140" height="42"/><text x="630" y="48" text-anchor="middle">Provider SSE</text>
 <rect class="box box-accent" x="735" y="22" width="130" height="42"/><text x="800" y="48" text-anchor="middle">State/Session</text>
 <path class="line-accent" d="M90 95 H250"/><text class="muted" x="170" y="88" text-anchor="middle">prompt or steering</text>
-<path class="line" d="M260 120 H450"/><text class="muted" x="355" y="113" text-anchor="middle">system + DEXT.md + memory + tools</text>
+<path class="line" d="M260 120 H450"/><text class="muted" x="355" y="113" text-anchor="middle">system + DEXT.md + optional recall + tools</text>
 <path class="line" d="M450 145 H630"/><text class="muted" x="540" y="138" text-anchor="middle">HTTP request</text>
 <path class="line-accent" d="M630 175 H270"/><text class="muted" x="450" y="168" text-anchor="middle">stream blocks: text / thinking / tool_use</text>
 <rect class="box box-green" x="185" y="205" width="150" height="54"/><text x="260" y="227" text-anchor="middle">Parse blocks</text><text class="muted" x="260" y="246" text-anchor="middle">append text/thinking</text>
@@ -655,10 +655,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 ├── auth.json                    # Stored credentials (0600 on Unix)
 ├── .env                         # Optional user-owned Dext dotenv settings
 ├── settings.json                 # user compaction threshold settings
-├── bundled-packs/                # private content-addressed embedded pack cache
 ├── crashes/                     # owner-private crash snapshots
-├── shelves/                     # User-scoped shelves
-├── packs/                       # User-scoped packs
+├── shelves/                     # User-scoped shelves and packs
 └── projects/
     └── &lt;project-key&gt;/
         └── sessions/
@@ -749,7 +747,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li><code>wire_tools_oai()</code> — OpenAI <code>function</code> type format</li>
 <li><code>wire_tools_chatgpt()</code> — ChatGPT flattened format with <code>strict: null</code></li>
 </ul>
-<p>Runtime-only pack and shelf commands are intentionally separate from provider-visible tools. Browser automation is delivered by the bundled <code>agent-browser</code> pack through the normal <code>bash</code> approval and sandbox path; it adds no browser recipe or provider-visible tool. Runtime-essential bundled files are embedded in the binary and materialized into a content-addressed <code>$DEXT_HOME/bundled-packs/</code> cache. Existing <code>DEXT_HOME</code> ownership/write safety is validated without changing its mode; cache directories are owner-private on Unix, symlink components are rejected, file bytes/modes are verified and repaired, and cache failures are surfaced without hiding project/user packs.</p>
+<p>Runtime-only pack and shelf commands are intentionally separate from provider-visible tools. Packs act as modular battery packs: Dext creates, discovers, inspects, maintains, and invokes shelf-contained workflows through the existing tool, approval, and sandbox surface. Dext ships no pack content and adds no pack-specific provider-visible tools.</p>
 </div>
 </section>
 
@@ -800,12 +798,15 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>Shift+Enter</code> / <code>Alt+Enter</code></td><td>Insert newline</td></tr>
 <tr><td><code>Ctrl+O</code></td><td>Toggle the latest expandable tool output</td></tr>
 <tr><td><code>Ctrl+B</code></td><td>Open backend output viewer while bash runs</td></tr>
+<tr><td><code>Ctrl+L</code></td><td>Open the read-only current todo list without entering the alternate screen</td></tr>
 <tr><td><code>Ctrl+D</code></td><td>Quit</td></tr>
 <tr><td><code>Ctrl+C</code></td><td>Interrupt current turn</td></tr>
 <tr><td><code>Up/Down</code></td><td>Navigate input history</td></tr>
 <tr><td><code>Scroll</code></td><td>Navigate transcript</td></tr>
 <tr><td><code>?</code></td><td>Show keymap help</td></tr>
 </table>
+<h3>Todo View</h3>
+<p><code>Ctrl+L</code> opens a clean read-only modal at any time, including while the agent is busy. It loads persisted session/project todos at startup, refreshes after <code>todo_read</code>/<code>todo_write</code>, scrolls with arrows, Page Up/Down, Home/End, or the mouse wheel, and closes with <code>Ctrl+L</code>, <code>Esc</code>, or <code>q</code>. Editing remains on the existing <code>todo_write</code> path so validation, approval, checkpoint, and session-state behavior are not duplicated. The backend viewer remains the only alternate-screen surface.</p>
 <h3>Tool Result Rendering</h3>
 <p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints.</p>
 <h3>Markdown Rendering</h3>
@@ -863,7 +864,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="memory-merge-rs" class="collapsible-header">Memory_merge.rs <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p>A section-aware merge driver for <code>MEMORY.md</code> and <code>recall.md</code> that protects Dext's memory from bad text merges.</p>
+<p>An optional section-aware merge driver for <code>MEMORY.md</code> and <code>recall.md</code>. These are not required runtime state: <code>recall.md</code> is injected only when the user creates it, while <code>MEMORY.md</code> is never auto-injected and is read only by explicit <code>dext memory ...</code> commands.</p>
 <h3>Memory Merge Algorithm</h3>
 <ol>
 <li><strong>Parse</strong> — Split both versions into preamble + sections (by heading hierarchy)</li>
@@ -910,7 +911,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="packs-rs" class="collapsible-header">Packs.rs — Pack System <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p><strong>Packs are workflow documents, not plugin binaries.</strong> The runtime reads pack metadata and <code>PACK.md</code>, then executes the workflow through the existing Dext tool surface. This keeps packs provider-neutral and auditable.</p>
+<p><strong>Packs are shelf-contained workflow documents, not plugin binaries.</strong> Dext supplies the create, discover, inspect, maintain, and run lifecycle; users own the content. The runtime reads <code>PACK.md</code> and executes through the existing Dext tool surface, keeping packs provider-neutral and auditable without bloating the core binary.</p>
 
 <h3>Design Contract</h3>
 <ul>
@@ -920,26 +921,24 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>Optional hooks via <code>phooks.json</code>, isolated from project <code>hooks.json</code>.</li>
 </ul>
 
-<div class="warn"><strong>Important:</strong> <code>autoresearch</code> is a <strong>sample pack</strong>, not core Dext runtime functionality. Dext core only provides pack loading/execution infrastructure.</div>
+<div class="tip"><strong>Battery-pack model:</strong> Dext ships no packs. Every pack lives under <code>&lt;shelf&gt;/packs/&lt;name&gt;</code> in a user, project, or explicitly configured shelf root.</div>
 
 <h3>Pack Object Model (<code>PackInfo</code>)</h3>
 <p><code>packs.rs</code> normalizes each discovered pack into <code>PackInfo</code> with:</p>
 <ul>
 <li><code>name</code>, <code>description</code>, declared <code>credential_env</code> names (from front matter or directory defaults)</li>
 <li><code>path</code>, <code>pack_md_path</code>, optional <code>phooks_path</code></li>
-<li><code>source</code> label (project/env/user/bundled) and optional shelf ownership</li>
+<li><code>source</code> label (project/env/user) and shelf ownership</li>
 </ul>
 <p>Invocation wraps this as <code>PackInvocation { pack, task }</code> so the task is explicit and auditable.</p>
 
-<h3>Discovery Precedence</h3>
+<h3>Discovery and Creation</h3>
 <ol>
-<li><code>DEXT_PACK_*_DIR</code> direct overrides</li>
-<li>Project shelves and packs: <code>.dext/shelves/*/packs</code>, <code>.dext/packs</code>, <code>packs</code></li>
-<li>Runtime env roots: <code>DEXT_SHELVES_DIR</code>, <code>DEXT_PACKS_DIR</code></li>
-<li>User roots: <code>~/.dext/shelves/*/packs</code>, <code>~/.dext/packs</code></li>
-<li>Bundled repository packs (examples/templates)</li>
+<li>Project shelves: <code>.dext/shelves/*/packs</code></li>
+<li>Explicit shelf roots: <code>DEXT_SHELVES_DIR</code></li>
+<li>User shelves: <code>~/.dext/shelves/*/packs</code></li>
 </ol>
-<p>Reusable packs should be created and installed in user-global Dext scope by default: <code>~/.dext/packs/&lt;name&gt;/</code> or <code>~/.dext/shelves/&lt;shelf&gt;/packs/&lt;name&gt;/</code>. Use project-local pack roots only when the user explicitly wants repository-scoped behavior.</p>
+<p>Create reusable packs with <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>; add <code>--project</code> only for an explicitly project-local pack. The scaffold creates a minimal <code>PACK.md</code>, refuses overwrite, and is immediately available to normal inspection and invocation. Direct <code>packs/</code>, <code>.dext/packs</code>, <code>~/.dext/packs</code>, <code>DEXT_PACKS_DIR</code>, and per-pack override roots are not discovery inputs.</p>
 <p>The resolver deduplicates by canonicalized path and normalized pack name. Name collisions are resolved by precedence order, not random filesystem order.</p>
 
 <h3>Pack Layout and Front Matter</h3>
@@ -961,7 +960,7 @@ credential-env: [SERVICE_TOKEN]
 4) Verify
 5) Deliver
 </code></pre>
-<p>Only <code>PACK.md</code> is required. Front matter stays minimal: identity/description plus an optional inline <code>credential-env</code> list of exact credential-shaped names required by the pack's own helper. That field is honored only for environment-selected, user-global, and bundled packs; project-local declarations are ignored.</p>
+<p>Only <code>PACK.md</code> is required. Front matter stays minimal: identity/description plus an optional inline <code>credential-env</code> list of exact credential-shaped names required by the pack's own helper. That field is honored only for user and <code>DEXT_SHELVES_DIR</code> packs; project-local declarations are ignored.</p>
 
 <h3>Prompt Injection Model</h3>
 <p><code>pack_prompt()</code> builds a bounded invocation prompt (cap: <code>PACK_PROMPT_CAP = 32_000</code> bytes) containing:</p>
@@ -973,12 +972,12 @@ credential-env: [SERVICE_TOKEN]
 <li>full <code>PACK.md</code> workflow body</li>
 <li>explicit user task text</li>
 </ul>
-<p>This gives the model procedural guidance without changing core runtime policy. The selected pack remains active for the session: its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for environment-selected, user-global, and bundled packs, they reach only a simple direct invocation of the active pack's own native <code>bin/</code> helper, never hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored and reported by pack inspection so repository content cannot enable parent credential inheritance. On Windows, only native <code>.exe</code>/<code>.com</code> helpers qualify for direct credential inheritance; script helpers use Bash with declared credentials removed. Changing the sandbox root clears active pack state.</p>
+<p>This gives the model procedural guidance without changing core runtime policy. The selected pack remains active for the session: its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own native <code>bin/</code> helper, never hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state.</p>
 
 <h3>Execution Paths</h3>
 <ul>
-<li>CLI: <code>dext pack list</code>, <code>dext pack inspect &lt;name&gt;</code>, <code>dext pack run &lt;name&gt; &quot;task&quot;</code></li>
-<li>Interactive: <code>/pack list</code>, <code>/pack inspect &lt;name&gt;</code>, <code>/pack run &lt;name&gt; task</code></li>
+<li>CLI: <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>, <code>list</code>, <code>inspect</code>, and <code>run</code></li>
+<li>Interactive: <code>/pack create</code>, <code>list</code>, <code>inspect</code>, and <code>run</code></li>
 <li>Conversational detection: <code>invoke &lt;name&gt;</code> / <code>run &lt;name&gt; on ...</code> patterns mapped by selector inference</li>
 </ul>
 
@@ -1206,7 +1205,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>/sessions ...</code></td><td>List/analyze/map/grep/focus/export session history</td></tr>
 <tr><td><code>/plan &lt;task&gt;</code></td><td>Run read-only planning and seed the plan into history</td></tr>
 <tr><td><code>/budget [cap]</code></td><td>Set or show budget cap</td></tr>
-<tr><td><code>/pack list|inspect|run</code></td><td>Pack management</td></tr>
+<tr><td><code>/pack create|list|inspect|run</code></td><td>Create or use shelf-contained packs</td></tr>
 <tr><td><code>/shelves</code></td><td>Show shelf registry</td></tr>
 <tr><td><code>/undo [--list|--apply|&lt;id&gt;]</code></td><td>Recovery checkpoint preview/apply management</td></tr>
 </table>
@@ -1215,7 +1214,7 @@ credential-env: [SERVICE_TOKEN]
 <section class="collapsible-section">
 <h2 id="tools-reference" class="collapsible-header">Tool Reference</h2>
 <div class="collapsible-content">
-<p>Dext implements 18 provider-visible tools. The default profile contains 13 core tool names. Specialized tools (<code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>git_log</code>, <code>csvkit</code>) require <code>dext --toolset full</code>, <code>DEXT_TOOLSET=full</code>, or <code>/tools full</code>. Browser automation is the embedded bundled <code>agent-browser</code> pack and does not modify this tool count.</p>
+<p>Dext implements 18 provider-visible tools. The default profile contains 13 core tool names. Specialized tools (<code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>git_log</code>, <code>csvkit</code>) require <code>dext --toolset full</code>, <code>DEXT_TOOLSET=full</code>, or <code>/tools full</code>. User-authored shelf packs orchestrate this existing surface and do not modify the tool count.</p>
 <h3>File Operations</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
@@ -1312,7 +1311,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>DEXT_HOOKS_FILE</code></td><td><code>hooks.json</code></td><td>Override project hook configuration file</td></tr>
 <tr><td><code>DEXT_SUDO_ASKPASS</code></td><td>—</td><td>Custom askpass helper for sudo</td></tr>
 <tr><td><code>DEXT_SHELVES_DIR</code></td><td>—</td><td>Additional shelf directories</td></tr>
-<tr><td><code>DEXT_PACKS_DIR</code></td><td>—</td><td>Additional pack directories</td></tr>
+
 <tr><td><code>DEXT_SESSION_TAG</code></td><td>PID</td><td>Session tag for checkpoint ref names</td></tr>
 <tr><td><code>ANTHROPIC_API_KEY</code></td><td>—</td><td>Anthropic API key</td></tr>
 <tr><td><code>OPENAI_API_KEY</code></td><td>—</td><td>OpenAI API key</td></tr>
@@ -1378,12 +1377,12 @@ credential-env: [SERVICE_TOKEN]
 <p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types. Credential-shaped parent environment variables are removed from agent-run subprocesses by default. <code>DEXT_INHERIT_TOOL_CREDENTIALS=1</code> opts in only trusted model-invoked bash/external tools; hooks and Dext-owned subprocesses remain scrubbed.</p>
 <h3><code>.env</code> (~/.dext/.env or $DEXT_HOME/.env)</h3>
 <p>Optional user-owned Dext settings. Project <code>.env</code> files and parent directories are never auto-loaded, so repository content cannot silently alter runtime policy.</p>
-<h3><code>DEXT.md</code> (project root)</h3>
-<p>Project-specific context injected into the system prompt. Auto-detected from the sandbox root.</p>
-<h3><code>MEMORY.md</code> (project root)</h3>
-<p>Durable long-form memory for the project. Section-aware merge driver prevents data loss during concurrent edits.</p>
-<h3><code>recall.md</code> (project root)</h3>
-<p>Compact prompt-facing recall cache. Line-based union merge for safe concurrent edits.</p>
+<h3><code>DEXT.md</code> (sandbox ancestry)</h3>
+<p>Tracked machine-facing project guidance auto-injected into the system prompt. Dext scans the sandbox root and ancestors and does not modify the file automatically.</p>
+<h3><code>recall.md</code> (optional sandbox ancestry)</h3>
+<p>Optional ignored prompt cache. It is auto-injected only when present; Dext does not create or update it automatically.</p>
+<h3><code>MEMORY.md</code> (optional project root)</h3>
+<p>Optional ignored long-form input for explicit <code>dext memory merge/distill/register</code> workflows. It is never auto-injected and normal sessions do not read it.</p>
 <h3><code>.gitattributes</code> and <code>.git/info/attributes</code></h3>
 <p><code>dext memory register</code> writes repository-local merge-driver config and local attributes by default. It writes versioned <code>.gitattributes</code> entries for <code>MEMORY.md</code> and <code>recall.md</code> only when <code>--versioned-attributes</code> is requested.</p>
 <h3><code>hooks.json</code> (project root or <code>DEXT_HOOKS_FILE</code>)</h3>

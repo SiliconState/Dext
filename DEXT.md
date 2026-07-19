@@ -19,7 +19,10 @@ The `bash` tool is deliberately atomic. Dext launches bash in a separate process
 - `src/provider.rs` — provider catalog/auth, request shaping, normalization, and transport deadlines.
 - `src/sse.rs`, `src/streaming.rs`, `src/tool_round.rs`, `src/tool_journal.rs` — bounded SSE framing, provider event assembly, tool-round execution, and durable side-effect fencing.
 - `src/git_checkpoints.rs`, `src/mutation_preview.rs`, `src/memory_merge.rs` —
-  Git-native recovery refs, file mutation previews, and memory merge helpers.
+  Git-native recovery refs, file mutation previews, and optional memory merge
+  helpers.
+- `src/packs.rs`, `src/shelves.rs` — shelf-contained pack creation, discovery,
+  invocation, and typed ability metadata.
 - `src/tui.rs` — Ratatui inline TUI using the regular terminal buffer.
 - `vendor/ratatui-core/` — exact upstream source plus Dext's narrow inline-terminal compatibility patch.
 - `benches/dext_bench.rs` — criterion perf harness.
@@ -53,13 +56,24 @@ When changing Dext itself:
 - Do not log documentation drift as an operational risk. Prevent it through the same-change rule above.
 - `docs/RISK_REGISTER.md` tracks open non-documentation risks. Update entries when controls, evidence, ownership, likelihood, impact, or status changes.
 
-## Context and memory
-- `recall.md` is a compact prompt-facing recall cache; durable long-form
-  memory lives in `MEMORY.md`.
-- Log durable decisions/findings to `MEMORY.md`, then keep only
-  the distilled prompt-worthy cache in `recall.md`.
-- Prefer context engineering and memory quality over adding tools. Minimize tool
-  duplication and prompt-injected historical detail.
+## Context files
+- `DEXT.md` is tracked project guidance and is auto-injected from the sandbox
+  root and its ancestors. Keep it terse and machine-facing.
+- `recall.md` is an optional ignored prompt cache. It is auto-injected when
+  present, but Dext does not create or update it automatically.
+- `MEMORY.md` is optional ignored long-form storage for explicit
+  `dext memory ...` merge/distill commands. It is never auto-injected and is
+  not required for normal sessions.
+- Do not create or update `recall.md` or `MEMORY.md` unless the user asks.
+
+## Packs and shelves
+- Packs extend Dext without bloating the core or provider-visible toolset.
+- Every pack lives at `<shelf>/packs/<name>` under `.dext/shelves`,
+  `~/.dext/shelves`, or a `DEXT_SHELVES_DIR` root.
+- Use `dext pack create <shelf>/<name>` for reusable user packs and add
+  `--project` only for explicitly project-local packs.
+- Dext ships no pack content; users own, review, maintain, and distribute their
+  shelves separately.
 
 ## Provider notes
 - Built-in providers include GLM, ChatGPT/Codex, OpenAI, Anthropic, Kimi Code, DeepSeek, and local OpenAI-compatible. Custom provider profiles can

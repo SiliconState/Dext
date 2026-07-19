@@ -12,8 +12,15 @@ TUI and dependency changes must preserve these behaviors:
 - Input and the viewport remain responsive while output streams and while the terminal is resized.
 - Resize replay is cohesive: no item-by-item reconstruction, whole-screen flash, cursor-query stall, or cursor-query timeout.
 - The backend viewer remains the only alternate-screen surface.
+- `Ctrl+L` opens a read-only todo modal in the inline UI; it never enters the alternate screen and remains available while the agent is busy.
 
 A dependency update that violates this contract is rejected even if it compiles and unit tests pass.
+
+## Todo view
+
+Press `Ctrl+L` at any time to open the current session todo list. The modal loads the persisted session/project todo state at startup, refreshes after `todo_read` or `todo_write`, and supports arrow, Page Up/Down, Home/End, and mouse-wheel scrolling. Close it with `Ctrl+L`, `Esc`, or `q`.
+
+The first version is intentionally read-only. Todo edits still use the existing `todo_write` path so validation, permission, checkpoint, and session-state behavior are not duplicated in the TUI. The modal is rendered inside the inline viewport; `Ctrl+B` and the backend viewer remain unchanged and are still the only alternate-screen path.
 
 ## Dependency stack
 

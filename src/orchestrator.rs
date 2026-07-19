@@ -1067,10 +1067,7 @@ fn commands_contain(commands: &[String], needles: &[&str]) -> bool {
 }
 
 fn is_decision_log_path(path: &str) -> bool {
-    path.ends_with("MEMORY.md")
-        || path.ends_with("recall.md")
-        || path.ends_with("DEXT.md")
-        || path.ends_with("autoresearch.ideas.md")
+    path.ends_with("MEMORY.md") || path.ends_with("recall.md") || path.ends_with("DEXT.md")
 }
 
 fn adaptive_tool_cap_for_pressure(

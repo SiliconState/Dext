@@ -137,7 +137,7 @@ Useful slash commands:
 /export html session.html     export transcript
 /sessions analyze             inspect latest session
 /pack list                    list discovered packs
-/pack run autoresearch <task> invoke a pack in-session
+/pack run my-pack <task>      invoke a shelf pack in-session
 /quit                         exit
 ```
 
@@ -157,8 +157,8 @@ dext --output stream-json "run a small diagnostic"
 dext --preview simple "make a small documented edit"
 dext undo --list
 dext memory check
-dext pack run autoresearch "improve this benchmark"
-dext --pack autoresearch "improve this benchmark"
+dext pack create personal/my-pack
+dext pack run my-pack "run its workflow"
 ```
 
 Use `--no-session` for disposable runs that should not write project session/log state. Because no durable state or tool journal is written, side-effect crash recovery is unavailable in this mode:
@@ -174,20 +174,17 @@ Likewise, `--fork` resumes into an unsaved branch without a durable tool journal
 
 See [`PACKS.md`](PACKS.md) for the full packs and shelves reference.
 
-Dext packs are regular source directories containing `PACK.md` plus optional helper scripts and `phooks.json`. Discovery checks, in precedence order:
+Dext packs are regular source directories inside shelves. Discovery checks, in precedence order:
 
-1. `DEXT_PACK_<NAME>_DIR` environment variables
-2. project `.dext/shelves/<shelf>/packs`, `.dext/packs`, and `packs`
-3. `DEXT_SHELVES_DIR` entries (`<shelf>/packs/<pack>` or a direct shelf root containing `packs/<pack>`)
-4. `DEXT_PACKS_DIR` entries
-5. user `~/.dext/shelves/<shelf>/packs` and `~/.dext/packs`
-6. embedded bundled packs, materialized under `$DEXT_HOME/bundled-packs/<content-hash>/`
+1. project `.dext/shelves/<shelf>/packs/<pack>`
+2. `DEXT_SHELVES_DIR` entries (`<shelf>/packs/<pack>` or a shelf root containing `packs/<pack>`)
+3. user `~/.dext/shelves/<shelf>/packs/<pack>`
 
-Reusable packs should be created and installed in user-global Dext scope by default: `~/.dext/packs/<name>/` or `~/.dext/shelves/<shelf>/packs/<name>/`. Use project-local `packs/<name>/`, `.dext/packs/<name>/`, or `.dext/shelves/<shelf>/packs/<name>/` only when the user explicitly asks for repository-scoped behavior.
+Create a reusable user pack with `dext pack create <shelf>/<name>`, or add `--project` for an explicitly project-local pack. Dext creates a minimal `PACK.md`, refuses overwrite, and discovers the new pack through the same shelf path immediately. Dext ships no pack content; shelf repositories are owned, reviewed, versioned, and distributed separately.
 
-Runtime-essential bundled pack files are compiled into the Dext binary. Discovery materializes and byte-verifies them in a content-addressed `$DEXT_HOME/bundled-packs/` cache so installed and extracted single binaries retain helper/hook functionality without a source checkout. Existing `DEXT_HOME` ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix, reject symlink components, and are repaired from embedded bytes. Cache failures are reported while project/user packs remain discoverable.
+Direct `packs/`, `.dext/packs`, `~/.dext/packs`, `DEXT_PACKS_DIR`, and `DEXT_PACK_<NAME>_DIR` locations are not discovery roots. The latter per-pack environment names are still exported after selection so a pack can locate its own helpers.
 
-Shelf packs are just source-first packs grouped under a shelf. If a shelf and legacy pack define the same pack name in a scope, the shelf pack wins. This is the current stable extension contract: scaffold `~/.dext/packs/<name>/PACK.md` or `~/.dext/shelves/<shelf>/packs/<name>/PACK.md` by default, keep scripts/data beside it, validate with `dext pack inspect <name>`, then run it on a disposable task before sharing. Because packs are plain files and normal commands, they work across users, LLMs, and providers without expanding the provider-visible tool list. Optional `shelf.json` manifests are loaded into `ShelfRegistry`, resolved by scope precedence, shown by `dext shelves` / `/shelves`, and summarized to the model as typed ability metadata rather than new provider-visible tools.
+This is the stable extension contract: packs act as modular battery packs without expanding Dext's provider-visible tool list. Optional `shelf.json` manifests are loaded into `ShelfRegistry`, resolved by scope precedence, shown by `dext shelves` / `/shelves`, and summarized to the model as typed ability metadata rather than executable provider tools.
 
 Inspect typed shelf manifests:
 
@@ -204,22 +201,22 @@ Inside a session:
 Use:
 
 ```bash
-dext pack list
-dext pack inspect autoresearch
-dext pack run autoresearch "improve this benchmark"
+dext pack create personal/my-pack
+dext pack inspect my-pack
+dext pack run my-pack "run its workflow"
 ```
 
 Inside a session:
 
 ```text
-/pack list
-/pack inspect autoresearch
-/pack run autoresearch improve this benchmark
+/pack create personal/my-pack
+/pack inspect my-pack
+/pack run my-pack run its workflow
 ```
 
-Conversational invocation also works when the message clearly asks to run/use a known pack, for example: `run autoresearch on reducing test runtime`.
+Conversational invocation also works when the message clearly asks to run or use a known pack, for example: `run my-pack on this task`.
 
-A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke helpers through paths such as `$DEXT_PACK_DIR/bin/helper.py`. An environment-selected, user-global, or bundled pack may declare exact names in the inline `credential-env` front-matter list; matching inherited values are available only to a simple direct invocation of that active pack's own native `bin/` helper. On Windows, only `.exe`/`.com` helpers qualify for this direct credential path; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Credential values are not exposed to hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, or sessions, and provider-auth names remain excluded. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
+A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke their own helpers. A pack from a user or `DEXT_SHELVES_DIR` shelf may declare exact names in the inline `credential-env` front-matter list; matching inherited values are available only to a simple direct invocation of that active pack's own native `bin/` helper. On Windows, only `.exe`/`.com` helpers qualify for this direct credential path; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Credential values are not exposed to hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, or sessions, and provider-auth names remain excluded. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
 
 ## Git checkpoints, undo, and mutation previews
 
@@ -275,9 +272,10 @@ Inside a session:
 
 ## Memory merge drivers
 
-Dext's durable memory files (`MEMORY.md` and `recall.md`) can be registered with
-section-aware Git merge drivers. Registration is explicit and local-only by
-default.
+Dext's optional memory files (`MEMORY.md` and `recall.md`) can be registered with
+section-aware Git merge drivers. Neither file is required for normal sessions:
+`MEMORY.md` is never auto-injected, while `recall.md` is injected only when the
+user creates it. Registration is explicit and local-only by default.
 
 ```bash
 dext memory check
@@ -410,7 +408,6 @@ DEXT_HOME=~/.dext
 DEXT_SESSIONS_DIR=~/.dext/sessions
 DEXT_LOGS_DIR=~/.dext/logs
 DEXT_LOG_ARCHIVES=4
-DEXT_PACKS_DIR=~/.dext/packs:/path/to/project-packs
 DEXT_SHELVES_DIR=~/.dext/shelves:/path/to/shared-shelves
 DEXT_EXTERNAL_AUTH_FILE=~/.dext/external-auth.json
 ```

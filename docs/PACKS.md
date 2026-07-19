@@ -1,174 +1,182 @@
 # Packs and shelves
 
-Packs and shelves are Dext's extension system. A pack is a source-first directory containing a `PACK.md` workflow document plus optional scripts and hooks. A shelf is a named group of packs with an optional `shelf.json` manifest.
+Packs are Dext's modular “battery packs”: source-first workflows that add specialized behavior without expanding the provider-visible toolset or bloating the core binary. Dext provides the lifecycle—create, discover, inspect, maintain, and run—while users own the pack content.
 
-Neither packs nor shelves add provider-visible tools. They teach Dext a workflow using files the model reads and commands Dext runs through the existing `bash` tool. This makes packs portable across providers and models.
+Dext ships no packs. A Dext checkout and release binary contain only the pack and shelf infrastructure.
 
-## Packs
+## Storage contract
 
-### Structure
-
-A pack is a directory containing at least `PACK.md`:
+Every pack lives inside a shelf:
 
 ```text
-my-pack/
-├── PACK.md          # required: agent-facing workflow document
-├── phooks.json      # optional: hook templates (never overwrites project hooks.json)
-├── bin/
-│   └── helper.py    # optional: helper scripts
-└── tests/
-    └── test.py      # optional: pack tests
+<shelf-root>/
+└── <shelf>/
+    ├── shelf.json              # optional typed metadata
+    └── packs/
+        └── <pack>/
+            ├── PACK.md         # required workflow
+            ├── phooks.json     # optional hook templates
+            ├── bin/            # optional helpers
+            ├── references/     # optional supporting context
+            └── tests/          # optional pack tests
 ```
 
-`PACK.md` is the only required file. It contains YAML front matter and a Markdown workflow:
+Dext discovers shelf roots in this precedence order:
+
+1. Project `.dext/shelves/`
+2. `DEXT_SHELVES_DIR` entries
+3. User `~/.dext/shelves/` or `$DEXT_HOME/shelves/`
+
+A `DEXT_SHELVES_DIR` entry may be one shelf directory containing `packs/`, or a root containing multiple shelf directories. The first pack name found wins.
+
+Direct pack roots are intentionally unsupported: project `packs/`, project `.dext/packs/`, user `~/.dext/packs/`, `DEXT_PACKS_DIR`, and `DEXT_PACK_<NAME>_DIR` are not discovery inputs. `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` are still exported for an already selected pack so its helpers can locate their own files.
+
+## Create
+
+Create a reusable user pack:
+
+```bash
+dext pack create engineering/refactor-helper
+```
+
+This creates:
+
+```text
+~/.dext/shelves/engineering/packs/refactor-helper/PACK.md
+```
+
+Create an explicitly project-local pack:
+
+```bash
+dext pack create local/release-check --project
+```
+
+This creates:
+
+```text
+.dext/shelves/local/packs/release-check/PACK.md
+```
+
+The command validates lowercase shelf and pack identifiers, creates a small editable workflow, and refuses to overwrite an existing path. The interactive equivalent is:
+
+```text
+/pack create engineering/refactor-helper
+/pack create local/release-check --project
+```
+
+For a dedicated shelf repository whose root contains multiple shelves, run Dext with that repository as the sandbox and ask it to create or maintain `<shelf>/packs/<name>`. Then validate against that root:
+
+```bash
+DEXT_SHELVES_DIR="$PWD" dext pack inspect <name>
+DEXT_SHELVES_DIR="$PWD" dext pack run <name> "test task"
+```
+
+Keep external shelf repositories separate from Dext. Review and audit them independently before enabling them through `DEXT_SHELVES_DIR`.
+
+## PACK.md
+
+`PACK.md` contains YAML front matter followed by the agent-facing workflow:
 
 ```markdown
 ---
-name: my-pack
-description: What this pack does. Shown in pack listings.
-credential-env: [SERVICE_TOKEN] # optional; exact helper-only credential names
+name: refactor-helper
+description: Guide a bounded refactor with tests and verification.
+credential-env: [SERVICE_TOKEN]
 ---
 
-# My pack
+# Refactor Helper
 
-Instructions for Dext to follow when this pack is active.
-Include setup steps, loop rules, helper commands, and state files.
+## Use when
+
+- The user requests a behavior-preserving refactor.
+
+## Workflow
+
+1. Inspect the affected code and tests.
+2. Make one bounded change.
+3. Run focused verification.
+4. Report changes and gaps.
 ```
 
-Front matter fields:
+Front matter:
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | no | Pack identifier. Defaults to directory name. |
-| `description` | no | One-line description for listings. |
-| `credential-env` | no | Comma-separated inline list of credential-shaped environment names required by this pack's own native `bin/` helper. Honored only for explicitly selected environment, user-global, and bundled pack sources; project-local declarations are ignored. Values are never added to prompts, hooks, logs, or sessions. Provider auth names are excluded. On Windows only `.exe`/`.com` helpers qualify; scripts run through Bash with declared credentials removed. |
+| Field | Required | Purpose |
+|---|---|---|
+| `name` | No | Pack identifier; defaults to the directory name. |
+| `description` | No | Short text shown in listings and prompt summaries. |
+| `credential-env` | No | Exact credential-shaped environment names required by the pack's own direct native helper. |
 
-### Discovery
+Credential declarations are honored only for packs from user or `DEXT_SHELVES_DIR` shelves. Project-local declarations are ignored so repository content cannot opt into inherited credentials. Provider credential names are always excluded.
 
-Dext searches for packs in this precedence order. First match wins:
-
-1. `DEXT_PACK_<NAME>_DIR` environment variable
-2. Project `.dext/shelves/<shelf>/packs/<name>/`
-3. Project `.dext/packs/<name>/`
-4. Project `packs/<name>/`
-5. `DEXT_SHELVES_DIR` entries (`<shelf>/packs/<name>/`)
-6. `DEXT_PACKS_DIR` entries
-7. User `~/.dext/shelves/<shelf>/packs/<name>/`
-8. User `~/.dext/packs/<name>/`
-9. Embedded bundled packs, materialized and byte-verified under `$DEXT_HOME/bundled-packs/<content-hash>/`. Existing `DEXT_HOME` ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix and reject symlink components.
-
-For reusable packs, default to user-global Dext scope: `~/.dext/packs/<name>/` for legacy packs or `~/.dext/shelves/<shelf>/packs/<name>/` for shelf packs. Use the project-local entries above only when the user explicitly asks for a repo-specific pack.
-
-### Running a pack
-
-CLI:
+## Inspect and run
 
 ```bash
 dext pack list
-dext pack inspect my-pack
-dext pack run my-pack "task description"
-dext --pack my-pack "task description"
+dext pack inspect refactor-helper
+dext pack run refactor-helper "refactor the parser"
+dext --pack refactor-helper "refactor the parser"
 ```
 
-Inside an interactive session:
+Interactive equivalents:
 
 ```text
 /pack list
-/pack inspect my-pack
-/pack run my-pack task description here
+/pack inspect refactor-helper
+/pack run refactor-helper refactor the parser
 ```
 
-Conversational invocation works when the message clearly references a known pack name:
+A clear conversational request can also invoke a known pack, for example: `run refactor-helper on the parser`.
 
-```text
-run autoresearch on improving this benchmark
-```
+When selected, Dext reads `PACK.md` as bounded invocation context and keeps the pack active for the session. It exports `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` calls and pack hook processes. Changing the sandbox root clears active pack state.
 
-When a pack runs, Dext reads `PACK.md` as the initial agent context and activates that pack for the current session. It passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so helper commands can use `$DEXT_PACK_DIR/bin/helper.py`. An explicitly selected environment, user-global, or bundled pack may declare exact credential names in the inline `credential-env` front-matter list; matching inherited values are preserved only for a simple direct invocation of that active pack's own native `bin/` helper. On Windows only `.exe`/`.com` helpers qualify for direct credential inheritance; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and `/pack inspect` reports that restriction, so repository content cannot opt into parent credential inheritance. Credential values remain scrubbed from hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, and sessions, and provider-auth environment names are never eligible. If the pack has `phooks.json`, Dext adds those hooks to the session; changing the sandbox root clears active pack hooks and environment.
+## Maintain
 
-### Building a pack
+Packs are ordinary files, so Dext maintains them with its normal read/edit/test tools and existing approval and sandbox policy. A practical loop is:
 
-1. Default to a user-global install location for reusable packs:
-   - legacy pack: `~/.dext/packs/<name>/`
-   - shelf pack: `~/.dext/shelves/<shelf>/packs/<name>/`
-   Use project-local `packs/<name>/`, `.dext/packs/<name>/`, or `.dext/shelves/<shelf>/packs/<name>/` only when the user explicitly wants repo-scoped behavior.
-2. Create the directory and `PACK.md` with front matter.
-3. Write clear workflow instructions: setup, loop rules, helper commands, state files.
-4. Add helper scripts in `bin/` — while the pack is active, call them through `bash` via `$DEXT_PACK_DIR/bin/helper.py`.
-5. Optionally add `phooks.json` for steering/validation hooks.
-6. Test locally:
+1. Inspect the shelf manifest, `PACK.md`, helpers, and tests.
+2. State the behavior the pack should add.
+3. Make the smallest workflow or helper change.
+4. Run pack-local tests.
+5. Run `dext pack inspect <name>`.
+6. Exercise `dext pack run <name> ...` on a disposable task.
+7. Review the shelf repository diff before publishing it.
 
-```bash
-dext pack inspect my-pack   # verify discovery and front matter
-dext pack run my-pack "test task"  # run on a disposable task
-```
+Dext does not auto-update packs or fetch shelf repositories. Versioning, review, distribution, and security auditing belong to the shelf owner.
 
-7. Distribute by placing in a shelf, a shared directory, or bundling in a repo.
+## Helpers and hooks
 
-### Hook templates
+Optional helpers live under the pack's `bin/` directory and run through normal Dext execution policy. Prefer small transparent helpers over new provider-visible tools.
 
-Packs use `phooks.json` (never `hooks.json`) to avoid colliding with a project's active hooks. Pack hooks can steer, validate, or summarize tool calls, but the pack must still work without hooks enabled.
+`phooks.json` contains pack hook templates and is distinct from a project's `hooks.json`. Dext adds these hooks for the active session; the pack should remain understandable and useful without them.
 
-To activate pack hooks:
+Credential handling is deliberately narrow:
 
-```bash
-export DEXT_HOOKS_FILE="$DEXT_PACK_MY_PACK_DIR/phooks.json"
-```
+- Declared values can reach only a simple direct invocation of the active pack's own native `bin/` helper.
+- Hooks, arbitrary Bash, pipelines, redirections, prompts, logs, and sessions do not receive those values.
+- On Windows, only native `.exe` and `.com` helpers qualify; scripts run through Bash with declared credentials removed.
+- `DEXT_INHERIT_TOOL_CREDENTIALS=1` is a separate high-trust opt-in for trusted model-invoked tools and is not required for normal packs.
 
-Or Dext activates them automatically when running a pack that has `phooks.json`.
+## Optional shelf.json
 
-## Shelves
-
-### Structure
-
-A shelf is a directory grouping one or more packs with an optional typed manifest:
-
-```text
-my-shelf/
-├── shelf.json       # optional: typed manifest with abilities
-└── packs/
-    ├── research/
-    │   ├── PACK.md
-    │   └── bin/
-    └── deploy/
-        └── PACK.md
-```
-
-Without `shelf.json`, a shelf is just a pack group discovered by directory structure. With `shelf.json`, it declares typed abilities that Dext can expose to the model as provider-neutral metadata.
-
-### Manifest schema
+A shelf may include `shelf.json` to describe packs and typed abilities:
 
 ```json
 {
-  "id": "community",
-  "name": "Community packs",
-  "description": "Shared workflow packs",
+  "id": "engineering",
+  "name": "Engineering",
+  "description": "Engineering workflow packs",
   "packs": [
     {
-      "id": "research",
-      "name": "Research",
-      "version": "1.0.0",
-      "description": "Deep research workflow",
+      "id": "refactor-helper",
+      "name": "Refactor Helper",
+      "version": "0.1.0",
+      "description": "Behavior-preserving refactor workflow",
       "abilities": [
         {
           "ability": "command",
-          "name": "research",
-          "usage": "/research <topic>",
-          "description": "Start a research cycle"
-        },
-        {
-          "ability": "tool",
-          "name": "research-helper",
-          "description": "Pack-local helper metadata",
-          "schema": {"type": "object"},
-          "grants": ["read", "process"],
-          "exposure": "on_demand"
-        },
-        {
-          "ability": "context",
-          "name": "research-state",
-          "description": "Current research findings",
-          "budget": 2000
+          "name": "refactor-helper",
+          "usage": "refactor-helper <target>",
+          "description": "Run the refactor workflow"
         }
       ]
     }
@@ -176,61 +184,16 @@ Without `shelf.json`, a shelf is just a pack group discovered by directory struc
 }
 ```
 
-Ability types:
-
-| Type | Purpose |
-|------|---------|
-| `tool` | Declares tool-like metadata with `schema`, `grants`, and `exposure`; it is registry metadata, not a provider-visible tool implementation. |
-| `command` | Declares command metadata (`name`, `usage`, `description`); it does not register an executable slash command. |
-| `hook` | Declares signal interest. For manifest-only shelves, this opts declared context into load/prompt injection; it does not load executable hook code. |
-| `context` | Declares named context the pack provides |
-
-### Shelf discovery
-
-Shelves are discovered from the same paths as packs. A shelf root is any directory containing `<shelf-name>/packs/` subdirectories or a `shelf.json` manifest.
+List typed shelf metadata with:
 
 ```bash
-# Point to a directory containing multiple shelves
-export DEXT_SHELVES_DIR=/path/to/shelves
-
-# Or use project/user defaults
-# .dext/shelves/<name>/packs/
-# ~/.dext/shelves/<name>/packs/
+dext shelves
 ```
 
-### Listing shelves
+or:
 
-```bash
-dext shelves    # CLI
-/shelves        # interactive
+```text
+/shelves
 ```
 
-Shelf metadata is injected into the model context as typed ability records, not as new provider tools or slash commands. Tool abilities require `schema`, `grants`, and `exposure` (`hidden`, `on_demand`, or `visible`) so the registry can describe capability shape without executing it directly. A manifest-only shelf can inject declared context when a matching load/prompt hook signal is present; executable signal effects require an in-process shelf implementation and are not a filesystem plugin API.
-
-## Reference example
-
-The bundled `autoresearch` pack implements an autonomous experiment loop, `packopt` applies a SkillOpt-style loop to pack/skill documents, and `agent-browser` wraps the upstream Rust browser CLI without adding a provider-visible tool. Runtime-essential files for these packs are embedded in the Dext binary and materialized into a content-addressed `$DEXT_HOME/bundled-packs/` cache. Existing state-directory ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix, reject symlink components, and repair altered files/modes from embedded bytes. Cache failures are surfaced while project/user packs remain available. The repository copies remain the editable sources. Reusable custom installations should normally go into user-global Dext scope (`~/.dext/...`) so they are callable from any project:
-
-- `packs/autoresearch/PACK.md` — autoresearch workflow document
-- `packs/autoresearch/bin/autoresearch.py` — autoresearch helper script
-- `packs/autoresearch/phooks.json` — autoresearch steering hooks
-- `packs/packopt/PACK.md` — bounded-edit pack/skill optimization workflow
-- `packs/packopt/bin/packopt.py` — validation/log/rejected-memory helper
-- `packs/agent-browser/PACK.md` — rendered-page browser workflow and safety contract
-- `packs/agent-browser/bin/agent-browser` — bounded launcher for the upstream native Rust CLI
-
-Run it:
-
-```bash
-dext pack run autoresearch "optimize the benchmark in this repo"
-dext pack run packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
-dext pack run agent-browser "inspect https://example.com"
-```
-
-Inspect it to see a full pack structure:
-
-```bash
-dext pack inspect autoresearch
-dext pack inspect packopt
-dext pack inspect agent-browser
-```
+Manifest abilities are provider-neutral metadata. They do not register executable provider tools or arbitrary slash commands. Packs still execute through Dext's normal tool surface.

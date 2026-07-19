@@ -117,15 +117,10 @@ dext session analyze latest
 dext doctor
 dext doctor --approval auto-write --sandbox read-only --cd /path/to/project
 dext undo --list
-dext memory check
-dext pack list
-dext pack inspect autoresearch
-# or inspect SkillOpt-style pack/skill optimization
-dext pack inspect packopt
-# Browser automation is a bundled pack, not a provider-visible tool:
-dext pack inspect agent-browser
-dext pack run agent-browser "inspect https://example.com"
-dext pack run autoresearch "optimize the benchmark in this repo"
+dext memory check                 # optional context-file merge setup
+dext pack create personal/my-pack
+dext pack inspect my-pack
+dext pack run my-pack "task description"
 dext --eval
 ```
 
@@ -148,10 +143,9 @@ Interactive slash commands:
 /undo
 /compact status
 /pack list
-/pack inspect autoresearch
-/pack inspect packopt
-/pack agent-browser inspect https://example.com
-/pack run autoresearch optimize the benchmark in this repo
+/pack create personal/my-pack
+/pack inspect my-pack
+/pack run my-pack task description
 /save name
 /export html path
 /sessions analyze|grep|failures|verify-log|decisions
@@ -179,7 +173,7 @@ systemctl --user stop dext-preview
 
 Use `dext-` prefixes for agent-started units so they are easy to inspect and stop (`systemctl --user list-units 'dext-*'`). On macOS/Windows or Linux without systemd, use the platform's native supervisor if needed; otherwise avoid persistent background processes.
 
-## Git safety and memory merging
+## Git safety
 
 Dext creates lightweight Git checkpoints before approved write-risk tool calls
 when the sandbox root is inside a Git repository, with direct file mutations
@@ -234,62 +228,55 @@ Inside Dext:
 `git` preview mode is accepted for forward compatibility and currently falls
 back to simple in-memory previews.
 
-Dext can also register section-aware Git merge drivers for its memory files:
+### Optional context-file merge helpers
+
+Dext auto-injects tracked `DEXT.md` guidance and an optional ignored `recall.md`
+when those files are present in the sandbox ancestry. It does not create or
+update either file automatically. `MEMORY.md` is separate optional ignored
+long-form storage: it is never auto-injected and normal sessions do not read it.
+Only explicit `dext memory ...` commands use it for merge registration or
+`recall.md` distillation.
 
 ```bash
 dext memory check
 dext memory register
 dext memory unregister
-# used by Git after registration:
-dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]
+dext memory distill            # report only
+dext memory distill --apply    # explicitly rewrite recall.md
 ```
 
-Registration is local-only by default: it writes repository-local Git config and
-local attributes. Use `dext memory register --versioned-attributes` only when you
-want `.gitattributes` entries committed for the project. `dext memory merge` is
-the Git merge-driver entry point and is not normally run by hand. The merge
-driver covers `MEMORY.md` and `recall.md` and is explicit; Dext does not
-silently edit Git config or attributes during normal agent runs.
+Registration is local-only by default. Use
+`dext memory register --versioned-attributes` only when the project intends to
+commit merge attributes. These helpers are optional and are not required for
+Dext sessions.
 
 ## Packs
 
-See [`docs/PACKS.md`](docs/PACKS.md) for the full packs and shelves reference, including structure, discovery, building, and distributing packs.
+Packs are Dext's modular “battery packs”: source-first workflows that add
+specialized behavior without adding provider-visible tools or bloating the core
+binary. Dext owns the create, discover, inspect, maintain, and run lifecycle but
+ships no pack content. Every pack lives inside a shelf at
+`<shelf>/packs/<name>`.
 
-Packs are source-first workflow bundles with a `PACK.md`. The bundled `agent-browser` pack supplies browser automation through the normal `bash` approval/sandbox path without adding a provider-visible browser tool. Runtime-essential bundled pack files are embedded in the binary and materialized into a content-addressed `$DEXT_HOME/bundled-packs/` cache for helper/hook execution. Existing `DEXT_HOME` ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix, reject symlink components, and repair bytes/modes from the binary. Cache failures are surfaced without hiding project/user packs. Dext otherwise discovers packs from `DEXT_PACK_<NAME>_DIR`, project `.dext/shelves/<shelf>/packs`, `.dext/packs`, `packs`, `DEXT_SHELVES_DIR`, `DEXT_PACKS_DIR`, user `~/.dext/shelves/<shelf>/packs`, `~/.dext/packs`, and embedded bundled packs. Shelf packs take precedence over same-named legacy project/user pack directories within the same scope. Typed shelf manifests named `shelf.json` are loaded from the same shelf roots into the runtime `ShelfRegistry` and exposed in prompt context plus `/shelves` / `dext shelves` as provider-neutral ability metadata.
-
-The default installation target for reusable packs is user-global Dext scope: `~/.dext/packs/<name>/` for legacy packs or `~/.dext/shelves/<shelf>/packs/<name>/` for shelf packs. Use project-local `packs/<name>/`, `.dext/packs/<name>/`, or `.dext/shelves/<shelf>/packs/<name>/` only when the user explicitly asks for repo-scoped behavior.
-
-The stable extension contract is intentionally provider-neutral: a pack is files plus instructions that any LLM/provider can read, with optional shell helpers and `phooks.json` steering. Scaffold reusable packs in user-global Dext scope by default (`~/.dext/packs/<name>/PACK.md` or `~/.dext/shelves/<shelf>/packs/<name>/PACK.md`), keep helper scripts inside that directory, and validate with `dext pack inspect <name>` plus a real `dext pack run <name> ...` on a disposable task. Use project-local `packs/<name>/PACK.md` or `.dext/...` variants only when the user explicitly wants the pack tied to one repository. Use `packopt` for SkillOpt-style improvement of pack/skill documents with bounded edits, strict held-out validation, and rejected-edit memory. Shared shelves live at `<shelf>/packs/<pack>` and can be distributed through project, user, or `DEXT_SHELVES_DIR` paths without adding provider-visible tools. `shelf.json` manifests add typed ability metadata for internal registry resolution; the runtime lists and prompt-injects those records without expanding the provider-visible tool list.
-
-Invoke a pack conversationally:
-
-```text
-run autoresearch on improving this project benchmark
-run packopt on improving ~/.dext/packs/autoresearch/PACK.md against held-out tasks
-```
-
-Or invoke it explicitly:
-
-```text
-/pack run autoresearch improve this benchmark
-/pack run packopt improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks
-```
-
-CLI equivalents:
+Create a reusable user pack, then edit and exercise it:
 
 ```bash
-dext pack list
-dext pack inspect autoresearch
-dext pack inspect packopt
-dext pack inspect agent-browser
-dext pack run agent-browser "inspect https://example.com"
-dext pack run autoresearch "improve this benchmark"
-dext pack run packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
-dext --pack autoresearch "improve this benchmark"
-dext --pack packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
+dext pack create personal/my-pack
+dext pack inspect my-pack
+dext pack run my-pack "test task"
 ```
 
-If a pack has `phooks.json`, Dext activates those hook templates for the current session. While the pack is active, Dext passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to its `bash` tool commands and hook processes. An environment-selected, user-global, or bundled pack may declare exact credential names in `credential-env`; inherited values are exposed only to a simple direct invocation of that active pack's own native `bin/` helper, never hooks or arbitrary shell commands, and provider-auth names remain excluded. On Windows, only `.exe`/`.com` helpers qualify for direct credential inheritance; script helpers use Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Shelf packs use the same invocation path and remain regular source directories.
+Use `dext pack create local/my-pack --project` for an explicitly project-local
+pack under `.dext/shelves/`. Dext discovers project shelves,
+`DEXT_SHELVES_DIR`, and user `~/.dext/shelves`; direct `packs/`, `.dext/packs`,
+`~/.dext/packs`, and `DEXT_PACKS_DIR` roots are not supported. Shelf repositories
+remain separate from Dext and should be reviewed and maintained on their own.
+
+Inside a session, use `/pack create`, `/pack list`, `/pack inspect`, and
+`/pack run`. Selected packs continue to use normal Dext tools, approvals,
+sandboxing, hooks, and helper environment variables. See
+[`docs/PACKS.md`](docs/PACKS.md) for the complete authoring and maintenance
+contract.
 
 ## Configuration and state
 
@@ -349,7 +336,7 @@ DEXT_CACHE_READ_USD_PER_MTOK=0.1
 DEXT_CACHE_CREATE_USD_PER_MTOK=1.25
 ```
 
-Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `target/`, `.env`, `DEXT.todo.json`, `autoresearch.*`, `packopt.*`, and `dext-session-*` exports are ignored.
+Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored.
 
 Usage metrics are recorded in session headers and `/usage` after provider turns. Cloud providers use returned usage objects when available; OpenAI-compatible streaming requests ask for usage chunks, while local llama.cpp derives exact prompt/cache/output counts from streamed `timings` and records zero dollar cost unless pricing env overrides are set.
 
@@ -394,8 +381,9 @@ Run the final full suite and install directly in a trusted host terminal. Dext's
 - `src/shelves.rs` — shelf registry with typed manifests and abilities.
 - `tests/` — integration tests and replay fixtures.
 - `benches/` — criterion benchmarks.
-- `DEXT.md` / `recall.md` — prompt-facing project guidance and recall for Dext working on itself.
-- `MEMORY.md` — durable project memory.
+- `DEXT.md` — tracked, auto-injected machine-facing project guidance.
+- `recall.md` — optional ignored prompt cache; injected only when present.
+- `MEMORY.md` — optional ignored input to explicit `dext memory` commands; never auto-injected.
 - `docs/PACKS.md` — packs and shelves reference.
 - `docs/TUI.md` — inline TUI contract, dependency stack, compatibility patch, and regression gate.
 - `docs/index.html` — canonical browsable technical documentation; update it in the same change as runtime, architecture, security, provider, tool, test, CI, or release behavior.

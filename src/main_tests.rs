@@ -1944,23 +1944,18 @@ fn multi_edit_preparation_is_all_or_nothing() -> Result<()> {
 }
 
 #[test]
-fn tool_paths_allow_only_user_global_pack_content_outside_project() {
+fn tool_paths_allow_only_user_shelf_pack_content_outside_project() {
     let _guard = env_lock();
     let root = temp_test_dir("tool-path-global-pack-root");
     let home = temp_test_dir("tool-path-global-pack-home");
-    let pack_dir = home.join("packs/demo");
     let shelf_dir = home.join("shelves/community");
     let shelf_pack_dir = shelf_dir.join("packs/demo");
-    std::fs::create_dir_all(&pack_dir).expect("create global pack dir");
     std::fs::create_dir_all(&shelf_pack_dir).expect("create shelf pack dir");
-    let pack_md = pack_dir.join("PACK.md");
     let shelf_pack_md = shelf_pack_dir.join("PACK.md");
     let shelf_manifest = shelf_dir.join("shelf.json");
-    std::fs::write(&pack_md, "---\nname: demo\n---\n# Demo\n").expect("write PACK.md");
     std::fs::write(&shelf_pack_md, "---\nname: shelf-demo\n---\n# Demo\n")
         .expect("write shelf PACK.md");
     std::fs::write(&shelf_manifest, "{}\n").expect("write shelf manifest");
-    let notes = pack_dir.join("notes.md");
     let shelf_notes = shelf_pack_dir.join("notes.md");
     let shelf_metadata = shelf_dir.join("metadata.json");
     let old_dext_home = std::env::var_os("DEXT_HOME");
@@ -1968,26 +1963,22 @@ fn tool_paths_allow_only_user_global_pack_content_outside_project() {
         std::env::set_var("DEXT_HOME", &home);
     }
 
-    for allowed in [&pack_md, &shelf_pack_md] {
-        let canonical = canonicalize_tool_path(&root, &allowed.display().to_string())
-            .expect("allow global pack path");
-        assert_eq!(
-            canonical,
-            std::fs::canonicalize(allowed).expect("canonical pack path")
-        );
-    }
+    let canonical = canonicalize_tool_path(&root, &shelf_pack_md.display().to_string())
+        .expect("allow user shelf pack path");
+    assert_eq!(
+        canonical,
+        std::fs::canonicalize(&shelf_pack_md).expect("canonical shelf pack path")
+    );
 
-    for allowed in [&notes, &shelf_notes] {
-        let preview =
-            mutation_preview::preview_write_file(&root, &allowed.display().to_string(), "hi\n")
-                .expect("preview global pack write");
-        assert_eq!(preview.path, *allowed);
-        assert!(preview.is_new_file);
-    }
+    let preview =
+        mutation_preview::preview_write_file(&root, &shelf_notes.display().to_string(), "hi\n")
+            .expect("preview user shelf pack write");
+    assert_eq!(preview.path, shelf_notes);
+    assert!(preview.is_new_file);
 
     for denied in [&shelf_manifest, &shelf_metadata] {
         let error = canonicalize_tool_path(&root, &denied.display().to_string())
-            .expect_err("shelf metadata is outside global pack content");
+            .expect_err("shelf metadata is outside pack content");
         assert!(
             error.contains("outside sandbox or Dext global pack roots"),
             "{error}"
@@ -11839,11 +11830,9 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
     let root = temp_test_dir("compact-env-ledger");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let old_dext_home = std::env::var_os("DEXT_HOME");
-    let old_packs_dir = std::env::var_os("DEXT_PACKS_DIR");
     let old_shelves_dir = std::env::var_os("DEXT_SHELVES_DIR");
     unsafe {
         std::env::set_var("DEXT_HOME", root.join("home"));
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
     }
     let mut agent = test_agent(&root);
@@ -11882,7 +11871,6 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
     );
 
     restore_env_var("DEXT_HOME", old_dext_home);
-    restore_env_var("DEXT_PACKS_DIR", old_packs_dir);
     restore_env_var("DEXT_SHELVES_DIR", old_shelves_dir);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -19197,14 +19185,13 @@ fn packs_discover_user_global_pack_from_dext_home() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("user-pack-discovery-root");
     let home = temp_test_dir("user-pack-discovery-home");
-    let pack_dir = home.join("packs/globaldemo");
+    let pack_dir = home.join("shelves/personal/packs/globaldemo");
     std::fs::create_dir_all(&pack_dir)?;
     std::fs::write(
         pack_dir.join("PACK.md"),
         "---\nname: globaldemo\ndescription: User-global workflow\n---\n# Global demo\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", &home);
     }
@@ -19212,7 +19199,8 @@ fn packs_discover_user_global_pack_from_dext_home() -> Result<()> {
     let pack = packs::find_pack(&root, "globaldemo")?;
     assert_eq!(pack.name, "globaldemo");
     assert_eq!(pack.description, "User-global workflow");
-    assert_eq!(pack.source, "user:~/.dext/packs");
+    assert_eq!(pack.source, "user:~/.dext/shelves/personal");
+    assert_eq!(pack.shelf.as_deref(), Some("personal"));
     assert_eq!(pack.path, pack_dir);
 
     let listing = packs::render_pack_listing(&root);
@@ -19234,14 +19222,13 @@ fn packs_discover_user_global_pack_from_dext_home() -> Result<()> {
 fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-discovery");
-    let pack_dir = root.join(".dext/packs/demo");
+    let pack_dir = root.join(".dext/shelves/project/packs/demo");
     std::fs::create_dir_all(&pack_dir)?;
     std::fs::write(
         pack_dir.join("PACK.md"),
         "---\nname: demo\ndescription: Demo workflow\ncredential-env: [X_AUTH_TOKEN, X_CT0, OPENAI_API_KEY, invalid-name]\n---\n# Demo pack\n\nDo the demo workflow.\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19291,20 +19278,20 @@ fn user_global_pack_preserves_helper_credential_declarations() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("user-pack-credential-declaration");
     let home = root.join("home");
-    let pack_dir = home.join("packs/trusted-helper");
+    let pack_dir = home.join("shelves/trusted/packs/trusted-helper");
     std::fs::create_dir_all(&pack_dir)?;
     std::fs::write(
         pack_dir.join("PACK.md"),
         "---\nname: trusted-helper\ncredential-env: [SERVICE_TOKEN]\n---\n# Trusted helper\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", &home);
     }
 
     let pack = packs::find_pack(&root, "trusted-helper")?;
-    assert_eq!(pack.source, "user:~/.dext/packs");
+    assert_eq!(pack.source, "user:~/.dext/shelves/trusted");
+    assert_eq!(pack.shelf.as_deref(), Some("trusted"));
     assert_eq!(pack.credential_env, vec!["SERVICE_TOKEN"]);
     assert!(!pack.credential_env_ignored);
 
@@ -19321,8 +19308,8 @@ fn project_pack_shadowing_user_pack_never_inherits_user_pack_credentials() -> Re
     let _guard = env_lock();
     let root = temp_test_dir("project-pack-shadows-user-credential-pack");
     let home = root.join("home");
-    let project_pack = root.join(".dext/packs/demo");
-    let user_pack = home.join("packs/demo");
+    let project_pack = root.join(".dext/shelves/project/packs/demo");
+    let user_pack = home.join("shelves/user/packs/demo");
     std::fs::create_dir_all(&project_pack)?;
     std::fs::create_dir_all(&user_pack)?;
     std::fs::write(
@@ -19334,11 +19321,9 @@ fn project_pack_shadowing_user_pack_never_inherits_user_pack_credentials() -> Re
         "---\nname: demo\ncredential-env: [SERVICE_TOKEN]\n---\n# User demo\n",
     )?;
     let old_dext_home = std::env::var_os("DEXT_HOME");
-    let old_packs_dir = std::env::var_os("DEXT_PACKS_DIR");
     let old_shelves_dir = std::env::var_os("DEXT_SHELVES_DIR");
     unsafe {
         std::env::set_var("DEXT_HOME", &home);
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
     }
 
@@ -19349,17 +19334,17 @@ fn project_pack_shadowing_user_pack_never_inherits_user_pack_credentials() -> Re
     assert!(pack.credential_env_ignored);
 
     restore_env_var("DEXT_HOME", old_dext_home);
-    restore_env_var("DEXT_PACKS_DIR", old_packs_dir);
     restore_env_var("DEXT_SHELVES_DIR", old_shelves_dir);
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
 
 #[test]
-fn packs_discovery_is_deterministic_and_dedupes_symlinked_roots() -> Result<()> {
+fn packs_discovery_is_deterministic_and_dedupes_symlinked_shelf_roots() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-deterministic-discovery");
-    let pack_root = root.join("shared-packs");
+    let shelves_root = root.join("shared-shelves");
+    let pack_root = shelves_root.join("community/packs");
     let alpha = pack_root.join("alpha");
     let beta = pack_root.join("beta");
     std::fs::create_dir_all(&alpha)?;
@@ -19372,16 +19357,15 @@ fn packs_discovery_is_deterministic_and_dedupes_symlinked_roots() -> Result<()> 
         beta.join("PACK.md"),
         "---\nname: beta\ndescription: Beta workflow\n---\n# Beta\n",
     )?;
-    let alias = root.join("alias-packs");
+    let alias = root.join("alias-shelves");
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&pack_root, &alias)?;
+    std::os::unix::fs::symlink(&shelves_root, &alias)?;
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&pack_root, &alias)?;
+    std::os::windows::fs::symlink_dir(&shelves_root, &alias)?;
     unsafe {
-        std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var(
-            "DEXT_PACKS_DIR",
-            std::env::join_paths([&alias, &pack_root])?,
+            "DEXT_SHELVES_DIR",
+            std::env::join_paths([&alias, &shelves_root])?,
         );
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19389,14 +19373,13 @@ fn packs_discovery_is_deterministic_and_dedupes_symlinked_roots() -> Result<()> 
     let packs = packs::discover_packs(&root);
     let names = packs
         .iter()
-        .filter(|pack| pack.source == "env:DEXT_PACKS_DIR")
+        .filter(|pack| pack.source.starts_with("env:DEXT_SHELVES_DIR"))
         .map(|pack| pack.name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["alpha", "beta"], "{names:?}");
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -19404,222 +19387,102 @@ fn packs_discovery_is_deterministic_and_dedupes_symlinked_roots() -> Result<()> 
 }
 
 #[test]
-fn embedded_bundled_packs_materialize_and_repair_without_source_tree() -> Result<()> {
+fn pack_create_scaffolds_user_and_project_shelf_packs() -> Result<()> {
     let _guard = env_lock();
-    let root = temp_test_dir("embedded-bundled-packs");
+    let root = temp_test_dir("pack-create");
     let home = root.join("home");
     let old_home = std::env::var_os("DEXT_HOME");
-    let old_packs = std::env::var_os("DEXT_PACKS_DIR");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
-    std::fs::create_dir_all(&home)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o750))?;
-    }
-    unsafe {
-        std::env::set_var("DEXT_HOME", &home);
-        std::env::remove_var("DEXT_PACKS_DIR");
-        std::env::remove_var("DEXT_SHELVES_DIR");
-    }
-
-    let result = (|| -> Result<()> {
-        let discovered = packs::discover_packs(&root);
-        let bundled = discovered
-            .iter()
-            .filter(|pack| pack.source == "bundled:embedded")
-            .map(|pack| pack.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(bundled, vec!["agent-browser", "autoresearch", "packopt"]);
-
-        let browser = packs::find_pack(&root, "agent-browser")?;
-        assert!(browser.path.starts_with(home.join("bundled-packs")));
-        let helper = browser.path.join("bin/agent-browser");
-        assert_eq!(
-            std::fs::read(&helper)?,
-            include_bytes!("../packs/agent-browser/bin/agent-browser")
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                std::fs::metadata(&helper)?.permissions().mode() & 0o777,
-                0o700
-            );
-            assert_eq!(
-                std::fs::metadata(&home)?.permissions().mode() & 0o777,
-                0o750,
-                "pre-existing DEXT_HOME mode must be preserved"
-            );
-            let cache_dirs = [
-                home.join("bundled-packs"),
-                browser
-                    .path
-                    .parent()
-                    .expect("digest cache parent")
-                    .to_path_buf(),
-                browser.path.clone(),
-                browser.path.join("bin"),
-            ];
-            for dir in cache_dirs {
-                assert_eq!(
-                    std::fs::metadata(&dir)?.permissions().mode() & 0o777,
-                    0o700,
-                    "unsafe cache directory mode: {}",
-                    dir.display()
-                );
-            }
-            std::fs::set_permissions(
-                browser.path.join("bin"),
-                std::fs::Permissions::from_mode(0o777),
-            )?;
-        }
-
-        std::fs::write(&helper, b"corrupt")?;
-        packs::discover_packs(&root);
-        assert_eq!(
-            std::fs::read(&helper)?,
-            include_bytes!("../packs/agent-browser/bin/agent-browser")
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                std::fs::metadata(browser.path.join("bin"))?
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-        }
-        Ok(())
-    })();
-
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_PACKS_DIR", old_packs);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
-    let _ = std::fs::remove_dir_all(&root);
-    result
-}
-
-#[cfg(unix)]
-#[test]
-fn embedded_pack_cache_rejects_symlink_components_without_hiding_project_packs() -> Result<()> {
-    use std::os::unix::fs::symlink;
-
-    let _guard = env_lock();
-    let root = temp_test_dir("embedded-pack-cache-symlink");
-    let home = root.join("home");
-    let redirect = root.join("redirect");
-    let project_pack = root.join("packs/demo");
-    std::fs::create_dir_all(&home)?;
-    std::fs::create_dir_all(&redirect)?;
-    std::fs::create_dir_all(&project_pack)?;
-    std::fs::write(
-        project_pack.join("PACK.md"),
-        "---\nname: demo\ndescription: Project workflow\n---\n# Demo\n",
-    )?;
-    symlink(&redirect, home.join("bundled-packs"))?;
-
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_packs = std::env::var_os("DEXT_PACKS_DIR");
     let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
     unsafe {
         std::env::set_var("DEXT_HOME", &home);
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
     }
 
-    let result = (|| -> Result<()> {
-        let demo = packs::find_pack(&root, "demo")?;
-        assert_eq!(demo.source, "project:packs");
+    let user_pack = packs::create_pack(&root, "personal/code-review", false)?;
+    assert_eq!(user_pack, home.join("shelves/personal/packs/code-review"));
+    let user_workflow = std::fs::read_to_string(user_pack.join("PACK.md"))?;
+    assert!(
+        user_workflow.contains("name: code-review"),
+        "{user_workflow}"
+    );
+    assert!(user_workflow.contains("# Code Review"), "{user_workflow}");
+    let discovered = packs::find_pack(&root, "code-review")?;
+    assert_eq!(discovered.shelf.as_deref(), Some("personal"));
+    assert_eq!(discovered.path, user_pack);
 
-        let listing = packs::render_pack_listing(&root);
-        assert!(listing.contains("demo"), "{listing}");
+    let project_pack = packs::create_pack(&root, "local/release-check", true)?;
+    assert_eq!(
+        project_pack,
+        root.join(".dext/shelves/local/packs/release-check")
+    );
+    let discovered = packs::find_pack(&root, "release-check")?;
+    assert_eq!(discovered.shelf.as_deref(), Some("local"));
+    assert!(discovered.source.starts_with("project:"));
+
+    let overwrite = packs::create_pack(&root, "personal/code-review", false)
+        .expect_err("existing pack must not be overwritten");
+    assert!(
+        overwrite.to_string().contains("already exists"),
+        "{overwrite:#}"
+    );
+    for invalid in ["missing-shelf", "Bad/name", "shelf/name/extra", "../escape"] {
         assert!(
-            listing.contains("bundled packs unavailable")
-                && listing.contains("must be a real directory"),
-            "{listing}"
+            packs::create_pack(&root, invalid, false).is_err(),
+            "invalid location accepted: {invalid}"
         );
-
-        let error = packs::find_pack(&root, "agent-browser").expect_err("unsafe cache must fail");
-        let error = format!("{error:#}");
-        assert!(error.contains("bundled packs unavailable"), "{error}");
-        assert!(error.contains("must be a real directory"), "{error}");
-        Ok(())
-    })();
-
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_PACKS_DIR", old_packs);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
-    let _ = std::fs::remove_dir_all(&root);
-    result
-}
-
-#[cfg(unix)]
-#[test]
-fn agent_browser_launcher_rejects_self_resolution_without_home() -> Result<()> {
-    use std::os::unix::fs::symlink;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    fn run_with_deadline(command: &mut Command) -> Result<std::process::ExitStatus> {
-        let mut child = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("agent-browser launcher did not terminate before the deadline");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
-    let root = temp_test_dir("agent-browser-launcher-self");
-    let helper = root.join("agent-browser-helper");
-    std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("packs/agent-browser/bin/agent-browser"),
-        &helper,
-    )?;
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
 
-    let direct = run_with_deadline(
-        Command::new(&helper)
-            .env("AGENT_BROWSER_BIN", &helper)
-            .env_remove("HOME"),
-    )?;
-    assert_eq!(direct.code(), Some(126));
+#[test]
+fn direct_pack_roots_and_overrides_are_not_discovered() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("direct-pack-roots-ignored");
+    let home = root.join("home");
+    let env_root = root.join("env-packs");
+    let direct_override = root.join("direct-override");
+    let paths = [
+        root.join("packs/project-root"),
+        root.join(".dext/packs/project-hidden"),
+        home.join("packs/user-root"),
+        env_root.join("env-root"),
+        direct_override.clone(),
+    ];
+    for (index, path) in paths.iter().enumerate() {
+        std::fs::create_dir_all(path)?;
+        std::fs::write(
+            path.join("PACK.md"),
+            format!("---\nname: direct-{index}\n---\n# Direct\n"),
+        )?;
+    }
+    let old_home = std::env::var_os("DEXT_HOME");
+    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
+    let old_packs = std::env::var_os("DEXT_PACKS_DIR");
+    let old_direct = std::env::var_os("DEXT_PACK_DIRECT_4_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_PACKS_DIR", &env_root);
+        std::env::set_var("DEXT_PACK_DIRECT_4_DIR", &direct_override);
+    }
 
-    let path_dir = root.join("path");
-    std::fs::create_dir_all(&path_dir)?;
-    symlink(&helper, path_dir.join("agent-browser"))?;
-    let path =
-        std::env::join_paths([path_dir.as_path(), Path::new("/usr/bin"), Path::new("/bin")])?;
-    let via_override = run_with_deadline(
-        Command::new(&helper)
-            .env("AGENT_BROWSER_BIN", "agent-browser")
-            .env_remove("HOME")
-            .env("PATH", &path),
-    )?;
-    assert_eq!(via_override.code(), Some(126));
+    let discovered = packs::discover_packs(&root);
+    assert!(
+        discovered
+            .iter()
+            .all(|pack| !pack.name.starts_with("direct-")),
+        "{discovered:?}"
+    );
 
-    let via_path = run_with_deadline(
-        Command::new(&helper)
-            .env_remove("AGENT_BROWSER_BIN")
-            .env_remove("HOME")
-            .env("PATH", path),
-    )?;
-    assert_eq!(via_path.code(), Some(127));
-
-    let _ = std::fs::remove_dir_all(root);
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    restore_env_var("DEXT_PACKS_DIR", old_packs);
+    restore_env_var("DEXT_PACK_DIRECT_4_DIR", old_direct);
+    let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
 
@@ -19646,7 +19509,6 @@ fn packs_discover_shelf_pack_and_apply_precedence() -> Result<()> {
         "---\nname: envpack\ndescription: Env shelf workflow\n---\n# Env demo\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::set_var("DEXT_SHELVES_DIR", root.join("external-shelf"));
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19748,17 +19610,53 @@ fn slash_shelves_lists_typed_manifest_registry() {
 }
 
 #[test]
+fn slash_pack_create_scaffolds_project_pack() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("slash-pack-create");
+    let home = root.join("home");
+    let old_home = std::env::var_os("DEXT_HOME");
+    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(
+        handle_slash("/pack create local/slash-pack --project", &mut agent),
+        Some(true)
+    );
+    let output = drain_events(&mut rx)
+        .into_iter()
+        .find_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(output.contains("created pack:"), "{output}");
+    let pack = packs::find_pack(&root, "slash-pack")?;
+    assert_eq!(pack.shelf.as_deref(), Some("local"));
+    assert!(pack.path.join("PACK.md").is_file());
+
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("slash-pack");
-    let pack_dir = root.join("packs/demo");
+    let pack_dir = root.join(".dext/shelves/test/packs/demo");
     std::fs::create_dir_all(&pack_dir)?;
     std::fs::write(
         pack_dir.join("PACK.md"),
         "---\nname: demo\ndescription: Slash demo\n---\n# Demo\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19793,14 +19691,13 @@ fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
 fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("slash-pack-verbose");
-    let pack_dir = root.join("packs/demo");
+    let pack_dir = root.join(".dext/shelves/test/packs/demo");
     std::fs::create_dir_all(&pack_dir)?;
     std::fs::write(
         pack_dir.join("PACK.md"),
         "---\nname: demo\ndescription: Verbose slash demo\n---\n# Demo\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19852,13 +19749,12 @@ fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
 fn pack_list_renders_compact_blocks_with_header_and_footer() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-list-normal");
-    std::fs::create_dir_all(root.join("packs/demo"))?;
+    std::fs::create_dir_all(root.join(".dext/shelves/test/packs/demo"))?;
     std::fs::write(
-        root.join("packs/demo/PACK.md"),
+        root.join(".dext/shelves/test/packs/demo/PACK.md"),
         "---\nname: demo\ndescription: Short demo\n---\n# Demo\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19890,13 +19786,12 @@ fn pack_list_verbose_shows_paths() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-list-verbose");
     let root = std::fs::canonicalize(&root)?;
-    std::fs::create_dir_all(root.join("packs/demo"))?;
+    std::fs::create_dir_all(root.join(".dext/shelves/test/packs/demo"))?;
     std::fs::write(
-        root.join("packs/demo/PACK.md"),
+        root.join(".dext/shelves/test/packs/demo/PACK.md"),
         "---\nname: demo\ndescription: Demo\n---\n# Demo\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19919,13 +19814,12 @@ fn pack_list_verbose_shows_paths() -> Result<()> {
 fn pack_list_narrow_terminal_wraps_description() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-list-narrow");
-    std::fs::create_dir_all(root.join("packs/demo"))?;
+    std::fs::create_dir_all(root.join(".dext/shelves/test/packs/demo"))?;
     std::fs::write(
-        root.join("packs/demo/PACK.md"),
+        root.join(".dext/shelves/test/packs/demo/PACK.md"),
         "---\nname: demo\ndescription: The quick brown fox jumps over the lazy dog repeatedly\n---\n# Demo\n",
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19953,14 +19847,13 @@ fn pack_list_narrow_terminal_wraps_description() -> Result<()> {
 fn pack_list_long_description_wraps_within_width() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-list-longdesc");
-    std::fs::create_dir_all(root.join("packs/demo"))?;
+    std::fs::create_dir_all(root.join(".dext/shelves/test/packs/demo"))?;
     let long_desc = "word ".repeat(50);
     std::fs::write(
-        root.join("packs/demo/PACK.md"),
+        root.join(".dext/shelves/test/packs/demo/PACK.md"),
         format!("---\nname: demo\ndescription: {long_desc}---\n# Demo\n"),
     )?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
@@ -19984,14 +19877,15 @@ fn pack_list_long_description_wraps_within_width() -> Result<()> {
 fn list_render_shorten_path_uses_project_relative() {
     let home = std::path::Path::new("/tmp/dext-test-home");
     let root = std::path::Path::new("/tmp/dext-test-home/work/project");
-    let pack_path = std::path::Path::new("/tmp/dext-test-home/work/project/packs/demo");
+    let pack_path =
+        std::path::Path::new("/tmp/dext-test-home/work/project/.dext/shelves/local/packs/demo");
 
     let shortened = list_render::shorten_path(pack_path, root, home, false);
-    assert_eq!(shortened, "./packs/demo");
+    assert_eq!(shortened, "./.dext/shelves/local/packs/demo");
 
-    let home_pack = std::path::Path::new("/tmp/dext-test-home/.dext/packs/demo");
+    let home_pack = std::path::Path::new("/tmp/dext-test-home/.dext/shelves/personal/packs/demo");
     let shortened2 = list_render::shorten_path(home_pack, root, home, false);
-    assert_eq!(shortened2, "~/.dext/packs/demo");
+    assert_eq!(shortened2, "~/.dext/shelves/personal/packs/demo");
 }
 
 #[test]
@@ -20103,11 +19997,10 @@ fn pack_invocation_args_preserve_complete_tasks() {
 fn conversational_pack_inference_requires_invocation_intent() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-inference");
-    let pack_dir = root.join("packs/demo");
+    let pack_dir = root.join(".dext/shelves/test/packs/demo");
     std::fs::create_dir_all(&pack_dir)?;
     std::fs::write(pack_dir.join("PACK.md"), "---\nname: demo\n---\n# Demo\n")?;
     unsafe {
-        std::env::remove_var("DEXT_PACKS_DIR");
         std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_HOME", root.join("home"));
     }

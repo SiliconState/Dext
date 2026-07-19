@@ -482,8 +482,8 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     },
     SlashCmd {
         name: "/pack",
-        args: "[list|inspect|run]",
-        help: "discover/invoke packs",
+        args: "[list|inspect|run|create]",
+        help: "create/discover/invoke shelf packs",
     },
     SlashCmd {
         name: "/hooks",
@@ -818,6 +818,9 @@ struct TuiState {
     thinking_effort: ThinkingEffort,
     last_expandable: Option<ExpandableBlock>,
     show_help: bool,
+    show_todos: bool,
+    todo_items: Vec<TodoItem>,
+    todo_scroll: usize,
     show_status_details: bool,
     show_inspector: bool,
     slash_acomp_sel: Option<usize>,
@@ -861,6 +864,19 @@ struct TodoProgress {
     completed: usize,
     in_progress: usize,
     active: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TodoItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TodoItem {
+    text: String,
+    status: TodoItemStatus,
 }
 
 impl TuiState {
@@ -926,6 +942,9 @@ impl TuiState {
             context_mode: ContextMode::Standard,
             last_expandable: None,
             show_help: false,
+            show_todos: false,
+            todo_items: Vec::new(),
+            todo_scroll: 0,
             show_status_details: false,
             show_inspector: false,
             slash_acomp_sel: None,
@@ -960,6 +979,31 @@ impl TuiState {
             backend_viewer_open: false,
             backend_viewer_call_id: None,
             backend_viewer_scroll_from_bottom: 0,
+        }
+    }
+
+    fn set_todo_items(&mut self, items: Vec<TodoItem>) {
+        self.todo_progress = todo_progress_from_items(&items);
+        self.todo_items = items;
+        self.todo_scroll = 0;
+    }
+
+    fn toggle_todo_view(&mut self) {
+        self.show_todos = !self.show_todos;
+        self.todo_scroll = 0;
+        self.show_help = false;
+        self.status = if self.show_todos {
+            "todo list visible".to_string()
+        } else {
+            "todo list hidden".to_string()
+        };
+    }
+
+    fn scroll_todo_view(&mut self, delta: isize) {
+        if delta >= 0 {
+            self.todo_scroll = self.todo_scroll.saturating_add(delta as usize);
+        } else {
+            self.todo_scroll = self.todo_scroll.saturating_sub(delta.unsigned_abs());
         }
     }
 
@@ -1831,9 +1875,9 @@ impl TuiState {
                 }
                 let lines_count = content.lines().count();
                 if matches!(n.as_str(), "todo_read" | "todo_write")
-                    && let Some(progress) = todo_progress_from_content(&content)
+                    && let Some(items) = todo_items_from_content(&content)
                 {
-                    self.todo_progress = Some(progress);
+                    self.set_todo_items(items);
                 }
                 let chunk = ToolChunk {
                     call_tag: call_tag.clone(),
@@ -2238,41 +2282,90 @@ fn todo_text_from_line(line: &str) -> String {
         .to_string()
 }
 
-fn todo_progress_from_content(content: &str) -> Option<TodoProgress> {
-    let mut total = 0usize;
-    let mut completed = 0usize;
-    let mut in_progress = 0usize;
-    let mut active = None;
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        let Some(mark) = trimmed.chars().next() else {
-            continue;
-        };
-        match mark {
-            '✓' => {
-                total += 1;
-                completed += 1;
-            }
-            '►' => {
-                total += 1;
-                in_progress += 1;
-                if active.is_none() {
-                    let text = todo_text_from_line(trimmed);
-                    if !text.is_empty() {
-                        active = Some(text);
-                    }
-                }
-            }
-            '○' => total += 1,
-            _ => {}
-        }
+fn todo_items_from_content(content: &str) -> Option<Vec<TodoItem>> {
+    if content.contains("(no todos")
+        || content.contains("(todo list is empty)")
+        || content.contains("0 pending, 0 in progress, 0 completed")
+    {
+        return Some(Vec::new());
     }
-    (total > 0).then_some(TodoProgress {
-        total,
+    let items = content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let status = match trimmed.chars().next()? {
+                '✓' => TodoItemStatus::Completed,
+                '►' => TodoItemStatus::InProgress,
+                '○' => TodoItemStatus::Pending,
+                _ => return None,
+            };
+            let text = todo_text_from_line(trimmed);
+            (!text.is_empty()).then_some(TodoItem { text, status })
+        })
+        .collect::<Vec<_>>();
+    (!items.is_empty()).then_some(items)
+}
+
+fn todo_progress_from_items(items: &[TodoItem]) -> Option<TodoProgress> {
+    if items.is_empty() {
+        return None;
+    }
+    let completed = items
+        .iter()
+        .filter(|item| item.status == TodoItemStatus::Completed)
+        .count();
+    let in_progress = items
+        .iter()
+        .filter(|item| item.status == TodoItemStatus::InProgress)
+        .count();
+    let active = items
+        .iter()
+        .find(|item| item.status == TodoItemStatus::InProgress)
+        .map(|item| item.text.clone());
+    Some(TodoProgress {
+        total: items.len(),
         completed,
         in_progress,
         active,
     })
+}
+
+#[cfg(test)]
+fn todo_progress_from_content(content: &str) -> Option<TodoProgress> {
+    todo_items_from_content(content).and_then(|items| todo_progress_from_items(&items))
+}
+
+fn todo_items_from_path(path: &std::path::Path) -> Option<Vec<TodoItem>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let items = serde_json::from_str::<Value>(&content).ok()?;
+    let items = items.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| {
+                let text = item["text"].as_str()?.trim();
+                if text.is_empty() {
+                    return None;
+                }
+                let status = match item["status"].as_str().unwrap_or("pending") {
+                    "completed" => TodoItemStatus::Completed,
+                    "in_progress" => TodoItemStatus::InProgress,
+                    _ => TodoItemStatus::Pending,
+                };
+                Some(TodoItem {
+                    text: text.to_string(),
+                    status,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn initial_todo_items(root: &std::path::Path, session_id: &str) -> Vec<TodoItem> {
+    let session_path = crate::session::session_todo_path(root, session_id);
+    todo_items_from_path(&session_path)
+        .or_else(|| todo_items_from_path(&root.join("DEXT.todo.json")))
+        .unwrap_or_default()
 }
 
 fn todo_progress_label(progress: &TodoProgress) -> String {
@@ -6920,6 +7013,7 @@ fn help_overlay_text() -> Text<'static> {
         ("Enter", "submit prompt"),
         ("Shift+Enter / Alt+Enter", "insert newline"),
         ("Ctrl+B", "open backend output viewer while bash runs"),
+        ("Ctrl+L", "show the current todo list (read-only)"),
         ("Ctrl+O", "toggle last tool output"),
         ("Ctrl+T", "toggle token/status details"),
         ("Paste", "multi-line paste is inserted without auto-submit"),
@@ -7562,6 +7656,111 @@ fn backend_viewer_text(state: &mut TuiState, area: Rect) -> (Text<'static>, Stri
     (Text::from(lines), title, footer)
 }
 
+fn todo_overlay_text(state: &mut TuiState, width: u16, height: u16) -> (Text<'static>, String) {
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let visible_rows = height.saturating_sub(2).max(1) as usize;
+    let mut rows = Vec::new();
+
+    if state.todo_items.is_empty() {
+        rows.push(Line::from(""));
+        rows.push(Line::from(Span::styled(
+            "No todos yet.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let completed = state
+            .todo_items
+            .iter()
+            .filter(|item| item.status == TodoItemStatus::Completed)
+            .count();
+        let in_progress = state
+            .todo_items
+            .iter()
+            .filter(|item| item.status == TodoItemStatus::InProgress)
+            .count();
+        let summary = if in_progress == 0 {
+            format!("{completed}/{} complete", state.todo_items.len())
+        } else {
+            format!(
+                "{completed}/{} complete · {in_progress} in progress",
+                state.todo_items.len()
+            )
+        };
+        rows.push(Line::from(Span::styled(
+            clamp_chars(&summary, inner_width),
+            Style::default().fg(Color::DarkGray),
+        )));
+        rows.push(Line::from(""));
+
+        let text_width = inner_width.saturating_sub(2).max(1);
+        for item in &state.todo_items {
+            let (mark, color) = match item.status {
+                TodoItemStatus::Pending => ("○", Color::DarkGray),
+                TodoItemStatus::InProgress => ("►", Color::Yellow),
+                TodoItemStatus::Completed => ("✓", Color::Green),
+            };
+            let wrapped = wrap_plain_words_visual(&item.text, text_width);
+            for (index, line) in wrapped.iter().enumerate() {
+                let prefix = if index == 0 { mark } else { " " };
+                rows.push(Line::from(vec![
+                    Span::styled(format!("{prefix} "), Style::default().fg(color)),
+                    Span::styled(
+                        line.clone(),
+                        if item.status == TodoItemStatus::Completed {
+                            Style::default().fg(Color::DarkGray)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                ]));
+            }
+        }
+    }
+
+    let max_scroll = rows.len().saturating_sub(visible_rows);
+    state.todo_scroll = state.todo_scroll.min(max_scroll);
+    let start = state.todo_scroll;
+    let shown = rows
+        .into_iter()
+        .skip(start)
+        .take(visible_rows)
+        .collect::<Vec<_>>();
+    let title = if state.todo_items.is_empty() {
+        " todos ".to_string()
+    } else {
+        format!(" todos · {} ", state.todo_items.len())
+    };
+    (Text::from(shown), title)
+}
+
+fn render_todo_overlay(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect) {
+    let desired_width = 76u16.min(area.width.saturating_sub(2).max(1));
+    let content_rows = state.todo_items.len().saturating_add(4) as u16;
+    let desired_height = content_rows
+        .clamp(6, 20)
+        .min(area.height.saturating_sub(2).max(1));
+    let rect = centered_rect(area, desired_width, desired_height);
+    let (text, title) = todo_overlay_text(state, rect.width, rect.height);
+    let footer = " read-only · ↑↓/Pg scroll · Ctrl+L/Esc/q close ";
+    let widget = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Line::from(Span::styled(
+                clamp_chars(footer, rect.width.max(1) as usize),
+                Style::default().fg(Color::DarkGray),
+            )))
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    render_widget_safe(frame, Clear, rect);
+    render_widget_safe(frame, widget, rect);
+}
+
 fn render_backend_viewer(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let area = frame.area();
     render_widget_safe(frame, Clear, area);
@@ -7691,6 +7890,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     if state.pending_local_auth.is_none()
         && state.pending_perm.is_none()
         && !state.show_help
+        && !state.show_todos
         && !state.work_map_is_active()
         && input_area.width > 0
         && input_area.height > 0
@@ -7703,9 +7903,13 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         frame.set_cursor_position((cx, cy));
     }
 
+    if state.show_todos && state.pending_local_auth.is_none() && state.pending_perm.is_none() {
+        render_todo_overlay(frame, state, area);
+    }
+
     if state.show_help {
         let help = help_overlay_text();
-        let desired_w = 56u16;
+        let desired_w = 72u16;
         let desired_h = (help.lines.len() as u16).saturating_add(2);
         let rect = centered_rect(area, desired_w, desired_h);
         let widget = Paragraph::new(help).wrap(Wrap { trim: false }).block(
@@ -7728,6 +7932,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     }
 
     if !state.show_help
+        && !state.show_todos
         && state.pending_local_auth.is_none()
         && state.pending_perm.is_none()
         && !state.work_map_is_active()
@@ -7808,6 +8013,11 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
         state.status = "backend viewer open; paste ignored".to_string();
         return;
     }
+    if state.show_todos {
+        clear_secret_string(&mut pasted);
+        state.status = "todo list open; paste ignored".to_string();
+        return;
+    }
     if state.pending_local_auth.is_some() {
         let submit = pasted.ends_with('\n') || pasted.ends_with('\r');
         pasted.retain(|ch| !matches!(ch, '\r' | '\n'));
@@ -7868,6 +8078,14 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => state.scroll_backend_viewer(1),
             MouseEventKind::ScrollDown => state.scroll_backend_viewer(-1),
+            _ => {}
+        }
+        return;
+    }
+    if state.show_todos {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => state.scroll_todo_view(-1),
+            MouseEventKind::ScrollDown => state.scroll_todo_view(1),
             _ => {}
         }
         return;
@@ -8272,6 +8490,35 @@ fn handle_backend_viewer_key(state: &mut TuiState, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_todo_view_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    if !state.show_todos {
+        return false;
+    }
+    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META);
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('c'), _) | (KeyCode::Char('d'), _) if is_ctrl => return false,
+        (KeyCode::Esc, _)
+        | (KeyCode::Char('q'), _)
+        | (KeyCode::Char('Q'), _)
+        | (KeyCode::Char('l'), _)
+            if key.code != KeyCode::Char('l') || is_ctrl =>
+        {
+            state.toggle_todo_view();
+        }
+        (KeyCode::Up, _) => state.scroll_todo_view(-1),
+        (KeyCode::Down, _) => state.scroll_todo_view(1),
+        (KeyCode::PageUp, _) => state.scroll_todo_view(-10),
+        (KeyCode::PageDown, _) => state.scroll_todo_view(10),
+        (KeyCode::Home, _) => state.todo_scroll = 0,
+        (KeyCode::End, _) => state.todo_scroll = usize::MAX,
+        _ => {}
+    }
+    true
+}
+
 fn handle_key(
     state: &mut TuiState,
     key: KeyEvent,
@@ -8337,6 +8584,9 @@ fn handle_key(
         }
         return;
     }
+    if handle_todo_view_key(state, key) {
+        return;
+    }
     let is_ctrl = |m: KeyModifiers| {
         m.contains(KeyModifiers::CONTROL)
             && !m.intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META)
@@ -8376,6 +8626,7 @@ fn handle_key(
                 && state.input.is_empty() =>
         {
             state.show_help = !state.show_help;
+            state.show_todos = false;
         }
         (KeyCode::Char('o'), m) if is_ctrl(m) => {
             if let Some(block) = state.last_expandable.as_ref() {
@@ -8401,6 +8652,9 @@ fn handle_key(
         }
         (KeyCode::Char('b'), m) if is_ctrl(m) => {
             state.open_backend_viewer();
+        }
+        (KeyCode::Char('l'), m) if is_ctrl(m) => {
+            state.toggle_todo_view();
         }
         (KeyCode::Char('t'), m) if is_ctrl(m) => {
             state.show_status_details = !state.show_status_details;
@@ -8899,6 +9153,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let approval_profile = agent.approval_profile();
     let thinking_effort = agent.thinking_effort();
     let context_mode = agent.context_mode;
+    let initial_todos = initial_todo_items(&agent.sandbox_root, &agent.session_id);
     let auto_approved_count = agent.auto_approved_privileged_tool_count();
     let _guard = TerminalGuard::new()?;
     let stdout = io::stdout();
@@ -8945,6 +9200,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         thinking_effort,
     );
     state.context_mode = context_mode;
+    state.set_todo_items(initial_todos);
     let banner = welcome_banner(
         &state.sandbox,
         &state.model,
@@ -9642,6 +9898,80 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_l_opens_read_only_todo_view_without_backend_viewer() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.set_todo_items(
+            todo_items_from_content(
+                "► Implement the view [in_progress]\n○ Verify it [pending]\n✓ Inspect state [completed]",
+            )
+            .expect("todo items"),
+        );
+        state.agent_busy = true;
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            &tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(state.show_todos);
+        assert!(!state.backend_viewer_open);
+        assert!(state.agent_busy);
+        let (text, title) = todo_overlay_text(&mut state, 60, 12);
+        let rendered = flatten_lines(&text).join("\n");
+        assert!(title.contains("3"), "{title}");
+        assert!(rendered.contains("Implement the view"), "{rendered}");
+        assert!(rendered.contains("Verify it"), "{rendered}");
+        assert!(rendered.contains("Inspect state"), "{rendered}");
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &interrupt,
+        );
+        assert!(!state.show_todos);
+        assert!(!state.backend_viewer_open);
+    }
+
+    #[test]
+    fn empty_todo_result_clears_todo_view_state() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state
+            .set_todo_items(todo_items_from_content("○ old task [pending]").expect("initial todo"));
+        state.set_todo_items(
+            todo_items_from_content("0 pending, 0 in progress, 0 completed")
+                .expect("empty todo result"),
+        );
+
+        assert!(state.todo_items.is_empty());
+        assert!(state.todo_progress.is_none());
+        let (text, _) = todo_overlay_text(&mut state, 40, 8);
+        assert!(flatten_lines(&text).join("\n").contains("No todos yet."));
+    }
+
+    #[test]
     fn ready_input_hint_is_empty_and_help_lists_keymap() {
         let state = TuiState::new(
             "test-model".to_string(),
@@ -9656,6 +9986,7 @@ mod tests {
         assert!(help.contains("Enter"), "{help}");
         assert!(help.contains("Shift+Enter / Alt+Enter"), "{help}");
         assert!(help.contains("Ctrl+O"), "{help}");
+        assert!(help.contains("Ctrl+L"), "{help}");
         assert!(help.contains("Ctrl+I"), "{help}");
         assert!(help.contains("Ctrl+T"), "{help}");
         assert!(help.contains("Branch(master (dirty))"), "{help}");

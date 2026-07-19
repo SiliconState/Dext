@@ -33,8 +33,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Sandbox-contained path resolution for previewed mutations.
 
 - `src/memory_merge.rs`
-  - Section-aware merge helpers for `MEMORY.md`.
-  - Compact merge helpers for `recall.md`.
+  - Optional, explicit Git merge helpers for `MEMORY.md` and `recall.md`.
   - Explicit local Git merge-driver check/register/unregister support.
 
 - `src/provider.rs`
@@ -85,13 +84,13 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `src/tui.rs`
   - Inline Ratatui UI in the regular terminal buffer.
-  - Transcript rendering, input box, status/live areas, permission prompts, and slash completions.
+  - Transcript rendering, input box, status/live areas, permission prompts, slash completions, and the read-only `Ctrl+L` todo modal.
   - See [`TUI.md`](TUI.md) for the renderer contract, exact dependency stack, compatibility patch, and PTY gate.
 
 - `src/packs.rs`
-  - Pack discovery, loading, invocation, and precedence.
-  - Compile-time embedding plus content-addressed `$DEXT_HOME/bundled-packs/` materialization/repair for runtime-essential bundled pack files. Existing state-directory ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix and reject symlink components.
+  - Shelf-contained pack scaffolding, discovery, loading, invocation, and precedence.
   - Front matter parsing and pack listing/inspection rendering.
+  - Dext ships no pack content; user/project/environment shelves own all packs.
 
 - `src/shelves.rs`
   - Shelf registry with typed manifests (`shelf.json`).
@@ -115,7 +114,7 @@ Dext exposes a deliberately small default native tool set:
 - Git: `git_diff`, `git_commit`.
 - Tasks: `todo_read`, `todo_write`.
 
-Browser automation is delivered by the bundled `agent-browser` pack, not a provider-visible browser tool or runtime recipe. It uses Dext's regular `bash` approval and sandbox path and does not expand the tool schema. On Windows, only native `.exe`/`.com` pack helpers can receive declared credentials through direct spawn; script helpers run through Bash with declared credentials removed.
+Packs extend this tool model without changing it. Dext creates, discovers, inspects, maintains, and invokes user-authored packs under shelf roots; it ships no pack content and registers no pack as a provider-visible tool. Pack helpers run through the regular approval and sandbox path. On Windows, only native `.exe`/`.com` pack helpers can receive narrowly declared credentials through direct spawn; script helpers run through Bash with declared credentials removed.
 
 The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`. Frugal/tiny retain the default core tool capabilities while using lean schemas and smaller context/result budgets.
 
@@ -160,7 +159,7 @@ Durable sessions use a small owner-private `tool-journal.json` beside the active
 
 `dext doctor` is an observational diagnostics path. It reuses the startup approval resolver and bounded state inspectors, reports effective policy/source separately from sandbox kernel enforcement, and inspects only active/latest provider, auth, session, todo, settings, journal, and checkpoint state. It does not repair files, resolve credential references, or contact provider endpoints.
 
-## Git recovery and memory safety
+## Git recovery and optional context-file merge helpers
 
 Dext's Git-native recovery features are local runtime helpers, not
 provider-visible tools:
@@ -178,7 +177,9 @@ provider-visible tools:
   and `multi_edit` before permission approval. The current `git` preview mode
   falls back to simple previews.
 - Memory merge registration is explicit through `dext memory check/register`.
-  It is local-only by default and targets `MEMORY.md` plus `recall.md`.
+  It is local-only by default and targets optional `MEMORY.md` plus `recall.md`.
+  `DEXT.md` and present `recall.md` files are prompt inputs; `MEMORY.md` is never
+  auto-injected and is read only by explicit `dext memory` commands.
 
 These helpers no-op outside Git repositories and preserve Dext's lean tool
 surface: the model still sees the regular filesystem/Git tools, not extra

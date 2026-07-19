@@ -19,6 +19,10 @@
 - Consolidated maintained project documentation and removed obsolete release
   plan/scope artifacts. The inline TUI contract, dependency stack, patch
   rationale, and regression procedure now live in `docs/TUI.md`.
+- Kept packs as first-class workflow units while making storage and discovery
+  shelf-only. Packs now live exclusively at `<shelf>/packs/<name>` under
+  project, user, or `DEXT_SHELVES_DIR` roots; direct pack roots and
+  `DEXT_PACKS_DIR` are no longer discovery inputs.
 
 ### Removed
 
@@ -27,6 +31,9 @@
   quality gates, TUI state, session artifacts dir, and all associated
   tests/fixtures. `/plan` preserved via a direct read-only planner.
   Net -1544 lines.
+- Removed all repository-owned and embedded pack payloads. Dext ships the pack
+  lifecycle and shelf integration, but no pack content; users own and
+  distribute shelf repositories separately.
 
 ### Added
 
@@ -34,6 +41,12 @@
   `https://siliconstate.github.io/Dext/`, deployed from `docs/` by a
   least-privilege workflow with commit-pinned actions and offline validation of
   metadata, local links, and anchors.
+- Added `dext pack create <shelf>/<name>` and `/pack create` scaffolding for
+  user-global packs by default and explicit project-local packs with
+  `--project`.
+- Added an always-available read-only todo modal to the inline TUI. `Ctrl+L`
+  opens persisted session/project todos while idle or busy without changing the
+  backend viewer's alternate-screen behavior.
 - Added an isolated Kimi Code provider at `https://api.kimi.com/coding` with
   coding-plan API keys created at `https://www.kimi.com/code/console`,
   `KIMI_API_KEY` support, K3 adaptive thinking/empty-signature compatibility,
@@ -101,8 +114,8 @@
 - Agent-run subprocesses now remove credential-shaped environment variables by
   default. Trusted model-invoked tools may explicitly opt in with
   `DEXT_INHERIT_TOOL_CREDENTIALS=1`; hooks and Dext-owned children remain scrubbed.
-- Pack helper credentials are restricted to direct helpers from environment-selected,
-  user-global, or bundled packs. Project-local `credential-env` declarations are
+- Pack helper credentials are restricted to direct helpers from user-owned or
+  `DEXT_SHELVES_DIR` packs. Project-local `credential-env` declarations are
   ignored so repository content cannot enable parent credential inheritance.
 - Linux Landlock and macOS Seatbelt profiles now preserve every filesystem read
   available to the Dext process user while limiting writes to the roots allowed
