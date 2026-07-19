@@ -211,3 +211,5 @@ cargo test --release --locked --test tui_smoke -- --nocapture
 ```
 
 The TUI smoke suite launches the real compiled binary inside a pseudo-terminal. In addition to launch/help/exit coverage, it checks narrow and wide layouts, multiline input, live-stream input, resize survival, bounded cursor queries, zero whole-screen resize clears, and completed output after resize. Renderer changes also follow the live-terminal checks in [`TUI.md`](TUI.md).
+
+On Windows CI and release builders, the scheduler-sensitive `fast_bash_command_returns_without_100ms_poll_tail` regression runs alone after the remaining release tests. Its original `<90 ms` assertion remains unchanged; isolation prevents unrelated parallel test load from obscuring the process-wait regression it measures.

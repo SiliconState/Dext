@@ -96,7 +96,14 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Run release tests
+        if: runner.os != 'Windows'
         run: cargo test --release --locked --target ${{ matrix.target }}
+      - name: Run Windows release tests
+        if: runner.os == 'Windows'
+        run: cargo test --release --locked --target ${{ matrix.target }} -- --skip main_tests::fast_bash_command_returns_without_100ms_poll_tail
+      - name: Run Windows bash fast-path latency test in isolation
+        if: runner.os == 'Windows'
+        run: cargo test --release --locked --target ${{ matrix.target }} main_tests::fast_bash_command_returns_without_100ms_poll_tail -- --exact --nocapture
       - name: Run TUI smoke tests
         if: runner.os != 'Windows'
         run: cargo test --release --locked --target ${{ matrix.target }} --test tui_smoke -- --nocapture

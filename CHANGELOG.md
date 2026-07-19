@@ -155,3 +155,7 @@
   declared credential values to hooks.
 - Shelf context aggregation now enforces the total byte budget, including
   separators and UTF-8-safe ellipses.
+- Windows CI and release jobs now run the scheduler-sensitive bash fast-path
+  latency regression alone after the remaining release tests. The original
+  `<90 ms` assertion is unchanged; isolation removes unrelated parallel-suite
+  contention without weakening the regression check.
