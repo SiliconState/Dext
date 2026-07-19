@@ -3,9 +3,22 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dext — Documentation</title>
-<meta name="description" content="Dext technical documentation — a single-binary Rust coding agent that runs from your terminal.">
+<title>Dext — Source-first terminal coding agent</title>
+<meta name="description" content="Dext is a source-first, single-binary Rust coding agent with project-scoped sessions, native tools, safety controls, and an inline terminal UI.">
 <meta name="theme-color" content="#060a13">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://siliconstate.github.io/Dext/">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Dext">
+<meta property="og:title" content="Dext — Source-first terminal coding agent">
+<meta property="og:description" content="A single-binary Rust coding agent with project-scoped sessions, native tools, safety controls, and an inline terminal UI.">
+<meta property="og:url" content="https://siliconstate.github.io/Dext/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Dext — Source-first terminal coding agent">
+<meta name="twitter:description" content="A single-binary Rust coding agent that lives in your terminal.">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Dext","applicationCategory":"DeveloperApplication","operatingSystem":"Linux, macOS, Windows","softwareVersion":"0.1.0","url":"https://siliconstate.github.io/Dext/","codeRepository":"https://github.com/SiliconState/Dext","license":"https://github.com/SiliconState/Dext/blob/main/LICENSE","description":"Source-first, single-binary Rust coding agent for terminal workflows."}</script>
 <style>
 /* ============ TOKENS ============ */
 :root[data-theme="dark"]{
@@ -43,6 +56,8 @@ color-scheme:light;
 /* ============ BASE ============ */
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
+.skip-link{position:fixed;left:1rem;top:1rem;z-index:1000;background:var(--text);color:var(--bg);font-weight:700;padding:.65rem 1rem;border-radius:9px;transform:translateY(-180%);transition:transform .15s}
+.skip-link:focus{transform:none}
 body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.7;font-size:15.5px;-webkit-font-smoothing:antialiased}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:none}
@@ -120,6 +135,14 @@ radial-gradient(700px 380px at 55% 95%,rgba(124,58,237,.10),transparent 65%)}
 .term-line.out{color:var(--faint)}
 .cursor{display:inline-block;width:8px;height:1.05em;background:var(--accent2);vertical-align:text-bottom;animation:blink 1.1s steps(2) infinite;border-radius:1px}
 @keyframes blink{50%{opacity:0}}
+/* ============ PROJECT PROOF ============ */
+.proof-wrap{position:relative;z-index:2;max-width:1120px;margin:-1.25rem auto 0;padding:0 2rem}
+.proof-grid{display:grid;grid-template-columns:repeat(4,1fr);background:var(--panel);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
+.proof{padding:1.05rem 1.15rem;border-right:1px solid var(--border)}
+.proof:last-child{border-right:none}
+.proof-kicker{display:block;color:var(--accent2);font-family:'JetBrains Mono',ui-monospace,monospace;font-size:.68rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.3rem}
+.proof strong{display:block;font-family:'Space Grotesk',ui-sans-serif,system-ui,sans-serif;font-size:.92rem;margin-bottom:.16rem}
+.proof p{color:var(--dim);font-size:.78rem;line-height:1.45}
 /* ============ LAYOUT ============ */
 .layout{max-width:1440px;margin:0 auto;display:grid;grid-template-columns:248px minmax(0,1fr) 216px;gap:2.4rem;padding:0 1.4rem}
 /* left rail */
@@ -251,6 +274,7 @@ pre code{background:none;border:none;padding:0;color:inherit;font-size:inherit;w
 @media(max-width:920px){
 .topnav{display:none}
 .layout{grid-template-columns:minmax(0,1fr);padding:0 1.1rem}
+.proof-wrap{padding:0 1.1rem}.proof-grid{grid-template-columns:repeat(2,1fr)}.proof:nth-child(2){border-right:none}.proof:nth-child(-n+2){border-bottom:1px solid var(--border)}
 .rail-left{position:fixed;top:0;left:0;width:280px;height:100vh;z-index:350;background:var(--panel);border-right:1px solid var(--border);padding:4rem 1rem 3rem;transform:translateX(-100%);transition:transform .3s}
 .rail-left.open{transform:none}
 .scrim{position:fixed;inset:0;z-index:340;background:rgba(3,6,12,.55);opacity:0;pointer-events:none;transition:opacity .3s}
@@ -262,9 +286,11 @@ body.drawer-open{overflow:hidden}
 .search-trigger{min-width:0}
 .search-trigger .st-text,.search-trigger kbd{display:none}
 }
+@media(max-width:560px){.brand-sub{display:none}.hero-stats{gap:1.2rem}.proof-grid{grid-template-columns:1fr}.proof,.proof:nth-child(2){border-right:none;border-bottom:1px solid var(--border)}.proof:last-child{border-bottom:none}}
 </style>
 </head>
 <body>
+<a class="skip-link" href="#main-content">Skip to documentation</a>
 <div class="progress" id="progress"></div>
 <header class="topbar">
 <div class="topbar-inner">
@@ -301,6 +327,7 @@ body.drawer-open{overflow:hidden}
     <p class="hero-sub">Dext keeps project-scoped session state and gives the model a curated set of native tools for filesystem operations, search, shell execution, HTTP, Git, and task tracking — source-first, no external service required.</p>
     <div class="hero-cta">
       <a class="btn btn-primary" href="#quickstart">Get started →</a>
+      <a class="btn btn-ghost" href="https://github.com/SiliconState/Dext/releases">Download a release</a>
       <a class="btn btn-ghost" href="#architecture">Explore the architecture</a>
     </div>
     <div class="hero-stats">
@@ -323,6 +350,15 @@ body.drawer-open{overflow:hidden}
 <div class="term-line out">▸ streaming response <span class="cursor"></span></div>
     </div>
   </div>
+</div>
+</section>
+
+<section class="proof-wrap" aria-label="Project highlights">
+<div class="proof-grid">
+  <article class="proof"><span class="proof-kicker">Source-first</span><strong>One auditable Rust binary</strong><p>Prompts, policy, providers, state, and the TUI live in this repository.</p></article>
+  <article class="proof"><span class="proof-kicker">Recoverable</span><strong>Git-native checkpoints</strong><p>Preview, inspect, and undo agent file changes without hiding recovery state.</p></article>
+  <article class="proof"><span class="proof-kicker">Bounded</span><strong>Safety at every layer</strong><p>Approval profiles, sandbox controls, credential scrubbing, and side-effect fencing.</p></article>
+  <article class="proof"><span class="proof-kicker">Portable</span><strong>Provider-neutral workflows</strong><p>Cloud and local model profiles share a compact native tool and pack system.</p></article>
 </div>
 </section>
 
@@ -377,6 +413,7 @@ body.drawer-open{overflow:hidden}
   <button class="nav-section" data-target="sec-test"><span class="num">05</span>Testing &amp; Perf<span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-test">
     <li><a href="#testing">Testing</a></li>
+    <li class="sub"><a href="#github-pages">GitHub Pages</a></li>
     <li><a href="#benchmarks">Benchmarks</a></li>
   </ul>
 </div>
@@ -389,7 +426,7 @@ body.drawer-open{overflow:hidden}
     <li class="sub"><a href="#env-vars">Environment Variables</a></li>
     <li class="sub"><a href="#providers">Providers</a></li>
     <li class="sub"><a href="#config-files">Configuration Files</a></li>
-    <li class="sub"><a href="RISK_REGISTER.md">Open Risk Register</a></li>
+    <li class="sub"><a href="https://github.com/SiliconState/Dext/blob/main/docs/RISK_REGISTER.md">Open Risk Register</a></li>
   </ul>
 </div>
 </nav>
@@ -398,9 +435,9 @@ body.drawer-open{overflow:hidden}
 <h1 id="overview">Dext — Technical Documentation</h1>
 <p>Dext is a <strong>single-binary Rust coding agent</strong> that runs from your terminal. It keeps project-scoped session state and gives the model a curated set of native tools for filesystem operations, search, shell execution, data processing, HTTP requests, Git operations, and task tracking.</p>
 <p>Dext is <strong>source-first</strong>: prompts, runtime state, tool policies, provider wiring, and the TUI all live in the repository with no external service required beyond your chosen model provider.</p>
-<div class="tip"><strong>Canonical documentation:</strong> this page is the main technical reference and must be updated in the same change as runtime, architecture, security, provider, tool, test, CI, or release behavior. Focused Markdown guides remain supplemental. Open non-documentation risks are tracked in <a href="RISK_REGISTER.md">RISK_REGISTER.md</a>.</div>
+<div class="tip"><strong>Canonical documentation:</strong> this GitHub Pages site is the main technical reference and is deployed from <code>docs/</code> after each reviewed change to <code>main</code>. Focused Markdown guides remain supplemental. Open non-documentation risks are tracked in the <a href="https://github.com/SiliconState/Dext/blob/main/docs/RISK_REGISTER.md">risk register</a>.</div>
 
-<div class="tip"><strong>Developer verification:</strong> run <code>cargo fmt --all -- --check</code>, Clippy with warnings denied, <code>cargo audit --deny warnings</code>, the vendored <code>ratatui-core</code> tests, release build/tests, and the PTY smoke suite. Reinstall with <code>cargo install --path . --force --locked</code> so the binary on <code>PATH</code> matches the source. Renderer-specific requirements are documented in <a href="TUI.md">TUI.md</a>.</div>
+<div class="tip"><strong>Developer verification:</strong> run <code>cargo fmt --all -- --check</code>, Clippy with warnings denied, <code>cargo audit --deny warnings</code>, the vendored <code>ratatui-core</code> tests, release build/tests, and the PTY smoke suite. Reinstall with <code>cargo install --path . --force --locked</code> so the binary on <code>PATH</code> matches the source. Renderer-specific requirements are documented in <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a>.</div>
 <div class="warn"><strong>Run the final gate on the host:</strong> Dext's default <code>workspace-write</code> sandbox intentionally denies shared <code>/tmp</code>, arbitrary pseudo-terminals, and Cargo install metadata such as <code>~/.cargo/.crates.toml</code>. Running Dext's own full suite through a confined Dext shell can therefore cause cascading temp-directory failures, deny all TUI smoke tests, and block installation. Run the gate directly in a trusted terminal or CI. If Dext must orchestrate it, start a separate controlled process with <code>dext --sandbox-profile danger-full-access --approval always</code>; setting an environment variable inside an already-confined shell cannot relax the parent kernel sandbox. Do not weaken the default sandbox for test convenience.</div>
 <p>Architecturally, Dext uses <code>Agent</code> in <code>main.rs</code> as a facade around focused modules: provider request shaping and auth (<code>provider.rs</code>), bounded stream assembly (<code>streaming.rs</code>), tool-round execution and side-effect fencing (<code>tool_round.rs</code>, <code>tool_journal.rs</code>), tool schemas and policy (<code>tools.rs</code>, <code>tool_policy.rs</code>), project/session state (<code>session.rs</code>), interactive rendering (<code>tui.rs</code>), safety/recovery primitives (<code>git_checkpoints.rs</code>, <code>mutation_preview.rs</code>, <code>memory_merge.rs</code>), and extension metadata/runtime (<code>packs.rs</code>, <code>shelves.rs</code>, <code>orchestrator.rs</code>).</p>
 
@@ -775,7 +812,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence.</p>
 <h3 id="tui-dependencies">Dependency and resize contract</h3>
 <p>The exact stack is <code>ratatui 0.30.2</code>, <code>ratatui-core 0.1.2</code>, <code>tui-markdown 0.3.8</code>, <code>crossterm 0.29.0</code>, and <code>unicode-width 0.2.2</code>. Dext selects exact versions and patches exact vendored <code>ratatui-core</code> source to avoid synchronous cursor-position queries during inline replay and whole-display clears during horizontal shrink.</p>
-<p>The real-PTY regression suite verifies editable input during streaming, resize survival with populated history, zero whole-screen resize clears, bounded cursor queries, terminal-height-bounded replay chunks, and completed output after resize. Its final stream marker has a bounded 10-second wait so slower macOS CI hosts do not create false negatives. See <a href="TUI.md">TUI.md</a> and <code>vendor/ratatui-core/DEXT_PATCH.md</code> for the maintained contract and patch rationale.</p>
+<p>The real-PTY regression suite verifies editable input during streaming, resize survival with populated history, zero whole-screen resize clears, bounded cursor queries, terminal-height-bounded replay chunks, and completed output after resize. Its final stream marker has a bounded 10-second wait so slower macOS CI hosts do not create false negatives. See <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a> and <a href="https://github.com/SiliconState/Dext/blob/main/vendor/ratatui-core/DEXT_PATCH.md"><code>vendor/ratatui-core/DEXT_PATCH.md</code></a> for the maintained contract and patch rationale.</p>
 </div>
 </section>
 <h1 id="safety-recovery">Safety &amp; Recovery</h1>
@@ -1049,7 +1086,9 @@ credential-env: [SERVICE_TOKEN]
 <li>Completed stream output and accepted input after resize, with no crash markers</li>
 </ul>
 <p>Run with: <code>cargo test --release --locked --test tui_smoke -- --nocapture</code></p>
-<p>The complete verification gate also runs formatting, Clippy with warnings denied across the Linux, macOS, and Windows CI matrix, <code>cargo audit --deny warnings</code>, the vendored <code>ratatui-core</code> unit tests, and a locked release build. See <a href="TUI.md">TUI.md</a> for renderer-specific live-terminal checks.</p>
+<p>The complete verification gate also runs formatting, Clippy with warnings denied across the Linux, macOS, and Windows CI matrix, <code>cargo audit --deny warnings</code>, the vendored <code>ratatui-core</code> unit tests, and a locked release build. See <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a> for renderer-specific live-terminal checks.</p>
+<h3 id="github-pages">GitHub Pages</h3>
+<p>The public site at <a href="https://siliconstate.github.io/Dext/">siliconstate.github.io/Dext</a> is deployed from the static <code>docs/</code> tree by <code>.github/workflows/pages.yml</code>. The workflow validates local links and anchors, uploads an immutable Pages artifact, and deploys with only <code>pages: write</code> and <code>id-token: write</code> in the deployment job. Third-party actions are pinned to full commit hashes and checkout credentials are not persisted.</p>
 <div class="warn"><strong>Confined self-test limitation:</strong> the complete suite is not expected to pass through a Dext <code>bash</code> tool under <code>workspace-write</code>. The sandbox's shared-temp denial can create many follow-on test failures after a common environment lock is poisoned; PTY denial prevents this smoke test from creating terminals; and Cargo-home protection blocks local installation metadata. These denials demonstrate confinement, but do not count as a successful release gate. Rerun from a trusted host terminal or CI.</div>
 </div>
 </section>
@@ -1353,7 +1392,7 @@ credential-env: [SERVICE_TOKEN]
 </section>
 
 <hr>
-<p style="color:var(--dim);font-size:.85rem;margin-top:3rem">Maintained with Dext source. This is the canonical main technical documentation; see <a href="RISK_REGISTER.md">the open non-documentation risk register</a> and <a href="https://github.com/SiliconState/Dext">github.com/SiliconState/Dext</a>.</p>
+<p class="doc-footer">Maintained with Dext source and published through GitHub Pages. This is the canonical main technical documentation; see <a href="https://github.com/SiliconState/Dext/blob/main/docs/RISK_REGISTER.md">the open non-documentation risk register</a>, <a href="https://github.com/SiliconState/Dext/releases">verified releases</a>, and <a href="https://github.com/SiliconState/Dext">the source repository</a>.</p>
 </main>
 <aside class="rail-right">
 <div class="onpage">

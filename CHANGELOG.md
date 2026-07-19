@@ -30,6 +30,10 @@
 
 ### Added
 
+- Added the public GitHub Pages documentation site at
+  `https://siliconstate.github.io/Dext/`, deployed from `docs/` by a
+  least-privilege workflow with commit-pinned actions and offline validation of
+  metadata, local links, and anchors.
 - Added an isolated Kimi Code provider at `https://api.kimi.com/coding` with
   coding-plan API keys created at `https://www.kimi.com/code/console`,
   `KIMI_API_KEY` support, K3 adaptive thinking/empty-signature compatibility,
