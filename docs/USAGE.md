@@ -26,11 +26,14 @@ List providers:
 dext auth providers
 ```
 
-Login with browser/OAuth where supported:
+Login with browser/OAuth where supported, or open a provider console for an API key:
 
 ```bash
 dext auth login chatgpt
+dext auth login kimi
 ```
+
+`dext auth login kimi` opens `https://www.kimi.com/code/console`. Create or copy the API key associated with the Kimi coding plan, then paste it into Dext. Dext stores it as an API key and uses the isolated `https://api.kimi.com/coding` profile; it does not use Kimi device OAuth.
 
 Store an API key:
 
@@ -38,8 +41,13 @@ Store an API key:
 dext auth login glm <api-key>
 dext auth login openai <api-key>
 dext auth login anthropic <api-key>
+dext auth login kimi <api-key>
 dext auth login deepseek <api-key>
 ```
+
+The bundled Kimi provider also accepts `KIMI_API_KEY`, using a key created at `https://www.kimi.com/code/console`. Kimi coding-plan API keys are separate from the independently billed Moonshot Open Platform and its `MOONSHOT_API_KEY`; Dext does not substitute one for the other. Custom Kimi-compatible catalog profiles remain API-key based and must use an ID other than the reserved built-in IDs `kimi`, `kimi-code`, `kimi-coding`, and `kimi-membership`. If an older catalog already uses one of those IDs, rename that custom profile before upgrading; Dext rejects the collision rather than silently converting it.
+
+An API-key value in `~/.dext/auth.json` may intentionally use `ENV_VAR_NAME` to resolve from the process environment or `!command` to resolve from command stdout. The command form runs through `bash -lc`; treat write access to `auth.json` as code-execution authority and use command references only when explicitly intended.
 
 Import credentials from an external auth file (`~/.dext/external-auth.json` or `DEXT_EXTERNAL_AUTH_FILE`):
 
@@ -67,11 +75,15 @@ Inside the interactive session, the matching slash commands are:
 /model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
 ```
 
-Credentials are stored in Dext state, not in the repository. Do not commit `.env`, `.dext/`, exported sessions, or auth stores.
+Credentials are stored in Dext state, not in the repository. Do not commit project `.env`, `.dext/`, exported sessions, or auth stores. Dext never auto-loads a project `.env` or searches parent directories; optional Dext dotenv settings belong in the user-owned `~/.dext/.env` (or `$DEXT_HOME/.env`).
 
 ### Provider catalog metadata
 
 `~/.dext/providers.json` is auto-normalized to catalog v2 while continuing to accept v1 profiles. A provider may set `request_contract` to `anthropic-messages`, `openai-chat-completions`, or `chatgpt-responses`; this controls request and response routing independently of the provider id. Optional `model_aliases`, `model_defaults`, and per-model `model_specs` supply canonical ids, context/output limits, effort levels, capabilities (`tools`, `reasoning`, `image_input`, and `prompt_cache`), and pricing. Explicit per-model metadata takes precedence; context hints embedded in model names (such as `-128k` or `[1m]`) take precedence over provider-wide context defaults. Built-in metadata only fills omitted values. Legacy `context_window`, `model_context_windows`, and `model_effort_levels` fields remain accepted. `DEXT_PROMPT_CACHE=on|off` overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.
+
+The built-in ChatGPT and OpenAI API catalogs include `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; OpenAI also retains the official unsuffixed `gpt-5.6` Sol alias, while ChatGPT normalizes that shorthand to `gpt-5.6-sol`. Each variant declares a 1,050,000-token context window, 128,000-token output metadata, and native reasoning levels from `none` through `xhigh` (`max` maps to `xhigh`). OpenAI requests use `max_completion_tokens`; ChatGPT/Codex requests deliberately omit the unsupported `max_output_tokens` field. Built-in input/cached-input/output prices per million tokens are Sol `$5/$0.50/$30`, Terra `$2.50/$0.25/$15`, and Luna `$1/$0.10/$6`; above 272,000 input tokens, Dext applies the documented 2× input/cache and 1.5× output tier unless explicit pricing overrides are set.
+
+The built-in Kimi Code catalog uses Anthropic Messages semantics at `https://api.kimi.com/coding`, defaults to K3, and reports zero incremental token cost because access is covered by the coding plan. Verified K3 metadata enables adaptive thinking with `max` effort and preserves empty thinking signatures required by that model; these compatibility rules do not apply to generic/custom Anthropic profiles.
 
 ## Local Qwen / llama.cpp
 
@@ -129,6 +141,12 @@ Useful slash commands:
 /quit                         exit
 ```
 
+## Terminal UI
+
+The interactive interface uses an inline Ratatui viewport in the regular terminal buffer, preserving native scrollback. Enter submits; Shift+Enter or Alt+Enter inserts a newline; Ctrl+D quits; `?` opens the complete keymap when the input is empty. Input remains editable while a turn streams.
+
+Dext pins the terminal stack exactly and carries a narrow vendored `ratatui-core` compatibility patch to avoid synchronous cursor-query stalls and whole-display clears during inline resize. See [`TUI.md`](TUI.md) for the behavior contract, dependency versions, regression coverage, and patch maintenance procedure.
+
 ## One-shot and automation
 
 ```bash
@@ -143,16 +161,18 @@ dext pack run autoresearch "improve this benchmark"
 dext --pack autoresearch "improve this benchmark"
 ```
 
-Use `--no-session` for disposable runs that should not write project session/log state:
+Use `--no-session` for disposable runs that should not write project session/log state. Because no durable state or tool journal is written, side-effect crash recovery is unavailable in this mode:
 
 ```bash
 dext --no-session "quick answer only"
 ```
 
+Likewise, `--fork` resumes into an unsaved branch without a durable tool journal; export or save the branch explicitly if it must be retained.
+
 
 ## Packs
 
-See [`docs/PACKS.md`](PACKS.md) for the full packs and shelves reference.
+See [`PACKS.md`](PACKS.md) for the full packs and shelves reference.
 
 Dext packs are regular source directories containing `PACK.md` plus optional helper scripts and `phooks.json`. Discovery checks, in precedence order:
 
@@ -161,9 +181,11 @@ Dext packs are regular source directories containing `PACK.md` plus optional hel
 3. `DEXT_SHELVES_DIR` entries (`<shelf>/packs/<pack>` or a direct shelf root containing `packs/<pack>`)
 4. `DEXT_PACKS_DIR` entries
 5. user `~/.dext/shelves/<shelf>/packs` and `~/.dext/packs`
-6. bundled packs in the Dext repository
+6. embedded bundled packs, materialized under `$DEXT_HOME/bundled-packs/<content-hash>/`
 
 Reusable packs should be created and installed in user-global Dext scope by default: `~/.dext/packs/<name>/` or `~/.dext/shelves/<shelf>/packs/<name>/`. Use project-local `packs/<name>/`, `.dext/packs/<name>/`, or `.dext/shelves/<shelf>/packs/<name>/` only when the user explicitly asks for repository-scoped behavior.
+
+Runtime-essential bundled pack files are compiled into the Dext binary. Discovery materializes and byte-verifies them in a content-addressed `$DEXT_HOME/bundled-packs/` cache so installed and extracted single binaries retain helper/hook functionality without a source checkout. Existing `DEXT_HOME` ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix, reject symlink components, and are repaired from embedded bytes. Cache failures are reported while project/user packs remain discoverable.
 
 Shelf packs are just source-first packs grouped under a shelf. If a shelf and legacy pack define the same pack name in a scope, the shelf pack wins. This is the current stable extension contract: scaffold `~/.dext/packs/<name>/PACK.md` or `~/.dext/shelves/<shelf>/packs/<name>/PACK.md` by default, keep scripts/data beside it, validate with `dext pack inspect <name>`, then run it on a disposable task before sharing. Because packs are plain files and normal commands, they work across users, LLMs, and providers without expanding the provider-visible tool list. Optional `shelf.json` manifests are loaded into `ShelfRegistry`, resolved by scope precedence, shown by `dext shelves` / `/shelves`, and summarized to the model as typed ability metadata rather than new provider-visible tools.
 
@@ -197,7 +219,7 @@ Inside a session:
 
 Conversational invocation also works when the message clearly asks to run/use a known pack, for example: `run autoresearch on reducing test runtime`.
 
-A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke helpers through paths such as `$DEXT_PACK_DIR/bin/helper.py`. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
+A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke helpers through paths such as `$DEXT_PACK_DIR/bin/helper.py`. An environment-selected, user-global, or bundled pack may declare exact names in the inline `credential-env` front-matter list; matching inherited values are available only to a simple direct invocation of that active pack's own native `bin/` helper. On Windows, only `.exe`/`.com` helpers qualify for this direct credential path; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Credential values are not exposed to hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, or sessions, and provider-auth names remain excluded. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
 
 ## Git checkpoints, undo, and mutation previews
 
@@ -249,8 +271,7 @@ Inside a session:
 /preview off
 ```
 
-`git` is accepted as a preview mode but currently falls back to simple previews.
-Future work may use an alternate Git index for richer tree-aware previews.
+`git` is accepted as a preview mode but currently uses the same in-memory preview implementation as `simple`.
 
 ## Memory merge drivers
 
@@ -297,15 +318,28 @@ dext --approval ask
 dext --approval never
 dext --approval auto-read
 dext --approval auto-write
-dext --trust       # default unless opted out
-dext --no-trust    # opt out of startup trust
+dext --trust       # explicit high-trust opt-in (`approval=always`)
+dext --no-trust    # explicitly select the default `ask` profile
 dext --sandbox-profile read-only
 dext --sandbox-profile workspace-write
 dext --sandbox-profile danger-full-access
 # --sandbox accepts the same profile names, or a directory as the sandbox root
 ```
 
-Trust mode is on by default: all gated tools are auto-approved at startup. Opt out with `--no-trust` or `DEXT_TRUST=0`, then use `/trust on|off|status` or `--trust` to toggle deliberately.
+Dext starts with the `ask` approval profile. Interactive frontends prompt before gated tools; non-interactive and JSON runs deny those calls instead of waiting for input. Automation that needs writes must opt in explicitly with `--approval auto-write`, `--approval always`, or `--trust`. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `DEXT_TRUST=1` is an alias for `approval=always`; false values do not override the safer fallback. Resuming a session never restores its saved trust grants over the current-run policy. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access.
+
+For durable sessions, approved side-effect-capable tool calls receive a bounded, redacted start/terminal journal under the private session state directory. On resume, pending transcript calls are reconciled without replay: absent starts are marked `not_started`, unresolved starts are `uncertain`, and terminal entries recover their status without claiming unavailable output. `--no-session` and `--fork` deliberately omit this journal, so side-effect crash recovery is unavailable in those modes.
+
+## Safety diagnostics
+
+```bash
+dext doctor
+dext doctor --approval auto-write --sandbox read-only --cd /path/to/project
+```
+
+Doctor reports `ok`, `info`, and `warn` findings for the effective approval profile and source, effective sandbox profile, kernel enforcement, provider catalog/auth integrity and versions, auth-file permissions, bounded latest session/todo/settings/tool-journal state, unresolved journal calls, and Git checkpoint support/latest metadata. It inspects only active/latest state and preserves the existing exit status 0 when warnings are present.
+
+Doctor does not repair or rewrite state, resolve environment or `!command` credential references, invoke provider/local-model APIs, or print credential-bearing JSON. Use the explicit flags to inspect the posture that those startup choices would produce.
 
 ## Session commands
 
@@ -333,12 +367,18 @@ DEXT_BASE_URL=http://127.0.0.1:8080
 DEXT_THINKING_EFFORT=off
 # cloud examples:
 DEXT_PROVIDER=glm
-DEXT_MODEL=glm-4.6
+DEXT_MODEL=glm-5.2[1m]
 # provider key env fallbacks: ZAI_API_KEY, CHATGPT_ACCESS_TOKEN, OPENAI_API_KEY,
-# ANTHROPIC_API_KEY, DEEPSEEK_API_KEY
+# ANTHROPIC_API_KEY, KIMI_API_KEY, DEEPSEEK_API_KEY
 DEXT_MODEL_FORCE=1
 DEXT_BASE_URL=https://api.example.test
 DEXT_API_KEY=...
+# Provider transport deadlines: positive values override all cloud/local defaults.
+# Defaults: connect 15s; first headers 180s cloud / 600s local;
+# stream or response-body idle 90s cloud / 300s local.
+DEXT_PROVIDER_CONNECT_TIMEOUT_SECS=15
+DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS=180
+DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS=90
 # ChatGPT/Codex only: model to switch to when a codex implementation model
 # stalls on repeated no-mutation turns (default: the provider's default model).
 DEXT_IMPL_FALLBACK_MODEL=gpt-5.4
@@ -350,13 +390,18 @@ Provider-specific credential fallbacks:
 ZAI_API_KEY=...
 ANTHROPIC_API_KEY=...
 OPENAI_API_KEY=...
+KIMI_API_KEY=...  # Kimi Code plan key; MOONSHOT_API_KEY is separate
 DEEPSEEK_API_KEY=...
 CHATGPT_ACCESS_TOKEN=...
 ```
 
-Provider credentials are available to Dext's own HTTP client, but credential-shaped environment variables (`*_API_KEY`, `*_TOKEN`, `*_PASSWORD`, client secrets, cloud credentials, SSH agent variables, and related known names) are removed from agent-run bash, external tools, hooks, diagnostics, and eval subprocesses by default. Set `DEXT_INHERIT_TOOL_CREDENTIALS=1` only for a trusted tool that explicitly requires the parent credential environment.
+Provider credentials are available to Dext's own HTTP client, but credential-shaped environment variables (`*_API_KEY`, `*_TOKEN`, `*_PASSWORD`, client secrets, cloud credentials, SSH agent variables, and related known names) are removed from agent-run subprocesses by default. Set `DEXT_INHERIT_TOOL_CREDENTIALS=1` only for a trusted model-invoked bash or external tool that explicitly requires the parent credential environment. Hooks, diagnostics, evals, checkpoints, browser launchers, and other Dext-owned subprocesses remain scrubbed even with that opt-in.
 
-Privacy redaction and sensitive native-read path guards are enabled by default. Set `DEXT_PRIVACY=0` or use `/privacy off` only when raw local data is intentionally required. Kernel sandboxing also hides unrelated files below the user's home on supported Linux/macOS hosts; `workspace-write` exposes write access only to the sandbox, scratch roots, and common toolchain caches. `danger-full-access` intentionally disables this confinement.
+Privacy redaction is enabled by default while user-readable files remain readable. Before tool results enter model context or session logs, Dext replaces private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers. Ordinary unlabeled long numbers and decimal market/HTTP values are not treated as cards. A compact redaction note is appended only when a value was actually replaced. Set `DEXT_PRIVACY=strict` or use `/privacy strict` to additionally block sensitive-looking native read paths. Set `DEXT_PRIVACY=0` or use `/privacy off` only when raw, unredacted local data is intentionally required. On supported Linux/macOS hosts, kernel sandboxing preserves reads available to the Dext process user while confining writes: `read-only` permits only required scratch/device writes, and `workspace-write` additionally permits writes to the sandbox and common toolchain caches. `danger-full-access` intentionally disables this confinement. Dext warns at startup and in `dext doctor` when a confined profile cannot apply kernel enforcement; in that fallback, native write guards remain but shell and external-tool subprocesses are unconfined.
+
+The complete Dext release suite is a deliberate exception to normal confined agent work. Under `workspace-write`, shared `/tmp`, arbitrary pseudo-terminals (`/dev/ptmx` and `/dev/pts`), and Cargo metadata such as `~/.cargo/.crates.toml` remain unwritable. Self-hosted `cargo test` can therefore show widespread temporary-directory failures and cascading shared-lock poisoning; `tui_smoke` cannot allocate its PTYs; and `cargo install` cannot update Cargo's install registry. Run those final commands directly in a trusted host terminal, or start a separate controlled Dext process with `dext --sandbox-profile danger-full-access --approval always`. Setting the profile only inside an already-confined shell cannot relax its inherited kernel sandbox. Keep the default hardening intact; see [`RELEASING.md`](RELEASING.md).
+
+The built-in `http` tool blocks loopback/unspecified, RFC1918, CGNAT, IPv6 unique-local, link-local, and cloud-metadata destinations after DNS resolution and on redirects. It connects directly and ignores proxy environment variables so these destination checks cannot be bypassed through proxy-side DNS. Trusted local-network use can opt in narrowly with `DEXT_HTTP_ALLOW_LOOPBACK=1`, `DEXT_HTTP_ALLOW_PRIVATE=1`, or `DEXT_HTTP_ALLOW_LINK_LOCAL=1`. These controls apply only to the built-in tool, not provider transport or arbitrary network clients run through `bash`.
 
 State and logs:
 
@@ -374,11 +419,17 @@ Runtime controls:
 
 ```bash
 DEXT_NO_TUI=1
-DEXT_TRUST=0  # opt out of default startup trust mode
-DEXT_PRIVACY=1  # default; set 0 only to allow raw sensitive paths/output
-# DEXT_INHERIT_TOOL_CREDENTIALS=1  # explicit high-trust subprocess opt-in
-DEXT_APPROVAL=ask
+DEXT_APPROVAL=ask  # default approval policy
+DEXT_TRUST=1  # explicit alias for DEXT_APPROVAL=always
+DEXT_PRIVACY=1  # default: redact detected secrets; reads remain available
+# DEXT_PRIVACY=strict  # also block sensitive-looking native read paths
+# DEXT_INHERIT_TOOL_CREDENTIALS=1  # high-trust model-invoked tool opt-in
 DEXT_SANDBOX_PROFILE=workspace-write  # sandbox + scratch + toolchain cache writes
+# Built-in http tool only; trusted-network opt-ins, all disabled by default.
+# This client ignores proxy environment variables so DNS/IP checks stay local:
+# DEXT_HTTP_ALLOW_LOOPBACK=1
+# DEXT_HTTP_ALLOW_PRIVATE=1
+# DEXT_HTTP_ALLOW_LINK_LOCAL=1
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean
@@ -396,6 +447,9 @@ DEXT_CACHE_CREATE_USD_PER_MTOK=1.25
 DEXT_MAX_OUTPUT_TOKENS=8192
 DEXT_EXTERNAL_TIMEOUT_SECS=60
 DEXT_BASH_TIMEOUT_SECS=60
+# Optional shell override. On Windows, Dext skips WSL app aliases and selects a
+# real bash.exe from PATH (normally Git for Windows).
+# DEXT_BASH_PATH='C:\Program Files\Git\bin\bash.exe'
 DEXT_HOOK_TIMEOUT_SECS=60
 # cargo-check workflow diagnostics timeout (default 120)
 DEXT_DIAGNOSTICS_TIMEOUT_SECS=120
@@ -406,15 +460,18 @@ DEXT_EVAL_TIMEOUT_SECS=15
 ## Development commands
 
 ```bash
-cargo fmt
-cargo build --release
-cargo test --release
-cargo test --release --test tui_smoke -- --nocapture
+cargo fmt --all -- --check
+cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
+cargo audit --deny warnings
+cargo test -p ratatui-core --lib --locked
+cargo build --release --locked
+cargo test --release --locked
+cargo test --release --locked --test tui_smoke -- --nocapture
 cargo bench
 ```
 
 After changing Dext itself, reinstall the interactive binary:
 
 ```bash
-cargo install --path . --force
+cargo install --path . --force --locked
 ```

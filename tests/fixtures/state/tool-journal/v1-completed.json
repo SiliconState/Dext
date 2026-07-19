@@ -1,0 +1,1 @@
+{"version":1,"session_id":"session-1","entries":[{"record_id":"record-1","session_id":"session-1","turn_id":"turn-1","batch_id":"batch-1","call_id":"call-1","tool_name":"bash","summary":"bash: synthetic fixture","input_sha256":"0000000000000000000000000000000000000000000000000000000000000000","started_at":1,"ended_at":2,"status":"completed"}]}

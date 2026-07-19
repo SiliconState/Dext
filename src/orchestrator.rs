@@ -1466,6 +1466,7 @@ pub(crate) fn classify_stream_error(body: &str) -> RetryPlan {
         "rate limit",
         "rate_limit",
         "try again",
+        "retry your request",
         "server_error",
         "internal server error",
         "gateway timeout",
@@ -1498,6 +1499,28 @@ pub(crate) fn classify_stream_error(body: &str) -> RetryPlan {
         kind: FailureKind::Permanent,
         retry: false,
     }
+}
+
+/// True when a provider error body says the request itself no longer fits the
+/// model context window (as opposed to an invalid max_tokens parameter or any
+/// other schema problem). These are recoverable in place: compact history and
+/// resend, instead of failing the turn and leaving the session wedged behind
+/// an oversized transcript.
+pub(crate) fn stream_error_is_context_overflow(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    [
+        // OpenAI / ChatGPT-Codex backends.
+        "context_length_exceeded",
+        "exceeds the context window",
+        "maximum context length",
+        // Anthropic-style messages.
+        "prompt is too long",
+        "input is too long",
+        "exceed context limit",
+        "request_too_large",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 pub(crate) fn classify_transport_failure(connect: bool, timeout: bool) -> RetryPlan {
@@ -2398,6 +2421,12 @@ mod tests {
             r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
         assert!(classify_stream_error(overloaded).retry);
 
+        // ChatGPT/Codex generic request failure observed in response.failed events.
+        let chatgpt = "An error occurred while processing your request. You can retry your request, or contact us through our help center.";
+        let plan = classify_stream_error(chatgpt);
+        assert_eq!(plan.kind, FailureKind::Transient);
+        assert!(plan.retry, "ChatGPT request-id failures must retry");
+
         // OpenAI server_error
         let server_err = r#"{"error":{"code":"server_error","message":"Please try again."}}"#;
         assert!(classify_stream_error(server_err).retry);
@@ -2424,6 +2453,36 @@ mod tests {
 
         // Body with no known markers → permanent default
         assert!(!classify_stream_error("nothing relevant").retry);
+    }
+
+    #[test]
+    fn context_overflow_detector_matches_overflow_bodies_across_providers() {
+        // The exact ChatGPT-Codex shape that wedged a live session: input larger
+        // than the backend's real window, declared window notwithstanding.
+        for body in [
+            "context_length_exceeded: Your input exceeds the context window of this model. Please adjust your input and try again.",
+            r#"{"error":{"code":"context_length_exceeded","message":"..."}}"#,
+            "This model's maximum context length is 128000 tokens. However, your messages resulted in 200000 tokens.",
+            "prompt is too long: 210000 tokens > 200000 maximum",
+            "input length and max_tokens exceed context limit: 199999 + 8192 > 200000",
+            r#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum allowed size"}}"#,
+        ] {
+            assert!(stream_error_is_context_overflow(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn context_overflow_detector_rejects_non_overflow_failures() {
+        // Compacting history cannot fix these; the hook must not fire on them.
+        for body in [
+            "max_tokens must be at least 1",
+            "Internal network failure, please contact customer service",
+            r#"{"error":{"code":"invalid_api_key","message":"Invalid API Key provided"}}"#,
+            "stream protocol error [chatgpt-responses/response.incomplete]: response did not complete; function calls were not accepted",
+            "nothing relevant",
+        ] {
+            assert!(!stream_error_is_context_overflow(body), "{body}");
+        }
     }
 
     #[test]

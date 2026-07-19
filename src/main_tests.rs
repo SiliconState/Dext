@@ -1,9 +1,10 @@
 use super::*;
 use crate::provider::{
-    DEFAULT_LOCAL_MODEL, ModelCapabilities, ModelPricing, ModelSpec,
-    clear_cached_local_llama_context_windows, list_models_for_available_providers,
-    merge_provider_profile, normalize_chatgpt_model_slug, parse_llama_context_window,
-    refresh_local_llama_context_window, resolve_provider_model_selection,
+    ANTHROPIC_API_VERSION, DEFAULT_LOCAL_MODEL, ModelCapabilities, ModelPricing, ModelSpec,
+    chatgpt_reasoning_effort, clear_cached_local_llama_context_windows,
+    list_models_for_available_providers, merge_provider_profile, normalize_chatgpt_model_slug,
+    parse_llama_context_window, refresh_local_llama_context_window,
+    resolve_provider_model_selection,
 };
 use crate::session::{
     append_log_line, canonicalize_read_tool_path, canonicalize_tool_path, cap_latest_log_buffer,
@@ -46,6 +47,10 @@ fn temp_test_dir(label: &str) -> PathBuf {
     std::fs::canonicalize(&dir).expect("canonical temp dir")
 }
 
+fn mutation_ok<T>(result: std::result::Result<T, String>) -> Result<T> {
+    result.map_err(anyhow::Error::msg)
+}
+
 fn prepend_env_path(path: &Path) -> String {
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let mut parts = vec![path.to_path_buf()];
@@ -73,7 +78,6 @@ fn test_agent(root: &Path) -> Agent {
         history: Vec::new(),
         tools: provider_tool_definitions()
             .into_iter()
-            .filter(|t| t.name != "browser")
             .filter(|t| tool_name_allowed_in_profile(t.name, ToolContextProfile::Default))
             .collect(),
         allowed: HashSet::new(),
@@ -105,8 +109,8 @@ fn test_agent(root: &Path) -> Agent {
         compact_threshold_percent: None,
         context_window_tokens: model_context_window("test-model"),
         approval_profile: ApprovalProfile::default(),
+        approval_policy_source: ApprovalPolicySource::default(),
         sandbox_profile: SandboxProfile::default(),
-        browser_recipe: BrowserRecipe::default(),
         context_mode: ContextMode::default(),
         context_mode_explicit: false,
         tool_context_profile: ToolContextProfile::default(),
@@ -134,6 +138,89 @@ fn test_agent(root: &Path) -> Agent {
     }
 }
 
+struct FixedPermissionSink {
+    choice: Choice,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl EventSink for FixedPermissionSink {
+    fn emit(&mut self, _event: AgentEvent) {}
+
+    fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.choice
+    }
+
+    fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+}
+
+fn spawn_openai_tool_call_server(
+    tool_call_id: &str,
+    tool_name: &str,
+    input: &Value,
+) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind tool-call test server");
+    let addr = listener.local_addr().expect("tool-call test server addr");
+    let arguments = serde_json::to_string(input).expect("serialize tool input");
+    let chunk = json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": tool_call_id,
+                    "function": {"name": tool_name, "arguments": arguments}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept tool-call request");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("set tool-call request timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).expect("read tool-call request");
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&buf[..read]);
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write tool-call response");
+    });
+    (format!("http://{addr}"), server)
+}
+
+fn configure_local_openai_agent(agent: &mut Agent, base_url: String) {
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.provider_id = "local".to_string();
+    agent.provider_requires_api_key = false;
+    agent.api_key.clear();
+    agent.base_url = base_url;
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
+    agent.set_approval_profile(ApprovalProfile::Always);
+}
+
+fn last_tool_result(history: &[Message]) -> Option<(&str, &str)> {
+    history.iter().rev().find_map(|message| {
+        message.content.iter().rev().find_map(|block| match block {
+            Block::ToolResult {
+                content, metadata, ..
+            } => Some((content.as_str(), metadata.status.as_deref().unwrap_or(""))),
+            _ => None,
+        })
+    })
+}
+
 fn drain_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
@@ -154,6 +241,25 @@ fn git_ok(root: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[cfg(unix)]
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Git output is UTF-8")
+        .trim()
+        .to_string()
 }
 
 #[test]
@@ -224,6 +330,44 @@ fn git_checkpoint_sidecar_restores_untracked_file() {
         std::fs::read_to_string(root.join("note.txt")).expect("read restored"),
         "before\n"
     );
+}
+
+#[test]
+fn checkpoint_worktree_restore_preserves_newer_index_state() {
+    let root = temp_test_dir("checkpoint-preserve-index");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    std::fs::write(root.join("tracked.txt"), "checkpoint-state\n").expect("write checkpoint state");
+    git_ok(&root, &["add", "tracked.txt"]);
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["tracked.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+
+    std::fs::write(root.join("tracked.txt"), "new-index-state\n").expect("write index state");
+    git_ok(&root, &["add", "tracked.txt"]);
+    std::fs::write(root.join("tracked.txt"), "new-worktree-state\n").expect("write worktree state");
+
+    git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore worktree only");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read restored worktree"),
+        "checkpoint-state\n"
+    );
+    let index = Command::new("git")
+        .args(["show", ":tracked.txt"])
+        .current_dir(&root)
+        .output()
+        .expect("read index");
+    assert!(index.status.success());
+    assert_eq!(String::from_utf8_lossy(&index.stdout), "new-index-state\n");
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -349,6 +493,37 @@ fn checkpoint_rejects_symlinked_git_exclude() {
         Ok(_) => panic!("symlinked Git exclude must be rejected"),
     };
     assert!(error.contains("not a real file"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&outside_file).expect("read outside exclude"),
+        "keep\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rejects_hardlinked_git_exclude() {
+    let root = temp_test_dir("checkpoint-exclude-hardlink");
+    let outside = temp_test_dir("checkpoint-exclude-hardlink-target");
+    let outside_file = outside.join("exclude.txt");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(&outside_file, "keep\n").expect("write outside exclude");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    std::fs::remove_file(root.join(".git/info/exclude")).expect("remove local exclude");
+    std::fs::hard_link(&outside_file, root.join(".git/info/exclude"))
+        .expect("hardlink local exclude");
+
+    let error = match git_checkpoints::create_checkpoint(&root, "bash", &[], 1) {
+        Err(error) => error,
+        Ok(_) => panic!("hardlinked Git exclude must be rejected"),
+    };
+    assert!(error.contains("single link"), "{error}");
     assert_eq!(
         std::fs::read_to_string(&outside_file).expect("read outside exclude"),
         "keep\n"
@@ -527,13 +702,145 @@ fn checkpoint_restore_refuses_to_replace_a_directory_with_absent_file_state() {
         git_checkpoints::RestoreMode::Worktree,
     )
     .expect_err("directory replacement must fail before restore");
-    assert!(error.contains("refusing to recursively remove"), "{error}");
+    assert!(
+        error.contains("refusing to recursively remove")
+            || error.contains("refusing to replace directory"),
+        "{error}"
+    );
     assert_eq!(
         std::fs::read_to_string(root.join("new.txt/keep.txt")).expect("read nested file"),
         "keep\n"
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn internal_checkpoint_git_never_executes_repository_configured_helpers() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let old_git_config_count = std::env::var_os("GIT_CONFIG_COUNT");
+    let old_git_config_key = std::env::var_os("GIT_CONFIG_KEY_0");
+    let old_git_config_value = std::env::var_os("GIT_CONFIG_VALUE_0");
+    let old_external_diff = std::env::var_os("GIT_EXTERNAL_DIFF");
+    let old_timeout = std::env::var_os("DEXT_INTERNAL_GIT_TIMEOUT_SECS");
+    let root = temp_test_dir("checkpoint-hostile-git-config");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join(".gitattributes"), "*.txt filter=evil diff=evil\n")?;
+    std::fs::write(root.join("tracked.txt"), "base\n")?;
+    git_ok(&root, &["add", ".gitattributes", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let marker = root.join("repository-helper-ran");
+    let helper = root.join("hostile-helper.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> {}\nexit 1\n",
+            shell_single_quote(&marker.display().to_string())
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&helper)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&helper, permissions)?;
+    let helper_text = helper
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 helper path"))?;
+
+    let hooks = root.join("hostile-hooks");
+    std::fs::create_dir(&hooks)?;
+    let reference_hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &reference_hook,
+        format!(
+            "#!/bin/sh\nprintf hook >> {}\nexit 1\n",
+            shell_single_quote(&marker.display().to_string())
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&reference_hook)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&reference_hook, permissions)?;
+
+    git_ok(&root, &["config", "core.fsmonitor", helper_text]);
+    git_ok(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            hooks
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 hooks path"))?,
+        ],
+    );
+    for key in [
+        "filter.evil.clean",
+        "filter.evil.smudge",
+        "filter.evil.process",
+        "diff.evil.command",
+        "diff.evil.textconv",
+        "diff.external",
+    ] {
+        git_ok(&root, &["config", key, helper_text]);
+    }
+    git_ok(&root, &["config", "filter.evil.required", "true"]);
+    let _ = std::fs::remove_file(&marker);
+
+    unsafe {
+        std::env::set_var("GIT_CONFIG_COUNT", "1");
+        std::env::set_var("GIT_CONFIG_KEY_0", "core.fsmonitor");
+        std::env::set_var("GIT_CONFIG_VALUE_0", helper_text);
+        std::env::set_var("GIT_EXTERNAL_DIFF", helper_text);
+        std::env::set_var("DEXT_INTERNAL_GIT_TIMEOUT_SECS", "2");
+    }
+
+    let result = (|| -> Result<()> {
+        std::fs::write(root.join("tracked.txt"), "checkpoint-state\n")?;
+        let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("dirty repository must create a checkpoint"))?;
+        assert!(
+            !marker.exists(),
+            "checkpoint creation executed a repository-configured helper: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+
+        std::fs::write(root.join("tracked.txt"), "current-state\n")?;
+        git_checkpoints::preview_restore(&root, &checkpoint).map_err(anyhow::Error::msg)?;
+        assert!(
+            !marker.exists(),
+            "checkpoint preview executed a repository-configured helper: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+
+        git_checkpoints::restore_worktree(
+            &root,
+            &checkpoint,
+            git_checkpoints::RestoreMode::Worktree,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt"))?,
+            "checkpoint-state\n"
+        );
+        assert!(
+            !marker.exists(),
+            "checkpoint restore executed a repository-configured helper: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        Ok(())
+    })();
+
+    restore_env_var("GIT_CONFIG_COUNT", old_git_config_count);
+    restore_env_var("GIT_CONFIG_KEY_0", old_git_config_key);
+    restore_env_var("GIT_CONFIG_VALUE_0", old_git_config_value);
+    restore_env_var("GIT_EXTERNAL_DIFF", old_external_diff);
+    restore_env_var("DEXT_INTERNAL_GIT_TIMEOUT_SECS", old_timeout);
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 #[test]
@@ -630,6 +937,14 @@ fn checkpoint_creation_enforces_retention_ceiling() {
         String::from_utf8_lossy(&refs.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&refs.stdout).lines().count(), 20);
+    assert_eq!(
+        std::fs::read_to_string(root.join(".dext/checkpoints/manifest.txt"))
+            .expect("read bounded checkpoint manifest")
+            .lines()
+            .count(),
+        20,
+        "automatic retention must compact the private manifest too"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -656,7 +971,8 @@ fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
 
     let result = git_checkpoints::prune(&root, None, None).expect("prune checkpoints");
     assert!(result.contains("pruned 1 checkpoint"), "{result}");
-    assert!(result.contains("1 orphan sidecar directory"), "{result}");
+    assert!(result.contains("1 orphan sidecar entry"), "{result}");
+
     assert!(!orphan_sidecar.exists(), "orphan sidecar should be removed");
     assert!(
         Command::new("git")
@@ -686,6 +1002,712 @@ fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
 }
 
 #[test]
+fn checkpoint_lookup_rejects_ambiguous_or_empty_prefixes() {
+    let root = temp_test_dir("checkpoint-lookup-ambiguity");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let first = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create first checkpoint")
+        .expect("first checkpoint exists");
+    let second = git_checkpoints::create_checkpoint(&root, "bash", &[], 2)
+        .expect("create second checkpoint")
+        .expect("second checkpoint exists");
+    let common_len = first
+        .id
+        .bytes()
+        .zip(second.id.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    assert!(
+        common_len > 0,
+        "checkpoint IDs should share a timestamp prefix"
+    );
+    let ambiguous = &first.id[..common_len];
+    let error = git_checkpoints::find_checkpoint(&root, ambiguous)
+        .expect_err("ambiguous checkpoint selector must fail closed");
+    assert!(error.contains("ambiguous"), "{error}");
+    assert!(
+        git_checkpoints::find_checkpoint(&root, "")
+            .expect_err("empty checkpoint selector must fail")
+            .contains("cannot be empty")
+    );
+    assert_eq!(
+        git_checkpoints::find_checkpoint(&root, &first.ref_name)
+            .expect("exact ref lookup")
+            .expect("exact ref found")
+            .id,
+        first.id
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_ref_creation_never_overwrites_an_existing_ref() {
+    let _guard = env_lock();
+    let root = temp_test_dir("checkpoint-ref-cas");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "first\n").expect("write first revision");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "first"]);
+    let first_oid = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .expect("read first OID")
+            .stdout,
+    )
+    .expect("UTF-8 OID")
+    .trim()
+    .to_string();
+
+    std::fs::write(root.join("tracked.txt"), "second\n").expect("write second revision");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "second"]);
+    let second_oid = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .expect("read second OID")
+            .stdout,
+    )
+    .expect("UTF-8 OID")
+    .trim()
+    .to_string();
+    assert_ne!(first_oid, second_oid);
+
+    let ref_name = "refs/dext/checkpoints/test/collision-id";
+    git_checkpoints::create_checkpoint_ref(&root, ref_name, &first_oid)
+        .expect("create initial checkpoint ref");
+    let error = git_checkpoints::create_checkpoint_ref(&root, ref_name, &second_oid)
+        .expect_err("existing checkpoint ref must not be overwritten");
+    assert!(
+        error.contains("cannot lock ref") || error.contains("reference already exists"),
+        "{error}"
+    );
+    let stored_oid = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", ref_name])
+            .current_dir(&root)
+            .output()
+            .expect("read stored ref")
+            .stdout,
+    )
+    .expect("UTF-8 stored OID")
+    .trim()
+    .to_string();
+    assert_eq!(stored_oid, first_oid);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_missing_ref_fixture_fails_closed_without_project_mutation() {
+    let root = temp_test_dir("checkpoint-missing-ref");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("initialize checkpoint storage")
+        .expect("checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    let manifest_before = std::fs::read(state_fixture_path("checkpoints", "missing-ref.manifest"))
+        .expect("read missing-ref fixture");
+    std::fs::write(&manifest, &manifest_before).expect("install missing-ref fixture");
+    let tracked_before = std::fs::read(root.join("tracked.txt")).expect("read tracked");
+
+    let error = git_checkpoints::list_checkpoints(&root, usize::MAX)
+        .expect_err("missing checkpoint ref must fail inspection");
+    assert!(
+        error.contains("manifest references a missing ref"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&manifest).expect("reread manifest"),
+        manifest_before
+    );
+    assert_eq!(
+        std::fs::read(root.join("tracked.txt")).expect("reread tracked"),
+        tracked_before
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_corrupt_manifest_fails_closed_without_leaking_new_ref() {
+    use std::io::Write as _;
+
+    let root = temp_test_dir("checkpoint-corrupt-manifest");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&manifest)
+        .expect("open manifest")
+        .write_all(b"corrupt manifest line\n")
+        .expect("corrupt manifest");
+    let error = git_checkpoints::list_checkpoints(&root, usize::MAX)
+        .expect_err("corrupt manifest must not be partially accepted");
+    assert!(
+        error.contains("invalid checkpoint manifest entry"),
+        "{error}"
+    );
+    assert!(
+        git_checkpoints::create_checkpoint(&root, "bash", &[], 2)
+            .expect_err("checkpoint append must reject corrupt manifest")
+            .contains("invalid checkpoint manifest entry")
+    );
+    let refs = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/dext/checkpoints/",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("list refs");
+    assert!(refs.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&refs.stdout).lines().count(),
+        1,
+        "failed append must roll its ref back"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rejects_hardlinked_private_manifest() {
+    let root = temp_test_dir("checkpoint-manifest-hardlink");
+    let outside = temp_test_dir("checkpoint-manifest-hardlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    let outside_manifest = outside.join("outside-manifest.txt");
+    std::fs::copy(&manifest, &outside_manifest).expect("copy manifest outside");
+    let outside_before = std::fs::read(&outside_manifest).expect("read outside manifest");
+    std::fs::remove_file(&manifest).expect("remove private manifest");
+    std::fs::hard_link(&outside_manifest, &manifest).expect("hardlink manifest");
+
+    let error = git_checkpoints::list_checkpoints(&root, usize::MAX)
+        .expect_err("hardlinked manifest must be rejected");
+    assert!(error.contains("safe regular file"), "{error}");
+    assert_eq!(
+        std::fs::read(&outside_manifest).expect("read unchanged outside manifest"),
+        outside_before
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_prune_unlinks_orphan_sidecar_symlink_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-prune-sidecar-symlink");
+    let outside = temp_test_dir("checkpoint-prune-sidecar-symlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(outside.join("keep.txt"), "keep\n").expect("write outside file");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::prune(&root, None, None).expect("initialize checkpoint storage");
+
+    let orphan = root.join(".dext/checkpoints/orphan_symlink");
+    symlink(&outside, &orphan).expect("create orphan sidecar symlink");
+    let result = git_checkpoints::prune(&root, None, None).expect("prune orphan symlink");
+    assert!(result.contains("1 orphan sidecar entry"), "{result}");
+    assert!(!orphan.exists(), "orphan symlink should be unlinked");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("keep.txt")).expect("read outside file"),
+        "keep\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn checkpoint_rejects_git_tracked_private_storage() {
+    let root = temp_test_dir("checkpoint-tracked-storage");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::create_dir_all(root.join(".dext/checkpoints")).expect("create checkpoint storage");
+    std::fs::write(
+        root.join(".dext/checkpoints/tracked.txt"),
+        "must not commit\n",
+    )
+    .expect("write tracked checkpoint file");
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked file");
+    git_ok(
+        &root,
+        &["add", ".dext/checkpoints/tracked.txt", "tracked.txt"],
+    );
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let error = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect_err("Git-tracked checkpoint storage must be rejected");
+    assert!(
+        error.contains("checkpoint storage is tracked by Git"),
+        "{error}"
+    );
+    assert!(!root.join(".dext/checkpoints/manifest.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_restore_accepts_tracked_directory_hint() {
+    let root = temp_test_dir("checkpoint-directory-hint");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::create_dir(root.join("nested")).expect("create tracked directory");
+    std::fs::write(root.join("nested/tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "nested/tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    std::fs::write(root.join("nested/tracked.txt"), "checkpoint\n").expect("checkpoint state");
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["nested".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    std::fs::write(root.join("nested/tracked.txt"), "later\n").expect("later state");
+
+    git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore tracked directory hint");
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/tracked.txt")).expect("read restored file"),
+        "checkpoint\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_restore_rejects_symlinked_parent_before_any_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-destination-parent-symlink");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::create_dir(root.join("nested")).expect("create tracked directory");
+    std::fs::write(root.join("a-safe.txt"), "base safe\n").expect("write safe tracked");
+    std::fs::write(root.join("nested/tracked.txt"), "base nested\n").expect("write nested tracked");
+    git_ok(&root, &["add", "a-safe.txt", "nested/tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    std::fs::write(root.join("a-safe.txt"), "checkpoint safe\n").expect("checkpoint safe");
+    std::fs::write(root.join("nested/tracked.txt"), "checkpoint nested\n")
+        .expect("checkpoint nested");
+    let checkpoint = git_checkpoints::create_checkpoint(
+        &root,
+        "write_file",
+        &["a-safe.txt".to_string(), "nested/tracked.txt".to_string()],
+        1,
+    )
+    .expect("create checkpoint")
+    .expect("checkpoint exists");
+
+    std::fs::write(root.join("a-safe.txt"), "later safe\n").expect("mutate safe");
+    std::fs::write(root.join("nested/tracked.txt"), "later nested\n").expect("mutate nested");
+    std::fs::rename(root.join("nested"), root.join("relocated"))
+        .expect("relocate tracked directory");
+    symlink("relocated", root.join("nested")).expect("alias tracked directory");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("symlinked restore parent must fail closed");
+    assert!(error.contains("parent is not a real directory"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a-safe.txt")).expect("read safe after rejection"),
+        "later safe\n",
+        "parent preflight must fail before restoring an earlier path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("relocated/tracked.txt"))
+            .expect("read aliased destination after rejection"),
+        "later nested\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_reset_head_rejects_hardlinked_destination_before_any_mutation() {
+    let root = temp_test_dir("checkpoint-reset-destination-hardlink");
+    let outside = temp_test_dir("checkpoint-reset-destination-hardlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("a-safe.txt"), "base safe\n").expect("write safe tracked");
+    std::fs::write(root.join("z-linked.txt"), "base linked\n").expect("write linked tracked");
+    git_ok(&root, &["add", "a-safe.txt", "z-linked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    std::fs::write(root.join("a-safe.txt"), "checkpoint safe\n").expect("checkpoint safe");
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["a-safe.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    std::fs::write(root.join("a-safe.txt"), "later safe\n").expect("mutate safe");
+    std::fs::write(root.join("z-linked.txt"), "later linked\n").expect("mutate linked");
+    git_ok(&root, &["add", "a-safe.txt", "z-linked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "later"]);
+    let later_head = git_stdout(&root, &["rev-parse", "HEAD"]);
+
+    std::fs::remove_file(root.join("z-linked.txt")).expect("remove linked tracked");
+    let victim = outside.join("victim.txt");
+    std::fs::write(&victim, "external must survive\n").expect("write outside victim");
+    std::fs::hard_link(&victim, root.join("z-linked.txt")).expect("hardlink reset destination");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::ResetHead,
+    )
+    .expect_err("reset-hard must reject multiply linked destinations");
+    assert!(error.contains("multiply linked"), "{error}");
+    assert_eq!(git_stdout(&root, &["rev-parse", "HEAD"]), later_head);
+    assert_eq!(
+        std::fs::read_to_string(root.join("a-safe.txt")).expect("read safe after rejection"),
+        "later safe\n",
+        "reset preflight must fail before changing HEAD or an earlier path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("read outside victim"),
+        "external must survive\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_restore_rejects_hardlinked_destination_before_any_mutation() {
+    let root = temp_test_dir("checkpoint-destination-hardlink");
+    let outside = temp_test_dir("checkpoint-destination-hardlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "checkpoint note\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(
+        &root,
+        "write_file",
+        &["tracked.txt".to_string(), "note.txt".to_string()],
+        1,
+    )
+    .expect("create checkpoint")
+    .expect("checkpoint exists");
+
+    std::fs::write(root.join("tracked.txt"), "new tracked state\n").expect("modify tracked");
+    std::fs::remove_file(root.join("note.txt")).expect("remove untracked target");
+    let victim = outside.join("victim.txt");
+    std::fs::write(&victim, "external must survive\n").expect("write outside victim");
+    std::fs::hard_link(&victim, root.join("note.txt")).expect("hardlink restore destination");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("multiply linked restore destination must fail closed");
+    assert!(
+        error.contains("multiply linked") || error.contains("unsafe"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read tracked after rejection"),
+        "new tracked state\n",
+        "preflight failure must occur before restoring any tracked path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("read outside victim"),
+        "external must survive\n",
+        "checkpoint restore must never truncate a multiply linked external inode"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_restore_rejects_hardlinked_tracked_destination_before_any_mutation() {
+    let root = temp_test_dir("checkpoint-tracked-destination-hardlink");
+    let outside = temp_test_dir("checkpoint-tracked-destination-hardlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("a-safe.txt"), "base safe\n").expect("write safe tracked");
+    std::fs::write(root.join("z-linked.txt"), "base linked\n").expect("write linked tracked");
+    git_ok(&root, &["add", "a-safe.txt", "z-linked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(
+        &root,
+        "write_file",
+        &["a-safe.txt".to_string(), "z-linked.txt".to_string()],
+        1,
+    )
+    .expect("create checkpoint")
+    .expect("checkpoint exists");
+    assert!(!checkpoint.includes_untracked_sidecar);
+
+    std::fs::write(root.join("a-safe.txt"), "new safe state\n").expect("modify safe tracked");
+    std::fs::remove_file(root.join("z-linked.txt")).expect("remove linked tracked");
+    let victim = outside.join("victim.txt");
+    std::fs::write(&victim, "external must survive\n").expect("write outside victim");
+    std::fs::hard_link(&victim, root.join("z-linked.txt"))
+        .expect("hardlink tracked restore destination");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("multiply linked tracked destination must fail closed");
+    assert!(error.contains("multiply linked"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a-safe.txt")).expect("read safe after rejection"),
+        "new safe state\n",
+        "tracked-only preflight failure must occur before restoring any earlier path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("read outside victim"),
+        "external must survive\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_full_restore_rejects_hardlinked_destination_before_any_mutation() {
+    let root = temp_test_dir("checkpoint-full-destination-hardlink");
+    let outside = temp_test_dir("checkpoint-full-destination-hardlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("a-safe.txt"), "base safe\n").expect("write safe tracked");
+    std::fs::write(root.join("z-linked.txt"), "base linked\n").expect("write linked tracked");
+    git_ok(&root, &["add", "a-safe.txt", "z-linked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    assert!(checkpoint.paths_hint.is_empty());
+
+    std::fs::write(root.join("a-safe.txt"), "new safe state\n").expect("modify safe tracked");
+    std::fs::remove_file(root.join("z-linked.txt")).expect("remove linked tracked");
+    let victim = outside.join("victim.txt");
+    std::fs::write(&victim, "external must survive\n").expect("write outside victim");
+    std::fs::hard_link(&victim, root.join("z-linked.txt"))
+        .expect("hardlink full restore destination");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("full restore must reject multiply linked destinations");
+    assert!(error.contains("multiply linked"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("a-safe.txt")).expect("read safe after rejection"),
+        "new safe state\n",
+        "full-worktree preflight failure must occur before git restore mutates any path"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("read outside victim"),
+        "external must survive\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_restore_rejects_hardlinked_sidecar_before_mutation() {
+    let root = temp_test_dir("checkpoint-sidecar-hardlink");
+    let outside = temp_test_dir("checkpoint-sidecar-hardlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "before\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["note.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    let sidecar = root
+        .join(".dext/checkpoints")
+        .join(&checkpoint.id)
+        .join("note.txt");
+    let outside_link = outside.join("linked-sidecar.txt");
+    std::fs::hard_link(&sidecar, &outside_link).expect("hardlink sidecar outside");
+    std::fs::write(root.join("note.txt"), "after\n").expect("mutate note");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("hardlinked sidecar must fail before restore");
+    assert!(error.contains("unsafe sidecar entry"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).expect("read unchanged note"),
+        "after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside_link).expect("read outside hardlink"),
+        "before\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn checkpoint_automatic_retention_removes_expired_sidecars() {
+    let root = temp_test_dir("checkpoint-retention-sidecars");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "untracked\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let mut first_id = String::new();
+    for ordinal in 0..21 {
+        let checkpoint = git_checkpoints::create_checkpoint(
+            &root,
+            "write_file",
+            &["note.txt".to_string()],
+            ordinal,
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+        if ordinal == 0 {
+            first_id = checkpoint.id;
+        }
+    }
+
+    assert!(
+        !root.join(".dext/checkpoints").join(&first_id).exists(),
+        "automatic retention must remove the expired sidecar directory"
+    );
+    let checkpoints =
+        git_checkpoints::list_checkpoints(&root, usize::MAX).expect("list retained checkpoints");
+    assert_eq!(checkpoints.len(), 20);
+    assert!(
+        checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.id != first_id)
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_reset_head_reports_commit_state_and_preserves_snapshot_ref() {
+    let root = temp_test_dir("checkpoint-reset-head-message");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write base");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    std::fs::write(root.join("tracked.txt"), "checkpoint-state\n").expect("write checkpoint state");
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["tracked.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    std::fs::write(root.join("tracked.txt"), "later-commit\n").expect("write later state");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "later"]);
+
+    let message = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::ResetHead,
+    )
+    .expect("reset HEAD");
+    assert!(message.contains("now match that commit"), "{message}");
+    assert!(
+        message.contains("captured uncommitted snapshot"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read reset worktree"),
+        "base\n"
+    );
+
+    git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore preserved uncommitted snapshot");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read snapshot worktree"),
+        "checkpoint-state\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn memory_merge_recall_prefers_ours_and_dedupes_theirs() {
     let base = "# Dext recall\n- keep\n- remove\n";
     let ours = "# Dext recall\n- keep\n- ours\n";
@@ -709,34 +1731,270 @@ fn mutation_preview_new_file_does_not_duplicate_added_lines() {
 }
 
 #[test]
-fn tool_paths_allow_user_global_pack_roots_outside_project() {
+fn prepared_mutation_replaces_atomically_preserves_mode_and_creates_parents() -> Result<()> {
+    let root = temp_test_dir("prepared-mutation-success");
+    let path = root.join("note.txt");
+    std::fs::write(&path, "before\n")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+    }
+    #[cfg(unix)]
+    let original_inode = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path)?.ino()
+    };
+
+    let prepared = mutation_ok(mutation_preview::prepare_write_file(
+        &root, "note.txt", "after\n",
+    ))?;
+    assert_eq!(prepared.preview().diff, "-before\n+after\n");
+    mutation_ok(mutation_preview::apply_prepared_mutation(&root, &prepared))?;
+    assert_eq!(std::fs::read_to_string(&path)?, "after\n");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::metadata(&path)?;
+        assert_ne!(metadata.ino(), original_inode, "replacement must be atomic");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+    }
+
+    let nested = mutation_ok(mutation_preview::prepare_write_file(
+        &root,
+        "new/deep/file.txt",
+        "created through prepared state\n",
+    ))?;
+    mutation_ok(mutation_preview::apply_prepared_mutation(&root, &nested))?;
+    assert_eq!(
+        std::fs::read_to_string(root.join("new/deep/file.txt"))?,
+        "created through prepared state\n"
+    );
+
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn prepared_mutation_rejects_stale_overwrite_and_edit() -> Result<()> {
+    let root = temp_test_dir("prepared-mutation-stale-content");
+    let path = root.join("note.txt");
+    std::fs::write(&path, "before\n")?;
+
+    let overwrite = mutation_ok(mutation_preview::prepare_write_file(
+        &root,
+        "note.txt",
+        "planned\n",
+    ))?;
+    std::fs::write(&path, "raced overwrite\n")?;
+    let error = mutation_preview::apply_prepared_mutation(&root, &overwrite)
+        .expect_err("stale overwrite must fail");
+    assert!(error.contains("stale file state"), "{error}");
+    assert!(error.contains("Re-read the file and retry"), "{error}");
+    assert_eq!(std::fs::read_to_string(&path)?, "raced overwrite\n");
+
+    std::fs::write(&path, "alpha beta gamma\n")?;
+    let edit = mutation_ok(mutation_preview::prepare_edit_file(
+        &root, "note.txt", "beta", "BETA",
+    ))?;
+    std::fs::write(&path, "alpha raced gamma\n")?;
+    let error =
+        mutation_preview::apply_prepared_mutation(&root, &edit).expect_err("stale edit must fail");
+    assert!(error.contains("stale file state"), "{error}");
+    assert_eq!(std::fs::read_to_string(&path)?, "alpha raced gamma\n");
+
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn prepared_mutation_rejects_path_appearance_disappearance_and_type_swap() -> Result<()> {
+    let root = temp_test_dir("prepared-mutation-stale-path");
+
+    let appeared = mutation_ok(mutation_preview::prepare_write_file(
+        &root,
+        "appeared.txt",
+        "planned\n",
+    ))?;
+    std::fs::write(root.join("appeared.txt"), "intruder\n")?;
+    let error = mutation_preview::apply_prepared_mutation(&root, &appeared)
+        .expect_err("appearing destination must fail");
+    assert!(error.contains("stale file state"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("appeared.txt"))?,
+        "intruder\n"
+    );
+
+    let vanished_path = root.join("vanished.txt");
+    std::fs::write(&vanished_path, "before\n")?;
+    let vanished = mutation_ok(mutation_preview::prepare_write_file(
+        &root,
+        "vanished.txt",
+        "planned\n",
+    ))?;
+    std::fs::remove_file(&vanished_path)?;
+    let error = mutation_preview::apply_prepared_mutation(&root, &vanished)
+        .expect_err("disappearing destination must fail");
+    assert!(error.contains("stale file state"), "{error}");
+    assert!(!vanished_path.exists());
+
+    let swapped_path = root.join("swapped.txt");
+    std::fs::write(&swapped_path, "before\n")?;
+    let swapped = mutation_ok(mutation_preview::prepare_write_file(
+        &root,
+        "swapped.txt",
+        "planned\n",
+    ))?;
+    std::fs::remove_file(&swapped_path)?;
+    std::fs::create_dir(&swapped_path)?;
+    let error = mutation_preview::apply_prepared_mutation(&root, &swapped)
+        .expect_err("type-swapped destination must fail");
+    assert!(error.contains("stale file state"), "{error}");
+    assert!(swapped_path.is_dir());
+
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_mutation_rejects_symlink_swap_without_touching_target() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("prepared-mutation-symlink-swap");
+    let outside = temp_test_dir("prepared-mutation-symlink-target");
+    let path = root.join("note.txt");
+    let outside_path = outside.join("outside.txt");
+    std::fs::write(&path, "before\n")?;
+    std::fs::write(&outside_path, "outside\n")?;
+
+    let prepared = mutation_ok(mutation_preview::prepare_write_file(
+        &root,
+        "note.txt",
+        "planned\n",
+    ))?;
+    std::fs::remove_file(&path)?;
+    symlink(&outside_path, &path)?;
+    let error = mutation_preview::apply_prepared_mutation(&root, &prepared)
+        .expect_err("symlink-swapped destination must fail");
+    assert!(error.contains("stale file state"), "{error}");
+    assert!(error.contains("Re-read the file and retry"), "{error}");
+    assert_eq!(std::fs::read_to_string(&outside_path)?, "outside\n");
+    assert!(std::fs::symlink_metadata(&path)?.file_type().is_symlink());
+
+    std::fs::remove_dir_all(root)?;
+    std::fs::remove_dir_all(outside)?;
+    Ok(())
+}
+
+#[test]
+fn prepared_mutation_write_failure_cleans_temp_and_preserves_original() -> Result<()> {
+    let root = temp_test_dir("prepared-mutation-write-failure");
+    let path = root.join("note.txt");
+    std::fs::write(&path, "before\n")?;
+    let prepared = mutation_ok(mutation_preview::prepare_write_file(
+        &root,
+        "note.txt",
+        "planned\n",
+    ))?;
+
+    let error = mutation_preview::fail_prepared_mutation_before_replace(&root, &prepared)
+        .expect_err("injected write failure must fail");
+    assert!(
+        error.contains("injected pre-replacement failure"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, "before\n");
+    let leaked_temp = std::fs::read_dir(&root)?
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().contains(".dext-tmp-"));
+    assert!(!leaked_temp, "failed mutation leaked a temp file");
+
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn multi_edit_preparation_is_all_or_nothing() -> Result<()> {
+    let root = temp_test_dir("prepared-multi-edit-all-or-nothing");
+    let path = root.join("note.txt");
+    std::fs::write(&path, "alpha beta gamma\n")?;
+    let edits = [
+        mutation_preview::MultiEdit {
+            old_string: "alpha".to_string(),
+            new_string: "ALPHA".to_string(),
+            replace_all: false,
+        },
+        mutation_preview::MultiEdit {
+            old_string: "missing".to_string(),
+            new_string: "MISSING".to_string(),
+            replace_all: false,
+        },
+    ];
+
+    let error = mutation_preview::prepare_multi_edit(&root, "note.txt", &edits)
+        .expect_err("invalid later edit must reject the full mutation");
+    assert!(error.contains("edit[1]: old_string not found"), "{error}");
+    assert_eq!(std::fs::read_to_string(&path)?, "alpha beta gamma\n");
+
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn tool_paths_allow_only_user_global_pack_content_outside_project() {
     let _guard = env_lock();
     let root = temp_test_dir("tool-path-global-pack-root");
     let home = temp_test_dir("tool-path-global-pack-home");
     let pack_dir = home.join("packs/demo");
+    let shelf_dir = home.join("shelves/community");
+    let shelf_pack_dir = shelf_dir.join("packs/demo");
     std::fs::create_dir_all(&pack_dir).expect("create global pack dir");
+    std::fs::create_dir_all(&shelf_pack_dir).expect("create shelf pack dir");
     let pack_md = pack_dir.join("PACK.md");
+    let shelf_pack_md = shelf_pack_dir.join("PACK.md");
+    let shelf_manifest = shelf_dir.join("shelf.json");
     std::fs::write(&pack_md, "---\nname: demo\n---\n# Demo\n").expect("write PACK.md");
+    std::fs::write(&shelf_pack_md, "---\nname: shelf-demo\n---\n# Demo\n")
+        .expect("write shelf PACK.md");
+    std::fs::write(&shelf_manifest, "{}\n").expect("write shelf manifest");
     let notes = pack_dir.join("notes.md");
+    let shelf_notes = shelf_pack_dir.join("notes.md");
+    let shelf_metadata = shelf_dir.join("metadata.json");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
     unsafe {
         std::env::set_var("DEXT_HOME", &home);
     }
 
-    let canonical = canonicalize_tool_path(&root, &pack_md.display().to_string())
-        .expect("allow global pack path");
-    assert_eq!(
-        canonical,
-        std::fs::canonicalize(&pack_md).expect("canonical pack path")
-    );
-
-    let preview = mutation_preview::preview_write_file(&root, &notes.display().to_string(), "hi\n")
-        .expect("preview global pack write");
-    assert_eq!(preview.path, notes);
-    assert!(preview.is_new_file);
-
-    unsafe {
-        std::env::remove_var("DEXT_HOME");
+    for allowed in [&pack_md, &shelf_pack_md] {
+        let canonical = canonicalize_tool_path(&root, &allowed.display().to_string())
+            .expect("allow global pack path");
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(allowed).expect("canonical pack path")
+        );
     }
+
+    for allowed in [&notes, &shelf_notes] {
+        let preview =
+            mutation_preview::preview_write_file(&root, &allowed.display().to_string(), "hi\n")
+                .expect("preview global pack write");
+        assert_eq!(preview.path, *allowed);
+        assert!(preview.is_new_file);
+    }
+
+    for denied in [&shelf_manifest, &shelf_metadata] {
+        let error = canonicalize_tool_path(&root, &denied.display().to_string())
+            .expect_err("shelf metadata is outside global pack content");
+        assert!(
+            error.contains("outside sandbox or Dext global pack roots"),
+            "{error}"
+        );
+    }
+
+    restore_env_var("DEXT_HOME", old_dext_home);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -788,6 +2046,70 @@ fn tool_paths_allow_external_reads_but_reject_external_writes() {
     let _ = std::fs::remove_dir_all(&outside);
 }
 
+#[cfg(unix)]
+#[test]
+fn tool_paths_reject_dangling_symlink_write_escapes() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("tool-path-dangling-root");
+    let home = temp_test_dir("tool-path-dangling-home");
+    let outside = temp_test_dir("tool-path-dangling-outside");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let outside_file = outside.join("created-by-escape.txt");
+    symlink(&outside_file, root.join("file-alias")).expect("create dangling file alias");
+    let error = canonicalize_tool_path(&root, "file-alias")
+        .expect_err("dangling file symlink must fail closed");
+    assert!(
+        error.contains("cannot resolve existing path component"),
+        "{error}"
+    );
+    let error = execute_tool(
+        "write_file",
+        &json!({"path": "file-alias", "content": "escaped\n"}),
+        &root,
+    )
+    .expect_err("write_file must reject dangling file alias");
+    assert!(
+        error.contains("cannot resolve existing path component"),
+        "{error}"
+    );
+    assert!(!outside_file.exists(), "outside target must not be created");
+
+    let outside_dir = outside.join("created-directory");
+    symlink(&outside_dir, root.join("dir-alias")).expect("create dangling directory alias");
+    let error = canonicalize_tool_path(&root, "dir-alias/escaped.txt")
+        .expect_err("dangling directory symlink must fail closed");
+    assert!(
+        error.contains("cannot resolve existing path component"),
+        "{error}"
+    );
+    let error = execute_tool(
+        "write_file",
+        &json!({"path": "dir-alias/escaped.txt", "content": "escaped\n"}),
+        &root,
+    )
+    .expect_err("write_file must reject dangling directory alias");
+    assert!(
+        error.contains("cannot resolve existing path component"),
+        "{error}"
+    );
+    assert!(
+        !outside_dir.exists(),
+        "outside directory must not be created through a dangling alias"
+    );
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
 #[test]
 fn memory_merge_cli_skips_merge_subcommand_for_positionals() {
     let root = temp_test_dir("memory-merge-cli");
@@ -813,6 +2135,30 @@ fn memory_merge_cli_skips_merge_subcommand_for_positionals() {
 struct SessionReplayFixture {
     header: SessionHeader,
     history: Vec<Message>,
+}
+
+fn state_fixture_path(area: &str, name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/state")
+        .join(area)
+        .join(name)
+}
+
+fn load_session_state_fixture(name: &str) -> Result<(SessionHeader, Vec<Message>)> {
+    let path = state_fixture_path("sessions", name);
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading state fixture {}", path.display()))?;
+    let mut lines = content.lines();
+    let header = parse_session_header(lines.next().context("empty session state fixture")?)?;
+    let history = lines
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str::<Message>(line)
+                .with_context(|| format!("bad fixture message on line {}", index + 2))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((header, history))
 }
 
 impl SessionReplayFixture {
@@ -979,6 +2325,48 @@ fn injected_steering_is_ledger_visible_and_final_required() {
                 if *messages == 1 && preview.contains("rg border overflow")
         )),
         "expected compact queued-update event"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn queued_path_steering_is_preserved_as_literal_task_input() {
+    let root = temp_test_dir("steering-path-literal");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_steering(rx, tx.clone());
+    let supplied_path = "/home/fixture-user/.dext/projects/stocks-test/sessions";
+    tx.send(supplied_path.to_string())
+        .expect("send path steering");
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+
+    assert!(agent.inject_queued_steering(&mut turn_state, 3, 7, false));
+    let injected = agent
+        .history
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .find_map(|block| match block {
+            Block::Text { text } if text.contains("[queued-user-update]") => Some(text),
+            _ => None,
+        })
+        .expect("queued path update injected");
+    assert!(injected.contains(supplied_path), "{injected}");
+    assert!(
+        injected.contains("literal user-authored task input"),
+        "{injected}"
+    );
+    assert!(
+        injected.contains("never dismiss or reinterpret"),
+        "{injected}"
+    );
+    assert!(injected.contains("inspect that path first"), "{injected}");
+    assert!(injected.contains("`read_file` for a file"), "{injected}");
+    assert!(injected.contains("`fd`/`rg` for a directory"), "{injected}");
+    assert!(
+        injected.contains("not guessed alternatives, bash discovery, or sudo"),
+        "{injected}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1499,7 +2887,7 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
     std::fs::write(
         &fake_sudo,
         format!(
-            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\npgid=$(ps -o pgid= -p \"$$\" | tr -d '[:space:]')\nif [ -z \"$pgid\" ]; then pgid=$PPID; fi\nstate=\"$state_dir/$pgid\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n  [ \"$pass\" = hunter2 ] || exit 1\n  : > \"$state\"\n  exit 0\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then exec \"$@\"; fi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
+            "#!/bin/sh\nset -eu\nstate_dir={state_dir}\nstate=\"$state_dir/authenticated\"\nif [ \"${{1:-}}\" = -n ] && [ \"${{2:-}}\" = -v ]; then\n  test -f \"$state\"\n  exit $?\nfi\nif [ \"${{1:-}}\" = -A ] && [ \"${{2:-}}\" = -v ]; then\n  ask=\"${{SUDO_ASKPASS:-}}\"\n  if [ -z \"$ask\" ]; then ask=\"${{DEXT_SUDO_ASKPASS:-}}\"; fi\n  [ -n \"$ask\" ] || exit 1\n  pass=$(\"$ask\" 'fake sudo prompt') || exit 1\n  [ \"$pass\" = hunter2 ] || exit 1\n  : > \"$state\"\n  exit 0\nfi\nwhile [ \"${{1:-}}\" = -n ]; do shift; done\nif [ -f \"$state\" ]; then exec \"$@\"; fi\nprintf '%s\\n' 'sudo: interactive authentication is required' >&2\nexit 1\n"
         ),
     )
     .expect("write fake sudo");
@@ -1510,25 +2898,22 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
     fake_perms.set_mode(0o700);
     std::fs::set_permissions(&fake_sudo, fake_perms).expect("chmod fake sudo");
 
-    let target = {
-        let _guard = env_lock();
-        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-            Ok(home) => PathBuf::from(home),
-            Err(_) => root.clone(),
-        };
-        let dir = home.join(format!(".dext-sudo-preauth-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create target dir");
-        dir.join("out.txt")
-    };
-    let _ = std::fs::remove_file(&target);
+    let target_dir = temp_test_dir("sudo-preauth-target");
+    let target = target_dir.join("out.txt");
 
     let (sudo_shim_dir, askpass, fifo) = {
         let _guard = env_lock();
-        (
+        let old_sessions_dir = std::env::var_os("DEXT_SESSIONS_DIR");
+        unsafe {
+            std::env::set_var("DEXT_SESSIONS_DIR", root.join("sessions"));
+        }
+        let result = (
             write_sudo_command_shim(&root, "test-session", &fake_sudo).expect("write sudo shim"),
             write_sudo_askpass_script(&root, "test-session").expect("write askpass"),
             create_sudo_password_fifo(&root, "test-session").expect("create sudo fifo"),
-        )
+        );
+        restore_env_var("DEXT_SESSIONS_DIR", old_sessions_dir);
+        result
     };
     let auth = LocalSudoAuth {
         askpass: Some(askpass),
@@ -1573,6 +2958,8 @@ fn tool_credential_env_key_matches_only_secret_variables() {
     assert!(tool_credential_env_key("AWS_SECRET_ACCESS_KEY"));
     assert!(tool_credential_env_key("SECRET_KEY"));
     assert!(tool_credential_env_key("TOKEN"));
+    assert!(tool_credential_env_key("X_CT0"));
+    assert!(tool_credential_env_key("X_CONSUMER_KEY"));
     assert!(!tool_credential_env_key("DEXT_BASE_URL"));
     assert!(!tool_credential_env_key("DEXT_PACK_DEMO_DIR"));
 }
@@ -1591,7 +2978,7 @@ fn sync_tool_children_scrub_credentials_unless_explicitly_enabled() {
         std::env::remove_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
     }
 
-    let mut scrubbed = Command::new("bash");
+    let mut scrubbed = Command::new(bash_executable_path());
     scrubbed.arg("-c").arg(
         "printf '%s|%s|%s' \"${SECURITY_TEST_API_KEY-unset}\" \"${CHATGPT_ACCESS_TOKEN-unset}\" \"${SECURITY_TEST_SAFE-unset}\"",
     );
@@ -1609,7 +2996,7 @@ fn sync_tool_children_scrub_credentials_unless_explicitly_enabled() {
     unsafe {
         std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
     }
-    let mut inherited = Command::new("bash");
+    let mut inherited = Command::new(bash_executable_path());
     inherited
         .arg("-c")
         .arg("printf '%s|%s' \"${SECURITY_TEST_API_KEY-unset}\" \"${CHATGPT_ACCESS_TOKEN-unset}\"");
@@ -1634,6 +3021,7 @@ fn sync_tool_children_scrub_credentials_unless_explicitly_enabled() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn async_tool_children_scrub_credentials_by_default() {
     let _guard = env_lock();
     let old_api_key = std::env::var_os("SECURITY_ASYNC_API_KEY");
@@ -1642,7 +3030,7 @@ async fn async_tool_children_scrub_credentials_by_default() {
         std::env::set_var("SECURITY_ASYNC_API_KEY", "fake-async-api-key-fixture");
         std::env::remove_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
     }
-    let mut command = tokio::process::Command::new("bash");
+    let mut command = tokio::process::Command::new(bash_executable_path());
     command
         .arg("-c")
         .arg("printf '%s' \"${SECURITY_ASYNC_API_KEY-unset}\"");
@@ -1656,6 +3044,7 @@ async fn async_tool_children_scrub_credentials_by_default() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn async_tool_children_scrub_injected_only_credentials_and_prompt_overrides() {
     let _guard = env_lock();
     let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
@@ -1689,6 +3078,664 @@ async fn async_tool_children_scrub_injected_only_credentials_and_prompt_override
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn declared_pack_credentials_reach_direct_helper_but_not_arbitrary_bash() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let old_auth = std::env::var_os("X_AUTH_TOKEN");
+    let old_provider = std::env::var_os("OPENAI_API_KEY");
+    let old_unrelated = std::env::var_os("UNRELATED_SECRET_KEY");
+    let old_bash_env = std::env::var_os("BASH_ENV");
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    unsafe {
+        std::env::set_var("X_AUTH_TOKEN", "fake-pack-auth-token");
+        std::env::set_var("OPENAI_API_KEY", "fake-provider-key");
+        std::env::set_var("UNRELATED_SECRET_KEY", "fake-unrelated-key");
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+    }
+    let root = temp_test_dir("pack credential env with spaces");
+    let root = std::fs::canonicalize(&root).expect("canonical root");
+    let startup = root.join("bash-env.sh");
+    std::fs::write(
+        &startup,
+        "export PACK_STARTUP_LEAK=loaded\nprintf '%s' \"${X_AUTH_TOKEN-unset}\" > startup-leak.txt\n",
+    )
+    .expect("write hostile bash startup file");
+    unsafe {
+        std::env::set_var("BASH_ENV", &startup);
+    }
+    let bin_dir = root.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create pack bin");
+    let helper = bin_dir.join("credential-probe");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\nif [ \"${X_AUTH_TOKEN-unset}\" = unset ]; then status=absent; else status=available; fi\nprintf '%s|%s|%s|%s|%s|%s' \"$status\" \"${X_AUTH_TOKEN-unset}\" \"${OPENAI_API_KEY-unset}\" \"${UNRELATED_SECRET_KEY-unset}\" \"${PACK_STARTUP_LEAK-unset}\" \"${1-unset}\"\n",
+    )
+    .expect("write credential probe");
+    let mut permissions = std::fs::metadata(&helper)
+        .expect("credential probe metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&helper, permissions).expect("make credential probe executable");
+    let pack_env = [
+        ("DEXT_PACK_DIR".to_string(), root.display().to_string()),
+        (
+            "DEXT_PACK_CREDENTIAL_ENV".to_string(),
+            "X_AUTH_TOKEN,OPENAI_API_KEY".to_string(),
+        ),
+    ];
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(8);
+    let live = LiveToolOutput {
+        call_id: "credential-helper".to_string(),
+        name: "bash".to_string(),
+        tx: live_tx,
+    };
+    let guarded_helper = tool_policy::apply_bash_guardrails(
+        "$DEXT_PACK_DIR/bin/credential-probe 'literal argument with spaces'",
+    )
+    .expect("guard direct helper");
+    let output = execute_bash_async_prepared(
+        &guarded_helper,
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        None,
+        SandboxProfile::DangerFullAccess,
+        Some(live),
+        &pack_env,
+        &[],
+    )
+    .await
+    .expect("run direct pack helper with declared credential");
+    assert!(
+        output.contains(
+            "available|[REDACTED_PACK_CREDENTIAL]|unset|unset|unset|literal argument with spaces"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("fake-pack-auth-token"), "{output}");
+    assert!(!output.contains("fake-provider-key"), "{output}");
+    assert!(!output.contains("fake-unrelated-key"), "{output}");
+    assert!(
+        live_rx.try_recv().is_err(),
+        "credential-bearing helper output must not bypass redaction via live deltas"
+    );
+    assert!(
+        !root.join("startup-leak.txt").exists(),
+        "BASH_ENV must not run before credential-bearing pack helpers"
+    );
+
+    let helper_without_declarations = [("DEXT_PACK_DIR".to_string(), root.display().to_string())];
+    let output = execute_bash_async_prepared(
+        &guarded_helper,
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        None,
+        SandboxProfile::DangerFullAccess,
+        None,
+        &helper_without_declarations,
+        &[],
+    )
+    .await
+    .expect("run direct pack helper without declarations");
+    assert!(
+        output.contains("absent|unset|unset|unset|unset|literal argument with spaces"),
+        "{output}"
+    );
+    assert!(!output.contains("fake-pack-auth-token"), "{output}");
+    assert!(!output.contains("fake-provider-key"), "{output}");
+    assert!(!output.contains("fake-unrelated-key"), "{output}");
+
+    let outside_helper = root.join("credential-probe-outside-bin");
+    std::fs::write(
+        &outside_helper,
+        "#!/bin/sh\nprintf '%s' \"${X_AUTH_TOKEN-unset}\"\n",
+    )
+    .expect("write outside credential probe");
+    let mut permissions = std::fs::metadata(&outside_helper)
+        .expect("outside credential probe metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&outside_helper, permissions)
+        .expect("make outside credential probe executable");
+    let linked_helper = bin_dir.join("linked-credential-probe");
+    std::os::unix::fs::symlink(&outside_helper, &linked_helper)
+        .expect("link outside helper into pack bin");
+    let linked_helper_command = shell_single_quote(&linked_helper.display().to_string());
+    let output = execute_bash_async_prepared(
+        &linked_helper_command,
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        None,
+        SandboxProfile::DangerFullAccess,
+        None,
+        &pack_env,
+        &[],
+    )
+    .await
+    .expect("run linked helper without declared credential");
+    assert!(output.contains("unset"), "{output}");
+    assert!(!output.contains("fake-pack-auth-token"), "{output}");
+
+    let output = execute_bash_async_prepared(
+        "printf '%s' \"${X_AUTH_TOKEN-unset}\"",
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(5),
+        None,
+        SandboxProfile::DangerFullAccess,
+        None,
+        &pack_env,
+        &[],
+    )
+    .await
+    .expect("run arbitrary bash with pack environment");
+    assert!(output.contains("unset"), "{output}");
+    assert!(!output.contains("fake-pack-auth-token"), "{output}");
+
+    restore_env_var("X_AUTH_TOKEN", old_auth);
+    restore_env_var("OPENAI_API_KEY", old_provider);
+    restore_env_var("UNRELATED_SECRET_KEY", old_unrelated);
+    restore_env_var("BASH_ENV", old_bash_env);
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_secret_commands_are_bounded_cached_and_credential_isolated() -> Result<()> {
+    let _guard = env_lock();
+    let old_api_key = std::env::var_os("SECRET_COMMAND_TEST_API_KEY");
+    let old_bash_env = std::env::var_os("BASH_ENV");
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    let old_timeout = std::env::var_os("DEXT_SECRET_COMMAND_TIMEOUT_SECS");
+    let root = temp_test_dir("provider-secret-command");
+    let startup_marker = root.join("startup-ran");
+    let startup = root.join("bash-env.sh");
+    std::fs::write(
+        &startup,
+        format!(
+            "printf startup > {}\nexport SECRET_COMMAND_STARTUP=loaded\n",
+            shell_single_quote(&startup_marker.display().to_string())
+        ),
+    )?;
+    unsafe {
+        std::env::set_var("SECRET_COMMAND_TEST_API_KEY", "secret-command-ambient-key");
+        std::env::set_var("BASH_ENV", &startup);
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+        std::env::set_var("DEXT_SECRET_COMMAND_TIMEOUT_SECS", "1");
+    }
+    crate::provider::command_secret_cache()
+        .lock()
+        .expect("secret command cache")
+        .clear();
+
+    let result = (|| -> Result<()> {
+        let isolated = crate::provider::resolve_secret_reference(
+            "!printf '%s|%s|%s|%s|%s' \"${SECRET_COMMAND_TEST_API_KEY-unset}\" \"${SECRET_COMMAND_STARTUP-unset}\" \"${GIT_TERMINAL_PROMPT-unset}\" \"${SSH_ASKPASS_REQUIRE-unset}\" \"${GCM_INTERACTIVE-unset}\"",
+        );
+        assert_eq!(isolated.as_deref(), Some("unset|unset|0|never|never"));
+        assert!(!startup_marker.exists(), "BASH_ENV startup file ran");
+
+        unsafe {
+            std::env::set_var("SECRET_COMMAND_TEST_API_KEY", "changed-after-cache");
+        }
+        let cached = crate::provider::resolve_secret_reference(
+            "!printf '%s|%s|%s|%s|%s' \"${SECRET_COMMAND_TEST_API_KEY-unset}\" \"${SECRET_COMMAND_STARTUP-unset}\" \"${GIT_TERMINAL_PROMPT-unset}\" \"${SSH_ASKPASS_REQUIRE-unset}\" \"${GCM_INTERACTIVE-unset}\"",
+        );
+        assert_eq!(cached, isolated, "successful result must be cached");
+
+        let failure_marker = root.join("failure-count");
+        let failing = format!(
+            "!printf x >> {}; exit 7",
+            shell_single_quote(&failure_marker.display().to_string())
+        );
+        assert_eq!(crate::provider::resolve_secret_reference(&failing), None);
+        assert_eq!(crate::provider::resolve_secret_reference(&failing), None);
+        assert_eq!(std::fs::read_to_string(&failure_marker)?, "x");
+
+        assert_eq!(
+            crate::provider::resolve_secret_reference("!head -c 20000 /dev/zero | tr '\\0' x"),
+            None,
+            "oversized secret output must be rejected"
+        );
+
+        let timeout_marker = root.join("timeout-descendant");
+        let timed = format!(
+            "!(sleep 2; printf late > {}) & wait",
+            shell_single_quote(&timeout_marker.display().to_string())
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(crate::provider::resolve_secret_reference(&timed), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "secret command timeout was not enforced"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(
+            !timeout_marker.exists(),
+            "timed-out secret command descendant survived process-group cleanup"
+        );
+        Ok(())
+    })();
+
+    crate::provider::command_secret_cache()
+        .lock()
+        .expect("secret command cache")
+        .clear();
+    restore_env_var("SECRET_COMMAND_TEST_API_KEY", old_api_key);
+    restore_env_var("BASH_ENV", old_bash_env);
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+    restore_env_var("DEXT_SECRET_COMMAND_TIMEOUT_SECS", old_timeout);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn internal_commands_ignore_tool_credential_opt_in_and_use_private_temp() -> Result<()> {
+    let _guard = env_lock();
+    let old_secret = std::env::var_os("INTERNAL_TEST_API_KEY");
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    let old_bash_env = std::env::var_os("BASH_ENV");
+    let old_zdotdir = std::env::var_os("ZDOTDIR");
+    let old_node_options = std::env::var_os("NODE_OPTIONS");
+    let root = temp_test_dir("internal-command-env");
+    let inherited_temp = root.join("inherited-temp");
+    let startup_marker = root.join("startup-ran");
+    let startup = root.join("startup.sh");
+    std::fs::create_dir(&inherited_temp)?;
+    std::fs::write(
+        &startup,
+        format!(
+            "printf startup > {}\nexport INTERNAL_STARTUP_RAN=yes\n",
+            shell_single_quote(&startup_marker.display().to_string())
+        ),
+    )?;
+    let old_tmpdir = std::env::var_os("TMPDIR");
+    let old_tmp = std::env::var_os("TMP");
+    let old_temp = std::env::var_os("TEMP");
+    unsafe {
+        std::env::set_var("INTERNAL_TEST_API_KEY", "internal-secret-fixture");
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+        std::env::set_var("BASH_ENV", &startup);
+        std::env::set_var("ZDOTDIR", &root);
+        std::env::set_var("NODE_OPTIONS", "--require=/definitely/not/loaded.js");
+        std::env::set_var("TMPDIR", &inherited_temp);
+        std::env::set_var("TMP", &inherited_temp);
+        std::env::set_var("TEMP", &inherited_temp);
+    }
+
+    let result = (|| -> Result<()> {
+        let mut command = Command::new(bash_executable_path());
+        command.arg("-c").arg(
+            r#"printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+             "${INTERNAL_TEST_API_KEY-unset}" \
+             "${INTERNAL_STARTUP_RAN-unset}" \
+             "${BASH_ENV-unset}" \
+             "${ZDOTDIR-unset}" \
+             "${NODE_OPTIONS-unset}" \
+             "${GIT_TERMINAL_PROMPT-unset}" \
+             "${SSH_ASKPASS_REQUIRE-unset}" \
+             "$(stat -c %a "$TMPDIR" 2>/dev/null || stat -f %Lp "$TMPDIR")" \
+             "$TMPDIR,$TMP,$TEMP""#,
+        );
+        let output = run_internal_command_limited(
+            command,
+            "internal environment probe",
+            std::time::Duration::from_secs(5),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(output.success());
+        let rendered = String::from_utf8(output.stdout)?;
+        let fields = rendered.split('|').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 9, "{rendered:?}");
+        assert_eq!(
+            &fields[..7],
+            &["unset", "unset", "unset", "unset", "unset", "0", "never"]
+        );
+        assert_eq!(fields[7], "700");
+        let temps = fields[8].split(',').collect::<Vec<_>>();
+        assert_eq!(temps.len(), 3, "{rendered:?}");
+        assert_eq!(temps[0], temps[1]);
+        assert_eq!(temps[0], temps[2]);
+        assert_ne!(Path::new(temps[0]), inherited_temp.as_path());
+        assert!(
+            !Path::new(temps[0]).exists(),
+            "private temp must be removed after the child exits"
+        );
+        assert!(!startup_marker.exists(), "BASH_ENV startup file ran");
+        Ok(())
+    })();
+
+    restore_env_var("INTERNAL_TEST_API_KEY", old_secret);
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+    restore_env_var("BASH_ENV", old_bash_env);
+    restore_env_var("ZDOTDIR", old_zdotdir);
+    restore_env_var("NODE_OPTIONS", old_node_options);
+    restore_env_var("TMPDIR", old_tmpdir);
+    restore_env_var("TMP", old_tmp);
+    restore_env_var("TEMP", old_temp);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn browser_launchers_are_bounded_credential_isolated_and_use_private_temp() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("browser-launcher-isolation");
+    let bin_dir = root.join("bin");
+    let marker = root.join("launcher-env.txt");
+    let startup_marker = root.join("startup-ran.txt");
+    let startup = root.join("bash-env.sh");
+    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::write(
+        &startup,
+        format!(
+            "printf startup > {}\n",
+            shell_single_quote(&startup_marker.display().to_string())
+        ),
+    )?;
+    let launcher = bin_dir.join("xdg-open");
+    for earlier in ["wslview", "powershell.exe"] {
+        let path = bin_dir.join(earlier);
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n")?;
+        let mut permissions = std::fs::metadata(&path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions)?;
+    }
+    std::fs::write(
+        &launcher,
+        r#"#!/bin/bash
+printf '%s|%s|%s|%s|%s|%s|%s' \
+  "${BROWSER_TEST_API_KEY-unset}" \
+  "${BASH_ENV-unset}" \
+  "${PYTHONPATH-unset}" \
+  "${GIT_TERMINAL_PROMPT-unset}" \
+  "$(stat -c %a "$TMPDIR")" \
+  "$TMPDIR,$TMP,$TEMP" \
+  "$1" > "$BROWSER_TEST_MARKER"
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(&launcher)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&launcher, permissions)?;
+
+    let names = [
+        "PATH",
+        "BROWSER_TEST_MARKER",
+        "BROWSER_TEST_API_KEY",
+        "BASH_ENV",
+        "PYTHONPATH",
+        TOOL_CREDENTIAL_ENV_INHERIT_FLAG,
+    ];
+    let old = names
+        .iter()
+        .map(|name| (*name, std::env::var_os(name)))
+        .collect::<Vec<_>>();
+    unsafe {
+        std::env::set_var("PATH", prepend_env_path(&bin_dir));
+        std::env::set_var("BROWSER_TEST_MARKER", &marker);
+        std::env::set_var("BROWSER_TEST_API_KEY", "browser-secret-fixture");
+        std::env::set_var("BASH_ENV", &startup);
+        std::env::set_var("PYTHONPATH", "/hostile/python/path");
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+    }
+
+    let result = (|| -> Result<()> {
+        let launcher_name =
+            crate::provider::open_url_in_browser("https://example.invalid/callback?code=fixture")?;
+        assert_eq!(launcher_name, "xdg-open");
+        let rendered = std::fs::read_to_string(&marker)?;
+        let fields = rendered.split('|').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 7, "{rendered:?}");
+        assert_eq!(&fields[..4], &["unset", "unset", "unset", "0"]);
+        assert_eq!(fields[4], "700");
+        let temps = fields[5].split(',').collect::<Vec<_>>();
+        assert_eq!(temps.len(), 3, "{rendered:?}");
+        assert_eq!(temps[0], temps[1]);
+        assert_eq!(temps[0], temps[2]);
+        assert!(
+            !Path::new(temps[0]).exists(),
+            "browser launcher scratch must be removed"
+        );
+        assert_eq!(fields[6], "https://example.invalid/callback?code=fixture");
+        assert!(!startup_marker.exists(), "BASH_ENV startup file ran");
+        Ok(())
+    })();
+
+    for (name, value) in old {
+        restore_env_var(name, value);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn browser_launcher_timeout_kills_descendants() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("browser-launcher-timeout");
+    let bin_dir = root.join("bin");
+    let descendant_marker = root.join("descendant-survived.txt");
+    std::fs::create_dir_all(&bin_dir)?;
+    let launcher = bin_dir.join("xdg-open");
+    std::fs::write(
+        &launcher,
+        r#"#!/bin/bash
+(/bin/sleep 2; printf late > "$BROWSER_DESCENDANT_MARKER") &
+wait
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(&launcher)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&launcher, permissions)?;
+    for fallback in [
+        "wslview",
+        "powershell.exe",
+        "gio",
+        "sensible-browser",
+        "x-www-browser",
+    ] {
+        let path = bin_dir.join(fallback);
+        std::fs::write(&path, "#!/bin/sh\nexit 1\n")?;
+        let mut permissions = std::fs::metadata(&path)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions)?;
+    }
+
+    let old_path = std::env::var_os("PATH");
+    let old_marker = std::env::var_os("BROWSER_DESCENDANT_MARKER");
+    let old_timeout = std::env::var_os("DEXT_BROWSER_OPEN_TIMEOUT_SECS");
+    unsafe {
+        std::env::set_var("PATH", prepend_env_path(&bin_dir));
+        std::env::set_var("BROWSER_DESCENDANT_MARKER", &descendant_marker);
+        std::env::set_var("DEXT_BROWSER_OPEN_TIMEOUT_SECS", "1");
+    }
+
+    let started = std::time::Instant::now();
+    let result = crate::provider::open_url_in_browser("https://example.invalid/timeout");
+    let elapsed = started.elapsed();
+    restore_env_var("PATH", old_path);
+    restore_env_var("BROWSER_DESCENDANT_MARKER", old_marker);
+    restore_env_var("DEXT_BROWSER_OPEN_TIMEOUT_SECS", old_timeout);
+
+    assert!(result.is_err(), "hanging launcher unexpectedly succeeded");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "browser launcher timeout was not enforced: {elapsed:?}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert!(
+        !descendant_marker.exists(),
+        "timed-out browser launcher descendant survived process-group cleanup"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn eval_shell_ignores_login_and_noninteractive_startup_files() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("eval-shell-startup-isolation");
+    let home = root.join("home");
+    let login_marker = root.join("login-profile-ran.txt");
+    let bash_env_marker = root.join("bash-env-ran.txt");
+    let bash_env = root.join("bash-env.sh");
+    std::fs::create_dir_all(&home)?;
+    std::fs::write(
+        home.join(".bash_profile"),
+        format!(
+            "printf login > {}\nexport EVAL_LOGIN_PROFILE_RAN=yes\n",
+            shell_single_quote(&login_marker.display().to_string())
+        ),
+    )?;
+    std::fs::write(
+        &bash_env,
+        format!(
+            "printf bash-env > {}\nexport EVAL_BASH_ENV_RAN=yes\n",
+            shell_single_quote(&bash_env_marker.display().to_string())
+        ),
+    )?;
+
+    let names = [
+        "HOME",
+        "BASH_ENV",
+        "EVAL_TEST_API_KEY",
+        TOOL_CREDENTIAL_ENV_INHERIT_FLAG,
+    ];
+    let old = names
+        .iter()
+        .map(|name| (*name, std::env::var_os(name)))
+        .collect::<Vec<_>>();
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var("BASH_ENV", &bash_env);
+        std::env::set_var("EVAL_TEST_API_KEY", "eval-secret-fixture");
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+    }
+
+    let result = (|| -> Result<()> {
+        let (code, stdout, stderr) = run_eval_shell_command(
+            &root,
+            "printf '%s|%s|%s|%s' \"${EVAL_TEST_API_KEY-unset}\" \"${EVAL_LOGIN_PROFILE_RAN-unset}\" \"${EVAL_BASH_ENV_RAN-unset}\" \"${BASH_ENV-unset}\"",
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(stdout, "unset|unset|unset|unset");
+        assert!(!login_marker.exists(), "login profile executed");
+        assert!(!bash_env_marker.exists(), "BASH_ENV startup file executed");
+        Ok(())
+    })();
+
+    for (name, value) in old {
+        restore_env_var(name, value);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn eval_shell_confines_project_and_external_writes() -> Result<()> {
+    if !sandbox::is_enforced() {
+        return Ok(());
+    }
+
+    let root = temp_test_dir("eval-shell-write-confinement");
+    let outside = root
+        .parent()
+        .expect("temp root parent")
+        .join(format!("dext-eval-outside-{}", std::process::id()));
+    let inside = root.join("mutated-by-eval.txt");
+    let command = format!(
+        "printf inside > {} || true; printf outside > {} || true; test ! -e {} && test ! -e {}",
+        shell_single_quote(&inside.to_string_lossy()),
+        shell_single_quote(&outside.to_string_lossy()),
+        shell_single_quote(&inside.to_string_lossy()),
+        shell_single_quote(&outside.to_string_lossy()),
+    );
+
+    let (code, _stdout, stderr) =
+        run_eval_shell_command(&root, &command).map_err(anyhow::Error::msg)?;
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!inside.exists(), "eval assertion mutated its fixture");
+    assert!(!outside.exists(), "eval assertion escaped its fixture");
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_file(outside);
+    Ok(())
+}
+
+#[test]
+fn pack_credential_redactor_handles_split_and_overlapping_values() {
+    let mut redactor = SecretByteRedactor::new(vec![b"token-value".to_vec(), b"token".to_vec()]);
+    let mut output = Vec::new();
+    redactor.push(b"before token-", |bytes| output.extend_from_slice(bytes));
+    redactor.push(b"value middle token after", |bytes| {
+        output.extend_from_slice(bytes)
+    });
+    redactor.finish(|bytes| output.extend_from_slice(bytes));
+
+    assert_eq!(
+        String::from_utf8(output).expect("redacted UTF-8"),
+        "before [REDACTED_PACK_CREDENTIAL] middle [REDACTED_PACK_CREDENTIAL] after"
+    );
+}
+
+#[test]
+fn hooks_never_receive_declared_pack_credential_values() {
+    let _guard = env_lock();
+    let old_auth = std::env::var_os("X_AUTH_TOKEN");
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    unsafe {
+        std::env::set_var("X_AUTH_TOKEN", "fake-hook-auth-token");
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+    }
+    let root = temp_test_dir("pack-hook-credential-scrub");
+    let hooks = Hooks {
+        pre_tool: vec![Hook {
+            tool_match: Some("bash".to_string()),
+            command: "printf '%s' \"${X_AUTH_TOKEN-unset}\"".to_string(),
+        }],
+        ..Default::default()
+    };
+    let extra_env = vec![(
+        "DEXT_PACK_CREDENTIAL_ENV".to_string(),
+        "X_AUTH_TOKEN".to_string(),
+    )];
+    let output = hooks.fire(
+        "pre_tool",
+        "bash",
+        &[],
+        &extra_env,
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
+    assert_eq!(output.len(), 1);
+    assert!(output[0].0.contains("unset"), "{}", output[0].0);
+    assert!(
+        !output[0].0.contains("fake-hook-auth-token"),
+        "{}",
+        output[0].0
+    );
+
+    restore_env_var("X_AUTH_TOKEN", old_auth);
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn sync_tool_children_scrub_command_only_credentials() {
     let _guard = env_lock();
@@ -1696,7 +3743,7 @@ fn sync_tool_children_scrub_command_only_credentials() {
     unsafe {
         std::env::remove_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
     }
-    let mut command = Command::new("bash");
+    let mut command = Command::new(bash_executable_path());
     command
         .arg("-c")
         .arg("printf '%s' \"${INJECTED_ONLY_SECRET_KEY-unset}\"")
@@ -1815,6 +3862,8 @@ fn busy_console_input_allows_public_copied_text_as_steering() {
         "d6280ad878e3\n",
         "grad-programs-ai-security-2027.md\n",
         "08_synthesis/grad-programs-ai-security-2027.md\n",
+        "/home/fixture-user/.dext/shelves/finance/packs/stock_deepdive/PACK.md\n",
+        "/compact-report/output.md\n",
         "- 08_synthesis/grad-programs-ai-security-2027.md\n",
         "fix the narrow emoji status column\n",
     ] {
@@ -1832,6 +3881,99 @@ fn busy_console_input_allows_public_copied_text_as_steering() {
         assert!(runtime_control_rx.try_recv().is_err());
         assert!(input_rx.try_recv().is_err());
     }
+}
+
+#[test]
+fn slash_routing_distinguishes_commands_from_absolute_and_wsl_paths() {
+    for command in [
+        "/help",
+        "/compact status",
+        "/pack run demo task",
+        "/privacy strict",
+    ] {
+        assert!(is_slash_command(command), "{command}");
+    }
+    for path in [
+        "/home/fixture-user/.dext/shelves/finance/packs/stock_deepdive/PACK.md",
+        "/mnt/c/Users/fixture-user/report.md",
+        "/compact-report/output.md",
+        r"\\wsl.localhost\Ubuntu\home\fixture-user\.dext\shelves",
+        r"\\wsl$\Ubuntu\home\fixture-user\.dext\shelves",
+    ] {
+        assert!(!is_slash_command(path), "{path}");
+    }
+
+    assert_eq!(
+        normalize_user_input_path(r"\\wsl.localhost\Ubuntu\home\fixture-user\.dext\shelves"),
+        "/home/fixture-user/.dext/shelves"
+    );
+    assert_eq!(
+        normalize_user_input_path(r"\\wsl$\Ubuntu\mnt\c\Users\fixture-user\report.md"),
+        "/mnt/c/Users/fixture-user/report.md"
+    );
+    assert_eq!(
+        normalize_user_input_path("/wsl.localhost/Ubuntu/home/fixture-user/report.md"),
+        "/wsl.localhost/Ubuntu/home/fixture-user/report.md"
+    );
+}
+
+#[test]
+fn busy_console_input_routes_absolute_and_wsl_paths_as_active_steering() {
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (runtime_control_tx, mut runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steering_tx, mut steering_rx) = tokio::sync::mpsc::unbounded_channel();
+    let busy = AtomicBool::new(true);
+
+    for (input, expected) in [
+        (
+            "/home/fixture-user/.dext/shelves/finance/packs/stock_deepdive/PACK.md\n",
+            "/home/fixture-user/.dext/shelves/finance/packs/stock_deepdive/PACK.md",
+        ),
+        ("/compact-report/output.md\n", "/compact-report/output.md"),
+        (
+            "\\\\wsl.localhost\\Ubuntu\\home\\fixture-user\\.dext\\shelves\n",
+            "/home/fixture-user/.dext/shelves",
+        ),
+        (
+            "\\\\wsl$\\Ubuntu\\mnt\\c\\Users\\fixture-user\\report.md\n",
+            "/mnt/c/Users/fixture-user/report.md",
+        ),
+    ] {
+        let route = route_interactive_input_line(
+            input.to_string(),
+            &busy,
+            &input_tx,
+            &runtime_control_tx,
+            &steering_tx,
+            &mut None,
+        );
+        assert_eq!(route, InteractiveInputRoute::SteeringQueued);
+        assert_eq!(steering_rx.try_recv().ok().as_deref(), Some(expected));
+        assert!(runtime_control_rx.try_recv().is_err());
+        assert!(input_rx.try_recv().is_err());
+    }
+}
+
+#[test]
+fn idle_console_input_normalizes_wsl_path_before_submission() {
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+    let busy = AtomicBool::new(false);
+
+    let route = route_interactive_input_line(
+        "\\\\wsl.localhost\\Ubuntu\\home\\fixture-user\\Dext\n".to_string(),
+        &busy,
+        &input_tx,
+        &runtime_control_tx,
+        &steering_tx,
+        &mut None,
+    );
+    assert_eq!(route, InteractiveInputRoute::Submitted);
+    assert_eq!(
+        input_rx.try_recv().ok().as_deref(),
+        Some("/home/fixture-user/Dext")
+    );
 }
 
 #[test]
@@ -1965,6 +4107,193 @@ fn active_runtime_control_detection_accepts_only_model_and_effort_sequences() {
             .expect("parse sequence"),
         vec!["/model chatgpt/gpt-5.4", "/effort xhigh"]
     );
+}
+
+#[test]
+fn crash_broken_pipe_detection_does_not_suppress_unrelated_panics() {
+    assert!(panic_message_is_broken_pipe(
+        "failed printing to stdout: Broken pipe (os error 32)"
+    ));
+    assert!(panic_message_is_broken_pipe(
+        "failed printing to stderr: Broken pipe (os error 32)"
+    ));
+    assert!(!panic_message_is_broken_pipe(
+        "database invariant failed after Broken pipe"
+    ));
+    assert!(!panic_message_is_broken_pipe(
+        "failed printing to stdout: permission denied"
+    ));
+}
+
+#[test]
+fn crash_ids_and_notices_never_expose_storage_paths() {
+    let first = new_crash_id().expect("generate first crash id");
+    let second = new_crash_id().expect("generate second crash id");
+    assert_ne!(first, second);
+    for id in [&first, &second] {
+        let parts = id.split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 4, "unexpected crash id: {id}");
+        assert_eq!(parts[0], "crash");
+        assert!(parts[1].parse::<u64>().is_ok());
+        assert!(parts[2].parse::<u32>().is_ok());
+        assert_eq!(parts[3].len(), 12);
+        assert!(parts[3].bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+        let notice = crash_snapshot_notice(id);
+        assert_eq!(notice, format!("[dext crash snapshot id: {id}]"));
+        assert!(!notice.contains('/'));
+        assert!(!notice.contains('\\'));
+        assert!(!notice.contains(".dext"));
+        assert!(!notice.contains("crashes"));
+    }
+}
+
+#[test]
+fn crash_snapshot_body_does_not_block_on_locked_runtime_state() {
+    let _state = crash_runtime_state().lock().expect("lock crash state");
+    let body = crash_snapshot_body("crash-safe-id", None);
+    assert_eq!(body["runtime"], Value::Null);
+}
+
+#[test]
+fn crash_session_ids_accept_only_generated_non_path_tokens() {
+    let valid = PathBuf::from(format!(
+        "/private/project/sessions/1784175000-4242-abcdef012345/{LATEST_SESSION_NAME}.jsonl"
+    ));
+    assert_eq!(
+        generated_session_id_from_path(&valid).as_deref(),
+        Some("1784175000-4242-abcdef012345")
+    );
+
+    for invalid in [
+        format!("/private/project/sessions/{LATEST_SESSION_NAME}.jsonl"),
+        format!(
+            "/private/project/sessions/1784175000-4242-ABCDEF012345/{LATEST_SESSION_NAME}.jsonl"
+        ),
+        format!(
+            "/private/project/sessions/1784175000-4242-abcdef01234g/{LATEST_SESSION_NAME}.jsonl"
+        ),
+        "/private/project/sessions/1784175000-4242-abcdef012345/transcript.jsonl".to_string(),
+        format!(
+            "/private/project/sessions/1784175000-4242-abcdef012345/{LATEST_SESSION_NAME}.json"
+        ),
+    ] {
+        assert_eq!(
+            generated_session_id_from_path(Path::new(&invalid)),
+            None,
+            "accepted invalid session path {invalid}"
+        );
+    }
+}
+
+#[test]
+fn crash_breadcrumbs_omit_all_free_form_event_fields() {
+    let secret = "CRASH_EVENT_SECRET_SENTINEL";
+    let events = [
+        AgentEvent::ToolCallPreview {
+            call_id: secret.to_string(),
+            name: secret.to_string(),
+            summary: secret.to_string(),
+        },
+        AgentEvent::ToolCallStart {
+            call_id: secret.to_string(),
+            name: secret.to_string(),
+            summary: secret.to_string(),
+        },
+        AgentEvent::ToolCallResult {
+            call_id: secret.to_string(),
+            name: secret.to_string(),
+            ok: false,
+            preview: secret.to_string(),
+            content: secret.to_string(),
+        },
+        AgentEvent::HttpRetry {
+            attempt: 2,
+            wait_secs: 1,
+            reason: secret.to_string(),
+        },
+        AgentEvent::CompactFailed {
+            message: secret.to_string(),
+        },
+        AgentEvent::RuntimeControl(secret.to_string()),
+        AgentEvent::SteeringReceived {
+            messages: 1,
+            preview: secret.to_string(),
+        },
+        AgentEvent::ToolBatchStart {
+            batch_id: secret.to_string(),
+            call_ids: vec![secret.to_string()],
+            labels: vec![secret.to_string()],
+        },
+        AgentEvent::ToolBatchEnd {
+            batch_id: secret.to_string(),
+            call_ids: vec![secret.to_string()],
+            labels: vec![secret.to_string()],
+            failed: 1,
+        },
+    ];
+
+    for event in events {
+        let breadcrumb = crash_event_breadcrumb(&event).expect("structural breadcrumb");
+        assert!(
+            !breadcrumb.contains(secret),
+            "leaked breadcrumb: {breadcrumb}"
+        );
+    }
+    assert!(crash_event_breadcrumb(&AgentEvent::Error(secret.to_string())).is_none());
+    assert!(
+        crash_event_breadcrumb(&AgentEvent::ToolOutputDelta {
+            call_id: secret.to_string(),
+            name: secret.to_string(),
+            stream: secret.to_string(),
+            text: secret.to_string(),
+        })
+        .is_none()
+    );
+}
+
+#[test]
+fn crash_snapshot_schema_omits_raw_paths_and_environment_text() {
+    let _guard = env_lock();
+    let old_columns = std::env::var_os("COLUMNS");
+    let old_lines = std::env::var_os("LINES");
+    let old_backtrace = std::env::var_os("RUST_BACKTRACE");
+    unsafe {
+        std::env::set_var("COLUMNS", "CRASH_COLUMNS_SECRET");
+        std::env::set_var("LINES", "42");
+        std::env::set_var("RUST_BACKTRACE", "CRASH_BACKTRACE_SECRET");
+    }
+
+    let source_path = "/private/source/CRASH_SOURCE_SECRET.rs";
+    let body = crash_snapshot_body("crash-safe-id", Some((source_path, 7, 9)));
+    let encoded = serde_json::to_string(&body).expect("serialize crash body");
+
+    restore_env_var("COLUMNS", old_columns);
+    restore_env_var("LINES", old_lines);
+    restore_env_var("RUST_BACKTRACE", old_backtrace);
+
+    assert_eq!(body["id"], "crash-safe-id");
+    assert_eq!(body["panic"], "panic captured; free-form payload omitted");
+    assert_eq!(body["location"]["line"], 7);
+    assert_eq!(body["location"]["column"], 9);
+    assert_eq!(body["location"]["file_sha256"], sha256_hex_str(source_path));
+    assert!(body.get("cwd").is_none());
+    assert!(body.get("cwd_sha256").is_none());
+    assert!(body.get("backtrace").is_none());
+    assert_eq!(body["terminal"]["columns"], Value::Null);
+    assert_eq!(body["terminal"]["lines"], 42);
+    assert_eq!(body["backtrace_enabled"], false);
+    for secret in [
+        source_path,
+        "CRASH_SOURCE_SECRET",
+        "CRASH_COLUMNS_SECRET",
+        "CRASH_BACKTRACE_SECRET",
+    ] {
+        assert!(
+            !encoded.contains(secret),
+            "snapshot leaked {secret}: {encoded}"
+        );
+    }
 }
 
 #[test]
@@ -2644,7 +4973,7 @@ fn track_origin_serializes_in_session_header() -> Result<()> {
 #[test]
 fn session_replay_fixture_circuit_breaker_stops_retrying_blocked_host() -> Result<()> {
     let replay = SessionReplayFixture::load("circuit_breaker")?;
-    assert_eq!(replay.header.version, 2);
+    assert_eq!(replay.header.version, SESSION_FORMAT_VERSION);
     assert_eq!(replay.header.model, "fixture-model");
     assert_eq!(replay.tool_call_count("bash"), 2);
 
@@ -3265,24 +5594,40 @@ fn session_state_dirs_are_session_scoped_and_concurrent() -> Result<()> {
 fn set_sandbox_root_allows_other_live_sessions() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("sandbox-session-switch");
-    let alpha = std::fs::canonicalize(
-        std::fs::create_dir_all(root.join("alpha")).map(|_| root.join("alpha"))?,
-    )?;
-    let beta = std::fs::canonicalize(
-        std::fs::create_dir_all(root.join("beta")).map(|_| root.join("beta"))?,
-    )?;
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_sessions_dir = std::env::var_os("DEXT_SESSIONS_DIR");
+    let old_logs_dir = std::env::var_os("DEXT_LOGS_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("dext-home"));
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
 
-    let mut agent = test_agent(&alpha);
-    let other = SessionStateLock::acquire(&beta, "other-session")?;
-    agent.set_sandbox_root(beta.clone())?;
-    assert_eq!(agent.sandbox_root, beta);
-    assert!(agent.state_lock.as_ref().is_some_and(|lock| {
-        lock.path
-            .ends_with(format!("sessions/{}/session.lock.json", agent.session_id))
-    }));
-    drop(other);
+    let result = (|| -> Result<()> {
+        let alpha = std::fs::canonicalize(
+            std::fs::create_dir_all(root.join("alpha")).map(|_| root.join("alpha"))?,
+        )?;
+        let beta = std::fs::canonicalize(
+            std::fs::create_dir_all(root.join("beta")).map(|_| root.join("beta"))?,
+        )?;
+
+        let mut agent = test_agent(&alpha);
+        let other = SessionStateLock::acquire(&beta, "other-session")?;
+        agent.set_sandbox_root(beta.clone())?;
+        assert_eq!(agent.sandbox_root, beta);
+        assert!(agent.state_lock.as_ref().is_some_and(|lock| {
+            lock.path
+                .ends_with(format!("sessions/{}/session.lock.json", agent.session_id))
+        }));
+        drop(other);
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_SESSIONS_DIR", old_sessions_dir);
+    restore_env_var("DEXT_LOGS_DIR", old_logs_dir);
     let _ = std::fs::remove_dir_all(&root);
-    Ok(())
+    result
 }
 
 #[test]
@@ -3396,6 +5741,55 @@ fn session_prune_removes_stale_locks_but_preserves_sessions() -> Result<()> {
 }
 
 #[test]
+fn session_prune_does_not_follow_symlinked_session_directories() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let _guard = env_lock();
+        let root = temp_test_dir("prune-symlinked-session");
+        let home = root.join("home");
+        unsafe {
+            std::env::set_var("DEXT_HOME", &home);
+            std::env::remove_var("DEXT_SESSIONS_DIR");
+            std::env::remove_var("DEXT_LOGS_DIR");
+        }
+
+        let result = (|| -> Result<()> {
+            let project = std::fs::canonicalize(&root)?;
+            let linked_lock = session_state_lock_path(&project, "linked-session");
+            std::fs::create_dir_all(linked_lock.parent().unwrap().parent().unwrap())?;
+            let outside = root.join("outside-session");
+            std::fs::create_dir_all(&outside)?;
+            let outside_lock = outside.join(SESSION_STATE_LOCK_NAME);
+            let lock_bytes = serde_json::to_vec(&json!({
+                "token": "external-stale",
+                "pid": 0,
+                "acquired_at": 1,
+                "project_key": "outside",
+                "sandbox_root": outside.display().to_string(),
+                "session_id": "outside"
+            }))?;
+            std::fs::write(&outside_lock, &lock_bytes)?;
+            symlink(&outside, linked_lock.parent().unwrap())?;
+
+            prune_project_dirs(&project, false, 0)?;
+            assert_eq!(std::fs::read(&outside_lock)?, lock_bytes);
+            Ok(())
+        })();
+
+        unsafe {
+            std::env::remove_var("DEXT_HOME");
+            std::env::remove_var("DEXT_SESSIONS_DIR");
+            std::env::remove_var("DEXT_LOGS_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        result?;
+    }
+    Ok(())
+}
+
+#[test]
 fn session_latest_prefers_newest_session_dir_but_supports_legacy_latest() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("latest-session-selector");
@@ -3492,6 +5886,157 @@ fn slash_resume_selector_loads_latest_autosaved_and_paths() -> Result<()> {
 }
 
 #[test]
+fn malformed_session_load_is_transactional() -> Result<()> {
+    let root = temp_test_dir("session-transactional-root");
+    let restored_root = temp_test_dir("session-transactional-restored-root");
+    let mut agent = test_agent(&root);
+    agent.model = "live-model".to_string();
+    agent.privacy.enabled = false;
+    agent.privacy.strict_paths = false;
+    agent.approval_profile = ApprovalProfile::Ask;
+    agent.pack_hook_env = vec![("LIVE_PACK_STATE".to_string(), "preserved".to_string())];
+    agent.suppress_pack_activation = true;
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "live history".to_string(),
+        }],
+    });
+
+    let mut header = serde_json::to_value(agent.session_header())?;
+    header["model"] = json!("restored-model");
+    header["sandbox"] = json!(restored_root.display().to_string());
+    header["approval_profile"] = json!("always");
+    header["privacy"] = json!({
+        "enabled": true,
+        "strict_paths": true,
+        "findings": {}
+    });
+    let valid_message = Message {
+        role: "assistant".to_string(),
+        content: vec![Block::Text {
+            text: "restored history".to_string(),
+        }],
+    };
+    let session_path = root.join("malformed-session.jsonl");
+    std::fs::write(
+        &session_path,
+        format!(
+            "{}\n{}\n{{malformed trailing message\n",
+            serde_json::to_string(&header)?,
+            serde_json::to_string(&valid_message)?
+        ),
+    )?;
+
+    let error = agent
+        .load_session_from_path(&session_path)
+        .expect_err("malformed trailing message must reject the whole session");
+    assert!(
+        error.to_string().contains("bad message on line 3"),
+        "{error:#}"
+    );
+    assert_eq!(agent.sandbox_root, root);
+    assert_eq!(agent.model, "live-model");
+    assert_eq!(agent.approval_profile, ApprovalProfile::Ask);
+    assert!(!agent.privacy.enabled);
+    assert!(!agent.privacy.strict_paths);
+    assert_eq!(agent.pack_hook_env.len(), 1);
+    assert_eq!(agent.pack_hook_env[0].0, "LIVE_PACK_STATE");
+    assert!(agent.suppress_pack_activation);
+    assert_eq!(agent.history.len(), 1);
+    assert!(matches!(
+        &agent.history[0].content[0],
+        Block::Text { text } if text == "live history"
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&restored_root);
+    Ok(())
+}
+
+#[test]
+fn invalid_saved_sandbox_load_is_transactional() -> Result<()> {
+    let root = temp_test_dir("session-invalid-sandbox-root");
+    let missing = root.join("missing-sandbox");
+    let file = root.join("sandbox-file");
+    std::fs::write(&file, "not a directory\n")?;
+
+    let mut agent = test_agent(&root);
+    agent.model = "live-model".to_string();
+    agent.allowed.insert("write_file".to_string());
+    agent.pack_hook_env = vec![("LIVE_PACK_STATE".to_string(), "preserved".to_string())];
+    agent.suppress_pack_activation = true;
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "live history".to_string(),
+        }],
+    });
+
+    for (index, invalid_root) in [&missing, &file].into_iter().enumerate() {
+        let mut header = serde_json::to_value(agent.session_header())?;
+        header["model"] = json!(format!("restored-model-{index}"));
+        header["sandbox"] = json!(invalid_root.display().to_string());
+        header["allowed"] = json!(["bash"]);
+        let restored_message = Message {
+            role: "assistant".to_string(),
+            content: vec![Block::Text {
+                text: "restored history".to_string(),
+            }],
+        };
+        let session_path = root.join(format!("invalid-sandbox-{index}.jsonl"));
+        std::fs::write(
+            &session_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&header)?,
+                serde_json::to_string(&restored_message)?
+            ),
+        )?;
+
+        let error = agent
+            .load_session_from_path(&session_path)
+            .expect_err("invalid saved sandbox must reject the whole session");
+        if index == 0 {
+            assert!(
+                error.to_string().contains("restoring saved sandbox"),
+                "{error:#}"
+            );
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("sandbox root is not a directory"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(agent.sandbox_root, root);
+        assert_eq!(agent.model, "live-model");
+        assert_eq!(agent.allowed, HashSet::from(["write_file".to_string()]));
+        assert_eq!(
+            agent.pack_hook_env,
+            vec![("LIVE_PACK_STATE".to_string(), "preserved".to_string())]
+        );
+        assert!(agent.suppress_pack_activation);
+        assert_eq!(agent.history.len(), 1);
+        assert!(matches!(
+            &agent.history[0].content[0],
+            Block::Text { text } if text == "live history"
+        ));
+    }
+
+    let slash_result = agent.set_sandbox_root(file.clone());
+    assert!(
+        slash_result.is_err(),
+        "regular file must not become a sandbox root"
+    );
+    assert_eq!(agent.sandbox_root, root);
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn session_names_reject_path_traversal() {
     assert!(validate_session_name("../escape").is_err());
     assert!(validate_session_name("..\\escape").is_err());
@@ -3508,6 +6053,35 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
     assert!(!should_parallelize_builtin_tools(&["bash"]));
     assert!(!should_parallelize_builtin_tools(&["http", "rg"]));
     assert!(!should_parallelize_builtin_tools(&[]));
+}
+
+#[test]
+fn side_effect_capability_covers_every_permission_required_tool() {
+    for tool in provider_tool_definitions() {
+        if needs_permission(tool.name) {
+            assert!(
+                is_side_effect_capable_tool(tool.name),
+                "permission-required tool {} must remain journaled",
+                tool.name
+            );
+        }
+    }
+    for read_only in [
+        "read_file",
+        "read_symbol",
+        "fd",
+        "rg",
+        "jq",
+        "fzf",
+        "git_diff",
+        "git_log",
+        "todo_read",
+    ] {
+        assert!(
+            !is_side_effect_capable_tool(read_only),
+            "read-only tool {read_only} must remain journal-free"
+        );
+    }
 }
 
 #[test]
@@ -3553,10 +6127,447 @@ fn slash_trust_emits_profile_update_for_tui_status() {
 }
 
 #[test]
+fn hook_execution_requires_explicit_non_persistent_approval() {
+    let root = temp_test_dir("hook-approval-policy");
+    let mut agent = test_agent(&root);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: requests.clone(),
+    }));
+
+    assert!(
+        !hooks_approved(&mut agent),
+        "empty hook sets need no approval"
+    );
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    agent.hooks.user_prompt.push(Hook {
+        tool_match: None,
+        command: "printf hook".to_string(),
+    });
+    assert!(!hooks_approved(&mut agent), "denied hooks must not run");
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!agent.allowed.contains(HOOKS_APPROVAL_NAME));
+
+    agent.set_approval_profile(ApprovalProfile::Never);
+    assert!(!hooks_approved(&mut agent));
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "approval=never must reject hooks without prompting"
+    );
+
+    agent.set_approval_profile(ApprovalProfile::Always);
+    assert!(
+        !hooks_approved(&mut agent),
+        "global approval=always must not implicitly authorize project hooks"
+    );
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    let once_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: once_requests.clone(),
+    }));
+    assert!(hooks_approved(&mut agent));
+    assert!(!agent.allowed.contains(HOOKS_APPROVAL_NAME));
+    assert!(hooks_approved(&mut agent));
+    assert_eq!(
+        once_requests.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "Once is intentionally scoped by the caller to one turn"
+    );
+
+    let always_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Always,
+        requests: always_requests.clone(),
+    }));
+    assert!(hooks_approved(&mut agent));
+    assert!(agent.allowed.contains(HOOKS_APPROVAL_NAME));
+    assert!(hooks_approved(&mut agent));
+    assert_eq!(always_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        !agent
+            .session_header()
+            .allowed
+            .contains(&HOOKS_APPROVAL_NAME.to_string()),
+        "hook trust must not be serialized into sessions"
+    );
+    agent.set_sandbox_profile(SandboxProfile::ReadOnly);
+    assert!(
+        !agent.allowed.contains(HOOKS_APPROVAL_NAME),
+        "hook trust must not survive sandbox-profile changes"
+    );
+
+    agent.set_approval_profile(ApprovalProfile::AutoRead);
+    assert!(!agent.allowed.contains(HOOKS_APPROVAL_NAME));
+    agent.allowed.insert(HOOKS_APPROVAL_NAME.to_string());
+    agent.allowed.insert(DIAGNOSTICS_APPROVAL_NAME.to_string());
+    agent.allowed.insert("bash".to_string());
+    agent.session_enabled = false;
+    let next_root = temp_test_dir("hook-approval-next-root");
+    agent
+        .set_sandbox_root(next_root.clone())
+        .expect("switch sandbox root");
+    assert!(
+        agent.allowed.is_empty(),
+        "tool and operation grants must not cross sandbox roots: {:?}",
+        agent.allowed
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(next_root);
+}
+
+#[test]
+fn git_commit_hook_execution_requires_explicit_non_persistent_approval() {
+    let root = temp_test_dir("git-commit-hook-approval-policy");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let deny_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: deny_requests.clone(),
+    }));
+
+    assert!(
+        !git_commit_hooks_approved(&mut agent),
+        "global approval=always must not authorize repository Git hooks"
+    );
+    assert_eq!(deny_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(!agent.allowed.contains(HOOKS_APPROVAL_NAME));
+
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    let once_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: once_requests.clone(),
+    }));
+    assert!(git_commit_hooks_approved(&mut agent));
+    assert!(git_commit_hooks_approved(&mut agent));
+    assert_eq!(
+        once_requests.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "Once must be scoped by the caller to one turn"
+    );
+    assert!(!agent.allowed.contains(HOOKS_APPROVAL_NAME));
+
+    let always_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Always,
+        requests: always_requests.clone(),
+    }));
+    assert!(git_commit_hooks_approved(&mut agent));
+    assert!(git_commit_hooks_approved(&mut agent));
+    assert_eq!(always_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(agent.allowed.contains(HOOKS_APPROVAL_NAME));
+    assert!(
+        !agent
+            .session_header()
+            .allowed
+            .contains(&HOOKS_APPROVAL_NAME.to_string()),
+        "native Git hook trust must not be serialized"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn diagnostics_requires_danger_approval_before_execution() {
+    let root = temp_test_dir("diagnostics-approval-denied");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::AutoWrite);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: requests.clone(),
+    }));
+
+    assert_eq!(handle_slash("/diagnostics", &mut agent), Some(true));
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(agent.work_ledger.diagnostics.is_empty());
+    assert!(!agent.allowed.contains(DIAGNOSTICS_APPROVAL_NAME));
+
+    agent.set_approval_profile(ApprovalProfile::Never);
+    assert_eq!(handle_slash("/diag", &mut agent), Some(true));
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "approval=never must deny without prompting"
+    );
+    assert!(agent.work_ledger.diagnostics.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn diagnostics_always_approval_is_persisted_visible_and_reset_with_profile() {
+    let root = temp_test_dir("diagnostics-approval-always");
+    let mut agent = test_agent(&root);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Always,
+        requests: requests.clone(),
+    }));
+
+    assert!(diagnostics_approved(&mut agent));
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(agent.allowed.contains(DIAGNOSTICS_APPROVAL_NAME));
+    assert!(
+        agent
+            .session_header()
+            .allowed
+            .contains(&DIAGNOSTICS_APPROVAL_NAME.to_string())
+    );
+
+    let denied_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: denied_requests.clone(),
+    }));
+    assert!(diagnostics_approved(&mut agent));
+    assert_eq!(
+        denied_requests.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "persisted diagnostics approval must not prompt again"
+    );
+
+    agent.set_approval_profile(ApprovalProfile::AutoRead);
+    assert!(!agent.allowed.contains(DIAGNOSTICS_APPROVAL_NAME));
+    assert!(!diagnostics_approved(&mut agent));
+    assert_eq!(
+        denied_requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "auto-read must not authorize project code execution"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn lsp_message_reader_bounds_headers_and_body_before_allocation() {
+    let oversized_body = format!("Content-Length: {}\r\n\r\n", LSP_MESSAGE_BODY_CAP + 1);
+    let error = read_lsp_message(&mut std::io::Cursor::new(oversized_body))
+        .expect_err("oversized body must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    let oversized_line = format!("X-Header: {}\r\n\r\n", "x".repeat(LSP_HEADER_LINE_CAP));
+    let error = read_lsp_message(&mut std::io::Cursor::new(oversized_line))
+        .expect_err("oversized header line must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    let mut aggregate = String::new();
+    while aggregate.len() <= LSP_HEADER_TOTAL_CAP {
+        aggregate.push_str("X: 1234567890\r\n");
+    }
+    aggregate.push_str("\r\n");
+    let error = read_lsp_message(&mut std::io::Cursor::new(aggregate))
+        .expect_err("oversized aggregate headers must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    let duplicate = "Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}";
+    let error = read_lsp_message(&mut std::io::Cursor::new(duplicate))
+        .expect_err("duplicate content length must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    let valid = "Content-Length: 2\r\n\r\n{}";
+    assert_eq!(
+        read_lsp_message(&mut std::io::Cursor::new(valid)).expect("valid LSP frame"),
+        Some("{}".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_analyzer_diagnostics_bounds_frame_queue_and_cleanup() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("diagnostics-lsp-frame-flood");
+    let bin_dir = root.join("bin");
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::create_dir(&bin_dir)?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"lsp-frame-flood\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )?;
+    std::fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
+    let analyzer = bin_dir.join("rust-analyzer");
+    std::fs::write(
+        &analyzer,
+        "#!/bin/sh\nwhile :; do printf 'Content-Length: 2\\r\\n\\r\\n{}'; done\n",
+    )?;
+    let mut permissions = std::fs::metadata(&analyzer)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&analyzer, permissions)?;
+
+    let old_path = std::env::var_os("PATH");
+    let old_timeout = std::env::var_os("DEXT_LSP_DIAGNOSTICS_TIMEOUT_SECS");
+    unsafe {
+        std::env::set_var("PATH", prepend_env_path(&bin_dir));
+        std::env::set_var("DEXT_LSP_DIAGNOSTICS_TIMEOUT_SECS", "1");
+    }
+
+    let started = std::time::Instant::now();
+    let report = run_rust_analyzer_diagnostics(&root);
+    let elapsed = started.elapsed();
+
+    restore_env_var("PATH", old_path);
+    restore_env_var("DEXT_LSP_DIAGNOSTICS_TIMEOUT_SECS", old_timeout);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        report.is_some(),
+        "fake analyzer should start and emit frames"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "bounded LSP cleanup took {elapsed:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_diagnostics_sources_reject_symlinks_and_hardlinks() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("diagnostics-source-aliases");
+    let outside = temp_test_dir("diagnostics-source-aliases-outside");
+    std::fs::create_dir_all(root.join("src/nested")).expect("create source directories");
+    std::fs::write(root.join("src/lib.rs"), "pub fn local() {}\n").expect("write local source");
+    std::fs::write(
+        outside.join("secret.rs"),
+        "const SECRET: &str = \"outside\";\n",
+    )
+    .expect("write outside source");
+    symlink(outside.join("secret.rs"), root.join("src/symlink.rs")).expect("create source symlink");
+    symlink(&outside, root.join("src/nested/external")).expect("create source directory symlink");
+    std::fs::hard_link(outside.join("secret.rs"), root.join("src/hardlink.rs"))
+        .expect("create source hardlink");
+
+    let sources = rust_files_for_diagnostics(&root);
+    assert_eq!(sources.len(), 1);
+    assert_eq!(
+        sources[0].0.strip_prefix(&root).expect("project source"),
+        Path::new("src/lib.rs")
+    );
+    assert_eq!(sources[0].1, "pub fn local() {}\n");
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(outside);
+}
+
+#[test]
+fn rust_diagnostics_sources_enforce_file_count_size_and_total_budgets() {
+    let file_count_root = temp_test_dir("diagnostics-source-file-count");
+    std::fs::create_dir_all(file_count_root.join("src")).expect("create source directory");
+    for index in 0..(LSP_DIAGNOSTIC_FILE_LIMIT + 6) {
+        std::fs::write(
+            file_count_root.join("src").join(format!("f{index:03}.rs")),
+            format!("pub const V{index}: usize = {index};\n"),
+        )
+        .expect("write counted source");
+    }
+    let counted = rust_files_for_diagnostics(&file_count_root);
+    assert_eq!(counted.len(), LSP_DIAGNOSTIC_FILE_LIMIT);
+
+    let byte_root = temp_test_dir("diagnostics-source-byte-budgets");
+    std::fs::create_dir_all(byte_root.join("src")).expect("create source directory");
+    std::fs::write(
+        byte_root.join("src/oversized.rs"),
+        vec![b'x'; LSP_DIAGNOSTIC_FILE_BYTE_CAP as usize + 1],
+    )
+    .expect("write oversized source");
+    let bounded_size = LSP_DIAGNOSTIC_FILE_BYTE_CAP as usize - 1;
+    for index in 0..9 {
+        std::fs::write(
+            byte_root.join("src").join(format!("bounded{index}.rs")),
+            vec![b'x'; bounded_size],
+        )
+        .expect("write bounded source");
+    }
+    let bounded = rust_files_for_diagnostics(&byte_root);
+    assert_eq!(
+        bounded.len(),
+        8,
+        "aggregate budget must exclude the ninth file"
+    );
+    assert!(
+        bounded.iter().all(
+            |(path, _)| path.file_name().and_then(|name| name.to_str()) != Some("oversized.rs")
+        )
+    );
+    assert!(
+        bounded
+            .iter()
+            .map(|(_, text)| text.len() as u64)
+            .sum::<u64>()
+            <= LSP_DIAGNOSTIC_TOTAL_BYTE_CAP
+    );
+
+    let _ = std::fs::remove_dir_all(file_count_root);
+    let _ = std::fs::remove_dir_all(byte_root);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cargo_diagnostics_confine_hostile_build_script_writes_to_private_scratch() -> Result<()> {
+    if !sandbox::is_enforced() {
+        return Ok(());
+    }
+
+    let root = temp_test_dir("diagnostics-hostile-build-script");
+    std::fs::create_dir_all(root.join("src"))?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"hostile-diagnostics\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build.rs\"\n",
+    )?;
+    std::fs::write(
+        root.join("Cargo.lock"),
+        "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"hostile-diagnostics\"\nversion = \"0.1.0\"\n",
+    )?;
+    std::fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
+    std::fs::write(
+        root.join("build.rs"),
+        r#"fn main() {
+    let marker = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("escaped-from-build-script.txt");
+    match std::fs::write(&marker, "escaped") {
+        Ok(()) => panic!("diagnostics sandbox unexpectedly allowed project write"),
+        Err(error) => panic!("diagnostics sandbox blocked project write: {error}"),
+    }
+}
+"#,
+    )?;
+
+    let report = run_cargo_check_diagnostics(&root);
+    assert_eq!(report.status, "failed", "{}", report.raw_output);
+    assert!(
+        report
+            .raw_output
+            .contains("diagnostics sandbox blocked project write"),
+        "hostile build script did not reach the confined write attempt:\n{}",
+        report.raw_output
+    );
+    assert!(!root.join("escaped-from-build-script.txt").exists());
+    assert!(
+        !root.join("target").exists(),
+        "diagnostic build artifacts must stay in private scratch"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn lsp_diagnostics_parser_extracts_publish_diagnostics() {
     let root = temp_test_dir("lsp-diagnostics-parser");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let uri = format!("file://{}/src/lib.rs", root.display());
+    let uri = file_uri_from_path(&root.join("src/lib.rs"));
     let line = json!({
         "method": "textDocument/publishDiagnostics",
         "params": {
@@ -3765,6 +6776,14 @@ fn action_contract_violation_notes_loop_and_fallback_after_repeated_no_mutation(
         "{notes:?}"
     );
 
+    assert!(action_contract_should_retry(1));
+    assert!(action_contract_should_retry(2));
+    assert!(!action_contract_should_retry(3));
+    assert!(!action_contract_should_retry(u32::MAX));
+    let halted = action_contract_retry_halted_note(3);
+    assert!(halted.contains("after 3 assistant responses"), "{halted}");
+    assert!(halted.contains("unbounded provider loop"), "{halted}");
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -3803,7 +6822,7 @@ fn workflow_diagnostics_render_and_ledger_are_prompt_visible() {
 }
 
 #[test]
-fn privacy_redacts_sensitive_tool_output_and_blocks_secret_paths() {
+fn privacy_redacts_sensitive_tool_output_and_strict_mode_blocks_secret_paths() {
     let root = temp_test_dir("privacy-policy");
     let mut agent = test_agent(&root);
     agent.privacy.enabled = true;
@@ -3839,16 +6858,75 @@ fn privacy_redacts_sensitive_tool_output_and_blocks_secret_paths() {
         redacted.text
     );
     assert!(
-        redacted.text.contains("[privacy] Redacted"),
+        redacted.text.contains("[privacy: redacted"),
         "{}",
         redacted.text
     );
 
+    let default_denial = agent
+        .privacy
+        .path_denial("read_file", &json!({"path": ".env"}), &root);
+    assert!(
+        default_denial.is_none(),
+        "default redaction mode must not block user-readable files"
+    );
+
+    agent.privacy.strict_paths = true;
     let denial = agent
         .privacy
         .path_denial("read_file", &json!({"path": ".env"}), &root)
-        .expect("secret path blocked");
-    assert!(denial.contains("blocked read_file"), "{denial}");
+        .expect("strict mode blocks secret path");
+    assert!(denial.contains("strict path mode"), "{denial}");
+
+    for (tool, input) in [
+        ("fd", json!({"pattern": ".*", "path": ".ssh"})),
+        ("rg", json!({"pattern": "token", "path": ".env"})),
+        ("jq", json!({"filter": ".", "path": "credentials.json"})),
+        ("git_diff", json!({"path": "private.key"})),
+        ("git_log", json!({"path": "secrets/history.txt"})),
+    ] {
+        let denial = agent
+            .privacy
+            .path_denial(tool, &input, &root)
+            .unwrap_or_else(|| panic!("strict mode must block {tool}: {input}"));
+        assert!(denial.contains(tool), "{denial}");
+    }
+    for (tool, input) in [
+        ("fd", json!({"pattern": ".*", "extra_args": ["--hidden"]})),
+        ("fd", json!({"pattern": ".*", "extra_args": ["-uuu"]})),
+        (
+            "rg",
+            json!({"pattern": "token", "extra_args": ["--follow"]}),
+        ),
+        (
+            "rg",
+            json!({"pattern": "token", "extra_args": ["--glob=.env"]}),
+        ),
+    ] {
+        let denial = agent
+            .privacy
+            .path_denial(tool, &input, &root)
+            .unwrap_or_else(|| panic!("strict mode must block sensitive {tool} scope: {input}"));
+        assert!(denial.contains("search scope"), "{denial}");
+    }
+    assert!(
+        agent
+            .privacy
+            .path_denial(
+                "rg",
+                &json!({"pattern": "needle", "path": ".", "extra_args": ["-i"]}),
+                &root,
+            )
+            .is_none(),
+        "ordinary strict-mode code search must remain available"
+    );
+    assert!(
+        agent
+            .privacy
+            .path_denial("fd", &json!({"pattern": "\\.rs$", "path": "."}), &root)
+            .is_none(),
+        "ordinary strict-mode file discovery must remain available"
+    );
 
     assert!(privacy_sensitive_path("/tmp/.ssh/config"));
     assert!(privacy_sensitive_path("config/providers.json"));
@@ -3871,9 +6949,130 @@ fn privacy_redacts_sensitive_tool_output_and_blocks_secret_paths() {
             .path_denial("read_file", &json!({"path": "notes.txt"}), &root)
             .expect("symlink alias to sensitive path blocked");
         assert!(denial.contains("notes.txt"), "{denial}");
+        for tool in ["fd", "rg", "jq", "git_diff", "git_log"] {
+            let input = match tool {
+                "fd" => json!({"pattern": ".*", "path": "notes.txt"}),
+                "rg" => json!({"pattern": "Host", "path": "notes.txt"}),
+                "jq" => json!({"filter": ".", "path": "notes.txt"}),
+                _ => json!({"path": "notes.txt"}),
+            };
+            let denial = agent
+                .privacy
+                .path_denial(tool, &input, &root)
+                .unwrap_or_else(|| panic!("strict mode must resolve sensitive alias for {tool}"));
+            assert!(denial.contains("notes.txt"), "{denial}");
+        }
     }
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn privacy_env_defaults_to_redaction_and_requires_explicit_strict_paths() {
+    let _guard = env_lock();
+    let old_privacy = std::env::var_os("DEXT_PRIVACY");
+    let root = temp_test_dir("privacy-env-modes");
+
+    unsafe { std::env::remove_var("DEXT_PRIVACY") };
+    let default_policy = PrivacyPolicy::from_env();
+    assert!(default_policy.enabled);
+    assert!(!default_policy.strict_paths);
+
+    unsafe { std::env::set_var("DEXT_PRIVACY", "1") };
+    let redaction_policy = PrivacyPolicy::from_env();
+    assert!(redaction_policy.enabled);
+    assert!(!redaction_policy.strict_paths);
+
+    unsafe { std::env::set_var("DEXT_PRIVACY", "strict") };
+    let mut strict_policy = PrivacyPolicy::from_env();
+    assert!(strict_policy.enabled);
+    assert!(strict_policy.strict_paths);
+    assert!(
+        strict_policy
+            .path_denial("read_file", &json!({"path": ".env"}), &root)
+            .is_some()
+    );
+
+    unsafe { std::env::set_var("DEXT_PRIVACY", "0") };
+    let disabled_policy = PrivacyPolicy::from_env();
+    assert!(!disabled_policy.enabled);
+    assert!(!disabled_policy.strict_paths);
+
+    restore_env_var("DEXT_PRIVACY", old_privacy);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn privacy_ignores_decimal_and_unlabeled_http_numeric_values() {
+    let mut policy = PrivacyPolicy::default();
+    let body = r#"HTTP/2 200
+content-type: application/json
+x-request-id: 49210000000008
+
+{"regularMarketPrice":278.10000000001,"previousClose":123.10000000009,"marketCap":8510000000000,"period1":1704067200,"period2":1735689600}"#;
+
+    let redacted = policy.apply_tool_output("http", &json!({}), body.to_string());
+
+    assert_eq!(redacted.text, body);
+    assert_eq!(redacted.counts.total(), 0);
+    assert_eq!(policy.findings.total(), 0);
+    assert!(!redacted.text.contains("[privacy:"));
+}
+
+#[test]
+fn privacy_keeps_labeled_identity_payment_and_secret_protection() {
+    let mut policy = PrivacyPolicy::default();
+    let ssn = ["123", "45", "6789"].join("-");
+    let card = ["4111", "1111", "1111", "1111"].join(" ");
+    let account = ["123456", "789012"].concat();
+    let routing = ["123", "456", "780"].concat();
+    let api_key = ["sk-test-", "A1b2C3d4E5f6"].concat();
+    let bearer = ["bearer-test-", "Z9y8X7w6"].concat();
+    let private_key = format!(
+        "-----BEGIN {}-----\nlocal-test-key-material\n-----END {}-----",
+        "PRIVATE KEY", "PRIVATE KEY"
+    );
+    let body = format!(
+        "ssn: {ssn}\ncard number: {card}\naccount number: {account}\nrouting number: {routing}\napi_key={api_key}\nAuthorization: Bearer {bearer}\n{private_key}"
+    );
+
+    let redacted = policy.apply_tool_output("http", &json!({}), body);
+
+    assert_eq!(redacted.counts.ssn, 1);
+    assert_eq!(redacted.counts.credit_card, 1);
+    assert_eq!(redacted.counts.account_number, 2);
+    assert_eq!(redacted.counts.api_key, 2);
+    assert_eq!(redacted.counts.private_key, 1);
+    assert!(redacted.text.contains("[REDACTED_SSN]"));
+    assert!(redacted.text.contains("[REDACTED_CARD]"));
+    assert!(redacted.text.contains("[REDACTED_ACCOUNT]"));
+    assert_eq!(redacted.text.matches("[REDACTED_SECRET]").count(), 2);
+    assert!(redacted.text.contains("[REDACTED_PRIVATE_KEY]"));
+    assert!(redacted.text.contains("raw values withheld"));
+    assert!(!redacted.text.contains(&ssn));
+    assert!(!redacted.text.contains(&card));
+    assert!(!redacted.text.contains(&account));
+    assert!(!redacted.text.contains(&routing));
+    assert!(!redacted.text.contains(&api_key));
+    assert!(!redacted.text.contains(&bearer));
+}
+
+#[test]
+fn privacy_ignores_secret_placeholders_and_code_expressions() {
+    let mut policy = PrivacyPolicy::default();
+    let text = r#"api_key: String
+password = std::env::var("PASSWORD")?
+auth_token=$TOKEN
+client_secret: example-value
+secret_key: <redacted>
+assert api_key == expected"#;
+
+    let redacted = policy.apply_tool_output("read_file", &json!({}), text.to_string());
+
+    assert_eq!(redacted.text, text);
+    assert_eq!(redacted.counts.total(), 0);
+    assert_eq!(policy.findings.total(), 0);
+    assert!(!redacted.text.contains("[privacy:"));
 }
 
 #[test]
@@ -3883,9 +7082,20 @@ fn slash_privacy_toggles_runtime_policy() {
 
     assert_eq!(handle_slash("/privacy on", &mut agent), Some(true));
     assert!(agent.privacy.enabled);
+    assert!(!agent.privacy.strict_paths);
+
+    assert_eq!(handle_slash("/privacy strict", &mut agent), Some(true));
+    assert!(agent.privacy.enabled);
+    assert!(agent.privacy.strict_paths);
+
+    assert_eq!(handle_slash("/privacy on", &mut agent), Some(true));
+    assert!(agent.privacy.enabled);
+    assert!(!agent.privacy.strict_paths);
     assert_eq!(handle_slash("/privacy status", &mut agent), Some(true));
+
     assert_eq!(handle_slash("/privacy off", &mut agent), Some(true));
     assert!(!agent.privacy.enabled);
+    assert!(!agent.privacy.strict_paths);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -3952,7 +7162,7 @@ fn default_and_frugal_toolsets_keep_core_capabilities() {
     ] {
         assert!(default_names.contains(name), "default should expose {name}");
     }
-    for name in ["jq", "fzf", "awk", "git_log", "csvkit", "browser"] {
+    for name in ["jq", "fzf", "awk", "git_log", "csvkit"] {
         assert!(!default_names.contains(name), "default should hide {name}");
     }
 
@@ -3984,16 +7194,11 @@ fn default_and_frugal_toolsets_keep_core_capabilities() {
     assert!(!agent.deny_tools.contains("csvkit"));
     assert!(agent.deny_tools.contains("rg"));
 
-    agent.context_mode = ContextMode::Standard;
-    agent.tool_context_profile = ToolContextProfile::Default;
-    agent.set_browser_recipe(BrowserRecipe::AgentBrowser);
-    assert!(agent.tools.iter().any(|t| t.name == "browser"));
-
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn full_toolset_env_exposes_specialized_tools_without_browser_by_default() -> Result<()> {
+fn full_toolset_env_exposes_specialized_tools() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("toolset-full-env");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -4006,7 +7211,6 @@ fn full_toolset_env_exposes_specialized_tools_without_browser_by_default() -> Re
         for name in ["jq", "fzf", "awk", "git_log", "csvkit"] {
             assert!(names.contains(name), "full toolset should expose {name}");
         }
-        assert!(!names.contains("browser"));
         assert_eq!(agent.tool_context_profile(), ToolContextProfile::Full);
         Ok(())
     };
@@ -4014,26 +7218,6 @@ fn full_toolset_env_exposes_specialized_tools_without_browser_by_default() -> Re
     unsafe { std::env::remove_var("DEXT_TOOLSET") };
     let _ = std::fs::remove_dir_all(&root);
     result
-}
-
-#[test]
-fn browser_recipe_toggles_browser_tool() {
-    let root = temp_test_dir("browser-recipe");
-    let mut agent = test_agent(&root);
-    assert!(agent.tools.iter().all(|t| t.name != "browser"));
-
-    agent.set_browser_recipe(BrowserRecipe::AgentBrowser);
-    assert!(agent.tools.iter().any(|t| t.name == "browser"));
-    assert_eq!(agent.browser_recipe(), BrowserRecipe::AgentBrowser);
-
-    agent.set_approval_profile(ApprovalProfile::Always);
-    assert!(agent.allowed.contains("browser"));
-    agent.set_browser_recipe(BrowserRecipe::Disabled);
-    assert!(agent.tools.iter().all(|t| t.name != "browser"));
-    assert_eq!(agent.browser_recipe(), BrowserRecipe::Disabled);
-    assert!(!agent.allowed.contains("browser"));
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -4086,19 +7270,106 @@ fn provider_bug_fallback_flattens_latest_tool_results() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[test]
-fn parse_tool_input_json_handles_stringified_json() {
-    let parsed = parse_tool_input_json("\"{\\\"task\\\":\\\"hello\\\",\\\"max_iterations\\\":1}\"");
-    assert_eq!(parsed["task"], "hello");
-    assert_eq!(parsed["max_iterations"], 1);
-}
+#[tokio::test(flavor = "current_thread")]
+async fn provider_bug_fallback_rebuilds_request_body_before_retry() {
+    let root = temp_test_dir("provider-workaround-request-rebuild");
+    std::fs::write(root.join("input.txt"), "hello").expect("write fixture");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read request");
+                assert!(read > 0, "client closed before request completed");
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read request body");
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..read]);
+            }
+            request[header_end..header_end + content_length].to_vec()
+        }
 
-#[test]
-fn append_tool_input_json_fragment_replaces_empty_placeholder() {
-    let mut raw = "{}".to_string();
-    append_tool_input_json_fragment(&mut raw, "{\"task\":\"hello\"}");
-    let parsed = parse_tool_input_json(&raw);
-    assert_eq!(parsed["task"], "hello");
+        let mut bodies = Vec::new();
+        for response_index in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            bodies.push(read_request_body(&mut stream));
+            let (status, content_type, body) = match response_index {
+                0 => (
+                    "200 OK",
+                    "text/event-stream",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_retry\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"input.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+                ),
+                1 => (
+                    "400 Bad Request",
+                    "application/json",
+                    "No tool call found for function call output with call_id call_retry.",
+                ),
+                _ => (
+                    "200 OK",
+                    "text/event-stream",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        bodies
+    });
+
+    let mut agent = test_agent(&root);
+    configure_local_openai_agent(&mut agent, format!("http://{addr}"));
+    agent.max_iterations = Some(2);
+    agent
+        .chat("Read input.txt once, then report the result.".to_string())
+        .await
+        .expect("provider workaround should recover");
+
+    let bodies = server.join().expect("server thread");
+    let rejected: Value = serde_json::from_slice(&bodies[1]).expect("rejected request JSON");
+    let retried: Value = serde_json::from_slice(&bodies[2]).expect("retried request JSON");
+    assert!(
+        rejected["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool")),
+        "{rejected}"
+    );
+    assert!(
+        retried["messages"].as_array().is_some_and(|messages| {
+            messages.iter().all(|message| message["role"] != "tool")
+                && messages.iter().any(|message| {
+                    message["content"].as_str().is_some_and(|text| {
+                        text.contains("provider rejected structured tool_result")
+                    })
+                })
+        }),
+        "retry reused the stale request body: {retried}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
@@ -4111,8 +7382,11 @@ async fn external_runner_times_out() {
         None,
         &root,
         Arc::new(AtomicBool::new(false)),
-        std::time::Duration::from_millis(150),
-        SandboxProfile::WorkspaceWrite,
+        ExternalExecutionPolicy {
+            timeout: std::time::Duration::from_millis(150),
+            sandbox_profile: SandboxProfile::WorkspaceWrite,
+            allow_tool_credentials: true,
+        },
     )
     .await
     .expect_err("expected timeout");
@@ -4137,8 +7411,11 @@ async fn external_runner_honors_interrupts() {
         None,
         &root,
         interrupt,
-        std::time::Duration::from_secs(10),
-        SandboxProfile::WorkspaceWrite,
+        ExternalExecutionPolicy {
+            timeout: std::time::Duration::from_secs(10),
+            sandbox_profile: SandboxProfile::WorkspaceWrite,
+            allow_tool_credentials: true,
+        },
     )
     .await
     .expect_err("expected interrupt");
@@ -4150,13 +7427,16 @@ async fn external_runner_honors_interrupts() {
 fn doctor_report_covers_core_checks() {
     let _guard = env_lock();
     let root = temp_test_dir("doctor-report");
+    let old_sandbox_profile = std::env::var_os("DEXT_SANDBOX_PROFILE");
     unsafe {
         std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_SANDBOX_PROFILE");
     }
     let (report, _warnings) = doctor_report(&root);
     unsafe {
         std::env::remove_var("DEXT_HOME");
     }
+    restore_env_var("DEXT_SANDBOX_PROFILE", old_sandbox_profile);
     let _ = std::fs::remove_dir_all(&root);
 
     for needle in [
@@ -4176,6 +7456,239 @@ fn doctor_report_covers_core_checks() {
         report.contains(&crate::sandbox::describe()),
         "sandbox line should embed the platform description:\n{report}"
     );
+}
+
+#[test]
+fn doctor_findings_render_levels_and_effective_policy_source() {
+    let (rendered, warnings) = render_doctor_findings(&[
+        DoctorFinding::ok("healthy", "ready"),
+        DoctorFinding::info("optional", "absent"),
+        DoctorFinding::warn("repair", "required"),
+    ]);
+    assert_eq!(warnings, 1);
+    assert!(rendered.contains("[ok  ] healthy: ready"), "{rendered}");
+    assert!(rendered.contains("[info] optional: absent"), "{rendered}");
+    assert!(rendered.contains("[warn] repair: required"), "{rendered}");
+
+    let _guard = env_lock();
+    let root = temp_test_dir("doctor-policy-source");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_sessions = std::env::var_os("DEXT_SESSIONS_DIR");
+    let old_approval = std::env::var_os("DEXT_APPROVAL");
+    let old_trust = std::env::var_os("DEXT_TRUST");
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("home"));
+        std::env::set_var("DEXT_SESSIONS_DIR", root.join("sessions"));
+        std::env::set_var("DEXT_APPROVAL", "always");
+        std::env::set_var("DEXT_TRUST", "1");
+    }
+    let (report, _) = doctor_report_with_overrides(
+        &root,
+        Some(ApprovalProfile::AutoRead),
+        Some(SandboxProfile::DangerFullAccess),
+    );
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_SESSIONS_DIR", old_sessions);
+    restore_env_var("DEXT_APPROVAL", old_approval);
+    restore_env_var("DEXT_TRUST", old_trust);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        report.contains("approval policy: auto-read (source CLI)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("sandbox: effective profile danger-full-access"),
+        "{report}"
+    );
+    assert!(
+        report.contains("sandbox kernel: intentionally disabled"),
+        "{report}"
+    );
+}
+
+#[test]
+fn doctor_reports_bounded_latest_state_without_executing_auth_references() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("doctor-latest-state");
+    let dext_home = root.join("home");
+    let sessions = root.join("sessions");
+    let session_dir = sessions.join("session-1");
+    std::fs::create_dir_all(&session_dir)?;
+    std::fs::create_dir_all(&dext_home)?;
+
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_sessions = std::env::var_os("DEXT_SESSIONS_DIR");
+    let old_approval = std::env::var_os("DEXT_APPROVAL");
+    let old_trust = std::env::var_os("DEXT_TRUST");
+    let old_sandbox = std::env::var_os("DEXT_SANDBOX_PROFILE");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &dext_home);
+        std::env::set_var("DEXT_SESSIONS_DIR", &sessions);
+        std::env::set_var("DEXT_APPROVAL", "never");
+        std::env::remove_var("DEXT_TRUST");
+        std::env::set_var("DEXT_SANDBOX_PROFILE", "workspace-write");
+    }
+
+    let result = (|| -> Result<()> {
+        let session_path = session_dir.join(format!("{LATEST_SESSION_NAME}.jsonl"));
+        let session_bytes = std::fs::read(state_fixture_path("sessions", "v3.jsonl"))?;
+        std::fs::write(&session_path, &session_bytes)?;
+        let todo_path = session_dir.join("DEXT.todo.json");
+        let todo_bytes = std::fs::read(state_fixture_path("todo", "corrupt.json"))?;
+        std::fs::write(&todo_path, &todo_bytes)?;
+        let settings_path = dext_home.join("settings.json");
+        let settings_bytes = std::fs::read(state_fixture_path("settings", "out-of-range.json"))?;
+        std::fs::write(&settings_path, &settings_bytes)?;
+        let journal_path = session_dir.join("tool-journal.json");
+        let journal_bytes =
+            std::fs::read(state_fixture_path("tool-journal", "v1-unresolved.json"))?;
+        std::fs::write(&journal_path, &journal_bytes)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o600))?;
+
+        let provider_path = dext_home.join("providers.json");
+        let provider_bytes = std::fs::read(state_fixture_path("providers", "v2.json"))?;
+        std::fs::write(&provider_path, &provider_bytes)?;
+        let marker = root.join("auth-command-executed");
+        let secret = "doctor-secret-must-not-render";
+        let auth_bytes = serde_json::to_vec(&json!({
+            "version": 1,
+            "providers": {
+                "openai": {
+                    "type": "api_key",
+                    "key": format!("!printf '{secret}' > {}", marker.display())
+                }
+            }
+        }))?;
+        let auth_path = dext_home.join("auth.json");
+        std::fs::write(&auth_path, &auth_bytes)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))?;
+
+        let (report, warnings) = doctor_report_with_overrides(&root, None, None);
+        assert!(warnings >= 3, "{report}");
+        assert!(
+            report.contains("approval policy: never (source DEXT_APPROVAL)"),
+            "{report}"
+        );
+        assert!(report.contains("provider catalog: valid v2"), "{report}");
+        assert!(report.contains("active provider: local"), "{report}");
+        assert!(report.contains("auth store: valid v1"), "{report}");
+        #[cfg(unix)]
+        assert!(
+            report.contains("auth permissions: owner-only mode 0600"),
+            "{report}"
+        );
+        assert!(report.contains("latest session: valid v3"), "{report}");
+        assert!(report.contains("[warn] latest todo:"), "{report}");
+        assert!(report.contains("[warn] settings:"), "{report}");
+        assert!(
+            report.contains("tool journal: 1 unresolved/uncertain call(s)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("checkpoints: unavailable outside a Git worktree"),
+            "{report}"
+        );
+        assert!(!report.contains(secret), "{report}");
+        assert!(!report.contains("printf"), "{report}");
+        assert!(
+            !marker.exists(),
+            "doctor executed an auth command reference"
+        );
+        assert_eq!(std::fs::read(&session_path)?, session_bytes);
+        assert_eq!(std::fs::read(&todo_path)?, todo_bytes);
+        assert_eq!(std::fs::read(&settings_path)?, settings_bytes);
+        assert_eq!(std::fs::read(&journal_path)?, journal_bytes);
+        assert_eq!(std::fs::read(&provider_path)?, provider_bytes);
+        assert_eq!(std::fs::read(&auth_path)?, auth_bytes);
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_SESSIONS_DIR", old_sessions);
+    restore_env_var("DEXT_APPROVAL", old_approval);
+    restore_env_var("DEXT_TRUST", old_trust);
+    restore_env_var("DEXT_SANDBOX_PROFILE", old_sandbox);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn doctor_rejects_symlinked_latest_session_entries() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let _guard = env_lock();
+        let root = temp_test_dir("doctor-latest-session-symlink");
+        let sessions = root.join("sessions");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&sessions)?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(outside.join("latest.jsonl"), "{}\n")?;
+        symlink(&outside, sessions.join("linked-session"))?;
+        let old_sessions = std::env::var_os("DEXT_SESSIONS_DIR");
+        unsafe {
+            std::env::set_var("DEXT_SESSIONS_DIR", &sessions);
+        }
+
+        let directory_error = doctor_latest_session_path(&root).expect_err("reject directory link");
+        assert!(
+            directory_error.contains("symlinked session entry"),
+            "{directory_error}"
+        );
+
+        std::fs::remove_file(sessions.join("linked-session"))?;
+        let regular = sessions.join("regular-session");
+        std::fs::create_dir_all(&regular)?;
+        symlink(
+            outside.join("latest.jsonl"),
+            regular.join(format!("{LATEST_SESSION_NAME}.jsonl")),
+        )?;
+        let file_error = doctor_latest_session_path(&root).expect_err("reject file link");
+        assert!(file_error.contains("path is a symlink"), "{file_error}");
+
+        std::fs::remove_file(regular.join(format!("{LATEST_SESSION_NAME}.jsonl")))?;
+        let safe_session = session_latest_session_path(&root, "safe-session");
+        atomic_write_bytes(&safe_session, b"{}\n")?;
+        symlink(
+            outside.join("latest.jsonl"),
+            project_latest_session_path(&root),
+        )?;
+        let legacy_error = doctor_latest_session_path(&root)
+            .expect_err("reject legacy file link even when a safe session is newer");
+        assert!(legacy_error.contains("path is a symlink"), "{legacy_error}");
+
+        std::fs::remove_dir_all(&sessions)?;
+        symlink(&outside, &sessions)?;
+        let root_error = doctor_latest_session_path(&root).expect_err("reject sessions root link");
+        assert!(
+            root_error.contains("directory is a symlink"),
+            "{root_error}"
+        );
+
+        restore_env_var("DEXT_SESSIONS_DIR", old_sessions);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    Ok(())
+}
+
+#[test]
+fn doctor_treats_intentional_full_access_as_configured_not_unavailable() {
+    let (ok, detail) = sandbox_doctor_status(SandboxProfile::DangerFullAccess);
+    assert!(ok);
+    assert!(detail.contains("intentionally disabled"), "{detail}");
+    assert!(!detail.contains("path-validation"), "{detail}");
+
+    let (ok, detail) = sandbox_doctor_status(SandboxProfile::WorkspaceWrite);
+    assert_eq!(ok, crate::sandbox::is_enforced());
+    assert!(detail.contains("workspace-write"), "{detail}");
+    assert!(detail.contains(&crate::sandbox::describe()), "{detail}");
 }
 
 #[tokio::test]
@@ -4205,35 +7718,25 @@ async fn sandbox_never_breaks_benign_commands() {
 
 #[tokio::test]
 async fn read_only_sandbox_does_not_break_git_inspection() {
-    // Git inspection stays confined like other external tools. The repository is
-    // placed under HOME, outside scratch roots, to exercise that path while
-    // confirming the sandbox root itself remains readable to Git.
-    // Read HOME and create the repo under the env lock: other tests transiently
-    // point HOME at a temp dir they later delete, which would otherwise pull the
-    // repo out from under us. git below uses absolute paths / current_dir, so it
-    // is unaffected by HOME changes once set up.
-    let (repo, setup) = {
-        let _guard = env_lock();
-        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-        let repo =
-            std::path::PathBuf::from(home).join(format!("dext-sbx-git-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&repo);
-        let setup = (|| -> std::result::Result<(), String> {
-            std::fs::create_dir_all(&repo).map_err(|e| e.to_string())?;
-            git_ok(&repo, &["init", "-q"]);
-            git_ok(&repo, &["config", "user.email", "t@e.invalid"]);
-            git_ok(&repo, &["config", "user.name", "T"]);
-            std::fs::write(repo.join("f.txt"), "one\n").map_err(|e| e.to_string())?;
-            git_ok(&repo, &["add", "f.txt"]);
-            git_ok(&repo, &["commit", "-q", "-m", "base"]);
-            std::fs::write(repo.join("f.txt"), "two\n").map_err(|e| e.to_string())?;
-            Ok(())
-        })();
-        (repo, setup)
-    };
+    // Git inspection stays confined like other external tools. Keep the fixture
+    // under the checkout so the parent test remains compatible with an outer
+    // workspace-write sandbox; the child still receives the repository itself as
+    // its read-only sandbox root.
+    let repo = std::env::current_dir()
+        .expect("current checkout")
+        .join(format!(".dext-sbx-git-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    let setup = (|| -> std::result::Result<(), String> {
+        std::fs::create_dir_all(&repo).map_err(|e| e.to_string())?;
+        git_ok(&repo, &["init", "-q"]);
+        git_ok(&repo, &["config", "user.email", "t@e.invalid"]);
+        git_ok(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("f.txt"), "one\n").map_err(|e| e.to_string())?;
+        git_ok(&repo, &["add", "f.txt"]);
+        git_ok(&repo, &["commit", "-q", "-m", "base"]);
+        std::fs::write(repo.join("f.txt"), "two\n").map_err(|e| e.to_string())?;
+        Ok(())
+    })();
 
     let outcome = match setup {
         Ok(()) => {
@@ -4246,7 +7749,9 @@ async fn read_only_sandbox_does_not_break_git_inspection() {
                 None,
                 None,
                 None,
+                None,
                 SandboxProfile::ReadOnly,
+                false,
                 None,
                 Vec::new(),
             )
@@ -4272,10 +7777,7 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
     // A path under the workspace root is always writable under WorkspaceWrite.
     let inside = root.join("inside.txt");
     let out = execute_bash_async_with_timeout(
-        &format!(
-            "echo ok > {}",
-            shell_single_quote(&inside.to_string_lossy())
-        ),
+        "echo ok > inside.txt",
         &root,
         Arc::new(AtomicBool::new(false)),
         std::time::Duration::from_secs(5),
@@ -4304,26 +7806,30 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
     assert!(rename_out.contains("x"), "{rename_out}");
 
     if crate::sandbox::is_enforced() {
-        // Target two HOME-based paths outside the workspace and scratch roots:
-        // an unrelated directory must stay read-only under WorkspaceWrite, while
-        // a standard toolchain cache remains writable.
-        let home_paths = {
+        // Target a session-shaped path outside the child workspace and scratch
+        // roots, plus a standard toolchain cache. The first fixture lives in
+        // the checkout so this control remains writable even when the test
+        // process itself inherited an outer Landlock sandbox.
+        let external_paths = {
             let _guard = env_lock();
             std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
                 .ok()
-                .map(|home| {
+                .and_then(|home| {
                     let home = std::path::PathBuf::from(home);
-                    let escape_dir = home.join(format!(".dext-sbx-test-{}", std::process::id()));
+                    let checkout = std::env::current_dir().ok()?;
+                    let escape_dir = checkout
+                        .join(format!(".dext-read-autonomy-test-{}", std::process::id()))
+                        .join("projects/stocks-test/sessions");
                     let cache_dir = home
                         .join(".cache/pip")
                         .join(format!("dext-sbx-test-{}", std::process::id()));
                     let _ = std::fs::create_dir_all(&escape_dir);
                     let _ = std::fs::create_dir_all(&cache_dir);
-                    (escape_dir, cache_dir)
+                    Some((escape_dir, cache_dir))
                 })
         };
-        if let Some((escape_dir, cache_dir)) = home_paths {
+        if let Some((escape_dir, cache_dir)) = external_paths {
             let escape_file = escape_dir.join("escape.txt");
             let escape_cmd = format!(
                 "echo pwned > {} 2>&1",
@@ -4344,7 +7850,7 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
             .expect("unsandboxed write should run");
             assert!(
                 escape_file.exists(),
-                "control: HOME-based path must be writable without a sandbox"
+                "control: external path must be writable without an additional sandbox"
             );
 
             // Control: the file is readable unsandboxed.
@@ -4359,23 +7865,84 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
             .expect("unsandboxed HOME read should run");
             assert!(readable.contains("pwned"), "{readable}");
 
+            // Native reads and every confined subprocess profile must be able to
+            // inspect exact files and enumerate user-readable directories outside
+            // the child workspace. This also mirrors DEXT_HOME session review.
+            let native_read = execute_tool(
+                "read_file",
+                &json!({"path": escape_file.display().to_string()}),
+                &root,
+            )
+            .expect("native read_file may inspect HOME session path");
+            assert!(native_read.contains("pwned"), "{native_read}");
+
             for profile in [SandboxProfile::ReadOnly, SandboxProfile::WorkspaceWrite] {
-                let blocked_read = execute_bash_async_with_timeout(
-                    &format!("cat {}", shell_single_quote(&escape_file.to_string_lossy())),
+                let shell_read = execute_bash_async_with_timeout(
+                    &format!(
+                        "ls -1 {} && cat {}",
+                        shell_single_quote(&escape_dir.to_string_lossy()),
+                        shell_single_quote(&escape_file.to_string_lossy())
+                    ),
                     &root,
                     Arc::new(AtomicBool::new(false)),
                     std::time::Duration::from_secs(5),
                     profile,
                 )
                 .await
-                .expect("sandboxed HOME read command should return output");
+                .expect("sandboxed external read command should return output");
                 assert!(
-                    !blocked_read.contains("pwned"),
-                    "{profile:?} must hide unrelated HOME content: {blocked_read}"
+                    shell_read.contains("escape.txt"),
+                    "{profile:?}: {shell_read}"
                 );
+                assert!(shell_read.contains("pwned"), "{profile:?}: {shell_read}");
+
+                let fd_read = execute_builtin_call(
+                    "fd".to_string(),
+                    json!({
+                        "pattern": "escape\\.txt$",
+                        "path": escape_dir.display().to_string(),
+                        "extra_args": ["-H"]
+                    }),
+                    root.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    profile,
+                    false,
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .expect("fd may enumerate HOME session path");
+                assert!(fd_read.contains("escape.txt"), "{profile:?}: {fd_read}");
+
+                let rg_read = execute_builtin_call(
+                    "rg".to_string(),
+                    json!({
+                        "pattern": "pwned",
+                        "path": escape_dir.display().to_string()
+                    }),
+                    root.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    profile,
+                    false,
+                    None,
+                    Vec::new(),
+                )
+                .await
+                .expect("rg may search HOME session path");
+                assert!(rg_read.contains("pwned"), "{profile:?}: {rg_read}");
             }
 
-            // Read-only denies the HOME write.
+            // Read-only denies the external write.
             let _ = std::fs::remove_file(&escape_file);
             let blocked = execute_bash_async_with_timeout(
                 &escape_cmd,
@@ -4391,7 +7958,7 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 "read-only sandbox must block writes outside scratch roots: {blocked}"
             );
 
-            // Workspace-write also denies unrelated HOME writes, preventing
+            // Workspace-write also denies unrelated external writes, preventing
             // persistence through shell startup files and similar paths.
             let _ = std::fs::remove_file(&escape_file);
             let blocked = execute_bash_async_with_timeout(
@@ -4405,7 +7972,7 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
             .expect("workspace-write command runs even when HOME write is denied");
             assert!(
                 !escape_file.exists(),
-                "workspace-write sandbox must block unrelated HOME writes: {blocked}"
+                "workspace-write sandbox must block unrelated external writes: {blocked}"
             );
 
             // Standard cache roots remain writable for cargo/npm/pip/etc.
@@ -4431,14 +7998,21 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
             let _ = std::fs::remove_dir_all(&cache_dir);
         }
 
-        // Scratch writes (temp dir) must still succeed even under ReadOnly.
-        let scratch =
-            std::env::temp_dir().join(format!("dext-sbx-scratch-{}.txt", std::process::id()));
-        let _ = std::fs::remove_file(&scratch);
-        let out = execute_bash_async_with_timeout(
+        // Arbitrary shared-temp writes are not scratch writes: they would let a
+        // read-only tool mutate another process's files or a temp-based workspace.
+        let shared_temp_target = PathBuf::from("/tmp").join(format!(
+            "dext-sbx-shared-temp-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&shared_temp_target);
+        let blocked = execute_bash_async_with_timeout(
             &format!(
-                "echo ok > {}",
-                shell_single_quote(&scratch.to_string_lossy())
+                "echo unsafe > {} 2>&1 || true",
+                shell_single_quote(&shared_temp_target.to_string_lossy())
             ),
             &root,
             Arc::new(AtomicBool::new(false)),
@@ -4446,12 +8020,36 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
             SandboxProfile::ReadOnly,
         )
         .await
-        .expect("read-only scratch write should run");
+        .expect("read-only shared-temp write command should run");
         assert!(
-            scratch.exists(),
-            "read-only sandbox must still allow scratch temp writes: {out}"
+            !shared_temp_target.exists(),
+            "read-only sandbox must block arbitrary shared-temp writes: {blocked}"
         );
-        let _ = std::fs::remove_file(&scratch);
+
+        // Normal temp APIs still work in one private directory. The command
+        // wrapper owns that directory, so it must be gone after the runner returns.
+        let private_temp = execute_bash_async_with_timeout(
+            "test \"$TMPDIR\" = \"$TMP\" && test \"$TMPDIR\" = \"$TEMP\" && \
+             file=$(mktemp \"$TMPDIR/dext.XXXXXX\") && printf data > \"$file\" && test -f \"$file\" && \
+             printf 'PRIVATE_TEMP=%s\\n' \"$TMPDIR\"",
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            SandboxProfile::ReadOnly,
+        )
+        .await
+        .expect("read-only private scratch command should run");
+        assert!(private_temp.contains("exit: 0"), "{private_temp}");
+        let scratch = private_temp
+            .lines()
+            .find_map(|line| line.strip_prefix("PRIVATE_TEMP="))
+            .map(PathBuf::from)
+            .expect("private scratch path in command output");
+        assert!(
+            !scratch.exists(),
+            "runner must remove private scratch after child exit: {}",
+            scratch.display()
+        );
     }
 
     let _ = std::fs::remove_dir_all(&root);
@@ -4459,6 +8057,7 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
 async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
     if !crate::sandbox::is_enforced() {
         return;
@@ -4468,8 +8067,8 @@ async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
     let old_pip_cache = std::env::var_os("PIP_CACHE_DIR");
     let old_tmpdir = std::env::var_os("TMPDIR");
     let root = temp_test_dir("sandbox-parent-env");
-    let home = crate::session::user_home_dir();
-    let escape_dir = home.join(format!(".dext-sbx-env-test-{}", std::process::id()));
+    let checkout = std::env::current_dir().expect("current checkout");
+    let escape_dir = checkout.join(format!(".dext-sbx-env-test-{}", std::process::id()));
     let escape_file = escape_dir.join("escape.txt");
     std::fs::create_dir_all(&escape_dir).expect("create escape directory");
     unsafe {
@@ -4605,9 +8204,150 @@ async fn bash_runner_emits_live_output_deltas() {
 }
 
 #[test]
+fn provider_transport_timeouts_use_local_defaults_and_valid_overrides() {
+    let _guard = env_lock();
+    let vars = [
+        "DEXT_PROVIDER_CONNECT_TIMEOUT_SECS",
+        "DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS",
+        "DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS",
+    ];
+    let old_values = vars.map(std::env::var_os);
+    unsafe {
+        for var in vars {
+            std::env::remove_var(var);
+        }
+    }
+
+    assert_eq!(
+        provider_connect_timeout(),
+        std::time::Duration::from_secs(15)
+    );
+    assert_eq!(
+        provider_first_byte_timeout(false),
+        std::time::Duration::from_secs(180)
+    );
+    assert_eq!(
+        provider_first_byte_timeout(true),
+        std::time::Duration::from_secs(600)
+    );
+    assert_eq!(
+        provider_stream_idle_timeout(false),
+        std::time::Duration::from_secs(90)
+    );
+    assert_eq!(
+        provider_stream_idle_timeout(true),
+        std::time::Duration::from_secs(300)
+    );
+
+    unsafe {
+        std::env::set_var(vars[0], "7");
+        std::env::set_var(vars[1], "8");
+        std::env::set_var(vars[2], "9");
+    }
+    assert_eq!(
+        provider_connect_timeout(),
+        std::time::Duration::from_secs(7)
+    );
+    assert_eq!(
+        provider_first_byte_timeout(true),
+        std::time::Duration::from_secs(8)
+    );
+    assert_eq!(
+        provider_stream_idle_timeout(true),
+        std::time::Duration::from_secs(9)
+    );
+
+    unsafe {
+        std::env::set_var(vars[0], "0");
+        std::env::set_var(vars[1], "invalid");
+        std::env::set_var(vars[2], "0");
+    }
+    assert_eq!(
+        provider_connect_timeout(),
+        std::time::Duration::from_secs(15)
+    );
+    assert_eq!(
+        provider_first_byte_timeout(false),
+        std::time::Duration::from_secs(180)
+    );
+    assert_eq!(
+        provider_stream_idle_timeout(false),
+        std::time::Duration::from_secs(90)
+    );
+
+    for (var, old_value) in vars.into_iter().zip(old_values) {
+        restore_env_var(var, old_value);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_body_reader_enforces_idle_timeout_after_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("server address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = std::io::Read::read(&mut stream, &mut buffer).expect("read request");
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\na";
+        std::io::Write::write_all(&mut stream, response).expect("write partial response");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}"))
+        .send()
+        .await
+        .expect("receive response headers");
+    let error = read_provider_body_limited(response, 16, std::time::Duration::from_millis(30))
+        .await
+        .expect_err("stalled body should time out");
+    assert!(
+        error.to_string().contains("response body idle timeout"),
+        "{error:#}"
+    );
+    server.join().expect("server thread");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_body_reader_stops_at_cap_without_buffering_the_rest() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("server address");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let read = std::io::Read::read(&mut stream, &mut buffer).expect("read request");
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nabcdefgh";
+        std::io::Write::write_all(&mut stream, response).expect("write response");
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}"))
+        .send()
+        .await
+        .expect("receive response headers");
+    let (body, truncated) =
+        read_provider_body_limited(response, 4, std::time::Duration::from_secs(1))
+            .await
+            .expect("read capped body");
+    assert_eq!(body, b"abcd");
+    assert!(truncated);
+    server.join().expect("server thread");
+}
+
+#[test]
 fn sync_runner_times_out() {
     let root = temp_test_dir("sync-timeout");
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new(bash_executable_path());
     cmd.arg("-lc").arg("sleep 2").current_dir(&root);
     let err = run_sync_command_limited(
         cmd,
@@ -4621,33 +8361,188 @@ fn sync_runner_times_out() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+fn descendant_pid(output: &str) -> libc::pid_t {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("DESCENDANT_PID="))
+        .and_then(|pid| pid.parse().ok())
+        .unwrap_or_else(|| panic!("missing descendant PID in runner output: {output}"))
+}
+
+#[cfg(unix)]
+fn assert_process_dead(pid: libc::pid_t, label: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let status = unsafe { libc::kill(pid, 0) };
+        if status == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label} descendant PID {pid} survived process-group cleanup"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
-async fn bash_runner_reaps_background_children_after_shell_exit() {
-    let root = temp_test_dir("bash-grandchild-reap");
-    let start = std::time::Instant::now();
-    let out = execute_bash_async_with_timeout(
-        "sleep 5 & echo done",
+async fn bash_process_lifecycle_matrix_reaps_background_nohup_and_disown_descendants() {
+    let root = temp_test_dir("bash-descendant-lifecycle");
+    let launchers = [
+        ("background", "sleep 30 >/dev/null 2>&1 & child=$!"),
+        (
+            "nohup",
+            "nohup sleep 30 </dev/null >/dev/null 2>&1 & child=$!",
+        ),
+        (
+            "disown",
+            "sleep 30 </dev/null >/dev/null 2>&1 & child=$!; disown \"$child\"",
+        ),
+    ];
+
+    for (label, launch) in launchers {
+        let completion = execute_bash_async_with_timeout(
+            &format!("{launch}; printf 'DESCENDANT_PID=%s\\n' \"$child\""),
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            SandboxProfile::WorkspaceWrite,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label} completion case failed: {error}"));
+        assert_process_dead(descendant_pid(&completion), &format!("{label} completion"));
+
+        let timeout = execute_bash_async_with_timeout(
+            &format!("{launch}; printf 'DESCENDANT_PID=%s\\n' \"$child\"; sleep 30"),
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_millis(150),
+            SandboxProfile::WorkspaceWrite,
+        )
+        .await
+        .expect_err("lifecycle timeout case must time out");
+        assert!(timeout.contains("timed out after"), "{label}: {timeout}");
+        assert_process_dead(descendant_pid(&timeout), &format!("{label} timeout"));
+
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let trigger = interrupt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let interrupted = execute_bash_async_with_timeout(
+            &format!("{launch}; printf 'DESCENDANT_PID=%s\\n' \"$child\"; sleep 30"),
+            &root,
+            interrupt,
+            std::time::Duration::from_secs(5),
+            SandboxProfile::WorkspaceWrite,
+        )
+        .await
+        .expect_err("lifecycle interrupt case must be interrupted");
+        assert!(
+            interrupted.contains("killed by interrupt"),
+            "{label}: {interrupted}"
+        );
+        assert_process_dead(descendant_pid(&interrupted), &format!("{label} interrupt"));
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(windows)]
+fn windows_descendant_pid(output: &str) -> u32 {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("DESCENDANT_PID="))
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("missing descendant PID in runner output: {output}"))
+}
+
+#[cfg(windows)]
+fn assert_windows_process_dead(pid: u32, label: &str) {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if process.is_null() {
+            return;
+        }
+        let status = unsafe { WaitForSingleObject(process, 0) };
+        unsafe {
+            CloseHandle(process);
+        }
+        if status == WAIT_OBJECT_0 {
+            return;
+        }
+        assert_eq!(status, WAIT_TIMEOUT, "wait failed for {label} PID {pid}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label} descendant PID {pid} survived Job Object cleanup"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn bash_process_lifecycle_reaps_windows_descendants() {
+    let root = temp_test_dir("bash-windows-descendant-lifecycle");
+    let launch = "powershell.exe -NoProfile -NonInteractive -Command '$p = Start-Process powershell.exe -ArgumentList \"-NoProfile\",\"-NonInteractive\",\"-Command\",\"Start-Sleep -Seconds 30\" -PassThru; Write-Output (\"DESCENDANT_PID=\" + $p.Id)'";
+
+    let completion = execute_bash_async_with_timeout(
+        launch,
         &root,
         Arc::new(AtomicBool::new(false)),
         std::time::Duration::from_secs(10),
         SandboxProfile::WorkspaceWrite,
     )
     .await
-    .expect("expected success");
-    let elapsed = start.elapsed();
-    assert!(out.contains("exit: 0"), "{out}");
-    assert!(out.contains("done"), "{out}");
-    assert!(
-        elapsed < std::time::Duration::from_secs(3),
-        "background child kept pipe open for {elapsed:?}; output={out}"
-    );
+    .expect("Windows lifecycle completion case failed");
+    assert_windows_process_dead(windows_descendant_pid(&completion), "Windows completion");
+
+    let timeout = execute_bash_async_with_timeout(
+        &format!("{launch}; sleep 30"),
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        std::time::Duration::from_secs(3),
+        SandboxProfile::WorkspaceWrite,
+    )
+    .await
+    .expect_err("Windows lifecycle timeout case must time out");
+    assert!(timeout.contains("timed out after"), "{timeout}");
+    assert_windows_process_dead(windows_descendant_pid(&timeout), "Windows timeout");
+
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let trigger = interrupt.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        trigger.store(true, Ordering::SeqCst);
+    });
+    let interrupted = execute_bash_async_with_timeout(
+        &format!("{launch}; sleep 30"),
+        &root,
+        interrupt,
+        std::time::Duration::from_secs(10),
+        SandboxProfile::WorkspaceWrite,
+    )
+    .await
+    .expect_err("Windows lifecycle interrupt case must be interrupted");
+    assert!(interrupted.contains("killed by interrupt"), "{interrupted}");
+    assert_windows_process_dead(windows_descendant_pid(&interrupted), "Windows interrupt");
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn sync_runner_reaps_background_children_after_shell_exit() {
     let root = temp_test_dir("sync-grandchild-reap");
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new(bash_executable_path());
     cmd.arg("-lc").arg("sleep 5 & echo done").current_dir(&root);
     let start = std::time::Instant::now();
     let (out, _, status) = run_sync_command_limited(
@@ -4711,6 +8606,7 @@ fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
         &root,
         Some(&cache),
         None,
+        None,
     )
     .expect("explicit read should succeed");
     assert!(
@@ -4754,6 +8650,7 @@ fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
         &json!({"path": "big.txt", "offset": 10, "limit": 10}),
         &root,
         Some(&cache),
+        None,
         None,
     );
     assert!(
@@ -5229,53 +9126,293 @@ fn prepare_http_tool_request_accepts_extract_text_flag() {
 }
 
 #[test]
-fn http_tool_blocks_link_local_and_metadata_destinations_by_default() {
+fn http_tool_blocks_local_and_internal_destinations_by_default() {
     let _guard = env_lock();
-    let old = std::env::var_os(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    let old_link_local = std::env::var_os(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    let old_private = std::env::var_os(HTTP_TOOL_ALLOW_PRIVATE_ENV);
     unsafe {
         std::env::remove_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+        std::env::remove_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+        std::env::remove_var(HTTP_TOOL_ALLOW_PRIVATE_ENV);
     }
 
-    let link_local = reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
-    let link_local_err = validate_http_tool_destination(&link_local).err();
-
-    let aws_v6 = reqwest::Url::parse("http://[fd00:ec2::254]/latest/meta-data/").unwrap();
-    let aws_v6_err = validate_http_tool_destination(&aws_v6).err();
-
-    let mapped = reqwest::Url::parse("http://[::ffff:169.254.169.254]/latest/meta-data/").unwrap();
-    let mapped_err = validate_http_tool_destination(&mapped).err();
-
-    let gcp = reqwest::Url::parse("http://metadata.google.internal/computeMetadata/v1/").unwrap();
-    let gcp_err = validate_http_tool_destination(&gcp).err();
-
-    let localhost = reqwest::Url::parse("http://127.0.0.1:1/").unwrap();
-    let localhost_ok = validate_http_tool_destination(&localhost).is_ok();
+    let blocked = [
+        ("http://169.254.169.254/latest/meta-data/", "link-local"),
+        ("http://[fd00:ec2::254]/latest/meta-data/", "metadata"),
+        ("http://[::ffff:169.254.169.254]/", "IPv4-embedded"),
+        (
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "metadata alias",
+        ),
+        ("http://127.0.0.1:1/", "loopback"),
+        ("http://0.0.0.0:1/", "unspecified"),
+        ("http://[::1]:1/", "loopback"),
+        ("http://[::]:1/", "unspecified"),
+        ("http://10.0.0.1/", "private"),
+        ("http://172.16.0.1/", "private"),
+        ("http://192.168.0.1/", "private"),
+        ("http://100.64.0.1/", "CGNAT"),
+        ("http://[fd12::1]/", "unique-local"),
+    ];
+    for (target, reason) in blocked {
+        let url = reqwest::Url::parse(target).unwrap();
+        let err = validate_http_tool_destination(&url).expect_err(target);
+        assert!(err.contains(reason), "{target}: {err}");
+    }
 
     unsafe {
+        std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1");
+        std::env::set_var(HTTP_TOOL_ALLOW_PRIVATE_ENV, "1");
         std::env::set_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, "1");
     }
-    let override_ok = validate_http_tool_destination(&link_local).is_ok();
+    for target in [
+        "http://127.0.0.1:1/",
+        "http://0.0.0.0:1/",
+        "http://10.0.0.1/",
+        "http://100.64.0.1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+    ] {
+        let url = reqwest::Url::parse(target).unwrap();
+        assert!(validate_http_tool_destination(&url).is_ok(), "{target}");
+    }
 
-    restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old);
+    restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old_link_local);
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    restore_env_var(HTTP_TOOL_ALLOW_PRIVATE_ENV, old_private);
+}
 
-    let err = link_local_err.expect("link-local blocked");
-    assert!(err.contains("link-local"), "{err}");
-    let err = aws_v6_err.expect("AWS IPv6 metadata blocked");
-    assert!(err.contains("metadata"), "{err}");
-    let err = mapped_err.expect("IPv4-mapped link-local blocked");
-    assert!(err.contains("IPv4-embedded"), "{err}");
-    let err = gcp_err.expect("metadata alias blocked");
-    assert!(err.contains("metadata alias"), "{err}");
-    assert!(localhost_ok, "localhost remains allowed");
-    assert!(override_ok, "env override allows link-local");
+#[test]
+fn http_tool_network_overrides_are_independent() {
+    let _guard = env_lock();
+    let old_link_local = std::env::var_os(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    let old_private = std::env::var_os(HTTP_TOOL_ALLOW_PRIVATE_ENV);
+
+    let cases = [
+        (
+            HTTP_TOOL_ALLOW_LOOPBACK_ENV,
+            "http://127.0.0.1:1/",
+            ["http://10.0.0.1/", "http://169.254.169.254/"],
+        ),
+        (
+            HTTP_TOOL_ALLOW_PRIVATE_ENV,
+            "http://10.0.0.1/",
+            ["http://127.0.0.1:1/", "http://169.254.169.254/"],
+        ),
+        (
+            HTTP_TOOL_ALLOW_LINK_LOCAL_ENV,
+            "http://169.254.169.254/",
+            ["http://127.0.0.1:1/", "http://10.0.0.1/"],
+        ),
+    ];
+
+    for (enabled, allowed, blocked) in cases {
+        unsafe {
+            std::env::remove_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+            std::env::remove_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+            std::env::remove_var(HTTP_TOOL_ALLOW_PRIVATE_ENV);
+            std::env::set_var(enabled, "1");
+        }
+
+        let allowed = reqwest::Url::parse(allowed).unwrap();
+        assert!(
+            validate_http_tool_destination(&allowed).is_ok(),
+            "{enabled} should allow {allowed}"
+        );
+        for target in blocked {
+            let target = reqwest::Url::parse(target).unwrap();
+            assert!(
+                validate_http_tool_destination(&target).is_err(),
+                "{enabled} must not allow {target}"
+            );
+        }
+    }
+
+    restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old_link_local);
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    restore_env_var(HTTP_TOOL_ALLOW_PRIVATE_ENV, old_private);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_http_client_ignores_proxy_environment() {
+    let _guard = env_lock();
+    let env_names = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        HTTP_TOOL_ALLOW_LOOPBACK_ENV,
+    ];
+    let old_env = env_names.map(|name| (name, std::env::var_os(name)));
+
+    let direct = TcpListener::bind("127.0.0.1:0").expect("bind direct test server");
+    direct.set_nonblocking(true).expect("nonblocking direct");
+    let direct_port = direct.local_addr().expect("direct addr").port();
+    let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy trap");
+    proxy.set_nonblocking(true).expect("nonblocking proxy");
+    let proxy_url = format!("http://{}", proxy.local_addr().expect("proxy addr"));
+    unsafe {
+        for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            std::env::set_var(name, &proxy_url);
+        }
+        for name in ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1");
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawn_server = |listener: TcpListener, body: &'static str, stop: Arc<AtomicBool>| {
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 1024];
+                        let _ = std::io::Read::read(&mut stream, &mut request);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write response");
+                        return true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test listener failed: {error}"),
+                }
+            }
+            false
+        })
+    };
+    let direct_server = spawn_server(direct, "direct", stop.clone());
+    let proxy_server = spawn_server(proxy, "proxied", stop.clone());
+
+    let response = build_http_tool_client()
+        .get(format!("http://127.0.0.1:{direct_port}/"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .expect("direct HTTP request despite proxy environment")
+        .text()
+        .await
+        .expect("read direct response");
+    stop.store(true, Ordering::SeqCst);
+    let direct_used = direct_server.join().expect("direct server thread");
+    let proxy_used = proxy_server.join().expect("proxy server thread");
+
+    for (name, value) in old_env {
+        restore_env_var(name, value);
+    }
+    assert_eq!(response, "direct");
+    assert!(direct_used, "direct listener should receive the request");
+    assert!(!proxy_used, "proxy environment must be ignored");
+}
+
+#[test]
+fn builtin_http_tool_enforces_exact_redirect_limit() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
+
+    let run_chain = |redirects: usize| {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set redirect listener nonblocking");
+        let addr = listener.local_addr().expect("redirect listener addr");
+        let expected_requests = redirects.min(HTTP_TOOL_REDIRECT_LIMIT) + 1;
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut handled = 0;
+            while handled < expected_requests && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("redirect listener failed: {error}"),
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("set redirect stream blocking");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("set redirect request timeout");
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buf).expect("read redirect request");
+                    assert!(read > 0, "client closed before sending redirect headers");
+                    request.extend_from_slice(&buf[..read]);
+                }
+
+                let response = if handled < redirects {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{addr}/hop/{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        handled + 1
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone"
+                        .to_string()
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write redirect response");
+                handled += 1;
+            }
+            handled
+        });
+
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                build_http_tool_client()
+                    .get(format!("http://{addr}/hop/0"))
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await?
+                    .text()
+                    .await
+            });
+        let handled = server.join().expect("redirect server thread");
+        (result, handled)
+    };
+
+    let (allowed, allowed_requests) = run_chain(HTTP_TOOL_REDIRECT_LIMIT);
+    assert_eq!(allowed.expect("redirect limit should be allowed"), "done");
+    assert_eq!(allowed_requests, HTTP_TOOL_REDIRECT_LIMIT + 1);
+
+    let (blocked, blocked_requests) = run_chain(HTTP_TOOL_REDIRECT_LIMIT + 1);
+    let error = blocked.expect_err("redirect beyond limit should fail");
+    assert!(error.is_redirect(), "{error:?}");
+    assert!(
+        format!("{error:?}").contains("too many redirects"),
+        "{error:?}"
+    );
+    assert_eq!(blocked_requests, HTTP_TOOL_REDIRECT_LIMIT + 1);
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
 }
 
 #[test]
 fn builtin_http_tool_blocks_redirect_to_link_local_metadata() {
     let _guard = env_lock();
-    let old = std::env::var_os(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    let old_link_local = std::env::var_os(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
     unsafe {
         std::env::remove_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV);
+        std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1");
     }
 
     let root = temp_test_dir("http-redirect-link-local");
@@ -5311,12 +9448,15 @@ fn builtin_http_tool_blocks_redirect_to_link_local_metadata() {
             None,
             None,
             None,
+            None,
             SandboxProfile::WorkspaceWrite,
+            false,
             None,
             Vec::new(),
         ));
 
-    restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old);
+    restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old_link_local);
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
     let out = outcome.expect_err("redirect to link-local should be blocked");
     assert!(out.contains("blocked http redirect"), "{out}");
     assert!(out.contains("169.254.169.254"), "{out}");
@@ -5325,7 +9465,11 @@ fn builtin_http_tool_blocks_redirect_to_link_local_metadata() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn builtin_http_tool_executes_without_xh_dependency() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
     let root = temp_test_dir("http-built-in");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let addr = listener.local_addr().expect("listener addr");
@@ -5402,7 +9546,9 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
         None,
         None,
         None,
+        None,
         SandboxProfile::WorkspaceWrite,
+        false,
         None,
         Vec::new(),
     )
@@ -5411,6 +9557,7 @@ async fn builtin_http_tool_executes_without_xh_dependency() {
 
     assert!(out.contains("{\"ok\":true}"), "{out}");
     server.join().expect("server thread");
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -5483,12 +9630,43 @@ fn git_log_builds_separate_flag_and_count_args() {
         prepare_external_tool("git_log", &json!({"count": 8, "oneline": true}), &root)
             .expect("prepare git_log");
     assert_eq!(bin, "git");
-    assert_eq!(args, vec!["log", "--oneline", "-8"]);
+    assert_eq!(
+        args,
+        vec![
+            "--no-pager",
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "protocol.allow=never",
+            "log",
+            "--oneline",
+            "-8",
+        ]
+    );
 
     let (_, args_no_oneline, _) =
         prepare_external_tool("git_log", &json!({"count": 5, "oneline": false}), &root)
             .expect("prepare git_log without oneline");
-    assert_eq!(args_no_oneline, vec!["log", "-5"]);
+    assert_eq!(
+        args_no_oneline,
+        vec![
+            "--no-pager",
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "protocol.allow=never",
+            "log",
+            "-5",
+        ]
+    );
 
     let (_, args_with_path, _) = prepare_external_tool(
         "git_log",
@@ -5498,7 +9676,22 @@ fn git_log_builds_separate_flag_and_count_args() {
     .expect("prepare git_log with path");
     assert_eq!(
         args_with_path,
-        vec!["log", "--oneline", "-3", "--", "src/main.rs"]
+        vec![
+            "--no-pager",
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "protocol.allow=never",
+            "log",
+            "--oneline",
+            "-3",
+            "--",
+            "src/main.rs",
+        ]
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -5603,7 +9796,7 @@ fn fzf_tool_pipes_items_as_stdin() {
 }
 
 #[test]
-fn awk_tool_passes_args_and_stdin_verbatim() {
+fn awk_tool_allows_inline_filters_and_rejects_process_or_write_capabilities() {
     let root = temp_test_dir("awk-argv");
     let root = std::fs::canonicalize(&root).unwrap();
 
@@ -5620,11 +9813,40 @@ fn awk_tool_passes_args_and_stdin_verbatim() {
     assert_eq!(args, vec!["-F,", "{print $2}"]);
     assert_eq!(stdin.as_deref(), Some("a,b,c\nd,e,f"));
 
+    for args in [
+        json!(["-F", ",", "-v", "min=2", "$1 > min { print $1 }"]),
+        json!(["$0 ~ /warn|error/ { print ($1 > 2) }"]),
+        json!(["{ print \"a > b | c\" }"]),
+        json!(["$1 > 2 || $2 < 4 { print $1 }"]),
+    ] {
+        prepare_external_tool("awk", &json!({"args": args}), &root)
+            .unwrap_or_else(|error| panic!("safe inline awk rejected: {error}"));
+    }
+
+    for args in [
+        json!(["-f", "program.awk", "data.csv"]),
+        json!(["--load=ext", "{ print $1 }"]),
+        json!(["{ system (\"touch pwned\") }"]),
+        json!(["{ @fn(\"touch pwned\") }"]),
+        json!(["{ print $1 | \"sh\" }"]),
+        json!(["{ print $1 > \"out.txt\" }"]),
+        json!(["{ \"cat /etc/passwd\" | getline line }"]),
+        json!(["BEGIN { print \"x\" > \"/inet/tcp/0/host/80\" }"]),
+    ] {
+        let error = prepare_external_tool("awk", &json!({"args": args}), &root)
+            .expect_err("capability-bearing awk must be blocked");
+        assert!(error.contains("blocked awk args"), "{error}");
+    }
+
+    let error = prepare_external_tool("awk", &json!({"args": ["{print}", 7]}), &root)
+        .expect_err("mixed-type awk argv must not be silently truncated");
+    assert!(error.contains("only strings"), "{error}");
+
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
-fn csvkit_tool_uses_subcommand_as_binary() {
+fn csvkit_tool_enforces_subcommand_allowlist_at_execution_boundary() {
     let root = temp_test_dir("csvkit-argv");
     let root = std::fs::canonicalize(&root).unwrap();
 
@@ -5642,9 +9864,130 @@ fn csvkit_tool_uses_subcommand_as_binary() {
     assert_eq!(args, vec!["-c", "1,3"]);
     assert_eq!(stdin.as_deref(), Some("a,b,c\n1,2,3"));
 
-    let err = prepare_external_tool("csvkit", &json!({"args": ["-c", "1"]}), &root)
+    let error = prepare_external_tool(
+        "csvkit",
+        &json!({"subcommand": "sh", "args": ["-c", "touch pwned"]}),
+        &root,
+    )
+    .expect_err("csvkit must not execute arbitrary PATH binaries");
+    assert!(error.contains("unsupported csvkit subcommand"), "{error}");
+    assert!(
+        tool_policy::tool_input_issue(
+            "csvkit",
+            &json!({"subcommand": "/bin/rm", "args": ["victim"]})
+        )
+        .is_some(),
+        "planner validation must enforce the same executable allowlist"
+    );
+
+    let error = prepare_external_tool(
+        "csvkit",
+        &json!({"subcommand": "csvcut", "args": ["-c", 1]}),
+        &root,
+    )
+    .expect_err("mixed-type csvkit argv must not be silently truncated");
+    assert!(error.contains("only strings"), "{error}");
+
+    let error = prepare_external_tool("csvkit", &json!({"args": ["-c", "1"]}), &root)
         .expect_err("csvkit without subcommand should error");
-    assert!(err.contains("subcommand"), "{err}");
+    assert!(error.contains("subcommand"), "{error}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_tools_reject_subprocess_exec_flags() {
+    let root = temp_test_dir("search-exec-flags");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let cases = [
+        ("fd", vec!["-x", "sh", "-c", "echo pwned"]),
+        ("fd", vec!["-HIx", "touch", "pwned"]),
+        ("fd", vec!["--exec-batch=touch", "pwned"]),
+        ("rg", vec!["--pre", "sh -c 'echo pwned'"]),
+        ("rg", vec!["--pre-glob=*.rs"]),
+        ("rg", vec!["-z"]),
+        ("rg", vec!["-iz"]),
+        ("rg", vec!["--search-zip"]),
+        ("rg", vec!["--hostname-bin", "sh"]),
+    ];
+
+    for (name, extra_args) in cases {
+        let err = prepare_external_tool(
+            name,
+            &json!({
+                "pattern": "needle",
+                "path": root.to_str().unwrap(),
+                "extra_args": extra_args
+            }),
+            &root,
+        )
+        .expect_err("exec-capable search flag must be rejected");
+        assert!(err.contains("subprocess-execution"), "{name}: {err}");
+    }
+
+    for (name, extra_args) in [
+        ("fd", vec!["../outside"]),
+        ("fd", vec!["--"]),
+        ("fd", vec!["--base-directory", "../outside"]),
+        ("rg", vec!["../outside"]),
+        ("rg", vec!["--files"]),
+        ("rg", vec!["--regexp=alternate"]),
+    ] {
+        let err = prepare_external_tool(
+            name,
+            &json!({
+                "pattern": "needle",
+                "path": root.to_str().unwrap(),
+                "extra_args": extra_args
+            }),
+            &root,
+        )
+        .expect_err("extra_args must not add or replace search operands");
+        assert!(
+            err.contains("search operands") || err.contains("positional"),
+            "{name}: {err}"
+        );
+    }
+
+    for (name, extra_args) in [
+        ("fd", vec!["-H", "-t", "f", "--glob"]),
+        ("rg", vec!["-i", "--glob", "*.rs", "--max-count", "3"]),
+    ] {
+        prepare_external_tool(
+            name,
+            &json!({
+                "pattern": "needle",
+                "path": root.to_str().unwrap(),
+                "extra_args": extra_args
+            }),
+            &root,
+        )
+        .expect("ordinary search flags remain allowed");
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn search_tool_patterns_are_separated_from_options() {
+    let root = temp_test_dir("search-option-pattern");
+    let root = std::fs::canonicalize(&root).unwrap();
+
+    for name in ["fd", "rg"] {
+        let (bin, args, _) = prepare_external_tool(
+            name,
+            &json!({"pattern": "--exec", "path": root.to_str().unwrap()}),
+            &root,
+        )
+        .expect("option-shaped pattern must remain data");
+        if matches!((name, bin.as_str()), ("fd", "fd") | ("rg", "rg")) {
+            let pattern_idx = args.iter().position(|arg| arg == "--exec").unwrap();
+            assert_eq!(args[pattern_idx - 1], "--", "{name}: {args:?}");
+        }
+        if name == "rg" && bin == "rg" {
+            assert!(args.iter().any(|arg| arg == "--no-config"), "{args:?}");
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -5669,8 +10012,11 @@ fn rg_tool_threads_extra_args_on_happy_path() {
     )
     .expect("prepare rg with extras");
     assert_eq!(bin, "rg");
-    // First two are always base flags, then extras in order, then pattern + path.
-    assert_eq!(&args[0..2], &["--line-number", "--no-heading"]);
+    // Base flags disable config-file injection and preserve stable output.
+    assert_eq!(
+        &args[0..3],
+        &["--no-config", "--line-number", "--no-heading"]
+    );
     assert!(args.contains(&"-i".to_string()), "{args:?}");
     assert!(args.contains(&"--glob=*.rs".to_string()), "{args:?}");
     assert!(
@@ -5678,6 +10024,10 @@ fn rg_tool_threads_extra_args_on_happy_path() {
         "{args:?}"
     );
     let pattern_idx = args.iter().position(|a| a == "fn main").expect("pattern");
+    assert_eq!(
+        args.get(pattern_idx.wrapping_sub(1)).map(String::as_str),
+        Some("--")
+    );
     let path_idx = pattern_idx + 1;
     assert_eq!(args.get(path_idx).map(String::as_str), root.to_str());
 
@@ -5703,7 +10053,8 @@ fn rg_grep_fallback_translates_glob_flag() {
             "extra_args": ["-i", "--glob=*.rs", "--glob", "!node_modules", "--unsupported-flag"]
         }),
         &root,
-    );
+    )
+    .expect("prepare rg fallback");
     assert_eq!(bin, "grep");
     assert_eq!(&args[0..3], &["-rn", "-E", "--color=never"]);
     assert!(args.contains(&"-i".to_string()), "{args:?}");
@@ -5715,8 +10066,29 @@ fn rg_grep_fallback_translates_glob_flag() {
         !args.iter().any(|a| a == "--unsupported-flag"),
         "unknown flags must be dropped in grep fallback: {args:?}"
     );
+    assert_eq!(args[args.len() - 3], "--");
     assert_eq!(args[args.len() - 2], "needle");
     assert_eq!(args.last().map(String::as_str), root.to_str(), "{args:?}");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let outside = temp_test_dir("rg-grep-fallback-dangling-target");
+        let target = outside.join("missing.txt");
+        symlink(&target, root.join("dangling-alias")).expect("create dangling fallback alias");
+        let error = prepare_external_tool_fallback(
+            "rg",
+            &json!({"pattern": "needle", "path": "dangling-alias"}),
+            &root,
+        )
+        .expect_err("fallback must not retarget an invalid path to the workspace root");
+        assert!(
+            error.contains("cannot resolve existing path component"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -5734,7 +10106,8 @@ fn fd_find_fallback_translates_type_and_consumes_value() {
             "extra_args": ["-H", "--type", "f"]
         }),
         &root,
-    );
+    )
+    .expect("prepare fd file fallback");
     assert_eq!(bin, "find");
     let type_idx = args
         .iter()
@@ -5823,7 +10196,8 @@ fn fd_find_fallback_maps_directory_type() {
             "extra_args": ["--type", "d"]
         }),
         &root,
-    );
+    )
+    .expect("prepare fd directory fallback");
     assert_eq!(bin, "find");
     let type_idx = args
         .iter()
@@ -5872,12 +10246,48 @@ fn git_diff_builds_expected_argv() {
         &root,
     )
     .expect("prepare git_diff");
-    assert_eq!(args, vec!["diff", "--cached", "--", "src/main.rs"]);
+    assert_eq!(
+        args,
+        vec![
+            "--no-pager",
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "protocol.allow=never",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--cached",
+            "--",
+            "src/main.rs",
+        ]
+    );
 
     let (_, args_commit, _) =
         prepare_external_tool("git_diff", &json!({"commit": "HEAD~1"}), &root)
             .expect("prepare git_diff commit");
-    assert_eq!(args_commit, vec!["diff", "HEAD~1"]);
+    assert_eq!(
+        args_commit,
+        vec![
+            "--no-pager",
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "protocol.allow=never",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD~1",
+        ]
+    );
 
     let (_, args_stat, _) = prepare_external_tool(
         "git_diff",
@@ -5887,10 +10297,556 @@ fn git_diff_builds_expected_argv() {
     .expect("prepare git_diff stat");
     assert_eq!(
         args_stat,
-        vec!["diff", "--stat", "--cached", "--", "src/main.rs"]
+        vec![
+            "--no-pager",
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "protocol.allow=never",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--stat",
+            "--cached",
+            "--",
+            "src/main.rs",
+        ]
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn git_tools_reject_option_injection_malformed_fields_and_outside_paths() {
+    let root = temp_test_dir("git-tool-input-validation");
+    let outside = root
+        .parent()
+        .expect("temp root parent")
+        .join(format!("outside-{}", std::process::id()));
+    std::fs::write(root.join("inside.txt"), "inside\n").expect("write inside fixture");
+    std::fs::write(&outside, "outside\n").expect("write outside fixture");
+
+    for revision in ["--ext-diff", "-O/tmp/order", "HEAD\n--output=leak"] {
+        let error = prepare_external_tool("git_diff", &json!({"commit": revision}), &root)
+            .expect_err("option-like or control-bearing revision must be rejected");
+        assert!(error.contains("non-option"), "{revision:?}: {error}");
+    }
+
+    for input in [
+        json!({"path": 7}),
+        json!({"staged": "yes"}),
+        json!({"stat": []}),
+    ] {
+        prepare_external_tool("git_diff", &input, &root)
+            .expect_err("malformed git_diff field must fail closed");
+    }
+    for input in [
+        json!({"path": false}),
+        json!({"oneline": "yes"}),
+        json!({"count": "10"}),
+        json!({"count": -1}),
+    ] {
+        prepare_external_tool("git_log", &input, &root)
+            .expect_err("malformed git_log field must fail closed");
+    }
+
+    for tool in ["git_diff", "git_log"] {
+        let error = prepare_external_tool(tool, &json!({"path": outside.to_string_lossy()}), &root)
+            .expect_err("outside Git path must be rejected");
+        assert!(error.contains("outside"), "{tool}: {error}");
+    }
+
+    let (_, args, _) = prepare_external_tool("git_diff", &json!({"path": ":(top,glob)**"}), &root)
+        .expect("pathspec magic must be passed as a literal filename");
+    assert!(args.iter().any(|arg| arg == "--literal-pathspecs"));
+    assert_eq!(args.last().map(String::as_str), Some(":(top,glob)**"));
+
+    let _ = std::fs::remove_file(outside);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn git_pathspec_preserves_final_symlink_and_rejects_symlinked_ancestors() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("git-tool-symlink-pathspec");
+    std::fs::create_dir(root.join("real-dir")).expect("create real directory");
+    std::fs::write(root.join("real-dir/file.txt"), "real\n").expect("write real file");
+    std::fs::write(root.join("target.txt"), "target\n").expect("write target");
+    symlink("target.txt", root.join("link.txt")).expect("create final symlink");
+    symlink("real-dir", root.join("alias-dir")).expect("create directory symlink");
+
+    assert_eq!(
+        git_tool_pathspec(&root, "git_diff", "link.txt").expect("preserve final symlink"),
+        "link.txt"
+    );
+    let (_, args, _) = prepare_external_tool("git_diff", &json!({"path": "link.txt"}), &root)
+        .expect("prepare final-symlink diff");
+    assert_eq!(args.last().map(String::as_str), Some("link.txt"));
+
+    let error = git_tool_pathspec(&root, "git_commit", "alias-dir/file.txt")
+        .expect_err("symlinked parent must fail closed");
+    assert!(error.contains("symlinked ancestor"), "{error}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn git_commit_path_stages_the_tracked_symlink_not_its_referent() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("git-commit-symlink-pathspec");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("target-a.txt"), "a\n").expect("write first target");
+    std::fs::write(root.join("target-b.txt"), "b\n").expect("write second target");
+    symlink("target-a.txt", root.join("link.txt")).expect("create tracked symlink");
+    git_ok(&root, &["add", "target-a.txt", "target-b.txt", "link.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    std::fs::remove_file(root.join("link.txt")).expect("remove old symlink");
+    symlink("target-b.txt", root.join("link.txt")).expect("retarget symlink");
+    execute_git_commit_async(
+        &json!({"message": "test: retarget link", "paths": ["link.txt"]}),
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        SandboxProfile::WorkspaceWrite,
+        false,
+    )
+    .await
+    .expect("commit tracked symlink change");
+
+    assert_eq!(
+        git_stdout(&root, &["show", "HEAD:link.txt"]),
+        "target-b.txt"
+    );
+    assert_eq!(git_stdout(&root, &["status", "--porcelain"]), "");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn git_commit_rejects_malformed_path_arrays_before_staging() {
+    let root = temp_test_dir("git-commit-path-array-validation");
+    std::fs::write(root.join("tracked.txt"), "unchanged\n").expect("write fixture");
+
+    for paths in [
+        json!("tracked.txt"),
+        json!([7]),
+        json!(["tracked.txt", null]),
+    ] {
+        let error = execute_git_commit_async(
+            &json!({"message": "test", "paths": paths}),
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            SandboxProfile::WorkspaceWrite,
+            false,
+        )
+        .await
+        .expect_err("malformed commit paths must fail before invoking Git");
+        assert!(error.contains("paths must"), "{error}");
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "current_thread")]
+async fn builtin_git_commit_disables_unapproved_hooks_filters_fsmonitor_and_signing() -> Result<()>
+{
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("builtin-git-commit-config-executors");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join(".gitattributes"), "*.txt filter=evil\n")?;
+    std::fs::write(root.join("tracked.txt"), "base\n")?;
+    git_ok(&root, &["add", ".gitattributes", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let marker = root.join("config-helper-ran");
+    let helper = root.join("config-helper.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncat\nexit 97\n",
+            shell_single_quote(&marker.to_string_lossy())
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&helper)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&helper, permissions)?;
+    let helper_text = helper.to_string_lossy().into_owned();
+    git_ok(&root, &["config", "filter.evil.clean", &helper_text]);
+    git_ok(&root, &["config", "filter.evil.smudge", &helper_text]);
+    git_ok(&root, &["config", "filter.evil.process", &helper_text]);
+    git_ok(&root, &["config", "filter.evil.required", "true"]);
+    git_ok(&root, &["config", "core.fsmonitor", &helper_text]);
+    git_ok(&root, &["config", "commit.gpgSign", "true"]);
+    git_ok(&root, &["config", "gpg.program", &helper_text]);
+    std::fs::write(
+        root.join(".git/hooks/pre-commit"),
+        format!(
+            "#!/bin/sh\nprintf hook >> {}\nexit 97\n",
+            shell_single_quote(&marker.to_string_lossy())
+        ),
+    )?;
+    let mut hook_permissions = std::fs::metadata(root.join(".git/hooks/pre-commit"))?.permissions();
+    hook_permissions.set_mode(0o700);
+    std::fs::set_permissions(root.join(".git/hooks/pre-commit"), hook_permissions)?;
+
+    std::fs::write(root.join("tracked.txt"), "changed\n")?;
+    execute_git_commit_async(
+        &json!({"message": "test: helpers disabled", "paths": ["tracked.txt"]}),
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        SandboxProfile::WorkspaceWrite,
+        false,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+
+    anyhow::ensure!(!marker.exists(), "repository-configured executor ran");
+    anyhow::ensure!(
+        git_stdout(&root, &["show", "HEAD:tracked.txt"]) == "changed",
+        "tracked content was not committed"
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_git_commit_disables_user_global_clean_filters() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("builtin-git-commit-global-filter");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join(".gitattributes"), "*.txt filter=global-evil\n")?;
+    std::fs::write(root.join("tracked.txt"), "base\n")?;
+    git_ok(&root, &["add", ".gitattributes", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let marker = root.join("global-filter-ran");
+    let helper = root.join("global-filter.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf helper > {}\ncat\nexit 97\n",
+            shell_single_quote(&marker.to_string_lossy())
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&helper)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&helper, permissions)?;
+
+    let home = root.join("test-home");
+    std::fs::create_dir(&home)?;
+    let global_config = home.join(".gitconfig");
+    let global_config_text = global_config.to_string_lossy().into_owned();
+    let helper_text = helper.to_string_lossy().into_owned();
+    git_ok(
+        &root,
+        &[
+            "config",
+            "--file",
+            &global_config_text,
+            "filter.global-evil.clean",
+            &helper_text,
+        ],
+    );
+    git_ok(
+        &root,
+        &[
+            "config",
+            "--file",
+            &global_config_text,
+            "filter.global-evil.required",
+            "true",
+        ],
+    );
+    std::fs::write(root.join("tracked.txt"), "changed\n")?;
+
+    let old_home = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("HOME", &home);
+    }
+    let result = execute_git_commit_async(
+        &json!({"message": "test: global filter disabled", "paths": ["tracked.txt"]}),
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        SandboxProfile::WorkspaceWrite,
+        false,
+    )
+    .await;
+    restore_env_var("HOME", old_home);
+
+    result.map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(!marker.exists(), "user-global clean filter executed");
+    anyhow::ensure!(
+        git_stdout(&root, &["show", "HEAD:tracked.txt"]) == "changed",
+        "tracked content was not committed"
+    );
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[tokio::test]
+async fn git_commit_rejects_malformed_all_and_unsafe_messages_before_staging() {
+    let root = temp_test_dir("git-commit-message-validation");
+    std::fs::write(root.join("tracked.txt"), "unchanged\n").expect("write fixture");
+
+    for input in [
+        json!({"message": "test", "all": "yes"}),
+        json!({"message": "   "}),
+        json!({"message": "bad\0message"}),
+        json!({"message": "x".repeat(64 * 1024 + 1)}),
+    ] {
+        execute_git_commit_async(
+            &input,
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            SandboxProfile::WorkspaceWrite,
+            false,
+        )
+        .await
+        .expect_err("invalid commit input must fail before invoking Git");
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_git_inspection_disables_helpers_and_ignores_ambient_git_state() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("builtin-git-inspection-isolation");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join(".gitattributes"), "*.txt diff=evil\n")?;
+    std::fs::write(root.join("tracked.txt"), "base\n")?;
+    git_ok(&root, &["add", ".gitattributes", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let helper = root.join("evil-helper.sh");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\nprintf 'GIT_HELPER_EXECUTED:%s:%s\\n' \"${GIT_INSPECTION_API_KEY-unset}\" \"${BASH_ENV-unset}\" >&2\nexit 97\n",
+    )?;
+    let mut permissions = std::fs::metadata(&helper)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&helper, permissions)?;
+    let helper_text = helper.to_string_lossy().into_owned();
+    git_ok(&root, &["config", "diff.external", &helper_text]);
+    git_ok(&root, &["config", "diff.evil.textconv", &helper_text]);
+    git_ok(&root, &["config", "core.fsmonitor", &helper_text]);
+    std::fs::write(root.join("tracked.txt"), "changed\n")?;
+
+    let alternate = temp_test_dir("builtin-git-inspection-alternate");
+    git_ok(&alternate, &["init", "-q"]);
+    let startup = root.join("startup.sh");
+    let startup_marker = root.join("startup-ran");
+    std::fs::write(
+        &startup,
+        format!(
+            "printf startup > {}\n",
+            shell_single_quote(&startup_marker.to_string_lossy())
+        ),
+    )?;
+
+    let old_external_diff = std::env::var_os("GIT_EXTERNAL_DIFF");
+    let old_git_dir = std::env::var_os("GIT_DIR");
+    let old_secret = std::env::var_os("GIT_INSPECTION_API_KEY");
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    let old_bash_env = std::env::var_os("BASH_ENV");
+    unsafe {
+        std::env::set_var("GIT_EXTERNAL_DIFF", &helper);
+        std::env::set_var("GIT_DIR", alternate.join(".git"));
+        std::env::set_var("GIT_INSPECTION_API_KEY", "inspection-secret");
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+        std::env::set_var("BASH_ENV", &startup);
+    }
+
+    let result = async {
+        let output = execute_builtin_call(
+            "git_diff".to_string(),
+            json!({"path": "tracked.txt"}),
+            root.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            SandboxProfile::ReadOnly,
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            output.contains("-base") && output.contains("+changed"),
+            "built-in diff did not inspect the active repository: {output}"
+        );
+        anyhow::ensure!(
+            !output.contains("GIT_HELPER_EXECUTED"),
+            "repository or ambient Git helper executed: {output}"
+        );
+        anyhow::ensure!(!startup_marker.exists(), "BASH_ENV startup file executed");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    restore_env_var("GIT_EXTERNAL_DIFF", old_external_diff);
+    restore_env_var("GIT_DIR", old_git_dir);
+    restore_env_var("GIT_INSPECTION_API_KEY", old_secret);
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+    restore_env_var("BASH_ENV", old_bash_env);
+    let _ = std::fs::remove_dir_all(alternate);
+    let _ = std::fs::remove_dir_all(root);
+    result
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_git_commit_hooks_are_credential_startup_and_temp_isolated() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("builtin-git-commit-hook-isolation");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n")?;
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let report = root.join("hook-report.txt");
+    let hook = root.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        format!(
+            r#"#!/bin/bash
+printf '%s|%s|%s|%s|%s|%s|%s|%s' \
+  "${{COMMIT_TEST_API_KEY-unset}}" \
+  "${{OPENAI_API_KEY-unset}}" \
+  "${{BASH_ENV-unset}}" \
+  "${{PYTHONPATH-unset}}" \
+  "${{GIT_TERMINAL_PROMPT-unset}}" \
+  "$(stat -c %a "$TMPDIR")" \
+  "$TMPDIR,$TMP,$TEMP" \
+  "${{COMMIT_STARTUP_RAN-unset}}" > {}
+"#,
+            shell_single_quote(&report.to_string_lossy())
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&hook)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&hook, permissions)?;
+
+    let startup = root.join("startup.sh");
+    let startup_marker = root.join("startup-ran");
+    std::fs::write(
+        &startup,
+        format!(
+            "printf startup > {}\nexport COMMIT_STARTUP_RAN=yes\n",
+            shell_single_quote(&startup_marker.to_string_lossy())
+        ),
+    )?;
+    let inherited_temp = root.join("inherited-temp");
+    std::fs::create_dir(&inherited_temp)?;
+    std::fs::write(root.join("tracked.txt"), "changed\n")?;
+
+    let old_secret = std::env::var_os("COMMIT_TEST_API_KEY");
+    let old_provider = std::env::var_os("OPENAI_API_KEY");
+    let old_opt_in = std::env::var_os(TOOL_CREDENTIAL_ENV_INHERIT_FLAG);
+    let old_bash_env = std::env::var_os("BASH_ENV");
+    let old_pythonpath = std::env::var_os("PYTHONPATH");
+    let old_tmpdir = std::env::var_os("TMPDIR");
+    let old_tmp = std::env::var_os("TMP");
+    let old_temp = std::env::var_os("TEMP");
+    unsafe {
+        std::env::set_var("COMMIT_TEST_API_KEY", "commit-secret");
+        std::env::set_var("OPENAI_API_KEY", "provider-secret");
+        std::env::set_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, "1");
+        std::env::set_var("BASH_ENV", &startup);
+        std::env::set_var("PYTHONPATH", &root);
+        std::env::set_var("TMPDIR", &inherited_temp);
+        std::env::set_var("TMP", &inherited_temp);
+        std::env::set_var("TEMP", &inherited_temp);
+    }
+
+    let result = async {
+        let output = execute_git_commit_async(
+            &json!({"message": "test: isolated hook", "paths": ["tracked.txt"]}),
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            SandboxProfile::WorkspaceWrite,
+            true,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(output.contains("test: isolated hook"), "{output}");
+        let rendered = std::fs::read_to_string(&report)?;
+        let fields = rendered.split('|').collect::<Vec<_>>();
+        anyhow::ensure!(fields.len() == 8, "unexpected hook report: {rendered:?}");
+        anyhow::ensure!(
+            fields[..5] == ["unset", "unset", "unset", "unset", "0"],
+            "hook inherited a credential, startup vector, or prompt setting: {rendered:?}"
+        );
+        anyhow::ensure!(
+            fields[5] == "700",
+            "hook temp was not private: {rendered:?}"
+        );
+        let temps = fields[6].split(',').collect::<Vec<_>>();
+        anyhow::ensure!(
+            temps.len() == 3,
+            "unexpected hook temp report: {rendered:?}"
+        );
+        anyhow::ensure!(temps[0] == temps[1] && temps[0] == temps[2]);
+        anyhow::ensure!(Path::new(temps[0]) != inherited_temp.as_path());
+        anyhow::ensure!(
+            !Path::new(temps[0]).exists(),
+            "private temp survived child exit: {}",
+            temps[0]
+        );
+        anyhow::ensure!(
+            fields[7] == "unset",
+            "startup file affected hook: {rendered:?}"
+        );
+        anyhow::ensure!(!startup_marker.exists(), "BASH_ENV startup file executed");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    restore_env_var("COMMIT_TEST_API_KEY", old_secret);
+    restore_env_var("OPENAI_API_KEY", old_provider);
+    restore_env_var(TOOL_CREDENTIAL_ENV_INHERIT_FLAG, old_opt_in);
+    restore_env_var("BASH_ENV", old_bash_env);
+    restore_env_var("PYTHONPATH", old_pythonpath);
+    restore_env_var("TMPDIR", old_tmpdir);
+    restore_env_var("TMP", old_tmp);
+    restore_env_var("TEMP", old_temp);
+    let _ = std::fs::remove_dir_all(root);
+    result
 }
 
 #[test]
@@ -6018,10 +10974,8 @@ fn parse_compact_slash_accepts_status_auto_and_percentage_override() {
         parse_compact_slash("/compact now"),
         Some(Err("usage: /compact [status|auto|<percent>|<percent>%]"))
     ));
-    assert!(matches!(
-        parse_compact_slash("/compacted"),
-        Some(Err("usage: /compact [status|auto|<percent>|<percent>%]"))
-    ));
+    assert!(parse_compact_slash("/compacted").is_none());
+    assert!(parse_compact_slash("/compact-report/output.md").is_none());
 }
 
 #[test]
@@ -6243,7 +11197,15 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
     assert!(chatgpt.get("reasoning").is_none(), "{chatgpt}");
     assert!(chatgpt.get("max_output_tokens").is_none(), "{chatgpt}");
 
-    assert!(openai_reasoning_effort(ThinkingEffort::Off).is_none());
+    assert!(openai_reasoning_effort(DEFAULT_LOCAL_MODEL, ThinkingEffort::Off).is_none());
+    assert_eq!(
+        openai_reasoning_effort("gpt-5.6-terra", ThinkingEffort::Off),
+        Some("none")
+    );
+    assert_eq!(
+        openai_reasoning_effort("gpt-5.6-luna", ThinkingEffort::Max),
+        Some("xhigh")
+    );
     assert!(anthropic_thinking_budget_tokens(ThinkingEffort::Off).is_none());
     assert_eq!(clamp_thinking_budget_below_max(8_192, 8_192), Some(6_144));
     assert_eq!(clamp_thinking_budget_below_max(4_096, 4_096), Some(3_072));
@@ -6251,6 +11213,44 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
     assert_eq!(clamp_thinking_budget_below_max(1_024, 1), None);
 
     let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn gpt_5_6_openai_request_uses_native_reasoning_and_completion_cap() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "openai".to_string();
+    agent.provider_profile = Some(profile);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "https://api.openai.com".to_string();
+    agent.model = "gpt-5.6-terra".to_string();
+    agent.thinking_effort = ThinkingEffort::Off;
+
+    let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["reasoning_effort"], "none", "{body}");
+    assert_eq!(body["max_completion_tokens"], 128_000, "{body}");
+    assert!(body.get("max_tokens").is_none(), "{body}");
+
+    let chatgpt = build_chatgpt_request(
+        "gpt-5.6-luna",
+        ThinkingEffort::Off,
+        "sys",
+        "sess-1",
+        vec![json!({"type":"message","role":"user","content":[]})],
+        Vec::new(),
+    );
+    assert_eq!(chatgpt["reasoning"]["effort"], "none", "{chatgpt}");
+    assert_eq!(
+        chatgpt_reasoning_effort("gpt-5.6-sol", ThinkingEffort::Max),
+        Some("xhigh")
+    );
+
     Ok(())
 }
 
@@ -6638,6 +11638,46 @@ fn current_dext_executable_falls_back_to_path_when_current_exe_missing() {
 }
 
 #[test]
+fn cross_platform_paths_normalize_for_tools_and_session_state() {
+    assert_eq!(
+        normalized_path_text(Path::new(r"\\?\C:\workspace\src\main.rs")),
+        "C:/workspace/src/main.rs"
+    );
+    assert_eq!(
+        normalized_path_text(Path::new(r"\\?\UNC\server\share\file.rs")),
+        "//server/share/file.rs"
+    );
+    for path in [
+        "/tmp/scratch.py",
+        r"C:\workspace\scratch.py",
+        r"\\server\share\scratch.py",
+    ] {
+        assert!(portable_path_is_absolute(path), "{path}");
+    }
+    assert!(!portable_path_is_absolute("src/main.rs"));
+}
+
+#[test]
+fn windows_bash_resolver_skips_wsl_aliases() {
+    let root = temp_test_dir("windows-bash-resolution");
+    let system32 = root.join("Windows/System32");
+    let windows_apps = root.join("Microsoft/WindowsApps");
+    let git_bin = root.join("Git/bin");
+    for dir in [&system32, &windows_apps, &git_bin] {
+        std::fs::create_dir_all(dir).expect("create fake PATH directory");
+        std::fs::write(dir.join("bash.exe"), b"fixture").expect("write fake bash");
+    }
+    let path = std::env::join_paths([&system32, &windows_apps, &git_bin]).expect("join fake PATH");
+
+    assert_eq!(
+        windows_bash_executable_from_path(&path),
+        Some(git_bin.join("bash.exe"))
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn shell_single_quote_handles_spaces_and_quotes() {
     #[cfg(unix)]
     assert_eq!(shell_single_quote("a b'c"), "'a b'\\''c'");
@@ -6653,7 +11693,14 @@ fn hooks_loads_project_hooks_json_by_default() {
     .expect("write hooks.json");
 
     let hooks = Hooks::load(&root);
-    let out = hooks.fire("user_prompt", "", &[], &[], &root);
+    let out = hooks.fire(
+        "user_prompt",
+        "",
+        &[],
+        &[],
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
     assert_eq!(out.len(), 1);
     assert!(out[0].0.contains("pack"), "{}", out[0].0);
 
@@ -6671,7 +11718,14 @@ fn hooks_capture_is_capped() {
         ..Default::default()
     };
 
-    let out = hooks.fire("pre_tool", "read_file", &[], &[], &root);
+    let out = hooks.fire(
+        "pre_tool",
+        "read_file",
+        &[],
+        &[],
+        &root,
+        SandboxProfile::WorkspaceWrite,
+    );
     assert_eq!(out.len(), 1);
     assert!(
         out[0].0.contains("hook stdout capped after"),
@@ -6685,6 +11739,59 @@ fn hooks_capture_is_capped() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_hooks_never_inherit_danger_full_access() {
+    let root = temp_test_dir("hook-sandbox-ceiling");
+    let outside = root.parent().expect("temp root parent").join(format!(
+        "dext-hook-outside-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos()
+    ));
+    let inside = root.join("inside.txt");
+    let hooks = Hooks {
+        user_prompt: vec![Hook {
+            tool_match: None,
+            command: format!(
+                "printf inside > {}; printf outside > {}",
+                shell_single_quote(&inside.to_string_lossy()),
+                shell_single_quote(&outside.to_string_lossy())
+            ),
+        }],
+        ..Default::default()
+    };
+
+    let out = hooks.fire(
+        "user_prompt",
+        "",
+        &[],
+        &[],
+        &root,
+        SandboxProfile::DangerFullAccess,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(std::fs::read_to_string(&inside).unwrap(), "inside");
+    if crate::sandbox::is_enforced() {
+        assert_ne!(out[0].1, 0, "outside hook write unexpectedly succeeded");
+        assert!(!outside.exists(), "hook escaped workspace confinement");
+    }
+
+    std::fs::remove_file(&inside).expect("remove workspace-write fixture");
+    let read_only = hooks.fire("user_prompt", "", &[], &[], &root, SandboxProfile::ReadOnly);
+    assert_eq!(read_only.len(), 1);
+    if crate::sandbox::is_enforced() {
+        assert_ne!(read_only[0].1, 0, "read-only hook mutated workspace");
+        assert!(!inside.exists(), "read-only hook wrote inside workspace");
+        assert!(!outside.exists(), "read-only hook wrote outside workspace");
+    }
+
+    let _ = std::fs::remove_file(outside);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -6728,8 +11835,17 @@ fn tiny_mode_uses_condensed_prompt_and_slim_env() {
 
 #[test]
 fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
+    let _guard = env_lock();
     let root = temp_test_dir("compact-env-ledger");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_packs_dir = std::env::var_os("DEXT_PACKS_DIR");
+    let old_shelves_dir = std::env::var_os("DEXT_SHELVES_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("home"));
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
     let mut agent = test_agent(&root);
     agent.work_ledger.files_changed = (0..8)
         .map(|idx| format!("src/module_{idx}.rs: {}", "x".repeat(500)))
@@ -6765,6 +11881,9 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
         env.len()
     );
 
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_PACKS_DIR", old_packs_dir);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves_dir);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -7159,6 +12278,98 @@ fn provider_switches_update_only_automatic_context_mode() {
 }
 
 #[test]
+fn session_state_fixtures_migrate_v1_v2_and_preserve_v3_semantics() -> Result<()> {
+    let (v1, v1_history) = load_session_state_fixture("v1.jsonl")?;
+    assert_eq!(v1.version, SESSION_FORMAT_VERSION);
+    assert_eq!(v1.model, "fixture-v1");
+    assert_eq!(v1.context_mode, ContextMode::Tiny);
+    assert!(v1.context_mode_explicit);
+    assert_eq!(v1_history.len(), 1);
+
+    let (v2, v2_history) = load_session_state_fixture("v2.jsonl")?;
+    assert_eq!(v2.version, SESSION_FORMAT_VERSION);
+    assert_eq!(v2.model, "fixture-v2");
+    assert_eq!(v2_history.len(), 2);
+    let Block::ToolResult { metadata, .. } = &v2_history[1].content[0] else {
+        panic!("v2 fixture must contain a tool result");
+    };
+    assert!(metadata.is_empty());
+
+    let (v3, v3_history) = load_session_state_fixture("v3.jsonl")?;
+    assert_eq!(v3.version, SESSION_FORMAT_VERSION);
+    let serialized_v3 = serde_json::to_string(&v3)?;
+    assert!(
+        !serialized_v3.contains("browser_recipe"),
+        "retired browser metadata must not be persisted: {serialized_v3}"
+    );
+    assert_eq!(v3.work_ledger.objective, "fixture objective");
+    assert_eq!(v3.work_ledger.current_phase, "verify");
+    assert_eq!(v3.provenance.provider, "local");
+    assert!(v3.provider_health.providers.contains_key("local"));
+    let Block::ToolResult { metadata, .. } = &v3_history[1].content[0] else {
+        panic!("v3 fixture must contain a tool result");
+    };
+    assert_eq!(metadata.status.as_deref(), Some("completed"));
+    assert_eq!(metadata.exit_code, Some(0));
+    assert_eq!(metadata.artifact.as_deref(), Some("fixture-artifact.json"));
+
+    let future_path = state_fixture_path("sessions", "future.jsonl");
+    let future_before = std::fs::read(&future_path)?;
+    let future = std::fs::read_to_string(&future_path)?;
+    let error = parse_session_header(future.lines().next().context("future fixture header")?)
+        .err()
+        .expect("future session fixture must fail")
+        .to_string();
+    assert!(
+        error.contains("unsupported session format version 4"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&future_path)?, future_before);
+
+    let corrupt_path = state_fixture_path("sessions", "corrupt.jsonl");
+    let corrupt_before = std::fs::read(&corrupt_path)?;
+    let error = load_session_state_fixture("corrupt.jsonl")
+        .err()
+        .expect("truncated session fixture must fail")
+        .to_string();
+    assert!(error.contains("bad fixture message on line 2"), "{error}");
+    assert_eq!(std::fs::read(&corrupt_path)?, corrupt_before);
+    Ok(())
+}
+
+#[test]
+fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
+    let legacy = parse_session_header(r#"{"model":"legacy","system":"system"}"#)
+        .expect("parse v1 session header");
+    assert_eq!(legacy.version, SESSION_FORMAT_VERSION);
+    assert_eq!(legacy.model, "legacy");
+
+    let v2 = parse_session_header(r#"{"version":2,"model":"v2","system":"system"}"#)
+        .expect("parse v2 session header");
+    assert_eq!(v2.version, SESSION_FORMAT_VERSION);
+    assert_eq!(v2.model, "v2");
+
+    let current = parse_session_header(
+        r#"{"version":3,"model":"v3","system":"system","context_mode":"Tiny"}"#,
+    )
+    .expect("parse v3 session header");
+    assert_eq!(current.version, SESSION_FORMAT_VERSION);
+    assert_eq!(current.context_mode, ContextMode::Tiny);
+    assert!(current.context_mode_explicit);
+
+    let error = parse_session_header(r#"{"version":4,"model":"future","system":"system"}"#)
+        .err()
+        .expect("future session format must fail")
+        .to_string();
+    assert!(
+        error.contains("unsupported session format version 4"),
+        "{error}"
+    );
+    assert!(parse_session_header(r#"{"version":"3"}"#).is_err());
+    assert!(parse_session_header("[]").is_err());
+}
+
+#[test]
 fn legacy_session_context_mode_preserves_nonstandard_as_explicit() {
     let mut value = serde_json::to_value(SessionHeader::default()).expect("serialize header");
     value
@@ -7235,6 +12446,21 @@ fn systems_preserve_tool_protocol_guardrails_and_table_guidance() {
     assert!(
         DEFAULT_SYSTEM.contains("Avoid stacked heading+table blocks"),
         "standard prompt should avoid renderer-hostile table stacks: {DEFAULT_SYSTEM}"
+    );
+
+    assert!(
+        DEFAULT_SYSTEM.contains("literal active user input")
+            && DEFAULT_SYSTEM.contains("Never dismiss terse, path-only")
+            && DEFAULT_SYSTEM.contains("inspect it first with native tools")
+            && DEFAULT_SYSTEM.contains("using bash/sudo discovery"),
+        "standard prompt should preserve path-only queued steering: {DEFAULT_SYSTEM}"
+    );
+    assert!(
+        TINY_SYSTEM.contains("literal active user input")
+            && TINY_SYSTEM.contains("never dismiss path-only/context-looking updates")
+            && TINY_SYSTEM.contains("inspect exact user paths first")
+            && TINY_SYSTEM.contains("not bash/sudo discovery"),
+        "tiny prompt should preserve path-only queued steering: {TINY_SYSTEM}"
     );
 
     let root = temp_test_dir("frugal-tool-protocol-note");
@@ -7380,6 +12606,7 @@ fn context_window_reads_from_provider_catalog() -> Result<()> {
             active_provider: "custom".to_string(),
             providers: vec![ProviderProfile {
                 id: "custom".to_string(),
+                builtin: None,
                 display_name: "Custom".to_string(),
                 api_provider: ApiProvider::OpenAi,
                 request_contract: Some(RequestContract::OpenAiChatCompletions),
@@ -7522,6 +12749,9 @@ fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> 
 
     let result = {
         assert_eq!(model_context_window("gpt-5.4"), 272_000);
+        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(model_context_window(model), 1_050_000, "{model}");
+        }
         Ok(())
     };
 
@@ -7898,7 +13128,6 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--budget=250k tokens".to_string(),
         "--approval=auto-read".to_string(),
         "--sandbox-profile=read-only".to_string(),
-        "--browser=agent-browser".to_string(),
         "--frugal".to_string(),
         "--tiny".to_string(),
         "--tool-context-profile=full".to_string(),
@@ -7908,15 +13137,15 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
     ])?;
 
     assert!(opts.no_session);
-    assert!(opts.no_trust_mode);
-    assert!(!opts.trust_mode);
     assert!(opts.fork);
     assert_eq!(opts.cd, Some(root.clone()));
     assert_eq!(opts.output, OutputMode::StreamJson);
     assert_eq!(opts.budget_cap.and_then(|cap| cap.tokens), Some(250_000));
-    assert_eq!(opts.approval_profile, Some(ApprovalProfile::AutoRead));
+    assert_eq!(
+        opts.approval_policy_override,
+        Some(ApprovalProfile::AutoRead)
+    );
     assert_eq!(opts.sandbox_profile, Some(SandboxProfile::ReadOnly));
-    assert_eq!(opts.browser_recipe, Some(BrowserRecipe::AgentBrowser));
     assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
     assert_eq!(opts.tool_context_profile, Some(ToolContextProfile::Full));
     assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
@@ -7988,15 +13217,439 @@ fn parse_cli_options_still_accepts_context_mode_tiny() -> Result<()> {
 }
 
 #[test]
-fn parse_cli_options_trust_flags_last_one_wins() -> Result<()> {
+fn parse_cli_options_policy_flags_last_one_wins() -> Result<()> {
     let opts = parse_cli_options(vec!["--no-trust".to_string(), "--trust".to_string()])?;
-    assert!(opts.trust_mode);
-    assert!(!opts.no_trust_mode);
+    assert_eq!(opts.approval_policy_override, Some(ApprovalProfile::Always));
 
-    let opts = parse_cli_options(vec!["--trust".to_string(), "--no-trust".to_string()])?;
-    assert!(!opts.trust_mode);
-    assert!(opts.no_trust_mode);
+    let opts = parse_cli_options(vec![
+        "--trust".to_string(),
+        "--approval=auto-write".to_string(),
+        "--no-trust".to_string(),
+        "--approval-profile".to_string(),
+        "never".to_string(),
+    ])?;
+    assert_eq!(opts.approval_policy_override, Some(ApprovalProfile::Never));
     Ok(())
+}
+
+#[test]
+fn console_permission_denies_non_interactive_and_prompts_only_with_two_terminals() {
+    let prompt_calls = std::cell::Cell::new(0);
+    let prompt = || {
+        prompt_calls.set(prompt_calls.get() + 1);
+        Choice::Once
+    };
+
+    assert!(matches!(
+        resolve_console_permission(false, true, prompt),
+        Choice::Deny
+    ));
+    assert!(matches!(
+        resolve_console_permission(true, false, prompt),
+        Choice::Deny
+    ));
+    assert_eq!(prompt_calls.get(), 0);
+    assert!(matches!(
+        resolve_console_permission(true, true, prompt),
+        Choice::Once
+    ));
+    assert_eq!(prompt_calls.get(), 1);
+}
+
+#[test]
+fn json_permission_always_denies_without_delegating_to_console() {
+    for mode in [OutputMode::Json, OutputMode::StreamJson] {
+        let mut sink = JsonSink::new(mode, false, true);
+        assert!(matches!(
+            sink.request_permission("write_file", &json!({"path": "denied.txt"})),
+            Choice::Deny
+        ));
+    }
+}
+
+#[test]
+fn approval_policy_resolver_is_fail_safe_and_has_fixed_precedence() {
+    let resolved = resolve_approval_policy(None, None, None);
+    assert_eq!(resolved.profile, ApprovalProfile::Ask);
+    assert_eq!(resolved.source, ApprovalPolicySource::Default);
+
+    let resolved = resolve_approval_policy(None, Some("auto-write"), Some("1"));
+    assert_eq!(resolved.profile, ApprovalProfile::AutoWrite);
+    assert_eq!(resolved.source, ApprovalPolicySource::DextApproval);
+
+    let resolved = resolve_approval_policy(Some(ApprovalProfile::Never), Some("always"), Some("1"));
+    assert_eq!(resolved.profile, ApprovalProfile::Never);
+    assert_eq!(resolved.source, ApprovalPolicySource::Cli);
+
+    let resolved = resolve_approval_policy(None, Some("invalid"), Some("yes"));
+    assert_eq!(resolved.profile, ApprovalProfile::Always);
+    assert_eq!(resolved.source, ApprovalPolicySource::DextTrust);
+    assert_eq!(resolved.warnings.len(), 1);
+
+    let resolved = resolve_approval_policy(None, None, Some("invalid"));
+    assert_eq!(resolved.profile, ApprovalProfile::Ask);
+    assert_eq!(resolved.source, ApprovalPolicySource::Default);
+    assert_eq!(resolved.warnings.len(), 1);
+
+    for false_value in ["0", "false", "off", "no"] {
+        let resolved = resolve_approval_policy(None, None, Some(false_value));
+        assert_eq!(resolved.profile, ApprovalProfile::Ask);
+        assert_eq!(resolved.source, ApprovalPolicySource::Default);
+    }
+}
+
+#[test]
+fn resume_reconciles_each_pending_tool_journal_fence_without_replay() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("tool-journal-resume-fences");
+    let input = json!({"path": "fenced.txt", "content": "new"});
+
+    let mut no_start_history = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call-no-start".to_string(),
+            name: "write_file".to_string(),
+            input: input.clone(),
+        }],
+    }];
+    let recovery = reconcile_pending_tool_calls(&mut no_start_history, None)?;
+    assert_eq!(recovery.not_started, 1);
+    assert_eq!(
+        last_tool_result(&no_start_history),
+        Some((
+            "[resume recovery] write_file was not started: no durable start fence exists. Review current state before making a new call.",
+            "not_started"
+        ))
+    );
+
+    let session_id = "resume-fences";
+    let session_path = session_latest_session_path(&root, session_id);
+    let record_id = tool_journal::start(
+        &root,
+        session_id,
+        tool_journal::StartSpec {
+            turn_id: "turn-1",
+            batch_id: "batch-1",
+            call_id: "call-fenced",
+            tool_name: "write_file",
+            summary: "write_file: approved side-effect-capable call",
+            input: &input,
+        },
+    )?;
+    let entries = tool_journal::load_for_session_file(&session_path)?.expect("started journal");
+    let mut uncertain_history = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call-fenced".to_string(),
+            name: "write_file".to_string(),
+            input: input.clone(),
+        }],
+    }];
+    let recovery = reconcile_pending_tool_calls(&mut uncertain_history, Some(&entries))?;
+    assert_eq!(recovery.uncertain, 1);
+    assert_eq!(
+        last_tool_result(&uncertain_history).map(|(_, status)| status),
+        Some("uncertain")
+    );
+
+    tool_journal::finish(
+        &root,
+        session_id,
+        &record_id,
+        tool_journal::ToolJournalStatus::Completed,
+    )?;
+    let entries = tool_journal::load_for_session_file(&session_path)?.expect("terminal journal");
+    let mut terminal_history = vec![Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call-fenced".to_string(),
+            name: "write_file".to_string(),
+            input: input.clone(),
+        }],
+    }];
+    let recovery = reconcile_pending_tool_calls(&mut terminal_history, Some(&entries))?;
+    assert_eq!(recovery.recovered_terminal, 1);
+    assert_eq!(
+        last_tool_result(&terminal_history).map(|(_, status)| status),
+        Some("recovered_completed")
+    );
+    assert!(
+        !root.join("fenced.txt").exists(),
+        "recovery must never replay the tool"
+    );
+
+    let before = terminal_history.len();
+    let recovery = reconcile_pending_tool_calls(&mut terminal_history, Some(&entries))?;
+    assert_eq!(recovery.total(), 0);
+    assert_eq!(
+        terminal_history.len(),
+        before,
+        "paired calls must remain unchanged"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn loading_session_reconciles_source_journal_and_emits_one_warning() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("tool-journal-load-recovery");
+    let mut source = test_agent(&root);
+    let input = json!({"path": "uncertain.txt", "content": "new"});
+    source.history.push(Message {
+        role: "assistant".to_string(),
+        content: vec![Block::ToolUse {
+            id: "call-uncertain".to_string(),
+            name: "write_file".to_string(),
+            input: input.clone(),
+        }],
+    });
+    let source_path = source.save_latest_session()?;
+    tool_journal::start(
+        &root,
+        &source.session_id,
+        tool_journal::StartSpec {
+            turn_id: "turn-1",
+            batch_id: "batch-1",
+            call_id: "call-uncertain",
+            tool_name: "write_file",
+            summary: "write_file: approved side-effect-capable call",
+            input: &input,
+        },
+    )?;
+
+    let mut resumed = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    resumed.set_sink(Box::new(ChannelSink { tx }));
+    resumed.load_session_from_path(&source_path)?;
+
+    assert_eq!(
+        last_tool_result(&resumed.history).map(|(_, status)| status),
+        Some("uncertain")
+    );
+    assert!(
+        !root.join("uncertain.txt").exists(),
+        "resume must not replay uncertain calls"
+    );
+    let warnings = drain_events(&mut rx)
+        .into_iter()
+        .filter(|event| matches!(event, AgentEvent::Warn(text) if text.contains("resume recovery")))
+        .count();
+    assert_eq!(warnings, 1);
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the process-global test environment must remain stable across the async operation"
+)]
+#[tokio::test(flavor = "current_thread")]
+async fn side_effect_tool_journal_records_completed_failed_and_interrupted_outcomes() -> Result<()>
+{
+    let _guard = env_lock();
+    async fn run_call(
+        root: &Path,
+        call_id: &str,
+        tool_name: &str,
+        input: Value,
+        interrupt_after_start: bool,
+    ) -> Result<(Agent, std::result::Result<(), anyhow::Error>)> {
+        let (base_url, server) = spawn_openai_tool_call_server(call_id, tool_name, &input);
+        let mut agent = test_agent(root);
+        configure_local_openai_agent(&mut agent, base_url);
+        agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+        let interrupt = agent.interrupt.clone();
+        let session_path = agent.latest_session_path.clone();
+        let watcher = interrupt_after_start.then(|| {
+            tokio::spawn(async move {
+                for _ in 0..500 {
+                    if tool_journal::load_for_session_file(&session_path)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry.status == tool_journal::ToolJournalStatus::Started
+                            })
+                        })
+                    {
+                        interrupt.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+        });
+        let result = agent.chat("run one tool".to_string()).await;
+        if let Some(watcher) = watcher {
+            watcher.await.expect("interrupt watcher");
+        }
+        server.join().expect("tool-call server");
+        Ok((agent, result))
+    }
+
+    let completed_root = temp_test_dir("tool-journal-completed");
+    let (completed, result) = run_call(
+        &completed_root,
+        "call-completed",
+        "write_file",
+        json!({"path": "completed.txt", "content": "done"}),
+        false,
+    )
+    .await?;
+    result?;
+    assert_eq!(
+        std::fs::read_to_string(completed_root.join("completed.txt"))?,
+        "done"
+    );
+    let entries = tool_journal::load_for_session_file(&completed.latest_session_path)?
+        .expect("completed journal");
+    assert_eq!(
+        entries.last().map(|entry| entry.status),
+        Some(tool_journal::ToolJournalStatus::Completed)
+    );
+
+    let failed_root = temp_test_dir("tool-journal-failed");
+    let (failed, result) = run_call(
+        &failed_root,
+        "call-failed",
+        "bash",
+        json!({"command": "exit 7"}),
+        false,
+    )
+    .await?;
+    result?;
+    let entries =
+        tool_journal::load_for_session_file(&failed.latest_session_path)?.expect("failed journal");
+    assert_eq!(
+        entries.last().map(|entry| entry.status),
+        Some(tool_journal::ToolJournalStatus::Failed)
+    );
+
+    let interrupted_root = temp_test_dir("tool-journal-interrupted");
+    let (interrupted, result) = run_call(
+        &interrupted_root,
+        "call-interrupted",
+        "bash",
+        json!({"command": "sleep 5"}),
+        true,
+    )
+    .await?;
+    assert!(result.is_err(), "interrupted turn should return an error");
+    let entries = tool_journal::load_for_session_file(&interrupted.latest_session_path)?
+        .expect("interrupted journal");
+    assert_eq!(
+        entries.last().map(|entry| entry.status),
+        Some(tool_journal::ToolJournalStatus::Interrupted)
+    );
+
+    let _ = std::fs::remove_dir_all(completed_root);
+    let _ = std::fs::remove_dir_all(failed_root);
+    let _ = std::fs::remove_dir_all(interrupted_root);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the process-global test environment must remain stable across the async operation"
+)]
+#[tokio::test(flavor = "current_thread")]
+async fn side_effect_tool_does_not_execute_when_journal_start_fence_fails() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let _guard = env_lock();
+
+    let root = temp_test_dir("tool-journal-start-fail-closed");
+    let input = json!({"path": "must-not-exist.txt", "content": "blocked"});
+    let (base_url, server) =
+        spawn_openai_tool_call_server("call-start-fails", "write_file", &input);
+    let mut agent = test_agent(&root);
+    configure_local_openai_agent(&mut agent, base_url);
+    std::fs::create_dir_all(session::session_state_dir(&root, &agent.session_id))?;
+    let target = root.join("unsafe-journal-target");
+    std::fs::write(&target, "{}")?;
+    symlink(
+        &target,
+        tool_journal::journal_path(&root, &agent.session_id),
+    )?;
+
+    agent.chat("try one tool".to_string()).await?;
+    server.join().expect("tool-call server");
+
+    assert!(!root.join("must-not-exist.txt").exists());
+    let (content, _) = last_tool_result(&agent.history).expect("start fence tool result");
+    assert!(content.contains("start fence failed"), "{content}");
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn applying_current_policy_after_resume_clears_saved_privileged_grants() -> Result<()> {
+    let root = temp_test_dir("resume-policy");
+    let mut source = test_agent(&root);
+    source.set_resolved_approval_profile(ApprovalProfile::Always, ApprovalPolicySource::Cli);
+    let path = root.join("saved.jsonl");
+    source.save_session_to_path(&path)?;
+
+    let mut resumed = test_agent(&root);
+    resumed.load_session_from_path(&path)?;
+    assert_eq!(resumed.approval_profile, ApprovalProfile::Always);
+    assert!(resumed.allowed.contains("write_file"));
+
+    resumed.set_resolved_approval_profile(ApprovalProfile::Ask, ApprovalPolicySource::Default);
+    assert_eq!(resumed.approval_profile, ApprovalProfile::Ask);
+    assert_eq!(
+        resumed.approval_policy_source,
+        ApprovalPolicySource::Default
+    );
+    assert!(!resumed.allowed.contains("write_file"));
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn user_dotenv_loads_only_the_explicit_state_file() {
+    let _guard = env_lock();
+    let root = temp_test_dir("user-dotenv");
+    let state_env = root.join("state.env");
+    let project_env = root.join(".env");
+    std::fs::write(
+        &state_env,
+        "DEXT_TEST_USER_DOTENV=trusted\nDEXT_APPROVAL=ask\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &project_env,
+        "DEXT_TEST_PROJECT_DOTENV=untrusted\nDEXT_APPROVAL=always\n",
+    )
+    .unwrap();
+    let old_user = std::env::var_os("DEXT_TEST_USER_DOTENV");
+    let old_project = std::env::var_os("DEXT_TEST_PROJECT_DOTENV");
+    let old_approval = std::env::var_os("DEXT_APPROVAL");
+    unsafe {
+        std::env::remove_var("DEXT_TEST_USER_DOTENV");
+        std::env::remove_var("DEXT_TEST_PROJECT_DOTENV");
+        std::env::remove_var("DEXT_APPROVAL");
+    }
+
+    load_user_dotenv_from(&state_env);
+
+    assert_eq!(
+        std::env::var("DEXT_TEST_USER_DOTENV").as_deref(),
+        Ok("trusted")
+    );
+    assert_eq!(std::env::var("DEXT_APPROVAL").as_deref(), Ok("ask"));
+    assert!(std::env::var("DEXT_TEST_PROJECT_DOTENV").is_err());
+
+    restore_env_var("DEXT_TEST_USER_DOTENV", old_user);
+    restore_env_var("DEXT_TEST_PROJECT_DOTENV", old_project);
+    restore_env_var("DEXT_APPROVAL", old_approval);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -8311,6 +13964,62 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
 }
 
 #[test]
+fn gpt_5_6_pricing_applies_documented_long_context_tier() {
+    let _guard = env_lock();
+    for name in [
+        "DEXT_INPUT_USD_PER_MTOK",
+        "DEXT_OUTPUT_USD_PER_MTOK",
+        "DEXT_CACHE_READ_USD_PER_MTOK",
+        "DEXT_CACHE_CREATE_USD_PER_MTOK",
+    ] {
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+    let usage = Usage {
+        input: 300_000,
+        output: 100_000,
+        cache_create: 0,
+        cache_read: 0,
+        cost_usd: None,
+    };
+    for (model, expected) in [
+        ("gpt-5.6-sol", 7.5),
+        ("gpt-5.6-terra", 3.75),
+        ("gpt-5.6-luna", 1.5),
+    ] {
+        let priced = usage_with_current_pricing(
+            usage,
+            "openai",
+            ApiProvider::OpenAi,
+            "https://api.openai.com",
+            model,
+            None,
+        );
+        assert_eq!(priced.cost_usd, Some(expected), "{model}");
+    }
+
+    let threshold_usage = Usage {
+        input: 272_000,
+        output: 100_000,
+        ..Usage::default()
+    };
+    let threshold = usage_with_current_pricing(
+        threshold_usage,
+        "openai",
+        ApiProvider::OpenAi,
+        "https://api.openai.com",
+        "gpt-5.6-terra",
+        None,
+    );
+    assert!(
+        (threshold.cost_usd.expect("threshold price") - 2.18).abs() < 1e-12,
+        "{:?}",
+        threshold.cost_usd
+    );
+}
+
+#[test]
 fn anthropic_fable_pricing_matches_console_session_cost() {
     let pricing = usage_pricing_for(
         "anthropic",
@@ -8565,14 +14274,8 @@ fn provider_runtime_and_slash_registries_are_split() {
     assert!(provider_names.contains("read_file"));
     assert!(provider_names.contains("jq"));
     assert!(provider_names.contains("csvkit"));
-    assert!(provider_names.contains("browser"));
-    assert!(tools::is_external_process_tool("browser"));
-    assert_eq!(
-        prepare_external_tool("browser", &json!({"args": ["snapshot"]}), Path::new("."))
-            .expect("prepare browser tool")
-            .0,
-        "agent-browser"
-    );
+    assert!(!provider_names.contains("browser"));
+    assert!(!tools::is_external_process_tool("browser"));
 
     let default_names: HashSet<&str> = provider_tool_definitions()
         .iter()
@@ -8584,16 +14287,11 @@ fn provider_runtime_and_slash_registries_are_split() {
     assert!(!default_names.contains("csvkit"));
     assert!(!default_names.contains("git_log"));
 
-    assert_eq!(
-        BrowserRecipe::parse("agentbrowser"),
-        Some(BrowserRecipe::AgentBrowser)
-    );
-
     let slash_names: HashSet<&str> = tools::slash_command_definitions()
         .iter()
         .map(|cmd| cmd.name)
         .collect();
-    assert!(slash_names.contains("browser"));
+    assert!(!slash_names.contains("browser"));
     assert!(slash_names.contains("tools"));
     assert!(!slash_names.contains("toolset"));
     assert!(slash_names.contains("pack"));
@@ -8714,35 +14412,6 @@ fn suppressed_checkpoints_do_not_clobber_parent_session() {
     result.expect("checkpoint suppression");
 }
 
-#[test]
-fn sse_scan_handles_mixed_lf_and_crlf_delimiters() {
-    let mut stream = Vec::new();
-    stream.extend_from_slice(b"event: content_block_delta\n");
-    stream.extend_from_slice(b"data: {\"n\":1}\n\n");
-    stream.extend_from_slice(b"event: content_block_delta\r\n");
-    stream.extend_from_slice(b"data: {\"n\":2}\r\n\r\n");
-    stream.extend_from_slice(b"event: message_stop\n");
-    stream.extend_from_slice(b"data: {}\n\n");
-
-    let mut recovered: Vec<Value> = Vec::new();
-    let mut buf: Vec<u8> = stream;
-    while let Some((event_text, consumed)) = next_sse_event(&buf) {
-        for line in event_text.lines() {
-            if let Some(rest) = line.strip_prefix("data:") {
-                let rest = rest.trim_start();
-                if let Ok(v) = serde_json::from_str::<Value>(rest) {
-                    recovered.push(v);
-                }
-            }
-        }
-        buf.drain(..consumed);
-    }
-    assert_eq!(recovered.len(), 3, "got {recovered:?}");
-    assert_eq!(recovered[0]["n"], 1);
-    assert_eq!(recovered[1]["n"], 2);
-    assert!(buf.is_empty(), "trailing {:?}", buf);
-}
-
 #[tokio::test]
 async fn bash_tool_receives_active_pack_environment() {
     let root = temp_test_dir("bash-pack-env");
@@ -8758,7 +14427,9 @@ async fn bash_tool_receives_active_pack_environment() {
         None,
         None,
         None,
+        None,
         SandboxProfile::WorkspaceWrite,
+        false,
         None,
         vec![
             ("DEXT_PACK_DIR".to_string(), pack_dir_text.clone()),
@@ -8788,7 +14459,9 @@ async fn bash_tool_honors_input_timeout() {
         None,
         None,
         None,
+        None,
         SandboxProfile::WorkspaceWrite,
+        false,
         None,
         Vec::new(),
     )
@@ -8872,6 +14545,35 @@ fn fd_and_rg_discovery_ignore_heavy_dirs_by_default() {
             .windows(2)
             .any(|w| w == ["--exclude", "target"] || w == ["-path", "*/target/*"]),
         "{unrestricted_args:?}"
+    );
+
+    let explicit_hidden_root = root.join(".dext/shelves");
+    std::fs::create_dir_all(&explicit_hidden_root).expect("create explicit hidden root");
+    let (_fd_bin, explicit_fd_args, _) = prepare_external_tool(
+        "fd",
+        &json!({"pattern": "PACK\\.md$", "path": explicit_hidden_root.to_str().unwrap()}),
+        &root,
+    )
+    .expect("prepare fd for explicit .dext root");
+    assert!(
+        !explicit_fd_args
+            .windows(2)
+            .any(|w| w == ["--exclude", ".dext"] || w == ["-path", "*/.dext/*"]),
+        "explicit .dext root must not exclude itself: {explicit_fd_args:?}"
+    );
+
+    let (_rg_bin, explicit_rg_args, _) = prepare_external_tool(
+        "rg",
+        &json!({"pattern": "needle", "path": explicit_hidden_root.to_str().unwrap()}),
+        &root,
+    )
+    .expect("prepare rg for explicit .dext root");
+    assert!(
+        !explicit_rg_args
+            .windows(2)
+            .any(|w| w == ["--glob", "!**/.dext/**"])
+            && !explicit_rg_args.contains(&"--exclude-dir=.dext".to_string()),
+        "explicit .dext root must not exclude itself: {explicit_rg_args:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -9071,6 +14773,57 @@ fn multi_edit_returns_diff_and_summary() {
     assert!(out.contains("+GAMMA"), "{out}");
     assert!(out.contains("applied 2 edits to"), "{out}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn todo_and_compact_settings_state_fixtures_validate_without_rewriting_rejections() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("todo-settings-fixtures");
+    let root = std::fs::canonicalize(root)?;
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("dext-home"));
+    }
+
+    let result = (|| -> Result<()> {
+        let todo_path = root.join("DEXT.todo.json");
+        let valid_todo = std::fs::read(state_fixture_path("todo", "valid.json"))?;
+        std::fs::write(&todo_path, &valid_todo)?;
+        let rendered = execute_tool("todo_read", &json!({}), &root).map_err(anyhow::Error::msg)?;
+        assert!(rendered.contains("fixture pending"), "{rendered}");
+        assert!(rendered.contains("fixture complete"), "{rendered}");
+        assert_eq!(std::fs::read(&todo_path)?, valid_todo);
+
+        let corrupt_todo = std::fs::read(state_fixture_path("todo", "corrupt.json"))?;
+        std::fs::write(&todo_path, &corrupt_todo)?;
+        let error = execute_tool("todo_read", &json!({}), &root)
+            .expect_err("non-array todo fixture must fail");
+        assert!(error.contains("expected array"), "{error}");
+        assert_eq!(std::fs::read(&todo_path)?, corrupt_todo);
+
+        let settings_path = compact_threshold_settings_path();
+        std::fs::create_dir_all(settings_path.parent().context("settings parent")?)?;
+        let valid_settings = std::fs::read(state_fixture_path("settings", "valid.json"))?;
+        std::fs::write(&settings_path, &valid_settings)?;
+        assert_eq!(load_compact_threshold_percent_setting()?, Some(42));
+        assert_eq!(std::fs::read(&settings_path)?, valid_settings);
+
+        for fixture in ["out-of-range.json", "corrupt.json"] {
+            let bytes = std::fs::read(state_fixture_path("settings", fixture))?;
+            std::fs::write(&settings_path, &bytes)?;
+            assert!(
+                load_compact_threshold_percent_setting().is_err(),
+                "settings fixture {fixture}"
+            );
+            assert_eq!(std::fs::read(&settings_path)?, bytes);
+        }
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
 }
 
 #[test]
@@ -9520,7 +15273,15 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["glm", "chatgpt", "openai", "anthropic", "deepseek", "local"]
+            vec![
+                "glm",
+                "chatgpt",
+                "openai",
+                "anthropic",
+                "kimi",
+                "deepseek",
+                "local",
+            ]
         );
 
         let glm = find_provider_profile(&catalog, "glm").context("glm")?;
@@ -9538,6 +15299,17 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         let anthropic = find_provider_profile(&catalog, "anthropic").context("anthropic")?;
         assert_eq!(anthropic.api_provider, ApiProvider::Anthropic);
         assert_eq!(anthropic.env_vars, vec!["ANTHROPIC_API_KEY"]);
+
+        let kimi = find_provider_profile(&catalog, "kimi").context("kimi")?;
+        assert_eq!(kimi.api_provider, ApiProvider::Anthropic);
+        assert_eq!(kimi.env_vars, vec!["KIMI_API_KEY"]);
+        assert_eq!(kimi.base_url, "https://api.kimi.com/coding");
+        assert_eq!(
+            kimi.login_url.as_deref(),
+            Some("https://www.kimi.com/code/console")
+        );
+        assert_eq!(kimi.default_model, "k3");
+        assert!(kimi.oauth_flow.is_none());
 
         let deepseek = find_provider_profile(&catalog, "deepseek").context("deepseek")?;
         assert_eq!(deepseek.api_provider, ApiProvider::OpenAi);
@@ -9649,6 +15421,215 @@ fn local_provider_merge_preserves_user_local_context_override_without_retired_ar
 
 #[cfg(unix)]
 #[test]
+fn crash_snapshots_are_private_and_reject_symlink_targets() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = temp_test_dir("crash-snapshot-private");
+    let crash_dir = root.join("crashes");
+    std::fs::create_dir(&crash_dir)?;
+    std::fs::set_permissions(&crash_dir, std::fs::Permissions::from_mode(0o755))?;
+    let snapshot = crash_dir.join("crash.json");
+    write_private_crash_snapshot(&snapshot, &json!({"safe": true}))?;
+    assert_eq!(
+        std::fs::metadata(&crash_dir)?.permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&snapshot)?.permissions().mode() & 0o777,
+        0o600
+    );
+
+    let victim = root.join("victim.json");
+    std::fs::write(&victim, b"unchanged")?;
+    let linked_snapshot = crash_dir.join("linked.json");
+    symlink(&victim, &linked_snapshot)?;
+    assert!(
+        write_private_crash_snapshot(&linked_snapshot, &json!({"safe": false})).is_err(),
+        "existing snapshot symlink must be rejected"
+    );
+    assert_eq!(std::fs::read(&victim)?, b"unchanged");
+
+    let target_dir = root.join("target-dir");
+    std::fs::create_dir(&target_dir)?;
+    let linked_dir = root.join("linked-crashes");
+    symlink(&target_dir, &linked_dir)?;
+    assert!(
+        write_private_crash_snapshot(&linked_dir.join("crash.json"), &json!({"safe": false}))
+            .is_err(),
+        "crash directory symlink must be rejected"
+    );
+    assert!(!target_dir.join("crash.json").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn auth_store_inspection_classifies_integrity_without_rewrite_or_reference_execution() -> Result<()>
+{
+    let _guard = env_lock();
+    let root = temp_test_dir("auth-store-inspection-integrity");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let path = auth_store_path();
+        let missing = crate::provider::inspect_auth_store();
+        assert_eq!(
+            missing.security,
+            crate::provider::AuthStoreFileSecurity::Missing
+        );
+        assert_eq!(
+            missing.integrity,
+            crate::provider::AuthStoreIntegrity::NotChecked
+        );
+
+        let marker = root.join("command-reference-executed");
+        let current = serde_json::to_vec(&json!({
+            "version": 1,
+            "providers": {
+                "openai": {
+                    "type": "api_key",
+                    "key": format!("!printf executed > {}", marker.display())
+                }
+            }
+        }))?;
+        std::fs::write(&path, &current)?;
+        let inspected = crate::provider::inspect_auth_store();
+        assert_eq!(
+            inspected.integrity,
+            crate::provider::AuthStoreIntegrity::Valid {
+                version: 1,
+                legacy: false
+            }
+        );
+        assert!(
+            !marker.exists(),
+            "auth inspection executed a command reference"
+        );
+        assert_eq!(std::fs::read(&path)?, current);
+
+        let legacy = br#"{"openai":"ENV_REFERENCE"}"#;
+        std::fs::write(&path, legacy)?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().integrity,
+            crate::provider::AuthStoreIntegrity::Valid {
+                version: 1,
+                legacy: true
+            }
+        );
+        assert_eq!(std::fs::read(&path)?, legacy);
+
+        let invalid = br#"{"version":1,"providers":"invalid"}"#;
+        std::fs::write(&path, invalid)?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().integrity,
+            crate::provider::AuthStoreIntegrity::InvalidSchema
+        );
+        assert_eq!(std::fs::read(&path)?, invalid);
+
+        let corrupt = br#"{"version":1"#;
+        std::fs::write(&path, corrupt)?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().integrity,
+            crate::provider::AuthStoreIntegrity::InvalidSchema
+        );
+        assert_eq!(std::fs::read(&path)?, corrupt);
+
+        let future = br#"{"version":2,"providers":{}}"#;
+        std::fs::write(&path, future)?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().integrity,
+            crate::provider::AuthStoreIntegrity::UnsupportedVersion { version: 2 }
+        );
+        assert_eq!(std::fs::read(&path)?, future);
+
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().security,
+            crate::provider::AuthStoreFileSecurity::NonRegular
+        );
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn auth_store_inspection_reports_unix_modes_symlinks_and_save_repair() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let _guard = env_lock();
+    let root = temp_test_dir("auth-store-inspection-unix");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let path = auth_store_path();
+        let bytes = br#"{"version":1,"providers":{}}"#;
+        std::fs::write(&path, bytes)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().security,
+            crate::provider::AuthStoreFileSecurity::Secure { mode: 0o600 }
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().security,
+            crate::provider::AuthStoreFileSecurity::UnsafeMode { mode: 0o640 }
+        );
+
+        let store = AuthStore::default();
+        save_auth_store(&store)?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().security,
+            crate::provider::AuthStoreFileSecurity::Secure { mode: 0o600 }
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+        let unreadable = crate::provider::inspect_auth_store();
+        assert_eq!(
+            unreadable.security,
+            crate::provider::AuthStoreFileSecurity::Secure { mode: 0o000 }
+        );
+        assert_eq!(
+            unreadable.integrity,
+            crate::provider::AuthStoreIntegrity::Unreadable
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+
+        let target = root.join("auth-target.json");
+        std::fs::write(&target, bytes)?;
+        std::fs::remove_file(&path)?;
+        symlink(&target, &path)?;
+        let linked = crate::provider::inspect_auth_store();
+        assert_eq!(
+            linked.security,
+            crate::provider::AuthStoreFileSecurity::Symlink
+        );
+        assert_eq!(
+            linked.integrity,
+            crate::provider::AuthStoreIntegrity::NotChecked
+        );
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(unix)]
+#[test]
 fn secret_writes_create_private_auth_and_oauth_files() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -9709,6 +15690,185 @@ fn secret_writes_create_private_auth_and_oauth_files() -> Result<()> {
     result
 }
 
+#[cfg(unix)]
+#[test]
+fn runtime_state_loading_repairs_auth_mode_and_rejects_unsafe_provider_state() -> Result<()> {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let _guard = env_lock();
+    let root = temp_test_dir("runtime-state-load-security");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let auth_path = auth_store_path();
+        let auth_bytes = br#"{"version":1,"providers":{}}"#;
+        std::fs::write(&auth_path, auth_bytes)?;
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o644))?;
+        load_auth_store()?;
+        assert_eq!(
+            crate::provider::inspect_auth_store().security,
+            crate::provider::AuthStoreFileSecurity::Secure { mode: 0o600 }
+        );
+        assert_eq!(
+            std::fs::metadata(&auth_path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&auth_path)?, auth_bytes);
+
+        let provider_path = provider_catalog_path();
+        let provider_bytes = std::fs::read(state_fixture_path("providers", "v2.json"))?;
+        std::fs::write(&provider_path, &provider_bytes)?;
+        std::fs::set_permissions(&provider_path, std::fs::Permissions::from_mode(0o666))?;
+        let error = load_provider_catalog()
+            .expect_err("group/world-writable provider state must be rejected")
+            .to_string();
+        assert!(error.contains("unsafe writable mode 0666"), "{error}");
+        assert_eq!(
+            crate::provider::inspect_provider_catalog().integrity,
+            crate::provider::ProviderCatalogIntegrity::UnsafeMode { mode: 0o666 }
+        );
+        assert_eq!(std::fs::read(&provider_path)?, provider_bytes);
+
+        std::fs::set_permissions(&provider_path, std::fs::Permissions::from_mode(0o600))?;
+        load_provider_catalog()?;
+        assert!(matches!(
+            crate::provider::inspect_provider_catalog().integrity,
+            crate::provider::ProviderCatalogIntegrity::Valid { version: 2, .. }
+        ));
+        let target = root.join("provider-target.json");
+        std::fs::write(&target, &provider_bytes)?;
+        std::fs::remove_file(&provider_path)?;
+        symlink(&target, &provider_path)?;
+        let error = load_provider_catalog()
+            .expect_err("symlinked provider state must be rejected")
+            .to_string();
+        assert!(error.contains("regular non-symlink file"), "{error}");
+        assert_eq!(
+            crate::provider::inspect_provider_catalog().integrity,
+            crate::provider::ProviderCatalogIntegrity::Symlink
+        );
+        assert_eq!(std::fs::read(&target)?, provider_bytes);
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn provider_and_auth_state_fixtures_normalize_and_reject_without_rewrite() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("state-provider-auth-fixtures");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let provider_path = provider_catalog_path();
+        std::fs::create_dir_all(provider_path.parent().unwrap_or(Path::new(".")))?;
+        for fixture in ["v1.json", "v2.json"] {
+            let source = state_fixture_path("providers", fixture);
+            let bytes = std::fs::read(&source)?;
+            std::fs::write(&provider_path, &bytes)?;
+            let catalog = load_provider_catalog()?;
+            assert_eq!(
+                catalog.version,
+                crate::provider::default_provider_catalog_version()
+            );
+            assert_eq!(resolve_active_provider_id(&catalog), "local");
+            let local =
+                find_provider_profile(&catalog, "local").context("local fixture profile")?;
+            assert_eq!(local.default_model, "fixture-model");
+            assert_eq!(std::fs::read(&provider_path)?, bytes);
+        }
+        for fixture in ["future.json", "corrupt.json"] {
+            let source = state_fixture_path("providers", fixture);
+            let bytes = std::fs::read(&source)?;
+            std::fs::write(&provider_path, &bytes)?;
+            assert!(
+                load_provider_catalog().is_err(),
+                "provider fixture {fixture}"
+            );
+            assert_eq!(std::fs::read(&provider_path)?, bytes);
+        }
+
+        let auth_path = auth_store_path();
+        for fixture in ["legacy-map.json", "v1.json"] {
+            let source = state_fixture_path("auth", fixture);
+            let bytes = std::fs::read(&source)?;
+            std::fs::write(&auth_path, &bytes)?;
+            let store = load_auth_store()?;
+            assert_eq!(store.version, crate::provider::default_auth_store_version());
+            let Some(StoredCredential::ApiKey { key }) = store.providers.get("openai") else {
+                anyhow::bail!("auth fixture missing openai API-key reference");
+            };
+            assert_eq!(key, "FIXTURE_API_KEY");
+            assert_eq!(std::fs::read(&auth_path)?, bytes);
+        }
+        for fixture in ["future.json", "corrupt.json"] {
+            let source = state_fixture_path("auth", fixture);
+            let bytes = std::fs::read(&source)?;
+            std::fs::write(&auth_path, &bytes)?;
+            assert!(load_auth_store().is_err(), "auth fixture {fixture}");
+            assert_eq!(std::fs::read(&auth_path)?, bytes);
+        }
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn provider_and_auth_future_versions_fail_without_rewriting_source() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("state-future-versions");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+    }
+
+    let result = (|| -> Result<()> {
+        let provider_path = provider_catalog_path();
+        std::fs::create_dir_all(provider_path.parent().unwrap_or(Path::new(".")))?;
+        let provider_bytes = br#"{"version":3,"active_provider":"glm","providers":[]}"#;
+        std::fs::write(&provider_path, provider_bytes)?;
+        let error = load_provider_catalog()
+            .expect_err("future provider catalog must fail")
+            .to_string();
+        assert!(
+            error.contains("unsupported provider catalog version 3"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&provider_path)?, provider_bytes);
+
+        let auth_path = auth_store_path();
+        let auth_bytes = br#"{"version":2,"providers":{}}"#;
+        std::fs::write(&auth_path, auth_bytes)?;
+        let error = load_auth_store()
+            .expect_err("future auth store must fail")
+            .to_string();
+        assert!(
+            error.contains("unsupported auth store version 2"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&auth_path)?, auth_bytes);
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
 #[test]
 fn auth_store_reads_legacy_provider_map() -> Result<()> {
     let _guard = env_lock();
@@ -9725,6 +15885,7 @@ fn auth_store_reads_legacy_provider_map() -> Result<()> {
         let store = load_auth_store()?;
         let profile = ProviderProfile {
             id: "openai".to_string(),
+            builtin: None,
             display_name: "OpenAI API".to_string(),
             api_provider: ApiProvider::OpenAi,
             request_contract: Some(RequestContract::OpenAiChatCompletions),
@@ -9942,7 +16103,26 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["glm", "chatgpt", "openai", "anthropic", "deepseek", "local"]
+            vec![
+                "glm",
+                "chatgpt",
+                "openai",
+                "anthropic",
+                "kimi",
+                "deepseek",
+                "local",
+            ]
+        );
+        let kimi = catalog
+            .providers
+            .iter()
+            .find(|p| p.id == "kimi")
+            .expect("kimi provider");
+        assert_eq!(kimi.base_url, "https://api.kimi.com/coding");
+        assert_eq!(kimi.default_model, "k3");
+        assert_eq!(
+            request_contract_for_profile(kimi),
+            RequestContract::AnthropicMessages
         );
         let local = catalog
             .providers
@@ -10153,9 +16333,12 @@ fn auth_store_parses_oauth_access_shape() -> Result<()> {
 fn login_chatgpt_import_mode_uses_external_auth() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("login-chatgpt-external-auth");
+    let ext_auth = root.join(".dext/external-auth.json");
+    let old_external_auth_file = std::env::var_os("DEXT_EXTERNAL_AUTH_FILE");
     unsafe {
         std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("HOME", &root);
+        std::env::set_var("DEXT_EXTERNAL_AUTH_FILE", &ext_auth);
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("DEXT_API_KEY");
     }
@@ -10196,6 +16379,7 @@ fn login_chatgpt_import_mode_uses_external_auth() -> Result<()> {
         std::env::remove_var("HOME");
         std::env::remove_var("OPENAI_API_KEY");
     }
+    restore_env_var("DEXT_EXTERNAL_AUTH_FILE", old_external_auth_file);
     let _ = std::fs::remove_dir_all(&root);
     result
 }
@@ -10669,6 +16853,9 @@ fn normalize_chatgpt_model_slug_accepts_compact_aliases() {
         "gpt-5.3-codex"
     );
     assert_eq!(normalize_chatgpt_model_slug("gpt5codex"), "gpt-5-codex");
+    assert_eq!(normalize_chatgpt_model_slug("gpt56"), "gpt-5.6-sol");
+    assert_eq!(normalize_chatgpt_model_slug("gpt56terra"), "gpt-5.6-terra");
+    assert_eq!(normalize_chatgpt_model_slug("GPT 5 6 LUNA"), "gpt-5.6-luna");
 }
 
 #[test]
@@ -10689,6 +16876,32 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         normalize_provider_model_value(&openai, "gpt-5.6"),
         "gpt-5.6"
     );
+    for profile in [&chatgpt, &openai] {
+        for (model, input, cached, output) in [
+            ("gpt-5.6-sol", 5.0, 0.5, 30.0),
+            ("gpt-5.6-terra", 2.5, 0.25, 15.0),
+            ("gpt-5.6-luna", 1.0, 0.1, 6.0),
+        ] {
+            assert!(profile.models.iter().any(|candidate| candidate == model));
+            let spec = resolve_model_spec(profile, model);
+            assert_eq!(spec.context_window, Some(1_050_000), "{model}");
+            assert_eq!(spec.max_output_tokens, Some(128_000), "{model}");
+            assert!(spec.tools && spec.reasoning && spec.image_input && spec.prompt_cache);
+            assert_eq!(
+                spec.effort_levels,
+                ["none", "low", "medium", "high", "xhigh"],
+                "{model}"
+            );
+            let pricing = spec.pricing.expect("gpt-5.6 pricing");
+            assert_eq!(pricing.input_usd_per_mtok, input, "{model}");
+            assert_eq!(pricing.cache_read_usd_per_mtok, cached, "{model}");
+            assert_eq!(pricing.output_usd_per_mtok, output, "{model}");
+            assert_eq!(pricing.cache_create_usd_per_mtok, input * 1.25, "{model}");
+        }
+    }
+    let alias_spec = resolve_model_spec(&openai, "gpt-5.6");
+    assert_eq!(alias_spec.context_window, Some(1_050_000));
+    assert_eq!(alias_spec.max_output_tokens, Some(128_000));
 
     let mut legacy = chatgpt.clone();
     legacy.request_contract = Some(RequestContract::OpenAiChatCompletions);
@@ -10698,7 +16911,8 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         version: 1,
         active_provider: "chatgpt".to_string(),
         providers: vec![legacy],
-    });
+    })
+    .expect("legacy catalog migration");
     let migrated = find_provider_profile(&migrated, "chatgpt").expect("migrated chatgpt");
     assert_eq!(
         request_contract_for_profile(&migrated),
@@ -10736,7 +16950,8 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         version: 2,
         active_provider: "chatgpt".to_string(),
         providers: vec![explicit],
-    });
+    })
+    .expect("explicit catalog normalization");
     let explicit = find_provider_profile(&normalized, "chatgpt").expect("explicit chatgpt");
     assert_eq!(
         request_contract_for_profile(&explicit),
@@ -11447,6 +17662,368 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
 }
 
 #[test]
+fn kimi_builtin_metadata_is_isolated_from_existing_provider_profiles() {
+    let profiles = built_in_provider_profiles();
+    for (id, api, contract, base_url, default_model) in [
+        (
+            "glm",
+            ApiProvider::Anthropic,
+            RequestContract::AnthropicMessages,
+            "https://api.z.ai/api/anthropic",
+            "glm-5.2[1m]",
+        ),
+        (
+            "chatgpt",
+            ApiProvider::ChatGpt,
+            RequestContract::ChatGptResponses,
+            "https://chatgpt.com/backend-api/codex",
+            "gpt-5.4",
+        ),
+        (
+            "openai",
+            ApiProvider::OpenAi,
+            RequestContract::OpenAiChatCompletions,
+            "https://api.openai.com",
+            "gpt-5",
+        ),
+        (
+            "anthropic",
+            ApiProvider::Anthropic,
+            RequestContract::AnthropicMessages,
+            "https://api.anthropic.com",
+            "claude-sonnet-4-6",
+        ),
+        (
+            "deepseek",
+            ApiProvider::OpenAi,
+            RequestContract::OpenAiChatCompletions,
+            "https://api.deepseek.com",
+            "deepseek-chat",
+        ),
+        (
+            "local",
+            ApiProvider::OpenAi,
+            RequestContract::OpenAiChatCompletions,
+            "http://127.0.0.1:8080",
+            DEFAULT_LOCAL_MODEL,
+        ),
+    ] {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .unwrap_or_else(|| panic!("missing {id} profile"));
+        assert_eq!(profile.api_provider, api, "{id}");
+        assert_eq!(request_contract_for_profile(profile), contract, "{id}");
+        assert_eq!(profile.base_url, base_url, "{id}");
+        assert_eq!(profile.default_model, default_model, "{id}");
+    }
+
+    let kimi = profiles
+        .iter()
+        .find(|profile| profile.id == "kimi")
+        .expect("kimi profile");
+    assert_eq!(kimi.base_url, "https://api.kimi.com/coding");
+    assert_eq!(kimi.env_vars, ["KIMI_API_KEY"]);
+    assert_eq!(kimi.default_model, "k3");
+    assert!(kimi.oauth_flow.is_none());
+    let k3 = resolve_model_spec(kimi, "k3");
+    assert_eq!(k3.context_window, Some(1_048_576));
+    assert_eq!(k3.max_output_tokens, Some(131_072));
+    assert_eq!(k3.effort_levels, ["max"]);
+    let k3_pricing = k3.pricing.expect("Kimi coding-plan pricing");
+    assert_eq!(k3_pricing.input_usd_per_mtok, 0.0);
+    assert_eq!(k3_pricing.output_usd_per_mtok, 0.0);
+    assert_eq!(k3_pricing.cache_read_usd_per_mtok, 0.0);
+    assert_eq!(k3_pricing.cache_create_usd_per_mtok, 0.0);
+    let legacy = resolve_model_spec(kimi, "k2p7");
+    assert_eq!(legacy.context_window, Some(262_144));
+    assert_eq!(legacy.max_output_tokens, Some(32_768));
+    assert_eq!(
+        legacy
+            .pricing
+            .expect("Kimi coding-plan pricing")
+            .output_usd_per_mtok,
+        0.0
+    );
+}
+
+#[test]
+fn kimi_custom_profile_collision_requires_rename_without_rewrite() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("kimi-profile-collision");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
+
+    let result = (|| -> Result<()> {
+        let legacy = crate::provider::normalize_provider_catalog(ProviderCatalog {
+            version: 1,
+            active_provider: "local".to_string(),
+            providers: vec![
+                built_in_provider_profiles()
+                    .into_iter()
+                    .find(|profile| profile.id == "local")
+                    .expect("local profile"),
+            ],
+        })?;
+        let kimi = find_provider_profile(&legacy, "kimi").expect("migrated Kimi profile");
+        assert!(is_official_kimi_profile(&kimi, &kimi.base_url));
+
+        for id in ["kimi", "kimi-code", "kimi-coding", "kimi-membership"] {
+            let mut custom = kimi.clone();
+            custom.id = id.to_string();
+            custom.builtin = None;
+            custom.display_name = "Existing custom profile".to_string();
+            custom.base_url = "https://example.test/custom".to_string();
+            let error = crate::provider::normalize_provider_catalog(ProviderCatalog {
+                version: 2,
+                active_provider: id.to_string(),
+                providers: vec![custom],
+            })
+            .expect_err("reserved unmarked Kimi id must not be captured");
+            assert!(
+                error.to_string().contains("rename the custom profile"),
+                "{error:#}"
+            );
+        }
+
+        let path = provider_catalog_path();
+        std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+        let bytes = br#"{"version":2,"active_provider":"kimi","providers":[{"id":"kimi","display_name":"Existing custom profile","api_provider":"anthropic","request_contract":"anthropic-messages","base_url":"https://example.test/custom","default_model":"custom-k3","models":["custom-k3"],"env_vars":["CUSTOM_KIMI_KEY"],"requires_api_key":true}]}"#;
+        std::fs::write(&path, bytes)?;
+        let error = load_provider_catalog().expect_err("custom Kimi collision must fail on load");
+        assert!(
+            error.to_string().contains("rename the custom profile"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path)?, bytes);
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn kimi_headers_use_plan_api_keys_and_isolate_official_metadata() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("kimi-headers");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
+    let client = reqwest::Client::new();
+    let result = (|| -> Result<()> {
+        let api_key = apply_provider_headers(
+            client.post("https://api.kimi.com/coding/v1/messages"),
+            RequestContract::AnthropicMessages,
+            "kimi-key",
+            true,
+            None,
+        )?
+        .build()?;
+        assert_eq!(api_key.headers()["x-api-key"], "kimi-key");
+        assert!(!api_key.headers().contains_key("authorization"));
+        assert_eq!(
+            api_key.headers()["anthropic-version"],
+            ANTHROPIC_API_VERSION
+        );
+        assert_eq!(api_key.headers()["x-msh-platform"], "kimi_code_cli");
+        assert!(api_key.headers().contains_key("x-msh-device-id"));
+        assert_eq!(
+            api_key.headers()["user-agent"],
+            format!("dext/{}", env!("CARGO_PKG_VERSION"))
+        );
+
+        let custom = apply_provider_headers(
+            client.post("https://example.test/v1/messages"),
+            RequestContract::AnthropicMessages,
+            "custom-key",
+            false,
+            None,
+        )?
+        .build()?;
+        assert_eq!(custom.headers()["x-api-key"], "custom-key");
+        assert!(!custom.headers().contains_key("authorization"));
+        assert!(!custom.headers().contains_key("x-msh-platform"));
+        assert!(!custom.headers().contains_key("x-msh-device-id"));
+        Ok(())
+    })();
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn kimi_runtime_auth_uses_plan_api_keys_and_ignores_stale_oauth() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("kimi-runtime-auth");
+    let env_names = [
+        "DEXT_HOME",
+        "DEXT_API_KEY",
+        "DEXT_BASE_URL",
+        "DEXT_MODEL",
+        "DEXT_MODEL_KIMI",
+        "DEXT_MODEL_FORCE",
+        "ANTHROPIC_BASE_URL",
+        "KIMI_API_KEY",
+    ];
+    let previous = env_names.map(|name| (name, std::env::var_os(name)));
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        for name in &env_names[1..] {
+            std::env::remove_var(name);
+        }
+    }
+
+    let result = (|| -> Result<()> {
+        let login = login_provider(Some("kimi"), Some("static-kimi-key"), false)?;
+        assert!(!login.awaiting_credentials);
+        assert!(
+            login.message.contains("stored credentials"),
+            "{}",
+            login.message
+        );
+        let resolved = resolve_runtime_provider(Some("kimi"), true)?;
+        assert_eq!(resolved.key_source, "auth:kimi");
+        assert!(is_official_kimi_profile(
+            &resolved.profile,
+            &resolved.base_url
+        ));
+
+        unsafe { std::env::set_var("DEXT_BASE_URL", "https://example.test/kimi") };
+        let custom_key = resolve_runtime_provider(Some("kimi"), true)?;
+        assert_eq!(custom_key.base_url, "https://example.test/kimi");
+
+        unsafe { std::env::remove_var("DEXT_BASE_URL") };
+        let mut store = load_auth_store()?;
+        store.providers.insert(
+            "kimi".to_string(),
+            StoredCredential::OAuth {
+                access_token: "oauth-access".to_string(),
+                refresh_token: Some("oauth-refresh".to_string()),
+                expires_at: Some(unix_timestamp_secs().saturating_add(3_600)),
+            },
+        );
+        save_auth_store(&store)?;
+        let error = resolve_runtime_provider(Some("kimi"), true)
+            .expect_err("legacy Kimi OAuth credentials must not be used");
+        assert!(
+            error.to_string().contains("missing credentials"),
+            "{error:#}"
+        );
+        let store = load_auth_store()?;
+        assert_eq!(provider_auth_status(&resolved.profile, &store), "missing");
+        Ok(())
+    })();
+
+    for (name, value) in previous {
+        restore_env_var(name, value);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn official_kimi_k3_request_uses_adaptive_thinking_and_empty_signatures_only_there() -> Result<()> {
+    let root = temp_test_dir("kimi-k3-request");
+    let root = std::fs::canonicalize(&root)?;
+    let kimi = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "kimi")
+        .expect("kimi profile");
+    let mut agent = test_agent(&root);
+    agent.provider_id = kimi.id.clone();
+    agent.provider_profile = Some(kimi.clone());
+    agent.api_provider = kimi.api_provider;
+    agent.base_url = kimi.base_url.clone();
+    agent.model = "k3".to_string();
+    agent.thinking_effort = ThinkingEffort::Max;
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "inspect".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                Block::Thinking {
+                    text: "reasoning".to_string(),
+                    signature: Some(String::new()),
+                },
+                Block::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: json!({"path":"src/main.rs"}),
+                },
+            ],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "ok".to_string(),
+                is_error: Some(false),
+                metadata: ToolResultMetadata::default(),
+            }],
+        },
+    ];
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: None,
+    }];
+
+    let (url, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    assert_eq!(url, "https://api.kimi.com/coding/v1/messages");
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["max_tokens"], 131_072);
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert!(body["thinking"].get("budget_tokens").is_none(), "{body}");
+    assert_eq!(body["output_config"]["effort"], "max");
+    let assistant = body["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["role"] == "assistant")
+        })
+        .expect("assistant message");
+    assert!(assistant["content"].as_array().is_some_and(|blocks| {
+        blocks.iter().any(|block| {
+            block["type"] == "thinking"
+                && block["thinking"] == "reasoning"
+                && block["signature"] == ""
+        })
+    }));
+
+    let mut custom = kimi;
+    custom.base_url = "https://example.test/kimi".to_string();
+    agent.provider_profile = Some(custom.clone());
+    agent.base_url = custom.base_url;
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["output_config"]["effort"], "max");
+    let assistant = body["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["role"] == "assistant")
+        })
+        .expect("assistant message");
+    assert!(
+        !assistant["content"]
+            .as_array()
+            .is_some_and(|blocks| { blocks.iter().any(|block| block["type"] == "thinking") })
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn max_output_tokens_reads_positive_env_override() {
     let _guard = env_lock();
     unsafe {
@@ -11909,8 +18486,16 @@ async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
     let addr = listener.local_addr().expect("local addr");
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0u8; 1024];
-        let _ = stream.read(&mut request);
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("set request timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).expect("read request headers");
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&buf[..read]);
+        }
         let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-full\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
@@ -11953,9 +18538,17 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
     let addr = listener.local_addr().expect("local addr");
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0u8; 1024];
-        let _ = stream.read(&mut request);
-        let body = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning removal**\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning masked login input**\\n\\n<!-- \"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"-->**Verifying restored history**\\n\\n<!-- -->\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"ignored because delta already populated\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n";
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("set request timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).expect("read request headers");
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&buf[..read]);
+        }
+        let body = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning removal**\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"**Planning masked login input**\\n\\n<!-- \"}\n\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"-->**Verifying restored history**\\n\\n<!-- -->\"}\n\ndata: {\"type\":\"response.reasoning_summary_text.done\",\"text\":\"ignored because delta already populated\"}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -12645,7 +19238,7 @@ fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
     std::fs::create_dir_all(&pack_dir)?;
     std::fs::write(
         pack_dir.join("PACK.md"),
-        "---\nname: demo\ndescription: Demo workflow\n---\n# Demo pack\n\nDo the demo workflow.\n",
+        "---\nname: demo\ndescription: Demo workflow\ncredential-env: [X_AUTH_TOKEN, X_CT0, OPENAI_API_KEY, invalid-name]\n---\n# Demo pack\n\nDo the demo workflow.\n",
     )?;
     unsafe {
         std::env::remove_var("DEXT_PACKS_DIR");
@@ -12657,6 +19250,18 @@ fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
     assert_eq!(pack.name, "demo");
     assert_eq!(pack.description, "Demo workflow");
     assert_eq!(pack.env_var_name(), "DEXT_PACK_DEMO_DIR");
+    assert!(
+        pack.credential_env.is_empty(),
+        "project packs cannot enable inherited credentials"
+    );
+    assert!(pack.credential_env_ignored);
+    let inspect = packs::render_pack_inspect(&root, "demo")?;
+    assert!(
+        inspect.contains(
+            "credential env: (ignored: project-local packs cannot inherit parent credentials)"
+        ),
+        "{inspect}"
+    );
     assert!(pack.pack_md_path.ends_with("PACK.md"));
 
     let listing = packs::render_pack_listing(&root);
@@ -12677,6 +19282,75 @@ fn packs_discover_project_pack_and_build_prompt() -> Result<()> {
         std::env::remove_var("DEXT_HOME");
         std::env::remove_var("DEXT_SHELVES_DIR");
     }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn user_global_pack_preserves_helper_credential_declarations() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("user-pack-credential-declaration");
+    let home = root.join("home");
+    let pack_dir = home.join("packs/trusted-helper");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(
+        pack_dir.join("PACK.md"),
+        "---\nname: trusted-helper\ncredential-env: [SERVICE_TOKEN]\n---\n# Trusted helper\n",
+    )?;
+    unsafe {
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let pack = packs::find_pack(&root, "trusted-helper")?;
+    assert_eq!(pack.source, "user:~/.dext/packs");
+    assert_eq!(pack.credential_env, vec!["SERVICE_TOKEN"]);
+    assert!(!pack.credential_env_ignored);
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn project_pack_shadowing_user_pack_never_inherits_user_pack_credentials() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("project-pack-shadows-user-credential-pack");
+    let home = root.join("home");
+    let project_pack = root.join(".dext/packs/demo");
+    let user_pack = home.join("packs/demo");
+    std::fs::create_dir_all(&project_pack)?;
+    std::fs::create_dir_all(&user_pack)?;
+    std::fs::write(
+        project_pack.join("PACK.md"),
+        "---\nname: demo\ncredential-env: [SERVICE_TOKEN]\n---\n# Project demo\n",
+    )?;
+    std::fs::write(
+        user_pack.join("PACK.md"),
+        "---\nname: demo\ncredential-env: [SERVICE_TOKEN]\n---\n# User demo\n",
+    )?;
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_packs_dir = std::env::var_os("DEXT_PACKS_DIR");
+    let old_shelves_dir = std::env::var_os("DEXT_SHELVES_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+
+    let pack = packs::find_pack(&root, "demo")?;
+    assert_eq!(pack.path, project_pack);
+    assert!(pack.source.starts_with("project:"), "{}", pack.source);
+    assert!(pack.credential_env.is_empty());
+    assert!(pack.credential_env_ignored);
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_PACKS_DIR", old_packs_dir);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves_dir);
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
@@ -12726,6 +19400,226 @@ fn packs_discovery_is_deterministic_and_dedupes_symlinked_roots() -> Result<()> 
         std::env::remove_var("DEXT_SHELVES_DIR");
     }
     let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn embedded_bundled_packs_materialize_and_repair_without_source_tree() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("embedded-bundled-packs");
+    let home = root.join("home");
+    let old_home = std::env::var_os("DEXT_HOME");
+    let old_packs = std::env::var_os("DEXT_PACKS_DIR");
+    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
+    std::fs::create_dir_all(&home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o750))?;
+    }
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+
+    let result = (|| -> Result<()> {
+        let discovered = packs::discover_packs(&root);
+        let bundled = discovered
+            .iter()
+            .filter(|pack| pack.source == "bundled:embedded")
+            .map(|pack| pack.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(bundled, vec!["agent-browser", "autoresearch", "packopt"]);
+
+        let browser = packs::find_pack(&root, "agent-browser")?;
+        assert!(browser.path.starts_with(home.join("bundled-packs")));
+        let helper = browser.path.join("bin/agent-browser");
+        assert_eq!(
+            std::fs::read(&helper)?,
+            include_bytes!("../packs/agent-browser/bin/agent-browser")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&helper)?.permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&home)?.permissions().mode() & 0o777,
+                0o750,
+                "pre-existing DEXT_HOME mode must be preserved"
+            );
+            let cache_dirs = [
+                home.join("bundled-packs"),
+                browser
+                    .path
+                    .parent()
+                    .expect("digest cache parent")
+                    .to_path_buf(),
+                browser.path.clone(),
+                browser.path.join("bin"),
+            ];
+            for dir in cache_dirs {
+                assert_eq!(
+                    std::fs::metadata(&dir)?.permissions().mode() & 0o777,
+                    0o700,
+                    "unsafe cache directory mode: {}",
+                    dir.display()
+                );
+            }
+            std::fs::set_permissions(
+                browser.path.join("bin"),
+                std::fs::Permissions::from_mode(0o777),
+            )?;
+        }
+
+        std::fs::write(&helper, b"corrupt")?;
+        packs::discover_packs(&root);
+        assert_eq!(
+            std::fs::read(&helper)?,
+            include_bytes!("../packs/agent-browser/bin/agent-browser")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(browser.path.join("bin"))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_PACKS_DIR", old_packs);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn embedded_pack_cache_rejects_symlink_components_without_hiding_project_packs() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("embedded-pack-cache-symlink");
+    let home = root.join("home");
+    let redirect = root.join("redirect");
+    let project_pack = root.join("packs/demo");
+    std::fs::create_dir_all(&home)?;
+    std::fs::create_dir_all(&redirect)?;
+    std::fs::create_dir_all(&project_pack)?;
+    std::fs::write(
+        project_pack.join("PACK.md"),
+        "---\nname: demo\ndescription: Project workflow\n---\n# Demo\n",
+    )?;
+    symlink(&redirect, home.join("bundled-packs"))?;
+
+    let old_home = std::env::var_os("DEXT_HOME");
+    let old_packs = std::env::var_os("DEXT_PACKS_DIR");
+    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_PACKS_DIR");
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+
+    let result = (|| -> Result<()> {
+        let demo = packs::find_pack(&root, "demo")?;
+        assert_eq!(demo.source, "project:packs");
+
+        let listing = packs::render_pack_listing(&root);
+        assert!(listing.contains("demo"), "{listing}");
+        assert!(
+            listing.contains("bundled packs unavailable")
+                && listing.contains("must be a real directory"),
+            "{listing}"
+        );
+
+        let error = packs::find_pack(&root, "agent-browser").expect_err("unsafe cache must fail");
+        let error = format!("{error:#}");
+        assert!(error.contains("bundled packs unavailable"), "{error}");
+        assert!(error.contains("must be a real directory"), "{error}");
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_PACKS_DIR", old_packs);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_browser_launcher_rejects_self_resolution_without_home() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn run_with_deadline(command: &mut Command) -> Result<std::process::ExitStatus> {
+        let mut child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("agent-browser launcher did not terminate before the deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let root = temp_test_dir("agent-browser-launcher-self");
+    let helper = root.join("agent-browser-helper");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("packs/agent-browser/bin/agent-browser"),
+        &helper,
+    )?;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+
+    let direct = run_with_deadline(
+        Command::new(&helper)
+            .env("AGENT_BROWSER_BIN", &helper)
+            .env_remove("HOME"),
+    )?;
+    assert_eq!(direct.code(), Some(126));
+
+    let path_dir = root.join("path");
+    std::fs::create_dir_all(&path_dir)?;
+    symlink(&helper, path_dir.join("agent-browser"))?;
+    let path =
+        std::env::join_paths([path_dir.as_path(), Path::new("/usr/bin"), Path::new("/bin")])?;
+    let via_override = run_with_deadline(
+        Command::new(&helper)
+            .env("AGENT_BROWSER_BIN", "agent-browser")
+            .env_remove("HOME")
+            .env("PATH", &path),
+    )?;
+    assert_eq!(via_override.code(), Some(126));
+
+    let via_path = run_with_deadline(
+        Command::new(&helper)
+            .env_remove("AGENT_BROWSER_BIN")
+            .env_remove("HOME")
+            .env("PATH", path),
+    )?;
+    assert_eq!(via_path.code(), Some(127));
+
+    let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
 
@@ -12944,10 +19838,7 @@ fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
         .collect::<Vec<_>>()
         .join("\n---\n");
     assert!(followup.contains("pack: demo"), "{followup}");
-    assert!(
-        followup.contains("dext pack run demo -v task"),
-        "{followup}"
-    );
+    assert!(followup.contains("dext pack demo -v task"), "{followup}");
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
@@ -13166,6 +20057,49 @@ fn session_listing_shows_header_and_footer() -> Result<()> {
 }
 
 #[test]
+fn pack_helper_direct_spawn_policy_is_platform_safe() {
+    assert!(pack_helper_supports_direct_spawn_on(
+        Path::new("helper"),
+        false
+    ));
+    assert!(pack_helper_supports_direct_spawn_on(
+        Path::new("helper.py"),
+        false
+    ));
+    assert!(pack_helper_supports_direct_spawn_on(
+        Path::new("helper.exe"),
+        true
+    ));
+    assert!(pack_helper_supports_direct_spawn_on(
+        Path::new("helper.COM"),
+        true
+    ));
+    assert!(!pack_helper_supports_direct_spawn_on(
+        Path::new("helper"),
+        true
+    ));
+    assert!(!pack_helper_supports_direct_spawn_on(
+        Path::new("helper.py"),
+        true
+    ));
+}
+
+#[test]
+fn pack_invocation_args_preserve_complete_tasks() {
+    assert_eq!(
+        packs::pack_invocation_args("run agent-browser inspect https://example.com now"),
+        Some(("agent-browser", "inspect https://example.com now"))
+    );
+    assert_eq!(
+        packs::pack_invocation_args("agent-browser inspect https://example.com now"),
+        Some(("agent-browser", "inspect https://example.com now"))
+    );
+    assert_eq!(packs::pack_invocation_args("inspect agent-browser"), None);
+    assert_eq!(packs::pack_invocation_args("run agent-browser"), None);
+    assert_eq!(packs::pack_invocation_args("agent-browser"), None);
+}
+
+#[test]
 fn conversational_pack_inference_requires_invocation_intent() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-inference");
@@ -13202,6 +20136,8 @@ fn pack_auto_invocation_disabled_by_env_globs_and_specific_names() {
         path: PathBuf::from("/tmp/crew"),
         pack_md_path: PathBuf::from("/tmp/crew/PACK.md"),
         phooks_path: None,
+        credential_env: Vec::new(),
+        credential_env_ignored: false,
         source: "test".to_string(),
         shelf: Some("orchestration".to_string()),
     };
@@ -13467,7 +20403,7 @@ fn sanitize_strips_prior_turn_thinking_but_keeps_current_tool_loop() {
         user_text("[runtime-note] keep output small"),
     ];
 
-    let sanitized = sanitize_anthropic_messages(&history, true);
+    let sanitized = sanitize_anthropic_messages(&history, true, false);
     assert!(
         !sanitized[1]
             .content
@@ -13484,7 +20420,7 @@ fn sanitize_strips_prior_turn_thinking_but_keeps_current_tool_loop() {
     );
 
     // With thinking disabled everything is stripped, as before.
-    let sanitized = sanitize_anthropic_messages(&history, false);
+    let sanitized = sanitize_anthropic_messages(&history, false, false);
     assert!(
         !sanitized
             .iter()
@@ -13866,7 +20802,7 @@ fn wire_messages_drop_content_emptied_by_sanitization() {
             }],
         },
     ];
-    let sanitized = sanitize_anthropic_messages(&history, true);
+    let sanitized = sanitize_anthropic_messages(&history, true, false);
     assert!(
         sanitized[1].content.is_empty(),
         "prior-turn thinking-only message should sanitize to empty"

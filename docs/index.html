@@ -4,121 +4,333 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Dext — Documentation</title>
+<meta name="description" content="Dext technical documentation — a single-binary Rust coding agent that runs from your terminal.">
+<meta name="theme-color" content="#060a13">
 <style>
+/* ============ TOKENS ============ */
 :root[data-theme="dark"]{
---bg:#0d1117;--surface:#161b22;--surface2:#1c2333;--border:#30363d;
---text:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--purple:#bc8cff;
---yellow:#e3b341;--green:#3fb950;--red:#f85149;--orange:#d29922;
---code-bg:#1a1f2b;--nav-bg:#0d1117;--nav-active:rgba(88,166,255,.15);
---tip-bg:rgba(63,185,80,.08);--warn-bg:rgba(210,153,34,.08);
---copy-ok:#3fb950;--scrollbar-track:#161b22;--scrollbar-thumb:#30363d;
+--bg:#060a13;--bg2:#0a1120;--panel:#0c1424;--panel2:#101a30;
+--surface:rgba(148,163,184,.06);--surface2:rgba(148,163,184,.11);--border:rgba(148,163,184,.15);--border-strong:rgba(148,163,184,.32);
+--text:#e8eef8;--dim:#8fa1ba;--faint:#5d6f88;
+--accent:#818cf8;--accent2:#22d3ee;--purple:#a78bfa;
+--yellow:#fbbf24;--green:#34d399;--red:#f87171;--orange:#fbbf24;
+--code-bg:#0a1222;--code-text:#d8e4fb;
+--nav-active:rgba(129,140,248,.12);
+--tip-bg:rgba(52,211,153,.07);--warn-bg:rgba(251,191,36,.07);
+--copy-ok:#34d399;
+--grad:linear-gradient(120deg,#818cf8 0%,#22d3ee 100%);
+--glow:0 0 0 1px rgba(129,140,248,.25),0 8px 30px -6px rgba(99,102,241,.35);
+--shadow:0 12px 40px -12px rgba(0,0,0,.55);
+--hero-grid:rgba(148,163,184,.07);
+color-scheme:dark;
 }
 :root[data-theme="light"]{
---bg:#ffffff;--surface:#f6f8fa;--surface2:#f0f2f5;--border:#d0d7de;
---text:#1f2328;--dim:#656d76;--accent:#0969da;--purple:#8250df;
---yellow:#9a6700;--green:#1a7f37;--red:#cf222e;--orange:#9a6700;
---code-bg:#eff1f3;--nav-bg:#f6f8fa;--nav-active:rgba(9,105,218,.12);
---tip-bg:rgba(26,127,55,.08);--warn-bg:rgba(154,103,0,.08);
---copy-ok:#1a7f37;--scrollbar-track:#f6f8fa;--scrollbar-thumb:#d0d7de;
+--bg:#f5f7fc;--bg2:#eceff7;--panel:#ffffff;--panel2:#f4f6fb;
+--surface:rgba(15,23,42,.035);--surface2:rgba(15,23,42,.06);--border:rgba(15,23,42,.11);--border-strong:rgba(15,23,42,.24);
+--text:#101a2e;--dim:#5b6b84;--faint:#8fa1ba;
+--accent:#4f46e5;--accent2:#0e7490;--purple:#7c3aed;
+--yellow:#b45309;--green:#059669;--red:#dc2626;--orange:#b45309;
+--code-bg:#0d1730;--code-text:#d8e4fb;
+--nav-active:rgba(79,70,229,.09);
+--tip-bg:rgba(5,150,105,.06);--warn-bg:rgba(180,83,9,.06);
+--copy-ok:#059669;
+--grad:linear-gradient(120deg,#4f46e5 0%,#0891b2 100%);
+--glow:0 0 0 1px rgba(79,70,229,.18),0 10px 30px -8px rgba(79,70,229,.28);
+--shadow:0 14px 40px -16px rgba(15,23,42,.22);
+--hero-grid:rgba(15,23,42,.06);
+color-scheme:light;
 }
+/* ============ BASE ============ */
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.65}
+body{font-family:'Inter',ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.7;font-size:15.5px;-webkit-font-smoothing:antialiased}
 a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code-bg);border:1px solid var(--border);border-radius:4px;padding:1px 6px;font-size:.87em;color:var(--yellow)}
-pre{font-family:inherit;background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:1rem;overflow-x:auto;margin:1rem 0;font-size:.87em;line-height:1.55;position:relative}
-pre code{background:none;border:none;padding:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-h1,h2,h3,h4{color:var(--text);margin-top:1.8rem;margin-bottom:.5rem;scroll-margin-top:70px}
-h1{font-size:1.85rem;border-bottom:2px solid var(--purple);padding-bottom:.4rem;margin-top:2.2rem}
-h2{font-size:1.4rem;border-bottom:1px solid var(--border);padding-bottom:.25rem}
-h3{font-size:1.15rem;color:var(--accent)}
-h4{font-size:1rem;color:var(--dim)}
-table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.9rem}
-th,td{border:1px solid var(--border);padding:.45rem .7rem;text-align:left}
-th{background:var(--surface);color:var(--dim);font-weight:600;font-size:.82em;text-transform:uppercase;letter-spacing:.04em}
-tr:nth-child(even){background:var(--surface)}
-.badge{display:inline-block;font-size:.68em;padding:2px 8px;border-radius:10px;font-weight:600;vertical-align:middle}
-.badge-rs{background:var(--green);color:#fff}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:1.1rem 1.3rem;margin:1rem 0}
-.card h3{margin-top:0}
-.tip{border-left:4px solid var(--green);padding:.7rem 1rem;background:var(--tip-bg);border-radius:0 8px 8px 0;margin:1rem 0}
-.warn{border-left:4px solid var(--orange);padding:.7rem 1rem;background:var(--warn-bg);border-radius:0 8px 8px 0;margin:1rem 0}
-.diagram-panel{background:linear-gradient(135deg,var(--surface),var(--surface2));border:1px solid var(--border);border-radius:14px;padding:1rem;margin:1rem 0;box-shadow:0 10px 24px rgba(0,0,0,.14)}
-.diagram-panel h4{margin:.1rem 0 .7rem;color:var(--accent);font-size:.95rem;text-transform:uppercase;letter-spacing:.05em}
+a:hover{text-decoration:none}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+::selection{background:rgba(129,140,248,.35)}
+h1,h2,h3,h4{font-family:'Space Grotesk','Inter',ui-sans-serif,system-ui,sans-serif;line-height:1.25;letter-spacing:-.01em;scroll-margin-top:96px}
+code{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em}
+p code,li code,td code,h3 code,h4 code{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:.1em .45em;color:var(--yellow)}
+strong{font-weight:600}
+hr{border:none;height:1px;background:var(--border);margin:3.5rem 0 0}
+/* ============ PROGRESS BAR ============ */
+.progress{position:fixed;top:0;left:0;height:2.5px;width:0;background:var(--grad);z-index:400;box-shadow:0 0 12px rgba(34,211,238,.6)}
+/* ============ TOPBAR ============ */
+.topbar{position:sticky;top:0;z-index:360;background:var(--bg);background:color-mix(in srgb,var(--bg) 72%,transparent);backdrop-filter:blur(16px) saturate(1.5);-webkit-backdrop-filter:blur(16px) saturate(1.5);border-bottom:1px solid var(--border)}
+.topbar-inner{max-width:1440px;margin:0 auto;display:flex;align-items:center;gap:1rem;padding:.6rem 1.4rem}
+.brand{display:flex;align-items:center;gap:.6rem;color:var(--text);font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:1.08rem;flex-shrink:0}
+.brand-mark{width:30px;height:30px;border-radius:9px;background:var(--grad);display:grid;place-items:center;color:#fff;font-size:.95rem;font-weight:700;box-shadow:0 4px 14px -2px rgba(99,102,241,.55)}
+.brand-sub{color:var(--dim);font-weight:500;font-size:.82rem;margin-left:.15rem}
+.topnav{display:flex;gap:.15rem;margin-left:1rem}
+.topnav a{color:var(--dim);font-size:.86rem;font-weight:500;padding:.42rem .7rem;border-radius:8px;position:relative;transition:color .15s,background .15s}
+.topnav a:hover,.topnav a.active{color:var(--text);background:var(--surface)}
+.topbar-actions{margin-left:auto;display:flex;align-items:center;gap:.55rem}
+.search-trigger{display:flex;align-items:center;gap:.55rem;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:.4rem .7rem;color:var(--faint);font-size:.84rem;cursor:pointer;font-family:inherit;transition:border-color .15s,color .15s;min-width:190px}
+.search-trigger:hover{border-color:var(--border-strong);color:var(--dim)}
+.search-trigger svg{width:14px;height:14px}
+.search-trigger kbd{margin-left:auto;font-family:inherit;font-size:.7rem;background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:.1rem .38rem;color:var(--faint)}
+.icon-btn{display:grid;place-items:center;width:34px;height:34px;background:var(--surface);border:1px solid var(--border);border-radius:10px;color:var(--dim);cursor:pointer;transition:all .15s}
+.icon-btn:hover{border-color:var(--accent);color:var(--accent)}
+.icon-btn svg{width:16px;height:16px}
+[data-theme="dark"] .icon-sun{display:block}[data-theme="dark"] .icon-moon{display:none}
+[data-theme="light"] .icon-sun{display:none}[data-theme="light"] .icon-moon{display:block}
+.menu-btn{display:none}
+/* ============ HERO ============ */
+.hero{position:relative;overflow:hidden;border-bottom:1px solid var(--border);background:var(--bg)}
+.hero-bg{position:absolute;inset:0;pointer-events:none}
+.hero-bg::before{content:"";position:absolute;inset:0;background:
+radial-gradient(640px 340px at 18% 8%,rgba(99,102,241,.28),transparent 65%),
+radial-gradient(560px 320px at 82% 22%,rgba(34,211,238,.20),transparent 65%),
+radial-gradient(700px 380px at 55% 95%,rgba(167,139,250,.14),transparent 65%)}
+:root[data-theme="light"] .hero-bg::before{background:
+radial-gradient(640px 340px at 18% 8%,rgba(99,102,241,.20),transparent 65%),
+radial-gradient(560px 320px at 82% 22%,rgba(8,145,178,.14),transparent 65%),
+radial-gradient(700px 380px at 55% 95%,rgba(124,58,237,.10),transparent 65%)}
+.hero-bg::after{content:"";position:absolute;inset:0;background-image:linear-gradient(var(--hero-grid) 1px,transparent 1px),linear-gradient(90deg,var(--hero-grid) 1px,transparent 1px);background-size:44px 44px;mask-image:radial-gradient(ellipse 90% 80% at 50% 0%,#000 30%,transparent 75%);-webkit-mask-image:radial-gradient(ellipse 90% 80% at 50% 0%,#000 30%,transparent 75%)}
+.hero-inner{position:relative;max-width:1120px;margin:0 auto;padding:4.6rem 2rem 3.6rem;display:grid;grid-template-columns:1.05fr .95fr;gap:3rem;align-items:center}
+.hero-badge{display:inline-flex;align-items:center;gap:.5rem;font-size:.78rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);background:var(--nav-active);border:1px solid rgba(129,140,248,.3);border-radius:999px;padding:.34rem .85rem;width:fit-content}
+.hero-badge .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.hero-title{font-size:clamp(2.2rem,4.4vw,3.4rem);font-weight:700;margin:1.1rem 0 .9rem}
+.hero-title .grad{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero-sub{color:var(--dim);font-size:1.04rem;max-width:34rem}
+.hero-cta{display:flex;gap:.8rem;margin-top:1.7rem;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:.5rem;font-family:inherit;font-weight:600;font-size:.92rem;border-radius:11px;padding:.68rem 1.25rem;cursor:pointer;border:1px solid transparent;transition:transform .15s,box-shadow .2s,border-color .15s}
+.btn:active{transform:translateY(1px)}
+.btn-primary{background:var(--grad);color:#fff;box-shadow:0 8px 24px -8px rgba(99,102,241,.6)}
+.btn-primary:hover{box-shadow:0 12px 32px -8px rgba(99,102,241,.75);transform:translateY(-1px)}
+.btn-ghost{background:var(--surface);border-color:var(--border);color:var(--text)}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent)}
+.hero-stats{display:flex;gap:2.2rem;margin-top:2.3rem;flex-wrap:wrap}
+.stat .stat-num{font-family:'Space Grotesk',sans-serif;font-size:1.55rem;font-weight:700;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.stat .stat-label{font-size:.76rem;color:var(--faint);text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+/* terminal mockup */
+.term{background:var(--code-bg);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.05);overflow:hidden;transform:rotate(.4deg)}
+.term-bar{display:flex;align-items:center;gap:.5rem;padding:.65rem .9rem;border-bottom:1px solid var(--border);background:rgba(148,163,184,.05)}
+.term-dot{width:11px;height:11px;border-radius:50%}
+.term-dot.r{background:#f87171}.term-dot.y{background:#fbbf24}.term-dot.g{background:#34d399}
+.term-title{margin-left:.4rem;font-size:.76rem;color:var(--faint);font-family:'JetBrains Mono',monospace}
+.term-copy{margin-left:auto;background:none;border:none;color:var(--faint);font-family:inherit;font-size:.74rem;cursor:pointer;display:flex;align-items:center;gap:.3rem}
+.term-copy:hover{color:var(--accent2)}
+.term-body{padding:1.05rem 1.15rem 1.2rem;font-family:'JetBrains Mono',monospace;font-size:.84rem;line-height:2}
+.term-line{color:var(--code-text);white-space:pre-wrap;word-break:break-all}
+.term-line .prompt{color:var(--accent2);font-weight:600;margin-right:.5rem}
+.term-line .str{color:var(--green)}
+.term-line .cm{color:var(--faint)}
+.term-line.out{color:var(--faint)}
+.cursor{display:inline-block;width:8px;height:1.05em;background:var(--accent2);vertical-align:text-bottom;animation:blink 1.1s steps(2) infinite;border-radius:1px}
+@keyframes blink{50%{opacity:0}}
+/* ============ LAYOUT ============ */
+.layout{max-width:1440px;margin:0 auto;display:grid;grid-template-columns:248px minmax(0,1fr) 216px;gap:2.4rem;padding:0 1.4rem}
+/* left rail */
+.rail-left{position:sticky;top:64px;height:calc(100vh - 64px);overflow-y:auto;padding:1.8rem .4rem 4rem 0;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.rail-left::-webkit-scrollbar{width:5px}
+.rail-left::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.nav-group{margin-bottom:1.1rem}
+.nav-section{display:flex;align-items:center;gap:.55rem;width:100%;background:none;border:none;color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:.78rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase;cursor:pointer;padding:.3rem .5rem;border-radius:8px}
+.nav-section:hover{background:var(--surface)}
+.nav-section .num{font-family:'JetBrains Mono',monospace;font-size:.72rem;color:var(--accent);opacity:.85}
+.nav-section .arrow{margin-left:auto;color:var(--faint);font-size:.7rem;transition:transform .2s}
+.nav-section.collapsed .arrow{transform:rotate(-90deg)}
+.nav-items{list-style:none;margin:.15rem 0 0;padding:0 0 0 .5rem}
+.nav-items.hidden{display:none}
+.nav-items a{display:block;position:relative;color:var(--dim);font-size:.855rem;padding:.28rem .6rem .28rem .85rem;border-radius:7px;border-left:2px solid transparent;transition:color .12s,background .12s}
+.nav-items a:hover{color:var(--text);background:var(--surface)}
+.nav-items a.active{color:var(--accent);background:var(--nav-active);border-left-color:var(--accent);font-weight:600}
+.nav-items li.sub a{padding-left:1.35rem;font-size:.82rem;color:var(--faint)}
+.nav-items li.sub a:hover,.nav-items li.sub a.active{color:var(--accent)}
+/* content */
+.content{min-width:0;padding:2.2rem 0 5rem;max-width:860px}
+.content>*{animation:none}
+.reveal{opacity:0;transform:translateY(14px);transition:opacity .55s ease,transform .55s ease}
+.reveal.in{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.reveal{opacity:1;transform:none;transition:none}.cursor,.hero-badge .dot{animation:none}.collapsible-content{transition:none}}
+/* headings in content */
+.content h1{font-size:1.72rem;font-weight:700;margin:3.4rem 0 1rem;padding-top:1.6rem;border-top:1px solid var(--border);display:flex;align-items:baseline;gap:.8rem;counter-increment:h1}
+.content h1:first-of-type{border-top:none;padding-top:0;margin-top:0}
+.content h1::before{content:counter(h1,decimal-leading-zero);font-family:'JetBrains Mono',monospace;font-size:.85rem;font-weight:600;color:var(--accent);background:var(--nav-active);border:1px solid rgba(129,140,248,.3);border-radius:8px;padding:.18rem .5rem;transform:translateY(-2px)}
+.content h1::after{content:"";flex:1;height:2px;background:linear-gradient(90deg,rgba(129,140,248,.5),transparent);border-radius:2px;margin-left:.4rem}
+.content{counter-reset:h1}
+.content h2{font-size:1.3rem;font-weight:600;margin:2.4rem 0 .8rem}
+.content h3{font-size:1.02rem;font-weight:600;margin:1.7rem 0 .55rem;color:var(--accent2)}
+.content h4{font-size:.95rem;margin:1.4rem 0 .5rem;color:var(--dim)}
+.content p{margin:.7rem 0;color:var(--text);color:color-mix(in srgb,var(--text) 88%,var(--dim))}
+.content ul,.content ol{margin:.7rem 0 .7rem 1.4rem;color:var(--text);color:color-mix(in srgb,var(--text) 88%,var(--dim))}
+.content li{margin:.32rem 0}
+.content li::marker{color:var(--accent)}
+/* ============ COMPONENTS ============ */
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:1.15rem 1.3rem;margin:1rem 0;box-shadow:0 1px 0 rgba(255,255,255,.03) inset;transition:border-color .2s,transform .2s,box-shadow .25s}
+.card:hover{border-color:var(--border-strong);transform:translateY(-2px);box-shadow:var(--shadow)}
+.card h3{margin-top:0;display:flex;align-items:center;gap:.5rem}
+.card h3::before{content:"";width:8px;height:8px;border-radius:3px;background:var(--grad);flex-shrink:0}
+.badge{display:inline-block;font-size:.62rem;padding:.18rem .55rem;border-radius:999px;font-weight:700;letter-spacing:.06em;vertical-align:middle;font-family:'JetBrains Mono',monospace}
+.badge-rs{background:var(--grad);color:#fff;box-shadow:0 2px 10px -2px rgba(99,102,241,.5)}
+.tip,.warn{position:relative;border:1px solid;border-radius:13px;padding:.95rem 1.1rem .95rem 3.35rem;margin:1.1rem 0;font-size:.92rem}
+.tip{border-color:rgba(52,211,153,.3);background:linear-gradient(120deg,var(--tip-bg),transparent 70%)}
+.warn{border-color:rgba(251,191,36,.32);background:linear-gradient(120deg,var(--warn-bg),transparent 70%)}
+.tip::before,.warn::before{position:absolute;left:1.05rem;top:1.05rem;width:26px;height:26px;border-radius:8px;display:grid;place-items:center;font-size:.85rem;font-weight:700}
+.tip::before{content:"✓";color:#0b3b2c;background:var(--green)}
+.warn::before{content:"!";color:#3b2a06;background:var(--orange)}
+/* tables */
+.table-scroll{overflow-x:auto;border:1px solid var(--border);border-radius:13px;margin:1.1rem 0;background:var(--panel)}
+.table-scroll table{margin:0;border:none}
+table{border-collapse:collapse;width:100%;font-size:.885rem}
+th,td{padding:.6rem .85rem;text-align:left;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+th{background:var(--surface);color:var(--dim);font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.07em;white-space:nowrap}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:var(--nav-active)}
+/* code blocks */
+.code-block{position:relative;margin:1.1rem 0}
+.code-block::before{content:"";position:absolute;top:.8rem;left:1rem;width:10px;height:10px;border-radius:50%;background:#f87171;box-shadow:16px 0 0 #fbbf24,32px 0 0 #34d399;opacity:.85;z-index:1;pointer-events:none}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:14px;padding:2.35rem 1.15rem 1.05rem;overflow-x:auto;margin:1.1rem 0;font-size:.855rem;line-height:1.65;color:var(--code-text);box-shadow:var(--shadow)}
+.code-block pre{margin:0}
+pre code{background:none;border:none;padding:0;color:inherit;font-size:inherit;white-space:pre}
+.copy-btn{position:absolute;top:.5rem;right:.55rem;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:.22rem .6rem;font-size:.72rem;cursor:pointer;color:var(--dim);font-family:inherit;transition:all .15s;z-index:2}
+.copy-btn:hover{border-color:var(--accent);color:var(--accent)}
+.copy-btn.copied{color:var(--copy-ok);border-color:var(--copy-ok)}
+/* diagrams */
+.diagram-panel{border:1px solid transparent;border-radius:18px;padding:1.2rem 1.2rem 1rem;margin:1.4rem 0;scroll-margin-top:96px;background:var(--panel);background:linear-gradient(var(--panel),var(--panel)) padding-box,linear-gradient(135deg,rgba(129,140,248,.55),rgba(34,211,238,.28) 50%,rgba(129,140,248,.12)) border-box;box-shadow:var(--shadow)}
+.diagram-panel h4{margin:0 0 .8rem;color:var(--accent);font-size:.8rem;text-transform:uppercase;letter-spacing:.09em;display:flex;align-items:center;gap:.5rem}
+.diagram-panel h4::before{content:"";width:14px;height:2px;background:var(--grad);border-radius:2px}
 .diagram-svg{width:100%;height:auto;display:block;overflow:visible}
-.diagram-svg text{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;fill:var(--text);font-size:13px}
+.diagram-svg text{font-family:'Inter',ui-sans-serif,system-ui,sans-serif;fill:var(--text);font-size:13px}
 .diagram-svg .muted{fill:var(--dim);font-size:11px}
-.diagram-svg .box{fill:var(--bg);stroke:var(--border);stroke-width:1.4;rx:10;ry:10}
+.diagram-svg .box{fill:var(--bg2);stroke:var(--border-strong);stroke-width:1.4;rx:10;ry:10}
 .diagram-svg .box-accent{fill:var(--nav-active);stroke:var(--accent)}
 .diagram-svg .box-green{fill:var(--tip-bg);stroke:var(--green)}
 .diagram-svg .box-warn{fill:var(--warn-bg);stroke:var(--orange)}
-.diagram-svg .box-danger{fill:rgba(248,81,73,.09);stroke:var(--red)}
+.diagram-svg .box-danger{fill:rgba(248,113,113,.09);stroke:var(--red)}
 .diagram-svg .line{stroke:var(--dim);stroke-width:1.5;fill:none;marker-end:url(#arrow)}
 .diagram-svg .line-accent{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#arrowAccent)}
 .diagram-svg .lane{stroke:var(--border);stroke-dasharray:4 4;stroke-width:1}
-.diagram-notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.6rem;margin-top:.75rem}
-.diagram-note{border:1px solid var(--border);background:var(--bg);border-radius:10px;padding:.65rem;font-size:.84rem;color:var(--dim)}
-.diagram-note strong{color:var(--text)}
-.sidenav{position:fixed;top:0;left:0;width:260px;height:100vh;background:var(--nav-bg);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100;overflow:hidden}
-.nav-header{display:flex;align-items:center;justify-content:space-between;padding:.85rem 1rem;border-bottom:1px solid var(--border)}
-.nav-logo{font-size:1.05rem;font-weight:700;color:var(--purple);text-decoration:none}
-.theme-toggle{background:none;border:1px solid var(--border);border-radius:6px;padding:2px 8px;cursor:pointer;font-size:1rem;color:var(--dim);line-height:1}
-.theme-toggle:hover{border-color:var(--accent);color:var(--accent)}
-[data-theme="dark"] .icon-sun{display:inline}[data-theme="dark"] .icon-moon{display:none}
-[data-theme="light"] .icon-sun{display:none}[data-theme="light"] .icon-moon{display:inline}
-.nav-search{padding:.5rem .75rem}
-.nav-search input{width:100%;padding:.4rem .6rem;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--text);font-size:.82em;outline:none}
-.nav-search input:focus{border-color:var(--accent)}
-.nav-tree{flex:1;overflow-y:auto;padding:.25rem .5rem 1.5rem;scrollbar-width:thin;scrollbar-color:var(--scrollbar-thumb) var(--scrollbar-track)}
-.nav-group{margin:.15rem 0}
-.nav-section{display:flex;align-items:center;justify-content:space-between;width:100%;background:none;border:none;padding:.35rem .5rem;color:var(--dim);font-size:.72em;font-weight:700;text-transform:uppercase;letter-spacing:.07em;cursor:pointer;border-radius:4px}
-.nav-section:hover{background:var(--nav-active);color:var(--text)}
-.nav-section .arrow{transition:transform .2s;font-size:.85em}
-.nav-section.collapsed .arrow{transform:rotate(-90deg)}
-.nav-items{list-style:none;padding:.1rem 0 .1rem .6rem;margin:0}
-.nav-items li{margin:.12rem 0}
-.nav-items a{color:var(--dim);font-size:.82em;display:block;padding:.18rem .5rem;border-radius:4px;text-decoration:none;border-left:2px solid transparent}
-.nav-items a:hover{color:var(--accent);background:var(--nav-active)}
-.nav-items a.active{color:var(--accent);background:var(--nav-active);border-left-color:var(--accent);font-weight:600}
-.nav-items li.sub a{padding-left:1rem;font-size:.8em}
-.nav-items.hidden{display:none}
-.main{margin-left:260px;padding:1.5rem 2.5rem 4rem;max-width:920px;min-height:100vh}
-.menu-toggle{display:none;position:fixed;top:.75rem;left:.75rem;z-index:200;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.3rem .6rem;font-size:1.2rem;cursor:pointer;color:var(--dim)}
-.menu-toggle:hover{border-color:var(--accent);color:var(--accent)}
-.back-to-top{position:fixed;bottom:1.5rem;right:1.5rem;z-index:90;background:var(--surface);border:1px solid var(--border);border-radius:50%;width:36px;height:36px;font-size:1.1rem;cursor:pointer;color:var(--dim);opacity:0;transition:opacity .3s;pointer-events:none}
-.back-to-top.visible{opacity:1;pointer-events:auto}
-.back-to-top:hover{border-color:var(--accent);color:var(--accent)}
-.copy-btn{position:absolute;top:.4rem;right:.4rem;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:2px 8px;font-size:.72em;cursor:pointer;color:var(--dim);opacity:0;transition:opacity .2s}
-pre:hover .copy-btn{opacity:1}
-.copy-btn.copied{color:var(--copy-ok);border-color:var(--copy-ok)}
-.collapsible-header{cursor:pointer;user-select:none;display:flex;align-items:center;gap:.5rem}
-.collapsible-header::before{content:"▾";font-size:.8em;transition:transform .2s;display:inline-block;color:var(--dim)}
-.collapsible-header.collapsed::before{transform:rotate(-90deg)}
-.collapsible-content{overflow:hidden;transition:max-height .3s ease}
-.collapsible-content.collapsed{max-height:0!important}
-@media(max-width:900px){
-.sidenav{transform:translateX(-100%);transition:transform .3s}
-.sidenav.open{transform:translateX(0)}
-.main{margin-left:0;padding:1.2rem 1rem 4rem}
-.menu-toggle{display:block}
+.diagram-notes{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.9rem}
+.diagram-note{border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:.42rem .85rem;font-size:.78rem;color:var(--dim)}
+.diagram-note strong{color:var(--text);font-weight:600}
+/* collapsible sections */
+.collapsible-section{margin:.4rem 0}
+.collapsible-header{cursor:pointer;user-select:none;display:flex;align-items:center;gap:.6rem;padding:.55rem .8rem;margin-left:-.8rem;margin-right:-.8rem;border-radius:12px;transition:background .15s}
+.collapsible-header:hover{background:var(--surface)}
+.collapsible-header::after{content:"▾";margin-left:auto;color:var(--faint);font-size:.85rem;transition:transform .25s}
+.collapsible-header.collapsed::after{transform:rotate(-90deg)}
+.collapsible-header .badge{margin-left:.2rem}
+.collapsible-content{overflow:hidden;transition:max-height .35s ease}
+/* right rail */
+.rail-right{position:sticky;top:64px;height:calc(100vh - 64px);overflow-y:auto;padding:1.8rem 0 4rem;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.onpage-title{font-family:'Space Grotesk',sans-serif;font-size:.72rem;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--faint);margin-bottom:.6rem;padding-left:.85rem}
+#onpage-list{list-style:none;border-left:1px solid var(--border)}
+#onpage-list a{display:block;color:var(--faint);font-size:.8rem;padding:.24rem .85rem;border-left:2px solid transparent;margin-left:-1.5px;transition:color .12s,border-color .12s}
+#onpage-list a:hover{color:var(--text)}
+#onpage-list a.lvl-h1{font-weight:600;color:var(--dim);margin-top:.5rem}
+#onpage-list a.active{color:var(--accent);border-left-color:var(--accent)}
+/* footer note */
+.doc-footer{color:var(--dim);font-size:.86rem;margin-top:3rem}
+/* back to top */
+.back-to-top{position:fixed;bottom:1.6rem;right:1.6rem;z-index:250;width:42px;height:42px;border-radius:50%;border:none;background:var(--grad);color:#fff;font-size:1.05rem;cursor:pointer;opacity:0;transform:translateY(8px);transition:opacity .3s,transform .3s;pointer-events:none;box-shadow:0 8px 22px -6px rgba(99,102,241,.65)}
+.back-to-top.visible{opacity:1;transform:none;pointer-events:auto}
+.back-to-top:hover{transform:translateY(-2px)}
+/* ============ COMMAND PALETTE ============ */
+.palette-overlay{position:fixed;inset:0;z-index:500;background:rgba(3,6,12,.6);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);display:none;align-items:flex-start;justify-content:center;padding:14vh 1rem 1rem}
+.palette-overlay.open{display:flex}
+.palette{width:min(560px,100%);background:var(--panel);border:1px solid var(--border-strong);border-radius:16px;box-shadow:0 30px 80px -20px rgba(0,0,0,.6);overflow:hidden;animation:pal-in .16s ease}
+@keyframes pal-in{from{opacity:0;transform:translateY(-8px) scale(.985)}to{opacity:1;transform:none}}
+.palette-input{display:flex;align-items:center;gap:.7rem;padding:.95rem 1.1rem;border-bottom:1px solid var(--border)}
+.palette-input svg{width:16px;height:16px;color:var(--faint);flex-shrink:0}
+.palette-input input{flex:1;background:none;border:none;outline:none;color:var(--text);font-family:inherit;font-size:1rem}
+.palette-input input::placeholder{color:var(--faint)}
+.palette-results{max-height:340px;overflow-y:auto;padding:.5rem}
+.pal-group{font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--faint);padding:.55rem .7rem .25rem}
+.pal-item{display:flex;align-items:center;gap:.6rem;width:100%;text-align:left;background:none;border:none;color:var(--dim);font-family:inherit;font-size:.9rem;padding:.5rem .7rem;border-radius:9px;cursor:pointer}
+.pal-item .pal-hash{color:var(--accent);font-family:'JetBrains Mono',monospace;font-size:.8rem}
+.pal-item.sel,.pal-item:hover{background:var(--nav-active);color:var(--text)}
+.pal-empty{padding:1.6rem;text-align:center;color:var(--faint);font-size:.88rem}
+.palette-foot{display:flex;gap:1.1rem;padding:.6rem 1.1rem;border-top:1px solid var(--border);font-size:.72rem;color:var(--faint)}
+.palette-foot kbd{background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:.05rem .32rem;font-family:inherit}
+/* ============ RESPONSIVE ============ */
+@media(max-width:1180px){.rail-right{display:none}.layout{grid-template-columns:232px minmax(0,1fr)}}
+@media(max-width:920px){
+.topnav{display:none}
+.layout{grid-template-columns:minmax(0,1fr);padding:0 1.1rem}
+.rail-left{position:fixed;top:0;left:0;width:280px;height:100vh;z-index:350;background:var(--panel);border-right:1px solid var(--border);padding:4rem 1rem 3rem;transform:translateX(-100%);transition:transform .3s}
+.rail-left.open{transform:none}
+.scrim{position:fixed;inset:0;z-index:340;background:rgba(3,6,12,.55);opacity:0;pointer-events:none;transition:opacity .3s}
+body.drawer-open .scrim{opacity:1;pointer-events:auto}
+body.drawer-open{overflow:hidden}
+.menu-btn{display:grid}
+.hero-inner{grid-template-columns:1fr;padding:3.2rem 1.2rem 2.6rem}
+.term{transform:none}
+.search-trigger{min-width:0}
+.search-trigger .st-text,.search-trigger kbd{display:none}
 }
 </style>
 </head>
 <body>
-<nav class="sidenav" id="sidenav">
-<div class="nav-header">
-  <a href="#overview" class="nav-logo">Dext Docs</a>
-  <button class="theme-toggle" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
-    <span class="icon-sun">☀</span><span class="icon-moon">☽</span>
-  </button>
+<div class="progress" id="progress"></div>
+<header class="topbar">
+<div class="topbar-inner">
+  <button class="icon-btn menu-btn" id="menu-toggle" aria-label="Toggle menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <a href="#top" class="brand"><span class="brand-mark">D</span>Dext<span class="brand-sub">Docs</span></a>
+  <nav class="topnav">
+    <a href="#overview">Overview</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#safety-recovery">Safety</a>
+    <a href="#extensibility">Extensibility</a>
+    <a href="#testing-perf">Testing</a>
+    <a href="#cli-reference">Reference</a>
+  </nav>
+  <div class="topbar-actions">
+    <button class="search-trigger" id="search-trigger" aria-label="Search docs">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <span class="st-text">Search docs…</span><kbd>⌘K</kbd>
+    </button>
+    <button class="icon-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
+    </button>
+    <a class="icon-btn" href="https://github.com/SiliconState/Dext" title="GitHub" aria-label="GitHub repository"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.9 10.9c.6.1.8-.2.8-.5v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.2-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0C17.2 4.9 18.2 5.2 18.2 5.2c.6 1.6.2 2.8.1 3.1.8.9 1.2 1.9 1.2 3.2 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.2c0 .3.2.6.8.5A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z"/></svg></a>
+  </div>
 </div>
-<div class="nav-search">
-  <input type="text" id="nav-search" placeholder="Search docs…" autocomplete="off">
+</header>
+
+<section class="hero" id="top">
+<div class="hero-bg"></div>
+<div class="hero-inner">
+  <div class="hero-copy">
+    <span class="hero-badge"><span class="dot"></span>Single-binary Rust coding agent</span>
+    <h1 class="hero-title">The agent that <span class="grad">lives in your terminal.</span></h1>
+    <p class="hero-sub">Dext keeps project-scoped session state and gives the model a curated set of native tools for filesystem operations, search, shell execution, HTTP, Git, and task tracking — source-first, no external service required.</p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="#quickstart">Get started →</a>
+      <a class="btn btn-ghost" href="#architecture">Explore the architecture</a>
+    </div>
+    <div class="hero-stats">
+      <div class="stat"><div class="stat-num">18</div><div class="stat-label">Provider tools</div></div>
+      <div class="stat"><div class="stat-num">7</div><div class="stat-label">Providers</div></div>
+      <div class="stat"><div class="stat-num">3</div><div class="stat-label">Sandbox profiles</div></div>
+      <div class="stat"><div class="stat-num">1</div><div class="stat-label">Rust binary</div></div>
+    </div>
+  </div>
+  <div class="term" id="hero-term">
+    <div class="term-bar">
+      <span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span>
+      <span class="term-title">~/Dext — zsh</span>
+      <button class="term-copy" id="term-copy">Copy</button>
+    </div>
+    <div class="term-body">
+<div class="term-line"><span class="prompt">$</span>cargo install --path . --force --locked</div>
+<div class="term-line"><span class="prompt">$</span>dext auth login chatgpt</div>
+<div class="term-line"><span class="prompt">$</span>dext <span class="str">"summarize this repo"</span></div>
+<div class="term-line out">▸ streaming response <span class="cursor"></span></div>
+    </div>
+  </div>
 </div>
-<nav class="nav-tree" id="nav-tree">
+</section>
+
+<div class="layout">
+<aside class="rail-left" id="rail-left">
+<nav class="rail-nav" id="nav-tree">
 <div class="nav-group">
-  <button class="nav-section" data-target="sec-overview">Overview <span class="arrow">▾</span></button>
+  <button class="nav-section" data-target="sec-overview"><span class="num">01</span>Overview<span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-overview">
     <li><a href="#overview">Introduction</a></li>
     <li><a href="#quickstart">Quick Start</a></li>
@@ -126,7 +338,7 @@ pre:hover .copy-btn{opacity:1}
   </ul>
 </div>
 <div class="nav-group">
-  <button class="nav-section" data-target="sec-arch">Architecture <span class="arrow">▾</span></button>
+  <button class="nav-section" data-target="sec-arch"><span class="num">02</span>Architecture<span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-arch">
     <li><a href="#architecture">Architecture Overview</a></li>
     <li class="sub"><a href="#system-diagrams">System Diagrams</a></li>
@@ -141,10 +353,11 @@ pre:hover .copy-btn{opacity:1}
     <li class="sub"><a href="#tools-rs">Tools.rs</a></li>
     <li class="sub"><a href="#tool-policy-rs">Tool_policy.rs</a></li>
     <li class="sub"><a href="#tui-rs">Tui.rs</a></li>
+    <li class="sub"><a href="#tui-dependencies">TUI Dependencies</a></li>
   </ul>
 </div>
 <div class="nav-group">
-  <button class="nav-section" data-target="sec-safety">Safety &amp; Recovery <span class="arrow">▾</span></button>
+  <button class="nav-section" data-target="sec-safety"><span class="num">03</span>Safety &amp; Recovery<span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-safety">
     <li><a href="#git-checkpoints-rs">Git_checkpoints.rs</a></li>
     <li class="sub"><a href="#checkpoint-flowchart">Checkpoint Flowchart</a></li>
@@ -153,7 +366,7 @@ pre:hover .copy-btn{opacity:1}
   </ul>
 </div>
 <div class="nav-group">
-  <button class="nav-section" data-target="sec-ext">Extensibility <span class="arrow">▾</span></button>
+  <button class="nav-section" data-target="sec-ext"><span class="num">04</span>Extensibility<span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-ext">
     <li><a href="#orchestrator-rs">Orchestrator.rs</a></li>
     <li class="sub"><a href="#packs-rs">Packs.rs</a></li>
@@ -161,14 +374,14 @@ pre:hover .copy-btn{opacity:1}
   </ul>
 </div>
 <div class="nav-group">
-  <button class="nav-section" data-target="sec-test">Testing &amp; Perf <span class="arrow">▾</span></button>
+  <button class="nav-section" data-target="sec-test"><span class="num">05</span>Testing &amp; Perf<span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-test">
     <li><a href="#testing">Testing</a></li>
     <li><a href="#benchmarks">Benchmarks</a></li>
   </ul>
 </div>
 <div class="nav-group">
-  <button class="nav-section" data-target="sec-ref">Reference <span class="arrow">▾</span></button>
+  <button class="nav-section" data-target="sec-ref"><span class="num">06</span>Reference<span class="arrow">▾</span></button>
   <ul class="nav-items" id="sec-ref">
     <li><a href="#cli-reference">CLI Reference</a></li>
     <li class="sub"><a href="#slash-commands">Slash Commands</a></li>
@@ -176,19 +389,20 @@ pre:hover .copy-btn{opacity:1}
     <li class="sub"><a href="#env-vars">Environment Variables</a></li>
     <li class="sub"><a href="#providers">Providers</a></li>
     <li class="sub"><a href="#config-files">Configuration Files</a></li>
+    <li class="sub"><a href="RISK_REGISTER.md">Open Risk Register</a></li>
   </ul>
 </div>
 </nav>
-</nav>
-<button class="menu-toggle" id="menu-toggle" aria-label="Toggle menu">☰</button>
-<button class="back-to-top" id="back-to-top" aria-label="Back to top">↑</button>
-<main class="main" id="main-content">
+</aside>
+<main class="content" id="main-content">
 <h1 id="overview">Dext — Technical Documentation</h1>
 <p>Dext is a <strong>single-binary Rust coding agent</strong> that runs from your terminal. It keeps project-scoped session state and gives the model a curated set of native tools for filesystem operations, search, shell execution, data processing, HTTP requests, Git operations, and task tracking.</p>
 <p>Dext is <strong>source-first</strong>: prompts, runtime state, tool policies, provider wiring, and the TUI all live in the repository with no external service required beyond your chosen model provider.</p>
+<div class="tip"><strong>Canonical documentation:</strong> this page is the main technical reference and must be updated in the same change as runtime, architecture, security, provider, tool, test, CI, or release behavior. Focused Markdown guides remain supplemental. Open non-documentation risks are tracked in <a href="RISK_REGISTER.md">RISK_REGISTER.md</a>.</div>
 
-<div class="tip"><strong>Developer Rebuild Path:</strong> to rebuild Dext from source, implement core behavior in <code>src/main.rs</code> + module files, run <code>cargo build --release</code>, run <code>cargo test --release</code> (and <code>cargo test --release --test tui_smoke -- --nocapture</code> when TUI changes), then reinstall with <code>cargo install --path . --force</code>. This keeps the CLI binary on <code>PATH</code> in sync with source.</div>
-<p>Architecturally, Dext is organized as a thin orchestrator around a stable module set: request shaping and auth (<code>provider.rs</code>), policy and tool schema surfaces (<code>tools.rs</code>, <code>tool_policy.rs</code>), project/session state (<code>session.rs</code>), interactive rendering (<code>tui.rs</code>), safety/recovery primitives (<code>git_checkpoints.rs</code>, <code>mutation_preview.rs</code>, <code>memory_merge.rs</code>), and extensibility metadata/runtime (<code>packs.rs</code>, <code>shelves.rs</code>, <code>orchestrator.rs</code>).</p>
+<div class="tip"><strong>Developer verification:</strong> run <code>cargo fmt --all -- --check</code>, Clippy with warnings denied, <code>cargo audit --deny warnings</code>, the vendored <code>ratatui-core</code> tests, release build/tests, and the PTY smoke suite. Reinstall with <code>cargo install --path . --force --locked</code> so the binary on <code>PATH</code> matches the source. Renderer-specific requirements are documented in <a href="TUI.md">TUI.md</a>.</div>
+<div class="warn"><strong>Run the final gate on the host:</strong> Dext's default <code>workspace-write</code> sandbox intentionally denies shared <code>/tmp</code>, arbitrary pseudo-terminals, and Cargo install metadata such as <code>~/.cargo/.crates.toml</code>. Running Dext's own full suite through a confined Dext shell can therefore cause cascading temp-directory failures, deny all TUI smoke tests, and block installation. Run the gate directly in a trusted terminal or CI. If Dext must orchestrate it, start a separate controlled process with <code>dext --sandbox-profile danger-full-access --approval always</code>; setting an environment variable inside an already-confined shell cannot relax the parent kernel sandbox. Do not weaken the default sandbox for test convenience.</div>
+<p>Architecturally, Dext uses <code>Agent</code> in <code>main.rs</code> as a facade around focused modules: provider request shaping and auth (<code>provider.rs</code>), bounded stream assembly (<code>streaming.rs</code>), tool-round execution and side-effect fencing (<code>tool_round.rs</code>, <code>tool_journal.rs</code>), tool schemas and policy (<code>tools.rs</code>, <code>tool_policy.rs</code>), project/session state (<code>session.rs</code>), interactive rendering (<code>tui.rs</code>), safety/recovery primitives (<code>git_checkpoints.rs</code>, <code>mutation_preview.rs</code>, <code>memory_merge.rs</code>), and extension metadata/runtime (<code>packs.rs</code>, <code>shelves.rs</code>, <code>orchestrator.rs</code>).</p>
 
 <section class="collapsible-section">
 <h2 id="quickstart" class="collapsible-header">Quick Start</h2>
@@ -197,14 +411,15 @@ pre:hover .copy-btn{opacity:1}
 <h3>Install</h3>
 <pre><code>git clone https://github.com/SiliconState/Dext.git
 cd Dext
-cargo install --path . --force</code></pre>
+cargo install --path . --force --locked</code></pre>
 </div>
 <div class="card">
 <h3>Authenticate</h3>
-<pre><code>dext auth providers          # list available providers
-dext auth login chatgpt      # ChatGPT/Codex OAuth
-dext auth login glm &lt;key&gt;    # ZAI GLM API key
-dext auth login openai &lt;key&gt; # OpenAI Platform key</code></pre>
+<pre><code>dext auth providers           # list available providers
+dext auth login chatgpt       # ChatGPT/Codex OAuth
+dext auth login glm &lt;key&gt;     # ZAI GLM API key
+dext auth login openai &lt;key&gt;  # OpenAI Platform key
+dext auth login kimi &lt;key&gt;    # Kimi Code plan key</code></pre>
 </div>
 <div class="card">
 <h3>Run</h3>
@@ -224,6 +439,10 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>src/main_tests.rs</code></td><td>Unit and integration tests for main.rs</td></tr>
 <tr><td><code>src/tui.rs</code></td><td>Ratatui inline TUI, permission prompts, transcript rendering</td></tr>
 <tr><td><code>src/provider.rs</code></td><td>Provider catalog, auth, request shaping, model normalization</td></tr>
+<tr><td><code>src/sse.rs</code></td><td>Input-buffer-bounded SSE frame decoder shared by runtime and benchmarks</td></tr>
+<tr><td><code>src/streaming.rs</code></td><td>Provider event validation and stream/tool-call assembly</td></tr>
+<tr><td><code>src/tool_round.rs</code></td><td>Tool planning, approval, checkpoint/journal boundaries, dispatch, result normalization</td></tr>
+<tr><td><code>src/tool_journal.rs</code></td><td>Owner-private side-effect start/terminal records and resume reconciliation</td></tr>
 <tr><td><code>src/session.rs</code></td><td>Session/log persistence, project state locks, atomic I/O</td></tr>
 <tr><td><code>src/tools.rs</code></td><td>Tool definitions, permission metadata, parallel-safe classification</td></tr>
 <tr><td><code>src/orchestrator.rs</code></td><td>Work phases, similarity guards, objective tracking, adaptive caps</td></tr>
@@ -234,12 +453,13 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>src/shelves.rs</code></td><td>Typed shelf registry with ability metadata, signals, and effects</td></tr>
 <tr><td><code>src/tool_policy.rs</code></td><td>Command risk classification, input validation, bash guardrails</td></tr>
 <tr><td><code>benches/dext_bench.rs</code></td><td>Criterion performance harness</td></tr>
-<tr><td><code>tests/tui_smoke.rs</code></td><td>PTY-backed TUI smoke tests</td></tr>
+<tr><td><code>tests/tui_smoke.rs</code></td><td>PTY-backed launch, multiline input, streaming, and resize regression tests</td></tr>
+<tr><td><code>vendor/ratatui-core/</code></td><td>Exact upstream source plus Dext's narrow inline-terminal compatibility patch</td></tr>
 </table>
 </div>
 </section>
 <h1 id="architecture">Architecture</h1>
-<p>Dext follows a <strong>single-binary architecture</strong> with no plugins or external services. The agent loop in <code>main.rs</code> drives everything: it composes prompts, makes streaming HTTP requests to model providers, dispatches tool calls, handles permissions, and manages session state.</p>
+<p>Dext follows a <strong>single-binary architecture</strong> with no runtime plugin service. The <code>Agent</code> facade composes prompts and state while focused modules assemble provider streams, execute tool rounds, enforce policy, render the terminal, and persist recovery metadata.</p>
 
 <h3>High-Level Data Flow</h3>
 <pre><code>User Input → Agent Loop → Provider HTTP (streaming SSE)
@@ -342,13 +562,12 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Key Enums and Structs</h3>
 <table>
 <tr><th>Type</th><th>Defined In</th><th>Purpose</th></tr>
-<tr><td><code>ThinkingEffort</code></td><td>main.rs</td><td>Reasoning depth: Off, Low, Medium, High, XHigh</td></tr>
+<tr><td><code>ThinkingEffort</code></td><td>main.rs</td><td>Reasoning depth: Off, Low, Medium, High, XHigh, Max</td></tr>
 <tr><td><code>OutputMode</code></td><td>main.rs</td><td>Text, Json, StreamJson — output format for non-interactive mode</td></tr>
 <tr><td><code>ApprovalProfile</code></td><td>main.rs</td><td>Ask, AutoRead, AutoWrite, Never, Always — permission gating</td></tr>
 <tr><td><code>SandboxProfile</code></td><td>main.rs</td><td>ReadOnly, WorkspaceWrite, DangerFullAccess</td></tr>
 <tr><td><code>ContextMode</code></td><td>main.rs</td><td>Standard, Frugal, Tiny — context window management</td></tr>
 <tr><td><code>MutationPreviewMode</code></td><td>main.rs</td><td>Off, Simple, Git — diff preview before mutations</td></tr>
-<tr><td><code>BrowserRecipe</code></td><td>main.rs</td><td>Disabled, AgentBrowser — browser automation toggle</td></tr>
 <tr><td><code>Usage</code></td><td>main.rs</td><td>Token tracking: input, output, cache_create, cache_read</td></tr>
 <tr><td><code>BudgetCap</code></td><td>main.rs</td><td>Session budget limits in USD or tokens</td></tr>
 <tr><td><code>WorkLedger</code></td><td>main.rs</td><td>Objective, phase, decisions, pending/done/blocked items</td></tr>
@@ -360,13 +579,13 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="main-rs" class="collapsible-header">Main.rs — Agent Core <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p>At ~18,000 lines, <code>main.rs</code> is the heart of Dext. It contains:</p>
+<p><code>main.rs</code> owns the <code>Agent</code> facade, CLI and slash-command dispatch, prompt/context assembly, compaction, built-in tool adapters, and eval harness. Provider stream parsing lives in <code>streaming.rs</code>; tool planning and dispatch live in <code>tool_round.rs</code>; durable side-effect records live in <code>tool_journal.rs</code>.</p>
 <h3>Agent Loop</h3>
 <p>The central <code>Agent</code> struct drives a turn-based loop:</p>
 <ol>
 <li><strong>Prompt composition</strong> — Builds the system prompt from <code>DEXT.md</code>, project context, tool catalog, session header, work ledger, shelf abilities, and recall cache.</li>
 <li><strong>History management</strong> — Maintains a <code>Vec&lt;Message&gt;</code> with automatic compaction when context pressure exceeds configurable thresholds (default: 90% at end-turn, 80% after safe tool-result checkpoints).</li>
-<li><strong>Provider dispatch</strong> — Sends streaming requests to the active provider. Parses SSE chunks into <code>Block</code> variants.</li>
+<li><strong>Provider dispatch</strong> — Sends streaming requests to the active provider. Applies connect, first-byte, and between-chunk idle deadlines, then parses bounded SSE frames into <code>Block</code> variants.</li>
 <li><strong>Tool execution</strong> — Dispatches <code>tool_use</code> blocks to native Rust implementations. Supports parallel execution for read-only tools.</li>
 <li><strong>Permission gating</strong> — Routes tool calls through <code>EventSink::request_permission()</code> based on the active <code>ApprovalProfile</code> and tool risk classification.</li>
 <li><strong>Steering</strong> — Active-turn user input is routed to a steering channel, injected at safe boundaries.</li>
@@ -374,16 +593,19 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Stream Parsing</h3>
 <table>
 <tr><th>Provider</th><th>API</th><th>Request Builder</th></tr>
-<tr><td>Anthropic / GLM</td><td>Messages API (<code>/v1/messages</code>)</td><td><code>Request</code> struct with <code>AnthropicThinking</code></td></tr>
+<tr><td>Anthropic / GLM / Kimi Code</td><td>Messages API (<code>/v1/messages</code>)</td><td><code>Request</code> struct with <code>AnthropicThinking</code></td></tr>
 <tr><td>OpenAI / DeepSeek / Local</td><td>Chat Completions (<code>/v1/chat/completions</code>)</td><td><code>OaiRequest</code> with <code>reasoning_effort</code></td></tr>
 <tr><td>ChatGPT / Codex</td><td>Responses API (<code>/codex/responses</code>)</td><td><code>build_chatgpt_request()</code></td></tr>
 </table>
+<h3>Transport Deadlines and Body Bounds</h3>
+<p>The shared provider client uses a 15-second connect timeout. Cloud requests allow 180 seconds to first response headers and 90 seconds between stream chunks; local llama.cpp requests default to 600 seconds and 300 seconds respectively. <code>DEXT_PROVIDER_CONNECT_TIMEOUT_SECS</code>, <code>DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS</code>, and <code>DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS</code> accept positive overrides. Initial requests and compaction retries use the same first-byte policy. Non-stream compaction responses use the stream-idle deadline while reading and reject JSON bodies above 4 MiB; provider error diagnostics stop at 4,000 bytes.</p>
+<p><code>src/sse.rs</code> limits its in-progress input buffer to one configured event plus at most four delimiter bytes before rejection. One large network read may still contain many valid small events; the decoder drains complete frames incrementally rather than rejecting by chunk size.</p>
 <h3>Session Persistence</h3>
 <p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). This header is the replay anchor for deterministic restore behavior.</p>
 <h3>Eval Harness</h3>
 <p>Outcome-oriented assertions on files and command output. The eval path validates objective completion semantically (not just command exit) and records verification artifacts for later audit. Run via <code>dext --eval</code>.</p>
 <h3>Crash Recovery</h3>
-<p>A panic hook writes crash snapshots to <code>~/.dext/crashes/</code> with session ID, last event IDs, terminal state, and backtrace, then restores terminal settings on next launch to avoid broken TTY state after crashes.</p>
+<p>A panic hook writes an owner-private JSON snapshot under <code>~/.dext/crashes/</code> with a generated crash id, hashed source-location metadata, terminal dimensions, process id, current generated session id, recent event breadcrumbs, and whether backtraces were enabled. Free-form panic payloads, raw source paths, environment text, and backtrace content are omitted.</p>
 </div>
 </section>
 <section class="collapsible-section">
@@ -394,7 +616,10 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <pre><code>~/.dext/                         # DEXT_HOME (overridable)
 ├── providers.json               # Provider catalog
 ├── auth.json                    # Stored credentials (0600 on Unix)
-├── crashes/                     # Crash snapshots
+├── .env                         # Optional user-owned Dext dotenv settings
+├── settings.json                 # user compaction threshold settings
+├── bundled-packs/                # private content-addressed embedded pack cache
+├── crashes/                     # owner-private crash snapshots
 ├── shelves/                     # User-scoped shelves
 ├── packs/                       # User-scoped packs
 └── projects/
@@ -406,6 +631,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
                 ├── latest.log
                 ├── session.lock.json
                 ├── DEXT.todo.json
+                ├── tool-journal.json
                 ├── artifacts/
                 ├── git-auth/
                 └── sudo/</code></pre>
@@ -434,10 +660,11 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Built-in Providers</h3>
 <table>
 <tr><th>ID</th><th>Display</th><th>API</th><th>Default Model</th><th>Auth</th></tr>
-<tr><td><code>glm</code></td><td>ZAI GLM</td><td>Anthropic</td><td>glm-4.6</td><td>API Key (<code>ZAI_API_KEY</code>)</td></tr>
+<tr><td><code>glm</code></td><td>ZAI GLM</td><td>Anthropic</td><td>glm-5.2[1m]</td><td>API Key (<code>ZAI_API_KEY</code>)</td></tr>
 <tr><td><code>chatgpt</code></td><td>ChatGPT</td><td>ChatGPT Responses</td><td>gpt-5.4</td><td>OAuth (OpenAI auth)</td></tr>
 <tr><td><code>openai</code></td><td>OpenAI API</td><td>OpenAI</td><td>gpt-5</td><td>API Key (<code>OPENAI_API_KEY</code>)</td></tr>
-<tr><td><code>anthropic</code></td><td>Anthropic</td><td>Anthropic</td><td>claude-sonnet-4-5</td><td>API Key (<code>ANTHROPIC_API_KEY</code>)</td></tr>
+<tr><td><code>anthropic</code></td><td>Anthropic</td><td>Anthropic</td><td>Provider catalog default</td><td>API Key (<code>ANTHROPIC_API_KEY</code>)</td></tr>
+<tr><td><code>kimi</code></td><td>Kimi Code</td><td>Anthropic</td><td>k3</td><td>API Key (<code>KIMI_API_KEY</code>)</td></tr>
 <tr><td><code>deepseek</code></td><td>DeepSeek</td><td>OpenAI</td><td>deepseek-chat</td><td>API Key (<code>DEEPSEEK_API_KEY</code>)</td></tr>
 <tr><td><code>local</code></td><td>Local llama.cpp</td><td>OpenAI</td><td>qwen3.6-35b-a3b-mtp-ud-q5_k_m</td><td>None; accepts the server model alias, probes live context, and defaults to frugal context</td></tr>
 </table>
@@ -456,7 +683,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>Profile's <code>default_model</code></li>
 </ol>
 <h3>ChatGPT Model Normalization</h3>
-<p>Compact aliases are canonicalized: <code>gpt5codex</code> → <code>gpt-5-codex</code>, <code>gpt54</code> → <code>gpt-5.4</code>, etc. GLM models get auto-prefixed with <code>glm-</code> if missing.</p>
+<p>Compact aliases are canonicalized (for example <code>gpt5codex</code> → <code>gpt-5-codex</code> and ChatGPT <code>gpt-5.6</code> → <code>gpt-5.6-sol</code>). GLM models get an automatic <code>glm-</code> prefix when omitted, and model-name context hints such as <code>[1m]</code> are honored.</p>
 <h3>Authentication</h3>
 <p>Credentials stored in <code>~/.dext/auth.json</code>. Two types: <code>ApiKey</code> (plain key, supports env var refs and <code>!command</code> secret references) and <code>OAuth</code> (access token + refresh token + expiry, used by ChatGPT). Provider/profile resolution merges built-ins with user catalog overrides while pruning retired bundled providers.</p>
 </div>
@@ -476,7 +703,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <table>
 <tr><th>Category</th><th>Tools</th></tr>
 <tr><td><strong>Read-only (parallel-safe)</strong></td><td><code>read_file</code>, <code>read_symbol</code>, <code>fd</code>, <code>rg</code>, <code>jq</code>, <code>fzf</code>, <code>git_diff</code>, <code>git_log</code>, <code>todo_read</code></td></tr>
-<tr><td><strong>Needs permission</strong></td><td><code>bash</code>, <code>browser</code>, <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>http</code>, <code>awk</code>, <code>csvkit</code>, <code>git_commit</code>, <code>todo_write</code></td></tr>
+<tr><td><strong>Needs permission</strong></td><td><code>bash</code>, <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>http</code>, <code>awk</code>, <code>csvkit</code>, <code>git_commit</code>, <code>todo_write</code></td></tr>
 <tr><td><strong>External process</strong></td><td><code>fd</code>, <code>rg</code>, <code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>csvkit</code>, <code>git_diff</code>, <code>git_log</code></td></tr>
 </table>
 <h3>Wire Format Adapters</h3>
@@ -485,7 +712,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li><code>wire_tools_oai()</code> — OpenAI <code>function</code> type format</li>
 <li><code>wire_tools_chatgpt()</code> — ChatGPT flattened format with <code>strict: null</code></li>
 </ul>
-<p>Runtime-only slash commands (<code>pack</code>, <code>shelves</code>) are intentionally separate from provider-visible tools. <code>/browser</code> controls the optional browser recipe, while the provider-visible <code>browser</code> tool is only useful when that recipe is enabled and <code>agent-browser</code> is installed.</p>
+<p>Runtime-only pack and shelf commands are intentionally separate from provider-visible tools. Browser automation is delivered by the bundled <code>agent-browser</code> pack through the normal <code>bash</code> approval and sandbox path; it adds no browser recipe or provider-visible tool. Runtime-essential bundled files are embedded in the binary and materialized into a content-addressed <code>$DEXT_HOME/bundled-packs/</code> cache. Existing <code>DEXT_HOME</code> ownership/write safety is validated without changing its mode; cache directories are owner-private on Unix, symlink components are rejected, file bytes/modes are verified and repaired, and cache failures are surfaced without hiding project/user packs.</p>
 </div>
 </section>
 
@@ -505,6 +732,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>Auto-injects <code>set -o pipefail</code> if missing</li>
 <li>Blocks <code>--break-system-packages</code> pip flag (overridable)</li>
 <li>Detects sudo commands needing password and routes to local auth prompt</li>
+<li>Bash calls are atomic: Unix roots run in detached sessions/process groups; Windows roots start suspended, enter kill-on-close Job Objects, then resume. Dext cleans the full child tree after completion, timeout, or interrupt.</li>
+<li>On Windows, shell-backed tools skip Windows/WSL app aliases and select a real <code>bash.exe</code> from <code>PATH</code> (for example Git for Windows); <code>DEXT_BASH_PATH</code> provides an explicit override.</li>
 <li>Advisories: prefer <code>rg</code> over <code>grep -r</code>, prefer <code>fd</code> over <code>find</code></li>
 </ul>
 <h3>Input Validation</h3>
@@ -517,7 +746,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="tui-rs" class="collapsible-header">Tui.rs — Terminal UI <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p>A full-featured inline TUI built on <strong>ratatui + crossterm</strong> that renders in the regular terminal buffer (no alternate-screen takeover).</p>
+<p>An inline TUI built on <strong>Ratatui + Crossterm</strong> that renders in the regular terminal buffer and preserves native terminal scrollback. The backend output viewer is the only alternate-screen surface.</p>
 <h3>Layout</h3>
 <ul>
 <li><strong>Transcript area</strong> — Scrollable message history with user, assistant, tool, thinking, and steering lines</li>
@@ -530,8 +759,10 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Key Bindings</h3>
 <table>
 <tr><th>Key</th><th>Action</th></tr>
-<tr><td><code>Enter</code></td><td>Submit input (or insert newline in multi-line mode)</td></tr>
-<tr><td><code>Ctrl+O</code></td><td>Toggle single-line / multi-line input</td></tr>
+<tr><td><code>Enter</code></td><td>Submit input</td></tr>
+<tr><td><code>Shift+Enter</code> / <code>Alt+Enter</code></td><td>Insert newline</td></tr>
+<tr><td><code>Ctrl+O</code></td><td>Toggle the latest expandable tool output</td></tr>
+<tr><td><code>Ctrl+B</code></td><td>Open backend output viewer while bash runs</td></tr>
 <tr><td><code>Ctrl+D</code></td><td>Quit</td></tr>
 <tr><td><code>Ctrl+C</code></td><td>Interrupt current turn</td></tr>
 <tr><td><code>Up/Down</code></td><td>Navigate input history</td></tr>
@@ -542,6 +773,9 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints.</p>
 <h3>Markdown Rendering</h3>
 <p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence.</p>
+<h3 id="tui-dependencies">Dependency and resize contract</h3>
+<p>The exact stack is <code>ratatui 0.30.2</code>, <code>ratatui-core 0.1.2</code>, <code>tui-markdown 0.3.8</code>, <code>crossterm 0.29.0</code>, and <code>unicode-width 0.2.2</code>. Dext selects exact versions and patches exact vendored <code>ratatui-core</code> source to avoid synchronous cursor-position queries during inline replay and whole-display clears during horizontal shrink.</p>
+<p>The real-PTY regression suite verifies editable input during streaming, resize survival with populated history, zero whole-screen resize clears, bounded cursor queries, terminal-height-bounded replay chunks, and completed output after resize. Its final stream marker has a bounded 10-second wait so slower macOS CI hosts do not create false negatives. See <a href="TUI.md">TUI.md</a> and <code>vendor/ratatui-core/DEXT_PATCH.md</code> for the maintained contract and patch rationale.</p>
 </div>
 </section>
 <h1 id="safety-recovery">Safety &amp; Recovery</h1>
@@ -568,7 +802,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Pruning</h3>
 <p>Default: keep the 20 newest checkpoints and remove entries older than 168 hours (7 days). Pruning rebuilds local manifests, removes orphaned <code>refs/dext/checkpoints/*</code>, and deletes associated sidecar directories for bounded disk growth. Never mirror-push <code>refs/dext/*</code>.</p>
 <h3>Checkpoint Triggers</h3>
-<p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Other tools are checkpointed when <code>tool_policy::classify_command_risk()</code> returns Write or Danger (for example write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code>, non-GET <code>http</code>, or enabled <code>browser</code> actions).</p>
+<p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Other tools are checkpointed when <code>tool_policy::classify_command_risk()</code> returns Write or Danger (for example write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> or non-GET <code>http</code>).</p>
 </div>
 </section>
 
@@ -585,7 +819,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>Show added/removed line counts and whether it's a new file</li>
 </ol>
 <h3>Sandbox Validation</h3>
-<p>All paths are canonicalized and validated to be within the sandbox root. Paths outside the sandbox are rejected.</p>
+<p>All paths are canonicalized and validated to be within the sandbox root. Paths outside the sandbox are rejected. Cross-platform display and Git pathspec rendering strips Windows verbatim prefixes and normalizes separators to forward slashes; work-ledger filtering recognizes both native and foreign-platform absolute paths.</p>
 </div>
 </section>
 
@@ -654,7 +888,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Pack Object Model (<code>PackInfo</code>)</h3>
 <p><code>packs.rs</code> normalizes each discovered pack into <code>PackInfo</code> with:</p>
 <ul>
-<li><code>name</code>, <code>description</code> (from front matter or directory defaults)</li>
+<li><code>name</code>, <code>description</code>, declared <code>credential_env</code> names (from front matter or directory defaults)</li>
 <li><code>path</code>, <code>pack_md_path</code>, optional <code>phooks_path</code></li>
 <li><code>source</code> label (project/env/user/bundled) and optional shelf ownership</li>
 </ul>
@@ -680,6 +914,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <pre><code>---
 name: my-pack
 description: One-line workflow summary
+credential-env: [SERVICE_TOKEN]
 ---
 
 # Workflow
@@ -689,7 +924,7 @@ description: One-line workflow summary
 4) Verify
 5) Deliver
 </code></pre>
-<p>Only <code>PACK.md</code> is required. Front matter fields are intentionally minimal to keep packs simple and portable.</p>
+<p>Only <code>PACK.md</code> is required. Front matter stays minimal: identity/description plus an optional inline <code>credential-env</code> list of exact credential-shaped names required by the pack's own helper. That field is honored only for environment-selected, user-global, and bundled packs; project-local declarations are ignored.</p>
 
 <h3>Prompt Injection Model</h3>
 <p><code>pack_prompt()</code> builds a bounded invocation prompt (cap: <code>PACK_PROMPT_CAP = 32_000</code> bytes) containing:</p>
@@ -697,10 +932,11 @@ description: One-line workflow summary
 <li>pack identity and source metadata</li>
 <li>paths for workflow and optional hooks</li>
 <li>pack-scoped environment names (<code>DEXT_PACK_DIR</code>, <code>DEXT_PACK_&lt;NAME&gt;_DIR</code>), which the runtime supplies to active-pack <code>bash</code> calls and hook processes</li>
+<li>declared credential names only, never their values</li>
 <li>full <code>PACK.md</code> workflow body</li>
 <li>explicit user task text</li>
 </ul>
-<p>This gives the model procedural guidance without changing core runtime policy. The selected pack remains active for the session: its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Changing the sandbox root clears that active pack state.</p>
+<p>This gives the model procedural guidance without changing core runtime policy. The selected pack remains active for the session: its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for environment-selected, user-global, and bundled packs, they reach only a simple direct invocation of the active pack's own native <code>bin/</code> helper, never hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored and reported by pack inspection so repository content cannot enable parent credential inheritance. On Windows, only native <code>.exe</code>/<code>.com</code> helpers qualify for direct credential inheritance; script helpers use Bash with declared credentials removed. Changing the sandbox root clears active pack state.</p>
 
 <h3>Execution Paths</h3>
 <ul>
@@ -791,7 +1027,7 @@ description: One-line workflow summary
 <h2 id="testing" class="collapsible-header">Testing</h2>
 <div class="collapsible-content">
 <h3>Unit Tests (main_tests.rs)</h3>
-<p>~8,000 lines of tests covering:</p>
+<p>The test suite covers provider catalogs and request shaping, auth and state formats, stream/tool-call assembly, tool policy, sandboxing, side-effect journals, recovery checkpoints, memory merges, TUI rendering, and runtime orchestration.</p>
 <ul>
 <li>Provider catalog loading, normalization, and model resolution</li>
 <li>Auth store operations (save, load, normalize)</li>
@@ -801,18 +1037,20 @@ description: One-line workflow summary
 <li>Memory merge algorithms (section-aware and recall)</li>
 <li>Checkpoint creation and restore logic</li>
 <li>Objective tracking and satisfaction assessment</li>
-<li>URL host extraction and bulk network detection</li>
+<li>URL host extraction, proxy isolation, destination policy, and exact redirect limits; redirect fixtures use bounded blocking reads on accepted sockets for consistent Windows behavior</li>
 </ul>
-<p>Run with: <code>cargo test --release</code></p>
-<h3>TUI Smoke Test (tests/tui_smoke.rs)</h3>
-<p>Spawns the real Dext binary in a Unix PTY at various terminal sizes (80×24, 120×40, 180×40) and verifies:</p>
+<p>Run with: <code>cargo test --release --locked</code></p>
+<h3>Real-PTY TUI Regression Suite (tests/tui_smoke.rs)</h3>
+<p>Spawns the real Dext binary in a Unix PTY at narrow and wide terminal sizes and verifies:</p>
 <ul>
-<li>Application launches and shows version, sandbox, model info</li>
-<li>Help keymap is visible when <code>?</code> is pressed</li>
-<li>Clean exit on Ctrl+D with success status</li>
-<li>No crash markers (<code>panicked at</code>, <code>[error]</code>)</li>
+<li>Application launch, banner/composer rendering, help, multiline input, and clean Ctrl+D exit</li>
+<li>Editable input while output streams and process survival during populated-history resize bursts</li>
+<li>Zero whole-screen clears, resize-bounded cursor queries, and terminal-height-bounded replay chunks</li>
+<li>Completed stream output and accepted input after resize, with no crash markers</li>
 </ul>
-<p>Run with: <code>cargo test --release --test tui_smoke -- --nocapture</code></p>
+<p>Run with: <code>cargo test --release --locked --test tui_smoke -- --nocapture</code></p>
+<p>The complete verification gate also runs formatting, Clippy with warnings denied across the Linux, macOS, and Windows CI matrix, <code>cargo audit --deny warnings</code>, the vendored <code>ratatui-core</code> unit tests, and a locked release build. See <a href="TUI.md">TUI.md</a> for renderer-specific live-terminal checks.</p>
+<div class="warn"><strong>Confined self-test limitation:</strong> the complete suite is not expected to pass through a Dext <code>bash</code> tool under <code>workspace-write</code>. The sandbox's shared-temp denial can create many follow-on test failures after a common environment lock is poisoned; PTY denial prevents this smoke test from creating terminals; and Cargo-home protection blocks local installation metadata. These denials demonstrate confinement, but do not count as a successful release gate. Rerun from a trusted host terminal or CI.</div>
 </div>
 </section>
 
@@ -822,13 +1060,10 @@ description: One-line workflow summary
 <p>Criterion benchmarks for performance-critical paths:</p>
 <table>
 <tr><th>Benchmark</th><th>What it measures</th></tr>
-<tr><td><code>sse_parse/stream_512_deltas</code></td><td>SSE event parsing throughput (512 delta events)</td></tr>
-<tr><td><code>tool_read_file/100k_linebuf</code></td><td>Line-numbered file reading with cap (100KB file)</td></tr>
-<tr><td><code>session_serialize/1k_messages</code></td><td>JSON serialization of 1000 messages</td></tr>
-<tr><td><code>log_append</code></td><td>Log append: full-rewrite vs fast-append (100 events, 64KB cap)</td></tr>
-<tr><td><code>json_parse/sse_delta_event</code></td><td>Single SSE delta JSON parse latency</td></tr>
+<tr><td><code>production_sse_decode/coalesced_provider_read</code></td><td>Production SSE framing for 512 events delivered in one provider read</td></tr>
+<tr><td><code>production_sse_decode/fragmented_97_byte_reads</code></td><td>The same production decoder under fragmented network reads</td></tr>
 </table>
-<p>Run with: <code>cargo bench</code></p>
+<p>Run with <code>cargo bench</code>; CI and the release quality job compile the benchmark with <code>cargo bench --no-run --locked</code>.</p>
 <h3>Build Profile</h3>
 <p>Release builds use: <code>lto = false</code>, <code>codegen-units = 16</code>, <code>strip = "symbols"</code> — optimized for build speed while keeping binary size small.</p>
 </div>
@@ -845,10 +1080,14 @@ description: One-line workflow summary
 <tr><td><code>dext -p</code></td><td>Read prompt from stdin</td></tr>
 <tr><td><code>dext --resume</code></td><td>Resume latest session</td></tr>
 <tr><td><code>dext --fork</code></td><td>Fork latest session into new session</td></tr>
-<tr><td><code>dext session ...</code></td><td>Inspect/export/analyze project-scoped latest or named sessions</td></tr>
+<tr><td><code>dext session ...</code></td><td>Brief/map/packet/focus/track/export/analyze/grep/failures/verification/decision operations</td></tr>
+<tr><td><code>dext doctor [...]</code></td><td>Inspect effective safety policy and bounded local state without repair or provider calls</td></tr>
+<tr><td><code>dext pack list|inspect|run ...</code></td><td>Discover or invoke source-first packs</td></tr>
+<tr><td><code>dext shelves</code></td><td>List typed shelf manifests and ability metadata</td></tr>
 <tr><td><code>dext --cd &lt;dir&gt;</code></td><td>Change working directory</td></tr>
 <tr><td><code>dext --no-session</code></td><td>Don't save session</td></tr>
-<tr><td><code>dext --frugal</code></td><td>Low-token mode (lean schemas, core tools, reduced context, medium default effort)</td></tr>
+<tr><td><code>dext --pack &lt;name&gt; "task"</code></td><td>Invoke a pack in one-shot mode</td></tr>
+<tr><td><code>dext --frugal</code> / <code>dext --tiny</code></td><td>Select reduced-context modes</td></tr>
 <tr><td><code>dext --context-mode standard|frugal|tiny</code></td><td>Choose context/cap mode</td></tr>
 <tr><td><code>dext --toolset default|full</code></td><td>Choose provider-visible tool count profile</td></tr>
 <tr><td><code>dext --tool-profile lean|full</code></td><td>Choose provider tool schema verbosity</td></tr>
@@ -858,7 +1097,8 @@ description: One-line workflow summary
 <tr><td><code>dext --output json|stream-json</code></td><td>Machine-readable output</td></tr>
 <tr><td><code>dext --effort off|low|medium|high|xhigh|max</code></td><td>Thinking effort</td></tr>
 <tr><td><code>dext --approval ask|auto-read|auto-write|never|always</code></td><td>Approval profile</td></tr>
-<tr><td><code>dext --no-trust</code></td><td>Opt out of default startup trust mode</td></tr>
+<tr><td><code>dext --trust</code></td><td>Explicitly select approval <code>always</code></td></tr>
+<tr><td><code>dext --no-trust</code></td><td>Explicitly select the default <code>ask</code> approval profile</td></tr>
 <tr><td><code>dext --budget &lt;amount&gt;</code></td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
 </table>
 <h3>Auth Subcommands</h3>
@@ -875,8 +1115,12 @@ description: One-line workflow summary
 <tr><td><code>dext undo --list</code></td><td>List recovery checkpoints</td></tr>
 <tr><td><code>dext undo --preview &lt;id&gt;</code></td><td>Preview checkpoint restore without modifying files</td></tr>
 <tr><td><code>dext undo --apply &lt;id&gt;</code></td><td>Apply a checkpoint restore</td></tr>
+<tr><td><code>dext undo --prune</code></td><td>Remove expired and excess checkpoints</td></tr>
 <tr><td><code>dext memory check</code></td><td>Check merge driver registration</td></tr>
 <tr><td><code>dext memory register</code></td><td>Register merge drivers</td></tr>
+<tr><td><code>dext memory unregister</code></td><td>Remove local merge-driver registration</td></tr>
+<tr><td><code>dext memory merge ...</code></td><td>Git merge-driver entry point</td></tr>
+<tr><td><code>dext memory distill [--apply]</code></td><td>Preview or apply recall-cache deduplication and stale-bullet cleanup</td></tr>
 <tr><td><code>dext pack list</code></td><td>List available packs</td></tr>
 <tr><td><code>dext pack inspect &lt;name&gt;</code></td><td>Show pack details</td></tr>
 <tr><td><code>dext pack run &lt;name&gt; "task"</code></td><td>Run a pack</td></tr>
@@ -902,6 +1146,7 @@ description: One-line workflow summary
 <tr><td><code>/approval [profile]</code></td><td>Set approval profile</td></tr>
 <tr><td><code>/sandbox [path]</code></td><td>Show or change sandbox root</td></tr>
 <tr><td><code>/sandbox-profile [profile]</code></td><td>Set sandbox: read-only, workspace-write, danger-full-access</td></tr>
+<tr><td><code>/privacy [on|strict|off|status]</code></td><td>Control local redaction and optional strict native-read path blocking</td></tr>
 <tr><td><code>/effort [level]</code></td><td>Set thinking effort: off, low, medium, high, xhigh, max</td></tr>
 <tr><td><code>/model [name]</code></td><td>Show or change model</td></tr>
 <tr><td><code>/provider [id]</code></td><td>Show or change provider</td></tr>
@@ -922,7 +1167,6 @@ description: One-line workflow summary
 <tr><td><code>/sessions ...</code></td><td>List/analyze/map/grep/focus/export session history</td></tr>
 <tr><td><code>/plan &lt;task&gt;</code></td><td>Run read-only planning and seed the plan into history</td></tr>
 <tr><td><code>/budget [cap]</code></td><td>Set or show budget cap</td></tr>
-<tr><td><code>/browser [off|agent-browser|status]</code></td><td>Browser automation control</td></tr>
 <tr><td><code>/pack list|inspect|run</code></td><td>Pack management</td></tr>
 <tr><td><code>/shelves</code></td><td>Show shelf registry</td></tr>
 <tr><td><code>/undo [--list|--apply|&lt;id&gt;]</code></td><td>Recovery checkpoint preview/apply management</td></tr>
@@ -932,7 +1176,7 @@ description: One-line workflow summary
 <section class="collapsible-section">
 <h2 id="tools-reference" class="collapsible-header">Tool Reference</h2>
 <div class="collapsible-content">
-<p>19 tools remain implemented, but standard mode exposes a smaller default set. Specialized tools (<code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>git_log</code>, <code>csvkit</code>) are hidden unless <code>dext --toolset full</code>, <code>DEXT_TOOLSET=full</code>, or <code>/tools full</code> is used. Browser stays opt-in through the browser recipe.</p>
+<p>Dext implements 18 provider-visible tools. The default profile contains 13 core tool names. Specialized tools (<code>jq</code>, <code>fzf</code>, <code>awk</code>, <code>git_log</code>, <code>csvkit</code>) require <code>dext --toolset full</code>, <code>DEXT_TOOLSET=full</code>, or <code>/tools full</code>. Browser automation is the embedded bundled <code>agent-browser</code> pack and does not modify this tool count.</p>
 <h3>File Operations</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
@@ -945,8 +1189,8 @@ description: One-line workflow summary
 <h3>Search &amp; Discovery</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
-<tr><td><code>fd</code></td><td>Read</td><td>Find files by regex pattern (fd).</td></tr>
-<tr><td><code>rg</code></td><td>Read</td><td>Search file contents with ripgrep.</td></tr>
+<tr><td><code>fd</code></td><td>Read</td><td>Find files by regex pattern. Subprocess-execution flags are rejected.</td></tr>
+<tr><td><code>rg</code></td><td>Read</td><td>Search file contents. Preprocessor and subprocess-capable flags are rejected.</td></tr>
 <tr><td><code>fzf</code></td><td>Read, full toolset</td><td>Non-interactive fuzzy filter.</td></tr>
 </table>
 <h3>Shell &amp; Process</h3>
@@ -961,11 +1205,10 @@ description: One-line workflow summary
 <tr><td><code>jq</code></td><td>Read, full toolset</td><td>Query/transform JSON.</td></tr>
 <tr><td><code>csvkit</code></td><td>Varies, full toolset</td><td>CSV processing suite: csvcut, csvstat, csvgrep, csvjson, etc.</td></tr>
 </table>
-<h3>HTTP &amp; Browser</h3>
+<h3>HTTP</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
-<tr><td><code>http</code></td><td>Varies</td><td>HTTPie-style HTTP client.</td></tr>
-<tr><td><code>browser</code></td><td>Write, opt-in</td><td>Optional agent-browser automation.</td></tr>
+<tr><td><code>http</code></td><td>Varies</td><td>HTTPie-style client. Loopback, private/CGNAT, unique-local, link-local, and metadata destinations are blocked after DNS resolution and across redirects unless narrowly opted in.</td></tr>
 </table>
 <h3>Git Operations</h3>
 <table>
@@ -997,6 +1240,9 @@ description: One-line workflow summary
 <tr><td><code>DEXT_API_KEY</code></td><td>—</td><td>Override API key for any provider</td></tr>
 <tr><td><code>DEXT_MODEL</code></td><td>Profile default</td><td>Override model for any provider</td></tr>
 <tr><td><code>DEXT_MODEL_FORCE</code></td><td>false</td><td>Force DEXT_MODEL even if incompatible</td></tr>
+<tr><td><code>DEXT_PROVIDER_CONNECT_TIMEOUT_SECS</code></td><td>15</td><td>Provider TCP/TLS connection deadline</td></tr>
+<tr><td><code>DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS</code></td><td>180 cloud · 600 local</td><td>Deadline through response headers; one positive override applies to all providers</td></tr>
+<tr><td><code>DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS</code></td><td>90 cloud · 300 local</td><td>Maximum idle interval between provider body/stream chunks</td></tr>
 <tr><td><code>DEXT_MODEL_{PROVIDER}</code></td><td>—</td><td>Provider-specific model override</td></tr>
 <tr><td><code>DEXT_BASE_URL</code></td><td>Profile default</td><td>Override base URL for any provider</td></tr>
 <tr><td><code>ANTHROPIC_BASE_URL</code></td><td>Profile default</td><td>Override Anthropic-family base URL</td></tr>
@@ -1006,21 +1252,24 @@ description: One-line workflow summary
 <tr><td><code>DEXT_TOOL_PROFILE</code></td><td>lean</td><td>Tool schema profile: full, lean</td></tr>
 <tr><td><code>DEXT_MUTATION_PREVIEW</code></td><td>simple</td><td>Mutation preview mode: off, simple, git</td></tr>
 <tr><td><code>DEXT_APPROVAL</code></td><td>ask</td><td>Approval profile: ask, auto-read, auto-write, never, always</td></tr>
-<tr><td><code>DEXT_SANDBOX_PROFILE</code></td><td>workspace-write</td><td>Sandbox profile: read-only, workspace-write, danger-full-access. On supported Linux/macOS hosts, confined profiles hide unrelated home content; workspace-write permits writes only under the sandbox, scratch roots, and explicit toolchain cache/package roots.</td></tr>
-<tr><td><code>DEXT_PRIVACY</code></td><td>true</td><td>Redact sensitive tool output and block sensitive native-read paths; disable only for controlled work.</td></tr>
-<tr><td><code>DEXT_INHERIT_TOOL_CREDENTIALS</code></td><td>false</td><td>High-trust opt-in to pass credential-shaped parent environment variables to agent-run subprocesses.</td></tr>
+<tr><td><code>DEXT_SANDBOX_PROFILE</code></td><td>workspace-write</td><td>Sandbox profile: read-only, workspace-write, danger-full-access. On supported Linux/macOS hosts, confined profiles preserve reads available to the Dext process user; workspace-write permits writes only under the sandbox, scratch roots, and explicit toolchain cache/package roots. macOS Seatbelt profiles allow both canonical <code>/private/...</code> scratch paths and their <code>/var</code> or <code>/tmp</code> aliases so standard temp APIs remain confined but usable.</td></tr>
+<tr><td><code>DEXT_PRIVACY</code></td><td>true</td><td>Before model context and session logging, replace private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers while keeping user-readable files readable. Set to <code>strict</code> to also block sensitive-looking native read paths; disable only for intentionally raw output.</td></tr>
+<tr><td><code>DEXT_INHERIT_TOOL_CREDENTIALS</code></td><td>false</td><td>High-trust opt-in to pass credential-shaped parent environment variables to model-invoked bash/external tools. Hooks and Dext-owned subprocesses remain scrubbed.</td></tr>
 <tr><td><code>DEXT_BUDGET_CAP</code></td><td>—</td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
 <tr><td><code>DEXT_CONTEXT_WINDOW_TOKENS</code></td><td>Profile default</td><td>Override context window size</td></tr>
 <tr><td><code>DEXT_CONTEXT_WINDOW</code></td><td>Profile default</td><td>Alias override for context window size</td></tr>
 <tr><td><code>DEXT_BASH_TIMEOUT_SECS</code></td><td>60</td><td>Default bash command timeout</td></tr>
+<tr><td><code>DEXT_BASH_PATH</code></td><td><code>bash</code></td><td>Explicit Bash executable. On Windows, the default resolver skips Windows/WSL app aliases and selects a real <code>bash.exe</code> from <code>PATH</code>.</td></tr>
 <tr><td><code>DEXT_ALLOW_BREAK_SYSTEM_PACKAGES</code></td><td>false</td><td>Allow the otherwise-blocked pip <code>--break-system-packages</code> flag</td></tr>
 <tr><td><code>DEXT_EXTERNAL_TIMEOUT_SECS</code></td><td>60</td><td>Default timeout for external tools</td></tr>
 <tr><td><code>DEXT_HOOK_TIMEOUT_SECS</code></td><td>60</td><td>Default timeout for hook commands</td></tr>
-<tr><td><code>DEXT_TRUST</code></td><td>true</td><td>Trust mode is enabled by default; set <code>DEXT_TRUST=0</code> to opt out</td></tr>
+<tr><td><code>DEXT_TRUST</code></td><td>false</td><td>Explicit alias for approval <code>always</code> when set to a true value; false values do not override the default <code>ask</code> profile.</td></tr>
+<tr><td><code>DEXT_HTTP_ALLOW_LOOPBACK</code></td><td>false</td><td>Built-in HTTP tool only: allow loopback and unspecified/local destinations.</td></tr>
+<tr><td><code>DEXT_HTTP_ALLOW_PRIVATE</code></td><td>false</td><td>Built-in HTTP tool only: allow private, CGNAT, and IPv6 unique-local destinations.</td></tr>
+<tr><td><code>DEXT_HTTP_ALLOW_LINK_LOCAL</code></td><td>false</td><td>Built-in HTTP tool only: allow link-local and cloud-metadata destinations.</td></tr>
 <tr><td><code>DEXT_NO_TUI</code></td><td>false</td><td>Disable inline TUI even when a terminal is available</td></tr>
 <tr><td><code>DEXT_SYSTEM</code></td><td>Built-in prompt</td><td>Override the base system prompt</td></tr>
 <tr><td><code>DEXT_SANDBOX</code></td><td><code>.</code></td><td>Override sandbox root path</td></tr>
-<tr><td><code>DEXT_BROWSER_RECIPE</code></td><td>disabled</td><td>Browser recipe: off/disabled or agent-browser</td></tr>
 <tr><td><code>DEXT_HOOKS_FILE</code></td><td><code>hooks.json</code></td><td>Override project hook configuration file</td></tr>
 <tr><td><code>DEXT_SUDO_ASKPASS</code></td><td>—</td><td>Custom askpass helper for sudo</td></tr>
 <tr><td><code>DEXT_SHELVES_DIR</code></td><td>—</td><td>Additional shelf directories</td></tr>
@@ -1028,6 +1277,7 @@ description: One-line workflow summary
 <tr><td><code>DEXT_SESSION_TAG</code></td><td>PID</td><td>Session tag for checkpoint ref names</td></tr>
 <tr><td><code>ANTHROPIC_API_KEY</code></td><td>—</td><td>Anthropic API key</td></tr>
 <tr><td><code>OPENAI_API_KEY</code></td><td>—</td><td>OpenAI API key</td></tr>
+<tr><td><code>KIMI_API_KEY</code></td><td>—</td><td>Kimi Code plan API key; distinct from <code>MOONSHOT_API_KEY</code></td></tr>
 <tr><td><code>ZAI_API_KEY</code></td><td>—</td><td>ZAI GLM API key</td></tr>
 <tr><td><code>CHATGPT_ACCESS_TOKEN</code></td><td>—</td><td>ChatGPT/Codex access token override</td></tr>
 <tr><td><code>DEEPSEEK_API_KEY</code></td><td>—</td><td>DeepSeek API key</td></tr>
@@ -1039,26 +1289,31 @@ description: One-line workflow summary
 <div class="collapsible-content">
 <h3>GLM (ZAI)</h3>
 <ul>
-<li>Default provider. Uses Anthropic-compatible API at <code>api.z.ai/api/anthropic</code></li>
-<li>Models: glm-4.6, glm-5.0, glm-5.1 — Context: 200K tokens</li>
+<li>Default built-in provider. Uses the Anthropic-compatible API at <code>api.z.ai/api/anthropic</code></li>
+<li>Catalog models: glm-5.2[1m] (default), glm-5.2, glm-5.1, glm-5.0, and glm-4.6. The 5.2 variants declare 1M context; the provider fallback is 200K.</li>
 <li>Auth: API key via <code>ZAI_API_KEY</code> or <code>dext auth login glm &lt;key&gt;</code></li>
 </ul>
 <h3>ChatGPT / Codex</h3>
 <ul>
-<li>Uses OpenAI OAuth flow with local callback server on port 1455</li>
-<li>Curated models include gpt-5.4, gpt-5.4-mini, gpt-5.5, gpt-5.3-codex, gpt-5.3-codex-spark, gpt-5-codex, gpt-5, gpt-5-mini, gpt-4.1, gpt-4o/mini, o3/o3-mini, and o4-mini</li>
-<li>Context: 272K default with model overrides for gpt-4.1 (1M) and gpt-4o family (128K) — Auth: OAuth via <code>dext auth login chatgpt</code> or <code>CHATGPT_ACCESS_TOKEN</code></li>
+<li>Uses the OpenAI OAuth flow with a local callback server on port 1455</li>
+<li>Catalog models include GPT-5.6 Sol/Terra/Luna, gpt-5.4 and 5.4-mini, gpt-5.5, Codex variants, gpt-5/mini, gpt-4.1, gpt-4o/mini, o3/o3-mini, and o4-mini.</li>
+<li>GPT-5.6 variants declare 1.05M context and 128K output metadata; other models use the provider fallback or explicit model overrides. Auth: <code>dext auth login chatgpt</code> or <code>CHATGPT_ACCESS_TOKEN</code>.</li>
 </ul>
 <h3>OpenAI API</h3>
 <ul>
-<li>Standard OpenAI Platform API</li>
-<li>Models: gpt-5, gpt-5-mini, gpt-4.1, gpt-4.1-mini, gpt-4o, gpt-4o-mini, o3, o3-mini, o4-mini — Context: 400K default with 1M overrides for gpt-4.1 family and 128K for gpt-4o family</li>
+<li>Standard OpenAI Platform API using API-key auth</li>
+<li>Catalog models include the official gpt-5.6 Sol alias plus Sol/Terra/Luna variants, gpt-5/mini, gpt-4.1/mini, gpt-4o/mini, o3/o3-mini, and o4-mini. Model-specific metadata overrides the 400K provider fallback.</li>
 <li>Auth: API key via <code>OPENAI_API_KEY</code> or <code>dext auth login openai &lt;key&gt;</code></li>
 </ul>
 <h3>Anthropic</h3>
 <ul>
-<li>Models: claude-sonnet-4-5, claude-opus-4-1, claude-opus-4-0, claude-haiku-4-5, claude-3-5-haiku-latest — Context: 200K tokens</li>
-<li>Auth: API key via <code>ANTHROPIC_API_KEY</code> or <code>dext auth login anthropic &lt;key&gt;</code></li>
+<li>The catalog includes current Sonnet, Opus, Fable, and Haiku model variants.</li>
+<li>Context fallback: 200K tokens. Auth: <code>ANTHROPIC_API_KEY</code> or <code>dext auth login anthropic &lt;key&gt;</code>.</li>
+</ul>
+<h3>Kimi Code</h3>
+<ul>
+<li>Uses Anthropic Messages semantics at <code>api.kimi.com/coding</code>; default model K3 declares 1,048,576-token context, 131,072-token output metadata, and adaptive <code>max</code> thinking.</li>
+<li>Auth: Kimi Code plan API key via <code>KIMI_API_KEY</code> or <code>dext auth login kimi &lt;key&gt;</code>. This key is distinct from <code>MOONSHOT_API_KEY</code>.</li>
 </ul>
 <h3>DeepSeek</h3>
 <ul>
@@ -1075,139 +1330,310 @@ description: One-line workflow summary
 <section class="collapsible-section">
 <h2 id="config-files" class="collapsible-header">Configuration Files</h2>
 <div class="collapsible-content">
+<p>Provider catalogs and auth stores are read through bounded non-symlink regular-file checks. On Unix, foreign ownership is rejected; group/world-writable provider catalogs are rejected; owner-owned auth files with loose mode are repaired to <code>0600</code> before parsing. <code>dext doctor</code> uses bounded, no-follow, inode-stable inspection and reports the same ownership/mode policy without repairing files.</p>
 <h3><code>providers.json</code> (~/.dext/providers.json)</h3>
 <p>Provider catalog with merged built-in + custom profiles. Editable via <code>/provider</code> and <code>/model</code> commands. Auto-normalized on load.</p>
 <p>Catalog v2 profiles may set <code>request_contract</code> to <code>anthropic-messages</code>, <code>openai-chat-completions</code>, or <code>chatgpt-responses</code>. Optional <code>model_aliases</code>, <code>model_defaults</code>, and <code>model_specs</code> provide canonical model ids, limits, effort levels, capabilities, and pricing. Explicit per-model metadata wins; context hints in model names such as <code>-128k</code> and <code>[1m]</code> win over provider-wide context defaults. Built-in metadata only fills omissions, and v1 profile fields remain accepted. <code>DEXT_PROMPT_CACHE=on|off</code> overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.</p>
 <h3><code>auth.json</code> (~/.dext/auth.json)</h3>
-<p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types. Credential-shaped parent environment variables are removed from agent-run bash, external tools, hooks, diagnostics, and eval subprocesses unless <code>DEXT_INHERIT_TOOL_CREDENTIALS=1</code> is explicitly set.</p>
+<p>API-key entries may reference a parent environment variable by name or intentionally run a <code>!command</code> through <code>bash -lc</code>. Treat write access to this store as code-execution authority.</p>
+<p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types. Credential-shaped parent environment variables are removed from agent-run subprocesses by default. <code>DEXT_INHERIT_TOOL_CREDENTIALS=1</code> opts in only trusted model-invoked bash/external tools; hooks and Dext-owned subprocesses remain scrubbed.</p>
+<h3><code>.env</code> (~/.dext/.env or $DEXT_HOME/.env)</h3>
+<p>Optional user-owned Dext settings. Project <code>.env</code> files and parent directories are never auto-loaded, so repository content cannot silently alter runtime policy.</p>
 <h3><code>DEXT.md</code> (project root)</h3>
 <p>Project-specific context injected into the system prompt. Auto-detected from the sandbox root.</p>
 <h3><code>MEMORY.md</code> (project root)</h3>
 <p>Durable long-form memory for the project. Section-aware merge driver prevents data loss during concurrent edits.</p>
 <h3><code>recall.md</code> (project root)</h3>
 <p>Compact prompt-facing recall cache. Line-based union merge for safe concurrent edits.</p>
-<h3><code>.gitattributes</code></h3>
-<p>When memory merge is registered, entries are added for <code>MEMORY.md merge=dext-memory</code> and <code>recall.md merge=dext-recall</code>.</p>
+<h3><code>.gitattributes</code> and <code>.git/info/attributes</code></h3>
+<p><code>dext memory register</code> writes repository-local merge-driver config and local attributes by default. It writes versioned <code>.gitattributes</code> entries for <code>MEMORY.md</code> and <code>recall.md</code> only when <code>--versioned-attributes</code> is requested.</p>
 <h3><code>hooks.json</code> (project root or <code>DEXT_HOOKS_FILE</code>)</h3>
 <p>Project-root hooks configuration loaded from <code>hooks.json</code> by default, or from <code>DEXT_HOOKS_FILE</code> when set. This is not the same as pack <code>phooks.json</code>.</p>
 </div>
 </section>
 
 <hr>
-<p style="color:var(--dim);font-size:.85rem;margin-top:3rem">Generated from Dext source code. Last updated: 2025. For the latest, see <a href="https://github.com/SiliconState/Dext">github.com/SiliconState/Dext</a>.</p>
+<p style="color:var(--dim);font-size:.85rem;margin-top:3rem">Maintained with Dext source. This is the canonical main technical documentation; see <a href="RISK_REGISTER.md">the open non-documentation risk register</a> and <a href="https://github.com/SiliconState/Dext">github.com/SiliconState/Dext</a>.</p>
 </main>
+<aside class="rail-right">
+<div class="onpage">
+<div class="onpage-title">On this page</div>
+<ul id="onpage-list"></ul>
+</div>
+</aside>
+</div>
+
+<div class="scrim" aria-hidden="true"></div>
+<button class="back-to-top" id="back-to-top" aria-label="Back to top">↑</button>
+
+<div class="palette-overlay" id="palette-overlay">
+<div class="palette" role="dialog" aria-label="Search documentation">
+  <div class="palette-input">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    <input type="text" id="palette-input" placeholder="Jump to a section…" autocomplete="off">
+  </div>
+  <div class="palette-results" id="palette-results"></div>
+  <div class="palette-foot">
+    <span><kbd>↑</kbd> <kbd>↓</kbd> navigate</span>
+    <span><kbd>↵</kbd> open</span>
+    <span><kbd>esc</kbd> close</span>
+  </div>
+</div>
+</div>
+
 <script>
 (function(){
-// Theme toggle
-const root=document.documentElement,stored=localStorage.getItem('dext-docs-theme');
-if(stored)root.setAttribute('data-theme',stored);
-document.getElementById('theme-toggle').addEventListener('click',()=>{
+const $=s=>document.querySelector(s),$$=s=>Array.from(document.querySelectorAll(s));
+const root=document.documentElement;
+
+// --- Theme ---
+const themeMeta=document.querySelector('meta[name="theme-color"]');
+function applyTheme(t){
+root.setAttribute('data-theme',t);
+if(themeMeta)themeMeta.setAttribute('content',t==='dark'?'#060a13':'#f5f7fc');
+}
+const stored=localStorage.getItem('dext-docs-theme');
+if(stored)applyTheme(stored);
+$('#theme-toggle').addEventListener('click',()=>{
 const t=root.getAttribute('data-theme')==='dark'?'light':'dark';
-root.setAttribute('data-theme',t);localStorage.setItem('dext-docs-theme',t);
+applyTheme(t);localStorage.setItem('dext-docs-theme',t);
 });
 
-// Collapsible nav sections
-document.querySelectorAll('.nav-section').forEach(btn=>{
+// --- Platform-aware shortcut hint ---
+const isMac=/Mac|iPhone|iPad/.test(navigator.platform||navigator.userAgent);
+if(!isMac){const k=$('.search-trigger kbd');if(k)k.textContent='Ctrl K';}
+
+// --- Scroll progress ---
+const prog=$('#progress');
+function updateProg(){
+const h=document.documentElement;
+const max=h.scrollHeight-h.clientHeight;
+prog.style.width=(max>0?(h.scrollTop/max)*100:0)+'%';
+}
+window.addEventListener('scroll',updateProg,{passive:true});updateProg();
+
+// --- Collapsible nav groups ---
+$$('.nav-section').forEach(btn=>{
+btn.setAttribute('aria-expanded','true');
 btn.addEventListener('click',()=>{
 btn.classList.toggle('collapsed');
+btn.setAttribute('aria-expanded',String(!btn.classList.contains('collapsed')));
 const ul=document.getElementById(btn.dataset.target);
 if(ul)ul.classList.toggle('hidden');
 });
 });
 
-// Collapsible content sections
-document.querySelectorAll('.collapsible-header').forEach(h=>{
-h.addEventListener('click',()=>{
-h.classList.toggle('collapsed');
+// --- Collapsible content sections ---
+function setSection(h,collapsed,instant){
 const c=h.nextElementSibling;
-if(c&&c.classList.contains('collapsible-content')){
-if(h.classList.contains('collapsed')){
-c.style.maxHeight='0';c.classList.add('collapsed');
-}else{
-c.classList.remove('collapsed');
+if(!c||!c.classList.contains('collapsible-content'))return;
+h.classList.toggle('collapsed',collapsed);
+c.classList.toggle('collapsed',collapsed);
+h.setAttribute('aria-expanded',String(!collapsed));
+if(collapsed){
+if(instant){c.style.maxHeight='0';return;}
 c.style.maxHeight=c.scrollHeight+'px';
-setTimeout(()=>c.style.maxHeight='none',350);
+void c.offsetHeight;
+c.style.maxHeight='0';
+}else{
+if(instant){c.style.maxHeight='none';return;}
+c.style.maxHeight=c.scrollHeight+'px';
+setTimeout(()=>{if(!h.classList.contains('collapsed'))c.style.maxHeight='none';},380);
 }
 }
+$$('.collapsible-header').forEach(h=>{
+h.setAttribute('role','button');
+h.setAttribute('tabindex','0');
+h.setAttribute('aria-expanded','true');
+h.addEventListener('click',()=>setSection(h,!h.classList.contains('collapsed')));
+h.addEventListener('keydown',e=>{
+if(e.key==='Enter'||e.key===' '){e.preventDefault();setSection(h,!h.classList.contains('collapsed'));}
 });
 });
 
-// Copy buttons on pre blocks
-document.querySelectorAll('pre').forEach(pre=>{
+// --- Expand collapsed ancestors when navigating to an in-page anchor ---
+function expandForTarget(el){
+if(!el)return;
+if(el.classList&&el.classList.contains('collapsible-header')&&el.classList.contains('collapsed'))setSection(el,false,true);
+let c=el.closest?el.closest('.collapsible-content'):null;
+while(c){
+const h=c.previousElementSibling;
+if(h&&h.classList.contains('collapsible-header')&&h.classList.contains('collapsed'))setSection(h,false,true);
+c=c.parentElement?c.parentElement.closest('.collapsible-content'):null;
+}
+}
+document.addEventListener('click',e=>{
+const a=e.target.closest('a[href^="#"]');
+if(!a)return;
+expandForTarget(document.getElementById(a.getAttribute('href').slice(1)));
+});
+if(location.hash){
+const t=document.getElementById(location.hash.slice(1));
+if(t){expandForTarget(t);setTimeout(()=>t.scrollIntoView(),0);}
+}
+
+// --- Wrap tables for rounded scroll cards ---
+$$('.content table').forEach(t=>{
+const w=document.createElement('div');w.className='table-scroll';
+t.parentNode.insertBefore(w,t);w.appendChild(t);
+});
+
+// --- Copy buttons on pre blocks (button lives on a wrapper so it doesn't scroll with the code) ---
+$$('pre').forEach(pre=>{
+const wrap=document.createElement('div');wrap.className='code-block';
+pre.parentNode.insertBefore(wrap,pre);wrap.appendChild(pre);
 const btn=document.createElement('button');
-btn.className='copy-btn';btn.textContent='Copy';
+btn.className='copy-btn';btn.textContent='Copy';btn.setAttribute('aria-label','Copy code');
 btn.addEventListener('click',()=>{
-navigator.clipboard.writeText(pre.textContent.replace(/^Copy$/m,'').trim()).then(()=>{
-btn.textContent='Copied!';btn.classList.add('copied');
+navigator.clipboard.writeText(pre.textContent.trim()).then(()=>{
+btn.textContent='Copied ✓';btn.classList.add('copied');
 setTimeout(()=>{btn.textContent='Copy';btn.classList.remove('copied');},1500);
 });
 });
-pre.style.position='relative';pre.appendChild(btn);
+wrap.appendChild(btn);
 });
 
-// Scroll spy
-const navLinks=document.querySelectorAll('.nav-items a');
-const sections=[];
+// --- Hero terminal copy ---
+const termCopy=$('#term-copy');
+if(termCopy)termCopy.addEventListener('click',()=>{
+const lines=['cargo install --path . --force --locked','dext auth login chatgpt','dext "summarize this repo"'];
+navigator.clipboard.writeText(lines.join('\n')).then(()=>{
+termCopy.textContent='Copied ✓';setTimeout(()=>termCopy.textContent='Copy',1500);
+});
+});
+
+// --- Build "On this page" rail from content headings ---
+const onList=$('#onpage-list');
+const main=$('#main-content');
+const heads=Array.from(main.querySelectorAll('h1[id],h2[id]'));
+heads.forEach(h=>{
+const li=document.createElement('li');
+const a=document.createElement('a');
+a.href='#'+h.id;
+a.textContent=h.textContent.replace(/\s*\.rs\s*$/,'').trim();
+if(h.tagName==='H1')a.className='lvl-h1';
+li.appendChild(a);onList.appendChild(li);
+});
+
+// --- Scroll spy (left rail + right rail) ---
+const navLinks=$$('.nav-items a');
+const spyTargets=[];
 navLinks.forEach(a=>{
 const el=document.getElementById(a.getAttribute('href').slice(1));
-if(el)sections.push({el,a});
+if(el)spyTargets.push({el,a});
 });
-function updateSpy(){
+const onLinks=$$('#onpage-list a');
+const onTargets=[];
+onLinks.forEach(a=>{
+const el=document.getElementById(a.getAttribute('href').slice(1));
+if(el)onTargets.push({el,a});
+});
+const topTargets=[];
+$$('.topnav a').forEach(a=>{
+const el=document.getElementById(a.getAttribute('href').slice(1));
+if(el)topTargets.push({el,a});
+});
+function spy(list,extra){
 let current=null;
-for(let i=sections.length-1;i>=0;i--){
-if(sections[i].el.getBoundingClientRect().top<=120){current=sections[i];break;}
+for(let i=list.length-1;i>=0;i--){
+if(list[i].el.getBoundingClientRect().top<=110){current=list[i];break;}
 }
-navLinks.forEach(a=>a.classList.remove('active'));
-if(current)current.a.classList.add('active');
-// Auto-expand nav group containing active item
-if(current){
-const group=current.a.closest('.nav-group');
+list.forEach(s=>s.a.classList.remove('active'));
+if(current){current.a.classList.add('active');if(extra)extra(current);}
+}
+const railEl=$('#rail-left');
+function updateSpy(){
+spy(spyTargets,cur=>{
+const group=cur.a.closest('.nav-group');
 if(group){
-const btn=group.querySelector('.nav-section');
-const ul=group.querySelector('.nav-items');
-if(btn&&btn.classList.contains('collapsed'))btn.classList.remove('collapsed');
+const btn=group.querySelector('.nav-section'),ul=group.querySelector('.nav-items');
+if(btn&&btn.classList.contains('collapsed')){btn.classList.remove('collapsed');btn.setAttribute('aria-expanded','true');}
 if(ul&&ul.classList.contains('hidden'))ul.classList.remove('hidden');
 }
+// keep active item visible in rail (desktop sticky rail only, not the mobile drawer);
+// adjust scrollTop directly — scrollIntoView would cancel an in-flight page smooth scroll
+if(getComputedStyle(railEl).position==='sticky'){
+const r=cur.a.getBoundingClientRect(),rr=railEl.getBoundingClientRect();
+if(r.top<rr.top+70)railEl.scrollTop+=r.top-(rr.top+70);
+else if(r.bottom>rr.bottom-40)railEl.scrollTop+=r.bottom-(rr.bottom-40);
 }
+});
+spy(onTargets);
+spy(topTargets);
 }
-window.addEventListener('scroll',updateSpy,{passive:true});
-updateSpy();
+window.addEventListener('scroll',updateSpy,{passive:true});updateSpy();
 
-// Nav search filter
-const searchInput=document.getElementById('nav-search');
-if(searchInput){
-searchInput.addEventListener('input',()=>{
-const q=searchInput.value.toLowerCase().trim();
-document.querySelectorAll('.nav-items').forEach(ul=>{
-let any=false;
-ul.querySelectorAll('li').forEach(li=>{
-const match=!q||li.textContent.toLowerCase().includes(q);
-li.style.display=match?'':'none';
-if(match)any=true;
+// --- Reveal on scroll ---
+const io=new IntersectionObserver(entries=>{
+entries.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);}});
+},{rootMargin:'0px 0px -6% 0px',threshold:.05});
+$$('.content h1,.content .collapsible-section,.content .diagram-panel,.content .card,.content .table-scroll,.content .tip,.content .warn').forEach(el=>{
+el.classList.add('reveal');io.observe(el);
 });
-if(q){ul.classList.remove('hidden');
-const btn=ul.previousElementSibling;
-if(btn&&btn.classList.contains('nav-section'))btn.classList.remove('collapsed');
-}
-if(!q&&!any)ul.classList.add('hidden');
-});
-});
-}
 
-// Back to top
-const btt=document.getElementById('back-to-top');
-window.addEventListener('scroll',()=>{
-btt.classList.toggle('visible',window.scrollY>400);
-},{passive:true});
+// --- Command palette ---
+const overlay=$('#palette-overlay'),pInput=$('#palette-input'),pResults=$('#palette-results');
+const paletteItems=[];
+$$('.nav-group').forEach(g=>{
+const group=g.querySelector('.nav-section').textContent.replace('▾','').replace(/^\d+/,'').trim();
+g.querySelectorAll('.nav-items a').forEach(a=>{
+paletteItems.push({group,label:a.textContent.trim(),href:a.getAttribute('href')});
+});
+});
+let selIdx=0,visible=[];
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function renderPalette(){
+const q=pInput.value.toLowerCase().trim();
+visible=paletteItems.filter(i=>!q||i.label.toLowerCase().includes(q)||i.group.toLowerCase().includes(q)).slice(0,24);
+selIdx=Math.min(selIdx,Math.max(visible.length-1,0));
+if(!visible.length){const d=document.createElement('div');d.className='pal-empty';d.textContent='No sections match “'+pInput.value+'”.';pResults.replaceChildren(d);return;}
+let html='',lastGroup='';
+visible.forEach((i,idx)=>{
+if(i.group!==lastGroup){html+='<div class="pal-group">'+esc(i.group)+'</div>';lastGroup=i.group;}
+html+='<button class="pal-item'+(idx===selIdx?' sel':'')+'" data-idx="'+idx+'"><span class="pal-hash">#</span>'+esc(i.label)+'</button>';
+});
+pResults.innerHTML=html;
+const selEl=pResults.querySelector('.pal-item.sel');if(selEl)selEl.scrollIntoView({block:'nearest'});
+}
+function openPalette(){overlay.classList.add('open');document.body.style.overflow='hidden';pInput.value='';selIdx=0;renderPalette();setTimeout(()=>pInput.focus(),30);}
+function closePalette(){overlay.classList.remove('open');document.body.style.overflow='';}
+function goSel(){const i=visible[selIdx];if(!i)return;closePalette();if(!i.href.startsWith('#')){window.location.href=i.href;return;}const el=document.getElementById(i.href.slice(1));if(el){expandForTarget(el);history.replaceState(null,'',i.href);el.scrollIntoView({behavior:'smooth'});}}
+$('#search-trigger').addEventListener('click',openPalette);
+overlay.addEventListener('click',e=>{if(e.target===overlay)closePalette();});
+pInput.addEventListener('input',()=>{selIdx=0;renderPalette();});
+pResults.addEventListener('click',e=>{
+const b=e.target.closest('.pal-item');if(!b)return;
+selIdx=+b.dataset.idx;goSel();
+});
+document.addEventListener('keydown',e=>{
+if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();overlay.classList.contains('open')?closePalette():openPalette();return;}
+if(!overlay.classList.contains('open'))return;
+if(e.key==='Escape')closePalette();
+else if(e.key==='ArrowDown'){e.preventDefault();selIdx=Math.min(selIdx+1,visible.length-1);renderPalette();}
+else if(e.key==='ArrowUp'){e.preventDefault();selIdx=Math.max(selIdx-1,0);renderPalette();}
+else if(e.key==='Enter'){e.preventDefault();goSel();}
+});
+
+// --- Back to top ---
+const btt=$('#back-to-top');
+window.addEventListener('scroll',()=>{btt.classList.toggle('visible',window.scrollY>500);},{passive:true});
 btt.addEventListener('click',()=>window.scrollTo({top:0,behavior:'smooth'}));
 
-// Mobile menu toggle
-const sidebar=document.getElementById('sidenav');
-document.getElementById('menu-toggle').addEventListener('click',()=>{
-sidebar.classList.toggle('open');
+// --- Mobile drawer ---
+const rail=$('#rail-left');
+function setDrawer(open){
+rail.classList.toggle('open',open);
+document.body.classList.toggle('drawer-open',open);
+}
+$('#menu-toggle').addEventListener('click',()=>setDrawer(!rail.classList.contains('open')));
+rail.querySelectorAll('a').forEach(a=>a.addEventListener('click',()=>setDrawer(false)));
+document.addEventListener('click',e=>{
+if(!rail.classList.contains('open'))return;
+if(rail.contains(e.target)||e.target.closest('#menu-toggle'))return;
+setDrawer(false);
 });
-sidebar.querySelectorAll('a').forEach(a=>{
-a.addEventListener('click',()=>sidebar.classList.remove('open'));
+document.addEventListener('keydown',e=>{
+if(e.key==='Escape'&&rail.classList.contains('open'))setDrawer(false);
 });
 })();
 </script>

@@ -631,12 +631,8 @@ fn find_git_dir(repo: &Path) -> Result<PathBuf, String> {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("git spawn: {e}"))?;
-    if !output.status.success() {
+    let output = crate::run_internal_git_command(cwd, args)?;
+    if !output.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git {}: {}", args.join(" "), stderr.trim()));
     }

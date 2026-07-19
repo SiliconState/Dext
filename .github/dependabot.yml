@@ -5,6 +5,14 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    groups:
+      tui-stack:
+        patterns:
+          - ratatui
+          - ratatui-core
+          - tui-markdown
+          - crossterm
+          - unicode-width
   - package-ecosystem: github-actions
     directory: /
     schedule:

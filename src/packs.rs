@@ -1,13 +1,70 @@
 use anyhow::{Context, Result};
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::list_render;
-use crate::session::{canonicalize_or_clone, dext_state_dir};
+use crate::session::{atomic_write_bytes, canonicalize_or_clone, dext_state_dir};
 use crate::{byte_prefix_at_char_boundary, cap_bytes_with_hint};
 
 const PACK_PROMPT_CAP: usize = 32_000;
 const PACK_LIST_LIMIT: usize = 50;
+
+type PackDirCandidate = (PathBuf, String, Option<String>);
+
+struct BundledPackFile {
+    relative_path: &'static str,
+    bytes: &'static [u8],
+    executable: bool,
+}
+
+const BUNDLED_PACK_FILES: &[BundledPackFile] = &[
+    BundledPackFile {
+        relative_path: "agent-browser/PACK.md",
+        bytes: include_bytes!("../packs/agent-browser/PACK.md"),
+        executable: false,
+    },
+    BundledPackFile {
+        relative_path: "agent-browser/bin/agent-browser",
+        bytes: include_bytes!("../packs/agent-browser/bin/agent-browser"),
+        executable: true,
+    },
+    BundledPackFile {
+        relative_path: "autoresearch/PACK.md",
+        bytes: include_bytes!("../packs/autoresearch/PACK.md"),
+        executable: false,
+    },
+    BundledPackFile {
+        relative_path: "autoresearch/bin/autoresearch.py",
+        bytes: include_bytes!("../packs/autoresearch/bin/autoresearch.py"),
+        executable: true,
+    },
+    BundledPackFile {
+        relative_path: "autoresearch/hooks/post_bash.py",
+        bytes: include_bytes!("../packs/autoresearch/hooks/post_bash.py"),
+        executable: true,
+    },
+    BundledPackFile {
+        relative_path: "autoresearch/hooks/user_prompt.py",
+        bytes: include_bytes!("../packs/autoresearch/hooks/user_prompt.py"),
+        executable: true,
+    },
+    BundledPackFile {
+        relative_path: "autoresearch/phooks.json",
+        bytes: include_bytes!("../packs/autoresearch/phooks.json"),
+        executable: false,
+    },
+    BundledPackFile {
+        relative_path: "packopt/PACK.md",
+        bytes: include_bytes!("../packs/packopt/PACK.md"),
+        executable: false,
+    },
+    BundledPackFile {
+        relative_path: "packopt/bin/packopt.py",
+        bytes: include_bytes!("../packs/packopt/bin/packopt.py"),
+        executable: true,
+    },
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PackInfo {
@@ -16,6 +73,8 @@ pub(crate) struct PackInfo {
     pub(crate) path: PathBuf,
     pub(crate) pack_md_path: PathBuf,
     pub(crate) phooks_path: Option<PathBuf>,
+    pub(crate) credential_env: Vec<String>,
+    pub(crate) credential_env_ignored: bool,
     pub(crate) source: String,
     pub(crate) shelf: Option<String>,
 }
@@ -30,6 +89,7 @@ pub(crate) struct PackInvocation {
 struct PackFrontMatter {
     name: Option<String>,
     description: Option<String>,
+    credential_env: Vec<String>,
 }
 
 impl PackInfo {
@@ -74,6 +134,29 @@ fn trim_yaml_scalar(raw: &str) -> String {
     trimmed.to_string()
 }
 
+fn parse_env_names(raw: &str) -> Vec<String> {
+    let raw = trim_yaml_scalar(raw);
+    let raw = raw
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&raw);
+    let mut names = raw
+        .split(',')
+        .map(trim_yaml_scalar)
+        .filter(|name| {
+            let mut chars = name.chars();
+            chars
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase() || ch == '_')
+                && chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names.truncate(32);
+    names
+}
+
 fn parse_front_matter(text: &str) -> PackFrontMatter {
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
@@ -94,6 +177,12 @@ fn parse_front_matter(text: &str) -> PackFrontMatter {
         match key.trim() {
             "name" => front.name = Some(trim_yaml_scalar(value)),
             "description" => front.description = Some(trim_yaml_scalar(value)),
+            "credential-env" | "credential_env" => {
+                front.credential_env.extend(parse_env_names(value));
+                front.credential_env.sort();
+                front.credential_env.dedup();
+                front.credential_env.truncate(32);
+            }
             _ => {}
         }
     }
@@ -115,6 +204,12 @@ fn load_pack_from_dir(dir: &Path, source: &str, shelf: Option<&str>) -> Result<O
             .to_string()
     });
     let description = front.description.unwrap_or_default();
+    let credential_env_ignored = source.starts_with("project:") && !front.credential_env.is_empty();
+    let credential_env = if credential_env_ignored {
+        Vec::new()
+    } else {
+        front.credential_env
+    };
     let path = dir.to_path_buf();
     let phooks = path.join("phooks.json");
     Ok(Some(PackInfo {
@@ -123,16 +218,14 @@ fn load_pack_from_dir(dir: &Path, source: &str, shelf: Option<&str>) -> Result<O
         path,
         pack_md_path,
         phooks_path: phooks.is_file().then_some(phooks),
+        credential_env,
+        credential_env_ignored,
         source: source.to_string(),
         shelf: shelf.map(str::to_string),
     }))
 }
 
-fn push_pack_root(
-    dirs: &mut Vec<(PathBuf, String, Option<String>)>,
-    pack_root: PathBuf,
-    label: impl Into<String>,
-) {
+fn push_pack_root(dirs: &mut Vec<PackDirCandidate>, pack_root: PathBuf, label: impl Into<String>) {
     if !pack_root.is_dir() {
         return;
     }
@@ -156,7 +249,7 @@ fn push_pack_root(
 }
 
 fn push_direct(
-    dirs: &mut Vec<(PathBuf, String, Option<String>)>,
+    dirs: &mut Vec<PackDirCandidate>,
     path: PathBuf,
     label: impl Into<String>,
     shelf: Option<String>,
@@ -165,7 +258,7 @@ fn push_direct(
     dirs.push((path, label.into(), shelf));
 }
 
-fn push_shelf(dirs: &mut Vec<(PathBuf, String, Option<String>)>, shelf_path: PathBuf, label: &str) {
+fn push_shelf(dirs: &mut Vec<PackDirCandidate>, shelf_path: PathBuf, label: &str) {
     let shelf_name = shelf_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -195,7 +288,7 @@ fn push_shelf(dirs: &mut Vec<(PathBuf, String, Option<String>)>, shelf_path: Pat
 }
 
 fn push_shelf_root(
-    dirs: &mut Vec<(PathBuf, String, Option<String>)>,
+    dirs: &mut Vec<PackDirCandidate>,
     shelf_root: PathBuf,
     label: impl Into<String>,
 ) {
@@ -217,7 +310,179 @@ fn push_shelf_root(
     }
 }
 
-fn candidate_pack_dirs(root: &Path) -> Vec<(PathBuf, String, Option<String>)> {
+fn bundled_pack_digest() -> String {
+    let mut hasher = Sha256::new();
+    for file in BUNDLED_PACK_FILES {
+        hasher.update(file.relative_path.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.bytes);
+        hasher.update([file.executable as u8]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn validate_cache_parent(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting Dext state directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "Dext state path must be a real directory: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!(
+                "Dext state directory is not owned by the current user: {}",
+                path.display()
+            );
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            anyhow::bail!(
+                "Dext state directory has unsafe writable mode {mode:04o}: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_cache_dir(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!(
+                    "bundled pack cache path must be a real directory: {}",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if metadata.uid() != unsafe { libc::geteuid() } {
+                    anyhow::bail!(
+                        "bundled pack cache directory is not owned by the current user: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder.create(path).with_context(|| {
+                format!("creating bundled pack cache directory {}", path.display())
+            })?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspecting bundled pack cache directory {}", path.display())
+            });
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("setting bundled pack cache mode on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_private_cache_tree(base: &Path, target: &Path) -> Result<()> {
+    ensure_private_cache_dir(base)?;
+    let relative = target.strip_prefix(base).with_context(|| {
+        format!(
+            "bundled pack cache path {} escapes {}",
+            target.display(),
+            base.display()
+        )
+    })?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!("unsafe bundled pack cache path: {}", target.display());
+        };
+        current.push(name);
+        ensure_private_cache_dir(&current)?;
+    }
+    Ok(())
+}
+
+fn materialize_bundled_packs() -> Result<PathBuf> {
+    let state_dir = dext_state_dir();
+    let state_dir_created = match std::fs::symlink_metadata(&state_dir) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(&state_dir).with_context(|| {
+                format!("creating Dext state directory {}", state_dir.display())
+            })?;
+            true
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspecting Dext state directory {}", state_dir.display())
+            });
+        }
+    };
+    if state_dir_created {
+        ensure_private_cache_dir(&state_dir)?;
+    } else {
+        validate_cache_parent(&state_dir)?;
+    }
+    let state_dir = std::fs::canonicalize(&state_dir)
+        .with_context(|| format!("resolving Dext state directory {}", state_dir.display()))?;
+    let cache_root = state_dir.join("bundled-packs");
+    ensure_private_cache_dir(&cache_root)?;
+    let root = cache_root.join(bundled_pack_digest());
+    ensure_private_cache_dir(&root)?;
+    for bundled in BUNDLED_PACK_FILES {
+        let path = root.join(bundled.relative_path);
+        let parent = path
+            .parent()
+            .context("bundled pack file is missing a parent directory")?;
+        ensure_private_cache_tree(&root, parent)?;
+        let matches = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            .and_then(|_| std::fs::read(&path).ok())
+            .is_some_and(|bytes| bytes == bundled.bytes);
+        if !matches {
+            atomic_write_bytes(&path, bundled.bytes)
+                .with_context(|| format!("materializing bundled pack file {}", path.display()))?;
+        }
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("validating bundled pack file {}", path.display()))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || std::fs::read(&path).ok().as_deref() != Some(bundled.bytes)
+        {
+            anyhow::bail!("bundled pack cache validation failed: {}", path.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = if bundled.executable { 0o700 } else { 0o600 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("setting bundled pack mode on {}", path.display()))?;
+        }
+    }
+    Ok(root)
+}
+
+fn candidate_pack_dirs(root: &Path) -> (Vec<PackDirCandidate>, Option<String>) {
     let mut direct = Vec::new();
     for (key, value) in std::env::vars() {
         if key.starts_with("DEXT_PACK_") && key.ends_with("_DIR") && !value.trim().is_empty() {
@@ -259,19 +524,23 @@ fn candidate_pack_dirs(root: &Path) -> Vec<(PathBuf, String, Option<String>)> {
         dext_state_dir().join("packs"),
         "user:~/.dext/packs",
     );
-    let bundled_packs = Path::new(env!("CARGO_MANIFEST_DIR")).join("packs");
-    if root.join("packs") != bundled_packs {
-        push_pack_root(&mut direct, bundled_packs, "bundled:packs");
-    }
+    let bundled_error = match materialize_bundled_packs() {
+        Ok(bundled_packs) => {
+            push_pack_root(&mut direct, bundled_packs, "bundled:embedded");
+            None
+        }
+        Err(error) => Some(format!("bundled packs unavailable: {error:#}")),
+    };
 
-    direct
+    (direct, bundled_error)
 }
 
-pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
+fn discover_packs_with_warning(root: &Path) -> (Vec<PackInfo>, Option<String>) {
     let mut packs = Vec::new();
     let mut seen_names = HashSet::new();
     let mut seen_paths = HashSet::new();
-    for (dir, source, shelf) in candidate_pack_dirs(root) {
+    let (candidate_dirs, warning) = candidate_pack_dirs(root);
+    for (dir, source, shelf) in candidate_dirs {
         let path_key = canonicalize_or_clone(&dir);
         if !seen_paths.insert(path_key) {
             continue;
@@ -285,7 +554,11 @@ pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
         }
     }
     packs.sort_by(|a, b| a.name.cmp(&b.name));
-    packs
+    (packs, warning)
+}
+
+pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
+    discover_packs_with_warning(root).0
 }
 
 pub(crate) fn find_pack(root: &Path, selector: &str) -> Result<PackInfo> {
@@ -294,7 +567,7 @@ pub(crate) fn find_pack(root: &Path, selector: &str) -> Result<PackInfo> {
         anyhow::bail!("missing pack name");
     }
     let key = normalize_key(selector);
-    let packs = discover_packs(root);
+    let (packs, bundled_warning) = discover_packs_with_warning(root);
     if let Some(pack) = packs.iter().find(|pack| normalize_key(&pack.name) == key) {
         return Ok(pack.clone());
     }
@@ -304,7 +577,12 @@ pub(crate) fn find_pack(root: &Path, selector: &str) -> Result<PackInfo> {
         .collect();
     match matches.as_slice() {
         [pack] => Ok(pack.clone()),
-        [] => anyhow::bail!("pack '{selector}' not found. Run /pack list."),
+        [] => {
+            if let Some(warning) = bundled_warning {
+                anyhow::bail!("pack '{selector}' not found; {warning}");
+            }
+            anyhow::bail!("pack '{selector}' not found. Run /pack list.")
+        }
         many => anyhow::bail!(
             "pack '{selector}' is ambiguous: {}",
             many.iter()
@@ -321,11 +599,13 @@ pub(crate) fn render_pack_listing(root: &Path) -> String {
 }
 
 pub(crate) fn render_pack_listing_opts(root: &Path, verbose: bool) -> String {
-    render_pack_list(
-        &discover_packs(root),
-        &list_render::ListOptions::detect(verbose),
-        root,
-    )
+    let (packs, warning) = discover_packs_with_warning(root);
+    let mut listing = render_pack_list(&packs, &list_render::ListOptions::detect(verbose), root);
+    if let Some(warning) = warning {
+        listing.push_str("\nwarning: ");
+        listing.push_str(&warning);
+    }
+    listing
 }
 
 /// Pure list renderer over discovered packs. Discovery/loading stays unchanged.
@@ -394,8 +674,15 @@ pub(crate) fn render_pack_inspect(root: &Path, selector: &str) -> Result<String>
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(none)".to_string());
+    let credentials = if pack.credential_env_ignored {
+        "(ignored: project-local packs cannot inherit parent credentials)".to_string()
+    } else if pack.credential_env.is_empty() {
+        "(none)".to_string()
+    } else {
+        pack.credential_env.join(", ")
+    };
     Ok(format!(
-        "pack: {}\ndescription: {}\nshelf: {}\nsource: {}\npath: {}\nworkflow: {}\nhooks: {}\nenv: {}={}",
+        "pack: {}\ndescription: {}\nshelf: {}\nsource: {}\npath: {}\nworkflow: {}\nhooks: {}\nenv: {}={}\ncredential env: {}",
         pack.name,
         if pack.description.is_empty() {
             "(none)"
@@ -408,7 +695,8 @@ pub(crate) fn render_pack_inspect(root: &Path, selector: &str) -> Result<String>
         pack.pack_md_path.display(),
         hooks,
         pack.env_var_name(),
-        pack.path.display()
+        pack.path.display(),
+        credentials
     ))
 }
 
@@ -445,6 +733,21 @@ pub(crate) fn pack_prompt(pack: &PackInfo, task: &str) -> Result<String> {
         workflow_path = pack.pack_md_path.display(),
         env_name = pack.env_var_name(),
     ))
+}
+
+pub(crate) fn pack_invocation_args(raw: &str) -> Option<(&str, &str)> {
+    let raw = raw.trim();
+    let (first, rest) = raw.split_once(char::is_whitespace)?;
+    let rest = rest.trim();
+    if matches!(first, "run" | "use" | "start") {
+        let (selector, task) = rest.split_once(char::is_whitespace)?;
+        let task = task.trim();
+        (!selector.is_empty() && !task.is_empty()).then_some((selector, task))
+    } else if matches!(first, "list" | "ls" | "inspect" | "info" | "show") {
+        None
+    } else {
+        (!rest.is_empty()).then_some((first, rest))
+    }
 }
 
 fn normalized_words(raw: &str) -> String {

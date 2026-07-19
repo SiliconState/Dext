@@ -22,11 +22,6 @@ pub(crate) struct SlashCommand {
 pub(crate) fn slash_command_definitions() -> Vec<SlashCommand> {
     vec![
         SlashCommand {
-            name: "browser",
-            usage: "/browser [off|agent-browser|status]",
-            description: "Enable/status optional agent-browser automation for heavy web/HTML work.",
-        },
-        SlashCommand {
             name: "tools",
             usage: "/tools [default|full|status]",
             description: "Show or switch the provider-visible tool count profile.",
@@ -172,7 +167,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
                 "properties": {
                     "pattern": {"type": "string"},
                     "path": {"type": "string", "description": "Root directory, defaults to '.'"},
-                    "extra_args": {"type": "array", "items": {"type": "string"}, "description": "Extra fd flags, e.g. ['-t','f','-H']"}
+                    "extra_args": {"type": "array", "items": {"type": "string"}, "description": "Extra non-executing fd flags, e.g. ['-t','f','-H']; exec flags (-x/-X/--exec*) are rejected"}
                 },
                 "required": ["pattern"]
             }),
@@ -185,7 +180,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
                 "properties": {
                     "pattern": {"type": "string"},
                     "path": {"type": "string", "description": "Path to search, defaults to '.'"},
-                    "extra_args": {"type": "array", "items": {"type": "string"}, "description": "Extra rg flags, e.g. ['-i','--glob','*.rs']"}
+                    "extra_args": {"type": "array", "items": {"type": "string"}, "description": "Extra non-executing rg flags, e.g. ['-i','--glob','*.rs']; preprocessor/archive/hostname command flags are rejected"}
                 },
                 "required": ["pattern"]
             }),
@@ -218,18 +213,6 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         Tool {
             name: "http",
             description: "HTTP request via Dext's built-in client. Args are HTTPie-ish, e.g. ['GET','https://api.x','Auth:Bearer abc'] or ['POST','url','name=john']. Response output is capped. Add --extract-text (or --text) to strip HTML/script/style noise and pretty-print JSON for research pages.",
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "args": {"type": "array", "items": {"type": "string"}},
-                    "stdin": {"type": "string", "description": "Optional stdin body"}
-                },
-                "required": ["args"]
-            }),
-        },
-        Tool {
-            name: "browser",
-            description: "Optional browser automation through the browser tool. Pass browser args such as ['open','https://example.com'], ['snapshot'], ['click','@ref'], or start with ['skills','get','core','--full'].",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -338,7 +321,21 @@ pub(crate) fn needs_permission(name: &str) -> bool {
     matches!(
         name,
         "bash"
-            | "browser"
+            | "write_file"
+            | "edit_file"
+            | "multi_edit"
+            | "http"
+            | "awk"
+            | "csvkit"
+            | "git_commit"
+            | "todo_write"
+    )
+}
+
+pub(crate) fn is_side_effect_capable_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
             | "write_file"
             | "edit_file"
             | "multi_edit"
@@ -353,7 +350,7 @@ pub(crate) fn needs_permission(name: &str) -> bool {
 pub(crate) fn is_external_process_tool(name: &str) -> bool {
     matches!(
         name,
-        "fd" | "rg" | "jq" | "fzf" | "awk" | "csvkit" | "git_diff" | "git_log" | "browser"
+        "fd" | "rg" | "jq" | "fzf" | "awk" | "csvkit" | "git_diff" | "git_log"
     )
 }
 
@@ -389,7 +386,6 @@ fn lean_description(name: &str, fallback: &str) -> String {
         "jq" => "Run jq on JSON text or file.",
         "fzf" => "Rank provided lines by fuzzy query.",
         "http" => "HTTPie-style request; response capped.",
-        "browser" => "Run optional browser automation.",
         "awk" => "Run awk with optional stdin.",
         "git_diff" => "Show capped git diff or stat; prefer stat first.",
         "git_log" => "Show recent git log.",

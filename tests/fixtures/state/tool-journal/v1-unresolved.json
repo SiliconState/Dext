@@ -1,0 +1,1 @@
+{"version":1,"session_id":"session-1","entries":[{"record_id":"record-1","session_id":"session-1","turn_id":"turn-1","batch_id":"batch-1","call_id":"call-1","tool_name":"write_file","summary":"write_file: fixture.txt","input_sha256":"1111111111111111111111111111111111111111111111111111111111111111","started_at":1,"status":"started"}]}

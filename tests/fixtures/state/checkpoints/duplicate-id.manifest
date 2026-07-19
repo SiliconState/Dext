@@ -1,0 +1,2 @@
+fixture-1	refs/dext/checkpoints/session/fixture-1	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	bash	1	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	false	["src/lib.rs"]	[]
+fixture-1	refs/dext/checkpoints/session/fixture-1	bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb	bash	2	bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb	false	["src/main.rs"]	[]

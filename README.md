@@ -8,23 +8,39 @@ Dext is source-first: prompts, runtime state, tool policies, provider wiring, an
 
 - Interactive terminal agent with an inline ratatui TUI; no alternate-screen takeover.
 - One-shot mode for scripted tasks and JSON/stream-JSON output for automation.
-- Provider catalog with built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, DeepSeek, and local OpenAI-compatible profiles plus env/catalog overrides.
+- Provider catalog with built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, Kimi Code, DeepSeek, and local OpenAI-compatible profiles plus env/catalog overrides.
 - OAuth/API-key auth flows stored outside the repo under Dext state directories.
 - Lean default tool schemas and smaller default toolset, with optional full schemas/full toolset and frugal context mode.
 - Project-scoped latest sessions, named session export/analyze/grep/failure/verification helpers.
 - Permission and sandbox profiles for read-only, workspace-write, and explicit danger modes.
-- Eval harness, release tests, and a PTY-backed TUI smoke test.
+- Eval harness, release tests, and PTY-backed TUI regression coverage for streaming and resize behavior.
+- Exact Ratatui dependency versions plus a documented, narrowly vendored `ratatui-core` compatibility patch.
 - Git-native safety helpers: pre-mutation checkpoints, `/undo`/`dext undo`, mutation previews, and explicit memory-file merge-driver registration.
 
 ## Install
 
 Requires Rust stable with edition 2024 support.
 
+Install from source:
+
 ```bash
 git clone https://github.com/SiliconState/Dext.git
 cd Dext
-cargo install --path . --force
+cargo install --path . --force --locked
 ```
+
+Versioned GitHub releases also provide tested archives for Linux x86_64 GNU, macOS x86_64, macOS arm64, and Windows x86_64 MSVC. Each archive contains the binary, `README.md`, and `LICENSE`. Verify the downloaded archive against `SHA256SUMS` and its GitHub build-provenance attestation before running it:
+
+```bash
+version=vX.Y.Z
+archive="dext-${version}-x86_64-unknown-linux-gnu.tar.gz"
+gh release download "$version" --repo SiliconState/Dext \
+  --pattern "$archive" --pattern SHA256SUMS
+grep "  ${archive}$" SHA256SUMS | sha256sum --check -
+gh attestation verify "$archive" --repo SiliconState/Dext
+```
+
+Use the matching target archive for other platforms. macOS can replace the checksum command with `shasum -a 256 -c -`; Windows can compare `Get-FileHash -Algorithm SHA256` with `SHA256SUMS`. Windows shell tools require a real Bash implementation such as Git for Windows; Dext skips the Windows/WSL app alias and selects `bash.exe` from `PATH`, or uses the explicit `DEXT_BASH_PATH` override. See [`docs/RELEASING.md`](docs/RELEASING.md) for owner and verification details.
 
 Then run:
 
@@ -49,6 +65,8 @@ dext auth login chatgpt          # ChatGPT/Codex OAuth
 dext auth login glm <api-key>    # ZAI GLM key
 dext auth login openai <api-key> # OpenAI Platform key
 dext auth login anthropic <api-key>
+dext auth login kimi              # Open Kimi Code console, then paste the coding-plan API key
+dext auth login kimi <api-key>    # Or store the Kimi Code API key directly
 dext auth login deepseek <api-key>
 # Local llama.cpp/Qwen on 127.0.0.1:8080, no key. Start one local model service first.
 dext auth provider local
@@ -96,12 +114,17 @@ dext --fork
 dext sessions
 dext session export latest html dext-session.html
 dext session analyze latest
+dext doctor
+dext doctor --approval auto-write --sandbox read-only --cd /path/to/project
 dext undo --list
 dext memory check
 dext pack list
 dext pack inspect autoresearch
 # or inspect SkillOpt-style pack/skill optimization
 dext pack inspect packopt
+# Browser automation is a bundled pack, not a provider-visible tool:
+dext pack inspect agent-browser
+dext pack run agent-browser "inspect https://example.com"
 dext pack run autoresearch "optimize the benchmark in this repo"
 dext --eval
 ```
@@ -127,6 +150,7 @@ Interactive slash commands:
 /pack list
 /pack inspect autoresearch
 /pack inspect packopt
+/pack agent-browser inspect https://example.com
 /pack run autoresearch optimize the benchmark in this repo
 /save name
 /export html path
@@ -134,9 +158,15 @@ Interactive slash commands:
 ```
 
 
+## Safety diagnostics
+
+`dext doctor` renders concise `ok`, `info`, and `warn` findings for the effective approval profile and source, sandbox profile and kernel enforcement, provider/auth integrity, auth-file permissions, the bounded latest session/todo/settings/tool-journal state, and Git checkpoint availability. Optional `--approval`, `--sandbox`, and `--cd` arguments show the posture that those explicit startup choices would produce.
+
+Doctor is observational: it does not repair or rewrite state, resolve environment or `!command` credential references, contact model/local-provider endpoints, or print credential-bearing JSON. Warnings are counted in the report but retain the existing exit status 0 so optional findings do not break scripts.
+
 ## Persistent local services
 
-Dext treats each bash call as atomic: commands run in a dedicated process group and that group is cleaned up after the shell exits, times out, or is interrupted. Do not expect `cmd &`, `nohup`, or `disown` to keep servers alive across tool calls. `setsid`-style detaches are unsupported because they escape Dext cleanup.
+Dext treats each bash call as atomic: commands run in a dedicated Unix session/process group or a kill-on-close Windows Job Object, and the complete child process tree is cleaned up after the shell exits, times out, or is interrupted. Do not expect `cmd &`, `nohup`, or `disown` to keep servers alive across tool calls. Unix `setsid`-style detaches are unsupported because they escape process-group cleanup.
 
 Prefer static files or one-shot commands when possible. If the user explicitly needs a long-lived local service, use the host OS supervisor and clean it up when finished. On Linux with systemd:
 
@@ -225,7 +255,7 @@ silently edit Git config or attributes during normal agent runs.
 
 See [`docs/PACKS.md`](docs/PACKS.md) for the full packs and shelves reference, including structure, discovery, building, and distributing packs.
 
-Packs are source-first workflow bundles with a `PACK.md`. Dext discovers packs from `DEXT_PACK_<NAME>_DIR`, project `.dext/shelves/<shelf>/packs`, `.dext/packs`, `packs`, `DEXT_SHELVES_DIR`, `DEXT_PACKS_DIR`, user `~/.dext/shelves/<shelf>/packs`, `~/.dext/packs`, and bundled repository packs. Shelf packs take precedence over same-named legacy project/user pack directories within the same scope. Typed shelf manifests named `shelf.json` are loaded from the same shelf roots into the runtime `ShelfRegistry` and exposed in prompt context plus `/shelves` / `dext shelves` as provider-neutral ability metadata.
+Packs are source-first workflow bundles with a `PACK.md`. The bundled `agent-browser` pack supplies browser automation through the normal `bash` approval/sandbox path without adding a provider-visible browser tool. Runtime-essential bundled pack files are embedded in the binary and materialized into a content-addressed `$DEXT_HOME/bundled-packs/` cache for helper/hook execution. Existing `DEXT_HOME` ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix, reject symlink components, and repair bytes/modes from the binary. Cache failures are surfaced without hiding project/user packs. Dext otherwise discovers packs from `DEXT_PACK_<NAME>_DIR`, project `.dext/shelves/<shelf>/packs`, `.dext/packs`, `packs`, `DEXT_SHELVES_DIR`, `DEXT_PACKS_DIR`, user `~/.dext/shelves/<shelf>/packs`, `~/.dext/packs`, and embedded bundled packs. Shelf packs take precedence over same-named legacy project/user pack directories within the same scope. Typed shelf manifests named `shelf.json` are loaded from the same shelf roots into the runtime `ShelfRegistry` and exposed in prompt context plus `/shelves` / `dext shelves` as provider-neutral ability metadata.
 
 The default installation target for reusable packs is user-global Dext scope: `~/.dext/packs/<name>/` for legacy packs or `~/.dext/shelves/<shelf>/packs/<name>/` for shelf packs. Use project-local `packs/<name>/`, `.dext/packs/<name>/`, or `.dext/shelves/<shelf>/packs/<name>/` only when the user explicitly asks for repo-scoped behavior.
 
@@ -251,17 +281,21 @@ CLI equivalents:
 dext pack list
 dext pack inspect autoresearch
 dext pack inspect packopt
+dext pack inspect agent-browser
+dext pack run agent-browser "inspect https://example.com"
 dext pack run autoresearch "improve this benchmark"
 dext pack run packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
 dext --pack autoresearch "improve this benchmark"
 dext --pack packopt "improve ~/.dext/packs/autoresearch/PACK.md against held-out tasks"
 ```
 
-If a pack has `phooks.json`, Dext activates those hook templates for the current session. While the pack is active, Dext passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to its `bash` tool commands and hook processes. Shelf packs use the same invocation path and remain regular source directories.
+If a pack has `phooks.json`, Dext activates those hook templates for the current session. While the pack is active, Dext passes `DEXT_PACK_DIR` plus `DEXT_PACK_<NAME>_DIR` to its `bash` tool commands and hook processes. An environment-selected, user-global, or bundled pack may declare exact credential names in `credential-env`; inherited values are exposed only to a simple direct invocation of that active pack's own native `bin/` helper, never hooks or arbitrary shell commands, and provider-auth names remain excluded. On Windows, only `.exe`/`.com` helpers qualify for direct credential inheritance; script helpers use Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Shelf packs use the same invocation path and remain regular source directories.
 
 ## Configuration and state
 
-Dext reads `.env` for local development if present, but `.env` is ignored and must never be committed. Prefer `dext auth login ...` for credentials. Provider credentials loaded from `.env` or the parent shell are removed from agent-run subprocess environments by default; set `DEXT_INHERIT_TOOL_CREDENTIALS=1` only when a trusted tool explicitly needs them. Privacy redaction and sensitive-path guards are on by default; set `DEXT_PRIVACY=0` or use `/privacy off` only for controlled work.
+Dext loads optional dotenv settings only from the user-owned state file `~/.dext/.env` (or `$DEXT_HOME/.env`), never from a project directory or its parents. Keep project `.env` files for the project itself; Dext deliberately ignores them so a repository cannot change approval, sandbox, privacy, or credential-inheritance policy. Prefer `dext auth login ...` for provider credentials. Provider credentials loaded from the user state dotenv or parent shell are removed from agent-run subprocess environments by default; set `DEXT_INHERIT_TOOL_CREDENTIALS=1` only when a trusted model-invoked tool explicitly needs them. Hooks and Dext-owned subprocesses remain scrubbed even with that opt-in. Privacy redaction is on by default while user-readable files remain readable. Set `DEXT_PRIVACY=strict` or use `/privacy strict` to block sensitive-looking native read paths; set `DEXT_PRIVACY=0` or use `/privacy off` only when raw, unredacted tool output is intentionally required.
+
+Privacy redaction replaces private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers before tool results enter model context or session logs. Ordinary unlabeled long numbers and decimal market/HTTP values are not classified as cards. A compact `[privacy: redacted ...; raw values withheld]` note appears only when a value was actually replaced.
 
 Useful environment variables:
 
@@ -282,19 +316,27 @@ DEXT_BASE_URL=https://example.test/v1
 DEXT_API_KEY=...
 ZAI_API_KEY=...
 ANTHROPIC_API_KEY=...
+KIMI_API_KEY=...  # Kimi Code coding-plan key from https://www.kimi.com/code/console; MOONSHOT_API_KEY is separate.
 OPENAI_API_KEY=...
 DEEPSEEK_API_KEY=...
 CHATGPT_ACCESS_TOKEN=...
 DEXT_HOME=~/.dext
 DEXT_SESSIONS_DIR=~/.dext/sessions
 DEXT_LOGS_DIR=~/.dext/logs
-DEXT_APPROVAL=ask
-DEXT_TRUST=0  # opt out of default startup trust mode
-DEXT_PRIVACY=1  # default: redact sensitive output and block sensitive native reads
-# Explicit high-trust opt-in; otherwise *_API_KEY and token/credential vars are
-# removed from bash, external tools, hooks, diagnostics, and eval subprocesses.
+DEXT_APPROVAL=ask  # default; prompts interactively and denies gated tools in non-interactive runs
+DEXT_TRUST=1  # explicit alias for DEXT_APPROVAL=always
+DEXT_PRIVACY=1  # default: redact detected secrets while keeping user-readable files readable
+# DEXT_PRIVACY=strict  # additionally block sensitive-looking native read paths
+# Explicit high-trust opt-in for model-invoked bash/external tools; hooks and
+# Dext-owned subprocesses always remove *_API_KEY and other credential variables.
 # DEXT_INHERIT_TOOL_CREDENTIALS=1
 DEXT_SANDBOX_PROFILE=workspace-write  # writes only in sandbox, scratch, and common toolchain caches
+# Built-in http tool only: trusted-network opt-ins (all off by default).
+# This client connects directly and ignores proxy environment variables so its
+# destination DNS/IP checks cannot be delegated to a proxy.
+# DEXT_HTTP_ALLOW_LOOPBACK=1
+# DEXT_HTTP_ALLOW_PRIVATE=1
+# DEXT_HTTP_ALLOW_LINK_LOCAL=1
 DEXT_CONTEXT_MODE=standard
 DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean
@@ -314,27 +356,40 @@ Usage metrics are recorded in session headers and `/usage` after provider turns.
 ## Development
 
 ```bash
-cargo fmt
-cargo build --release
-cargo test --release
-cargo test --release --test tui_smoke -- --nocapture
-cargo install --path . --force
+cargo fmt --all -- --check
+cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
+cargo audit --deny warnings
+cargo test -p ratatui-core --lib --locked
+cargo bench --no-run --locked
+cargo build --release --locked
+cargo test --release --locked
+cargo test --release --locked --test tui_smoke -- --nocapture
+cargo install --path . --force --locked
 ```
 
-Use the TUI smoke test after changing `src/tui.rs`.
+Use the complete renderer gate after changing `src/tui.rs`, terminal dependencies, or the vendored compatibility patch. See [`docs/TUI.md`](docs/TUI.md) for the inline-terminal behavior contract and patch maintenance procedure.
+
+Run the final full suite and install directly in a trusted host terminal. Dext's default `workspace-write` sandbox intentionally blocks shared `/tmp`, arbitrary pseudo-terminals, and Cargo install metadata outside approved cache roots. A release gate invoked through a confined Dext `bash` tool may therefore report cascading temp-directory failures, deny every TUI smoke test, and fail to write `~/.cargo/.crates.toml`. To orchestrate the gate with Dext, launch a separate controlled process with `dext --sandbox-profile danger-full-access --approval always`; changing an environment variable inside the confined shell cannot relax its parent kernel sandbox. Do not weaken the default sandbox to make self-hosted tests pass. See [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Repository map
 
-- `src/main.rs` — agent loop, tool execution, CLI, slash commands, evals, orchestration.
+- `src/main.rs` — agent facade, CLI, turn orchestration, and remaining tool execution adapters.
 - `src/git_checkpoints.rs` — Git-native pre-mutation checkpoints, hidden recovery refs, undo preview/apply support.
 - `src/mutation_preview.rs` — capped in-memory diffs for direct file-tool approval prompts.
 - `src/memory_merge.rs` — explicit Git merge-driver helpers for `MEMORY.md` and `recall.md`.
-- `src/provider.rs` — provider catalog, auth, OAuth/API-key handling, request shaping.
+- `src/provider.rs` — provider catalog, auth, OAuth/API-key handling, request shaping, transport deadlines/body bounds, and side-effect-free bounded state/auth-permission inspection.
 - `src/session.rs` — session persistence, project state paths, logs, lock cleanup, terminal restore.
 - `src/tools.rs` — tool catalog and provider-facing tool schemas.
 - `src/tool_policy.rs` — validation and command/external-source guardrails.
+- `src/sse.rs` — bounded SSE framing shared by runtime and Criterion benchmarks.
+- `src/streaming.rs` — provider event validation and stream/tool-call assembly.
+- `src/tool_round.rs` — tool-call planning, approval, checkpoint/journal boundaries, dispatch, and result normalization.
+- `src/tool_journal.rs` — bounded private side-effect start/terminal journal and recovery metadata.
+- `.github/workflows/release.yml` — tag/version gate, four-platform release builds, checksums, attestations, and GitHub release publication.
+- `docs/RELEASING.md` — owner release checklist and archive verification.
 - `src/orchestrator.rs` — turn telemetry, dedupe, circuit-breaker, and workflow guards.
 - `src/tui.rs` — inline terminal UI.
+- `vendor/ratatui-core/` — exact upstream source plus Dext's narrow inline-terminal compatibility patch.
 - `src/packs.rs` — pack discovery, loading, and invocation.
 - `src/shelves.rs` — shelf registry with typed manifests and abilities.
 - `tests/` — integration tests and replay fixtures.
@@ -342,5 +397,8 @@ Use the TUI smoke test after changing `src/tui.rs`.
 - `DEXT.md` / `recall.md` — prompt-facing project guidance and recall for Dext working on itself.
 - `MEMORY.md` — durable project memory.
 - `docs/PACKS.md` — packs and shelves reference.
+- `docs/TUI.md` — inline TUI contract, dependency stack, compatibility patch, and regression gate.
+- `docs/index.html` — canonical browsable technical documentation; update it in the same change as runtime, architecture, security, provider, tool, test, CI, or release behavior.
+- `docs/RISK_REGISTER.md` — open non-documentation risks, controls, owners, and review triggers.
 
-More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/USAGE.md`](docs/USAGE.md), [`SECURITY.md`](SECURITY.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md).
+More detail: the canonical [`docs/index.html`](docs/index.html), [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/USAGE.md`](docs/USAGE.md), [`docs/TUI.md`](docs/TUI.md), [`SECURITY.md`](SECURITY.md), and [`CONTRIBUTING.md`](CONTRIBUTING.md).

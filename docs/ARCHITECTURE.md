@@ -16,7 +16,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `src/main.rs`
   - Agent state and loop.
-  - CLI parsing and top-level command dispatch.
+  - CLI parsing, top-level command dispatch, and structured `dext doctor` rendering.
   - Slash commands.
   - Built-in tool implementations.
   - Eval harness.
@@ -38,12 +38,28 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Explicit local Git merge-driver check/register/unregister support.
 
 - `src/provider.rs`
-  - Provider profile/catalog loading and normalization.
-  - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, DeepSeek, and local OpenAI-compatible profiles.
+  - Provider profile/catalog loading, normalization, and bounded side-effect-free catalog/auth inspection.
+  - Connect, first-byte, stream/body-idle, and non-stream body-size limits for provider transport.
+  - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, Kimi Code, DeepSeek, and local OpenAI-compatible profiles.
   - live llama.cpp runtime context probing for the local provider; arbitrary server model aliases are supported without model-specific built-in context values.
   - API-key and OAuth login flows.
   - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs.
   - Model alias normalization and provider/model switching helpers.
+
+- `src/sse.rs`
+  - Capped SSE framing shared by the runtime and Criterion benchmark target.
+
+- `src/streaming.rs`
+  - Provider-specific event validation/assembly.
+  - Provider-neutral streamed blocks and strict final tool-argument construction.
+
+- `src/tool_round.rs`
+  - Tool-call planning, approval inputs, checkpoint/journal boundaries, dispatch, and result normalization.
+  - Narrow runtime context supplied by `Agent`, which remains the facade.
+
+- `src/tool_journal.rs`
+  - Bounded owner-private start/terminal records for approved side-effect-capable calls.
+  - Resume reconciliation metadata that never stores raw tool input/output or replays uncertain calls.
 
 - `src/tools.rs`
   - Tool catalog.
@@ -68,12 +84,14 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Terminal restore helpers used by crash/panic paths.
 
 - `src/tui.rs`
-  - Inline ratatui UI in the regular terminal buffer.
+  - Inline Ratatui UI in the regular terminal buffer.
   - Transcript rendering, input box, status/live areas, permission prompts, and slash completions.
+  - See [`TUI.md`](TUI.md) for the renderer contract, exact dependency stack, compatibility patch, and PTY gate.
 
 - `src/packs.rs`
-  - Pack discovery, loading, and invocation.
-  - Front matter parsing, precedence ordering, and pack listing/inspection rendering.
+  - Pack discovery, loading, invocation, and precedence.
+  - Compile-time embedding plus content-addressed `$DEXT_HOME/bundled-packs/` materialization/repair for runtime-essential bundled pack files. Existing state-directory ownership/write safety is validated without changing its mode; cache descendants are owner-private on Unix and reject symlink components.
+  - Front matter parsing and pack listing/inspection rendering.
 
 - `src/shelves.rs`
   - Shelf registry with typed manifests (`shelf.json`).
@@ -81,10 +99,10 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Scope-precedence resolution and bounded context injection for manifest-only shelves.
   - In-process shelf implementations can participate in the typed signal/effect loop; filesystem manifests do not register executable tools, commands, or arbitrary effect handlers.
 
-- `src/tool_policy.rs`
-  - Tool input validation and command risk classification.
-  - URL/host extraction and external-attempt guard helpers.
-  - Bash guardrails (pipefail injection, unsafe pip flag blocking).
+- `vendor/ratatui-core/`
+  - Exact upstream `ratatui-core 0.1.2` source selected through `[patch.crates-io]`.
+  - Narrow inline-terminal fixes that avoid synchronous cursor-query stalls and whole-display clears during resize.
+  - Hunk rationale and refresh instructions in `vendor/ratatui-core/DEXT_PATCH.md`.
 
 ## Tool model
 
@@ -92,19 +110,22 @@ Dext exposes a deliberately small default native tool set:
 
 - Filesystem: `read_file`, `read_symbol`, `write_file`, `edit_file`, `multi_edit`.
 - Search: `fd`, `rg`.
-- Shell/process: `bash` (atomic per call; the tool process group is cleaned up after exit).
+- Shell/process: `bash` (atomic per call; the child process tree is cleaned up after exit).
 - Network: `http`.
 - Git: `git_diff`, `git_commit`.
 - Tasks: `todo_read`, `todo_write`.
-- Optional browser recipe: `browser` only when enabled.
+
+Browser automation is delivered by the bundled `agent-browser` pack, not a provider-visible browser tool or runtime recipe. It uses Dext's regular `bash` approval and sandbox path and does not expand the tool schema. On Windows, only native `.exe`/`.com` pack helpers can receive declared credentials through direct spawn; script helpers run through Bash with declared credentials removed.
 
 The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`. Frugal/tiny retain the default core tool capabilities while using lean schemas and smaller context/result budgets.
 
-Bash is intentionally transaction-like: Dext starts tool commands in their own process group and cleans that group after the shell exits or is interrupted, so shell backgrounding (`cmd &`), `nohup`, and `disown` are not a supported way to keep servers alive across tool calls. `setsid`-style detaches are also unsupported because they escape Dext cleanup. If the user explicitly needs a persistent local service, prefer OS supervision without adding a Dext daemon tool. On Linux with systemd, use `systemd-run --user --unit=dext-<name> --same-dir <cmd>`, inspect with `systemctl --user status dext-<name>`/`journalctl --user-unit dext-<name>`, and stop it with `systemctl --user stop dext-<name>` when finished. Keep unit names prefixed with `dext-`; on platforms without systemd, use the platform's native supervisor or avoid a persistent service.
+Bash is intentionally transaction-like: Dext cleans the complete child process tree after the shell exits, times out, or is interrupted. Unix children run in a detached session/process group; Windows children start suspended, enter a kill-on-close Job Object, and resume only after assignment. On Windows, shell-backed tools require a real Bash implementation such as Git for Windows; every shell execution path uses the same resolver, Dext skips Windows/WSL app aliases when selecting `bash.exe` from `PATH`, and `DEXT_BASH_PATH` can select an explicit executable. Cross-platform path rendering strips Windows verbatim prefixes, uses forward slashes for Git/shell arguments, and filters Unix, drive-letter, and UNC absolute paths from session work ledgers. Shell backgrounding (`cmd &`), `nohup`, and `disown` are therefore not a supported way to keep servers alive across tool calls. Unix `setsid`-style detaches are also unsupported because they escape process-group cleanup. If the user explicitly needs a persistent local service, prefer OS supervision without adding a Dext daemon tool. On Linux with systemd, use `systemd-run --user --unit=dext-<name> --same-dir <cmd>`, inspect with `systemctl --user status dext-<name>`/`journalctl --user-unit dext-<name>`, and stop it with `systemctl --user stop dext-<name>` when finished. Keep unit names prefixed with `dext-`; on platforms without systemd, use the platform's native supervisor or avoid a persistent service.
+
+Provider transport uses a 15-second connect deadline, a first-header deadline of 180 seconds for cloud providers or 600 seconds for local llama.cpp, and an idle deadline of 90 seconds for cloud streams/bodies or 300 seconds for local ones. Positive `DEXT_PROVIDER_CONNECT_TIMEOUT_SECS`, `DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS`, and `DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS` values override those defaults. Initial calls and retries share the same policy. Non-stream summary JSON is capped at 4 MiB and provider error diagnostics at 4,000 bytes. SSE framing bounds in-progress allocation before appending oversized chunks while incrementally accepting one large read containing many valid events.
 
 Lean schemas are the default to reduce prompt cost. Full schemas are available with `--tool-profile full` or `/tool-profile full`; `default` is treated as lean when parsing the env/CLI alias.
 
-Capability-as-filesystem is deliberately parked. Dext does not implement `.dext/cap/` or virtual `/cap/...` today, and it should not become core without a concrete high-value use case and a safe pack/shelf prototype first. The unresolved risks are broad: permission mapping, hidden side effects, lifecycle cleanup, sandbox boundaries, streaming/progress, concurrency, discoverability, secrets/privacy, error semantics, versioning, and plugin-protocol creep.
+The current extension model is packs and shelves. Dext does not expose `.dext/cap/` or virtual `/cap/...` paths; adding another capability protocol would require a concrete use case and a security model for permissions, side effects, lifecycle, concurrency, discovery, secrets, and versioning.
 
 ## Sessions and state
 
@@ -112,6 +133,7 @@ Dext distinguishes project files from runtime state:
 
 - Project files live in the Git repository.
 - State defaults to `~/.dext` or `DEXT_HOME`.
+- Runtime provider/auth loads reject symlinks, non-regular files, oversized content, and foreign Unix ownership. Group/world-writable provider catalogs are rejected; owner-owned auth files with loose Unix mode are repaired to `0600` on load. Doctor uses bounded no-follow, inode-stable inspection and reports the same policy without repairing files.
 - Project latest sessions/logs are scoped by a stable project key.
 - Named sessions can be stored under `DEXT_SESSIONS_DIR`.
 - Session exports (`dext-session-*.jsonl`, `dext-session-*.html`) are ignored by Git.
@@ -129,10 +151,14 @@ Dext has three safety layers:
 Profiles:
 
 - Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`.
-- Sandbox: `read-only`, `workspace-write`, `danger-full-access`. On supported Linux/macOS hosts, confined profiles hide unrelated files below the user's home. `workspace-write` permits writes only under the sandbox root, scratch/device roots, and common per-user toolchain caches; `read-only` retains only required scratch/device writes.
-- Tool subprocesses remove credential-shaped environment variables by default. `DEXT_INHERIT_TOOL_CREDENTIALS=1` is an explicit high-trust opt-in for tools that require the parent credential environment.
+- Sandbox: `read-only`, `workspace-write`, `danger-full-access`. On supported Linux/macOS hosts, confined profiles preserve every read available to the Dext process user. `workspace-write` permits writes only under the sandbox root, scratch/device roots, and common per-user toolchain caches; `read-only` retains only required scratch/device writes. macOS Seatbelt profiles authorize both canonical `/private/...` scratch paths and their `/var` or `/tmp` aliases so standard temp APIs remain confined but usable.
+- Tool subprocesses remove credential-shaped environment variables by default. `DEXT_INHERIT_TOOL_CREDENTIALS=1` is an explicit high-trust opt-in for model-invoked bash/external tools that require the parent credential environment; hooks and Dext-owned subprocesses always scrub credentials. Pack-declared helper credentials are narrower still, and project-local declarations are ignored.
 
-`--trust` is the default startup behavior and auto-approves gated tools. Use `--no-trust` or `DEXT_TRUST=0` to opt out.
+Dext starts with approval profile `ask`. Interactive frontends request approval for gated tools; non-interactive and JSON runs deny instead of blocking. Startup precedence is the last CLI policy flag, then valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `--trust` and `DEXT_TRUST=1` explicitly select `always`; resumed sessions retain their historical profile only as provenance and current-run policy clears stale grants. Approval policy and sandbox confinement are independent.
+
+Durable sessions use a small owner-private `tool-journal.json` beside the active session transcript. Approved side-effect-capable calls are fenced as `started` before dispatch and updated to `completed`, `failed`, or `interrupted` immediately after execution. Entries contain only bounded metadata and an input digest, not raw input/output. Resume reconciles pending transcript calls without replay. `--no-session` and `--fork` intentionally disable both durable state and this crash-side-effect recovery.
+
+`dext doctor` is an observational diagnostics path. It reuses the startup approval resolver and bounded state inspectors, reports effective policy/source separately from sandbox kernel enforcement, and inspects only active/latest provider, auth, session, todo, settings, journal, and checkpoint state. It does not repair files, resolve credential references, or contact provider endpoints.
 
 ## Git recovery and memory safety
 
@@ -173,11 +199,14 @@ Compaction preserves recent tool evidence and summarizes older conversation when
 Expected checks before releasing Dext changes:
 
 ```bash
-cargo fmt
-cargo build --release
-cargo test --release
-cargo test --release --test tui_smoke -- --nocapture
+cargo fmt --all -- --check
+cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
+cargo test -p ratatui-core --lib --locked
+cargo bench --no-run --locked
+cargo build --release --locked
+cargo test --release --locked
+cargo test --release --locked --test tui_smoke -- --nocapture
 ```
 
-The TUI smoke test launches the real compiled binary inside a pseudo-terminal and verifies banner/help/exit behavior without requiring a human terminal session.
+The TUI smoke suite launches the real compiled binary inside a pseudo-terminal. In addition to launch/help/exit coverage, it checks narrow and wide layouts, multiline input, live-stream input, resize survival, bounded cursor queries, zero whole-screen resize clears, and completed output after resize. Renderer changes also follow the live-terminal checks in [`TUI.md`](TUI.md).

@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -24,6 +24,13 @@ jobs:
           persist-credentials: false
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
+      - name: Test Ratatui compatibility patch
+        run: cargo test -p ratatui-core --lib --locked
+      - name: Compile benchmarks
+        if: runner.os == 'Linux'
+        run: cargo bench --no-run --locked
       - name: Build release binary
         run: cargo build --release --locked
       - name: Run release tests

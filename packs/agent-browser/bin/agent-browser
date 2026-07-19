@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PACK_HELPER="${BASH_SOURCE[0]}"
+if [[ "$PACK_HELPER" != /* ]]; then
+  PACK_HELPER="$PWD/$PACK_HELPER"
+fi
+PACK_DIR="${PACK_HELPER%/*}"
+[[ -n "$PACK_DIR" ]] || PACK_DIR=/
+PACK_HELPER="$(cd -- "$PACK_DIR" && pwd -P)/${PACK_HELPER##*/}"
+
+if [[ -n "${AGENT_BROWSER_BIN:-}" ]]; then
+  resolved="$AGENT_BROWSER_BIN"
+  if [[ "$resolved" != */* ]]; then
+    resolved="$(type -P -- "$resolved" 2>/dev/null || true)"
+  fi
+  if [[ -n "$resolved" && "$resolved" -ef "$PACK_HELPER" ]]; then
+    printf '%s\n' 'AGENT_BROWSER_BIN resolves to the bundled launcher; refusing recursive execution.' >&2
+    exit 126
+  fi
+  exec "$AGENT_BROWSER_BIN" "$@"
+fi
+
+while IFS= read -r candidate; do
+  [[ -n "$candidate" ]] || continue
+  if [[ -x "$candidate" && ! "$candidate" -ef "$PACK_HELPER" ]]; then
+    exec "$candidate" "$@"
+  fi
+done < <(type -aP agent-browser 2>/dev/null || true)
+
+if [[ -n "${HOME:-}" && -x "$HOME/.cargo/bin/agent-browser" && ! "$HOME/.cargo/bin/agent-browser" -ef "$PACK_HELPER" ]]; then
+  exec "$HOME/.cargo/bin/agent-browser" "$@"
+fi
+
+printf '%s\n' \
+  'agent-browser is not installed.' \
+  'Install the native Rust CLI, then install Chrome for Testing:' \
+  '  cargo install agent-browser --locked' \
+  '  agent-browser install' \
+  'Upstream: https://github.com/vercel-labs/agent-browser' >&2
+exit 127
