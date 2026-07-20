@@ -12,7 +12,6 @@ dext sessions         list project latest + named sessions
 dext session ...      export/analyze/grep/failures/verify-log/decisions
 dext auth ...         provider/model/auth management
 dext undo ...         list, preview, or restore Dext Git checkpoints
-dext memory ...       check/register memory-file merge drivers
 dext --eval [NAME]    run eval harness
 ```
 
@@ -156,7 +155,6 @@ dext --output json "return a short answer"
 dext --output stream-json "run a small diagnostic"
 dext --preview simple "make a small documented edit"
 dext undo --list
-dext memory check
 dext pack create personal/my-pack
 dext pack run my-pack "run its workflow"
 ```
@@ -269,28 +267,6 @@ Inside a session:
 ```
 
 `git` is accepted as a preview mode but currently uses the same in-memory preview implementation as `simple`.
-
-## Memory merge drivers
-
-Dext's optional memory files (`MEMORY.md` and `recall.md`) can be registered with
-section-aware Git merge drivers. Neither file is required for normal sessions:
-`MEMORY.md` is never auto-injected, while `recall.md` is injected only when the
-user creates it. Registration is explicit and local-only by default.
-
-```bash
-dext memory check
-dext memory register
-dext memory unregister
-# used by Git after registration:
-dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]
-```
-
-`dext memory register` configures repository-local Git merge drivers and local
-attributes. Use `dext memory register --versioned-attributes` only if the project
-should commit `.gitattributes` entries for those memory files. Running
-`dext memory check` from a subdirectory still resolves the repository toplevel
-before reporting versioned attributes. `dext memory merge` is the Git
-merge-driver entry point and is not normally run by hand.
 
 ## Context and cost controls
 

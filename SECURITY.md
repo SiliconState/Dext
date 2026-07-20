@@ -58,13 +58,14 @@ find . -path ./.git -prune -o -path ./target -prune -o -type f -print
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
+cargo deny check licenses
 cargo test -p ratatui-core --lib --locked
 cargo build --release --locked
 cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture
 ```
 
-Also scan untracked and ignored files before deciding what to preserve locally vs. delete. Owner tag creation, immutable asset handling, checksum verification, and GitHub build-provenance verification are documented in [`docs/RELEASING.md`](docs/RELEASING.md). Terminal dependency and renderer changes must also satisfy [`docs/TUI.md`](docs/TUI.md), including its PTY gate and live-terminal acceptance. Published release archives should be used only after both `SHA256SUMS` and `gh attestation verify <archive> --repo SiliconState/Dext` succeed.
+Also scan untracked and ignored files before deciding what to preserve locally vs. delete. Dependency licenses are checked against `deny.toml`; release publication generates `dext.cdx.json` and includes it in checksum and provenance verification. Owner tag creation, immutable asset handling, checksum verification, and GitHub build-provenance verification are documented in [`docs/RELEASING.md`](docs/RELEASING.md). Terminal dependency and renderer changes must also satisfy [`docs/TUI.md`](docs/TUI.md), including its PTY gate and live-terminal acceptance. Published release assets should be used only after both `SHA256SUMS` and `gh attestation verify <asset> --repo SiliconState/Dext` succeed.
 
 ## Runtime safety notes
 

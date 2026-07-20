@@ -29,6 +29,14 @@ fn restore_env_var(name: &str, old_value: Option<std::ffi::OsString>) {
     }
 }
 
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn temp_test_dir(label: &str) -> PathBuf {
     let unique = format!(
         "dext-{label}-{}-{}",
@@ -1761,19 +1769,6 @@ fn checkpoint_reset_head_reports_commit_state_and_preserves_snapshot_ref() {
 }
 
 #[test]
-fn memory_merge_recall_prefers_ours_and_dedupes_theirs() {
-    let base = "# Dext recall\n- keep\n- remove\n";
-    let ours = "# Dext recall\n- keep\n- ours\n";
-    let theirs = "# Dext recall\n- keep\n- remove\n- theirs\n";
-    let merged = memory_merge::merge_recall(base, ours, theirs);
-    assert!(merged.clean);
-    assert!(merged.content.contains("- ours"));
-    assert!(merged.content.contains("- theirs"));
-    assert!(!merged.content.contains("- remove\n"));
-    assert_eq!(merged.content.matches("- keep").count(), 1);
-}
-
-#[test]
 fn mutation_preview_new_file_does_not_duplicate_added_lines() {
     let root = temp_test_dir("mutation-preview-new");
     let preview =
@@ -2227,28 +2222,6 @@ fn tool_paths_reject_dangling_symlink_write_escapes() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&outside);
-}
-
-#[test]
-fn memory_merge_cli_skips_merge_subcommand_for_positionals() {
-    let root = temp_test_dir("memory-merge-cli");
-    let base = root.join("base.md");
-    let ours = root.join("ours.md");
-    let theirs = root.join("theirs.md");
-    std::fs::write(&base, "# Memory\n\n## A\nbase\n").expect("write base");
-    std::fs::write(&ours, "# Memory\n\n## A\nours\n").expect("write ours");
-    std::fs::write(&theirs, "# Memory\n\n## A\nbase\n").expect("write theirs");
-
-    let args = vec![
-        "merge".to_string(),
-        base.display().to_string(),
-        ours.display().to_string(),
-        theirs.display().to_string(),
-    ];
-    assert_eq!(handle_memory_cli(&args, &root), 0);
-    let merged = std::fs::read_to_string(&ours).expect("read merged");
-    assert!(merged.contains("ours"), "{merged}");
-    assert!(!merged.contains("theirs"), "{merged}");
 }
 
 struct SessionReplayFixture {
@@ -7937,18 +7910,20 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 .and_then(|home| {
                     let home = std::path::PathBuf::from(home);
                     let checkout = std::env::current_dir().ok()?;
-                    let escape_dir = checkout
-                        .join(format!(".dext-read-autonomy-test-{}", std::process::id()))
-                        .join("projects/stocks-test/sessions");
+                    let escape_root =
+                        checkout.join(format!(".dext-read-autonomy-test-{}", std::process::id()));
+                    let escape_dir = escape_root.join("projects/stocks-test/sessions");
                     let cache_dir = home
                         .join(".cache/pip")
                         .join(format!("dext-sbx-test-{}", std::process::id()));
                     let _ = std::fs::create_dir_all(&escape_dir);
                     let _ = std::fs::create_dir_all(&cache_dir);
-                    Some((escape_dir, cache_dir))
+                    Some((escape_root, escape_dir, cache_dir))
                 })
         };
-        if let Some((escape_dir, cache_dir)) = external_paths {
+        if let Some((escape_root, escape_dir, cache_dir)) = external_paths {
+            let _escape_cleanup = RemoveDirOnDrop(escape_root);
+            let _cache_cleanup = RemoveDirOnDrop(cache_dir.clone());
             let escape_file = escape_dir.join("escape.txt");
             let escape_cmd = format!(
                 "echo pwned > {} 2>&1",
@@ -8113,8 +8088,6 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 cache_file.exists(),
                 "workspace-write must allow toolchain cache writes: {cache_out}"
             );
-            let _ = std::fs::remove_dir_all(&escape_dir);
-            let _ = std::fs::remove_dir_all(&cache_dir);
         }
 
         // Arbitrary shared-temp writes are not scratch writes: they would let a
@@ -8190,6 +8163,7 @@ async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
     let escape_dir = checkout.join(format!(".dext-sbx-env-test-{}", std::process::id()));
     let escape_file = escape_dir.join("escape.txt");
     std::fs::create_dir_all(&escape_dir).expect("create escape directory");
+    let _escape_cleanup = RemoveDirOnDrop(escape_dir.clone());
     unsafe {
         std::env::set_var("SANDBOX_PARENT_ONLY_SECRET", "parent-secret-fixture");
         std::env::set_var("PIP_CACHE_DIR", &escape_dir);
@@ -8230,7 +8204,6 @@ async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
     restore_env_var("SANDBOX_PARENT_ONLY_SECRET", old_secret);
     restore_env_var("PIP_CACHE_DIR", old_pip_cache);
     restore_env_var("TMPDIR", old_tmpdir);
-    let _ = std::fs::remove_dir_all(&escape_dir);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -12156,43 +12129,6 @@ fn session_brief_renders_safe_continuation_packet() {
 }
 
 #[test]
-fn memory_distill_dedupes_and_flags_unbacked_bullets() {
-    let memory = "# Dext durable memory\n\n## Decisions\n- bash is intentionally atomic and the process group is cleaned per call\n";
-    let recall = "# Dext recall\n- Bash is atomic: process group cleaned per call\n- Bash is atomic: process group cleaned per call\n- Unrelated note about foobars widget calibration\n";
-
-    let distill = crate::memory_merge::distill_recall(memory, recall);
-
-    assert_eq!(distill.original_bullets, 3);
-    assert_eq!(distill.kept_bullets, 2);
-    assert_eq!(
-        distill.removed_duplicates.len(),
-        1,
-        "{:?}",
-        distill.removed_duplicates
-    );
-    // The bash bullet is backed by MEMORY; the foobars note is not.
-    assert_eq!(distill.unbacked.len(), 1, "{:?}", distill.unbacked);
-    assert!(
-        distill.unbacked[0].contains("foobars"),
-        "{:?}",
-        distill.unbacked
-    );
-    // The surviving content keeps the bash bullet exactly once.
-    assert_eq!(
-        distill.content.matches("Bash is atomic").count(),
-        1,
-        "{}",
-        distill.content
-    );
-    // Structure (heading) is preserved.
-    assert!(
-        distill.content.starts_with("# Dext recall"),
-        "{}",
-        distill.content
-    );
-}
-
-#[test]
 fn llama_tool_grammar_is_gated_to_local_and_opt_in() {
     use crate::provider::ApiProvider;
     let tools = ["read_file", "bash"];
@@ -12916,8 +12852,24 @@ fn detected_llama_context_does_not_override_explicit_environment_setting() {
     }
 }
 
-#[test]
-fn local_llama_runtime_context_is_endpoint_scoped_not_model_global() -> Result<()> {
+#[tokio::test]
+async fn offline_local_llama_probe_is_safe_inside_tokio_runtime() -> Result<()> {
+    let _guard = env_lock();
+    clear_cached_local_llama_context_windows();
+    let tokens = refresh_local_llama_context_window(
+        "local",
+        ApiProvider::OpenAi,
+        "http://127.0.0.1:0",
+        "offline-local-model",
+    );
+
+    assert_eq!(tokens, None);
+    clear_cached_local_llama_context_windows();
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_llama_runtime_context_is_endpoint_scoped_not_model_global() -> Result<()> {
     let _guard = env_lock();
     unsafe {
         std::env::remove_var("DEXT_CONTEXT_WINDOW");

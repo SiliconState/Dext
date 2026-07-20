@@ -18,9 +18,10 @@ The `bash` tool is deliberately atomic. Dext launches bash in a separate process
   provider tool schemas.
 - `src/provider.rs` — provider catalog/auth, request shaping, normalization, and transport deadlines.
 - `src/sse.rs`, `src/streaming.rs`, `src/tool_round.rs`, `src/tool_journal.rs` — bounded SSE framing, provider event assembly, tool-round execution, and durable side-effect fencing.
-- `src/git_checkpoints.rs`, `src/mutation_preview.rs`, `src/memory_merge.rs` —
-  Git-native recovery refs, file mutation previews, and optional memory merge
-  helpers.
+- `src/git_checkpoints.rs`, `src/mutation_preview.rs` — Git-native recovery
+  refs and file mutation previews.
+- `src/sandbox.rs`, `src/tool_policy.rs`, `src/orchestrator.rs` — OS
+  confinement, tool risk/validation policy, and runtime work-state controls.
 - `src/packs.rs`, `src/shelves.rs` — shelf-contained pack creation, discovery,
   invocation, and typed ability metadata.
 - `src/tui.rs` — Ratatui inline TUI using the regular terminal buffer.
@@ -35,6 +36,7 @@ When changing Dext itself:
    - `cargo fmt --all -- --check`
    - `cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings`
    - `cargo audit --deny warnings`
+   - `cargo deny check licenses`
    - `cargo test -p ratatui-core --lib --locked`
    - `cargo build --release --locked`
    - `cargo test --release --locked`
@@ -61,10 +63,7 @@ When changing Dext itself:
   root and its ancestors. Keep it terse and machine-facing.
 - `recall.md` is an optional ignored prompt cache. It is auto-injected when
   present, but Dext does not create or update it automatically.
-- `MEMORY.md` is optional ignored long-form storage for explicit
-  `dext memory ...` merge/distill commands. It is never auto-injected and is
-  not required for normal sessions.
-- Do not create or update `recall.md` or `MEMORY.md` unless the user asks.
+- Do not create or update `recall.md` unless the user asks.
 
 ## Packs and shelves
 - Packs extend Dext without bloating the core or provider-visible toolset.

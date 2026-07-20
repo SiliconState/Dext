@@ -2813,6 +2813,11 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
     ));
 
     if let Some(branch) = &state.git_branch {
+        let branch = match branch.as_str() {
+            "main" => "Main",
+            "main (dirty)" => "Main (dirty)",
+            other => other,
+        };
         spans.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
             format!("Branch({})", clamp_chars(branch, 28)),
@@ -10970,7 +10975,7 @@ mod tests {
         );
         state.provider_label = "chatgpt".to_string();
         state.api_family = "chatgpt-responses".to_string();
-        state.git_branch = Some("main".to_string());
+        state.git_branch = Some("main (dirty)".to_string());
 
         let sandbox = "Documents/Projects/Learn/Finance";
         let lines = draw_to_lines(100, 20, &mut state);
@@ -10980,9 +10985,9 @@ mod tests {
             .unwrap_or_else(|| panic!("sandbox not visible: {lines:?}"));
         assert!(line.contains(sandbox), "{line}");
         assert!(!line.contains("~/Documents/Projects/Le…"), "{line}");
-        assert!(line.contains(" | Branch(main) │ GPT-5.5"), "{line}");
+        assert!(line.contains(" | Branch(Main (dirty)) │ GPT-5.5"), "{line}");
         assert!(
-            line.find("Branch(main)").unwrap() < line.find("GPT-5.5").unwrap(),
+            line.find("Branch(Main (dirty))").unwrap() < line.find("GPT-5.5").unwrap(),
             "{line}"
         );
     }

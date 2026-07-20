@@ -28,5 +28,8 @@ __pycache__/
 Screenshot*.jpg
 Screenshot*.png
 
-MEMORY.md
+# Generated supply-chain artifacts
+/dext.cdx.json
+/vendor/ratatui-core/dext.cdx.json
+
 recall.md

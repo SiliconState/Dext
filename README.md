@@ -29,18 +29,26 @@ cd Dext
 cargo install --path . --force --locked
 ```
 
-Versioned GitHub releases also provide tested archives for Linux x86_64 GNU, macOS x86_64, macOS arm64, and Windows x86_64 MSVC. Each archive contains the binary, `README.md`, and `LICENSE`. Verify the downloaded archive against `SHA256SUMS` and its GitHub build-provenance attestation before running it:
+Versioned GitHub releases also provide tested archives for Linux x86_64 GNU, macOS x86_64, macOS arm64, and Windows x86_64 MSVC, plus a CycloneDX JSON SBOM. Each archive contains the binary, `README.md`, and `LICENSE`. Verify the downloaded archive and SBOM against `SHA256SUMS` and their GitHub build-provenance attestations before use:
 
 ```bash
+set -euo pipefail
 version=vX.Y.Z
 archive="dext-${version}-x86_64-unknown-linux-gnu.tar.gz"
 gh release download "$version" --repo SiliconState/Dext \
-  --pattern "$archive" --pattern SHA256SUMS
-grep "  ${archive}$" SHA256SUMS | sha256sum --check -
+  --pattern "$archive" --pattern dext.cdx.json --pattern SHA256SUMS
+awk -v archive="$archive" '
+  $2 == archive { print; archive_found++ }
+  $2 == "dext.cdx.json" { print; sbom_found++ }
+  END { if (archive_found != 1 || sbom_found != 1) exit 1 }
+' SHA256SUMS > selected-SHA256SUMS
+sha256sum --check selected-SHA256SUMS
+rm selected-SHA256SUMS
 gh attestation verify "$archive" --repo SiliconState/Dext
+gh attestation verify dext.cdx.json --repo SiliconState/Dext
 ```
 
-Use the matching target archive for other platforms. macOS can replace the checksum command with `shasum -a 256 -c -`; Windows can compare `Get-FileHash -Algorithm SHA256` with `SHA256SUMS`. Windows shell tools require a real Bash implementation such as Git for Windows; Dext skips the Windows/WSL app alias and selects `bash.exe` from `PATH`, or uses the explicit `DEXT_BASH_PATH` override. See [`docs/RELEASING.md`](docs/RELEASING.md) for owner and verification details.
+Use the matching target archive for other platforms. macOS can replace the checksum command with `shasum -a 256 -c selected-SHA256SUMS`; Windows can compare both `Get-FileHash -Algorithm SHA256` values with `SHA256SUMS`. Windows shell tools require a real Bash implementation such as Git for Windows; Dext skips the Windows/WSL app alias and selects `bash.exe` from `PATH`, or uses the explicit `DEXT_BASH_PATH` override. See [`docs/RELEASING.md`](docs/RELEASING.md) for owner and verification details.
 
 Then run:
 
@@ -117,7 +125,6 @@ dext session analyze latest
 dext doctor
 dext doctor --approval auto-write --sandbox read-only --cd /path/to/project
 dext undo --list
-dext memory check                 # optional context-file merge setup
 dext pack create personal/my-pack
 dext pack inspect my-pack
 dext pack run my-pack "task description"
@@ -228,27 +235,11 @@ Inside Dext:
 `git` preview mode is accepted for forward compatibility and currently falls
 back to simple in-memory previews.
 
-### Optional context-file merge helpers
+### Optional prompt recall
 
 Dext auto-injects tracked `DEXT.md` guidance and an optional ignored `recall.md`
 when those files are present in the sandbox ancestry. It does not create or
-update either file automatically. `MEMORY.md` is separate optional ignored
-long-form storage: it is never auto-injected and normal sessions do not read it.
-Only explicit `dext memory ...` commands use it for merge registration or
-`recall.md` distillation.
-
-```bash
-dext memory check
-dext memory register
-dext memory unregister
-dext memory distill            # report only
-dext memory distill --apply    # explicitly rewrite recall.md
-```
-
-Registration is local-only by default. Use
-`dext memory register --versioned-attributes` only when the project intends to
-commit merge attributes. These helpers are optional and are not required for
-Dext sessions.
+update either file automatically.
 
 ## Packs
 
@@ -346,6 +337,7 @@ Usage metrics are recorded in session headers and `/usage` after provider turns.
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
+cargo deny check licenses
 cargo test -p ratatui-core --lib --locked
 cargo bench --no-run --locked
 cargo build --release --locked
@@ -363,8 +355,8 @@ Run the final full suite and install directly in a trusted host terminal. Dext's
 - `src/main.rs` — agent facade, CLI, turn orchestration, and remaining tool execution adapters.
 - `src/git_checkpoints.rs` — Git-native pre-mutation checkpoints, hidden recovery refs, undo preview/apply support.
 - `src/mutation_preview.rs` — capped in-memory diffs for direct file-tool approval prompts.
-- `src/memory_merge.rs` — explicit Git merge-driver helpers for `MEMORY.md` and `recall.md`.
 - `src/provider.rs` — provider catalog, auth, OAuth/API-key handling, request shaping, transport deadlines/body bounds, and side-effect-free bounded state/auth-permission inspection.
+- `src/sandbox.rs` — OS confinement, profile-specific write roots, private scratch, and offline diagnostic isolation.
 - `src/session.rs` — session persistence, project state paths, logs, lock cleanup, terminal restore.
 - `src/tools.rs` — tool catalog and provider-facing tool schemas.
 - `src/tool_policy.rs` — validation and command/external-source guardrails.
@@ -372,8 +364,9 @@ Run the final full suite and install directly in a trusted host terminal. Dext's
 - `src/streaming.rs` — provider event validation and stream/tool-call assembly.
 - `src/tool_round.rs` — tool-call planning, approval, checkpoint/journal boundaries, dispatch, and result normalization.
 - `src/tool_journal.rs` — bounded private side-effect start/terminal journal and recovery metadata.
-- `.github/workflows/release.yml` — tag/version gate, four-platform release builds, checksums, attestations, and GitHub release publication.
-- `docs/RELEASING.md` — owner release checklist and archive verification.
+- `deny.toml` — dependency-license allowlist enforced by security and release workflows.
+- `.github/workflows/release.yml` — tag/version gate, four-platform release builds, sorted checksums, SBOM, attestations, and GitHub release publication.
+- `docs/RELEASING.md` — owner release checklist and asset verification.
 - `src/orchestrator.rs` — turn telemetry, dedupe, circuit-breaker, and workflow guards.
 - `src/tui.rs` — inline terminal UI.
 - `vendor/ratatui-core/` — exact upstream source plus Dext's narrow inline-terminal compatibility patch.
@@ -383,7 +376,6 @@ Run the final full suite and install directly in a trusted host terminal. Dext's
 - `benches/` — criterion benchmarks.
 - `DEXT.md` — tracked, auto-injected machine-facing project guidance.
 - `recall.md` — optional ignored prompt cache; injected only when present.
-- `MEMORY.md` — optional ignored input to explicit `dext memory` commands; never auto-injected.
 - `docs/PACKS.md` — packs and shelves reference.
 - `docs/TUI.md` — inline TUI contract, dependency stack, compatibility patch, and regression gate.
 - `docs/index.html` — canonical browsable technical documentation; update it in the same change as runtime, architecture, security, provider, tool, test, CI, or release behavior.

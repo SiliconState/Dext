@@ -71,17 +71,6 @@
   Configure with `/preview`, `--preview off|simple|git`, or
   `DEXT_MUTATION_PREVIEW=off|simple|git`. The accepted `git` mode currently
   falls back to simple previews until alternate-index previews are implemented.
-- Added explicit memory merge-driver support for Dext memory files.
-  - `dext memory check` reports whether `MEMORY.md` and `recall.md` have merge
-    drivers registered.
-  - `dext memory register` installs local-only Git merge-driver configuration
-    for section-aware merges.
-  - `dext memory register --versioned-attributes` may also write versioned
-    `.gitattributes` entries when a project intentionally wants them.
-  - `dext memory unregister` removes the local registration.
-  - `dext memory merge [--recall] <base> <ours> <theirs>` is the Git merge-driver
-    entry point used after registration.
-
 - Added a bounded owner-private tool execution journal for approved
   side-effect-capable calls. Resume reports unresolved starts as uncertain and
   never automatically replays them.
@@ -123,8 +112,9 @@
 - Checkpoint manifests and sidecars now use owner-private storage, reject
   symlinked storage paths on Unix, add `/.dext/` to the repository-local Git
   exclude, and automatically retain at most 20 checkpoints for seven days.
-- Added least-privilege CI, weekly `cargo audit`, and Cargo/GitHub Actions
-  Dependabot configuration.
+- Added least-privilege CI, weekly vulnerability and dependency-license checks,
+  Cargo/GitHub Actions Dependabot configuration, and a checksummed, attested
+  CycloneDX SBOM for release publication.
 
 ### Fixed
 
@@ -143,11 +133,9 @@
 - Checkpoint sidecar paths resolve against the sandbox root and restore only the
   intended hinted paths.
 - Changing the sandbox root resets cached Git-root discovery.
-- Memory merge registration resolves the Git toplevel before touching versioned
-  `.gitattributes`, so running from a subdirectory does not write attributes in
-  the wrong place.
-- Recall merges prefer local content for ambiguous deletions, dedupe additions
-  from the incoming side, and keep a clean trailing newline.
+- Local llama.cpp context discovery now owns its blocking HTTP client on a
+  dedicated thread, so an offline local provider cleanly falls back instead of
+  panicking when the probe runs inside Tokio.
 - Mutation preview path handling enforces sandbox containment and avoids
   double-counting trailing new-file additions.
 - Active packs now expose `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to

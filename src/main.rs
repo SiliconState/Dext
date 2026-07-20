@@ -1,6 +1,5 @@
 mod git_checkpoints;
 mod list_render;
-mod memory_merge;
 mod mutation_preview;
 mod orchestrator;
 mod packs;
@@ -20474,182 +20473,6 @@ fn handle_undo_cli(args: &[String], root: &Path) -> i32 {
     0
 }
 
-fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
-    let sub = args.first().map(String::as_str).unwrap_or("check");
-    match sub {
-        "check" => {
-            match memory_merge::check(root) {
-                Ok(status) => {
-                    println!(
-                        "memory merge: {}",
-                        if status.memory_registered {
-                            "registered"
-                        } else {
-                            "not registered"
-                        }
-                    );
-                    println!(
-                        "recall merge: {}",
-                        if status.recall_registered {
-                            "registered"
-                        } else {
-                            "not registered"
-                        }
-                    );
-                    println!(
-                        "local attributes: {}",
-                        if status.gitattributes_local {
-                            "yes"
-                        } else {
-                            "no"
-                        }
-                    );
-                    println!(
-                        "versioned attributes: {}",
-                        if status.gitattributes_versioned {
-                            "yes"
-                        } else {
-                            "no"
-                        }
-                    );
-                    if !status.memory_registered {
-                        eprintln!("run 'dext memory register' to enable section-aware merging");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return 1;
-                }
-            }
-            0
-        }
-        "register" => {
-            let versioned = args.iter().any(|a| a == "--versioned-attributes");
-            let modes = if args.iter().any(|a| a == "--recall") {
-                vec![memory_merge::RegisterMode::Recall]
-            } else if args.iter().any(|a| a == "--memory") {
-                vec![memory_merge::RegisterMode::Memory]
-            } else {
-                vec![
-                    memory_merge::RegisterMode::Memory,
-                    memory_merge::RegisterMode::Recall,
-                ]
-            };
-            for mode in modes {
-                if let Err(e) = memory_merge::register(root, mode, versioned) {
-                    eprintln!("error: {e}");
-                    return 1;
-                }
-            }
-            println!("registered memory merge driver(s)");
-            0
-        }
-        "unregister" => {
-            if let Err(e) = memory_merge::unregister(root) {
-                eprintln!("error: {e}");
-                return 1;
-            }
-            println!("unregistered memory merge drivers");
-            0
-        }
-        "merge" => {
-            let is_recall = args.iter().any(|a| a == "--recall");
-            // Git merge driver protocol: %O %A %B %L %P
-            // %O=base %A=ours %B=theirs %L=marker-size %P=path
-            let positional: Vec<&String> = args
-                .iter()
-                .skip(1)
-                .filter(|a| !a.starts_with('-'))
-                .collect();
-            if positional.len() < 3 {
-                eprintln!(
-                    "usage: dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]"
-                );
-                return 2;
-            }
-            let base_content = std::fs::read_to_string(positional[0]).unwrap_or_default();
-            let ours_content = std::fs::read_to_string(positional[1]).unwrap_or_default();
-            let theirs_content = std::fs::read_to_string(positional[2]).unwrap_or_default();
-
-            let outcome = if is_recall {
-                memory_merge::merge_recall(&base_content, &ours_content, &theirs_content)
-            } else {
-                memory_merge::merge_memory(&base_content, &ours_content, &theirs_content)
-            };
-
-            // Write result to ours file (Git merge driver protocol)
-            if let Err(e) = std::fs::write(positional[1], &outcome.content) {
-                eprintln!("error writing merge result: {e}");
-                return 1;
-            }
-            for w in &outcome.warnings {
-                eprintln!("warning: {w}");
-            }
-            if outcome.clean { 0 } else { 1 }
-        }
-        "distill" => {
-            let memory_path = root.join("MEMORY.md");
-            let recall_path = root.join("recall.md");
-            let recall = match std::fs::read_to_string(&recall_path) {
-                Ok(text) => text,
-                Err(e) => {
-                    eprintln!("error reading {}: {e}", recall_path.display());
-                    return 1;
-                }
-            };
-            let memory = std::fs::read_to_string(&memory_path).unwrap_or_default();
-            let distill = memory_merge::distill_recall(&memory, &recall);
-
-            println!(
-                "recall.md: {} bullet(s) -> {} after dedupe ({} exact duplicate(s) removed)",
-                distill.original_bullets,
-                distill.kept_bullets,
-                distill.removed_duplicates.len()
-            );
-            for dup in &distill.removed_duplicates {
-                println!("  - duplicate: {dup}");
-            }
-            if !distill.near_duplicates.is_empty() {
-                println!("near-duplicate bullets (kept; review manually):");
-                for item in &distill.near_duplicates {
-                    println!("  ~ {item}");
-                }
-            }
-            if !distill.unbacked.is_empty() {
-                println!(
-                    "bullets not reflected in MEMORY.md (possibly stale, or promote to MEMORY.md):"
-                );
-                for item in &distill.unbacked {
-                    println!("  ? {item}");
-                }
-            }
-
-            let apply = args.iter().any(|a| a == "--apply");
-            if apply {
-                if distill.content == recall {
-                    println!("recall.md already distilled; nothing to write");
-                } else if let Err(e) =
-                    crate::session::atomic_write_bytes(&recall_path, distill.content.as_bytes())
-                {
-                    eprintln!("error writing {}: {e}", recall_path.display());
-                    return 1;
-                } else {
-                    println!("applied: rewrote {}", recall_path.display());
-                }
-            } else if distill.content != recall {
-                println!("\n(dry run; re-run with --apply to rewrite recall.md)");
-            } else {
-                println!("\nrecall.md already distilled; no changes needed");
-            }
-            0
-        }
-        _ => {
-            eprintln!("usage: dext memory [check|register|unregister|merge|distill]");
-            2
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorLevel {
     Ok,
@@ -24630,15 +24453,6 @@ async fn main() -> Result<()> {
         release_registered_locks();
         std::process::exit(code);
     }
-    if argv.first().is_some_and(|a| a == "memory") {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from("."));
-        let code = handle_memory_cli(&argv[1..], &root);
-        release_registered_locks();
-        std::process::exit(code);
-    }
     if argv.first().is_some_and(|a| a == "doctor") {
         let root = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -24706,10 +24520,6 @@ async fn main() -> Result<()> {
         println!("       dext undo --list      list recent Dext checkpoints");
         println!("       dext undo --preview <id>  non-interactive preview");
         println!("       dext undo --apply <id>   non-interactive apply");
-        println!("       dext memory check    check memory merge registration");
-        println!("       dext memory register register merge drivers (local)");
-        println!("       dext memory distill [--apply]  dedupe recall.md, flag stale bullets");
-        println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
             "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
