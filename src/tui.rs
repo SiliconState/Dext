@@ -28,12 +28,11 @@ use crate::provider::{curated_provider_models, provider_has_available_credential
 use crate::{
     Agent, AgentEvent, ApprovalProfile, Choice, ContextMode, EventSink,
     HISTORY_CHAR_BUDGET_END_TURN_PERCENT, LocalAuthSecret, ThinkingEffort, Usage, WorkMapEventKind,
-    canonical_provider_id, clear_secret_string, git_summary, handle_slash,
-    history_char_budget_with_window, load_auth_store, load_provider_catalog, model_context_window,
-    orchestrator::ExternalTelemetry, packs, parse_active_runtime_control_sequence,
-    parse_compact_slash, provider_auth_status, pseudo_tool_redaction_marker,
-    redact_pseudo_tool_protocol_text, resolve_active_provider_id, summarize_call,
-    text_line_looks_like_pseudo_tool_syntax,
+    canonical_provider_id, clear_secret_string, handle_slash, history_char_budget_with_window,
+    load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
+    packs, parse_active_runtime_control_sequence, parse_compact_slash, provider_auth_status,
+    pseudo_tool_redaction_marker, redact_pseudo_tool_protocol_text, resolve_active_provider_id,
+    summarize_call, text_line_looks_like_pseudo_tool_syntax, tui_git_summary,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
@@ -60,6 +59,18 @@ const LIVE_BACKEND_MAX_TOOLS: usize = 8;
 const LIVE_OUTPUT_DRAIN_BATCH: usize = 32;
 const RESIZE_REPLAY_QUIET: Duration = Duration::from_millis(120);
 const RESIZE_REPLAY_MAX_LATENCY: Duration = Duration::from_millis(360);
+const WELCOME_RIGHT_MIN_WIDTH: usize = 80;
+const WELCOME_LABEL_GUTTER: usize = 14;
+const TIPS: &[&str] = &[
+    "Type / to browse commands and their arguments.",
+    "Press ? with an empty input to open the complete keymap.",
+    "Ctrl+L opens the current read-only todo list.",
+    "Ctrl+T shows exact token counts and runtime details.",
+    "Ctrl+O expands or collapses the latest tool output.",
+    "Ctrl+B opens captured bash output after a command starts.",
+    "Shift+Enter or Alt+Enter inserts a newline.",
+    "Use /plan <task> to run the read-only planner.",
+];
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ToolChunk {
@@ -136,9 +147,24 @@ struct ActiveFocusLabel {
     mode: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WelcomeGit {
+    branch: String,
+    dirty: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WelcomeBanner {
+    cwd: String,
+    model: String,
+    approval: String,
+    git: Option<WelcomeGit>,
+    tip_index: usize,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Line_ {
-    Banner(String),
+    Banner(WelcomeBanner),
     User(String),
     Assistant {
         text: String,
@@ -207,6 +233,7 @@ enum ToTui {
         message: String,
         responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
     },
+    GitSummary(Option<String>),
 }
 
 enum FromTui {
@@ -214,6 +241,7 @@ enum FromTui {
     LoginInput(String),
     LoginCancel,
     CycleEffort(i8),
+    GitContext(Option<String>),
     Quit,
 }
 
@@ -830,6 +858,7 @@ struct TuiState {
     slash_acomp_scroll: usize,
     git_branch: Option<String>,
     git_branch_refreshed: Option<Instant>,
+    git_refresh_in_flight: bool,
     tool_tint_parity: bool,
     transcript_needs_rebuild: bool,
     call_tag_seq: usize,
@@ -956,6 +985,7 @@ impl TuiState {
             slash_acomp_scroll: 0,
             git_branch: None,
             git_branch_refreshed: None,
+            git_refresh_in_flight: false,
             tool_tint_parity: false,
             transcript_needs_rebuild: false,
             call_tag_seq: 0,
@@ -1029,16 +1059,21 @@ impl TuiState {
         }
     }
 
-    fn refresh_git_branch(&mut self) {
-        let stale = match self.git_branch_refreshed {
-            Some(t) => t.elapsed() > Duration::from_secs(2),
-            None => true,
-        };
-        if !stale {
-            return;
+    fn begin_git_branch_refresh(&mut self) -> bool {
+        let stale = self
+            .git_branch_refreshed
+            .is_none_or(|refreshed| refreshed.elapsed() > Duration::from_secs(2));
+        if self.git_refresh_in_flight || !stale {
+            return false;
         }
-        self.git_branch = git_summary(std::path::Path::new(&self.sandbox));
+        self.git_refresh_in_flight = true;
+        true
+    }
+
+    fn apply_git_branch_refresh(&mut self, summary: Option<String>) {
+        self.git_branch = summary;
         self.git_branch_refreshed = Some(Instant::now());
+        self.git_refresh_in_flight = false;
     }
 
     fn push_debug_event(&mut self, event: impl Into<String>) {
@@ -2927,23 +2962,26 @@ fn status_model_label(model: &str) -> String {
     }
 }
 
+fn home_tilde_with_home(path: &str, home: &str) -> String {
+    if home.is_empty() {
+        return path.to_string();
+    }
+    let norm_path = path.replace('\\', "/");
+    let norm_home = home.replace('\\', "/").trim_end_matches('/').to_string();
+    let Some(rest) = norm_path.strip_prefix(&norm_home) else {
+        return path.to_string();
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return path.to_string();
+    }
+    format!("~{rest}")
+}
+
 fn home_tilde(path: &str) -> String {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_default();
-    if !home.is_empty() {
-        let norm_path = path.replace('\\', "/");
-        let norm_home = home.replace('\\', "/");
-        if let Some(rest) = norm_path.strip_prefix(&norm_home) {
-            let mut out = String::from("~");
-            if !rest.starts_with('/') && !rest.is_empty() {
-                out.push('/');
-            }
-            out.push_str(rest);
-            return out;
-        }
-    }
-    path.to_string()
+    home_tilde_with_home(path, &home)
 }
 
 fn format_count(n: u64) -> String {
@@ -4023,7 +4061,7 @@ fn input_editor_text(state: &TuiState) -> Cow<'_, str> {
     } else if let Some(preview) = &state.input_display_override {
         Cow::Borrowed(preview.as_str())
     } else if state.input.is_empty() {
-        Cow::Borrowed("Type a request…")
+        Cow::Borrowed(" ❯ Type a request…   @ files · / commands")
     } else {
         Cow::Borrowed(state.input.as_str())
     }
@@ -4034,6 +4072,8 @@ fn input_display_cursor(state: &TuiState) -> usize {
         input_editor_text(state).len()
     } else if !state.login_input.is_empty() {
         state.login_cursor
+    } else if state.input.is_empty() {
+        " ❯ ".len()
     } else {
         state.cursor
     }
@@ -5545,33 +5585,81 @@ fn reasoning_paragraphs(body: &str) -> Vec<String> {
     paragraphs
 }
 
-fn welcome_context_description(mode: ContextMode) -> &'static str {
-    match mode {
-        ContextMode::Standard => "default schemas and caps",
-        ContextMode::Frugal => "lean schemas, core tools, smaller caps, deterministic compaction",
-        ContextMode::Tiny => "lean schemas, smallest caps, deterministic compaction",
-    }
-}
-
 fn welcome_approval_value(profile: ApprovalProfile, auto_approved_count: usize) -> String {
-    let label = match profile {
-        ApprovalProfile::Always => "trust mode",
-        ApprovalProfile::Ask => "ask",
-        ApprovalProfile::AutoRead => "auto-read",
-        ApprovalProfile::AutoWrite => "auto-write",
-        ApprovalProfile::Never => "never",
-    };
     let suffix = if auto_approved_count == 1 {
         "privileged tool runs without confirmation"
     } else {
         "privileged tools run without confirmation"
     };
-    if profile == ApprovalProfile::Always {
-        format!("⚠ {label} · {auto_approved_count} {suffix}")
-    } else if auto_approved_count == 0 {
-        label.to_string()
-    } else {
-        format!("{label} · {auto_approved_count} {suffix}")
+    match profile {
+        ApprovalProfile::Always => {
+            format!("Trust mode · {auto_approved_count} {suffix}")
+        }
+        ApprovalProfile::Ask => "Ask · privileged tools require confirmation".to_string(),
+        ApprovalProfile::AutoRead => {
+            format!("Auto-read · {auto_approved_count} {suffix}")
+        }
+        ApprovalProfile::AutoWrite => {
+            format!("Auto-write · {auto_approved_count} {suffix}")
+        }
+        ApprovalProfile::Never => "Never · privileged tools are denied".to_string(),
+    }
+}
+
+fn welcome_single_line(text: &str) -> String {
+    sanitize_display_text(text)
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn welcome_git(summary: Option<&str>) -> Option<WelcomeGit> {
+    let summary = welcome_single_line(summary?.trim());
+    if summary.is_empty() {
+        return None;
+    }
+    let (branch, dirty) = summary
+        .strip_suffix(" (dirty)")
+        .map_or((summary.as_str(), false), |branch| (branch, true));
+    Some(WelcomeGit {
+        branch: branch.to_string(),
+        dirty,
+    })
+}
+
+fn welcome_session_index(root: &std::path::Path, session_id: &str, session_enabled: bool) -> usize {
+    let tracked = session_enabled.then(|| {
+        std::fs::read_dir(crate::session::latest_sessions_dir(root))
+            .ok()
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                    .count()
+                    .saturating_sub(1)
+            })
+    });
+    tracked.flatten().unwrap_or_else(|| {
+        let mut hasher = DefaultHasher::new();
+        session_id.hash(&mut hasher);
+        hasher.finish() as usize
+    })
+}
+
+fn welcome_effort_label(effort: ThinkingEffort) -> &'static str {
+    match effort {
+        ThinkingEffort::Off => "Off",
+        ThinkingEffort::Low => "Low",
+        ThinkingEffort::Medium => "Medium",
+        ThinkingEffort::High => "High",
+        ThinkingEffort::XHigh => "XHigh",
+        ThinkingEffort::Max => "Max",
     }
 }
 
@@ -5579,71 +5667,199 @@ fn welcome_banner(
     sandbox: &str,
     model: &str,
     thinking_effort: ThinkingEffort,
-    context_mode: ContextMode,
     approval_profile: ApprovalProfile,
     auto_approved_count: usize,
-) -> String {
-    format!(
-        "🐺 Dext v{}\nsandbox\t{}\nmodel\t{} · {} reasoning\ncontext\t{} · {}\napproval\t{}\nkeys\tCtrl+C/Esc interrupt · Ctrl+D quit · ? help",
-        env!("CARGO_PKG_VERSION"),
-        clamp_chars(&home_tilde(sandbox), 96),
-        clamp_chars(model, 40),
-        thinking_effort.as_str(),
-        context_mode.as_str(),
-        welcome_context_description(context_mode),
-        welcome_approval_value(approval_profile, auto_approved_count),
-    )
+    git_summary: Option<&str>,
+    session_index: usize,
+) -> WelcomeBanner {
+    WelcomeBanner {
+        cwd: welcome_single_line(&home_tilde(sandbox)),
+        model: format!(
+            "{} · {} reasoning",
+            welcome_single_line(&status_model_label(model)),
+            welcome_effort_label(thinking_effort)
+        ),
+        approval: welcome_approval_value(approval_profile, auto_approved_count),
+        git: welcome_git(git_summary),
+        tip_index: session_index % TIPS.len(),
+    }
 }
 
-fn push_welcome_banner_lines(lines: &mut Vec<Line<'static>>, banner: &str) {
-    const LABEL_WIDTH: usize = 10;
-    let mut raw_lines = banner.split('\n');
-    let title = raw_lines.next().unwrap_or("🐺 Dext");
-    let rows: Vec<(&str, &str)> = raw_lines.filter_map(|raw| raw.split_once('\t')).collect();
-    let row_width = rows
-        .iter()
-        .map(|(label, value)| text_width(&format!("{label:<LABEL_WIDTH$}{value}")))
-        .max()
-        .unwrap_or(0)
-        .max(68);
-    let top_static_width = text_width("── ") + text_width(title) + 1;
-    let rule_width = row_width.max(top_static_width + 12);
-    let rule_style = Style::default().fg(Color::DarkGray);
-    let title_style = Style::default();
-    let top_fill = "─".repeat(rule_width.saturating_sub(top_static_width));
-    lines.push(Line::from(vec![
-        Span::styled("── ".to_string(), rule_style),
-        Span::styled(title.to_string(), title_style),
-        Span::styled(format!(" {top_fill}"), rule_style),
-    ]));
-    for (label, value) in rows {
-        let warning = label == "approval" && value.contains('⚠');
-        let row_style = if warning {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default()
-        };
-        let label_style = if warning {
-            row_style
-        } else {
-            Style::default().fg(Color::Green)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{label:<LABEL_WIDTH$}"), label_style),
-            Span::styled(value.to_string(), row_style),
-        ]));
+fn welcome_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+fn truncate_cells_ascii(text: &str, max_cells: usize) -> String {
+    if welcome_width(text) <= max_cells {
+        return text.to_string();
     }
-    lines.push(Line::from(vec![Span::styled(
-        "─".repeat(rule_width),
-        rule_style,
-    )]));
+    if max_cells <= 3 {
+        return ".".repeat(max_cells);
+    }
+    let keep = max_cells - 3;
+    let mut out = String::new();
+    let mut cells = 0usize;
+    for cluster in display_clusters(text) {
+        if cells + cluster.width > keep {
+            break;
+        }
+        out.push_str(&text[cluster.byte_start..cluster.byte_start + cluster.byte_len]);
+        cells += cluster.width;
+    }
+    out.push_str("...");
+    out
+}
+
+fn truncate_path_for_cells(path: &str, max_cells: usize) -> String {
+    if welcome_width(path) <= max_cells {
+        return path.to_string();
+    }
+    if max_cells <= 3 {
+        return ".".repeat(max_cells);
+    }
+    let budget = max_cells - 3;
+    let clusters = display_clusters(path);
+    let mut start = path.len();
+    let mut cells = 0usize;
+    for cluster in clusters.iter().rev() {
+        if cells + cluster.width > budget {
+            break;
+        }
+        start = cluster.byte_start;
+        cells += cluster.width;
+    }
+    format!("...{}", &path[start..])
+}
+
+fn welcome_right_alignment_padding(
+    left: &str,
+    right: &str,
+    width: usize,
+    minimum_gap: usize,
+) -> Option<usize> {
+    let occupied = welcome_width(left)
+        .saturating_add(welcome_width(right))
+        .saturating_add(minimum_gap);
+    (occupied <= width).then(|| width - welcome_width(left) - welcome_width(right))
+}
+
+fn welcome_right_segment(cwd: &str, git: Option<&WelcomeGit>, available_cells: usize) -> String {
+    if available_cells == 0 {
+        return String::new();
+    }
+    let suffix = git.map_or_else(String::new, |git| {
+        let marker = if git.dirty { '✗' } else { '✓' };
+        format!(" · {} {marker}", truncate_cells_ascii(&git.branch, 24))
+    });
+    if welcome_width(&suffix) >= available_cells {
+        return truncate_cells_ascii(&suffix, available_cells);
+    }
+    let path_cells = available_cells - welcome_width(&suffix);
+    format!("{}{}", truncate_path_for_cells(cwd, path_cells), suffix)
+}
+
+fn welcome_fact_line(label: &str, value: &str, width: usize, value_style: Style) -> Line<'static> {
+    let label_width = WELCOME_LABEL_GUTTER.saturating_sub(2);
+    let label_text = truncate_cells_ascii(&format!("  {label:<label_width$}"), width);
+    let value_cells = width.saturating_sub(welcome_width(&label_text));
+    Line::from(vec![
+        Span::styled(label_text, Style::default().fg(Color::DarkGray)),
+        Span::styled(truncate_cells_ascii(value, value_cells), value_style),
+    ])
+}
+
+fn push_welcome_banner_lines(lines: &mut Vec<Line<'static>>, banner: &WelcomeBanner, width: u16) {
+    let width = usize::from(width.max(1));
+    let content_width = width.saturating_sub(1);
+    let brand = "◆ Dext";
+    let version = format!("  v{}", env!("CARGO_PKG_VERSION"));
+    let branded = format!("{brand}{version}");
+    let brand_budget = content_width.saturating_sub(1);
+    let branded_display = truncate_cells_ascii(&branded, brand_budget);
+    let left = format!(" {branded_display}");
+    let mut brand_spans = if welcome_width(&branded) <= brand_budget {
+        vec![
+            Span::raw(" "),
+            Span::styled(
+                brand,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(version, Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        vec![
+            Span::raw(" "),
+            Span::styled(
+                truncate_cells_ascii(&branded, content_width),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]
+    };
+    if width >= WELCOME_RIGHT_MIN_WIDTH {
+        let right_cap =
+            (content_width * 3 / 5).min(content_width.saturating_sub(welcome_width(&left) + 3));
+        let right = welcome_right_segment(&banner.cwd, banner.git.as_ref(), right_cap);
+        if let Some(padding) = welcome_right_alignment_padding(&left, &right, content_width, 3) {
+            brand_spans.push(Span::raw(" ".repeat(padding)));
+            if let Some(git) = &banner.git {
+                let marker = if git.dirty { '✗' } else { '✓' };
+                if let Some(body) = right.strip_suffix(marker) {
+                    brand_spans.push(Span::styled(
+                        body.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    brand_spans.push(Span::styled(
+                        marker.to_string(),
+                        Style::default().fg(if git.dirty {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        }),
+                    ));
+                } else {
+                    brand_spans.push(Span::styled(right, Style::default().fg(Color::DarkGray)));
+                }
+            } else {
+                brand_spans.push(Span::styled(right, Style::default().fg(Color::DarkGray)));
+            }
+        }
+    }
+    lines.push(Line::from(brand_spans));
+
+    let rule_style = Style::default().fg(Color::DarkGray);
+    let rule = format!(" {}", "─".repeat(width.saturating_sub(2)));
+    lines.push(Line::from(Span::styled(rule.clone(), rule_style)));
+    lines.push(welcome_fact_line(
+        "Model",
+        &banner.model,
+        content_width,
+        Style::default(),
+    ));
+    lines.push(welcome_fact_line(
+        "Approval",
+        &banner.approval,
+        content_width,
+        Style::default().fg(Color::Yellow),
+    ));
+    lines.push(Line::from(Span::styled(rule, rule_style)));
+    lines.push(welcome_fact_line(
+        "Tip",
+        TIPS[banner.tip_index],
+        content_width,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(""));
 }
 
 fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     match item {
-        Line_::Banner(s) => {
-            push_welcome_banner_lines(&mut lines, s);
+        Line_::Banner(banner) => {
+            push_welcome_banner_lines(&mut lines, banner, width);
         }
         Line_::TurnSep => {
             let sep: String = "─".repeat(60);
@@ -6522,7 +6738,12 @@ fn cached_transcript_render(
         state.render_cache_weight = state.render_cache_weight.saturating_sub(removed_weight);
     }
 
-    let text = line_to_text(item, render_width);
+    let text_width = if matches!(item, Line_::Banner(_)) {
+        width.max(1)
+    } else {
+        render_width
+    };
+    let text = line_to_text(item, text_width);
     let height = text_visual_height(&text, render_width);
     let weight = text_render_weight(&text);
     if weight <= RENDER_CACHE_MAX_BYTES {
@@ -7732,6 +7953,7 @@ fn apply_tui_message(state: &mut TuiState, msg: ToTui) {
             state.close_backend_viewer();
             queue_local_auth_secret_request(state, tool, message, responder);
         }
+        ToTui::GitSummary(summary) => state.apply_git_branch_refresh(summary),
     }
 }
 
@@ -9463,6 +9685,11 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let approval_profile = agent.approval_profile();
     let thinking_effort = agent.thinking_effort();
     let context_mode = agent.context_mode;
+    let session_index = welcome_session_index(
+        &agent.sandbox_root,
+        &agent.session_id,
+        agent.session_enabled,
+    );
     let initial_todos = initial_todo_items(&agent.sandbox_root, &agent.session_id);
     let auto_approved_count = agent.auto_approved_privileged_tool_count();
     let _guard = TerminalGuard::new()?;
@@ -9480,9 +9707,30 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         tokio::sync::mpsc::channel::<AgentEvent>(crate::LIVE_OUTPUT_EVENT_QUEUE_CAP);
     let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<FromTui>();
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let git_probe_root = agent.sandbox_root.clone();
+    let mut git_probe = tokio::task::spawn_blocking(move || tui_git_summary(&git_probe_root));
+    let (git_context, git_probe_pending) =
+        match tokio::time::timeout(Duration::from_millis(8), &mut git_probe).await {
+            Ok(Ok(summary)) => (summary, false),
+            Ok(Err(_)) => (None, false),
+            Err(_) => {
+                let ui_tx = ev_tx.clone();
+                let agent_tx = in_tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(summary) = git_probe.await {
+                        let _ = ui_tx.send(ToTui::GitSummary(summary.clone()));
+                        let _ = agent_tx.send(FromTui::GitContext(summary));
+                    }
+                });
+                (None, true)
+            }
+        };
 
     let interrupt = agent.interrupt.clone();
-    agent.set_sink(Box::new(TuiSink { tx: ev_tx, live_tx }));
+    agent.set_sink(Box::new(TuiSink {
+        tx: ev_tx.clone(),
+        live_tx,
+    }));
     agent.pretty = false;
     agent.silent = false;
 
@@ -9510,14 +9758,21 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         thinking_effort,
     );
     state.context_mode = context_mode;
+    agent.git_context = git_context.clone();
+    state.git_branch = git_context.clone();
+    state.git_refresh_in_flight = git_probe_pending;
+    if !git_probe_pending {
+        state.git_branch_refreshed = Some(Instant::now());
+    }
     state.set_todo_items(initial_todos);
     let banner = welcome_banner(
         &state.sandbox,
         &state.model,
         state.thinking_effort,
-        context_mode,
         state.approval_profile,
         auto_approved_count,
+        git_context.as_deref(),
+        session_index,
     );
     state.queue(Line_::Banner(banner));
     if let Some(task) = initial_task {
@@ -9673,6 +9928,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                         effort.as_str()
                     )));
                 }
+                FromTui::GitContext(summary) => {
+                    agent.git_context = summary;
+                }
                 FromTui::Quit => break,
             }
         }
@@ -9711,7 +9969,13 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
             continue;
         }
 
-        state.refresh_git_branch();
+        if state.begin_git_branch_refresh() {
+            let root = std::path::PathBuf::from(&state.sandbox);
+            let tx = ev_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.send(ToTui::GitSummary(tui_git_summary(&root)));
+            });
+        }
         if terminal_has_render_area(&terminal)? {
             let width = current_transcript_pane_width(&mut terminal, &state)?;
             let replay_width_change = resize_replay.should_replay(
@@ -9889,62 +10153,218 @@ mod tests {
     }
 
     #[test]
-    fn welcome_banner_renders_titled_card_with_inline_warning() {
+    fn home_tilde_requires_a_path_component_boundary() {
+        assert_eq!(
+            home_tilde_with_home("/home/alice/project", "/home/alice"),
+            "~/project"
+        );
+        assert_eq!(
+            home_tilde_with_home("/home/alice2/project", "/home/alice"),
+            "/home/alice2/project"
+        );
+        assert_eq!(
+            home_tilde_with_home(r"C:\Users\Alice\repo", r"C:\Users\Alice\"),
+            "~/repo"
+        );
+    }
+
+    #[test]
+    fn welcome_banner_orients_with_facts_tip_and_cached_git() {
         let banner = welcome_banner(
             "~/Documents/Projects/Screener",
             "gpt-5.5",
             ThinkingEffort::Medium,
-            ContextMode::Tiny,
             ApprovalProfile::Always,
             5,
+            Some("main (dirty)"),
+            0,
         );
         let text = line_to_text(&Line_::Banner(banner), 120);
         let lines = flatten_lines(&text);
 
         assert_eq!(lines.len(), 7);
-        assert!(lines[0].starts_with("── 🐺 Dext v"));
-        assert!(!lines.iter().any(|line| line == "🐺 Dext"));
-        assert_eq!(
-            text_width(lines[0].trim_start()),
-            text_width(lines[6].trim_start())
+        assert!(lines[0].starts_with(" ◆ Dext  v"), "{}", lines[0]);
+        assert!(
+            lines[0].ends_with("~/Documents/Projects/Screener · main ✗"),
+            "{}",
+            lines[0]
         );
-        assert!(lines[1].starts_with("sandbox   ~/Documents/Projects/Screener"));
-        assert_eq!(lines[2], "model     gpt-5.5 · medium reasoning");
+        assert_eq!(lines[1], format!(" {}", "─".repeat(118)));
+        assert_eq!(lines[2], "  Model       GPT-5.5 · Medium reasoning");
         assert_eq!(
             lines[3],
-            "context   tiny · lean schemas, smallest caps, deterministic compaction"
+            "  Approval    Trust mode · 5 privileged tools run without confirmation"
         );
-        assert_eq!(
-            lines[4],
-            "approval  ⚠ trust mode · 5 privileged tools run without confirmation"
-        );
+        assert_eq!(lines[4], lines[1]);
         assert_eq!(
             lines[5],
-            "keys      Ctrl+C/Esc interrupt · Ctrl+D quit · ? help"
+            "  Tip         Type / to browse commands and their arguments."
         );
-        let approval_style = span_style_for(&text, "⚠ trust mode").expect("approval style");
-        assert_eq!(approval_style.fg, Some(Color::Yellow));
-        let title_style = span_style_for(&text, "🐺 Dext").expect("title style");
-        assert_ne!(title_style.fg, Some(Color::DarkGray));
+        assert_eq!(lines[6], "");
+        assert!(!lines.iter().any(|line| {
+            line.contains("Sandbox") || line.contains("Context") || line.contains("keys")
+        }));
+        assert_eq!(
+            span_style_for(&text, "Trust mode")
+                .expect("approval style")
+                .fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            span_style_for(&text, "◆ Dext").expect("brand style").fg,
+            Some(Color::Cyan)
+        );
     }
 
     #[test]
-    fn welcome_banner_renders_frugal_context_description() {
+    fn welcome_tips_rotate_by_session_index() {
+        let first = welcome_banner(
+            ".",
+            "gpt-5.5",
+            ThinkingEffort::Medium,
+            ApprovalProfile::Ask,
+            0,
+            None,
+            0,
+        );
+        let second = welcome_banner(
+            ".",
+            "gpt-5.5",
+            ThinkingEffort::Medium,
+            ApprovalProfile::Ask,
+            0,
+            None,
+            1,
+        );
+        let wrapped = welcome_banner(
+            ".",
+            "gpt-5.5",
+            ThinkingEffort::Medium,
+            ApprovalProfile::Ask,
+            0,
+            None,
+            TIPS.len(),
+        );
+
+        assert_ne!(first.tip_index, second.tip_index);
+        assert_eq!(first.tip_index, wrapped.tip_index);
+        assert!((5..=8).contains(&TIPS.len()));
+    }
+
+    #[test]
+    fn welcome_right_alignment_padding_uses_terminal_cells() {
+        let left = " ◆ Dext  v0.1.0";
+        let right = "~/界/Dext · main ✓";
+        let padding = welcome_right_alignment_padding(left, right, 80, 3).expect("fits");
+
+        assert_eq!(
+            welcome_width(left) + padding + welcome_width(right),
+            80,
+            "right edge must land on the requested terminal cell"
+        );
+        assert!(welcome_right_alignment_padding(left, right, 20, 3).is_none());
+    }
+
+    #[test]
+    fn welcome_path_truncation_preserves_the_useful_tail_and_cell_budget() {
+        let path = "~/Documents/界面/Projects/VeryLongRepositoryName";
+        let truncated = truncate_path_for_cells(path, 24);
+
+        assert!(truncated.starts_with("..."), "{truncated}");
+        assert!(truncated.ends_with("RepositoryName"), "{truncated}");
+        assert!(welcome_width(&truncated) <= 24, "{truncated}");
+    }
+
+    #[test]
+    fn welcome_narrow_width_drops_the_right_brand_segment() {
         let banner = welcome_banner(
             "~/Documents/Projects/Screener",
             "gpt-5.5",
             ThinkingEffort::Medium,
-            ContextMode::Frugal,
+            ApprovalProfile::Ask,
+            0,
+            Some("main"),
+            0,
+        );
+        let narrow = flatten_lines(&line_to_text(&Line_::Banner(banner.clone()), 79));
+        let eighty = flatten_lines(&line_to_text(&Line_::Banner(banner), 80));
+
+        assert_eq!(
+            narrow[0],
+            format!(" ◆ Dext  v{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(!narrow[0].contains("Screener"), "{}", narrow[0]);
+        assert!(eighty[0].contains("Screener · main ✓"), "{}", eighty[0]);
+    }
+
+    #[test]
+    fn welcome_stays_single_line_aligned_at_target_widths() {
+        let banner = welcome_banner(
+            "~/Documents/Projects/ARepositoryWithALongName",
+            "gpt-5.6-terra",
+            ThinkingEffort::Medium,
             ApprovalProfile::Always,
-            5,
+            7,
+            Some("feature/welcome-screen (dirty)"),
+            3,
+        );
+
+        for width in [60u16, 80, 120] {
+            let text = line_to_text(&Line_::Banner(banner.clone()), width);
+            let lines = flatten_lines(&text);
+            assert_eq!(lines.len(), 7, "width {width}: {lines:?}");
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| welcome_width(line) <= width as usize),
+                "width {width}: {lines:?}"
+            );
+            assert_eq!(welcome_width(&lines[1]), width.saturating_sub(1) as usize);
+            assert_eq!(welcome_width(&lines[4]), width.saturating_sub(1) as usize);
+        }
+    }
+
+    #[test]
+    fn welcome_brand_and_facts_do_not_wrap_at_tiny_widths() {
+        let banner = welcome_banner(
+            "/tmp/repository",
+            "gpt-5.6-terra",
+            ThinkingEffort::Medium,
+            ApprovalProfile::Always,
+            7,
+            Some("main (dirty)"),
+            0,
+        );
+
+        for width in 1u16..20 {
+            let lines = flatten_lines(&line_to_text(&Line_::Banner(banner.clone()), width));
+            assert_eq!(lines.len(), 7, "width {width}: {lines:?}");
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| welcome_width(line) <= width as usize),
+                "width {width}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn welcome_metadata_is_forced_to_single_lines() {
+        let banner = welcome_banner(
+            "/tmp/repo\nspoofed\tpath",
+            "model\nspoofed",
+            ThinkingEffort::Medium,
+            ApprovalProfile::Ask,
+            0,
+            Some("main\nspoofed (dirty)"),
+            0,
         );
         let lines = flatten_lines(&line_to_text(&Line_::Banner(banner), 120));
 
-        assert_eq!(
-            lines[3],
-            "context   frugal · lean schemas, core tools, smaller caps, deterministic compaction"
-        );
-        assert!(!lines.iter().any(|line| line.starts_with("[context]")));
+        assert_eq!(lines.len(), 7, "{lines:?}");
+        assert!(lines[0].contains("spoofed path · main spoofed ✗"));
+        assert!(!lines.iter().any(|line| line.contains(['\n', '\r', '\t'])));
+        assert_eq!(lines[2], "  Model       model spoofed · Medium reasoning");
     }
 
     fn flatten_lines(text: &Text<'_>) -> Vec<String> {
@@ -10388,6 +10808,10 @@ mod tests {
             ThinkingEffort::Medium,
         );
         assert_eq!(input_hint_text(&state), "");
+        assert_eq!(
+            input_editor_text(&state),
+            " ❯ Type a request…   @ files · / commands"
+        );
 
         let help = flatten_lines(&help_overlay_text()).join("\n");
         assert!(help.contains("Enter"), "{help}");
@@ -14197,9 +14621,10 @@ mod tests {
             "/home/fixture-user/Documents/Projects/dext",
             "test-model",
             ThinkingEffort::Medium,
-            ContextMode::Tiny,
             ApprovalProfile::Always,
             5,
+            Some("main"),
+            0,
         );
         state.queue(Line_::Banner(banner));
         let size = terminal.size().expect("terminal size");

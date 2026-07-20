@@ -176,3 +176,8 @@
   Dext header, agent-active clock, command summary, styled stdout/stderr lanes,
   command position, and compact controls while preserving its existing event,
   selection, scrolling, and security behavior.
+- The inline startup welcome now presents an adaptive brand/location row, exactly
+  two Model/Approval facts, and a session-rotated verified tip; narrow terminals
+  drop the location segment, terminal-cell width drives alignment/truncation,
+  and Git status probing no longer blocks the render loop. The empty composer
+  also advertises `@ files` and `/ commands` beside its request prompt.

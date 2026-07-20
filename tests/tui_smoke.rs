@@ -53,7 +53,7 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
         ],
     )
     .expect("spawn dext in pty");
-    assert_visible(&mut pty, &mut child, "Dext v", Duration::from_secs(5));
+    assert_visible(&mut pty, &mut child, "◆ Dext  v", Duration::from_secs(5));
 
     const TRANSCRIPT_BLOCKS: usize = 24;
     // Each submitted command contributes a separator, a three-row user card,
@@ -216,7 +216,7 @@ fn tui_smoke_shift_enter_inserts_newline() {
     )
     .expect("spawn dext in pty");
 
-    assert_visible(&mut pty, &mut child, "Dext v", Duration::from_secs(5));
+    assert_visible(&mut pty, &mut child, "◆ Dext  v", Duration::from_secs(5));
     pty.write_all_retry(b"hello").expect("send text");
     pty.write_all_retry(b"\x1b[13;2u")
         .expect("send Shift+Enter CSI-u");
@@ -253,10 +253,16 @@ fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
     let mut pty = Pty::open(cols, rows).expect("open pty");
     let mut child = spawn_dext(&pty, &sandbox, &dext_home, &home).expect("spawn dext in pty");
 
-    assert_visible(&mut pty, &mut child, "Dext v", Duration::from_secs(5));
-    assert_visible(&mut pty, &mut child, "sandbox", Duration::from_secs(2));
-    assert_visible(&mut pty, &mut child, "model", Duration::from_secs(2));
-    assert_visible(&mut pty, &mut child, "Ctrl+D quit", Duration::from_secs(2));
+    assert_visible(&mut pty, &mut child, "◆ Dext  v", Duration::from_secs(5));
+    assert_visible(&mut pty, &mut child, "Model", Duration::from_secs(2));
+    assert_visible(&mut pty, &mut child, "Approval", Duration::from_secs(2));
+    assert_visible(&mut pty, &mut child, "Tip", Duration::from_secs(2));
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Type a request…   @ files · / commands",
+        Duration::from_secs(2),
+    );
 
     if exercise_help {
         pty.write_all_retry(b"?").expect("send help key");

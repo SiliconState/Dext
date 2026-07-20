@@ -264,6 +264,26 @@ fn git_ok(root: &Path, args: &[&str]) {
     );
 }
 
+#[test]
+fn git_status_summary_parses_branch_tracking_and_dirty_state() {
+    assert_eq!(
+        parse_git_status_summary(b"## main...origin/main [ahead 2]\n"),
+        Some("main".to_string())
+    );
+    assert_eq!(
+        parse_git_status_summary(b"## feature/welcome...origin/feature/welcome\n M src/tui.rs\n"),
+        Some("feature/welcome (dirty)".to_string())
+    );
+    assert_eq!(
+        parse_git_status_summary(b"## No commits yet on main\n?? README.md\n"),
+        Some("main (dirty)".to_string())
+    );
+    assert_eq!(
+        parse_git_status_summary(b"fatal: not a git repository\n"),
+        None
+    );
+}
+
 #[cfg(unix)]
 fn git_stdout(root: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
@@ -820,6 +840,18 @@ fn internal_checkpoint_git_never_executes_repository_configured_helpers() -> Res
 
     let result = (|| -> Result<()> {
         std::fs::write(root.join("tracked.txt"), "checkpoint-state\n")?;
+        let summary = tui_git_summary(&root);
+        assert!(
+            summary
+                .as_deref()
+                .is_some_and(|summary| summary.ends_with(" (dirty)")),
+            "unexpected TUI Git summary: {summary:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "TUI Git summary executed a repository-configured helper: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
         let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow::anyhow!("dirty repository must create a checkpoint"))?;

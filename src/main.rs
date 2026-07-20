@@ -5799,14 +5799,43 @@ fn git_filter_drivers_from_output(
     Ok(drivers)
 }
 
-fn internal_git_filter_drivers(cwd: &Path) -> std::result::Result<Vec<String>, String> {
+fn internal_git_filter_drivers_with_timeout(
+    cwd: &Path,
+    timeout: std::time::Duration,
+) -> std::result::Result<Vec<String>, String> {
     let args = ["config", "--null", "--name-only", "--list"];
     let output = run_internal_command_limited(
         internal_git_command(cwd, &args, &[]),
         "git config --name-only --list",
-        internal_git_timeout(),
+        timeout,
     )?;
     git_filter_drivers_from_output(&output)
+}
+
+fn internal_git_filter_drivers(cwd: &Path) -> std::result::Result<Vec<String>, String> {
+    internal_git_filter_drivers_with_timeout(cwd, internal_git_timeout())
+}
+
+fn run_internal_git_command_with_timeout(
+    cwd: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> std::result::Result<InternalCommandOutput, String> {
+    let started = std::time::Instant::now();
+    let filter_drivers = internal_git_filter_drivers_with_timeout(cwd, timeout)?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(format!(
+            "git {} timed out while hardening filters",
+            args.join(" ")
+        ));
+    }
+    let label = format!("git {}", args.join(" "));
+    run_internal_command_limited(
+        internal_git_command(cwd, args, &filter_drivers),
+        &label,
+        remaining,
+    )
 }
 
 pub(crate) fn run_internal_git_command(
@@ -13820,17 +13849,45 @@ fn save_compact_threshold_percent_setting(percent: Option<u8>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn git_summary(root: &Path) -> Option<String> {
-    let branch_out = run_internal_git_command(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
-    if !branch_out.success() {
+fn parse_git_status_summary(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut lines = text.lines();
+    let branch_line = lines.next()?.strip_prefix("## ")?;
+    let branch = branch_line
+        .strip_prefix("No commits yet on ")
+        .or_else(|| branch_line.strip_prefix("Initial commit on "))
+        .unwrap_or(branch_line);
+    let branch = branch
+        .split_once("...")
+        .map_or(branch, |(branch, _)| branch)
+        .trim();
+    if branch.is_empty() {
         return None;
     }
-    let branch = String::from_utf8_lossy(&branch_out.stdout)
-        .trim()
-        .to_string();
-    let status_out = run_internal_git_command(root, &["status", "--porcelain"]).ok()?;
-    let dirty = !status_out.stdout.is_empty();
+    let dirty = lines.any(|line| !line.trim().is_empty());
     Some(format!("{branch}{}", if dirty { " (dirty)" } else { "" }))
+}
+
+fn git_summary_with_timeout(root: &Path, timeout: std::time::Duration) -> Option<String> {
+    let args = [
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "--branch",
+    ];
+    let output = run_internal_git_command_with_timeout(root, &args, timeout).ok()?;
+    if !output.success() {
+        return None;
+    }
+    parse_git_status_summary(&output.stdout)
+}
+
+pub(crate) fn git_summary(root: &Path) -> Option<String> {
+    git_summary_with_timeout(root, internal_git_timeout())
+}
+
+pub(crate) fn tui_git_summary(root: &Path) -> Option<String> {
+    git_summary_with_timeout(root, std::time::Duration::from_millis(250))
 }
 
 struct Agent {
@@ -13918,12 +13975,13 @@ struct Agent {
 
 impl Agent {
     fn new() -> Result<Self> {
-        Self::new_with_sandbox(None, true)
+        Self::new_with_sandbox(None, true, false)
     }
 
     pub(crate) fn new_with_sandbox(
         sandbox: Option<PathBuf>,
         session_enabled: bool,
+        defer_git_context: bool,
     ) -> Result<Self> {
         let resolved = resolve_runtime_provider(None, false)?;
         let provider_id = resolved.profile.id.clone();
@@ -14011,7 +14069,11 @@ impl Agent {
         };
 
         let pretty = io::stdout().is_terminal();
-        let git_context = git_summary(&sandbox_root);
+        let git_context = if defer_git_context {
+            None
+        } else {
+            git_summary(&sandbox_root)
+        };
         let tool_profile = ToolProfile::from_env();
         let budget_cap = BudgetCap::from_env();
         let tool_context_profile = ToolContextProfile::from_env().effective(context_mode);
@@ -24681,7 +24743,17 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut agent = Agent::new_with_sandbox(opts.cd.clone(), !opts.no_session && !opts.fork)?;
+    let will_use_tui = opts.pack.is_none()
+        && !opts.print
+        && !opts.no_tui
+        && !opts.output.is_json()
+        && std::env::var("DEXT_NO_TUI").is_err()
+        && io::stdout().is_terminal();
+    let mut agent = Agent::new_with_sandbox(
+        opts.cd.clone(),
+        !opts.no_session && !opts.fork,
+        will_use_tui,
+    )?;
     agent.prewarm_connection();
     if let Some(profile) = std::env::var("DEXT_SANDBOX_PROFILE")
         .ok()
@@ -24824,12 +24896,7 @@ async fn main() -> Result<()> {
         };
     }
 
-    let use_tui = !opts.no_tui
-        && !opts.output.is_json()
-        && std::env::var("DEXT_NO_TUI").is_err()
-        && io::stdout().is_terminal();
-
-    if use_tui && !opts.print {
+    if will_use_tui {
         let result = tui::run(agent, one_shot_task).await;
         release_registered_locks();
         return result;
