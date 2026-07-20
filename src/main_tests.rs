@@ -7,8 +7,8 @@ use crate::provider::{
     resolve_provider_model_selection,
 };
 use crate::session::{
-    append_log_line, canonicalize_read_tool_path, canonicalize_tool_path, cap_latest_log_buffer,
-    latest_log_path, render_limited_lines, validate_session_name,
+    append_log_line, canonicalize_mutation_path, canonicalize_read_tool_path,
+    cap_latest_log_buffer, latest_log_path, render_limited_lines, validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
@@ -1979,12 +1979,14 @@ fn tool_paths_allow_only_user_shelf_pack_content_outside_project() {
     std::fs::write(&shelf_manifest, "{}\n").expect("write shelf manifest");
     let shelf_notes = shelf_pack_dir.join("notes.md");
     let shelf_metadata = shelf_dir.join("metadata.json");
+    let loose_packs_file = shelf_dir.join("packs/loose.md");
+    let fake_pack_file = shelf_dir.join("packs/not-a-pack/notes.md");
     let old_dext_home = std::env::var_os("DEXT_HOME");
     unsafe {
         std::env::set_var("DEXT_HOME", &home);
     }
 
-    let canonical = canonicalize_tool_path(&root, &shelf_pack_md.display().to_string())
+    let canonical = canonicalize_mutation_path(&root, &shelf_pack_md.display().to_string())
         .expect("allow user shelf pack path");
     assert_eq!(
         canonical,
@@ -1997,8 +1999,13 @@ fn tool_paths_allow_only_user_shelf_pack_content_outside_project() {
     assert_eq!(preview.path, shelf_notes);
     assert!(preview.is_new_file);
 
-    for denied in [&shelf_manifest, &shelf_metadata] {
-        let error = canonicalize_tool_path(&root, &denied.display().to_string())
+    for denied in [
+        &shelf_manifest,
+        &shelf_metadata,
+        &loose_packs_file,
+        &fake_pack_file,
+    ] {
+        let error = canonicalize_mutation_path(&root, &denied.display().to_string())
             .expect_err("shelf metadata is outside pack content");
         assert!(
             error.contains("outside sandbox or Dext global pack roots"),
@@ -2009,6 +2016,74 @@ fn tool_paths_allow_only_user_shelf_pack_content_outside_project() {
     restore_env_var("DEXT_HOME", old_dext_home);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn prepared_user_pack_mutation_rechecks_pack_marker_before_apply() {
+    let _guard = env_lock();
+    let root = temp_test_dir("prepared-pack-marker-root");
+    let home = temp_test_dir("prepared-pack-marker-home");
+    let pack_dir = home.join("shelves/community/packs/demo");
+    std::fs::create_dir_all(&pack_dir).expect("create pack directory");
+    let marker = pack_dir.join("PACK.md");
+    std::fs::write(&marker, "---\nname: demo\n---\n# Demo\n").expect("write pack marker");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let destination = pack_dir.join("new/deep/notes.md");
+    let prepared =
+        mutation_preview::prepare_write_file(&root, &destination.display().to_string(), "notes\n")
+            .expect("prepare authenticated pack mutation");
+    std::fs::remove_file(&marker).expect("remove pack marker before apply");
+    let error = mutation_preview::apply_prepared_mutation(&root, &prepared)
+        .expect_err("missing marker must invalidate prepared pack mutation");
+    assert!(error.contains("stale file state"), "{error}");
+    assert!(
+        error.contains("outside sandbox or Dext global pack roots"),
+        "{error}"
+    );
+    assert!(!destination.exists());
+    assert!(!pack_dir.join("new").exists());
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn tool_paths_reject_symlinked_user_pack_marker() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("tool-path-symlinked-pack-marker-root");
+    let home = temp_test_dir("tool-path-symlinked-pack-marker-home");
+    let outside = temp_test_dir("tool-path-symlinked-pack-marker-outside");
+    let pack_dir = home.join("shelves/community/packs/demo");
+    std::fs::create_dir_all(&pack_dir).expect("create shelf pack dir");
+    let outside_marker = outside.join("PACK.md");
+    std::fs::write(&outside_marker, "---\nname: outside\n---\n# Outside\n")
+        .expect("write outside marker");
+    symlink(&outside_marker, pack_dir.join("PACK.md")).expect("symlink pack marker");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let notes = pack_dir.join("notes.md");
+    let error = canonicalize_mutation_path(&root, &notes.display().to_string())
+        .expect_err("symlinked PACK.md must not authorize external mutation");
+    assert!(
+        error.contains("outside sandbox or Dext global pack roots"),
+        "{error}"
+    );
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 #[test]
@@ -2033,7 +2108,7 @@ fn tool_paths_allow_external_reads_but_reject_external_writes() {
         .expect("read_file may inspect outside sandbox");
     assert!(read_output.contains("1\tnope"), "{read_output}");
 
-    let err = canonicalize_tool_path(&root, &outside_file.display().to_string())
+    let err = canonicalize_mutation_path(&root, &outside_file.display().to_string())
         .expect_err("reject outside write path");
     assert!(
         err.contains("outside sandbox or Dext global pack roots"),
@@ -2073,7 +2148,7 @@ fn tool_paths_reject_dangling_symlink_write_escapes() {
 
     let outside_file = outside.join("created-by-escape.txt");
     symlink(&outside_file, root.join("file-alias")).expect("create dangling file alias");
-    let error = canonicalize_tool_path(&root, "file-alias")
+    let error = canonicalize_mutation_path(&root, "file-alias")
         .expect_err("dangling file symlink must fail closed");
     assert!(
         error.contains("cannot resolve existing path component"),
@@ -2093,7 +2168,7 @@ fn tool_paths_reject_dangling_symlink_write_escapes() {
 
     let outside_dir = outside.join("created-directory");
     symlink(&outside_dir, root.join("dir-alias")).expect("create dangling directory alias");
-    let error = canonicalize_tool_path(&root, "dir-alias/escaped.txt")
+    let error = canonicalize_mutation_path(&root, "dir-alias/escaped.txt")
         .expect_err("dangling directory symlink must fail closed");
     assert!(
         error.contains("cannot resolve existing path component"),

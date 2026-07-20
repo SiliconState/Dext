@@ -805,10 +805,12 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>Scroll</code></td><td>Navigate transcript</td></tr>
 <tr><td><code>?</code></td><td>Show keymap help</td></tr>
 </table>
+<h3>Status and Active Time</h3>
+<p>The main status row reserves its right edge for a live cumulative agent-active clock while Dext handles a turn. It advances during provider waits, tool calls, permission/auth waits, and in-turn compaction; while Dext is idle awaiting user input, the clock pauses and is hidden, then resumes on the next turn. It updates through the existing redraw cadence and uses compact forms such as <code>7s</code>, <code>7m 05s</code>, and <code>1h 07m</code> without adding a timer thread.</p>
 <h3>Todo View</h3>
-<p><code>Ctrl+L</code> opens a clean read-only modal at any time, including while the agent is busy. It loads persisted session/project todos at startup, refreshes after <code>todo_read</code>/<code>todo_write</code>, scrolls with arrows, Page Up/Down, Home/End, or the mouse wheel, and closes with <code>Ctrl+L</code>, <code>Esc</code>, or <code>q</code>. Editing remains on the existing <code>todo_write</code> path so validation, approval, checkpoint, and session-state behavior are not duplicated. The backend viewer remains the only alternate-screen surface.</p>
+<p><code>Ctrl+L</code> opens a clean read-only modal during ordinary idle or busy work. Security-critical permission and local-auth prompts intentionally retain input and rendering priority and must be resolved or canceled first. The modal loads persisted session/project todos at startup, refreshes after <code>todo_read</code>/<code>todo_write</code>, scrolls with arrows, Page Up/Down, Home/End, or the mouse wheel, and closes with <code>Ctrl+L</code>, <code>Esc</code>, or <code>q</code>. Empty-state parsing matches Dext's generated sentinel lines exactly, so ordinary todo text cannot clear the modal accidentally. When todo progress is the live-status fallback above the composer, Dext uses the compact <code>Todos 1/3 ■■□□□□□ · Active: …</code> form while retaining the active task when space permits. Editing remains on the existing <code>todo_write</code> path so validation, approval, checkpoint, and session-state behavior are not duplicated. The backend viewer remains the only alternate-screen surface.</p>
 <h3>Tool Result Rendering</h3>
-<p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints.</p>
+<p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints. Failed native <code>write_file</code>, <code>edit_file</code>, and <code>multi_edit</code> blocks explicitly state that no edits were applied, matching the atomic prepare-and-replace invariant. The alternate-screen backend viewer normalizes CRLF across arbitrary output chunks without introducing blank rows and visually matches the main TUI with a Dext header, agent-active clock, command summary, styled stdout/stderr lanes, output panel, command position, and compact controls. It continues to use the existing bounded ring buffer, selection, scrolling, event stream, and permission/auth priority.</p>
 <h3>Markdown Rendering</h3>
 <p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence.</p>
 <h3 id="tui-dependencies">Dependency and resize contract</h3>
@@ -989,6 +991,7 @@ credential-env: [SERVICE_TOKEN]
 <li>Use <code>phooks.json</code> only when needed; packs must still function without hooks.</li>
 <li>Treat pack workflows as code: version, test on disposable repos, and review diffs.</li>
 </ul>
+<p>Outside the active sandbox, native mutation tools may write only below a concrete user pack directory (<code>~/.dext/shelves/&lt;shelf&gt;/packs/&lt;pack&gt;/...</code>) containing a regular <code>PACK.md</code>. Shelf manifests and loose files directly under <code>packs/</code> remain outside that exception. Dext revalidates the destination and marker before atomic replacement; same-user path races remain outside the isolation boundary and are tracked in the risk register.</p>
 </div>
 </section>
 

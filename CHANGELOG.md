@@ -160,3 +160,19 @@
   `<90 ms` assertion remains unchanged.
 - The tool-call mock provider now consumes its bounded request body before
   responding, preventing Windows resets caused by unread HTTP request data.
+- User-shelf native mutations now require content below a concrete pack
+  directory containing a regular `PACK.md`; shelf metadata and loose files
+  directly under `packs/` remain outside the write exception, and application
+  revalidates the destination and marker before atomic replacement.
+- Backend viewer output now normalizes CRLF across arbitrary stream chunks
+  without inserting blank rows.
+- Todo empty-state parsing now matches generated sentinel lines exactly, and
+  failed native edit blocks explicitly report that no edits were applied.
+- The main TUI status row now keeps a live cumulative agent-active elapsed
+  clock at its right edge. It advances while Dext handles a turn, then pauses
+  and hides while Dext waits idle for user input; the live todo fallback shows
+  completed/total progress as a seven-cell battery.
+- The alternate-screen backend viewer now visually matches the main TUI with a
+  Dext header, agent-active clock, command summary, styled stdout/stderr lanes,
+  command position, and compact controls while preserving its existing event,
+  selection, scrolling, and security behavior.

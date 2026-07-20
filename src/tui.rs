@@ -281,6 +281,7 @@ struct BackendOutput {
     dropped_bytes: usize,
     running: bool,
     partial_stream: Option<String>,
+    pending_cr_streams: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -803,6 +804,8 @@ struct TuiState {
     streaming_text: String,
     streaming_thinking: String,
     stream_started_at: Option<Instant>,
+    agent_active_elapsed: Duration,
+    agent_active_started_at: Option<Instant>,
     stream_chars: u64,
     pending_perm: Option<PendingPermission>,
     pending_local_auth: Option<PendingLocalAuth>,
@@ -928,6 +931,8 @@ impl TuiState {
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             stream_started_at: None,
+            agent_active_elapsed: Duration::ZERO,
+            agent_active_started_at: None,
             stream_chars: 0,
             pending_perm: None,
             pending_local_auth: None,
@@ -980,6 +985,23 @@ impl TuiState {
             backend_viewer_call_id: None,
             backend_viewer_scroll_from_bottom: 0,
         }
+    }
+
+    fn set_agent_busy_at(&mut self, busy: bool, now: Instant) {
+        if busy {
+            if self.agent_active_started_at.is_none() {
+                self.agent_active_started_at = Some(now);
+            }
+        } else if let Some(started_at) = self.agent_active_started_at.take() {
+            self.agent_active_elapsed = self
+                .agent_active_elapsed
+                .saturating_add(now.saturating_duration_since(started_at));
+        }
+        self.agent_busy = busy;
+    }
+
+    fn set_agent_busy(&mut self, busy: bool) {
+        self.set_agent_busy_at(busy, Instant::now());
     }
 
     fn set_todo_items(&mut self, items: Vec<TodoItem>) {
@@ -1109,9 +1131,30 @@ impl TuiState {
         output.dropped_bytes = output.dropped_bytes.saturating_add(drain_to);
     }
 
+    fn normalize_backend_newlines(text: &str, suppress_leading_lf: bool) -> (String, bool) {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        if suppress_leading_lf && chars.peek() == Some(&'\n') {
+            chars.next();
+        }
+        let mut trailing_cr = false;
+        while let Some(ch) = chars.next() {
+            if ch == '\r' {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                } else if chars.peek().is_none() {
+                    trailing_cr = true;
+                }
+                out.push('\n');
+            } else {
+                out.push(ch);
+            }
+        }
+        (out, trailing_cr)
+    }
+
     fn append_backend_labeled_text(output: &mut BackendOutput, stream: &str, text: &str) {
-        let normalized = text.replace('\r', "\n");
-        if normalized.is_empty() {
+        if text.is_empty() {
             return;
         }
         let label = if stream == "stderr" {
@@ -1119,6 +1162,14 @@ impl TuiState {
         } else {
             "stdout"
         };
+        let suppress_leading_lf = output.pending_cr_streams.remove(label);
+        let (normalized, trailing_cr) = Self::normalize_backend_newlines(text, suppress_leading_lf);
+        if trailing_cr {
+            output.pending_cr_streams.insert(label.to_string());
+        }
+        if normalized.is_empty() {
+            return;
+        }
         let mut line_open_stream = if output.text.ends_with('\n') {
             None
         } else {
@@ -1205,6 +1256,7 @@ impl TuiState {
                 dropped_bytes: 0,
                 running,
                 partial_stream: None,
+                pending_cr_streams: HashSet::new(),
             });
             if self.backend_viewer_call_id.is_none() {
                 self.set_backend_selection_to_latest();
@@ -1666,7 +1718,7 @@ impl TuiState {
                 self.push_debug_event("turn start");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
-                self.agent_busy = true;
+                self.set_agent_busy(true);
                 self.status = "scroll: live".into();
                 self.external_telemetry = ExternalTelemetry::default();
                 self.retry_status = None;
@@ -1921,7 +1973,7 @@ impl TuiState {
                 self.input_preview_spans.clear();
                 self.input_display_override = None;
                 self.history_idx = None;
-                self.agent_busy = false;
+                self.set_agent_busy(false);
                 self.pending_login_provider = provider;
                 self.status = self
                     .pending_login_provider
@@ -2068,7 +2120,7 @@ impl TuiState {
                 self.stream_started_at = None;
                 self.stream_chars = 0;
                 self.live_tools.clear();
-                self.agent_busy = false;
+                self.set_agent_busy(false);
                 if s.starts_with("focus cleared;") || s.starts_with("cleared ") {
                     self.active_focus = None;
                 }
@@ -2092,7 +2144,7 @@ impl TuiState {
                 self.stream_started_at = None;
                 self.stream_chars = 0;
                 self.live_tools.clear();
-                self.agent_busy = false;
+                self.set_agent_busy(false);
                 if matches!(kind, WorkMapEventKind::Focus)
                     && let Some(focus) = parse_work_map_focus_label(&text)
                 {
@@ -2153,7 +2205,7 @@ impl TuiState {
                         "{tool_total} {tool_noun} · {elapsed}{error_note} · {tool_summary}",
                     )));
                 }
-                self.agent_busy = false;
+                self.set_agent_busy(false);
                 self.status = "ready".into();
                 self.retry_status = None;
                 self.stream_started_at = None;
@@ -2166,7 +2218,7 @@ impl TuiState {
                 self.push_debug_event("compact start");
                 self.compacting_resume_busy = self.agent_busy;
                 self.compacting = true;
-                self.agent_busy = true;
+                self.set_agent_busy(true);
                 self.status = "compacting history".into();
             }
 
@@ -2175,7 +2227,7 @@ impl TuiState {
                 let resume_busy = self.compacting_resume_busy;
                 self.compacting = false;
                 self.compacting_resume_busy = false;
-                self.agent_busy = resume_busy;
+                self.set_agent_busy(resume_busy);
                 self.last_turn_context_tokens = self
                     .last_turn_context_tokens
                     .max(((self.history_chars.saturating_add(3)) / 4).max(1));
@@ -2193,7 +2245,7 @@ impl TuiState {
                 let resume_busy = self.compacting_resume_busy;
                 self.compacting = false;
                 self.compacting_resume_busy = false;
-                self.agent_busy = resume_busy;
+                self.set_agent_busy(resume_busy);
                 self.queue(Line_::Warn(format!("compact failed: {message}")));
                 self.status = if self.agent_busy {
                     "thinking".into()
@@ -2206,7 +2258,7 @@ impl TuiState {
                 self.compacting = false;
                 self.compacting_resume_busy = false;
                 self.queue(Line_::Warn("interrupted".into()));
-                self.agent_busy = false;
+                self.set_agent_busy(false);
                 self.status = "ready".into();
                 self.stream_started_at = None;
                 self.stream_chars = 0;
@@ -2283,12 +2335,6 @@ fn todo_text_from_line(line: &str) -> String {
 }
 
 fn todo_items_from_content(content: &str) -> Option<Vec<TodoItem>> {
-    if content.contains("(no todos")
-        || content.contains("(todo list is empty)")
-        || content.contains("0 pending, 0 in progress, 0 completed")
-    {
-        return Some(Vec::new());
-    }
     let items = content
         .lines()
         .filter_map(|line| {
@@ -2303,7 +2349,21 @@ fn todo_items_from_content(content: &str) -> Option<Vec<TodoItem>> {
             (!text.is_empty()).then_some(TodoItem { text, status })
         })
         .collect::<Vec<_>>();
-    (!items.is_empty()).then_some(items)
+    if !items.is_empty() {
+        return Some(items);
+    }
+    content
+        .lines()
+        .map(str::trim)
+        .any(|line| {
+            matches!(
+                line,
+                "(no todos — use todo_write to create a task list)"
+                    | "(todo list is empty)"
+                    | "0 pending, 0 in progress, 0 completed"
+            )
+        })
+        .then(Vec::new)
 }
 
 fn todo_progress_from_items(items: &[TodoItem]) -> Option<TodoProgress> {
@@ -2368,17 +2428,21 @@ fn initial_todo_items(root: &std::path::Path, session_id: &str) -> Vec<TodoItem>
         .unwrap_or_default()
 }
 
+fn todo_progress_battery_cells(progress: &TodoProgress, cells: usize) -> usize {
+    if progress.total == 0 || cells == 0 {
+        return 0;
+    }
+    (progress.completed.saturating_mul(cells) + progress.total / 2) / progress.total
+}
+
 fn todo_progress_label(progress: &TodoProgress) -> String {
     let active = match (progress.in_progress, progress.active.as_deref()) {
         (0, _) => String::new(),
-        (1, Some(text)) => format!(" · active: {text}"),
-        (n, Some(text)) => format!(" · {n} active: {text}"),
-        (n, None) => format!(" · {n} active"),
+        (1, Some(text)) => format!(" · Active: {text}"),
+        (n, Some(text)) => format!(" · Active ({n}): {text}"),
+        (n, None) => format!(" · Active: {n}"),
     };
-    format!(
-        "[{}/{} todos done{}]",
-        progress.completed, progress.total, active
-    )
+    format!("Todos {}/{}{}", progress.completed, progress.total, active)
 }
 
 fn derived_busy_status(state: &TuiState) -> String {
@@ -2415,6 +2479,32 @@ fn format_elapsed(elapsed: Duration) -> String {
     } else {
         format!("{}m {:02}s", secs / 60, secs % 60)
     }
+}
+
+fn format_agent_active_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn agent_active_elapsed_at(state: &TuiState, now: Instant) -> Duration {
+    state.agent_active_elapsed.saturating_add(
+        state
+            .agent_active_started_at
+            .map(|started_at| now.saturating_duration_since(started_at))
+            .unwrap_or_default(),
+    )
+}
+
+fn agent_active_elapsed_label(state: &TuiState) -> Option<String> {
+    state
+        .agent_busy
+        .then(|| format_agent_active_elapsed(agent_active_elapsed_at(state, Instant::now())))
 }
 
 fn live_indicator_elapsed(state: &TuiState) -> Option<String> {
@@ -2502,11 +2592,40 @@ fn live_thinking_detail_line(
 }
 
 fn live_indicator_todo_detail(state: &TuiState, max_cells: usize) -> Option<Line<'static>> {
-    state
-        .todo_progress
-        .as_ref()
-        .map(todo_progress_label)
-        .map(|detail| live_detail_line(detail, Color::Green, max_cells, state.context_mode))
+    let progress = state.todo_progress.as_ref()?;
+    let filled = todo_progress_battery_cells(progress, 7).min(7);
+    let label = format!("Todos {}/{} ", progress.completed, progress.total);
+    let base_width = text_width(&label).saturating_add(7);
+    if base_width > max_cells {
+        return Some(live_detail_line(
+            todo_progress_label(progress),
+            Color::Green,
+            max_cells,
+            state.context_mode,
+        ));
+    }
+
+    let mut spans = vec![
+        Span::styled("  ↳ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(label, Style::default().fg(Color::Green)),
+        Span::styled("■".repeat(filled), Style::default().fg(Color::Green)),
+        Span::styled("□".repeat(7 - filled), Style::default().fg(Color::DarkGray)),
+    ];
+    if let Some(active) = progress.active.as_deref() {
+        let suffix = if progress.in_progress > 1 {
+            format!(" · Active ({}): {active}", progress.in_progress)
+        } else {
+            format!(" · Active: {active}")
+        };
+        let remaining = max_cells.saturating_sub(base_width);
+        if remaining > 0 {
+            spans.push(Span::styled(
+                clamp_chars(&suffix, remaining),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    Some(Line::from(spans))
 }
 
 fn live_indicator_detail(state: &TuiState, width: u16) -> Option<Line<'static>> {
@@ -5736,14 +5855,33 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                     "  Ctrl+O collapse",
                     Style::default().fg(Color::DarkGray),
                 )));
-            } else if is_mutating_diff
-                && matches!(ok, Some(true) | Some(false))
-                && !content.is_empty()
-            {
+            } else if is_mutating_diff && matches!(ok, Some(true)) && !content.is_empty() {
                 let remaining = push_diff_preview(&mut lines, content, 8, width);
                 if remaining > 0 {
                     lines.push(Line::from(vec![Span::styled(
                         format!("  +{remaining} lines hidden · Ctrl+O"),
+                        Style::default().fg(Color::DarkGray),
+                    )]));
+                }
+            } else if is_mutating_diff && matches!(ok, Some(false)) {
+                let stripped = strip_content_line_numbers(content);
+                for raw in stripped.lines().take(COLLAPSED_PREVIEW_LINES) {
+                    push_prefixed_wrapped_line(
+                        &mut lines,
+                        "│ ",
+                        Style::default().fg(Color::Red),
+                        raw,
+                        Style::default().fg(Color::Red),
+                        width,
+                    );
+                }
+                let remaining = stripped
+                    .lines()
+                    .count()
+                    .saturating_sub(COLLAPSED_PREVIEW_LINES);
+                if remaining > 0 {
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("  ⎯ {remaining} more lines hidden · Ctrl+O"),
                         Style::default().fg(Color::DarkGray),
                     )]));
                 }
@@ -5842,6 +5980,17 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                         Style::default().fg(Color::DarkGray),
                     )]));
                 }
+            }
+            if is_mutating_diff && matches!(ok, Some(false)) {
+                lines.push(Line::from(vec![
+                    Span::styled("  atomicity  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "no edits applied",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
             }
         }
         Line_::PermissionPrompt {
@@ -6967,6 +7116,8 @@ fn queue_permission_request(
     let tier = PermissionTier::from_risk(risk);
     let command = permission_command_text(&name, &input);
     let audit_label = permission_audit_label(&name, &input);
+    state.show_help = false;
+    state.show_todos = false;
     state.status = "thinking".to_string();
     let prompt = Line_::PermissionPrompt {
         tool: name.clone(),
@@ -6996,6 +7147,8 @@ fn queue_local_auth_secret_request(
 ) {
     let previous = state.pending_local_auth.take();
     clear_secret_string(&mut state.local_auth_input);
+    state.show_help = false;
+    state.show_todos = false;
     if let Some(pending) = previous {
         let _ = pending.responder.send(LocalAuthSecret::Canceled);
     }
@@ -7603,7 +7756,35 @@ fn drain_live_output_events(
     }
 }
 
-fn backend_viewer_text(state: &mut TuiState, area: Rect) -> (Text<'static>, String, String) {
+fn backend_output_line(row: &str) -> Line<'static> {
+    if let Some(body) = row.strip_prefix("stdout │ ") {
+        Line::from(vec![
+            Span::styled("stdout", Style::default().fg(Color::Cyan)),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(body.to_string(), Style::default().fg(Color::Gray)),
+        ])
+    } else if let Some(body) = row.strip_prefix("stderr │ ") {
+        Line::from(vec![
+            Span::styled("stderr", Style::default().fg(Color::Yellow)),
+            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(body.to_string(), Style::default().fg(Color::LightRed)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            row.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    }
+}
+
+struct BackendViewerText {
+    body: Text<'static>,
+    title: String,
+    summary: String,
+    position: String,
+}
+
+fn backend_viewer_text(state: &mut TuiState, area: Rect) -> BackendViewerText {
     let inner_width = area.width.saturating_sub(2).max(1);
     let visible_rows = area.height.saturating_sub(2).max(1) as usize;
     let rows = state.backend_body_rows_for_width(inner_width);
@@ -7623,37 +7804,36 @@ fn backend_viewer_text(state: &mut TuiState, area: Rect) -> (Text<'static>, Stri
             )
         })
         .unwrap_or_else(|| ("—".to_string(), "idle".to_string(), String::new()));
-    let summary_rows = usize::from(!summary.is_empty()).min(visible_rows);
-    let body_visible_rows = visible_rows.saturating_sub(summary_rows);
+    let body_visible_rows = visible_rows;
     state.clamp_backend_scroll(rows.len(), body_visible_rows);
 
     let title = clamp_chars(
-        &format!(" backend {selected}/{total} {call_tag} · {status} "),
+        &format!(" output · {call_tag} · {status} "),
         area.width.max(1) as usize,
     );
-    let footer = clamp_chars(
-        " Esc/q close · ↑↓/Pg scroll · Tab next · Shift+Tab prev ",
-        area.width.max(1) as usize,
-    );
+    let position = if total > 0 {
+        format!(" {selected}/{total} ")
+    } else {
+        " 0/0 ".to_string()
+    };
 
     let end = rows
         .len()
         .saturating_sub(state.backend_viewer_scroll_from_bottom);
     let start = end.saturating_sub(body_visible_rows);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if !summary.is_empty() {
-        lines.push(Line::from(Span::styled(
-            clamp_chars(&summary, inner_width as usize),
-            Style::default().fg(Color::Cyan),
-        )));
-    }
     for row in rows.iter().skip(start).take(end.saturating_sub(start)) {
-        lines.push(Line::from(row.clone()));
+        lines.push(backend_output_line(row));
     }
     while lines.len() < visible_rows {
         lines.push(Line::from(""));
     }
-    (Text::from(lines), title, footer)
+    BackendViewerText {
+        body: Text::from(lines),
+        title,
+        summary,
+        position,
+    }
 }
 
 fn todo_overlay_text(state: &mut TuiState, width: u16, height: u16) -> (Text<'static>, String) {
@@ -7726,9 +7906,9 @@ fn todo_overlay_text(state: &mut TuiState, width: u16, height: u16) -> (Text<'st
         .take(visible_rows)
         .collect::<Vec<_>>();
     let title = if state.todo_items.is_empty() {
-        " todos ".to_string()
+        " Todos ".to_string()
     } else {
-        format!(" todos · {} ", state.todo_items.len())
+        format!(" Todos · {} ", state.todo_items.len())
     };
     (Text::from(shown), title)
 }
@@ -7764,23 +7944,129 @@ fn render_todo_overlay(frame: &mut ratatui::Frame, state: &mut TuiState, area: R
 fn render_backend_viewer(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let area = frame.area();
     render_widget_safe(frame, Clear, area);
-    let (text, title, footer) = backend_viewer_text(state, area);
-    let widget = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let header_height = if area.height >= 6 { 3 } else { 1 };
+    let footer_height = u16::from(area.height >= 4);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_height),
+            Constraint::Min(1),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
+    let header_area = chunks[0];
+    let output_area = chunks[1];
+    let footer_area = chunks[2];
+    let view = backend_viewer_text(state, output_area);
+
+    let marker = if state
+        .selected_backend_output()
+        .is_some_and(|output| output.running)
+    {
+        SPINNER_FRAMES[(state.frame_count % SPINNER_FRAMES.len() as u64) as usize]
+    } else {
+        '●'
+    };
+    let marker_color = if marker == '●' {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+    let clock = agent_active_elapsed_label(state).map(|elapsed| format!("Active {elapsed}"));
+    let clock_width = clock
+        .as_deref()
+        .map(text_width)
+        .unwrap_or_default()
+        .saturating_add(usize::from(clock.is_some()))
+        .min(header_area.width as usize) as u16;
+    let header_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(clock_width)])
+        .split(Rect::new(
+            header_area.x,
+            header_area.y,
+            header_area.width,
+            1,
+        ));
+    render_widget_safe(
+        frame,
+        Paragraph::new(Line::from(vec![
+            Span::styled(marker.to_string(), Style::default().fg(marker_color)),
+            Span::styled(
+                "  dext",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · backend viewer", Style::default().fg(Color::DarkGray)),
+        ])),
+        header_chunks[0],
+    );
+    if let Some(clock) = clock {
+        render_widget_safe(
+            frame,
+            Paragraph::new(
+                Line::from(Span::styled(clock, Style::default().fg(Color::Green))).right_aligned(),
+            ),
+            header_chunks[1],
+        );
+    }
+    if header_height > 1 {
+        let summary_area = Rect::new(
+            header_area.x,
+            header_area.y.saturating_add(1),
+            header_area.width,
+            1,
+        );
+        render_widget_safe(
+            frame,
+            Paragraph::new(Line::from(Span::styled(
+                clamp_chars(
+                    if view.summary.is_empty() {
+                        "Waiting for a bash command…"
+                    } else {
+                        &view.summary
+                    },
+                    summary_area.width as usize,
+                ),
+                Style::default().fg(Color::Gray),
+            ))),
+            summary_area,
+        );
+    }
+
+    let output = Paragraph::new(view.body).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(
-                title,
+                view.title,
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ))
             .title_bottom(Line::from(Span::styled(
-                footer,
+                view.position,
                 Style::default().fg(Color::DarkGray),
             )))
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(Color::DarkGray)),
     );
-    render_widget_safe(frame, widget, area);
+    render_widget_safe(frame, output, output_area);
+
+    if footer_height > 0 {
+        let footer = Line::from(vec![
+            Span::styled("Esc/q", Style::default().fg(Color::Yellow)),
+            Span::styled(" close  ·  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑↓/Pg", Style::default().fg(Color::Cyan)),
+            Span::styled(" scroll  ·  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab/Shift+Tab", Style::default().fg(Color::Cyan)),
+            Span::styled(" switch command", Style::default().fg(Color::DarkGray)),
+        ]);
+        render_widget_safe(frame, Paragraph::new(footer), footer_area);
+    }
 }
 
 fn render_inspector(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
@@ -7820,15 +8106,38 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         render_inspector(frame, state, inspector_area);
     }
 
-    let status = if state.show_status_details {
-        Paragraph::new(Text::from(vec![
+    let status_lines = if state.show_status_details {
+        vec![
             Line::from(status_spans(state)),
             Line::from(status_detail_spans(state)),
-        ]))
+        ]
     } else {
-        Paragraph::new(Line::from(status_spans(state)))
+        vec![Line::from(status_spans(state))]
     };
-    render_widget_safe(frame, status, status_area);
+    if status_area.width > 0 && status_area.height > 0 {
+        let clock = agent_active_elapsed_label(state);
+        let clock_width = clock
+            .as_deref()
+            .map(text_width)
+            .unwrap_or_default()
+            .saturating_add(usize::from(clock.is_some()))
+            .min(status_area.width as usize) as u16;
+        let status_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(clock_width)])
+            .split(status_area);
+        render_widget_safe(frame, Paragraph::new(status_lines), status_chunks[0]);
+        if let Some(clock) = clock {
+            render_widget_safe(
+                frame,
+                Paragraph::new(
+                    Line::from(Span::styled(clock, Style::default().fg(Color::Green)))
+                        .right_aligned(),
+                ),
+                status_chunks[1],
+            );
+        }
+    }
 
     let prompt_style = if (state.input.is_empty() && state.input_display_override.is_none())
         || (state.agent_busy && state.pending_perm.is_none())
@@ -8362,7 +8671,7 @@ fn handle_login_input_key(
             } else {
                 let non_secret_command = login_input_is_non_secret_command(state);
                 let text = state.take_login_input();
-                state.agent_busy = true;
+                state.set_agent_busy(true);
                 state.status = if non_secret_command {
                     "running login command…".to_string()
                 } else {
@@ -9104,6 +9413,7 @@ async fn run_backend_viewer(
     while state.backend_viewer_open && !state.quit {
         if terminal_has_render_area(&terminal)? {
             terminal.draw(|f| render_backend_viewer(f, state))?;
+            state.frame_count = state.frame_count.wrapping_add(1);
         }
         let timeout = tick
             .checked_sub(last_tick.elapsed())
@@ -9663,6 +9973,22 @@ mod tests {
             .collect()
     }
 
+    fn draw_backend_to_lines(width: u16, height: u16, state: &mut TuiState) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_backend_viewer(frame, state))
+            .expect("draw backend viewer");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     fn span_style_for<'a>(text: &'a Text<'a>, needle: &str) -> Option<Style> {
         text.lines
             .iter()
@@ -9858,6 +10184,73 @@ mod tests {
     }
 
     #[test]
+    fn backend_output_normalizes_crlf_within_and_across_chunks() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::ToolCallStart {
+            call_id: "call_crlf".to_string(),
+            name: "bash".to_string(),
+            summary: "bash: windows output".to_string(),
+        });
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_crlf".to_string(),
+            name: "bash".to_string(),
+            stream: "stdout".to_string(),
+            text: "windows one\r\nwindows two\r".to_string(),
+        });
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_crlf".to_string(),
+            name: "bash".to_string(),
+            stream: "stderr".to_string(),
+            text: "between\n".to_string(),
+        });
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_crlf".to_string(),
+            name: "bash".to_string(),
+            stream: "stdout".to_string(),
+            text: "\nwindows three\r\n".to_string(),
+        });
+
+        let output = state.backend_outputs.back().expect("backend output");
+        assert_eq!(
+            output.text,
+            "stdout │ windows one\nstdout │ windows two\nstderr │ between\nstdout │ windows three\n"
+        );
+    }
+
+    #[test]
+    fn backend_output_keeps_split_crlf_state_across_empty_delta() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::ToolCallStart {
+            call_id: "call_empty_crlf".to_string(),
+            name: "bash".to_string(),
+            summary: "bash: split windows output".to_string(),
+        });
+        for text in ["line one\r", "", "\nline two\r\n"] {
+            state.apply_event(AgentEvent::ToolOutputDelta {
+                call_id: "call_empty_crlf".to_string(),
+                name: "bash".to_string(),
+                stream: "stdout".to_string(),
+                text: text.to_string(),
+            });
+        }
+
+        let output = state.backend_outputs.back().expect("backend output");
+        assert_eq!(output.text, "stdout │ line one\nstdout │ line two\n");
+    }
+
+    #[test]
     fn ctrl_b_opens_and_esc_closes_backend_viewer() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -9950,6 +10343,20 @@ mod tests {
     }
 
     #[test]
+    fn todo_content_does_not_treat_count_phrase_inside_item_as_empty_state() {
+        let items = todo_items_from_content(
+            "○ Explain 0 pending, 0 in progress, 0 completed [pending]\n\n1 pending, 0 in progress, 0 completed",
+        )
+        .expect("todo items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, TodoItemStatus::Pending);
+        assert_eq!(
+            items[0].text,
+            "Explain 0 pending, 0 in progress, 0 completed"
+        );
+    }
+
+    #[test]
     fn empty_todo_result_clears_todo_view_state() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -10015,6 +10422,40 @@ mod tests {
             .map(|span| span.content)
             .collect::<String>();
         assert!(!rendered.contains("awaiting permission"));
+    }
+
+    #[test]
+    fn security_prompts_close_noncritical_overlays() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.show_todos = true;
+        state.show_help = true;
+        let (permission_tx, _permission_rx) = std::sync::mpsc::sync_channel(1);
+        queue_permission_request(
+            &mut state,
+            "bash".to_string(),
+            serde_json::json!({"command": "pwd"}),
+            permission_tx,
+        );
+        assert!(!state.show_todos);
+        assert!(!state.show_help);
+
+        state.show_todos = true;
+        state.show_help = true;
+        let (auth_tx, _auth_rx) = std::sync::mpsc::sync_channel(1);
+        queue_local_auth_secret_request(
+            &mut state,
+            "git".to_string(),
+            "credential required".to_string(),
+            auth_tx,
+        );
+        assert!(!state.show_todos);
+        assert!(!state.show_help);
     }
 
     #[test]
@@ -10130,6 +10571,200 @@ mod tests {
             .collect::<String>();
         assert!(!rendered.contains("trust●"), "{rendered}");
         assert_eq!(input_border_style(&state).fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn agent_active_elapsed_formats_clock_scale_durations() {
+        assert_eq!(format_agent_active_elapsed(Duration::from_secs(7)), "7s");
+        assert_eq!(
+            format_agent_active_elapsed(Duration::from_secs(7 * 60 + 5)),
+            "7m 05s"
+        );
+        assert_eq!(
+            format_agent_active_elapsed(Duration::from_secs(3600 + 7 * 60 + 59)),
+            "1h 07m"
+        );
+    }
+
+    #[test]
+    fn agent_active_elapsed_pauses_while_idle_and_accumulates_busy_time() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let start = Instant::now();
+
+        assert_eq!(
+            agent_active_elapsed_at(&state, start + Duration::from_secs(30)),
+            Duration::ZERO
+        );
+        state.set_agent_busy_at(true, start + Duration::from_secs(30));
+        assert_eq!(
+            agent_active_elapsed_at(&state, start + Duration::from_secs(42)),
+            Duration::from_secs(12)
+        );
+        state.set_agent_busy_at(false, start + Duration::from_secs(42));
+        assert_eq!(
+            agent_active_elapsed_at(&state, start + Duration::from_secs(90)),
+            Duration::from_secs(12)
+        );
+        state.set_agent_busy_at(true, start + Duration::from_secs(90));
+        assert_eq!(
+            agent_active_elapsed_at(&state, start + Duration::from_secs(95)),
+            Duration::from_secs(17)
+        );
+    }
+
+    #[test]
+    fn status_bar_keeps_agent_active_clock_at_right_edge() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_active_elapsed = Duration::from_secs(3600 + 7 * 60);
+        state.agent_busy = true;
+
+        let lines = draw_to_lines(80, 20, &mut state);
+        let status = lines
+            .iter()
+            .find(|line| line.contains("1h 07m"))
+            .expect("status clock");
+        assert!(status.ends_with("1h 07m"), "{status:?}");
+        assert!(status.contains("test-model"), "{status:?}");
+    }
+
+    #[test]
+    fn status_bar_hides_active_clock_while_idle() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_active_elapsed = Duration::from_secs(12);
+
+        let lines = draw_to_lines(80, 20, &mut state);
+        assert!(lines.iter().all(|line| !line.ends_with("12s")), "{lines:?}");
+        assert_eq!(agent_active_elapsed_label(&state), None);
+    }
+
+    #[test]
+    fn live_todo_detail_renders_seven_cell_progress_battery() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.todo_progress = Some(TodoProgress {
+            total: 7,
+            completed: 3,
+            in_progress: 1,
+            active: Some("polish backend viewer".to_string()),
+        });
+
+        let text = transcript_live_indicator_text(&state, 100).expect("live indicator");
+        let lines = flatten_lines(&text);
+        assert!(lines[1].contains("Todos 3/7 ■■■□□□□"), "{lines:?}");
+        assert!(
+            lines[1].contains("Active: polish backend viewer"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn backend_viewer_matches_main_tui_and_styles_stream_lanes() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_active_elapsed = Duration::from_secs(3600 + 7 * 60);
+        state.agent_busy = true;
+        state.apply_event(AgentEvent::ToolCallStart {
+            call_id: "call_viewer".to_string(),
+            name: "bash".to_string(),
+            summary: "bash: cargo test --release".to_string(),
+        });
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_viewer".to_string(),
+            name: "bash".to_string(),
+            stream: "stdout".to_string(),
+            text: "tests passed\n".to_string(),
+        });
+        state.apply_event(AgentEvent::ToolOutputDelta {
+            call_id: "call_viewer".to_string(),
+            name: "bash".to_string(),
+            stream: "stderr".to_string(),
+            text: "warning\n".to_string(),
+        });
+
+        let lines = draw_backend_to_lines(100, 24, &mut state);
+        let joined = lines.join("\n");
+        for anchor in [
+            "dext · backend viewer",
+            "Active 1h 07m",
+            "bash: cargo test --release",
+            "output · #0.1 · running",
+            "stdout │ tests passed",
+            "stderr │ warning",
+            "Esc/q close",
+            "Tab/Shift+Tab switch command",
+        ] {
+            assert!(joined.contains(anchor), "missing {anchor:?}: {joined}");
+        }
+
+        let stdout = Text::from(backend_output_line("stdout │ ok"));
+        let stderr = Text::from(backend_output_line("stderr │ warning"));
+        assert_eq!(
+            span_style_for(&stdout, "stdout").unwrap().fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            span_style_for(&stderr, "stderr").unwrap().fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            span_style_for(&stderr, "warning").unwrap().fg,
+            Some(Color::LightRed)
+        );
+    }
+
+    #[test]
+    fn backend_viewer_renders_at_narrow_supported_width() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::ToolCallStart {
+            call_id: "call_narrow_viewer".to_string(),
+            name: "bash".to_string(),
+            summary: "bash: narrow output".to_string(),
+        });
+        let lines = draw_backend_to_lines(60, 12, &mut state);
+        assert_eq!(lines.len(), 12);
+        assert!(
+            lines.iter().any(|line| line.contains("backend viewer")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("output")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -10358,7 +10993,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_progress_surfaces_active_task_when_idle() {
+    fn todo_progress_surfaces_active_task_without_rolling_activity() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -10373,9 +11008,9 @@ mod tests {
 
         let text = transcript_live_indicator_text(&state, 80).expect("live indicator");
         let lines = flatten_lines(&text);
-        assert!(
-            lines[1].contains("[1/3 todos done · active: improve live indicator]"),
-            "{lines:?}"
+        assert_eq!(
+            lines[1],
+            "  ↳ Todos 1/3 ■■□□□□□ · Active: improve live indicator"
         );
     }
 
@@ -11802,6 +12437,74 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("+fn main() {}")));
         let added_style = span_style_for(&text, "+fn main() {}").expect("added line span");
         assert_eq!(added_style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn failed_long_tool_output_remains_expandable_after_flush_sync() {
+        let item = tool_line(
+            "#1.4f",
+            "multi_edit",
+            "multi_edit: src/tui.rs",
+            Some(false),
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+        );
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        sync_last_expandable(&mut state, std::slice::from_ref(&item));
+        assert!(
+            state
+                .last_expandable
+                .as_ref()
+                .is_some_and(|block| block.name == "multi_edit" && !block.expanded)
+        );
+        let lines = flatten_lines(&line_to_text(&item, 120));
+        assert!(
+            lines.iter().any(|line| line.contains("Ctrl+O")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn failed_edit_tool_explicitly_reports_atomic_noop() {
+        let item = tool_line(
+            "#1.4e",
+            "multi_edit",
+            "multi_edit: src/tui.rs",
+            Some(false),
+            "edit[1]: old_string not found",
+        );
+        let text = line_to_text(&item, 120);
+        let lines = flatten_lines(&text);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("edit[1]: old_string not found")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("no edits applied")),
+            "{lines:?}"
+        );
+        let style = span_style_for(&text, "no edits applied").expect("atomicity style");
+        assert_eq!(style.fg, Some(Color::Green));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+
+        let mut expanded = item;
+        if let Line_::Tool { expanded, .. } = &mut expanded {
+            *expanded = true;
+        }
+        let expanded_lines = flatten_lines(&line_to_text(&expanded, 120));
+        assert!(
+            expanded_lines
+                .iter()
+                .any(|line| line.contains("no edits applied")),
+            "{expanded_lines:?}"
+        );
     }
 
     #[test]
@@ -14647,6 +15350,20 @@ mod tests {
                 .height
                 <= 3
         );
+    }
+
+    #[test]
+    fn empty_composer_shows_full_placeholder_at_eighty_columns() {
+        let mut state = TuiState::new(
+            "gpt-5.4".to_string(),
+            model_context_window("gpt-5.4"),
+            "/home/fixture-user/Documents/Projects/Dext".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let lines = draw_to_lines(80, 24, &mut state);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Type a request…"), "{joined}");
     }
 
     #[test]
