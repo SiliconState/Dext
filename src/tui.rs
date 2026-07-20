@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, Write as IoWrite};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -2471,8 +2471,8 @@ fn todo_progress_battery(progress: &TodoProgress, max_cells: usize) -> (usize, u
     if progress.completed >= progress.total {
         return (cells, cells);
     }
-    let proportional =
-        (progress.completed.saturating_mul(cells) + progress.total / 2) / progress.total;
+    let proportional = ((progress.completed as u128 * cells as u128 + progress.total as u128 / 2)
+        / progress.total as u128) as usize;
     let filled = if cells > 1 {
         proportional.clamp(1, cells - 1)
     } else {
@@ -2482,7 +2482,8 @@ fn todo_progress_battery(progress: &TodoProgress, max_cells: usize) -> (usize, u
 }
 
 fn todo_progress_label(progress: &TodoProgress) -> String {
-    let active = match (progress.in_progress, progress.active.as_deref()) {
+    let active = progress.active.as_deref().map(single_line_display_text);
+    let active = match (progress.in_progress, active.as_deref()) {
         (0, _) => String::new(),
         (1, Some(text)) => format!(" · Active: {text}"),
         (n, Some(text)) => format!(" · Active ({n}): {text}"),
@@ -2661,11 +2662,14 @@ fn live_indicator_todo_detail(state: &TuiState, max_cells: usize) -> Option<Line
         ),
     ];
     if let Some(active) = progress.active.as_deref() {
+        let active = single_line_display_text(active);
         let suffix = if progress.in_progress > 1 {
             format!(" · Active ({}): {active}", progress.in_progress)
         } else {
             format!(" · Active: {active}")
         };
+        let suffix =
+            single_line_display_text(&sanitize_live_indicator_detail(&suffix, state.context_mode));
         let remaining = max_cells.saturating_sub(base_width);
         if remaining > 0 {
             spans.push(Span::styled(
@@ -3891,6 +3895,19 @@ fn sanitize_display_text(text: &str) -> String {
         }
     }
     out
+}
+
+fn single_line_display_text(text: &str) -> String {
+    sanitize_display_text(text)
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 /// A single base char plus any trailing zero-width continuation chars (VS16,
@@ -5621,16 +5638,7 @@ fn welcome_approval_value(profile: ApprovalProfile, auto_approved_count: usize) 
 }
 
 fn welcome_single_line(text: &str) -> String {
-    sanitize_display_text(text)
-        .chars()
-        .map(|ch| {
-            if matches!(ch, '\n' | '\r' | '\t') {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect()
+    single_line_display_text(text)
 }
 
 fn welcome_git(summary: Option<&str>) -> Option<WelcomeGit> {
@@ -5867,6 +5875,11 @@ fn push_welcome_banner_lines(lines: &mut Vec<Line<'static>>, banner: &WelcomeBan
         Style::default().fg(Color::DarkGray),
     ));
     lines.push(Line::from(""));
+}
+
+fn queue_welcome_banner(state: &mut TuiState, banner: WelcomeBanner) {
+    state.queue(Line_::Blank);
+    state.queue(Line_::Banner(banner));
 }
 
 fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
@@ -9692,11 +9705,6 @@ async fn run_backend_viewer(
     Ok(())
 }
 
-fn write_startup_gap(out: &mut impl IoWrite) -> io::Result<()> {
-    writeln!(out)?;
-    out.flush()
-}
-
 pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let model = agent.model.clone();
     let context_window_tokens = agent.context_window_tokens();
@@ -9711,9 +9719,8 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     );
     let initial_todos = initial_todo_items(&agent.sandbox_root, &agent.session_id);
     let auto_approved_count = agent.auto_approved_privileged_tool_count();
-    let mut stdout = io::stdout();
-    write_startup_gap(&mut stdout)?;
     let _guard = TerminalGuard::new()?;
+    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::with_options(
         backend,
@@ -9794,7 +9801,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         git_context.as_deref(),
         session_index,
     );
-    state.queue(Line_::Banner(banner));
+    queue_welcome_banner(&mut state, banner);
     if let Some(task) = initial_task {
         state.queue(Line_::User(task.clone()));
         let _ = in_tx.send(FromTui::Submit(task));
@@ -10186,15 +10193,6 @@ mod tests {
             home_tilde_with_home(r"C:\Users\Alice\repo", r"C:\Users\Alice\"),
             "~/repo"
         );
-    }
-
-    #[test]
-    fn startup_gap_is_one_blank_line_before_terminal_setup() {
-        let mut output = Vec::new();
-
-        write_startup_gap(&mut output).expect("startup gap");
-
-        assert_eq!(output, b"\n");
     }
 
     #[test]
@@ -11118,6 +11116,7 @@ mod tests {
             (20, 15, "■■■■■□□"),
             (20, 19, "■■■■■■□"),
             (20, 20, "■■■■■■■"),
+            (usize::MAX, usize::MAX - 1, "■■■■■■□"),
         ] {
             let progress = TodoProgress {
                 total,
@@ -11159,6 +11158,29 @@ mod tests {
             lines[1].contains("Active: polish backend viewer"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn live_todo_detail_sanitizes_active_task_to_one_line() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.todo_progress = Some(TodoProgress {
+            total: 3,
+            completed: 1,
+            in_progress: 1,
+            active: Some("polish\nspoofed\t\x1b[31mred".to_string()),
+        });
+
+        let text = transcript_live_indicator_text(&state, 100).expect("live indicator");
+        let lines = flatten_lines(&text);
+        assert_eq!(lines[1], "  ↳ Todos 1/3 ■□□ · Active: polish spoofed red");
+        assert!(!lines[1].contains(['\n', '\r', '\t', '\x1b']));
     }
 
     #[test]
@@ -14651,6 +14673,68 @@ mod tests {
         assert_eq!(area.width, 92);
         assert_eq!(area.height, VIEWPORT_HEIGHT);
         assert!(area.y > 0);
+    }
+
+    #[test]
+    fn startup_welcome_keeps_a_blank_row_after_cli_diagnostics() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Position;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let seed = std::iter::once(format!("{:<120}", "[approval] profile always (source CLI)"))
+            .chain(std::iter::once(format!(
+                "{:<120}",
+                "[sandbox] profile danger-full-access"
+            )))
+            .chain(std::iter::repeat_n(" ".repeat(120), 18))
+            .collect::<Vec<_>>();
+        let mut backend = TestBackend::with_lines(seed);
+        backend
+            .set_cursor_position(Position::new(0, 2))
+            .expect("diagnostic cursor");
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Always,
+            ThinkingEffort::Medium,
+        );
+        let banner = welcome_banner(
+            ".",
+            "test-model",
+            ThinkingEffort::Medium,
+            ApprovalProfile::Always,
+            0,
+            None,
+            0,
+        );
+
+        queue_welcome_banner(&mut state, banner);
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::Blank, Line_::Banner(_)]
+        ));
+        let size = terminal.size().expect("terminal size");
+        let width = transcript_pane_width(size.width, size.height, &state);
+        flush_pending_insert(&mut terminal, &mut state, width).expect("flush welcome");
+
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..120)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert_eq!(row(0).trim_end(), "[approval] profile always (source CLI)");
+        assert_eq!(row(1).trim_end(), "[sandbox] profile danger-full-access");
+        assert_eq!(row(2).trim(), "");
+        assert!(row(3).starts_with(" ◆ Dext  v"), "{}", row(3));
     }
 
     #[test]

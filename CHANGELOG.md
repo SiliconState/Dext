@@ -171,7 +171,7 @@
 - The main TUI status row now keeps a live cumulative agent-active elapsed
   clock at its right edge. It advances while Dext handles a turn, then pauses
   and hides while Dext waits idle for user input; the live todo fallback shows
-  completed/total progress as a seven-cell battery.
+  completed/total progress as an up-to-seven-cell battery.
 - The alternate-screen backend viewer now visually matches the main TUI with a
   Dext header, agent-active clock, command summary, styled stdout/stderr lanes,
   command position, and compact controls while preserving its existing event,
@@ -183,5 +183,6 @@
   also advertises `@ files` and `/ commands` beside its request prompt.
 - Todo progress batteries now track short lists one cell per task and scale
   proportionally up to a seven-cell cap for longer lists, while preserving
-  visibly incomplete progress. The inline welcome also starts after a blank
-  separator so CLI approval and sandbox diagnostics remain visually distinct.
+  visibly incomplete progress. The inline welcome now owns its blank transcript
+  separator so CLI approval and sandbox diagnostics remain visually distinct
+  through inline viewport placement and replay.
