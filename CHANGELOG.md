@@ -181,3 +181,7 @@
   drop the location segment, terminal-cell width drives alignment/truncation,
   and Git status probing no longer blocks the render loop. The empty composer
   also advertises `@ files` and `/ commands` beside its request prompt.
+- Todo progress batteries now track short lists one cell per task and scale
+  proportionally up to a seven-cell cap for longer lists, while preserving
+  visibly incomplete progress. The inline welcome also starts after a blank
+  separator so CLI approval and sandbox diagnostics remain visually distinct.

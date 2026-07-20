@@ -2463,11 +2463,22 @@ fn initial_todo_items(root: &std::path::Path, session_id: &str) -> Vec<TodoItem>
         .unwrap_or_default()
 }
 
-fn todo_progress_battery_cells(progress: &TodoProgress, cells: usize) -> usize {
-    if progress.total == 0 || cells == 0 {
-        return 0;
+fn todo_progress_battery(progress: &TodoProgress, max_cells: usize) -> (usize, usize) {
+    let cells = progress.total.min(max_cells);
+    if cells == 0 || progress.completed == 0 {
+        return (0, cells);
     }
-    (progress.completed.saturating_mul(cells) + progress.total / 2) / progress.total
+    if progress.completed >= progress.total {
+        return (cells, cells);
+    }
+    let proportional =
+        (progress.completed.saturating_mul(cells) + progress.total / 2) / progress.total;
+    let filled = if cells > 1 {
+        proportional.clamp(1, cells - 1)
+    } else {
+        proportional.min(cells)
+    };
+    (filled, cells)
 }
 
 fn todo_progress_label(progress: &TodoProgress) -> String {
@@ -2628,9 +2639,9 @@ fn live_thinking_detail_line(
 
 fn live_indicator_todo_detail(state: &TuiState, max_cells: usize) -> Option<Line<'static>> {
     let progress = state.todo_progress.as_ref()?;
-    let filled = todo_progress_battery_cells(progress, 7).min(7);
+    let (filled, cells) = todo_progress_battery(progress, 7);
     let label = format!("Todos {}/{} ", progress.completed, progress.total);
-    let base_width = text_width(&label).saturating_add(7);
+    let base_width = text_width(&label).saturating_add(cells);
     if base_width > max_cells {
         return Some(live_detail_line(
             todo_progress_label(progress),
@@ -2644,7 +2655,10 @@ fn live_indicator_todo_detail(state: &TuiState, max_cells: usize) -> Option<Line
         Span::styled("  ↳ ", Style::default().fg(Color::DarkGray)),
         Span::styled(label, Style::default().fg(Color::Green)),
         Span::styled("■".repeat(filled), Style::default().fg(Color::Green)),
-        Span::styled("□".repeat(7 - filled), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "□".repeat(cells.saturating_sub(filled)),
+            Style::default().fg(Color::DarkGray),
+        ),
     ];
     if let Some(active) = progress.active.as_deref() {
         let suffix = if progress.in_progress > 1 {
@@ -9678,6 +9692,11 @@ async fn run_backend_viewer(
     Ok(())
 }
 
+fn write_startup_gap(out: &mut impl IoWrite) -> io::Result<()> {
+    writeln!(out)?;
+    out.flush()
+}
+
 pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let model = agent.model.clone();
     let context_window_tokens = agent.context_window_tokens();
@@ -9692,8 +9711,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     );
     let initial_todos = initial_todo_items(&agent.sandbox_root, &agent.session_id);
     let auto_approved_count = agent.auto_approved_privileged_tool_count();
+    let mut stdout = io::stdout();
+    write_startup_gap(&mut stdout)?;
     let _guard = TerminalGuard::new()?;
-    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::with_options(
         backend,
@@ -10166,6 +10186,15 @@ mod tests {
             home_tilde_with_home(r"C:\Users\Alice\repo", r"C:\Users\Alice\"),
             "~/repo"
         );
+    }
+
+    #[test]
+    fn startup_gap_is_one_blank_line_before_terminal_setup() {
+        let mut output = Vec::new();
+
+        write_startup_gap(&mut output).expect("startup gap");
+
+        assert_eq!(output, b"\n");
     }
 
     #[test]
@@ -11080,7 +11109,34 @@ mod tests {
     }
 
     #[test]
-    fn live_todo_detail_renders_seven_cell_progress_battery() {
+    fn todo_progress_battery_tracks_short_lists_and_caps_long_lists() {
+        for (total, completed, expected) in [
+            (1, 0, "□"),
+            (4, 3, "■■■□"),
+            (8, 1, "■□□□□□□"),
+            (20, 1, "■□□□□□□"),
+            (20, 15, "■■■■■□□"),
+            (20, 19, "■■■■■■□"),
+            (20, 20, "■■■■■■■"),
+        ] {
+            let progress = TodoProgress {
+                total,
+                completed,
+                in_progress: 0,
+                active: None,
+            };
+            let (filled, cells) = todo_progress_battery(&progress, 7);
+            let rendered = format!(
+                "{}{}",
+                "■".repeat(filled),
+                "□".repeat(cells.saturating_sub(filled))
+            );
+            assert_eq!(rendered, expected, "{completed}/{total}");
+        }
+    }
+
+    #[test]
+    fn live_todo_detail_renders_capped_progress_battery() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -11434,7 +11490,7 @@ mod tests {
         let lines = flatten_lines(&text);
         assert_eq!(
             lines[1],
-            "  ↳ Todos 1/3 ■■□□□□□ · Active: improve live indicator"
+            "  ↳ Todos 1/3 ■□□ · Active: improve live indicator"
         );
     }
 
