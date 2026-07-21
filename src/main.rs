@@ -130,6 +130,7 @@ const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     "__pycache__",
 ];
 const MAX_STREAM_ATTEMPTS: u32 = 4;
+const MAX_INCOMPLETE_RESPONSE_RECOVERIES: u32 = 3;
 // Inner per-request HTTP retry budget (distinct from the outer stream-restart
 // budget MAX_STREAM_ATTEMPTS, even though they currently share the value).
 const MAX_HTTP_ATTEMPTS: u32 = 4;
@@ -254,6 +255,16 @@ fn stream_error_body(err: &anyhow::Error) -> String {
         "transient stream transport error: provider closed the chunked response early (unexpected EOF during chunk size line)".to_string()
     } else {
         body
+    }
+}
+
+fn chatgpt_incomplete_reason(contract: RequestContract, stop_reason: Option<&str>) -> Option<&str> {
+    if contract != RequestContract::ChatGptResponses {
+        return None;
+    }
+    match stop_reason? {
+        "incomplete" => Some("unknown"),
+        reason => reason.strip_prefix("incomplete:"),
     }
 }
 
@@ -1970,12 +1981,16 @@ impl EventSink for ConsoleSink {
                 }
             }
             AgentEvent::TextBlockComplete(full) => {
-                if self.pretty && !full.is_empty() {
-                    print!("\r\x1b[2K");
-                    let _ = io::stdout().flush();
-                    print!("{full}");
-                    if !full.ends_with('\n') {
-                        println!();
+                if self.pretty {
+                    if self.printed_prefix {
+                        print!("\r\x1b[2K");
+                        let _ = io::stdout().flush();
+                    }
+                    if !full.is_empty() {
+                        print!("{full}");
+                        if !full.ends_with('\n') {
+                            println!();
+                        }
                     }
                     self.printed_prefix = false;
                     self.printed_any_text_this_block = false;
@@ -2018,6 +2033,10 @@ impl EventSink for ConsoleSink {
             AgentEvent::RuntimeControl(s) => println!("{s}"),
             AgentEvent::RuntimeControlApplied { stream_aborted, .. } => {
                 if stream_aborted {
+                    if self.pretty && self.printed_prefix {
+                        print!("\r\x1b[2K");
+                        let _ = io::stdout().flush();
+                    }
                     self.printed_any_text_this_block = false;
                     self.printed_prefix = false;
                     self.text_accum.clear();
@@ -14697,6 +14716,30 @@ impl Agent {
         ))
     }
 
+    fn incomplete_response_retry_effort(
+        &self,
+        current: ThinkingEffort,
+    ) -> Option<(ThinkingEffort, String)> {
+        if self.request_contract() != RequestContract::ChatGptResponses {
+            return None;
+        }
+        let reduced = match current {
+            ThinkingEffort::Max | ThinkingEffort::XHigh | ThinkingEffort::High => {
+                ThinkingEffort::Medium
+            }
+            ThinkingEffort::Medium => ThinkingEffort::Low,
+            ThinkingEffort::Low | ThinkingEffort::Off => return None,
+        };
+        Some((
+            reduced,
+            format!(
+                "provider recovery: ChatGPT ended a response without producing an executable function call; reduced reasoning effort from {} to {} for the retry",
+                current.as_str(),
+                reduced.as_str()
+            ),
+        ))
+    }
+
     fn maybe_fallback_implementation_model(&mut self) -> Option<String> {
         if self.request_contract() != RequestContract::ChatGptResponses
             || !model_is_codex_implementation_model(&self.model)
@@ -16122,6 +16165,7 @@ impl Agent {
         items
     }
 
+    #[cfg(test)]
     fn build_streaming_request(
         &self,
         sys_stable: &str,
@@ -16130,8 +16174,27 @@ impl Agent {
         wire_tools: &[WireTool],
         chatgpt_session_id: &str,
     ) -> Result<(String, Vec<u8>)> {
+        self.build_streaming_request_with_effort(
+            sys_stable,
+            sys_env,
+            sys_blocks,
+            wire_tools,
+            chatgpt_session_id,
+            None,
+        )
+    }
+
+    fn build_streaming_request_with_effort(
+        &self,
+        sys_stable: &str,
+        sys_env: &str,
+        sys_blocks: &[SystemBlock<'_>],
+        wire_tools: &[WireTool],
+        chatgpt_session_id: &str,
+        effort_override: Option<ThinkingEffort>,
+    ) -> Result<(String, Vec<u8>)> {
         let contract = self.request_contract();
-        let effort = self.effective_thinking_effort();
+        let effort = effort_override.unwrap_or_else(|| self.effective_thinking_effort());
         let max_output_tokens = self.request_max_output_tokens();
         let url = provider_request_url(&self.base_url, contract);
         match contract {
@@ -17556,6 +17619,8 @@ impl Agent {
             compacted_this_turn = true;
         }
 
+        let mut incomplete_response_recoveries = 0u32;
+        let mut request_effort_override = None;
         loop {
             if let Some(msg) = self.budget_cap_denial() {
                 self.sink.emit(AgentEvent::Warn(msg.clone()));
@@ -17576,6 +17641,10 @@ impl Agent {
             }
             iterations += 1;
             let runtime_controls = apply_queued_runtime_controls(self);
+            if runtime_controls.changed_model || runtime_controls.changed_effort {
+                incomplete_response_recoveries = 0;
+                request_effort_override = None;
+            }
             if runtime_controls.aborted_stream {
                 continue;
             }
@@ -17606,12 +17675,13 @@ impl Agent {
             let mut context_overflow_compact_attempted = false;
             let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
-                let (url, req_body) = self.build_streaming_request(
+                let (url, req_body) = self.build_streaming_request_with_effort(
                     &sys_stable,
                     &sys_env,
                     &sys_blocks,
                     &wire_tools,
                     chatgpt_session_id.as_deref().unwrap_or("dext"),
+                    request_effort_override,
                 )?;
                 stream_attempt += 1;
                 let mut attempt: u32 = 0;
@@ -17813,7 +17883,15 @@ impl Agent {
                 }
                 match self.parse_stream_response(resp).await {
                     Ok(result) => {
-                        self.record_provider_success();
+                        if let Some(reason) =
+                            chatgpt_incomplete_reason(self.request_contract(), result.1.as_deref())
+                        {
+                            self.record_provider_stream_failure(&format!(
+                                "provider returned an incomplete response ({reason})"
+                            ));
+                        } else {
+                            self.record_provider_success();
+                        }
                         break 'stream_retry result;
                     }
                     Err(e)
@@ -17908,6 +17986,8 @@ impl Agent {
 
             if stop_reason.as_deref() == Some("runtime_control") {
                 self.partial_stream_text = None;
+                incomplete_response_recoveries = 0;
+                request_effort_override = None;
                 continue;
             }
 
@@ -17964,6 +18044,63 @@ impl Agent {
                     _ => None,
                 })
                 .collect();
+
+            let incomplete_reason =
+                chatgpt_incomplete_reason(self.request_contract(), stop_reason.as_deref());
+            if let Some(reason) = incomplete_reason
+                && tool_calls.is_empty()
+            {
+                last_retry_reason = Some(format!("incomplete response ({reason})"));
+                if reason == "content_filter" {
+                    let note = "[provider recovery halted] ChatGPT ended the response because of its content filter. No function call was executed; revise the request or switch models."
+                        .to_string();
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("incomplete_response_content_filter", &note);
+                    self.history.push(Message {
+                        role: "assistant".to_string(),
+                        content: vec![Block::Text { text: note }],
+                    });
+                    self.checkpoint_latest_session("after_incomplete_response_halt");
+                    break;
+                }
+                incomplete_response_recoveries = incomplete_response_recoveries.saturating_add(1);
+                if incomplete_response_recoveries > MAX_INCOMPLETE_RESPONSE_RECOVERIES {
+                    let note = format!(
+                        "[provider recovery halted] ChatGPT kept returning incomplete responses after {MAX_INCOMPLETE_RESPONSE_RECOVERIES} automatic recovery requests. The session remains usable; retry with `continue`, lower `/effort`, or switch models."
+                    );
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("incomplete_response_halt", &note);
+                    self.history.push(Message {
+                        role: "assistant".to_string(),
+                        content: vec![Block::Text { text: note }],
+                    });
+                    self.checkpoint_latest_session("after_incomplete_response_halt");
+                    break;
+                }
+                last_retry_reason = Some(format!("incomplete response ({reason})"));
+                let current_effort =
+                    request_effort_override.unwrap_or_else(|| self.effective_thinking_effort());
+                if let Some((reduced, note)) = self.incomplete_response_retry_effort(current_effort)
+                {
+                    request_effort_override = Some(reduced);
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("incomplete_response_mitigation", &note);
+                }
+                let note = format!(
+                    "[runtime-note] The provider ended the previous response as incomplete without producing an executable function call (recovery {incomplete_response_recoveries}/{MAX_INCOMPLETE_RESPONSE_RECOVERIES}). Continue from the existing history without repeating analysis. Make one concise next tool call or finish the answer; split large tool arguments into smaller calls."
+                );
+                self.sink.emit(AgentEvent::Warn(note.clone()));
+                self.append_latest_log("incomplete_response_recovery", &note);
+                self.history.push(Message {
+                    role: "user".to_string(),
+                    content: vec![Block::Text { text: note }],
+                });
+                self.checkpoint_latest_session("after_incomplete_response_recovery");
+                iterations = iterations.saturating_sub(1);
+                continue;
+            }
+            incomplete_response_recoveries = 0;
+            request_effort_override = None;
 
             let empty_call_count = tool_calls
                 .iter()

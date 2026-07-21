@@ -1792,6 +1792,9 @@ impl TuiState {
                     "assistant block complete · {} chars",
                     full.chars().count()
                 ));
+                if full.is_empty() && self.stream_chars > 0 {
+                    self.history_chars = self.history_chars.saturating_sub(self.stream_chars);
+                }
                 let rendered = self.pseudo_tool_display_text(&full);
                 if !rendered.is_empty() {
                     let dim_prefix = self.assistant_prefix_seen;
@@ -2120,6 +2123,7 @@ impl TuiState {
                     "runtime control applied · commands={commands} abort={stream_aborted}"
                 ));
                 if stream_aborted {
+                    self.history_chars = self.history_chars.saturating_sub(self.stream_chars);
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
                     self.stream_started_at = None;
@@ -12597,6 +12601,53 @@ mod tests {
                 .any(|line| line.starts_with("  ruct") || line.starts_with("  d ")),
             "thinking body should avoid mid-word wrap fragments like the reported UX issue: {lines:?}"
         );
+    }
+
+    #[test]
+    fn empty_text_completion_discards_live_preview_context_estimate() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.history_chars = 100;
+        state.apply_event(AgentEvent::TextDelta("discarded".to_string()));
+        assert_eq!(state.history_chars, 109);
+        assert_eq!(state.stream_chars, 9);
+
+        state.apply_event(AgentEvent::TextBlockComplete(String::new()));
+
+        assert_eq!(state.history_chars, 100);
+        assert_eq!(state.stream_chars, 0);
+        assert!(state.streaming_text.is_empty());
+        assert!(state.pending_insert.is_empty());
+    }
+
+    #[test]
+    fn runtime_control_abort_discards_live_preview_context_estimate() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.history_chars = 100;
+        state.apply_event(AgentEvent::TextDelta("discarded".to_string()));
+
+        state.apply_event(AgentEvent::RuntimeControlApplied {
+            commands: 1,
+            model_changed: false,
+            effort_changed: true,
+            stream_aborted: true,
+        });
+
+        assert_eq!(state.history_chars, 100);
+        assert_eq!(state.stream_chars, 0);
+        assert!(state.streaming_text.is_empty());
+        assert!(state.streaming_thinking.is_empty());
     }
 
     #[test]
