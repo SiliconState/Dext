@@ -1196,7 +1196,27 @@ fn parse_chatgpt_frame(
                 ));
             }
             if response_incomplete {
-                state.stop_reason = Some("incomplete".to_string());
+                let incomplete_reason = match response.get("incomplete_details") {
+                    None | Some(Value::Null) => None,
+                    Some(details) => {
+                        let details =
+                            object(contract, event, details, "response.incomplete_details")?;
+                        optional_string(
+                            contract,
+                            event,
+                            details.get("reason"),
+                            "response.incomplete_details.reason",
+                        )?
+                    }
+                };
+                state.stop_reason = Some(
+                    incomplete_reason
+                        .filter(|reason| !reason.trim().is_empty())
+                        .map(|reason| {
+                            format!("incomplete:{}", bounded_label(&reason.to_ascii_lowercase()))
+                        })
+                        .unwrap_or_else(|| "incomplete".to_string()),
+                );
             } else if let Some(status) = status {
                 state.stop_reason = Some(status);
             }
@@ -1205,8 +1225,12 @@ fn parse_chatgpt_frame(
                 state.usage = Usage::parse_openai(usage);
             }
             let mut terminal_function_items = BTreeSet::new();
-            if let Some(outputs) = response.get("output") {
-                for output in array(contract, event, outputs, "response.output")? {
+            let terminal_outputs = response
+                .get("output")
+                .map(|outputs| array(contract, event, outputs, "response.output"))
+                .transpose()?;
+            if !response_incomplete && let Some(outputs) = terminal_outputs {
+                for output in outputs {
                     let output = object(contract, event, output, "response output item")?;
                     let output_type = nonempty_string(
                         contract,
@@ -1279,19 +1303,8 @@ fn parse_chatgpt_frame(
                             "final function item was not announced by output_item.added",
                         ));
                     };
-                    if response_incomplete && !streamed.done {
-                        return Err(protocol_error(
-                            contract,
-                            event,
-                            "response did not complete; function calls were not accepted",
-                        ));
-                    }
-                    let identity_conflicts = if response_incomplete {
-                        streamed.id != call.id || streamed.name != call.name
-                    } else {
-                        (!streamed.id.is_empty() && streamed.id != call.id)
-                            || (!streamed.name.is_empty() && streamed.name != call.name)
-                    };
+                    let identity_conflicts = (!streamed.id.is_empty() && streamed.id != call.id)
+                        || (!streamed.name.is_empty() && streamed.name != call.name);
                     let arguments_conflict = if streamed.done {
                         streamed.arguments != call.arguments
                     } else {
@@ -1304,46 +1317,56 @@ fn parse_chatgpt_frame(
                             "final function item conflicts with streamed state",
                         ));
                     }
-                    if !response_incomplete {
-                        state.tool_calls.insert(item_id, call);
-                    }
+                    state.tool_calls.insert(item_id, call);
                 }
             }
-            if response_incomplete
-                && (state.tool_call_order.is_empty()
-                    || state.tool_call_order.iter().any(|item_id| {
-                        !state.tool_calls.get(item_id).is_some_and(|call| {
-                            call.done && !call.id.trim().is_empty() && !call.name.trim().is_empty()
-                        })
-                    }))
-            {
-                return Err(protocol_error(
-                    contract,
-                    event,
-                    "response did not complete; function calls were not accepted",
-                ));
-            }
             if response_incomplete {
-                if state.text_in_progress {
+                let discard_all_response_content =
+                    state.stop_reason.as_deref() == Some("incomplete:content_filter");
+                let accepted_function_items = state
+                    .tool_call_order
+                    .iter()
+                    .filter(|item_id| {
+                        !discard_all_response_content
+                            && state.tool_calls.get(*item_id).is_some_and(|call| {
+                                call.done
+                                    && !call.id.trim().is_empty()
+                                    && !call.name.trim().is_empty()
+                            })
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                state
+                    .tool_call_order
+                    .retain(|item_id| accepted_function_items.contains(item_id));
+                state
+                    .tool_calls
+                    .retain(|item_id, _| accepted_function_items.contains(item_id));
+                if state.text_in_progress
+                    || (discard_all_response_content && !state.text.is_empty())
+                {
                     state.text.clear();
                     state.text_in_progress = false;
                     updates.push(StreamUpdate::TextBlockComplete(String::new()));
                 }
-                if state.reasoning_in_progress {
+                if state.reasoning_in_progress
+                    || (discard_all_response_content && !state.reasoning.is_empty())
+                {
                     state.reasoning.clear();
                     state.reasoning_emitted.clear();
                     state.reasoning_in_progress = false;
                     updates.push(StreamUpdate::ThinkingBlockComplete(String::new()));
                 }
             }
-            // Some ChatGPT backends (observed with gpt-5.6 models) omit already
-            // finalized function items from the terminal output array; the
-            // streamed *.done events remain authoritative for those. Only an
-            // item that never finished anywhere is a protocol violation.
-            if state.tool_call_order.iter().any(|item_id| {
-                !terminal_function_items.contains(item_id)
-                    && !state.tool_calls.get(item_id).is_some_and(|call| call.done)
-            }) {
+            // Completed responses must reconcile every unfinished streamed call
+            // against the terminal output array. Incomplete responses instead
+            // keep only calls finalized by streamed *.done events above.
+            if !response_incomplete
+                && state.tool_call_order.iter().any(|item_id| {
+                    !terminal_function_items.contains(item_id)
+                        && !state.tool_calls.get(item_id).is_some_and(|call| call.done)
+                })
+            {
                 return Err(protocol_error(
                     contract,
                     event,
@@ -1856,10 +1879,14 @@ mod tests {
             ));
         }
 
+        // A function call truncated by an incomplete response is not executable,
+        // even if the terminal snapshot contains a syntactically complete-looking
+        // version. Discard it and let the agent issue a fresh request.
         let mut parser = ProviderStreamParser::new(contract, false);
         for data in [
             r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write_file"}}"#,
             r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\":\"README"}"#,
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write_file","arguments":"{\"path\":\"README.md\"}"}]}}"#,
         ] {
             parser
                 .push_frame(SseFrame {
@@ -1868,30 +1895,85 @@ mod tests {
                 })
                 .unwrap();
         }
-        let error = parser
+        let parsed = parser.finish().unwrap();
+        assert_eq!(parsed.stop_reason.as_deref(), Some("incomplete"));
+        assert!(parsed.blocks.is_empty(), "{:?}", parsed.blocks);
+
+        // The provider can also stop before producing any output item. This is
+        // a recoverable terminal response, not a malformed SSE stream.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        parser
             .push_frame(SseFrame {
                 event: None,
                 data: Some(
-                    r#"{"type":"response.incomplete","response":{"status":"incomplete","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write_file","arguments":"{\"path\":\"README.md\"}"}]}}"#
+                    r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}"#
                         .to_string(),
                 ),
             })
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("response did not complete"), "{error}");
+            .unwrap();
+        let parsed = parser.finish().unwrap();
+        assert_eq!(
+            parsed.stop_reason.as_deref(),
+            Some("incomplete:max_output_tokens")
+        );
+        assert!(parsed.blocks.is_empty());
 
         let mut parser = ProviderStreamParser::new(contract, false);
-        let error = parser
+        parser
             .push_frame(SseFrame {
                 event: None,
                 data: Some(
-                    r#"{"type":"response.incomplete","response":{"status":"incomplete","output":[]}}"#
+                    r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}"#
                         .to_string(),
                 ),
             })
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("response did not complete"), "{error}");
+            .unwrap();
+        let parsed = parser.finish().unwrap();
+        assert_eq!(
+            parsed.stop_reason.as_deref(),
+            Some("incomplete:content_filter")
+        );
+        assert!(parsed.blocks.is_empty());
+
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for data in [
+            r#"{"type":"response.output_text.delta","delta":"filtered draft"}"#,
+            r#"{"type":"response.output_text.done","text":"filtered draft"}"#,
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}"#,
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert_eq!(
+            parsed.stop_reason.as_deref(),
+            Some("incomplete:content_filter")
+        );
+        assert!(parsed.blocks.is_empty());
+
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for data in [
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write_file"}}"#,
+            r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"path\":\"README.md\"}"}"#,
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"write_file","arguments":"{\"path\":\"README.md\"}"}]}}"#,
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert_eq!(
+            parsed.stop_reason.as_deref(),
+            Some("incomplete:content_filter")
+        );
+        assert!(parsed.blocks.is_empty());
 
         let mut parser = ProviderStreamParser::new(contract, false);
         for data in [

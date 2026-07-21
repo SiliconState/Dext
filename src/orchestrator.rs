@@ -863,7 +863,6 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                         "documented",
                         "logged",
                         "recorded",
-                        "memory.md",
                         "recall.md",
                         "pending",
                         "follow-up",
@@ -1067,7 +1066,7 @@ fn commands_contain(commands: &[String], needles: &[&str]) -> bool {
 }
 
 fn is_decision_log_path(path: &str) -> bool {
-    path.ends_with("MEMORY.md") || path.ends_with("recall.md") || path.ends_with("DEXT.md")
+    path.ends_with("recall.md") || path.ends_with("DEXT.md")
 }
 
 fn adaptive_tool_cap_for_pressure(
@@ -1852,7 +1851,7 @@ mod tests {
                 content: vec![crate::Block::ToolUse {
                     id: "tool-log".to_string(),
                     name: "write_file".to_string(),
-                    input: json!({"path": "MEMORY.md", "content": "documented fix"}),
+                    input: json!({"path": "recall.md", "content": "documented fix"}),
                 }],
             },
             crate::Message {

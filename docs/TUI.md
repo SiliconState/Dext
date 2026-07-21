@@ -8,19 +8,28 @@ TUI and dependency changes must preserve these behaviors:
 
 - The main interface remains an inline viewport in the regular terminal buffer.
 - Completed transcript output remains in native terminal scrollback.
-- The settled banner, transcript, composer, status rows, expansion state, spacing, and styling do not change merely because dependencies changed.
+- The settled banner, transcript, composer, status rows, expansion state, spacing, and styling change only through explicit TUI work, never merely because dependencies changed.
+- The startup welcome stays in inline transcript scrollback, starts with one transcript-owned blank separator row below CLI diagnostics, and uses a compact four-zone layout: a Dext/version brand row, an adaptive working-directory and cached Git summary at 80 columns or wider, exactly two Model/Approval facts between rules, and one rotating tip drawn from verified TUI features. Width calculations and truncation use terminal cell width, and the Git probe runs off the render loop with only an 8 ms startup wait before falling back to path-only rendering.
+- The empty composer prompt is `❯ Type a request…   @ files · / commands`; typing, login, permission, paste-preview, and work-map behavior retain their existing paths.
+- The main status row shows the exact `main` branch label as `Main`, including `Main (dirty)` when the working tree is dirty, without renaming the branch or changing any other branch casing. It keeps a live cumulative agent-active elapsed clock at its right edge while Dext works; the clock pauses and hides while Dext is idle awaiting input.
 - Input and the viewport remain responsive while output streams and while the terminal is resized.
 - Resize replay is cohesive: no item-by-item reconstruction, whole-screen flash, cursor-query stall, or cursor-query timeout.
 - The backend viewer remains the only alternate-screen surface.
-- `Ctrl+L` opens a read-only todo modal in the inline UI; it never enters the alternate screen and remains available while the agent is busy.
+- `Ctrl+L` opens a read-only todo modal in the inline UI; it never enters the alternate screen and remains available during ordinary idle or busy work. Permission and local-auth prompts intentionally retain input and rendering priority.
 
 A dependency update that violates this contract is rejected even if it compiles and unit tests pass.
 
 ## Todo view
 
-Press `Ctrl+L` at any time to open the current session todo list. The modal loads the persisted session/project todo state at startup, refreshes after `todo_read` or `todo_write`, and supports arrow, Page Up/Down, Home/End, and mouse-wheel scrolling. Close it with `Ctrl+L`, `Esc`, or `q`.
+Press `Ctrl+L` during ordinary idle or busy work to open the current session todo list. Security-critical permission and local-auth prompts intentionally take priority and must be resolved or canceled first. The modal loads the persisted session/project todo state at startup, refreshes after `todo_read` or `todo_write`, and supports arrow, Page Up/Down, Home/End, and mouse-wheel scrolling. Close it with `Ctrl+L`, `Esc`, or `q`.
 
-The first version is intentionally read-only. Todo edits still use the existing `todo_write` path so validation, permission, checkpoint, and session-state behavior are not duplicated in the TUI. The modal is rendered inside the inline viewport; `Ctrl+B` and the backend viewer remain unchanged and are still the only alternate-screen path.
+The first version is intentionally read-only. Todo edits still use the existing `todo_write` path so validation, permission, checkpoint, and session-state behavior are not duplicated in the TUI. Empty-state parsing matches Dext's generated empty-list lines exactly, so ordinary todo text cannot clear the modal accidentally. When todo progress is the live-status fallback above the composer, its battery follows the list length up to seven cells: `Todos 3/4 ■■■□` uses one cell per task, while longer lists such as `Todos 15/20 ■■■■■□□` stay capped and proportional. Partial progress always retains at least one filled and one empty cell, and the active task remains visible when space allows. The modal is rendered inside the inline viewport; `Ctrl+B` and the backend viewer remain the only alternate-screen path.
+
+## Status and backend viewer
+
+The main status row reserves its right edge for a live cumulative agent-active clock while Dext is handling a turn. It advances during provider waits, tool calls, permission/auth waits, and in-turn compaction; while Dext is idle awaiting user input, the clock pauses and is hidden, then resumes on the next turn. It updates through the existing redraw cadence and uses compact `7s`, `7m 05s`, and `1h 07m` forms without adding a timer thread.
+
+`Ctrl+B` opens the existing alternate-screen backend viewer for captured `bash` output. It uses the same event stream, bounded ring buffer, command selection, scrolling, and permission/auth priority as before. The viewer visually matches the main TUI with a Dext header, agent-active clock, command summary, styled stdout/stderr lanes, output panel, command position, and compact key footer. Close it with `Ctrl+B`, `Esc`, or `q`; switch captured commands with Tab/Shift+Tab and scroll with arrows, Page Up/Down, Home/End, or the mouse wheel.
 
 ## Dependency stack
 

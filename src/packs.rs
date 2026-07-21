@@ -298,8 +298,9 @@ pub(crate) fn create_pack(root: &Path, selector: &str, project: bool) -> Result<
         dext_state_dir().join("shelves")
     };
     let pack_path = shelf_root.join(shelf).join("packs").join(name);
-    let pack_path = crate::session::canonicalize_tool_path(root, &pack_path.to_string_lossy())
-        .map_err(anyhow::Error::msg)?;
+    let pack_path =
+        crate::session::canonicalize_pack_scaffold_path(root, &pack_path.to_string_lossy())
+            .map_err(anyhow::Error::msg)?;
     if std::fs::symlink_metadata(&pack_path).is_ok() {
         anyhow::bail!("pack path already exists: {}", pack_path.display());
     }

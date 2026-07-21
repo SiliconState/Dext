@@ -71,19 +71,34 @@ fn canonicalize_with_missing_ancestors(path: &Path) -> std::result::Result<PathB
     }
 }
 
-fn dext_global_pack_path_allowed(path: &Path) -> bool {
+fn dext_global_pack_path_allowed(
+    path: &Path,
+    minimum_components: usize,
+    require_pack_marker: bool,
+) -> bool {
     let dext_home = dext_state_dir();
     let shelves = canonicalize_with_missing_ancestors(&dext_home.join("shelves"))
         .unwrap_or_else(|_| canonicalize_or_clone(&dext_home.join("shelves")));
-    let Ok(relative) = path.strip_prefix(shelves) else {
+    let Ok(relative) = path.strip_prefix(&shelves) else {
         return false;
     };
-    let mut components = relative.components();
-    matches!(components.next(), Some(std::path::Component::Normal(_)))
+    let components = relative.components().collect::<Vec<_>>();
+    let shape_matches = components.len() >= minimum_components
+        && matches!(components.first(), Some(std::path::Component::Normal(_)))
         && matches!(
-            components.next(),
-            Some(std::path::Component::Normal(component)) if component == "packs"
-        )
+            components.get(1),
+            Some(std::path::Component::Normal(component)) if *component == "packs"
+        );
+    if !shape_matches || !require_pack_marker {
+        return shape_matches;
+    }
+    let (Some(std::path::Component::Normal(shelf)), Some(std::path::Component::Normal(pack))) =
+        (components.first(), components.get(2))
+    else {
+        return false;
+    };
+    std::fs::symlink_metadata(shelves.join(shelf).join("packs").join(pack).join("PACK.md"))
+        .is_ok_and(|metadata| metadata.is_file())
 }
 
 pub(crate) fn canonicalize_read_tool_path(
@@ -100,9 +115,32 @@ pub(crate) fn canonicalize_read_tool_path(
     canonicalize_with_missing_ancestors(&candidate)
 }
 
-pub(crate) fn canonicalize_tool_path(
+pub(crate) fn canonicalize_pack_scaffold_path(
     root: &Path,
     user_path: &str,
+) -> std::result::Result<PathBuf, String> {
+    canonicalize_write_path(root, user_path, 3, false)
+}
+
+pub(crate) fn canonicalize_mutation_path(
+    root: &Path,
+    user_path: &str,
+) -> std::result::Result<PathBuf, String> {
+    canonicalize_write_path(root, user_path, 4, true)
+}
+
+pub(crate) fn canonicalize_mutation_parent_path(
+    root: &Path,
+    user_path: &str,
+) -> std::result::Result<PathBuf, String> {
+    canonicalize_write_path(root, user_path, 3, true)
+}
+
+fn canonicalize_write_path(
+    root: &Path,
+    user_path: &str,
+    minimum_pack_components: usize,
+    require_pack_marker: bool,
 ) -> std::result::Result<PathBuf, String> {
     let root = canonicalize_or_clone(root);
     let expanded = expand_user_path(user_path);
@@ -112,7 +150,9 @@ pub(crate) fn canonicalize_tool_path(
         root.join(expanded)
     };
     let canonical = canonicalize_with_missing_ancestors(&candidate)?;
-    if canonical.starts_with(&root) || dext_global_pack_path_allowed(&canonical) {
+    if canonical.starts_with(&root)
+        || dext_global_pack_path_allowed(&canonical, minimum_pack_components, require_pack_marker)
+    {
         Ok(canonical)
     } else {
         Err(format!(

@@ -131,7 +131,7 @@ When selected, Dext reads `PACK.md` as bounded invocation context and keeps the 
 
 ## Maintain
 
-Packs are ordinary files, so Dext maintains them with its normal read/edit/test tools and existing approval and sandbox policy. A practical loop is:
+Packs are ordinary files, so Dext maintains them with its normal read/edit/test tools and existing approval and sandbox policy. Outside the active project sandbox, the native mutation exception is limited to content inside a concrete user pack directory (`~/.dext/shelves/<shelf>/packs/<pack>/...`) containing a regular `PACK.md`; shelf manifests and loose files directly under `packs/` are not writable through that exception. Dext revalidates the destination and marker before atomic replacement. A practical loop is:
 
 1. Inspect the shelf manifest, `PACK.md`, helpers, and tests.
 2. State the behavior the pack should add.

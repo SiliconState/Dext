@@ -1,6 +1,5 @@
 mod git_checkpoints;
 mod list_render;
-mod memory_merge;
 mod mutation_preview;
 mod orchestrator;
 mod packs;
@@ -131,6 +130,7 @@ const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     "__pycache__",
 ];
 const MAX_STREAM_ATTEMPTS: u32 = 4;
+const MAX_INCOMPLETE_RESPONSE_RECOVERIES: u32 = 3;
 // Inner per-request HTTP retry budget (distinct from the outer stream-restart
 // budget MAX_STREAM_ATTEMPTS, even though they currently share the value).
 const MAX_HTTP_ATTEMPTS: u32 = 4;
@@ -255,6 +255,16 @@ fn stream_error_body(err: &anyhow::Error) -> String {
         "transient stream transport error: provider closed the chunked response early (unexpected EOF during chunk size line)".to_string()
     } else {
         body
+    }
+}
+
+fn chatgpt_incomplete_reason(contract: RequestContract, stop_reason: Option<&str>) -> Option<&str> {
+    if contract != RequestContract::ChatGptResponses {
+        return None;
+    }
+    match stop_reason? {
+        "incomplete" => Some("unknown"),
+        reason => reason.strip_prefix("incomplete:"),
     }
 }
 
@@ -1971,12 +1981,16 @@ impl EventSink for ConsoleSink {
                 }
             }
             AgentEvent::TextBlockComplete(full) => {
-                if self.pretty && !full.is_empty() {
-                    print!("\r\x1b[2K");
-                    let _ = io::stdout().flush();
-                    print!("{full}");
-                    if !full.ends_with('\n') {
-                        println!();
+                if self.pretty {
+                    if self.printed_prefix {
+                        print!("\r\x1b[2K");
+                        let _ = io::stdout().flush();
+                    }
+                    if !full.is_empty() {
+                        print!("{full}");
+                        if !full.ends_with('\n') {
+                            println!();
+                        }
                     }
                     self.printed_prefix = false;
                     self.printed_any_text_this_block = false;
@@ -2019,6 +2033,10 @@ impl EventSink for ConsoleSink {
             AgentEvent::RuntimeControl(s) => println!("{s}"),
             AgentEvent::RuntimeControlApplied { stream_aborted, .. } => {
                 if stream_aborted {
+                    if self.pretty && self.printed_prefix {
+                        print!("\r\x1b[2K");
+                        let _ = io::stdout().flush();
+                    }
                     self.printed_any_text_this_block = false;
                     self.printed_prefix = false;
                     self.text_accum.clear();
@@ -5799,14 +5817,43 @@ fn git_filter_drivers_from_output(
     Ok(drivers)
 }
 
-fn internal_git_filter_drivers(cwd: &Path) -> std::result::Result<Vec<String>, String> {
+fn internal_git_filter_drivers_with_timeout(
+    cwd: &Path,
+    timeout: std::time::Duration,
+) -> std::result::Result<Vec<String>, String> {
     let args = ["config", "--null", "--name-only", "--list"];
     let output = run_internal_command_limited(
         internal_git_command(cwd, &args, &[]),
         "git config --name-only --list",
-        internal_git_timeout(),
+        timeout,
     )?;
     git_filter_drivers_from_output(&output)
+}
+
+fn internal_git_filter_drivers(cwd: &Path) -> std::result::Result<Vec<String>, String> {
+    internal_git_filter_drivers_with_timeout(cwd, internal_git_timeout())
+}
+
+fn run_internal_git_command_with_timeout(
+    cwd: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> std::result::Result<InternalCommandOutput, String> {
+    let started = std::time::Instant::now();
+    let filter_drivers = internal_git_filter_drivers_with_timeout(cwd, timeout)?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(format!(
+            "git {} timed out while hardening filters",
+            args.join(" ")
+        ));
+    }
+    let label = format!("git {}", args.join(" "));
+    run_internal_command_limited(
+        internal_git_command(cwd, args, &filter_drivers),
+        &label,
+        remaining,
+    )
 }
 
 pub(crate) fn run_internal_git_command(
@@ -13820,17 +13867,45 @@ fn save_compact_threshold_percent_setting(percent: Option<u8>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn git_summary(root: &Path) -> Option<String> {
-    let branch_out = run_internal_git_command(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
-    if !branch_out.success() {
+fn parse_git_status_summary(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut lines = text.lines();
+    let branch_line = lines.next()?.strip_prefix("## ")?;
+    let branch = branch_line
+        .strip_prefix("No commits yet on ")
+        .or_else(|| branch_line.strip_prefix("Initial commit on "))
+        .unwrap_or(branch_line);
+    let branch = branch
+        .split_once("...")
+        .map_or(branch, |(branch, _)| branch)
+        .trim();
+    if branch.is_empty() {
         return None;
     }
-    let branch = String::from_utf8_lossy(&branch_out.stdout)
-        .trim()
-        .to_string();
-    let status_out = run_internal_git_command(root, &["status", "--porcelain"]).ok()?;
-    let dirty = !status_out.stdout.is_empty();
+    let dirty = lines.any(|line| !line.trim().is_empty());
     Some(format!("{branch}{}", if dirty { " (dirty)" } else { "" }))
+}
+
+fn git_summary_with_timeout(root: &Path, timeout: std::time::Duration) -> Option<String> {
+    let args = [
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "--branch",
+    ];
+    let output = run_internal_git_command_with_timeout(root, &args, timeout).ok()?;
+    if !output.success() {
+        return None;
+    }
+    parse_git_status_summary(&output.stdout)
+}
+
+pub(crate) fn git_summary(root: &Path) -> Option<String> {
+    git_summary_with_timeout(root, internal_git_timeout())
+}
+
+pub(crate) fn tui_git_summary(root: &Path) -> Option<String> {
+    git_summary_with_timeout(root, std::time::Duration::from_millis(250))
 }
 
 struct Agent {
@@ -13918,12 +13993,13 @@ struct Agent {
 
 impl Agent {
     fn new() -> Result<Self> {
-        Self::new_with_sandbox(None, true)
+        Self::new_with_sandbox(None, true, false)
     }
 
     pub(crate) fn new_with_sandbox(
         sandbox: Option<PathBuf>,
         session_enabled: bool,
+        defer_git_context: bool,
     ) -> Result<Self> {
         let resolved = resolve_runtime_provider(None, false)?;
         let provider_id = resolved.profile.id.clone();
@@ -14011,7 +14087,11 @@ impl Agent {
         };
 
         let pretty = io::stdout().is_terminal();
-        let git_context = git_summary(&sandbox_root);
+        let git_context = if defer_git_context {
+            None
+        } else {
+            git_summary(&sandbox_root)
+        };
         let tool_profile = ToolProfile::from_env();
         let budget_cap = BudgetCap::from_env();
         let tool_context_profile = ToolContextProfile::from_env().effective(context_mode);
@@ -14633,6 +14713,30 @@ impl Agent {
         Some(format!(
             "runtime model mitigation: {} implementation phase uses medium effort to favor concrete tool calls over analysis narration; keep xhigh for review/debug phases.",
             self.model
+        ))
+    }
+
+    fn incomplete_response_retry_effort(
+        &self,
+        current: ThinkingEffort,
+    ) -> Option<(ThinkingEffort, String)> {
+        if self.request_contract() != RequestContract::ChatGptResponses {
+            return None;
+        }
+        let reduced = match current {
+            ThinkingEffort::Max | ThinkingEffort::XHigh | ThinkingEffort::High => {
+                ThinkingEffort::Medium
+            }
+            ThinkingEffort::Medium => ThinkingEffort::Low,
+            ThinkingEffort::Low | ThinkingEffort::Off => return None,
+        };
+        Some((
+            reduced,
+            format!(
+                "provider recovery: ChatGPT ended a response without producing an executable function call; reduced reasoning effort from {} to {} for the retry",
+                current.as_str(),
+                reduced.as_str()
+            ),
         ))
     }
 
@@ -16061,6 +16165,7 @@ impl Agent {
         items
     }
 
+    #[cfg(test)]
     fn build_streaming_request(
         &self,
         sys_stable: &str,
@@ -16069,8 +16174,27 @@ impl Agent {
         wire_tools: &[WireTool],
         chatgpt_session_id: &str,
     ) -> Result<(String, Vec<u8>)> {
+        self.build_streaming_request_with_effort(
+            sys_stable,
+            sys_env,
+            sys_blocks,
+            wire_tools,
+            chatgpt_session_id,
+            None,
+        )
+    }
+
+    fn build_streaming_request_with_effort(
+        &self,
+        sys_stable: &str,
+        sys_env: &str,
+        sys_blocks: &[SystemBlock<'_>],
+        wire_tools: &[WireTool],
+        chatgpt_session_id: &str,
+        effort_override: Option<ThinkingEffort>,
+    ) -> Result<(String, Vec<u8>)> {
         let contract = self.request_contract();
-        let effort = self.effective_thinking_effort();
+        let effort = effort_override.unwrap_or_else(|| self.effective_thinking_effort());
         let max_output_tokens = self.request_max_output_tokens();
         let url = provider_request_url(&self.base_url, contract);
         match contract {
@@ -17495,6 +17619,8 @@ impl Agent {
             compacted_this_turn = true;
         }
 
+        let mut incomplete_response_recoveries = 0u32;
+        let mut request_effort_override = None;
         loop {
             if let Some(msg) = self.budget_cap_denial() {
                 self.sink.emit(AgentEvent::Warn(msg.clone()));
@@ -17515,6 +17641,10 @@ impl Agent {
             }
             iterations += 1;
             let runtime_controls = apply_queued_runtime_controls(self);
+            if runtime_controls.changed_model || runtime_controls.changed_effort {
+                incomplete_response_recoveries = 0;
+                request_effort_override = None;
+            }
             if runtime_controls.aborted_stream {
                 continue;
             }
@@ -17545,12 +17675,13 @@ impl Agent {
             let mut context_overflow_compact_attempted = false;
             let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
-                let (url, req_body) = self.build_streaming_request(
+                let (url, req_body) = self.build_streaming_request_with_effort(
                     &sys_stable,
                     &sys_env,
                     &sys_blocks,
                     &wire_tools,
                     chatgpt_session_id.as_deref().unwrap_or("dext"),
+                    request_effort_override,
                 )?;
                 stream_attempt += 1;
                 let mut attempt: u32 = 0;
@@ -17752,7 +17883,15 @@ impl Agent {
                 }
                 match self.parse_stream_response(resp).await {
                     Ok(result) => {
-                        self.record_provider_success();
+                        if let Some(reason) =
+                            chatgpt_incomplete_reason(self.request_contract(), result.1.as_deref())
+                        {
+                            self.record_provider_stream_failure(&format!(
+                                "provider returned an incomplete response ({reason})"
+                            ));
+                        } else {
+                            self.record_provider_success();
+                        }
                         break 'stream_retry result;
                     }
                     Err(e)
@@ -17847,6 +17986,8 @@ impl Agent {
 
             if stop_reason.as_deref() == Some("runtime_control") {
                 self.partial_stream_text = None;
+                incomplete_response_recoveries = 0;
+                request_effort_override = None;
                 continue;
             }
 
@@ -17903,6 +18044,63 @@ impl Agent {
                     _ => None,
                 })
                 .collect();
+
+            let incomplete_reason =
+                chatgpt_incomplete_reason(self.request_contract(), stop_reason.as_deref());
+            if let Some(reason) = incomplete_reason
+                && tool_calls.is_empty()
+            {
+                last_retry_reason = Some(format!("incomplete response ({reason})"));
+                if reason == "content_filter" {
+                    let note = "[provider recovery halted] ChatGPT ended the response because of its content filter. No function call was executed; revise the request or switch models."
+                        .to_string();
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("incomplete_response_content_filter", &note);
+                    self.history.push(Message {
+                        role: "assistant".to_string(),
+                        content: vec![Block::Text { text: note }],
+                    });
+                    self.checkpoint_latest_session("after_incomplete_response_halt");
+                    break;
+                }
+                incomplete_response_recoveries = incomplete_response_recoveries.saturating_add(1);
+                if incomplete_response_recoveries > MAX_INCOMPLETE_RESPONSE_RECOVERIES {
+                    let note = format!(
+                        "[provider recovery halted] ChatGPT kept returning incomplete responses after {MAX_INCOMPLETE_RESPONSE_RECOVERIES} automatic recovery requests. The session remains usable; retry with `continue`, lower `/effort`, or switch models."
+                    );
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("incomplete_response_halt", &note);
+                    self.history.push(Message {
+                        role: "assistant".to_string(),
+                        content: vec![Block::Text { text: note }],
+                    });
+                    self.checkpoint_latest_session("after_incomplete_response_halt");
+                    break;
+                }
+                last_retry_reason = Some(format!("incomplete response ({reason})"));
+                let current_effort =
+                    request_effort_override.unwrap_or_else(|| self.effective_thinking_effort());
+                if let Some((reduced, note)) = self.incomplete_response_retry_effort(current_effort)
+                {
+                    request_effort_override = Some(reduced);
+                    self.sink.emit(AgentEvent::Warn(note.clone()));
+                    self.append_latest_log("incomplete_response_mitigation", &note);
+                }
+                let note = format!(
+                    "[runtime-note] The provider ended the previous response as incomplete without producing an executable function call (recovery {incomplete_response_recoveries}/{MAX_INCOMPLETE_RESPONSE_RECOVERIES}). Continue from the existing history without repeating analysis. Make one concise next tool call or finish the answer; split large tool arguments into smaller calls."
+                );
+                self.sink.emit(AgentEvent::Warn(note.clone()));
+                self.append_latest_log("incomplete_response_recovery", &note);
+                self.history.push(Message {
+                    role: "user".to_string(),
+                    content: vec![Block::Text { text: note }],
+                });
+                self.checkpoint_latest_session("after_incomplete_response_recovery");
+                iterations = iterations.saturating_sub(1);
+                continue;
+            }
+            incomplete_response_recoveries = 0;
+            request_effort_override = None;
 
             let empty_call_count = tool_calls
                 .iter()
@@ -20410,182 +20608,6 @@ fn handle_undo_cli(args: &[String], root: &Path) -> i32 {
         }
     }
     0
-}
-
-fn handle_memory_cli(args: &[String], root: &Path) -> i32 {
-    let sub = args.first().map(String::as_str).unwrap_or("check");
-    match sub {
-        "check" => {
-            match memory_merge::check(root) {
-                Ok(status) => {
-                    println!(
-                        "memory merge: {}",
-                        if status.memory_registered {
-                            "registered"
-                        } else {
-                            "not registered"
-                        }
-                    );
-                    println!(
-                        "recall merge: {}",
-                        if status.recall_registered {
-                            "registered"
-                        } else {
-                            "not registered"
-                        }
-                    );
-                    println!(
-                        "local attributes: {}",
-                        if status.gitattributes_local {
-                            "yes"
-                        } else {
-                            "no"
-                        }
-                    );
-                    println!(
-                        "versioned attributes: {}",
-                        if status.gitattributes_versioned {
-                            "yes"
-                        } else {
-                            "no"
-                        }
-                    );
-                    if !status.memory_registered {
-                        eprintln!("run 'dext memory register' to enable section-aware merging");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return 1;
-                }
-            }
-            0
-        }
-        "register" => {
-            let versioned = args.iter().any(|a| a == "--versioned-attributes");
-            let modes = if args.iter().any(|a| a == "--recall") {
-                vec![memory_merge::RegisterMode::Recall]
-            } else if args.iter().any(|a| a == "--memory") {
-                vec![memory_merge::RegisterMode::Memory]
-            } else {
-                vec![
-                    memory_merge::RegisterMode::Memory,
-                    memory_merge::RegisterMode::Recall,
-                ]
-            };
-            for mode in modes {
-                if let Err(e) = memory_merge::register(root, mode, versioned) {
-                    eprintln!("error: {e}");
-                    return 1;
-                }
-            }
-            println!("registered memory merge driver(s)");
-            0
-        }
-        "unregister" => {
-            if let Err(e) = memory_merge::unregister(root) {
-                eprintln!("error: {e}");
-                return 1;
-            }
-            println!("unregistered memory merge drivers");
-            0
-        }
-        "merge" => {
-            let is_recall = args.iter().any(|a| a == "--recall");
-            // Git merge driver protocol: %O %A %B %L %P
-            // %O=base %A=ours %B=theirs %L=marker-size %P=path
-            let positional: Vec<&String> = args
-                .iter()
-                .skip(1)
-                .filter(|a| !a.starts_with('-'))
-                .collect();
-            if positional.len() < 3 {
-                eprintln!(
-                    "usage: dext memory merge [--recall] <base> <ours> <theirs> [marker-size] [path]"
-                );
-                return 2;
-            }
-            let base_content = std::fs::read_to_string(positional[0]).unwrap_or_default();
-            let ours_content = std::fs::read_to_string(positional[1]).unwrap_or_default();
-            let theirs_content = std::fs::read_to_string(positional[2]).unwrap_or_default();
-
-            let outcome = if is_recall {
-                memory_merge::merge_recall(&base_content, &ours_content, &theirs_content)
-            } else {
-                memory_merge::merge_memory(&base_content, &ours_content, &theirs_content)
-            };
-
-            // Write result to ours file (Git merge driver protocol)
-            if let Err(e) = std::fs::write(positional[1], &outcome.content) {
-                eprintln!("error writing merge result: {e}");
-                return 1;
-            }
-            for w in &outcome.warnings {
-                eprintln!("warning: {w}");
-            }
-            if outcome.clean { 0 } else { 1 }
-        }
-        "distill" => {
-            let memory_path = root.join("MEMORY.md");
-            let recall_path = root.join("recall.md");
-            let recall = match std::fs::read_to_string(&recall_path) {
-                Ok(text) => text,
-                Err(e) => {
-                    eprintln!("error reading {}: {e}", recall_path.display());
-                    return 1;
-                }
-            };
-            let memory = std::fs::read_to_string(&memory_path).unwrap_or_default();
-            let distill = memory_merge::distill_recall(&memory, &recall);
-
-            println!(
-                "recall.md: {} bullet(s) -> {} after dedupe ({} exact duplicate(s) removed)",
-                distill.original_bullets,
-                distill.kept_bullets,
-                distill.removed_duplicates.len()
-            );
-            for dup in &distill.removed_duplicates {
-                println!("  - duplicate: {dup}");
-            }
-            if !distill.near_duplicates.is_empty() {
-                println!("near-duplicate bullets (kept; review manually):");
-                for item in &distill.near_duplicates {
-                    println!("  ~ {item}");
-                }
-            }
-            if !distill.unbacked.is_empty() {
-                println!(
-                    "bullets not reflected in MEMORY.md (possibly stale, or promote to MEMORY.md):"
-                );
-                for item in &distill.unbacked {
-                    println!("  ? {item}");
-                }
-            }
-
-            let apply = args.iter().any(|a| a == "--apply");
-            if apply {
-                if distill.content == recall {
-                    println!("recall.md already distilled; nothing to write");
-                } else if let Err(e) =
-                    crate::session::atomic_write_bytes(&recall_path, distill.content.as_bytes())
-                {
-                    eprintln!("error writing {}: {e}", recall_path.display());
-                    return 1;
-                } else {
-                    println!("applied: rewrote {}", recall_path.display());
-                }
-            } else if distill.content != recall {
-                println!("\n(dry run; re-run with --apply to rewrite recall.md)");
-            } else {
-                println!("\nrecall.md already distilled; no changes needed");
-            }
-            0
-        }
-        _ => {
-            eprintln!("usage: dext memory [check|register|unregister|merge|distill]");
-            2
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24568,15 +24590,6 @@ async fn main() -> Result<()> {
         release_registered_locks();
         std::process::exit(code);
     }
-    if argv.first().is_some_and(|a| a == "memory") {
-        let root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from("."));
-        let code = handle_memory_cli(&argv[1..], &root);
-        release_registered_locks();
-        std::process::exit(code);
-    }
     if argv.first().is_some_and(|a| a == "doctor") {
         let root = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -24644,10 +24657,6 @@ async fn main() -> Result<()> {
         println!("       dext undo --list      list recent Dext checkpoints");
         println!("       dext undo --preview <id>  non-interactive preview");
         println!("       dext undo --apply <id>   non-interactive apply");
-        println!("       dext memory check    check memory merge registration");
-        println!("       dext memory register register merge drivers (local)");
-        println!("       dext memory distill [--apply]  dedupe recall.md, flag stale bullets");
-        println!("       dext memory merge [--recall] <base> <ours> <theirs>");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
             "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
@@ -24681,7 +24690,17 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut agent = Agent::new_with_sandbox(opts.cd.clone(), !opts.no_session && !opts.fork)?;
+    let will_use_tui = opts.pack.is_none()
+        && !opts.print
+        && !opts.no_tui
+        && !opts.output.is_json()
+        && std::env::var("DEXT_NO_TUI").is_err()
+        && io::stdout().is_terminal();
+    let mut agent = Agent::new_with_sandbox(
+        opts.cd.clone(),
+        !opts.no_session && !opts.fork,
+        will_use_tui,
+    )?;
     agent.prewarm_connection();
     if let Some(profile) = std::env::var("DEXT_SANDBOX_PROFILE")
         .ok()
@@ -24824,12 +24843,7 @@ async fn main() -> Result<()> {
         };
     }
 
-    let use_tui = !opts.no_tui
-        && !opts.output.is_json()
-        && std::env::var("DEXT_NO_TUI").is_err()
-        && io::stdout().is_terminal();
-
-    if use_tui && !opts.print {
+    if will_use_tui {
         let result = tui::run(agent, one_shot_task).await;
         release_registered_locks();
         return result;

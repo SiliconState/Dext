@@ -1,4 +1,4 @@
-use crate::session::canonicalize_tool_path;
+use crate::session::{canonicalize_mutation_parent_path, canonicalize_mutation_path};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -126,7 +126,7 @@ pub(crate) fn prepare_write_file(
     path_str: &str,
     content: &str,
 ) -> Result<PreparedMutation, String> {
-    let path = canonicalize_tool_path(root, path_str)?;
+    let path = canonicalize_mutation_path(root, path_str)?;
     let (expected, before) = capture_expected(&path)?;
     Ok(PreparedMutation {
         requested_path: path_str.to_string(),
@@ -143,7 +143,7 @@ pub(crate) fn prepare_edit_file(
     old: &str,
     new: &str,
 ) -> Result<PreparedMutation, String> {
-    let path = canonicalize_tool_path(root, path_str)?;
+    let path = canonicalize_mutation_path(root, path_str)?;
     let (expected, before) = capture_expected(&path)?;
     if matches!(expected, ExpectedFile::Missing) {
         return Err(format!("failed to read {}: file not found", path.display()));
@@ -172,7 +172,7 @@ pub(crate) fn prepare_multi_edit(
     path_str: &str,
     edits: &[MultiEdit],
 ) -> Result<PreparedMutation, String> {
-    let path = canonicalize_tool_path(root, path_str)?;
+    let path = canonicalize_mutation_path(root, path_str)?;
     let (expected, before) = capture_expected(&path)?;
     if matches!(expected, ExpectedFile::Missing) {
         return Err(format!("failed to read {}: file not found", path.display()));
@@ -330,16 +330,16 @@ fn ensure_parent_directories(
                         ),
                     ));
                 }
-                let resolved =
-                    canonicalize_tool_path(root, &cursor.to_string_lossy()).map_err(|error| {
-                        stale_error(
-                            prepared,
-                            &format!(
-                                "parent component no longer resolves safely ({}): {error}",
-                                cursor.display()
-                            ),
-                        )
-                    })?;
+                let resolved = canonicalize_mutation_parent_path(root, &cursor.to_string_lossy())
+                    .map_err(|error| {
+                    stale_error(
+                        prepared,
+                        &format!(
+                            "parent component no longer resolves safely ({}): {error}",
+                            cursor.display()
+                        ),
+                    )
+                })?;
                 if resolved != cursor {
                     return Err(stale_error(
                         prepared,
@@ -406,8 +406,8 @@ fn ensure_parent_directories(
                 ),
             ));
         }
-        let resolved =
-            canonicalize_tool_path(root, &current.to_string_lossy()).map_err(|error| {
+        let resolved = canonicalize_mutation_parent_path(root, &current.to_string_lossy())
+            .map_err(|error| {
                 stale_error(
                     prepared,
                     &format!(
@@ -427,7 +427,7 @@ fn ensure_parent_directories(
 }
 
 fn validate_destination(root: &Path, prepared: &PreparedMutation) -> Result<(), String> {
-    let resolved = canonicalize_tool_path(root, &prepared.requested_path).map_err(|error| {
+    let resolved = canonicalize_mutation_path(root, &prepared.requested_path).map_err(|error| {
         stale_error(
             prepared,
             &format!("the destination path no longer resolves safely: {error}"),

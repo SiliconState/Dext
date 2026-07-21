@@ -32,15 +32,15 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Capped in-memory previews for `write_file`, `edit_file`, and `multi_edit`.
   - Sandbox-contained path resolution for previewed mutations.
 
-- `src/memory_merge.rs`
-  - Optional, explicit Git merge helpers for `MEMORY.md` and `recall.md`.
-  - Explicit local Git merge-driver check/register/unregister support.
+- `src/sandbox.rs`
+  - Linux Landlock and macOS Seatbelt command construction.
+  - Profile-specific write roots, private scratch directories, and offline diagnostic confinement.
 
 - `src/provider.rs`
   - Provider profile/catalog loading, normalization, and bounded side-effect-free catalog/auth inspection.
   - Connect, first-byte, stream/body-idle, and non-stream body-size limits for provider transport.
   - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, Kimi Code, DeepSeek, and local OpenAI-compatible profiles.
-  - live llama.cpp runtime context probing for the local provider; arbitrary server model aliases are supported without model-specific built-in context values.
+  - Live llama.cpp runtime context probing for the local provider; unavailable local servers fall back cleanly without aborting startup.
   - API-key and OAuth login flows.
   - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs.
   - Model alias normalization and provider/model switching helpers.
@@ -159,9 +159,9 @@ Durable sessions use a small owner-private `tool-journal.json` beside the active
 
 `dext doctor` is an observational diagnostics path. It reuses the startup approval resolver and bounded state inspectors, reports effective policy/source separately from sandbox kernel enforcement, and inspects only active/latest provider, auth, session, todo, settings, journal, and checkpoint state. It does not repair files, resolve credential references, or contact provider endpoints.
 
-## Git recovery and optional context-file merge helpers
+## Git recovery and mutation previews
 
-Dext's Git-native recovery features are local runtime helpers, not
+Recovery checkpoints and mutation previews are local runtime helpers, not
 provider-visible tools:
 
 - Before approved write-risk tool calls, Dext can create a checkpoint under
@@ -176,14 +176,8 @@ provider-visible tools:
 - Mutation previews render capped in-memory diffs for `write_file`, `edit_file`,
   and `multi_edit` before permission approval. The current `git` preview mode
   falls back to simple previews.
-- Memory merge registration is explicit through `dext memory check/register`.
-  It is local-only by default and targets optional `MEMORY.md` plus `recall.md`.
-  `DEXT.md` and present `recall.md` files are prompt inputs; `MEMORY.md` is never
-  auto-injected and is read only by explicit `dext memory` commands.
 
-These helpers no-op outside Git repositories and preserve Dext's lean tool
-surface: the model still sees the regular filesystem/Git tools, not extra
-recovery tools.
+Checkpoint helpers no-op outside Git repositories. Recovery and preview behavior preserve Dext's lean tool surface: the model still sees the regular filesystem/Git tools, not extra recovery tools.
 
 ## Context modes
 
@@ -197,12 +191,15 @@ Compaction preserves recent tool evidence and summarizes older conversation when
 
 ## Verification surface
 
+Expected release assets also include a CycloneDX JSON SBOM. The release workflow includes the SBOM in `SHA256SUMS`, provenance attestation, verification, and publication alongside the four platform archives. The first successful tag run remains explicitly tracked in [`RELEASING.md`](RELEASING.md) until this path has end-to-end evidence.
+
 Expected checks before releasing Dext changes:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
+cargo deny check licenses
 cargo test -p ratatui-core --lib --locked
 cargo bench --no-run --locked
 cargo build --release --locked

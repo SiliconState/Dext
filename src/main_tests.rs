@@ -7,8 +7,8 @@ use crate::provider::{
     resolve_provider_model_selection,
 };
 use crate::session::{
-    append_log_line, canonicalize_read_tool_path, canonicalize_tool_path, cap_latest_log_buffer,
-    latest_log_path, render_limited_lines, validate_session_name,
+    append_log_line, canonicalize_mutation_path, canonicalize_read_tool_path,
+    cap_latest_log_buffer, latest_log_path, render_limited_lines, validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
@@ -26,6 +26,14 @@ fn restore_env_var(name: &str, old_value: Option<std::ffi::OsString>) {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
         }
+    }
+}
+
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -250,12 +258,26 @@ fn drain_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Ve
     events
 }
 
+fn git_test_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(root);
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn git_ok(root: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .expect("run git");
+    let output = git_test_command(root).args(args).output().expect("run git");
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -264,13 +286,29 @@ fn git_ok(root: &Path, args: &[&str]) {
     );
 }
 
+#[test]
+fn git_status_summary_parses_branch_tracking_and_dirty_state() {
+    assert_eq!(
+        parse_git_status_summary(b"## main...origin/main [ahead 2]\n"),
+        Some("main".to_string())
+    );
+    assert_eq!(
+        parse_git_status_summary(b"## feature/welcome...origin/feature/welcome\n M src/tui.rs\n"),
+        Some("feature/welcome (dirty)".to_string())
+    );
+    assert_eq!(
+        parse_git_status_summary(b"## No commits yet on main\n?? README.md\n"),
+        Some("main (dirty)".to_string())
+    );
+    assert_eq!(
+        parse_git_status_summary(b"fatal: not a git repository\n"),
+        None
+    );
+}
+
 #[cfg(unix)]
 fn git_stdout(root: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .expect("run git");
+    let output = git_test_command(root).args(args).output().expect("run git");
     assert!(
         output.status.success(),
         "git {:?} failed: {}",
@@ -380,7 +418,7 @@ fn checkpoint_worktree_restore_preserves_newer_index_state() {
         std::fs::read_to_string(root.join("tracked.txt")).expect("read restored worktree"),
         "checkpoint-state\n"
     );
-    let index = Command::new("git")
+    let index = git_test_command(&root)
         .args(["show", ":tracked.txt"])
         .current_dir(&root)
         .output()
@@ -431,7 +469,7 @@ fn checkpoint_rejects_symlinked_storage_root() {
     };
     assert!(error.contains("not a real directory"), "{error}");
     assert!(!outside.join("checkpoints").exists());
-    let refs = Command::new("git")
+    let refs = git_test_command(&root)
         .args([
             "for-each-ref",
             "--format=%(refname)",
@@ -820,6 +858,18 @@ fn internal_checkpoint_git_never_executes_repository_configured_helpers() -> Res
 
     let result = (|| -> Result<()> {
         std::fs::write(root.join("tracked.txt"), "checkpoint-state\n")?;
+        let summary = tui_git_summary(&root);
+        assert!(
+            summary
+                .as_deref()
+                .is_some_and(|summary| summary.ends_with(" (dirty)")),
+            "unexpected TUI Git summary: {summary:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "TUI Git summary executed a repository-configured helper: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
         let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow::anyhow!("dirty repository must create a checkpoint"))?;
@@ -943,7 +993,7 @@ fn checkpoint_creation_enforces_retention_ceiling() {
     let checkpoints =
         git_checkpoints::list_checkpoints(&root, usize::MAX).expect("list checkpoints");
     assert_eq!(checkpoints.len(), 20, "checkpoint retention ceiling");
-    let refs = Command::new("git")
+    let refs = git_test_command(&root)
         .args([
             "for-each-ref",
             "--format=%(refname)",
@@ -996,7 +1046,7 @@ fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
 
     assert!(!orphan_sidecar.exists(), "orphan sidecar should be removed");
     assert!(
-        Command::new("git")
+        git_test_command(&root)
             .args(["show-ref", "--verify", "--quiet", orphan])
             .current_dir(&root)
             .status()
@@ -1004,7 +1054,7 @@ fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
         "orphan checkpoint ref should be removed"
     );
     assert!(
-        Command::new("git")
+        git_test_command(&root)
             .args(["show-ref", "--verify", "--quiet", sibling])
             .current_dir(&root)
             .status()
@@ -1012,7 +1062,7 @@ fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
         "manual prune must preserve sibling ref namespaces"
     );
     assert!(
-        Command::new("git")
+        git_test_command(&root)
             .args(["show-ref", "--verify", "--quiet", &checkpoint.ref_name])
             .current_dir(&root)
             .status()
@@ -1079,7 +1129,7 @@ fn checkpoint_ref_creation_never_overwrites_an_existing_ref() {
     git_ok(&root, &["add", "tracked.txt"]);
     git_ok(&root, &["commit", "-q", "-m", "first"]);
     let first_oid = String::from_utf8(
-        Command::new("git")
+        git_test_command(&root)
             .args(["rev-parse", "HEAD"])
             .current_dir(&root)
             .output()
@@ -1094,7 +1144,7 @@ fn checkpoint_ref_creation_never_overwrites_an_existing_ref() {
     git_ok(&root, &["add", "tracked.txt"]);
     git_ok(&root, &["commit", "-q", "-m", "second"]);
     let second_oid = String::from_utf8(
-        Command::new("git")
+        git_test_command(&root)
             .args(["rev-parse", "HEAD"])
             .current_dir(&root)
             .output()
@@ -1116,7 +1166,7 @@ fn checkpoint_ref_creation_never_overwrites_an_existing_ref() {
         "{error}"
     );
     let stored_oid = String::from_utf8(
-        Command::new("git")
+        git_test_command(&root)
             .args(["rev-parse", ref_name])
             .current_dir(&root)
             .output()
@@ -1200,7 +1250,7 @@ fn checkpoint_corrupt_manifest_fails_closed_without_leaking_new_ref() {
             .expect_err("checkpoint append must reject corrupt manifest")
             .contains("invalid checkpoint manifest entry")
     );
-    let refs = Command::new("git")
+    let refs = git_test_command(&root)
         .args([
             "for-each-ref",
             "--format=%(refname)",
@@ -1729,19 +1779,6 @@ fn checkpoint_reset_head_reports_commit_state_and_preserves_snapshot_ref() {
 }
 
 #[test]
-fn memory_merge_recall_prefers_ours_and_dedupes_theirs() {
-    let base = "# Dext recall\n- keep\n- remove\n";
-    let ours = "# Dext recall\n- keep\n- ours\n";
-    let theirs = "# Dext recall\n- keep\n- remove\n- theirs\n";
-    let merged = memory_merge::merge_recall(base, ours, theirs);
-    assert!(merged.clean);
-    assert!(merged.content.contains("- ours"));
-    assert!(merged.content.contains("- theirs"));
-    assert!(!merged.content.contains("- remove\n"));
-    assert_eq!(merged.content.matches("- keep").count(), 1);
-}
-
-#[test]
 fn mutation_preview_new_file_does_not_duplicate_added_lines() {
     let root = temp_test_dir("mutation-preview-new");
     let preview =
@@ -1979,12 +2016,14 @@ fn tool_paths_allow_only_user_shelf_pack_content_outside_project() {
     std::fs::write(&shelf_manifest, "{}\n").expect("write shelf manifest");
     let shelf_notes = shelf_pack_dir.join("notes.md");
     let shelf_metadata = shelf_dir.join("metadata.json");
+    let loose_packs_file = shelf_dir.join("packs/loose.md");
+    let fake_pack_file = shelf_dir.join("packs/not-a-pack/notes.md");
     let old_dext_home = std::env::var_os("DEXT_HOME");
     unsafe {
         std::env::set_var("DEXT_HOME", &home);
     }
 
-    let canonical = canonicalize_tool_path(&root, &shelf_pack_md.display().to_string())
+    let canonical = canonicalize_mutation_path(&root, &shelf_pack_md.display().to_string())
         .expect("allow user shelf pack path");
     assert_eq!(
         canonical,
@@ -1997,8 +2036,13 @@ fn tool_paths_allow_only_user_shelf_pack_content_outside_project() {
     assert_eq!(preview.path, shelf_notes);
     assert!(preview.is_new_file);
 
-    for denied in [&shelf_manifest, &shelf_metadata] {
-        let error = canonicalize_tool_path(&root, &denied.display().to_string())
+    for denied in [
+        &shelf_manifest,
+        &shelf_metadata,
+        &loose_packs_file,
+        &fake_pack_file,
+    ] {
+        let error = canonicalize_mutation_path(&root, &denied.display().to_string())
             .expect_err("shelf metadata is outside pack content");
         assert!(
             error.contains("outside sandbox or Dext global pack roots"),
@@ -2009,6 +2053,74 @@ fn tool_paths_allow_only_user_shelf_pack_content_outside_project() {
     restore_env_var("DEXT_HOME", old_dext_home);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn prepared_user_pack_mutation_rechecks_pack_marker_before_apply() {
+    let _guard = env_lock();
+    let root = temp_test_dir("prepared-pack-marker-root");
+    let home = temp_test_dir("prepared-pack-marker-home");
+    let pack_dir = home.join("shelves/community/packs/demo");
+    std::fs::create_dir_all(&pack_dir).expect("create pack directory");
+    let marker = pack_dir.join("PACK.md");
+    std::fs::write(&marker, "---\nname: demo\n---\n# Demo\n").expect("write pack marker");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let destination = pack_dir.join("new/deep/notes.md");
+    let prepared =
+        mutation_preview::prepare_write_file(&root, &destination.display().to_string(), "notes\n")
+            .expect("prepare authenticated pack mutation");
+    std::fs::remove_file(&marker).expect("remove pack marker before apply");
+    let error = mutation_preview::apply_prepared_mutation(&root, &prepared)
+        .expect_err("missing marker must invalidate prepared pack mutation");
+    assert!(error.contains("stale file state"), "{error}");
+    assert!(
+        error.contains("outside sandbox or Dext global pack roots"),
+        "{error}"
+    );
+    assert!(!destination.exists());
+    assert!(!pack_dir.join("new").exists());
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn tool_paths_reject_symlinked_user_pack_marker() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("tool-path-symlinked-pack-marker-root");
+    let home = temp_test_dir("tool-path-symlinked-pack-marker-home");
+    let outside = temp_test_dir("tool-path-symlinked-pack-marker-outside");
+    let pack_dir = home.join("shelves/community/packs/demo");
+    std::fs::create_dir_all(&pack_dir).expect("create shelf pack dir");
+    let outside_marker = outside.join("PACK.md");
+    std::fs::write(&outside_marker, "---\nname: outside\n---\n# Outside\n")
+        .expect("write outside marker");
+    symlink(&outside_marker, pack_dir.join("PACK.md")).expect("symlink pack marker");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let notes = pack_dir.join("notes.md");
+    let error = canonicalize_mutation_path(&root, &notes.display().to_string())
+        .expect_err("symlinked PACK.md must not authorize external mutation");
+    assert!(
+        error.contains("outside sandbox or Dext global pack roots"),
+        "{error}"
+    );
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 #[test]
@@ -2033,7 +2145,7 @@ fn tool_paths_allow_external_reads_but_reject_external_writes() {
         .expect("read_file may inspect outside sandbox");
     assert!(read_output.contains("1\tnope"), "{read_output}");
 
-    let err = canonicalize_tool_path(&root, &outside_file.display().to_string())
+    let err = canonicalize_mutation_path(&root, &outside_file.display().to_string())
         .expect_err("reject outside write path");
     assert!(
         err.contains("outside sandbox or Dext global pack roots"),
@@ -2073,7 +2185,7 @@ fn tool_paths_reject_dangling_symlink_write_escapes() {
 
     let outside_file = outside.join("created-by-escape.txt");
     symlink(&outside_file, root.join("file-alias")).expect("create dangling file alias");
-    let error = canonicalize_tool_path(&root, "file-alias")
+    let error = canonicalize_mutation_path(&root, "file-alias")
         .expect_err("dangling file symlink must fail closed");
     assert!(
         error.contains("cannot resolve existing path component"),
@@ -2093,7 +2205,7 @@ fn tool_paths_reject_dangling_symlink_write_escapes() {
 
     let outside_dir = outside.join("created-directory");
     symlink(&outside_dir, root.join("dir-alias")).expect("create dangling directory alias");
-    let error = canonicalize_tool_path(&root, "dir-alias/escaped.txt")
+    let error = canonicalize_mutation_path(&root, "dir-alias/escaped.txt")
         .expect_err("dangling directory symlink must fail closed");
     assert!(
         error.contains("cannot resolve existing path component"),
@@ -2120,28 +2232,6 @@ fn tool_paths_reject_dangling_symlink_write_escapes() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&outside);
-}
-
-#[test]
-fn memory_merge_cli_skips_merge_subcommand_for_positionals() {
-    let root = temp_test_dir("memory-merge-cli");
-    let base = root.join("base.md");
-    let ours = root.join("ours.md");
-    let theirs = root.join("theirs.md");
-    std::fs::write(&base, "# Memory\n\n## A\nbase\n").expect("write base");
-    std::fs::write(&ours, "# Memory\n\n## A\nours\n").expect("write ours");
-    std::fs::write(&theirs, "# Memory\n\n## A\nbase\n").expect("write theirs");
-
-    let args = vec![
-        "merge".to_string(),
-        base.display().to_string(),
-        ours.display().to_string(),
-        theirs.display().to_string(),
-    ];
-    assert_eq!(handle_memory_cli(&args, &root), 0);
-    let merged = std::fs::read_to_string(&ours).expect("read merged");
-    assert!(merged.contains("ours"), "{merged}");
-    assert!(!merged.contains("theirs"), "{merged}");
 }
 
 struct SessionReplayFixture {
@@ -2724,7 +2814,7 @@ fn git_credential_helper_feeds_git_credential_fill() {
             .any(|(k, v)| k == "GIT_CONFIG_VALUE_1" && v.starts_with('!'))
     );
 
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = git_test_command(&root);
     cmd.arg("credential").arg("fill").current_dir(&root);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     // Isolate from the developer's real credential helpers.
@@ -7830,18 +7920,20 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 .and_then(|home| {
                     let home = std::path::PathBuf::from(home);
                     let checkout = std::env::current_dir().ok()?;
-                    let escape_dir = checkout
-                        .join(format!(".dext-read-autonomy-test-{}", std::process::id()))
-                        .join("projects/stocks-test/sessions");
+                    let escape_root =
+                        checkout.join(format!(".dext-read-autonomy-test-{}", std::process::id()));
+                    let escape_dir = escape_root.join("projects/stocks-test/sessions");
                     let cache_dir = home
                         .join(".cache/pip")
                         .join(format!("dext-sbx-test-{}", std::process::id()));
                     let _ = std::fs::create_dir_all(&escape_dir);
                     let _ = std::fs::create_dir_all(&cache_dir);
-                    Some((escape_dir, cache_dir))
+                    Some((escape_root, escape_dir, cache_dir))
                 })
         };
-        if let Some((escape_dir, cache_dir)) = external_paths {
+        if let Some((escape_root, escape_dir, cache_dir)) = external_paths {
+            let _escape_cleanup = RemoveDirOnDrop(escape_root);
+            let _cache_cleanup = RemoveDirOnDrop(cache_dir.clone());
             let escape_file = escape_dir.join("escape.txt");
             let escape_cmd = format!(
                 "echo pwned > {} 2>&1",
@@ -8006,8 +8098,6 @@ async fn sandbox_enforces_write_confinement_when_kernel_supports_it() {
                 cache_file.exists(),
                 "workspace-write must allow toolchain cache writes: {cache_out}"
             );
-            let _ = std::fs::remove_dir_all(&escape_dir);
-            let _ = std::fs::remove_dir_all(&cache_dir);
         }
 
         // Arbitrary shared-temp writes are not scratch writes: they would let a
@@ -8083,6 +8173,7 @@ async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
     let escape_dir = checkout.join(format!(".dext-sbx-env-test-{}", std::process::id()));
     let escape_file = escape_dir.join("escape.txt");
     std::fs::create_dir_all(&escape_dir).expect("create escape directory");
+    let _escape_cleanup = RemoveDirOnDrop(escape_dir.clone());
     unsafe {
         std::env::set_var("SANDBOX_PARENT_ONLY_SECRET", "parent-secret-fixture");
         std::env::set_var("PIP_CACHE_DIR", &escape_dir);
@@ -8123,7 +8214,6 @@ async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
     restore_env_var("SANDBOX_PARENT_ONLY_SECRET", old_secret);
     restore_env_var("PIP_CACHE_DIR", old_pip_cache);
     restore_env_var("TMPDIR", old_tmpdir);
-    let _ = std::fs::remove_dir_all(&escape_dir);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -10870,6 +10960,29 @@ fn stream_error_classification_retries_chunked_eof() {
 }
 
 #[test]
+fn chatgpt_incomplete_reason_is_contract_scoped() {
+    assert_eq!(
+        chatgpt_incomplete_reason(
+            RequestContract::ChatGptResponses,
+            Some("incomplete:max_output_tokens")
+        ),
+        Some("max_output_tokens")
+    );
+    assert_eq!(
+        chatgpt_incomplete_reason(RequestContract::ChatGptResponses, Some("incomplete")),
+        Some("unknown")
+    );
+    assert_eq!(
+        chatgpt_incomplete_reason(RequestContract::OpenAiChatCompletions, Some("incomplete")),
+        None
+    );
+    assert_eq!(
+        chatgpt_incomplete_reason(RequestContract::ChatGptResponses, Some("completed")),
+        None
+    );
+}
+
+#[test]
 fn partial_stream_preserve_only_text_blocks() {
     let blocks = vec![Block::Text {
         text: "partial".to_string(),
@@ -12049,43 +12162,6 @@ fn session_brief_renders_safe_continuation_packet() {
 }
 
 #[test]
-fn memory_distill_dedupes_and_flags_unbacked_bullets() {
-    let memory = "# Dext durable memory\n\n## Decisions\n- bash is intentionally atomic and the process group is cleaned per call\n";
-    let recall = "# Dext recall\n- Bash is atomic: process group cleaned per call\n- Bash is atomic: process group cleaned per call\n- Unrelated note about foobars widget calibration\n";
-
-    let distill = crate::memory_merge::distill_recall(memory, recall);
-
-    assert_eq!(distill.original_bullets, 3);
-    assert_eq!(distill.kept_bullets, 2);
-    assert_eq!(
-        distill.removed_duplicates.len(),
-        1,
-        "{:?}",
-        distill.removed_duplicates
-    );
-    // The bash bullet is backed by MEMORY; the foobars note is not.
-    assert_eq!(distill.unbacked.len(), 1, "{:?}", distill.unbacked);
-    assert!(
-        distill.unbacked[0].contains("foobars"),
-        "{:?}",
-        distill.unbacked
-    );
-    // The surviving content keeps the bash bullet exactly once.
-    assert_eq!(
-        distill.content.matches("Bash is atomic").count(),
-        1,
-        "{}",
-        distill.content
-    );
-    // Structure (heading) is preserved.
-    assert!(
-        distill.content.starts_with("# Dext recall"),
-        "{}",
-        distill.content
-    );
-}
-
-#[test]
 fn llama_tool_grammar_is_gated_to_local_and_opt_in() {
     use crate::provider::ApiProvider;
     let tools = ["read_file", "bash"];
@@ -12809,8 +12885,24 @@ fn detected_llama_context_does_not_override_explicit_environment_setting() {
     }
 }
 
-#[test]
-fn local_llama_runtime_context_is_endpoint_scoped_not_model_global() -> Result<()> {
+#[tokio::test]
+async fn offline_local_llama_probe_is_safe_inside_tokio_runtime() -> Result<()> {
+    let _guard = env_lock();
+    clear_cached_local_llama_context_windows();
+    let tokens = refresh_local_llama_context_window(
+        "local",
+        ApiProvider::OpenAi,
+        "http://127.0.0.1:0",
+        "offline-local-model",
+    );
+
+    assert_eq!(tokens, None);
+    clear_cached_local_llama_context_windows();
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_llama_runtime_context_is_endpoint_scoped_not_model_global() -> Result<()> {
     let _guard = env_lock();
     unsafe {
         std::env::remove_var("DEXT_CONTEXT_WINDOW");
@@ -18485,6 +18577,133 @@ fn chatgpt_request_body_maps_xhigh_to_actual_reasoning_effort_and_summary() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn chatgpt_incomplete_function_call_retries_with_lower_effort() {
+    let root = temp_test_dir("chatgpt-incomplete-function-recovery");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    let server = std::thread::spawn(move || {
+        fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read request");
+                assert!(read > 0, "client closed before request completed");
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read request body");
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..read]);
+            }
+            request[header_end..header_end + content_length].to_vec()
+        }
+
+        let responses = [
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"discarded draft\"}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"write_file\"}}\n\n",
+                "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"path\\\":\\\"README\"}\n\n",
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}]}}\n\n"
+            ),
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Recovered.\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"text\":\"Recovered.\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+            ),
+        ];
+        let mut bodies = Vec::new();
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            bodies.push(read_request_body(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+        }
+        bodies
+    });
+
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "chatgpt")
+        .expect("chatgpt profile");
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.provider_profile = Some(profile);
+    agent.base_url = format!("http://{addr}");
+    agent.model = "gpt-5.6-sol".to_string();
+    agent.api_key = "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string();
+    agent.thinking_effort = ThinkingEffort::XHigh;
+    agent.max_iterations = Some(1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    agent
+        .chat("Continue the existing work.".to_string())
+        .await
+        .expect("incomplete response should recover");
+    let bodies = server.join().expect("server thread");
+    let first: Value = serde_json::from_slice(&bodies[0]).expect("first request JSON");
+    let retry: Value = serde_json::from_slice(&bodies[1]).expect("retry request JSON");
+    assert_eq!(first["reasoning"]["effort"], "xhigh");
+    assert_eq!(retry["reasoning"]["effort"], "medium");
+    assert!(retry["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["content"].as_array().is_some_and(|content| {
+                content.iter().any(|part| {
+                    part["text"].as_str().is_some_and(|text| {
+                        text.contains("without producing an executable function call")
+                    })
+                })
+            })
+        })
+    }));
+    assert_eq!(agent.thinking_effort(), ThinkingEffort::XHigh);
+    assert!(agent.history.iter().any(|message| {
+        message.role == "assistant"
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == "Recovered."))
+    }));
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextBlockComplete(text) if text.is_empty()
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Warn(message) if message.contains("reduced reasoning effort from xhigh to medium")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnDiagnostics {
+            last_retry_reason: Some(reason),
+            ..
+        } if reason == "incomplete response (max_output_tokens)"
+    )));
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

@@ -60,6 +60,21 @@ jobs:
         run: cargo install cargo-audit --version 0.22.0 --locked
       - name: Audit Rust dependencies
         run: cargo audit --deny warnings
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Check dependency licenses
+        run: cargo deny check licenses
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Generate release SBOM
+        run: cargo cyclonedx --format json --override-filename dext.cdx --all-features --target all
+      - name: Upload release SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-sbom
+          path: dext.cdx.json
+          if-no-files-found: error
+          retention-days: 7
 
   build:
     needs: [validate-tag, quality]
@@ -168,7 +183,7 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Generate and verify deterministic checksum manifest
+      - name: Generate and verify sorted checksum manifest
         shell: bash
         run: |
           set -euo pipefail
@@ -182,13 +197,15 @@ jobs:
             printf 'expected 4 release archives, found %s\n' "${#archives[@]}" >&2
             exit 1
           fi
-          sha256sum "${archives[@]}" > SHA256SUMS
+          test -s dext.cdx.json
+          mapfile -t assets < <(printf '%s\n' "${archives[@]}" dext.cdx.json | sort)
+          sha256sum "${assets[@]}" > SHA256SUMS
           sha256sum --check SHA256SUMS
-      - name: Attest release archives
+      - name: Attest release assets
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-checksums: dist/SHA256SUMS
-      - name: Verify release archive attestations
+      - name: Verify release asset attestations
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -204,7 +221,7 @@ jobs:
         run: |
           set -euo pipefail
           gh release create "$GITHUB_REF_NAME" \
-            dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
+            dist/*.tar.gz dist/*.zip dist/dext.cdx.json dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "Dext $GITHUB_REF_NAME" \

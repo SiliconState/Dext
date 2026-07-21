@@ -398,7 +398,6 @@ body.drawer-open{overflow:hidden}
     <li><a href="#git-checkpoints-rs">Git_checkpoints.rs</a></li>
     <li class="sub"><a href="#checkpoint-flowchart">Checkpoint Flowchart</a></li>
     <li class="sub"><a href="#mutation-preview-rs">Mutation_preview.rs</a></li>
-    <li class="sub"><a href="#memory-merge-rs">Memory_merge.rs</a></li>
   </ul>
 </div>
 <div class="nav-group">
@@ -437,9 +436,9 @@ body.drawer-open{overflow:hidden}
 <p>Dext is <strong>source-first</strong>: prompts, runtime state, tool policies, provider wiring, and the TUI all live in the repository with no external service required beyond your chosen model provider.</p>
 <div class="tip"><strong>Canonical documentation:</strong> this GitHub Pages site is the main technical reference and is deployed from <code>docs/</code> after each reviewed change to <code>main</code>. Focused Markdown guides remain supplemental. Open non-documentation risks are tracked in the <a href="https://github.com/SiliconState/Dext/blob/main/docs/RISK_REGISTER.md">risk register</a>.</div>
 
-<div class="tip"><strong>Developer verification:</strong> run <code>cargo fmt --all -- --check</code>, Clippy with warnings denied, <code>cargo audit --deny warnings</code>, the vendored <code>ratatui-core</code> tests, release build/tests, and the PTY smoke suite. Reinstall with <code>cargo install --path . --force --locked</code> so the binary on <code>PATH</code> matches the source. Renderer-specific requirements are documented in <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a>.</div>
+<div class="tip"><strong>Developer verification:</strong> run <code>cargo fmt --all -- --check</code>, Clippy with warnings denied, <code>cargo audit --deny warnings</code>, <code>cargo deny check licenses</code>, the vendored <code>ratatui-core</code> tests, release build/tests, and the PTY smoke suite. Reinstall with <code>cargo install --path . --force --locked</code> so the binary on <code>PATH</code> matches the source. Renderer-specific requirements are documented in <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a>.</div>
 <div class="warn"><strong>Run the final gate on the host:</strong> Dext's default <code>workspace-write</code> sandbox intentionally denies shared <code>/tmp</code>, arbitrary pseudo-terminals, and Cargo install metadata such as <code>~/.cargo/.crates.toml</code>. Running Dext's own full suite through a confined Dext shell can therefore cause cascading temp-directory failures, deny all TUI smoke tests, and block installation. Run the gate directly in a trusted terminal or CI. If Dext must orchestrate it, start a separate controlled process with <code>dext --sandbox-profile danger-full-access --approval always</code>; setting an environment variable inside an already-confined shell cannot relax the parent kernel sandbox. Do not weaken the default sandbox for test convenience.</div>
-<p>Architecturally, Dext uses <code>Agent</code> in <code>main.rs</code> as a facade around focused modules: provider request shaping and auth (<code>provider.rs</code>), bounded stream assembly (<code>streaming.rs</code>), tool-round execution and side-effect fencing (<code>tool_round.rs</code>, <code>tool_journal.rs</code>), tool schemas and policy (<code>tools.rs</code>, <code>tool_policy.rs</code>), project/session state (<code>session.rs</code>), interactive rendering (<code>tui.rs</code>), safety/recovery primitives (<code>git_checkpoints.rs</code>, <code>mutation_preview.rs</code>, <code>memory_merge.rs</code>), and extension metadata/runtime (<code>packs.rs</code>, <code>shelves.rs</code>, <code>orchestrator.rs</code>).</p>
+<p>Architecturally, Dext uses <code>Agent</code> in <code>main.rs</code> as a facade around focused modules: provider request shaping and auth (<code>provider.rs</code>), bounded stream assembly (<code>streaming.rs</code>), tool-round execution and side-effect fencing (<code>tool_round.rs</code>, <code>tool_journal.rs</code>), tool schemas and policy (<code>tools.rs</code>, <code>tool_policy.rs</code>), project/session state (<code>session.rs</code>), interactive rendering (<code>tui.rs</code>), safety/recovery primitives (<code>git_checkpoints.rs</code>, <code>mutation_preview.rs</code>, <code>sandbox.rs</code>), and extension metadata/runtime (<code>packs.rs</code>, <code>shelves.rs</code>, <code>orchestrator.rs</code>).</p>
 
 <section class="collapsible-section">
 <h2 id="quickstart" class="collapsible-header">Quick Start</h2>
@@ -472,7 +471,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <div class="collapsible-content">
 <table>
 <tr><th>File</th><th>Purpose</th></tr>
-<tr><td><code>src/main.rs</code></td><td>Agent loop, provider HTTP, permissions, sandboxing, slash commands, CLI entry, eval</td></tr>
+<tr><td><code>src/main.rs</code></td><td>Agent loop, provider HTTP, permissions, slash commands, CLI entry, eval</td></tr>
 <tr><td><code>src/main_tests.rs</code></td><td>Unit and integration tests for main.rs</td></tr>
 <tr><td><code>src/tui.rs</code></td><td>Ratatui inline TUI, permission prompts, transcript rendering</td></tr>
 <tr><td><code>src/provider.rs</code></td><td>Provider catalog, auth, request shaping, model normalization</td></tr>
@@ -481,14 +480,15 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>src/tool_round.rs</code></td><td>Tool planning, approval, checkpoint/journal boundaries, dispatch, result normalization</td></tr>
 <tr><td><code>src/tool_journal.rs</code></td><td>Owner-private side-effect start/terminal records and resume reconciliation</td></tr>
 <tr><td><code>src/session.rs</code></td><td>Session/log persistence, project state locks, atomic I/O</td></tr>
+<tr><td><code>src/sandbox.rs</code></td><td>OS confinement, profile write roots, private scratch, offline diagnostics isolation</td></tr>
 <tr><td><code>src/tools.rs</code></td><td>Tool definitions, permission metadata, parallel-safe classification</td></tr>
 <tr><td><code>src/orchestrator.rs</code></td><td>Work phases, similarity guards, objective tracking, adaptive caps</td></tr>
 <tr><td><code>src/git_checkpoints.rs</code></td><td>Git-native recovery refs, /undo, sidecar files, pruning</td></tr>
 <tr><td><code>src/mutation_preview.rs</code></td><td>In-memory line-level previews before applying file mutations</td></tr>
-<tr><td><code>src/memory_merge.rs</code></td><td>Optional explicit merge helpers for MEMORY.md and recall.md</td></tr>
 <tr><td><code>src/packs.rs</code></td><td>Pack discovery, invocation, conversational pack inference</td></tr>
 <tr><td><code>src/shelves.rs</code></td><td>Typed shelf registry with ability metadata, signals, and effects</td></tr>
 <tr><td><code>src/tool_policy.rs</code></td><td>Command risk classification, input validation, bash guardrails</td></tr>
+<tr><td><code>deny.toml</code></td><td>Dependency-license allowlist enforced by security and release workflows</td></tr>
 <tr><td><code>benches/dext_bench.rs</code></td><td>Criterion performance harness</td></tr>
 <tr><td><code>tests/tui_smoke.rs</code></td><td>PTY-backed launch, multiline input, streaming, and resize regression tests</td></tr>
 <tr><td><code>vendor/ratatui-core/</code></td><td>Exact upstream source plus Dext's narrow inline-terminal compatibility patch</td></tr>
@@ -637,6 +637,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Transport Deadlines and Body Bounds</h3>
 <p>The shared provider client uses a 15-second connect timeout. Cloud requests allow 180 seconds to first response headers and 90 seconds between stream chunks; local llama.cpp requests default to 600 seconds and 300 seconds respectively. <code>DEXT_PROVIDER_CONNECT_TIMEOUT_SECS</code>, <code>DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS</code>, and <code>DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS</code> accept positive overrides. Initial requests and compaction retries use the same first-byte policy. Non-stream compaction responses use the stream-idle deadline while reading and reject JSON bodies above 4 MiB; provider error diagnostics stop at 4,000 bytes.</p>
 <p><code>src/sse.rs</code> limits its in-progress input buffer to one configured event plus at most four delimiter bytes before rejection. One large network read may still contain many valid small events; the decoder drains complete frames incrementally rather than rejecting by chunk size.</p>
+<p>ChatGPT Responses terminal events with <code>status=incomplete</code> are recoverable rather than fatal protocol errors. Dext executes only function calls that reached a streamed completion event and discards truncated calls, ignoring complete-looking terminal snapshots for those unfinished calls. Discarded live text/thinking preview state is reset; interactive warnings identify the recovery. If no executable call remains, Dext issues a bounded continuation request with a concise runtime hint; provider-reported content filtering halts immediately instead of retrying. Recovery lowers ChatGPT reasoning effort for that request only (for example, <code>xhigh</code> to <code>medium</code>) without changing the user-selected effort or consuming the normal tool-iteration budget. After three unsuccessful continuation requests, Dext halts the turn with guidance while keeping the session usable.</p>
 <h3>Session Persistence</h3>
 <p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). This header is the replay anchor for deterministic restore behavior.</p>
 <h3>Eval Harness</h3>
@@ -789,6 +790,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li><strong>Input panel</strong> — Multi-line text input with history (200 entries), completion for slash commands</li>
 <li><strong>Work map drawer</strong> — Collapsible work-ledger visualization</li>
 </ul>
+<h3>Startup Welcome</h3>
+<p>The startup welcome remains inline transcript content, so it scrolls away naturally with the conversation. One transcript-owned blank separator row keeps it visually distinct from CLI approval and sandbox diagnostics, including after inline viewport placement or replay. Its brand row shows Dext and the version, plus the working directory and cached Git branch/state at 80 columns or wider; narrower terminals drop that right segment. Exactly two facts, Model and Approval, sit between horizontal rules, followed by one rotating tip selected from verified commands and key bindings. Terminal-cell width controls alignment and path truncation. Git status uses one <code>git status --porcelain=v1 --branch</code> probe off the render loop, with only an 8 ms startup wait before path-only fallback. The empty composer reads <code>❯ Type a request… &nbsp; @ files · / commands</code>.</p>
 <h3>Permission Prompts</h3>
 <p>Tool calls requiring permission show inline prompts with risk tier color coding (yellow for Read/Write, red for Danger). Choices: Once, Always (session), Deny.</p>
 <h3>Key Bindings</h3>
@@ -805,10 +808,12 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>Scroll</code></td><td>Navigate transcript</td></tr>
 <tr><td><code>?</code></td><td>Show keymap help</td></tr>
 </table>
+<h3>Status and Active Time</h3>
+<p>The main status row presents the exact <code>main</code> branch label as <code>Main</code>, including <code>Main (dirty)</code> when the working tree is dirty, without renaming the branch or changing any other branch casing. It reserves its right edge for a live cumulative agent-active clock while Dext handles a turn. The clock advances during provider waits, tool calls, permission/auth waits, and in-turn compaction; while Dext is idle awaiting user input, it pauses and is hidden, then resumes on the next turn. It updates through the existing redraw cadence and uses compact forms such as <code>7s</code>, <code>7m 05s</code>, and <code>1h 07m</code> without adding a timer thread.</p>
 <h3>Todo View</h3>
-<p><code>Ctrl+L</code> opens a clean read-only modal at any time, including while the agent is busy. It loads persisted session/project todos at startup, refreshes after <code>todo_read</code>/<code>todo_write</code>, scrolls with arrows, Page Up/Down, Home/End, or the mouse wheel, and closes with <code>Ctrl+L</code>, <code>Esc</code>, or <code>q</code>. Editing remains on the existing <code>todo_write</code> path so validation, approval, checkpoint, and session-state behavior are not duplicated. The backend viewer remains the only alternate-screen surface.</p>
+<p><code>Ctrl+L</code> opens a clean read-only modal during ordinary idle or busy work. Security-critical permission and local-auth prompts intentionally retain input and rendering priority and must be resolved or canceled first. The modal loads persisted session/project todos at startup, refreshes after <code>todo_read</code>/<code>todo_write</code>, scrolls with arrows, Page Up/Down, Home/End, or the mouse wheel, and closes with <code>Ctrl+L</code>, <code>Esc</code>, or <code>q</code>. Empty-state parsing matches Dext's generated sentinel lines exactly, so ordinary todo text cannot clear the modal accidentally. When todo progress is the live-status fallback above the composer, the battery follows the list length up to seven cells: <code>Todos 3/4 ■■■□</code> maps one cell to each short-list item, while a longer list such as <code>Todos 15/20 ■■■■■□□</code> stays capped and proportional. Partial progress retains at least one filled and one empty cell, and the active task remains visible when space permits. Editing remains on the existing <code>todo_write</code> path so validation, approval, checkpoint, and session-state behavior are not duplicated. The backend viewer remains the only alternate-screen surface.</p>
 <h3>Tool Result Rendering</h3>
-<p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints.</p>
+<p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints. Failed native <code>write_file</code>, <code>edit_file</code>, and <code>multi_edit</code> blocks explicitly state that no edits were applied, matching the atomic prepare-and-replace invariant. The alternate-screen backend viewer normalizes CRLF across arbitrary output chunks without introducing blank rows and visually matches the main TUI with a Dext header, agent-active clock, command summary, styled stdout/stderr lanes, output panel, command position, and compact controls. It continues to use the existing bounded ring buffer, selection, scrolling, event stream, and permission/auth priority.</p>
 <h3>Markdown Rendering</h3>
 <p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence.</p>
 <h3 id="tui-dependencies">Dependency and resize contract</h3>
@@ -861,24 +866,6 @@ dext --frugal --effort off    # low-token mode</code></pre>
 </div>
 </section>
 
-<section class="collapsible-section">
-<h2 id="memory-merge-rs" class="collapsible-header">Memory_merge.rs <span class="badge badge-rs">.rs</span></h2>
-<div class="collapsible-content">
-<p>An optional section-aware merge driver for <code>MEMORY.md</code> and <code>recall.md</code>. These are not required runtime state: <code>recall.md</code> is injected only when the user creates it, while <code>MEMORY.md</code> is never auto-injected and is read only by explicit <code>dext memory ...</code> commands.</p>
-<h3>Memory Merge Algorithm</h3>
-<ol>
-<li><strong>Parse</strong> — Split both versions into preamble + sections (by heading hierarchy)</li>
-<li><strong>Index</strong> — Map sections by heading path (e.g., <code>["Durable decisions", "Tool surface"]</code>)</li>
-<li><strong>Three-way merge</strong> — For each section: if only one side changed, take that; if both changed identically, take either; if conflicting, produce explicit conflict markers</li>
-<li><strong>List merging</strong> — Pure list sections are union-merged by normalized content</li>
-<li><strong>Never silently drop</strong> — Conflicts are always marked explicitly</li>
-</ol>
-<h3>Recall Merge</h3>
-<p><code>recall.md</code> uses simpler line-based union merge: deduplicate by normalized content, prefer "ours" ordering.</p>
-<h3>Git Integration</h3>
-<p>Register via <code>dext memory register</code> which configures Git merge drivers (<code>dext-memory</code>, <code>dext-recall</code>) in local config and writes local or versioned gitattributes entries. Registration is explicit; Dext does not silently mutate global Git config.</p>
-</div>
-</section>
 <h1 id="extensibility">Extensibility</h1>
 
 <section class="collapsible-section">
@@ -989,6 +976,7 @@ credential-env: [SERVICE_TOKEN]
 <li>Use <code>phooks.json</code> only when needed; packs must still function without hooks.</li>
 <li>Treat pack workflows as code: version, test on disposable repos, and review diffs.</li>
 </ul>
+<p>Outside the active sandbox, native mutation tools may write only below a concrete user pack directory (<code>~/.dext/shelves/&lt;shelf&gt;/packs/&lt;pack&gt;/...</code>) containing a regular <code>PACK.md</code>. Shelf manifests and loose files directly under <code>packs/</code> remain outside that exception. Dext revalidates the destination and marker before atomic replacement; same-user path races remain outside the isolation boundary and are tracked in the risk register.</p>
 </div>
 </section>
 
@@ -1063,14 +1051,13 @@ credential-env: [SERVICE_TOKEN]
 <h2 id="testing" class="collapsible-header">Testing</h2>
 <div class="collapsible-content">
 <h3>Unit Tests (main_tests.rs)</h3>
-<p>The test suite covers provider catalogs and request shaping, auth and state formats, stream/tool-call assembly, tool policy, sandboxing, side-effect journals, recovery checkpoints, memory merges, TUI rendering, and runtime orchestration.</p>
+<p>The test suite covers provider catalogs and request shaping, auth and state formats, stream/tool-call assembly, tool policy, sandboxing, side-effect journals, recovery checkpoints, TUI rendering, and runtime orchestration. Git fixture subprocesses explicitly clear ambient repository-routing variables such as <code>GIT_DIR</code> and <code>GIT_WORK_TREE</code>, so parallel environment-isolation tests cannot redirect unrelated temporary repositories.</p>
 <ul>
 <li>Provider catalog loading, normalization, and model resolution</li>
 <li>Auth store operations (save, load, normalize)</li>
 <li>Session header parsing and backwards compatibility</li>
 <li>Tool input validation and risk classification</li>
 <li>Bash guardrails and sudo detection</li>
-<li>Memory merge algorithms (section-aware and recall)</li>
 <li>Checkpoint creation and restore logic</li>
 <li>Objective tracking and satisfaction assessment</li>
 <li>URL host extraction, proxy isolation, destination policy, and exact redirect limits; redirect fixtures use bounded blocking reads on accepted sockets for consistent Windows behavior</li>
@@ -1085,7 +1072,7 @@ credential-env: [SERVICE_TOKEN]
 <li>Completed stream output and accepted input after resize, with no crash markers</li>
 </ul>
 <p>Run with: <code>cargo test --release --locked --test tui_smoke -- --nocapture</code></p>
-<p>The complete verification gate also runs formatting, Clippy with warnings denied across the Linux, macOS, and Windows CI matrix, <code>cargo audit --deny warnings</code>, the vendored <code>ratatui-core</code> unit tests, and a locked release build. On Windows CI and release builders, the scheduler-sensitive <code>fast_bash_command_returns_without_100ms_poll_tail</code> regression runs alone after the remaining release tests. Its original <code>&lt;90 ms</code> assertion remains unchanged; isolation prevents unrelated suite load from obscuring the process-wait regression it measures. The tool-call mock provider consumes its bounded <code>Content-Length</code> request body before responding so Windows does not reset the connection with unread request data. See <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a> for renderer-specific live-terminal checks.</p>
+<p>The complete verification gate also runs formatting, Clippy with warnings denied across the Linux, macOS, and Windows CI matrix, vulnerability auditing, dependency-license policy checks, the vendored <code>ratatui-core</code> unit tests, and a locked release build. Release publication generates <code>dext.cdx.json</code>, includes it in <code>SHA256SUMS</code>, and attests and verifies it alongside the four platform archives. The first successful tag run remains tracked in <a href="https://github.com/SiliconState/Dext/blob/main/docs/RELEASING.md">docs/RELEASING.md</a> until the publication path has end-to-end evidence. On Windows CI and release builders, the scheduler-sensitive <code>fast_bash_command_returns_without_100ms_poll_tail</code> regression runs alone after the remaining release tests. Its original <code>&lt;90 ms</code> assertion remains unchanged; isolation prevents unrelated suite load from obscuring the process-wait regression it measures. The tool-call mock provider consumes its bounded <code>Content-Length</code> request body before responding so Windows does not reset the connection with unread request data. See <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a> for renderer-specific live-terminal checks.</p>
 <h3 id="github-pages">GitHub Pages</h3>
 <p>The public site at <a href="https://siliconstate.github.io/Dext/">siliconstate.github.io/Dext</a> is deployed from the static <code>docs/</code> tree by <code>.github/workflows/pages.yml</code>. The workflow validates local links and anchors, uploads an immutable Pages artifact, and deploys with only <code>pages: write</code> and <code>id-token: write</code> in the deployment job. Third-party actions are pinned to full commit hashes and checkout credentials are not persisted.</p>
 <div class="warn"><strong>Confined self-test limitation:</strong> the complete suite is not expected to pass through a Dext <code>bash</code> tool under <code>workspace-write</code>. The sandbox's shared-temp denial can create many follow-on test failures after a common environment lock is poisoned; PTY denial prevents this smoke test from creating terminals; and Cargo-home protection blocks local installation metadata. These denials demonstrate confinement, but do not count as a successful release gate. Rerun from a trusted host terminal or CI.</div>
@@ -1154,11 +1141,6 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>dext undo --preview &lt;id&gt;</code></td><td>Preview checkpoint restore without modifying files</td></tr>
 <tr><td><code>dext undo --apply &lt;id&gt;</code></td><td>Apply a checkpoint restore</td></tr>
 <tr><td><code>dext undo --prune</code></td><td>Remove expired and excess checkpoints</td></tr>
-<tr><td><code>dext memory check</code></td><td>Check merge driver registration</td></tr>
-<tr><td><code>dext memory register</code></td><td>Register merge drivers</td></tr>
-<tr><td><code>dext memory unregister</code></td><td>Remove local merge-driver registration</td></tr>
-<tr><td><code>dext memory merge ...</code></td><td>Git merge-driver entry point</td></tr>
-<tr><td><code>dext memory distill [--apply]</code></td><td>Preview or apply recall-cache deduplication and stale-bullet cleanup</td></tr>
 <tr><td><code>dext pack list</code></td><td>List available packs</td></tr>
 <tr><td><code>dext pack inspect &lt;name&gt;</code></td><td>Show pack details</td></tr>
 <tr><td><code>dext pack run &lt;name&gt; "task"</code></td><td>Run a pack</td></tr>
@@ -1360,7 +1342,7 @@ credential-env: [SERVICE_TOKEN]
 </ul>
 <h3>Local (llama.cpp)</h3>
 <ul>
-<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — accepts the configured server model alias; local providers default to frugal context and probe llama.cpp for the live runtime context window without model-specific built-in context values</li>
+<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — accepts the configured server model alias; local providers default to frugal context and probe llama.cpp for the live runtime context window without model-specific built-in context values. If the local server is offline, discovery falls back cleanly and the later provider request reports the ordinary connection error.</li>
 </ul>
 </div>
 </section>
@@ -1381,10 +1363,6 @@ credential-env: [SERVICE_TOKEN]
 <p>Tracked machine-facing project guidance auto-injected into the system prompt. Dext scans the sandbox root and ancestors and does not modify the file automatically.</p>
 <h3><code>recall.md</code> (optional sandbox ancestry)</h3>
 <p>Optional ignored prompt cache. It is auto-injected only when present; Dext does not create or update it automatically.</p>
-<h3><code>MEMORY.md</code> (optional project root)</h3>
-<p>Optional ignored long-form input for explicit <code>dext memory merge/distill/register</code> workflows. It is never auto-injected and normal sessions do not read it.</p>
-<h3><code>.gitattributes</code> and <code>.git/info/attributes</code></h3>
-<p><code>dext memory register</code> writes repository-local merge-driver config and local attributes by default. It writes versioned <code>.gitattributes</code> entries for <code>MEMORY.md</code> and <code>recall.md</code> only when <code>--versioned-attributes</code> is requested.</p>
 <h3><code>hooks.json</code> (project root or <code>DEXT_HOOKS_FILE</code>)</h3>
 <p>Project-root hooks configuration loaded from <code>hooks.json</code> by default, or from <code>DEXT_HOOKS_FILE</code> when set. This is not the same as pack <code>phooks.json</code>.</p>
 </div>

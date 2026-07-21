@@ -71,17 +71,6 @@
   Configure with `/preview`, `--preview off|simple|git`, or
   `DEXT_MUTATION_PREVIEW=off|simple|git`. The accepted `git` mode currently
   falls back to simple previews until alternate-index previews are implemented.
-- Added explicit memory merge-driver support for Dext memory files.
-  - `dext memory check` reports whether `MEMORY.md` and `recall.md` have merge
-    drivers registered.
-  - `dext memory register` installs local-only Git merge-driver configuration
-    for section-aware merges.
-  - `dext memory register --versioned-attributes` may also write versioned
-    `.gitattributes` entries when a project intentionally wants them.
-  - `dext memory unregister` removes the local registration.
-  - `dext memory merge [--recall] <base> <ours> <theirs>` is the Git merge-driver
-    entry point used after registration.
-
 - Added a bounded owner-private tool execution journal for approved
   side-effect-capable calls. Resume reports unresolved starts as uncertain and
   never automatically replays them.
@@ -123,8 +112,9 @@
 - Checkpoint manifests and sidecars now use owner-private storage, reject
   symlinked storage paths on Unix, add `/.dext/` to the repository-local Git
   exclude, and automatically retain at most 20 checkpoints for seven days.
-- Added least-privilege CI, weekly `cargo audit`, and Cargo/GitHub Actions
-  Dependabot configuration.
+- Added least-privilege CI, weekly vulnerability and dependency-license checks,
+  Cargo/GitHub Actions Dependabot configuration, and a checksummed, attested
+  CycloneDX SBOM for release publication.
 
 ### Fixed
 
@@ -143,11 +133,9 @@
 - Checkpoint sidecar paths resolve against the sandbox root and restore only the
   intended hinted paths.
 - Changing the sandbox root resets cached Git-root discovery.
-- Memory merge registration resolves the Git toplevel before touching versioned
-  `.gitattributes`, so running from a subdirectory does not write attributes in
-  the wrong place.
-- Recall merges prefer local content for ambiguous deletions, dedupe additions
-  from the incoming side, and keep a clean trailing newline.
+- Local llama.cpp context discovery now owns its blocking HTTP client on a
+  dedicated thread, so an offline local provider cleanly falls back instead of
+  panicking when the probe runs inside Tokio.
 - Mutation preview path handling enforces sandbox containment and avoids
   double-counting trailing new-file additions.
 - Active packs now expose `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to
@@ -160,3 +148,29 @@
   `<90 ms` assertion remains unchanged.
 - The tool-call mock provider now consumes its bounded request body before
   responding, preventing Windows resets caused by unread HTTP request data.
+- User-shelf native mutations now require content below a concrete pack
+  directory containing a regular `PACK.md`; shelf metadata and loose files
+  directly under `packs/` remain outside the write exception, and application
+  revalidates the destination and marker before atomic replacement.
+- Backend viewer output now normalizes CRLF across arbitrary stream chunks
+  without inserting blank rows.
+- Todo empty-state parsing now matches generated sentinel lines exactly, and
+  failed native edit blocks explicitly report that no edits were applied.
+- The main TUI status row now keeps a live cumulative agent-active elapsed
+  clock at its right edge. It advances while Dext handles a turn, then pauses
+  and hides while Dext waits idle for user input; the live todo fallback shows
+  completed/total progress as an up-to-seven-cell battery.
+- The alternate-screen backend viewer now visually matches the main TUI with a
+  Dext header, agent-active clock, command summary, styled stdout/stderr lanes,
+  command position, and compact controls while preserving its existing event,
+  selection, scrolling, and security behavior.
+- The inline startup welcome now presents an adaptive brand/location row, exactly
+  two Model/Approval facts, and a session-rotated verified tip; narrow terminals
+  drop the location segment, terminal-cell width drives alignment/truncation,
+  and Git status probing no longer blocks the render loop. The empty composer
+  also advertises `@ files` and `/ commands` beside its request prompt.
+- Todo progress batteries now track short lists one cell per task and scale
+  proportionally up to a seven-cell cap for longer lists, while preserving
+  visibly incomplete progress. The inline welcome now owns its blank transcript
+  separator so CLI approval and sandbox diagnostics remain visually distinct
+  through inline viewport placement and replay.

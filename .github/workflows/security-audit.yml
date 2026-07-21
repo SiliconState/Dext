@@ -4,13 +4,15 @@ on:
   push:
     branches: [main]
     paths:
-      - Cargo.toml
+      - "**/Cargo.toml"
       - Cargo.lock
+      - deny.toml
       - .github/workflows/security-audit.yml
   pull_request:
     paths:
-      - Cargo.toml
+      - "**/Cargo.toml"
       - Cargo.lock
+      - deny.toml
       - .github/workflows/security-audit.yml
   schedule:
     - cron: "17 6 * * 1"
@@ -21,6 +23,7 @@ permissions:
 
 jobs:
   cargo-audit:
+    name: Dependency audit and licenses
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -31,3 +34,7 @@ jobs:
         run: cargo install cargo-audit --version 0.22.0 --locked
       - name: Audit Rust dependencies
         run: cargo audit --deny warnings
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Check dependency licenses
+        run: cargo deny check licenses

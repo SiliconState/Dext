@@ -953,11 +953,19 @@ pub(crate) fn refresh_local_llama_context_window(
         return Some(tokens);
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(LLAMA_CONTEXT_DISCOVERY_TIMEOUT)
-        .build()
-        .ok()?;
-    let tokens = fetch_llama_context_window(&client, base_url)?;
+    let base_url = base_url.to_string();
+    let tokens = std::thread::Builder::new()
+        .name("dext-local-context-probe".to_string())
+        .spawn(move || {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(LLAMA_CONTEXT_DISCOVERY_TIMEOUT)
+                .build()
+                .ok()?;
+            fetch_llama_context_window(&client, &base_url)
+        })
+        .ok()?
+        .join()
+        .ok()??;
     if let Ok(mut cache) = local_llama_cache().lock() {
         cache.insert(endpoint_key, tokens);
     }
