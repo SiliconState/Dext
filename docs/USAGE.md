@@ -212,20 +212,29 @@ Inside a session:
 /pack run my-pack run its workflow
 ```
 
-Conversational invocation also works when the message clearly asks to run or use a known pack, for example: `run my-pack on this task`.
+Conversational invocation also works when the message clearly asks to run or use a known pack, for example: `run my-pack on this task`. Conversational project-pack activation and project `shelf.json` metadata require one first-use confirmation for the active repository. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Before approval, project metadata is omitted and cannot shadow a same-named user or run-shelf pack. Dext accepts `PACK.md` and `shelf.json` only as regular non-symlink files no larger than 1 MiB; the selected workflow is then capped to 32 KiB for model context.
 
 A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke their own helpers. A pack from a user or `DEXT_SHELVES_DIR` shelf may declare exact names in the inline `credential-env` front-matter list; matching inherited values are available only to a simple direct invocation of that active pack's own native `bin/` helper. On Windows, only `.exe`/`.com` helpers qualify for this direct credential path; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Credential values are not exposed to hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, or sessions, and provider-auth names remain excluded. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
 
 ## Git checkpoints, undo, and mutation previews
 
 When Dext is running inside a Git repository, approved write-risk tool calls can
-create lightweight recovery checkpoints before the operation happens. Direct
+create lightweight recovery checkpoints immediately before each sequential dispatch. This means a
+later call in one tool round captures state produced by earlier calls. Direct
 file mutations receive path-specific restore hints. Checkpoints use hidden refs
 under `refs/dext/checkpoints/` and owner-private local manifests and sidecars
 under `.dext/checkpoints/` on Unix. Dext adds `/.dext/` to the repository-local
 Git exclude file and automatically retains at most 20 checkpoints for no longer
 than seven days. They are intended for Dext write recovery, not as a replacement
-for commits. Never mirror-push `refs/dext/*`.
+for commits. Write-risk `bash`/`awk`/`csvkit` calls preserve existing untracked
+regular files up to 500 paths, 8 MiB per file, and 32 MiB total. Private sidecars
+retain owner execute state, and restore fails closed if any declared sidecar is
+missing. If the required
+snapshot fails, the call does not run. In a Git repository without an initial
+commit, Dext also blocks writes that would overwrite existing worktree/index
+state because there is no normal Git restore base. A workspace with no `.git`
+marker remains a non-Git no-op without invoking Git; a discovered but malformed
+repository marker fails closed. Never mirror-push `refs/dext/*`.
 
 CLI undo commands:
 
@@ -266,7 +275,7 @@ Inside a session:
 /preview off
 ```
 
-`git` is accepted as a preview mode but currently uses the same in-memory preview implementation as `simple`.
+`git` is accepted as a preview mode but currently uses the same in-memory preview implementation as `simple`. The display is capped at 4 KiB, while added/removed counts cover the full proposed change. Final-newline-only changes are shown explicitly, and very high line-count inputs use a bounded conservative fallback.
 
 ## Context and cost controls
 

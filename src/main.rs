@@ -7865,7 +7865,7 @@ fn diagnostics_command(
     program: &Path,
     root: &Path,
 ) -> std::result::Result<sandbox::SandboxedStdCommand, String> {
-    let mut command = sandbox::std_command_offline(program, SandboxProfile::ReadOnly, root, &[])
+    let mut command = sandbox::std_command_offline(program, SandboxProfile::ReadOnly, root)
         .map_err(|error| format!("prepare offline diagnostics sandbox: {error}"))?;
     if let Some(scratch) = command.scratch_path().map(Path::to_path_buf) {
         command.env("CARGO_TARGET_DIR", scratch.join("cargo-target"));
@@ -10116,7 +10116,6 @@ fn start_git_credential_pipe_writer(path: PathBuf, payload: String) -> SudoPassw
 /// the FIFO, so it must outlive the tool call.
 struct GitCredentialHelperRuntime {
     env: Vec<(String, String)>,
-    sandbox_read_roots: Vec<PathBuf>,
     _pipe: SudoPasswordPipeRuntime,
 }
 
@@ -10168,11 +10167,7 @@ fn prepare_git_credential_helper(
         ),
         ("GIT_CONFIG_VALUE_4".to_string(), "always".to_string()),
     ];
-    Ok(GitCredentialHelperRuntime {
-        env,
-        sandbox_read_roots: vec![script, fifo],
-        _pipe: pipe,
-    })
+    Ok(GitCredentialHelperRuntime { env, _pipe: pipe })
 }
 
 #[cfg(not(unix))]
@@ -10257,7 +10252,6 @@ async fn execute_bash_async_with_timeout(
         sandbox_profile,
         None,
         &[],
-        &[],
     )
     .await
 }
@@ -10272,7 +10266,6 @@ async fn execute_bash_async_prepared(
     sandbox_profile: SandboxProfile,
     live_output: Option<LiveToolOutput>,
     extra_env: &[(String, String)],
-    extra_read_roots: &[PathBuf],
 ) -> std::result::Result<String, String> {
     let mut local_sudo_auth = local_sudo_auth;
     let pack_helper = if local_sudo_auth.is_none() {
@@ -10297,31 +10290,19 @@ async fn execute_bash_async_prepared(
     } else {
         sandbox_profile
     };
-    let mut sandbox_read_roots = extra_read_roots.to_vec();
-    if let Some(auth) = local_sudo_auth.as_ref() {
-        sandbox_read_roots.push(auth.sudo_shim_dir.clone());
-        if let Some(askpass) = auth.askpass.as_ref() {
-            sandbox_read_roots.push(askpass.clone());
-        }
-        if let Some(fifo) = auth.password_fifo.as_ref() {
-            sandbox_read_roots.push(fifo.clone());
-        }
-    }
     let mut command = if let Some(invocation) = pack_helper.as_ref() {
         let executable = invocation
             .executable
             .to_str()
             .ok_or_else(|| "pack helper path is not valid UTF-8".to_string())?;
-        let mut command =
-            sandbox::tokio_command(executable, effective_profile, root, &sandbox_read_roots)
-                .map_err(|error| format!("prepare sandbox for pack helper: {error}"))?;
+        let mut command = sandbox::tokio_command(executable, effective_profile, root)
+            .map_err(|error| format!("prepare sandbox for pack helper: {error}"))?;
         command.args(&invocation.args);
         command
     } else {
         let bash = bash_executable_path();
-        let mut command =
-            sandbox::tokio_command(&bash, effective_profile, root, &sandbox_read_roots)
-                .map_err(|error| format!("prepare bash sandbox: {error}"))?;
+        let mut command = sandbox::tokio_command(&bash, effective_profile, root)
+            .map_err(|error| format!("prepare bash sandbox: {error}"))?;
         command.arg("-c").arg(&bash_cmd);
         command
     };
@@ -10501,7 +10482,7 @@ async fn execute_external_async_status(
     } else {
         PathBuf::from(bin)
     };
-    let mut cmd = sandbox::tokio_command(&executable, policy.sandbox_profile, cwd, &[])
+    let mut cmd = sandbox::tokio_command(&executable, policy.sandbox_profile, cwd)
         .map_err(|error| format!("prepare sandbox for {bin}: {error}"))?;
     cmd.args(args)
         .current_dir(cwd)
@@ -10925,10 +10906,8 @@ async fn execute_builtin_call(
             _ => None,
         };
         let mut extra_env = pack_env;
-        let mut sandbox_read_roots = Vec::new();
         if let Some(runtime) = git_cred_runtime.as_ref() {
             extra_env.extend(runtime.env.clone());
-            sandbox_read_roots.extend(runtime.sandbox_read_roots.clone());
         }
         execute_bash_async_prepared(
             &guarded,
@@ -10939,7 +10918,6 @@ async fn execute_builtin_call(
             sandbox_profile,
             live_output,
             &extra_env,
-            &sandbox_read_roots,
         )
         .await
     } else if name == "http" {
@@ -11557,6 +11535,7 @@ type PromptContextSections = Vec<(String, PathBuf, String)>;
 /// Refreshed when the epoch (user turn) changes or a stat signature drifts.
 struct PromptScanCache {
     epoch: u64,
+    include_project_extensions: bool,
     dext_md: PromptContextScan,
     recall: PromptContextScan,
     pack_summary: Option<String>,
@@ -11677,6 +11656,7 @@ const COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 1_000;
 const FRUGAL_COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 360;
 
 const HOOKS_APPROVAL_NAME: &str = "hooks";
+const PROJECT_EXTENSIONS_APPROVAL_NAME: &str = "project_extensions";
 
 #[derive(Deserialize, Clone, Default)]
 struct Hook {
@@ -11752,7 +11732,7 @@ impl Hooks {
                 SandboxProfile::WorkspaceWrite
             };
             let bash = bash_executable_path();
-            let sandboxed = match sandbox::std_command(&bash, hook_profile, root, &[]) {
+            let sandboxed = match sandbox::std_command(&bash, hook_profile, root) {
                 Ok(command) => command,
                 Err(error) => {
                     out.push((format!("prepare hook sandbox: {error}"), -1));
@@ -11960,31 +11940,8 @@ impl ToolContextProfile {
     }
 }
 
-const DEFAULT_TOOL_NAMES: &[&str] = &[
-    "read_file",
-    "read_symbol",
-    "write_file",
-    "edit_file",
-    "multi_edit",
-    "bash",
-    "fd",
-    "rg",
-    "http",
-    "git_diff",
-    "git_commit",
-    "todo_read",
-    "todo_write",
-];
-
-const SPECIALIZED_TOOL_NAMES: &[&str] = &["jq", "fzf", "awk", "git_log", "csvkit"];
-
 fn tool_name_allowed_in_profile(name: &str, profile: ToolContextProfile) -> bool {
-    match profile {
-        ToolContextProfile::Full => true,
-        ToolContextProfile::Default | ToolContextProfile::Frugal => {
-            DEFAULT_TOOL_NAMES.contains(&name)
-        }
-    }
+    profile == ToolContextProfile::Full || tools::is_default_tool(name)
 }
 
 struct ToolsCommandResult {
@@ -12032,10 +11989,9 @@ fn render_tools_status(agent: &Agent) -> String {
         )
     );
 
-    let hidden_specialized: Vec<String> = SPECIALIZED_TOOL_NAMES
-        .iter()
-        .filter(|name| !agent.tools.iter().any(|tool| tool.name == **name))
-        .map(|name| (*name).to_string())
+    let hidden_specialized: Vec<String> = tools::specialized_tool_names()
+        .filter(|name| !agent.tools.iter().any(|tool| tool.name == *name))
+        .map(str::to_string)
         .collect();
     if !hidden_specialized.is_empty() {
         let _ = writeln!(
@@ -13940,6 +13896,7 @@ struct Agent {
     hooks: Hooks,
     pack_hook_env: Vec<(String, String)>,
     active_pack_hook_paths: HashSet<PathBuf>,
+    project_extensions_approved: Option<bool>,
     suppress_pack_activation: bool,
     state_lock: Option<Arc<SessionStateLock>>,
     session_enabled: bool,
@@ -14120,6 +14077,7 @@ impl Agent {
             hooks: Hooks::load(&sandbox_root),
             pack_hook_env: Vec::new(),
             active_pack_hook_paths: HashSet::new(),
+            project_extensions_approved: None,
             suppress_pack_activation: false,
             sandbox_root,
             git_context,
@@ -15036,6 +14994,7 @@ impl Agent {
         self.active_pack_hook_paths.clear();
         if root_changed {
             self.allowed.clear();
+            self.project_extensions_approved = None;
         }
         self.suppress_pack_activation = false;
         self.sandbox_root = root;
@@ -15082,6 +15041,7 @@ impl Agent {
 
     async fn run_pack(&mut self, selector: &str, task: &str) -> Result<()> {
         let pack = packs::find_pack(&self.sandbox_root, selector)?;
+        let prompt = packs::pack_prompt(&pack, task)?;
         self.activate_pack_hooks(&pack);
         self.sink.emit(AgentEvent::Slash(format!(
             "▶ pack: {} · {}\nworkflow: {}",
@@ -15093,16 +15053,15 @@ impl Agent {
             },
             pack.pack_md_path.display()
         )));
-        let prompt = packs::pack_prompt(&pack, task)?;
-        self.chat(prompt).await
+        self.chat_with_pack_activation(prompt, true).await
     }
 
-    fn maybe_create_tool_checkpoint(&mut self, name: &str, input: &Value) {
+    fn maybe_create_tool_checkpoint(&mut self, name: &str, input: &Value) -> Result<(), String> {
         if !git_checkpoints::tool_needs_checkpoint(name, input) {
-            return;
+            return Ok(());
         }
-        let Some(git_root) = self.checkpoint_cache.get(&self.sandbox_root).ok().flatten() else {
-            return;
+        let Some(git_root) = self.checkpoint_cache.get(&self.sandbox_root)? else {
+            return Ok(());
         };
         let paths_hint: Vec<String> = input["path"]
             .as_str()
@@ -15116,12 +15075,25 @@ impl Agent {
             &paths_hint,
             self.checkpoint_ordinal,
         ) {
-            Ok(Some(cp)) => self.append_latest_log("checkpoint", &format!("created {}", cp.id)),
-            Ok(None) => self.append_latest_log(
-                "checkpoint",
-                "skipped: no restorable repository state for this tool call",
-            ),
-            Err(e) => self.append_latest_log("checkpoint", &format!("warning: {e}")),
+            Ok(Some(cp)) => {
+                self.append_latest_log("checkpoint", &format!("created {}", cp.id));
+                Ok(())
+            }
+            Ok(None) => {
+                self.append_latest_log(
+                    "checkpoint",
+                    "skipped: no restorable repository state for this tool call",
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.append_latest_log("checkpoint", &format!("warning: {error}"));
+                if git_checkpoints::checkpoint_failure_blocks_tool(name) {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -15165,15 +15137,23 @@ impl Agent {
     /// Prompt context contributed by the typed shelf signal→effect loop
     /// (Context abilities of shelves that opt in via a load-signal Hook).
     fn shelf_context_section(&self) -> Option<String> {
-        self.shelf_registry
-            .collect_context(&shelves::Signal::Load, &self.shelf_frame(), 1_200)
+        self.shelf_registry.collect_context(
+            &shelves::Signal::Load,
+            &self.shelf_frame(),
+            1_200,
+            self.project_extensions_approved == Some(true),
+        )
     }
 
     /// A shelf veto for a tool call, if any behavioral shelf opts into tool
     /// signals and returns a Block effect. No-op for manifest-only shelves.
     fn shelf_tool_denial(&self, name: &str, input: &Value) -> Option<String> {
-        self.shelf_registry
-            .tool_block_reason(&self.shelf_frame(), name, input)
+        self.shelf_registry.tool_block_reason(
+            &self.shelf_frame(),
+            name,
+            input,
+            self.project_extensions_approved == Some(true),
+        )
     }
 
     fn budget_cap_denial(&mut self) -> Option<String> {
@@ -15224,11 +15204,15 @@ impl Agent {
             return (
                 prompt_context_files(&self.sandbox_root, "DEXT.md"),
                 prompt_context_files(&self.sandbox_root, "recall.md"),
-                packs::pack_summary_for_prompt(&self.sandbox_root),
+                packs::pack_summary_for_prompt(
+                    &self.sandbox_root,
+                    self.project_extensions_approved == Some(true),
+                ),
             );
         };
         if let Some(cache) = guard.as_ref()
             && cache.epoch == self.prompt_scan_epoch
+            && cache.include_project_extensions == (self.project_extensions_approved == Some(true))
             && prompt_context_scan_is_current(&cache.dext_md)
             && prompt_context_scan_is_current(&cache.recall)
         {
@@ -15240,7 +15224,10 @@ impl Agent {
         }
         let dext_md = scan_prompt_context_files(&self.sandbox_root, "DEXT.md");
         let recall = scan_prompt_context_files(&self.sandbox_root, "recall.md");
-        let pack_summary = packs::pack_summary_for_prompt(&self.sandbox_root);
+        let pack_summary = packs::pack_summary_for_prompt(
+            &self.sandbox_root,
+            self.project_extensions_approved == Some(true),
+        );
         let result = (
             dext_md.sections.clone(),
             recall.sections.clone(),
@@ -15248,6 +15235,7 @@ impl Agent {
         );
         *guard = Some(PromptScanCache {
             epoch: self.prompt_scan_epoch,
+            include_project_extensions: self.project_extensions_approved == Some(true),
             dext_md,
             recall,
             pack_summary,
@@ -15278,7 +15266,10 @@ impl Agent {
                 break;
             }
             prompt_sources.push(path.clone());
-            let section = format!("\n\n## Project context (DEXT.md from {label})\n{}", content);
+            let section = format!(
+                "\n\n## Project-controlled guidance (DEXT.md from {label})\n{}",
+                content
+            );
             if section.len() <= context_budget {
                 stable.push_str(&section);
                 context_budget -= section.len();
@@ -15289,7 +15280,7 @@ impl Agent {
                     "DEXT.md truncated; keep only the most important project guidance here.",
                 );
                 stable.push_str(&format!(
-                    "\n\n## Project context (DEXT.md from {label})\n{remaining}"
+                    "\n\n## Project-controlled guidance (DEXT.md from {label})\n{remaining}"
                 ));
                 context_budget = 0;
                 break;
@@ -15482,8 +15473,10 @@ impl Agent {
                     env.push('\n');
                 }
             }
-            if let Some(shelf_summary) = shelves::registry_summary_for_prompt(&self.shelf_registry)
-            {
+            if let Some(shelf_summary) = shelves::registry_summary_for_prompt(
+                &self.shelf_registry,
+                self.project_extensions_approved == Some(true),
+            ) {
                 env.push_str("\n## Dext shelves\n");
                 env.push_str(&cap_bytes_with_hint(
                     shelf_summary,
@@ -15611,7 +15604,10 @@ impl Agent {
                 env.push('\n');
             }
         }
-        if let Some(shelf_summary) = shelves::registry_summary_for_prompt(&self.shelf_registry) {
+        if let Some(shelf_summary) = shelves::registry_summary_for_prompt(
+            &self.shelf_registry,
+            self.project_extensions_approved == Some(true),
+        ) {
             env.push_str("\n## Dext shelves\n");
             env.push_str(&cap_bytes_with_hint(
                 shelf_summary,
@@ -17474,11 +17470,21 @@ impl Agent {
     }
 
     async fn chat(&mut self, user_input: String) -> Result<()> {
+        self.chat_with_pack_activation(user_input, false).await
+    }
+
+    async fn chat_with_pack_activation(
+        &mut self,
+        user_input: String,
+        suppress_pack_activation_for_turn: bool,
+    ) -> Result<()> {
         self.interrupt.store(false, Ordering::SeqCst);
         self.begin_provider_turn();
         self.sink.emit(AgentEvent::TurnStart);
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
-        let result = self.chat_inner(user_input).await;
+        let result = self
+            .chat_inner(user_input, suppress_pack_activation_for_turn)
+            .await;
         if result.is_err() {
             let interrupted = self.interrupt.load(Ordering::SeqCst);
             if interrupted {
@@ -17492,28 +17498,57 @@ impl Agent {
         result
     }
 
-    async fn chat_inner(&mut self, mut user_input: String) -> Result<()> {
+    async fn chat_inner(
+        &mut self,
+        mut user_input: String,
+        suppress_pack_activation_for_turn: bool,
+    ) -> Result<()> {
         let mut compacted_this_turn = false;
         // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
         // walks, pack discovery) on the first request of the turn.
         self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         let turn_id = format!("turn-{}-{}", unix_timestamp_secs(), self.prompt_scan_epoch);
         self.git_context = git_summary(&self.sandbox_root);
-        if !self.suppress_pack_activation
-            && let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input)
+        let suppress_pack_activation =
+            self.suppress_pack_activation || suppress_pack_activation_for_turn;
+        let project_pack_requested = !suppress_pack_activation
+            && packs::project_pack_invocation_requested(&self.sandbox_root, &user_input);
+        let project_context_requested =
+            !suppress_pack_activation && self.shelf_registry.has_project_extensions();
+        if (project_context_requested || project_pack_requested)
+            && self.project_extensions_approved.is_none()
         {
+            approve_project_extensions(self);
+        }
+        let inferred_pack = if suppress_pack_activation {
+            None
+        } else {
+            packs::infer_pack_invocation_with_project(
+                &self.sandbox_root,
+                &user_input,
+                self.project_extensions_approved == Some(true),
+            )
+        };
+        if project_pack_requested && self.project_extensions_approved != Some(true) {
+            self.sink.emit(AgentEvent::Info(
+                "project-controlled pack auto-invocation not approved; matching non-project packs remain eligible"
+                    .to_string(),
+            ));
+        }
+        if let Some(invocation) = inferred_pack {
             if pack_auto_invocation_disabled_by_env(&invocation.pack) {
                 self.sink.emit(AgentEvent::Info(format!(
                     "[pack:{}] auto-invocation disabled by DEXT_NO_PACK",
                     invocation.pack.name
                 )));
             } else {
+                let prompt = packs::pack_prompt(&invocation.pack, &invocation.task)?;
                 self.activate_pack_hooks(&invocation.pack);
                 self.sink.emit(AgentEvent::Info(format!(
                     "[pack:{}] inferred conversational invocation",
                     invocation.pack.name
                 )));
-                user_input = packs::pack_prompt(&invocation.pack, &invocation.task)?;
+                user_input = prompt;
             }
         }
         let mut hooks_approval_decided = !self.hooks.is_empty();
@@ -21820,6 +21855,30 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
 
 const DIAGNOSTICS_APPROVAL_NAME: &str = "diagnostics";
 
+fn approve_project_extensions(agent: &mut Agent) -> bool {
+    if let Some(approved) = agent.project_extensions_approved {
+        return approved;
+    }
+    if agent.approval_profile == ApprovalProfile::Never {
+        agent.project_extensions_approved = Some(false);
+        return false;
+    }
+    let input = json!({
+        "operation": "load project-controlled shelf context or PACK.md workflows for this repository",
+        "paths": [".dext/shelves/*/shelf.json", ".dext/shelves/*/packs/*/PACK.md"],
+        "risk": "repository-controlled text can steer the model; tool side effects still use normal approval and sandbox controls"
+    });
+    let approved = match agent
+        .sink
+        .request_permission(PROJECT_EXTENSIONS_APPROVAL_NAME, &input)
+    {
+        Choice::Once | Choice::Always => true,
+        Choice::Deny => false,
+    };
+    agent.project_extensions_approved = Some(approved);
+    approved
+}
+
 fn hooks_approved(agent: &mut Agent) -> bool {
     if agent.hooks.is_empty() {
         return false;
@@ -23690,7 +23749,7 @@ fn run_eval_shell_command(
     command: &str,
 ) -> std::result::Result<(i32, String, String), String> {
     let bash = bash_executable_path();
-    let mut sandboxed = sandbox::std_command(&bash, SandboxProfile::ReadOnly, root, &[])
+    let mut sandboxed = sandbox::std_command(&bash, SandboxProfile::ReadOnly, root)
         .map_err(|error| format!("prepare eval sandbox: {error}"))?;
     sandboxed
         .arg("--noprofile")

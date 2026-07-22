@@ -4,7 +4,11 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+const SHELF_MANIFEST_CAP: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub(crate) struct ShelfId(String);
@@ -379,10 +383,13 @@ impl ShelfRegistry {
         self.shelves.iter().map(|shelf| shelf.manifest()).collect()
     }
 
-    pub(crate) fn resolve(&self) -> Vec<ResolvedAbility> {
+    fn resolve_with_project(&self, include_project: bool) -> Vec<ResolvedAbility> {
         let mut map: BTreeMap<String, (u8, usize, usize, ResolvedAbility)> = BTreeMap::new();
         for (shelf_index, shelf) in self.shelves.iter().enumerate() {
             let manifest = shelf.manifest();
+            if !include_project && manifest.origin.scope == ShelfScope::Project {
+                continue;
+            }
             let rank = manifest.origin.scope.rank();
             for (pack_index, pack) in manifest.packs.iter().enumerate() {
                 for ability in &pack.abilities {
@@ -411,6 +418,10 @@ impl ShelfRegistry {
             .collect()
     }
 
+    pub(crate) fn resolve(&self) -> Vec<ResolvedAbility> {
+        self.resolve_with_project(true)
+    }
+
     pub(crate) fn emit(&self, signal: &Signal, frame: &ShelfFrame) -> Result<Vec<Effect>> {
         let mut effects = Vec::new();
         for shelf in &self.shelves {
@@ -436,27 +447,46 @@ impl ShelfRegistry {
     }
 
     /// Collect Context/Note effects produced for a load/prompt signal into a
-    /// single priority-ordered block bounded by `total_budget` bytes. Returns
-    /// None when no shelf opts into the signal or produces context.
+    /// single priority-ordered block bounded by `total_budget` bytes. Project
+    /// manifest context is omitted until the caller confirms project extensions.
     pub(crate) fn collect_context(
         &self,
         signal: &Signal,
         frame: &ShelfFrame,
         total_budget: usize,
+        include_project: bool,
     ) -> Option<String> {
         if !self.wants_any(signal.kind()) {
             return None;
         }
-        let effects = self.emit(signal, frame).ok()?;
-        let mut items: Vec<(i16, String)> = effects
-            .into_iter()
-            .filter_map(|effect| match effect {
-                Effect::Context { text, priority } => Some((priority, text)),
-                Effect::Note { text } => Some((0, text)),
-                _ => None,
-            })
-            .filter(|(_, text)| !text.trim().is_empty())
-            .collect();
+        let mut items: Vec<(i16, String)> = Vec::new();
+        for shelf in &self.shelves {
+            let manifest = shelf.manifest();
+            if !wants_signal(manifest, signal.kind())
+                || (!include_project && manifest.origin.scope == ShelfScope::Project)
+            {
+                continue;
+            }
+            let project_controlled = manifest.origin.scope == ShelfScope::Project;
+            let effects = shelf.on_signal(signal, frame).ok()?;
+            let blocked = effects.iter().any(Effect::stops_flow);
+            items.extend(effects.into_iter().filter_map(|effect| {
+                let (priority, text) = match effect {
+                    Effect::Context { text, priority } => (priority, text),
+                    Effect::Note { text } => (0, text),
+                    _ => return None,
+                };
+                let text = if project_controlled {
+                    format!("[project-controlled shelf context] {text}")
+                } else {
+                    text
+                };
+                (!text.trim().is_empty()).then_some((priority, text))
+            }));
+            if blocked {
+                break;
+            }
+        }
         if items.is_empty() {
             return None;
         }
@@ -483,6 +513,12 @@ impl ShelfRegistry {
         (!out.is_empty()).then_some(out)
     }
 
+    pub(crate) fn has_project_extensions(&self) -> bool {
+        self.shelves
+            .iter()
+            .any(|shelf| shelf.manifest().origin.scope == ShelfScope::Project)
+    }
+
     /// Emit a tool "before" signal and return the first Block reason, if any.
     /// Lets behavioral shelves veto a tool call before it runs.
     pub(crate) fn tool_block_reason(
@@ -490,21 +526,30 @@ impl ShelfRegistry {
         frame: &ShelfFrame,
         name: &str,
         input: &Value,
+        include_project: bool,
     ) -> Option<String> {
-        if !self.wants_any(SignalKind::Tool) {
-            return None;
-        }
         let signal = Signal::Tool {
             phase: ToolPhase::Before,
             name: name.to_string(),
             input: input.clone(),
             output: None,
         };
-        let effects = self.emit(&signal, frame).ok()?;
-        effects.into_iter().find_map(|effect| match effect {
-            Effect::Block { reason } => Some(reason),
-            _ => None,
-        })
+        for shelf in &self.shelves {
+            let manifest = shelf.manifest();
+            if !wants_signal(manifest, SignalKind::Tool)
+                || (!include_project && manifest.origin.scope == ShelfScope::Project)
+            {
+                continue;
+            }
+            let effects = shelf.on_signal(&signal, frame).ok()?;
+            if let Some(reason) = effects.into_iter().find_map(|effect| match effect {
+                Effect::Block { reason } => Some(reason),
+                _ => None,
+            }) {
+                return Some(reason);
+            }
+        }
+        None
     }
 }
 
@@ -535,8 +580,48 @@ impl StaticShelf {
     }
 
     pub(crate) fn from_json_file(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspecting shelf manifest {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("shelf manifest is not a regular file: {}", path.display());
+        }
+        if metadata.len() > SHELF_MANIFEST_CAP {
+            bail!(
+                "shelf manifest exceeds the {} byte limit: {}",
+                SHELF_MANIFEST_CAP,
+                path.display()
+            );
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("opening shelf manifest {}", path.display()))?;
+        let opened = file
+            .metadata()
+            .with_context(|| format!("inspecting open shelf manifest {}", path.display()))?;
+        if !opened.is_file() || opened.len() > SHELF_MANIFEST_CAP {
+            bail!(
+                "shelf manifest changed or exceeds its byte limit: {}",
+                path.display()
+            );
+        }
+        let mut text = String::new();
+        file.take(SHELF_MANIFEST_CAP + 1)
+            .read_to_string(&mut text)
             .with_context(|| format!("reading shelf manifest {}", path.display()))?;
+        if text.len() as u64 > SHELF_MANIFEST_CAP {
+            bail!(
+                "shelf manifest exceeds the {} byte limit: {}",
+                SHELF_MANIFEST_CAP,
+                path.display()
+            );
+        }
         let mut manifest: ShelfManifest = serde_json::from_str(&text)
             .with_context(|| format!("parsing shelf manifest {}", path.display()))?;
         manifest
@@ -609,13 +694,6 @@ fn shelf_manifest_candidates(root: &Path) -> Vec<ShelfManifestCandidate> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
-    let bundled_shelves = Path::new(env!("CARGO_MANIFEST_DIR")).join("shelves");
-    push_shelf_manifest_root(
-        &mut candidates,
-        &mut seen,
-        bundled_shelves,
-        ShelfScope::Core,
-    );
     push_shelf_manifest_root(
         &mut candidates,
         &mut seen,
@@ -688,7 +766,7 @@ pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
     let opts = crate::list_render::ListOptions::detect(false);
 
     if registry.is_empty() {
-        return "Shelves  none found\nsearch paths: .dext/shelves/*/shelf.json, DEXT_SHELVES_DIR, ~/.dext/shelves/*/shelf.json, bundled shelves".to_string();
+        return "Shelves  none found\nsearch paths: .dext/shelves/*/shelf.json, DEXT_SHELVES_DIR, ~/.dext/shelves/*/shelf.json".to_string();
     }
 
     let manifests = registry.manifests();
@@ -737,12 +815,19 @@ pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
     out
 }
 
-pub(crate) fn registry_summary_for_prompt(registry: &ShelfRegistry) -> Option<String> {
-    if registry.is_empty() {
+pub(crate) fn registry_summary_for_prompt(
+    registry: &ShelfRegistry,
+    include_project: bool,
+) -> Option<String> {
+    let manifests = registry
+        .manifests()
+        .into_iter()
+        .filter(|manifest| include_project || manifest.origin.scope != ShelfScope::Project)
+        .collect::<Vec<_>>();
+    if manifests.is_empty() {
         return None;
     }
-    let manifests = registry.manifests();
-    let resolved = registry.resolve();
+    let resolved = registry.resolve_with_project(include_project);
     let mut out = format!(
         "Typed shelf registry: {} shelf(s), {} resolved ability metadata entr{}.",
         manifests.len(),
@@ -927,12 +1012,16 @@ mod tests {
 
     impl GuardShelf {
         fn new() -> Self {
+            Self::with_scope(ShelfScope::Core)
+        }
+
+        fn with_scope(scope: ShelfScope) -> Self {
             Self {
                 manifest: ShelfManifest {
-                    id: ShelfId::new("core").unwrap(),
-                    name: "core".to_string(),
-                    description: "built-in Dext shelf".to_string(),
-                    origin: ShelfOrigin::core(),
+                    id: ShelfId::new("guard").unwrap(),
+                    name: "guard".to_string(),
+                    description: "Dext guard shelf".to_string(),
+                    origin: ShelfOrigin { scope, path: None },
                     mode: ShelfMode::Always,
                     packs: vec![PackManifest {
                         id: PackId::new("guard").unwrap(),
@@ -1030,6 +1119,14 @@ mod tests {
             "project search",
         ));
 
+        assert!(registry.has_project_extensions());
+        let unapproved = registry_summary_for_prompt(&registry, false).unwrap();
+        assert!(
+            unapproved.contains("tool:search (core/search, core search)"),
+            "{unapproved}"
+        );
+        assert!(!unapproved.contains("project search"), "{unapproved}");
+
         let resolved = registry.resolve();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].shelf, ShelfId::new("project").unwrap());
@@ -1087,6 +1184,7 @@ mod tests {
             &ShelfFrame::new("."),
             "bash",
             &json!({"command": "rm -rf target"}),
+            true,
         );
         assert_eq!(
             reason.as_deref(),
@@ -1095,8 +1193,32 @@ mod tests {
         // A benign command is not vetoed.
         assert!(
             registry
-                .tool_block_reason(&ShelfFrame::new("."), "bash", &json!({"command": "ls"}))
+                .tool_block_reason(
+                    &ShelfFrame::new("."),
+                    "bash",
+                    &json!({"command": "ls"}),
+                    true,
+                )
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn unapproved_project_shelf_cannot_block_tools() {
+        let mut registry = ShelfRegistry::new();
+        registry.register(GuardShelf::with_scope(ShelfScope::Project));
+        let input = json!({"command": "rm -rf target"});
+
+        assert!(
+            registry
+                .tool_block_reason(&ShelfFrame::new("."), "bash", &input, false)
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .tool_block_reason(&ShelfFrame::new("."), "bash", &input, true)
+                .as_deref(),
+            Some("destructive command blocked by pack")
         );
     }
 
@@ -1136,7 +1258,7 @@ mod tests {
         // Context ability + a load-signal hook → injected.
         let mut registry = ShelfRegistry::new();
         registry.register(context_shelf(true));
-        let block = registry.collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000);
+        let block = registry.collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000, true);
         assert!(
             block
                 .as_deref()
@@ -1149,7 +1271,7 @@ mod tests {
         registry.register(context_shelf(false));
         assert!(
             registry
-                .collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000)
+                .collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000, true)
                 .is_none()
         );
     }
@@ -1165,7 +1287,7 @@ mod tests {
         registry.register(shelf);
 
         let block = registry
-            .collect_context(&Signal::Load, &ShelfFrame::new("."), 17)
+            .collect_context(&Signal::Load, &ShelfFrame::new("."), 17, true)
             .expect("bounded context");
         assert!(block.len() <= 17, "{} bytes: {block:?}", block.len());
         assert!(block.is_char_boundary(block.len()));
@@ -1226,6 +1348,59 @@ mod tests {
             Ability::Context(context) => assert_eq!(context.budget, 1024),
             other => panic!("expected context ability, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_shelf_rejects_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "dext-shelf-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("outside.json");
+        std::fs::write(&target, "{}").unwrap();
+        let manifest = root.join("shelf.json");
+        symlink(&target, &manifest).unwrap();
+
+        let error = match StaticShelf::from_json_file(&manifest) {
+            Err(error) => error,
+            Ok(_) => panic!("symlink must be rejected"),
+        };
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "{error:#}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn static_shelf_rejects_oversized_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "dext-shelf-oversized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest = root.join("shelf.json");
+        let file = std::fs::File::create(&manifest).unwrap();
+        file.set_len(SHELF_MANIFEST_CAP + 1).unwrap();
+
+        let error = match StaticShelf::from_json_file(&manifest) {
+            Err(error) => error,
+            Ok(_) => panic!("oversize must be rejected"),
+        };
+        assert!(error.to_string().contains("byte limit"), "{error:#}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1295,7 +1470,7 @@ mod tests {
         assert!(listing.contains("scope: run"), "{listing}");
         assert!(listing.contains("tool:search"), "{listing}");
         assert!(listing.contains("run search"), "{listing}");
-        let summary = registry_summary_for_prompt(&registry).unwrap();
+        let summary = registry_summary_for_prompt(&registry, true).unwrap();
         assert!(
             summary.contains("tool:search (community/search, run search)"),
             "{summary}"

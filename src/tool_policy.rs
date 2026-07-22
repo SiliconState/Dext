@@ -193,24 +193,7 @@ fn awk_statement_has_top_level_redirection(statement: &str) -> bool {
 }
 
 pub(crate) fn required_fields_for_tool(name: &str) -> &'static [&'static str] {
-    match name {
-        "read_file" => &["path"],
-        "read_symbol" => &["path"],
-        "write_file" => &["path", "content"],
-        "edit_file" => &["path", "old_string", "new_string"],
-        "multi_edit" => &["path", "edits"],
-        "bash" => &["command"],
-        "fd" => &["pattern"],
-        "rg" => &["pattern"],
-        "jq" => &["filter"],
-        "fzf" => &["query", "items"],
-        "http" => &["args"],
-        "awk" => &["args"],
-        "csvkit" => &["subcommand", "args"],
-        "git_commit" => &["message"],
-        "todo_write" => &["todos"],
-        _ => &[],
-    }
+    crate::tools::required_fields(name)
 }
 
 pub(crate) fn missing_required_tool_fields(name: &str, input: &Value) -> Vec<&'static str> {
@@ -660,11 +643,16 @@ fn skip_env_command_prefix(words: &[String], idx: &mut usize) {
 }
 
 fn shell_command_basename(word: &str) -> &str {
-    word.rsplit('/')
+    let basename = word
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(word)
         .trim_start_matches(['(', '{'])
-        .trim_end_matches([')', '}'])
+        .trim_end_matches([')', '}']);
+    basename
+        .strip_suffix(".exe")
+        .or_else(|| basename.strip_suffix(".com"))
+        .unwrap_or(basename)
 }
 
 fn skip_command_builtin_prefix(words: &[String], idx: &mut usize) {
@@ -1683,6 +1671,9 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     match command {
         "find" => invocation.iter().any(|arg| arg == "-delete"),
         "git" => git_invocation_is_dangerous(invocation),
+        "python" | "python3" | "perl" | "node" | "nodejs" => {
+            interpreter_inline_code_is_dangerous(command, invocation)
+        }
         "docker" | "podman" => container_invocation_is_dangerous(invocation),
         "curl" => curl_invocation_is_dangerous(invocation),
         "wget" => wget_invocation_is_dangerous(invocation),
@@ -1714,6 +1705,96 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     }
 }
 
+fn interpreter_inline_code_is_dangerous(command: &str, invocation: &[String]) -> bool {
+    let args = &invocation[1..];
+    if args.is_empty() {
+        return true;
+    }
+    let inline = args.iter().any(|arg| match command {
+        "python" | "python3" => arg == "-" || arg == "-c" || arg.starts_with("-c") && arg.len() > 2,
+        "perl" => {
+            arg == "-"
+                || arg == "-e"
+                || arg == "-E"
+                || arg.starts_with("-e")
+                || arg.starts_with("-E")
+                || (arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && !arg.starts_with("-I")
+                    && !arg.starts_with("-F")
+                    && !arg.starts_with("-M")
+                    && !arg.starts_with("-m")
+                    && arg[1..].chars().any(|flag| matches!(flag, 'e' | 'E')))
+        }
+        "node" | "nodejs" => {
+            arg == "-"
+                || matches!(arg.as_str(), "-e" | "--eval" | "-p" | "--print")
+                || arg.starts_with("-e")
+                || arg.starts_with("-p")
+                || arg.starts_with("--eval=")
+                || arg.starts_with("--print=")
+        }
+        _ => false,
+    });
+    if inline
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "-v" | "-V" | "--version"))
+    {
+        return inline;
+    }
+    !interpreter_has_explicit_program(command, args)
+}
+
+fn interpreter_has_explicit_program(command: &str, args: &[String]) -> bool {
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            return args.get(index + 1).is_some_and(|next| next != "-");
+        }
+        match command {
+            "python" | "python3" => {
+                if arg == "-m" {
+                    return args.get(index + 1).is_some();
+                }
+                if arg.starts_with("-m") && arg.len() > 2 {
+                    return true;
+                }
+                if matches!(arg, "-W" | "-X" | "--check-hash-based-pycs") {
+                    index = index.saturating_add(2);
+                    continue;
+                }
+            }
+            "perl" if matches!(arg, "-I" | "-F") => {
+                index = index.saturating_add(2);
+                continue;
+            }
+            "node" | "nodejs"
+                if matches!(
+                    arg,
+                    "-r" | "--require"
+                        | "--loader"
+                        | "--import"
+                        | "--conditions"
+                        | "--input-type"
+                        | "--inspect-port"
+                ) =>
+            {
+                index = index.saturating_add(2);
+                continue;
+            }
+            _ => {}
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 fn git_invocation_is_dangerous(invocation: &[String]) -> bool {
     let Some(subcommand_idx) = git_subcommand_index(invocation, 0) else {
         return false;
@@ -1721,7 +1802,11 @@ fn git_invocation_is_dangerous(invocation: &[String]) -> bool {
     let subcommand = invocation[subcommand_idx].as_str();
     let args = &invocation[subcommand_idx.saturating_add(1)..];
     match subcommand {
-        "push" | "clean" => true,
+        "push" | "clean" | "checkout" => true,
+        "stash" => args
+            .iter()
+            .find(|arg| !arg.starts_with('-'))
+            .is_some_and(|action| matches!(action.as_str(), "drop" | "clear" | "pop")),
         "reset" => args
             .iter()
             .any(|arg| arg == "--hard" || arg.starts_with("--hard=")),
@@ -2180,6 +2265,19 @@ mod tests {
             "git -C repo push origin main",
             "git --git-dir=.git push origin main",
             "git reset --hard HEAD~1",
+            "git checkout -- .",
+            "git.exe checkout -- .",
+            "git stash drop",
+            "git stash clear",
+            "git stash pop",
+            "python3 -c 'import shutil; shutil.rmtree(\"build\")'",
+            "C:/Python/python.exe -c 'import shutil; shutil.rmtree(\"build\")'",
+            "python3 -c'import os; os.unlink(\"stale\")'",
+            "printf 'import os; os.unlink(\"stale\")' | python3",
+            "perl -e 'unlink \"stale.txt\"'",
+            "perl -E'unlink \"stale.txt\"'",
+            "node -e 'require(\"fs\").rmSync(\"build\", {recursive:true})'",
+            "node -p 'require(\"fs\").rmSync(\"build\", {recursive:true})'",
             "docker system prune",
             "curl --request=DELETE https://example.invalid/item/1",
             "curl --data=x=1 https://example.invalid/items",
@@ -2239,6 +2337,21 @@ mod tests {
         assert_ne!(
             classify_command_risk("bash", &json!({"command": "git -C . status"})),
             CommandRisk::Danger
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "python3 script.py"})),
+            CommandRisk::Write,
+            "script execution remains ordinary write-risk"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "python.exe script.py"})),
+            CommandRisk::Write,
+            "Windows-suffixed script execution remains ordinary write-risk"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "git stash list"})),
+            CommandRisk::Write,
+            "non-destructive stash operations are not promoted to danger"
         );
         // git branch listing is read-only; branch mutation/creation is not.
         assert_eq!(

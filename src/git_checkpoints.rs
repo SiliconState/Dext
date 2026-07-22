@@ -26,13 +26,14 @@ pub(crate) struct Checkpoint {
     pub paths_hint: Vec<String>,
     pub includes_untracked_sidecar: bool,
     /// Untracked (not-ignored) repo paths present when the checkpoint was
-    /// taken. Lets undo/preview name untracked files a write-risk command
-    /// created or removed afterwards, even though `git stash create` does not
-    /// capture untracked content.
+    /// taken. Arbitrary-command checkpoints also preserve bounded regular-file
+    /// content for these paths in the checkpoint sidecar.
     pub untracked_snapshot: Vec<String>,
 }
 
 const UNTRACKED_SNAPSHOT_CAP: usize = 500;
+const BASH_UNTRACKED_SIDECAR_FILE_CAP: u64 = 8 * 1024 * 1024;
+const BASH_UNTRACKED_SIDECAR_TOTAL_CAP: u64 = 32 * 1024 * 1024;
 
 fn random_checkpoint_nonce() -> Result<String, String> {
     let mut bytes = [0u8; 16];
@@ -44,20 +45,39 @@ fn git_command(cwd: &Path, args: &[&str]) -> Result<crate::InternalCommandOutput
     crate::run_internal_git_command(cwd, args)
 }
 
+struct UntrackedFiles {
+    paths: Vec<String>,
+    truncated: bool,
+}
+
 /// List untracked, not-ignored repo paths via porcelain status.
-fn untracked_files(git_root: &Path) -> Vec<String> {
-    let Ok(out) = run_git(
+fn untracked_files(git_root: &Path) -> Result<UntrackedFiles, String> {
+    let output = git_command(
         git_root,
-        &["status", "--porcelain", "--untracked-files=all"],
-    ) else {
-        return Vec::new();
-    };
-    out.lines()
-        .filter_map(|line| line.strip_prefix("?? "))
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .take(UNTRACKED_SNAPSHOT_CAP)
-        .collect()
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )?;
+    if !output.success() {
+        return Err(format!(
+            "git status --porcelain -z --untracked-files=all: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|record| record.strip_prefix(b"?? "))
+        .map(git_path_from_bytes)
+        .map(|path| {
+            let path = path?;
+            path.into_os_string()
+                .into_string()
+                .map_err(|_| "untracked checkpoint path is not valid UTF-8".to_string())
+        })
+        .take(UNTRACKED_SNAPSHOT_CAP + 1)
+        .collect::<Result<Vec<_>, String>>()?;
+    let truncated = paths.len() > UNTRACKED_SNAPSHOT_CAP;
+    paths.truncate(UNTRACKED_SNAPSHOT_CAP);
+    Ok(UntrackedFiles { paths, truncated })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,15 +88,37 @@ pub(crate) enum RestoreMode {
     ResetHead,
 }
 
+fn git_marker_in_ancestry(root: &Path) -> Result<bool, String> {
+    let mut current = root;
+    loop {
+        match std::fs::symlink_metadata(current.join(".git")) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect Git marker under {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+        let Some(parent) = current.parent() else {
+            return Ok(false);
+        };
+        if parent == current {
+            return Ok(false);
+        }
+        current = parent;
+    }
+}
+
 pub(crate) fn repo_root(root: &Path) -> Result<Option<PathBuf>, String> {
+    if !git_marker_in_ancestry(root)? {
+        return Ok(None);
+    }
     let output = git_command(root, &["rev-parse", "--show-toplevel"])?;
     if output.success() {
         let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
         return Ok((!trimmed.is_empty()).then(|| PathBuf::from(trimmed)));
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    if stderr.contains("not a git repository") || stderr.contains("outside repository") {
-        return Ok(None);
     }
     Err(format!(
         "git rev-parse --show-toplevel: {}",
@@ -697,14 +739,14 @@ fn head_oid(git_root: &Path) -> Result<Option<String>, String> {
     ))
 }
 
-/// Save untracked file content as a sidecar before direct file tools
-/// overwrite it. Returns the sidecar directory path on success.
-pub(crate) fn save_untracked_sidecar(
+/// Save untracked file content as a private checkpoint sidecar.
+fn save_untracked_sidecar(
     git_root: &Path,
     id: &str,
     abs_path: &Path,
     git_root_relative: &Path,
-) -> Result<(), String> {
+    max_bytes: Option<u64>,
+) -> Result<u64, String> {
     if !safe_checkpoint_id(id) || !safe_repo_relative_path(git_root_relative) {
         return Err("unsafe checkpoint sidecar path".to_string());
     }
@@ -731,12 +773,85 @@ pub(crate) fn save_untracked_sidecar(
         return Err("checkpoint sidecar source is not a regular file".to_string());
     }
     let mut destination = create_private_file(&dest).map_err(|e| format!("sidecar write: {e}"))?;
-    if let Err(error) = std::io::copy(&mut source, &mut destination) {
-        drop(destination);
-        let _ = std::fs::remove_file(&dest);
-        return Err(format!("sidecar copy: {error}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if source_metadata.permissions().mode() & 0o100 != 0 {
+            0o700
+        } else {
+            0o600
+        };
+        destination
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("sidecar permissions: {error}"))?;
     }
-    Ok(())
+    let copy_result = match max_bytes {
+        Some(limit) => std::io::copy(
+            &mut (&mut source).take(limit.saturating_add(1)),
+            &mut destination,
+        ),
+        None => std::io::copy(&mut source, &mut destination),
+    };
+    let copied = match copy_result {
+        Ok(copied) if max_bytes.is_some_and(|limit| copied > limit) => {
+            drop(destination);
+            let _ = std::fs::remove_file(&dest);
+            return Err(
+                "checkpoint sidecar source exceeded its byte limit while copying".to_string(),
+            );
+        }
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(destination);
+            let _ = std::fs::remove_file(&dest);
+            return Err(format!("sidecar copy: {error}"));
+        }
+    };
+    Ok(copied)
+}
+
+fn save_bash_untracked_sidecars(
+    git_root: &Path,
+    id: &str,
+    paths: &[String],
+) -> Result<bool, String> {
+    let mut total = 0u64;
+    for path in paths {
+        let relative = Path::new(path);
+        if !safe_repo_relative_path(relative) {
+            return Err(format!("unsafe untracked checkpoint path: {path}"));
+        }
+        let absolute = git_root.join(relative);
+        let metadata = std::fs::symlink_metadata(&absolute)
+            .map_err(|error| format!("inspect untracked checkpoint path {path}: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "untracked checkpoint path is not a regular file: {path}"
+            ));
+        }
+        if metadata.len() > BASH_UNTRACKED_SIDECAR_FILE_CAP {
+            return Err(format!(
+                "untracked checkpoint file exceeds {} MiB sidecar limit: {path}",
+                BASH_UNTRACKED_SIDECAR_FILE_CAP / 1024 / 1024
+            ));
+        }
+        if total.saturating_add(metadata.len()) > BASH_UNTRACKED_SIDECAR_TOTAL_CAP {
+            return Err(format!(
+                "untracked checkpoint content exceeds {} MiB total sidecar limit",
+                BASH_UNTRACKED_SIDECAR_TOTAL_CAP / 1024 / 1024
+            ));
+        }
+        let remaining = BASH_UNTRACKED_SIDECAR_TOTAL_CAP.saturating_sub(total);
+        let copied = save_untracked_sidecar(
+            git_root,
+            id,
+            &absolute,
+            relative,
+            Some(BASH_UNTRACKED_SIDECAR_FILE_CAP.min(remaining)),
+        )?;
+        total = total.saturating_add(copied);
+    }
+    Ok(!paths.is_empty())
 }
 
 /// Check if a path is tracked by Git.
@@ -884,8 +999,8 @@ fn create_checkpoint_ref(git_root: &Path, ref_name: &str, oid: &str) -> Result<(
 }
 
 /// Create a recovery checkpoint before a workspace mutation.
-/// Returns None if not in a Git repo or if HEAD is unborn. Returns error only on unexpected
-/// failures; checkpoint errors should warn but not block tool execution.
+/// Returns None if not in a Git repo or if there is no prior state to preserve.
+/// Unexpected failures are returned so callers can apply tool-specific policy.
 #[cfg(test)]
 pub(crate) fn create_checkpoint(
     root: &Path,
@@ -906,11 +1021,28 @@ pub(crate) fn create_checkpoint_in_repo(
     paths_hint: &[String],
     ordinal: usize,
 ) -> Result<Option<Checkpoint>, String> {
-    let Some(_) = head_oid(git_root)? else {
-        return Ok(None);
-    };
     let _operation_lock = CheckpointOperationLock::acquire(git_root)?;
+    let file_tools = ["write_file", "edit_file", "multi_edit"];
+    let arbitrary_command = matches!(tool, "bash" | "awk" | "csvkit");
     let Some(head) = head_oid(git_root)? else {
+        ensure_checkpoint_git_exclude(git_root)?;
+        if arbitrary_command && is_dirty(git_root)? {
+            return Err(
+                "repository has no initial commit and contains worktree or index state; commit or remove it before running an arbitrary write-risk command"
+                    .to_string(),
+            );
+        }
+        if file_tools.contains(&tool)
+            && paths_hint.iter().any(|path| {
+                resolve_user_repo_path(root, git_root, path)
+                    .is_some_and(|relative| git_root.join(relative).exists())
+            })
+        {
+            return Err(
+                "repository has no initial commit; commit the existing target before mutating it"
+                    .to_string(),
+            );
+        }
         return Ok(None);
     };
 
@@ -960,15 +1092,12 @@ pub(crate) fn create_checkpoint_in_repo(
     // point even if a future entropy source or caller regresses.
     create_checkpoint_ref(git_root, &ref_name, &oid)?;
 
-    // Handle untracked sidecar for direct file tools. A checkpoint that cannot
-    // preserve an existing untracked target is not a usable recovery point.
     let mut includes_untracked_sidecar = false;
-    let file_tools = ["write_file", "edit_file", "multi_edit"];
     if file_tools.contains(&tool) {
         for rel in &normalized_paths {
             let abs = git_root.join(rel);
             if abs.is_file() && !is_tracked(git_root, rel) {
-                if let Err(error) = save_untracked_sidecar(git_root, &id, &abs, rel) {
+                if let Err(error) = save_untracked_sidecar(git_root, &id, &abs, rel, None) {
                     let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
                     let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &id));
                     return Err(format!(
@@ -981,13 +1110,32 @@ pub(crate) fn create_checkpoint_in_repo(
         }
     }
 
-    // Direct file tools already capture their exact target via the sidecar
-    // above, so skip the broad (and per-call costly) untracked scan for them;
-    // it is the value-add for arbitrary commands like bash.
-    let untracked_snapshot = if file_tools.contains(&tool) {
-        Vec::new()
+    let untracked_snapshot = if arbitrary_command {
+        let files = match untracked_files(git_root) {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
+                return Err(format!("list untracked checkpoint files: {error}"));
+            }
+        };
+        if files.truncated {
+            let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
+            return Err(format!(
+                "more than {UNTRACKED_SNAPSHOT_CAP} untracked files; bounded checkpoint sidecar unavailable"
+            ));
+        }
+        let paths = files.paths;
+        match save_bash_untracked_sidecars(git_root, &id, &paths) {
+            Ok(saved) => includes_untracked_sidecar = saved,
+            Err(error) => {
+                let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
+                let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &id));
+                return Err(format!("preserve untracked checkpoint files: {error}"));
+            }
+        }
+        paths
     } else {
-        untracked_files(git_root)
+        Vec::new()
     };
 
     let cp = Checkpoint {
@@ -1147,7 +1295,7 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
         || !untracked_snapshot
             .iter()
             .all(|path| safe_repo_relative_path(Path::new(path)))
-        || (parts[6] == "true" && paths_hint.is_empty())
+        || (parts[6] == "true" && paths_hint.is_empty() && untracked_snapshot.is_empty())
     {
         return None;
     }
@@ -1311,7 +1459,8 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
     {
         return Err(format!("unsafe checkpoint untracked path: {path}"));
     }
-    if cp.includes_untracked_sidecar && cp.paths_hint.is_empty() {
+    if cp.includes_untracked_sidecar && cp.paths_hint.is_empty() && cp.untracked_snapshot.is_empty()
+    {
         return Err("checkpoint sidecar has no declared restore paths".to_string());
     }
     Ok(())
@@ -1390,13 +1539,14 @@ fn preview_restore_locked(git_root: &Path, cp: &Checkpoint) -> Result<String, St
         }
     }
 
-    // Untracked-file delta since the checkpoint. `git stash create` does not
-    // capture untracked content, so name what changed instead of restoring it.
+    // Untracked-file delta since the checkpoint. Older manifests may only
+    // identify removed paths; current arbitrary-command checkpoints preserve
+    // bounded regular-file content in sidecars.
     let before: std::collections::HashSet<&str> =
         cp.untracked_snapshot.iter().map(String::as_str).collect();
-    let now = untracked_files(git_root);
-    let now_set: std::collections::HashSet<&str> = now.iter().map(String::as_str).collect();
+    let now = untracked_files(git_root)?;
     let created: Vec<&str> = now
+        .paths
         .iter()
         .map(String::as_str)
         .filter(|p| !before.contains(p))
@@ -1405,8 +1555,16 @@ fn preview_restore_locked(git_root: &Path, cp: &Checkpoint) -> Result<String, St
         .untracked_snapshot
         .iter()
         .map(String::as_str)
-        .filter(|p| !now_set.contains(p))
+        .filter(|path| {
+            std::fs::symlink_metadata(git_root.join(path))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
         .collect();
+    if now.truncated {
+        out.push_str(&format!(
+            "\nCurrent untracked-file scan capped at {UNTRACKED_SNAPSHOT_CAP} paths; listed deltas may be incomplete.\n"
+        ));
+    }
     if !created.is_empty() {
         out.push_str(
             "\nUntracked files created since checkpoint (restore will NOT remove them):\n",
@@ -1416,9 +1574,15 @@ fn preview_restore_locked(git_root: &Path, cp: &Checkpoint) -> Result<String, St
         }
     }
     if !removed.is_empty() {
-        out.push_str(
-            "\nUntracked files present at checkpoint but gone now (content not recoverable):\n",
-        );
+        if cp.includes_untracked_sidecar {
+            out.push_str(
+                "\nUntracked files present at checkpoint but gone now (sidecar content will be restored):\n",
+            );
+        } else {
+            out.push_str(
+                "\nUntracked files present at checkpoint but gone now (content not recoverable):\n",
+            );
+        }
         for p in removed.iter().take(50) {
             out.push_str(&format!("  - {p}\n"));
         }
@@ -1587,10 +1751,33 @@ fn preflight_sidecar_restore(
     if !cp.includes_untracked_sidecar {
         return Err("checkpoint has unexpected untracked sidecar files".to_string());
     }
-    let allowed = restore_paths
+    let allowed = if restore_paths.is_empty() {
+        cp.untracked_snapshot
+            .iter()
+            .map(Path::new)
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        restore_paths
+            .iter()
+            .map(|(relative, _)| relative.as_path())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let present = entries
         .iter()
-        .map(|(relative, _)| relative.as_path())
-        .collect::<std::collections::HashSet<_>>();
+        .map(|entry| {
+            entry
+                .strip_prefix(&sdir)
+                .map_err(|_| "checkpoint sidecar escapes its storage directory".to_string())
+        })
+        .collect::<Result<std::collections::HashSet<_>, String>>()?;
+    if restore_paths.is_empty()
+        && let Some(missing) = allowed.difference(&present).next()
+    {
+        return Err(format!(
+            "required untracked checkpoint sidecar is missing: {}",
+            missing.display()
+        ));
+    }
     for entry in &entries {
         let relative = entry
             .strip_prefix(&sdir)
@@ -1838,11 +2025,10 @@ fn copy_sidecar_file(source: &Path, git_root: &Path, relative: &Path) -> Result<
     let mut input = source_options
         .open(source)
         .map_err(|error| format!("open sidecar {}: {error}", source.display()))?;
-    if !safe_private_file_metadata(
-        &input
-            .metadata()
-            .map_err(|error| format!("sidecar metadata {}: {error}", source.display()))?,
-    ) {
+    let input_metadata = input
+        .metadata()
+        .map_err(|error| format!("sidecar metadata {}: {error}", source.display()))?;
+    if !safe_private_file_metadata(&input_metadata) {
         return Err(format!(
             "sidecar source is not a safe private file: {}",
             source.display()
@@ -1861,6 +2047,15 @@ fn copy_sidecar_file(source: &Path, git_root: &Path, relative: &Path) -> Result<
     })?;
     let mut temp_path = None;
     let mut output = None;
+    #[cfg(unix)]
+    let restore_mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        if input_metadata.permissions().mode() & 0o100 != 0 {
+            0o700
+        } else {
+            0o600
+        }
+    };
     for _ in 0..16 {
         let nonce = random_checkpoint_nonce()?;
         let candidate = parent.join(format!(".{file_name}.dext-restore-{nonce}"));
@@ -1869,7 +2064,7 @@ fn copy_sidecar_file(source: &Path, git_root: &Path, relative: &Path) -> Result<
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            options.mode(restore_mode).custom_flags(libc::O_NOFOLLOW);
         }
         match options.open(&candidate) {
             Ok(file) => {
@@ -2098,6 +2293,20 @@ pub(crate) fn latest_checkpoint(root: &Path) -> Result<Option<Checkpoint>, Strin
     Ok(cps.into_iter().next())
 }
 
+pub(crate) fn checkpoint_failure_blocks_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "awk"
+            | "csvkit"
+            | "write_file"
+            | "edit_file"
+            | "multi_edit"
+            | "todo_write"
+            | "git_commit"
+    )
+}
+
 /// Determine if a tool needs a checkpoint based on command risk.
 pub(crate) fn tool_needs_checkpoint(name: &str, input: &serde_json::Value) -> bool {
     let always = [
@@ -2110,7 +2319,9 @@ pub(crate) fn tool_needs_checkpoint(name: &str, input: &serde_json::Value) -> bo
     if always.contains(&name) {
         return true;
     }
-    // For bash/awk/csvkit, checkpoint only if write-risk
+    // Arbitrary command tools need a checkpoint when they can write. Other
+    // non-read tools keep the existing checkpoint policy without broad
+    // untracked-content capture.
     let risk = crate::tool_policy::classify_command_risk(name, input);
     risk != crate::tool_policy::CommandRisk::Read
 }
@@ -2126,10 +2337,14 @@ impl RepoRootCache {
     }
 
     pub(crate) fn get(&mut self, root: &Path) -> Result<Option<PathBuf>, String> {
-        if self.cached.is_none() {
-            self.cached = Some(repo_root(root)?);
+        if let Some(Some(cached)) = &self.cached {
+            return Ok(Some(cached.clone()));
         }
-        Ok(self.cached.as_ref().unwrap().clone())
+        let discovered = repo_root(root)?;
+        if discovered.is_some() {
+            self.cached = Some(discovered.clone());
+        }
+        Ok(discovered)
     }
 }
 

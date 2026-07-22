@@ -3,7 +3,7 @@
 // This is defense-in-depth that backstops the heuristic command-risk
 // classifier and native-tool path validation. Unsupported platforms keep native
 // path guards, but tool subprocesses run unconfined; once a kernel mechanism is
-// failures stop the child instead of silently running it unconfined.
+// selected, failures stop the child instead of silently running it unconfined.
 //
 // Enforcement by platform:
 //   - Linux:   Landlock LSM (kernel >= 5.13 with the LSM enabled).
@@ -295,25 +295,22 @@ pub(crate) fn std_command(
     program: impl AsRef<OsStr>,
     profile: SandboxProfile,
     root: &Path,
-    extra_read_roots: &[PathBuf],
 ) -> std::io::Result<SandboxedStdCommand> {
-    std_command_inner(program.as_ref(), profile, root, extra_read_roots, false)
+    std_command_inner(program.as_ref(), profile, root, false)
 }
 
 pub(crate) fn std_command_offline(
     program: impl AsRef<OsStr>,
     profile: SandboxProfile,
     root: &Path,
-    extra_read_roots: &[PathBuf],
 ) -> std::io::Result<SandboxedStdCommand> {
-    std_command_inner(program.as_ref(), profile, root, extra_read_roots, true)
+    std_command_inner(program.as_ref(), profile, root, true)
 }
 
 fn std_command_inner(
     program: &OsStr,
     profile: SandboxProfile,
     root: &Path,
-    extra_read_roots: &[PathBuf],
     offline: bool,
 ) -> std::io::Result<SandboxedStdCommand> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -353,9 +350,8 @@ fn std_command_inner(
             .as_ref()
             .map(|scratch| scratch.path.as_path())
             .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
-        let profile_text =
-            macos::profile_text(profile, root, extra_read_roots, scratch_path, offline)
-                .ok_or_else(|| std::io::Error::other("could not build macOS sandbox profile"))?;
+        let profile_text = macos::profile_text(profile, root, scratch_path, offline)
+            .ok_or_else(|| std::io::Error::other("could not build macOS sandbox profile"))?;
         let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(profile_text).arg(program);
         command
@@ -378,13 +374,7 @@ fn std_command_inner(
                 .as_ref()
                 .map(|scratch| scratch.path.as_path())
                 .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
-            linux::install_landlock_pre_exec_std(
-                &mut command,
-                profile,
-                root,
-                extra_read_roots,
-                scratch_path,
-            );
+            linux::install_landlock_pre_exec_std(&mut command, profile, root, scratch_path);
         }
         if offline {
             linux::install_offline_pre_exec_std(&mut command);
@@ -397,7 +387,7 @@ fn std_command_inner(
             .env("TMP", &scratch.path)
             .env("TEMP", &scratch.path);
     }
-    let _ = (profile, root, extra_read_roots, offline);
+    let _ = (profile, root, offline);
     Ok(SandboxedStdCommand { command, scratch })
 }
 
@@ -409,7 +399,6 @@ pub(crate) fn tokio_command(
     program: impl AsRef<OsStr>,
     profile: SandboxProfile,
     root: &Path,
-    extra_read_roots: &[PathBuf],
 ) -> std::io::Result<SandboxedCommand> {
     let program = program.as_ref();
     let scratch = Some(PrivateScratch::create()?);
@@ -420,9 +409,8 @@ pub(crate) fn tokio_command(
             .as_ref()
             .map(|scratch| scratch.path.as_path())
             .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
-        let profile_text =
-            macos::profile_text(profile, root, extra_read_roots, scratch_path, false)
-                .ok_or_else(|| std::io::Error::other("could not build macOS sandbox profile"))?;
+        let profile_text = macos::profile_text(profile, root, scratch_path, false)
+            .ok_or_else(|| std::io::Error::other("could not build macOS sandbox profile"))?;
         let mut command = tokio::process::Command::new("/usr/bin/sandbox-exec");
         command.arg("-p").arg(profile_text).arg(program);
         command
@@ -439,13 +427,7 @@ pub(crate) fn tokio_command(
             .as_ref()
             .map(|scratch| scratch.path.as_path())
             .ok_or_else(|| std::io::Error::other("confined command has no private scratch"))?;
-        linux::install_landlock_pre_exec(
-            &mut command,
-            profile,
-            root,
-            extra_read_roots,
-            scratch_path,
-        );
+        linux::install_landlock_pre_exec(&mut command, profile, root, scratch_path);
     }
 
     if let Some(scratch) = scratch.as_ref() {
@@ -454,7 +436,7 @@ pub(crate) fn tokio_command(
             .env("TMP", &scratch.path)
             .env("TEMP", &scratch.path);
     }
-    let _ = (profile, root, extra_read_roots);
+    let _ = (profile, root);
     Ok(SandboxedCommand {
         command,
         _scratch: scratch,
@@ -653,7 +635,6 @@ mod linux {
         cmd: &mut std::process::Command,
         profile: SandboxProfile,
         root: &Path,
-        extra_read_roots: &[std::path::PathBuf],
         scratch: &Path,
     ) {
         use std::os::unix::process::CommandExt as _;
@@ -661,7 +642,6 @@ mod linux {
         if landlock_abi().is_none() {
             return;
         }
-        let _ = extra_read_roots;
         let Some(ruleset) = build_ruleset(profile, root, scratch) else {
             unsafe {
                 cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
@@ -687,7 +667,6 @@ mod linux {
         cmd: &mut tokio::process::Command,
         profile: SandboxProfile,
         root: &Path,
-        extra_read_roots: &[std::path::PathBuf],
         scratch: &Path,
     ) {
         // Skip the work entirely if the kernel can't enforce Landlock.
@@ -697,7 +676,6 @@ mod linux {
         // Once a Landlock-capable kernel is detected, a requested confined
         // profile must not silently run unconfined because rule construction or
         // restriction failed.
-        let _ = extra_read_roots;
         let Some(ruleset) = build_ruleset(profile, root, scratch) else {
             unsafe {
                 cmd.pre_exec(|| Err(std::io::Error::from_raw_os_error(libc::EPERM)));
@@ -737,7 +715,6 @@ mod macos {
     pub(super) fn profile_text(
         profile: SandboxProfile,
         root: &Path,
-        _extra_read_roots: &[std::path::PathBuf],
         scratch: &Path,
         offline: bool,
     ) -> Option<String> {
@@ -899,7 +876,7 @@ mod tests {
         }
         let root = temp_dir("offline-network");
         let current_exe = std::env::current_exe().expect("locate test executable");
-        let mut command = std_command_offline(&current_exe, SandboxProfile::ReadOnly, &root, &[])
+        let mut command = std_command_offline(&current_exe, SandboxProfile::ReadOnly, &root)
             .expect("prepare offline child");
         let output = command
             .arg("--exact")
@@ -1027,7 +1004,7 @@ mod tests {
             for case in &cases {
                 let _ = std::fs::remove_file(case.observed);
                 let mut command =
-                    std_command("bash", profile, &workspace, &[]).expect("prepare matrix command");
+                    std_command("bash", profile, &workspace).expect("prepare matrix command");
                 let output = command
                     .current_dir(&workspace)
                     .arg("-c")
@@ -1074,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn confined_command_uses_one_private_temp_directory_and_cleans_it_up() {
         let root = temp_dir("private-temp-command");
-        let mut command = tokio_command("bash", SandboxProfile::ReadOnly, &root, &[])
+        let mut command = tokio_command("bash", SandboxProfile::ReadOnly, &root)
             .expect("prepare confined command");
         let output = command
             .arg("-c")

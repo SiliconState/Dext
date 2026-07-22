@@ -294,17 +294,6 @@ impl Agent {
             let plan = plan.expect("plan must be set");
 
             if matches!(plan, Plan::Builtin)
-                && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
-            {
-                self.work_ledger_note_file_change(&input);
-            }
-
-            // Create recovery checkpoint before write-risk mutations.
-            if matches!(plan, Plan::Builtin) {
-                self.maybe_create_tool_checkpoint(&name, &input);
-            }
-
-            if matches!(plan, Plan::Builtin)
                 && bulk_network
                 && let Some((_, msg)) =
                     turn_state.advance_phase(orchestrator::PhaseTrigger::ScaleCollection)
@@ -489,6 +478,17 @@ impl Agent {
                     );
                     continue;
                 }
+                // Sequential dispatch is the mutation boundary: a later call in
+                // the same round must checkpoint state produced by earlier calls.
+                if let Err(error) = self.maybe_create_tool_checkpoint(&n, &inp) {
+                    builtin_outputs.insert(
+                        idx,
+                        Err(format!(
+                            "{n} was not executed because its recovery checkpoint failed: {error}"
+                        )),
+                    );
+                    continue;
+                }
                 if self.session_enabled && is_side_effect_capable_tool(&n) {
                     match tool_journal::start(
                         &root,
@@ -663,7 +663,11 @@ impl Agent {
 
             let (mut content, is_error) = match plan {
                 Plan::Immediate { content, is_error } => (content, is_error),
-                Plan::Builtin => match builtin_outputs.remove(&idx).unwrap() {
+                Plan::Builtin => match builtin_outputs.remove(&idx).unwrap_or_else(|| {
+                    Err(format!(
+                        "internal tool runner omitted the result for {name}; the tool outcome is unknown"
+                    ))
+                }) {
                     Ok(s) => {
                         if name == "bash" {
                             let failed = parse_bash_exit_code(&s).is_some_and(|code| code != 0);
@@ -684,10 +688,11 @@ impl Agent {
                 );
             }
 
+            let post_tool_result = self.privacy.redact_text(&content).text;
             let post_env = [
                 ("DEXT_TOOL_NAME", name.as_str()),
                 ("DEXT_TOOL_INPUT", input_str.as_str()),
-                ("DEXT_TOOL_RESULT", content.as_str()),
+                ("DEXT_TOOL_RESULT", post_tool_result.as_str()),
             ];
             if hooks_approved {
                 for (out, _code) in self.hooks.fire(
@@ -706,6 +711,12 @@ impl Agent {
             }
 
             let ok = !is_error.unwrap_or(false);
+            if ok
+                && ran_builtin
+                && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
+            {
+                self.work_ledger_note_file_change(&input);
+            }
             if ok
                 && ran_builtin
                 && (ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())

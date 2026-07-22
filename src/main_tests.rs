@@ -102,6 +102,7 @@ fn test_agent(root: &Path) -> Agent {
         hooks: Hooks::default(),
         pack_hook_env: Vec::new(),
         active_pack_hook_paths: HashSet::new(),
+        project_extensions_approved: None,
         suppress_pack_activation: false,
         state_lock: None,
         session_enabled: true,
@@ -330,6 +331,21 @@ fn git_checkpoint_non_git_is_noop() {
 }
 
 #[test]
+fn git_checkpoint_malformed_git_marker_fails_closed() {
+    let root = temp_test_dir("checkpoint-malformed-git-marker");
+    std::fs::write(root.join(".git"), "not a gitdir file\n").expect("write malformed marker");
+
+    let error = git_checkpoints::create_checkpoint(&root, "write_file", &[], 1)
+        .expect_err("malformed repository candidate must not be treated as non-Git");
+    assert!(
+        error.contains("git config") || error.contains("git rev-parse"),
+        "{error}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn git_checkpoint_sidecar_restores_untracked_file() {
     let root = temp_test_dir("checkpoint-sidecar");
     git_ok(&root, &["init", "-q"]);
@@ -430,7 +446,7 @@ fn checkpoint_worktree_restore_preserves_newer_index_state() {
 }
 
 #[test]
-fn git_checkpoint_unborn_head_is_noop_before_and_after_mutation() {
+fn git_checkpoint_unborn_head_blocks_existing_state_but_allows_new_file_targets() {
     let root = temp_test_dir("checkpoint-unborn-head");
     git_ok(&root, &["init", "-q"]);
     git_ok(&root, &["config", "user.email", "test@example.invalid"]);
@@ -441,11 +457,34 @@ fn git_checkpoint_unborn_head_is_noop_before_and_after_mutation() {
     assert!(before.is_none());
 
     std::fs::write(root.join("created.txt"), "new\n").expect("write created");
-    let after =
+    let error =
         git_checkpoints::create_checkpoint(&root, "write_file", &["created.txt".to_string()], 2)
-            .expect("checkpoint after mutation");
-    assert!(after.is_none());
+            .expect_err("existing target in an unborn repository must fail closed");
+    assert!(error.contains("no initial commit"), "{error}");
+    let error = git_checkpoints::create_checkpoint(&root, "bash", &[], 3)
+        .expect_err("arbitrary command cannot protect unborn worktree state");
+    assert!(error.contains("worktree or index state"), "{error}");
+
+    let new_target =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["new-target.txt".to_string()], 4)
+            .expect("new target has no prior state to preserve");
+    assert!(new_target.is_none());
     assert!(!root.join(".dext/checkpoints/manifest.txt").exists());
+}
+
+#[test]
+fn checkpoint_repo_cache_rechecks_after_git_init() {
+    let root = temp_test_dir("checkpoint-cache-late-git-init");
+    let mut cache = git_checkpoints::RepoRootCache::new();
+    assert!(cache.get(&root).expect("probe non-repository").is_none());
+
+    git_ok(&root, &["init", "-q"]);
+    assert_eq!(
+        cache.get(&root).expect("recheck after git init"),
+        Some(root.clone())
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -704,6 +743,40 @@ fn checkpoint_restore_fails_closed_when_required_sidecar_is_missing() {
 }
 
 #[test]
+fn checkpoint_restore_fails_closed_when_one_required_sidecar_is_missing() {
+    let root = temp_test_dir("checkpoint-sidecar-partially-missing");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("one.txt"), "one\n").expect("write first untracked");
+    std::fs::write(root.join("two.txt"), "two\n").expect("write second untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let sidecar_root = root.join(".dext/checkpoints").join(&checkpoint.id);
+    std::fs::remove_file(sidecar_root.join("two.txt")).expect("remove one sidecar");
+    std::fs::write(root.join("tracked.txt"), "after\n").expect("mutate tracked file");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("partial sidecar set must fail before restore");
+    assert!(error.contains("sidecar is missing: two.txt"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read unchanged tracked file"),
+        "after\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn checkpoint_restore_rejects_ref_oid_mismatch_before_mutation() {
     let root = temp_test_dir("checkpoint-ref-mismatch");
     git_ok(&root, &["init", "-q"]);
@@ -779,12 +852,6 @@ fn checkpoint_restore_refuses_to_replace_a_directory_with_absent_file_state() {
 fn internal_checkpoint_git_never_executes_repository_configured_helpers() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let _guard = env_lock();
-    let old_git_config_count = std::env::var_os("GIT_CONFIG_COUNT");
-    let old_git_config_key = std::env::var_os("GIT_CONFIG_KEY_0");
-    let old_git_config_value = std::env::var_os("GIT_CONFIG_VALUE_0");
-    let old_external_diff = std::env::var_os("GIT_EXTERNAL_DIFF");
-    let old_timeout = std::env::var_os("DEXT_INTERNAL_GIT_TIMEOUT_SECS");
     let root = temp_test_dir("checkpoint-hostile-git-config");
     git_ok(&root, &["init", "-q"]);
     git_ok(&root, &["config", "user.email", "test@example.invalid"]);
@@ -848,14 +915,6 @@ fn internal_checkpoint_git_never_executes_repository_configured_helpers() -> Res
     git_ok(&root, &["config", "filter.evil.required", "true"]);
     let _ = std::fs::remove_file(&marker);
 
-    unsafe {
-        std::env::set_var("GIT_CONFIG_COUNT", "1");
-        std::env::set_var("GIT_CONFIG_KEY_0", "core.fsmonitor");
-        std::env::set_var("GIT_CONFIG_VALUE_0", helper_text);
-        std::env::set_var("GIT_EXTERNAL_DIFF", helper_text);
-        std::env::set_var("DEXT_INTERNAL_GIT_TIMEOUT_SECS", "2");
-    }
-
     let result = (|| -> Result<()> {
         std::fs::write(root.join("tracked.txt"), "checkpoint-state\n")?;
         let summary = tui_git_summary(&root);
@@ -905,11 +964,6 @@ fn internal_checkpoint_git_never_executes_repository_configured_helpers() -> Res
         Ok(())
     })();
 
-    restore_env_var("GIT_CONFIG_COUNT", old_git_config_count);
-    restore_env_var("GIT_CONFIG_KEY_0", old_git_config_key);
-    restore_env_var("GIT_CONFIG_VALUE_0", old_git_config_value);
-    restore_env_var("GIT_EXTERNAL_DIFF", old_external_diff);
-    restore_env_var("DEXT_INTERNAL_GIT_TIMEOUT_SECS", old_timeout);
     let _ = std::fs::remove_dir_all(&root);
     result
 }
@@ -958,6 +1012,15 @@ fn checkpoint_snapshots_untracked_and_preview_names_created_files() {
         "snapshot should record pre-existing untracked file: {:?}",
         cp.untracked_snapshot
     );
+    assert!(cp.includes_untracked_sidecar);
+    let sidecar = root
+        .join(".dext/checkpoints")
+        .join(&cp.id)
+        .join("existing.txt");
+    assert_eq!(
+        std::fs::read_to_string(sidecar).expect("read bash untracked sidecar"),
+        "x\n"
+    );
 
     // Simulate the command creating a new untracked file and removing the old one.
     std::fs::write(root.join("created.txt"), "new\n").expect("write created untracked");
@@ -972,6 +1035,122 @@ fn checkpoint_snapshots_untracked_and_preview_names_created_files() {
         preview.contains("existing.txt"),
         "preview should name removed untracked file:\n{preview}"
     );
+    assert!(
+        preview.contains("sidecar content will be restored"),
+        "{preview}"
+    );
+
+    git_checkpoints::restore_worktree(&root, &cp, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore arbitrary-command checkpoint");
+    assert_eq!(
+        std::fs::read_to_string(root.join("existing.txt")).expect("read restored untracked file"),
+        "x\n"
+    );
+    assert!(
+        root.join("created.txt").is_file(),
+        "restore must not remove files created after the checkpoint"
+    );
+}
+
+#[test]
+fn arbitrary_command_checkpoint_rejects_unbounded_untracked_content() {
+    let root = temp_test_dir("checkpoint-untracked-cap");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let oversized = std::fs::File::create(root.join("oversized.bin")).expect("create oversized");
+    oversized
+        .set_len(8 * 1024 * 1024 + 1)
+        .expect("size oversized fixture");
+    let error = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect_err("unsafe arbitrary-command checkpoint must fail");
+    assert!(error.contains("sidecar limit"), "{error}");
+    assert!(
+        git_checkpoints::list_checkpoints(&root, usize::MAX)
+            .expect("list checkpoints")
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn arbitrary_command_checkpoint_restores_owner_executable_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("checkpoint-executable-sidecar");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let script = root.join("helper.sh");
+    std::fs::write(&script, "#!/bin/sh\nprintf ok\n").expect("write script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+        .expect("make script executable");
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let sidecar = root
+        .join(".dext/checkpoints")
+        .join(&checkpoint.id)
+        .join("helper.sh");
+    assert_eq!(
+        std::fs::metadata(&sidecar)
+            .expect("sidecar metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    std::fs::remove_file(&script).expect("remove script");
+    git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore checkpoint");
+    assert_eq!(
+        std::fs::metadata(&script)
+            .expect("restored script metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_preview_caps_large_current_untracked_set() {
+    let root = temp_test_dir("checkpoint-preview-current-untracked-cap");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    for index in 0..=500 {
+        std::fs::write(root.join(format!("current-{index:03}.txt")), "new\n")
+            .expect("write current untracked file");
+    }
+
+    let preview = git_checkpoints::preview_restore(&root, &checkpoint)
+        .expect("preview remains available after untracked growth");
+    assert!(preview.contains("scan capped at 500 paths"), "{preview}");
+    assert!(
+        preview.contains("listed deltas may be incomplete"),
+        "{preview}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1786,6 +1965,126 @@ fn mutation_preview_new_file_does_not_duplicate_added_lines() {
     assert_eq!(preview.added, 2);
     assert_eq!(preview.diff.matches("+a").count(), 1);
     assert_eq!(preview.diff.matches("+b").count(), 1);
+
+    let no_newline = mutation_preview::preview_write_file(&root, "single.txt", "only")
+        .expect("preview new file without final newline");
+    assert_eq!(no_newline.added, 1);
+    assert_eq!(no_newline.removed, 0);
+    assert!(
+        no_newline.diff.contains("No newline at end of new content"),
+        "{}",
+        no_newline.diff
+    );
+}
+
+#[test]
+fn mutation_preview_top_insertion_keeps_unchanged_lines_out_of_counts() {
+    let root = temp_test_dir("mutation-preview-top-insert");
+    std::fs::write(root.join("note.txt"), "a\nb\nc\n").expect("write fixture");
+    let preview = mutation_preview::preview_write_file(&root, "note.txt", "new\na\nb\nc\n")
+        .expect("preview insertion");
+    assert_eq!(preview.added, 1, "{}", preview.diff);
+    assert_eq!(preview.removed, 0, "{}", preview.diff);
+    assert!(preview.diff.contains("+new\n a\n"), "{}", preview.diff);
+}
+
+#[test]
+fn mutation_preview_reports_final_newline_only_changes() {
+    let root = temp_test_dir("mutation-preview-final-newline");
+    std::fs::write(root.join("note.txt"), "same\n").expect("write fixture");
+    let preview = mutation_preview::preview_write_file(&root, "note.txt", "same")
+        .expect("preview final-newline removal");
+    assert_eq!(preview.added, 1, "{}", preview.diff);
+    assert_eq!(preview.removed, 1, "{}", preview.diff);
+    assert!(preview.diff.contains("-same\n+same\n"), "{}", preview.diff);
+    assert!(
+        preview.diff.contains("No newline at end of new content"),
+        "{}",
+        preview.diff
+    );
+}
+
+#[test]
+fn mutation_preview_reports_newline_marker_with_content_change() {
+    let root = temp_test_dir("mutation-preview-content-and-newline");
+    std::fs::write(root.join("note.txt"), "before\n").expect("write fixture");
+    let preview = mutation_preview::preview_write_file(&root, "note.txt", "after")
+        .expect("preview content and newline change");
+    assert_eq!(preview.added, 1, "{}", preview.diff);
+    assert_eq!(preview.removed, 1, "{}", preview.diff);
+    assert!(
+        preview.diff.contains("-before\n+after\n"),
+        "{}",
+        preview.diff
+    );
+    assert!(
+        preview.diff.contains("No newline at end of new content"),
+        "{}",
+        preview.diff
+    );
+}
+
+#[test]
+fn mutation_preview_skips_oversized_context_but_keeps_change_lines() {
+    let root = temp_test_dir("mutation-preview-oversized-context");
+    let context = "é".repeat(2_040);
+    std::fs::write(root.join("note.txt"), format!("{context}\nbefore\n")).expect("write fixture");
+    let preview =
+        mutation_preview::preview_write_file(&root, "note.txt", &format!("{context}\nafter\n"))
+            .expect("preview after oversized context line");
+    assert_eq!(preview.added, 1, "{}", preview.diff);
+    assert_eq!(preview.removed, 1, "{}", preview.diff);
+    assert!(
+        preview.diff.contains("-before\n+after\n"),
+        "{}",
+        preview.diff
+    );
+    assert!(preview.truncated);
+    assert!(preview.diff.len() <= 4096);
+}
+
+#[test]
+fn mutation_preview_large_fallback_is_bounded_but_counts_all_changes() {
+    let root = temp_test_dir("mutation-preview-large-bounded");
+    let before = (0..700)
+        .map(|index| format!("before-{index:04}-{}", "x".repeat(32)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let after = (0..700)
+        .map(|index| format!("after-{index:04}-{}", "y".repeat(32)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(root.join("note.txt"), before).expect("write large fixture");
+
+    let preview = mutation_preview::preview_write_file(&root, "note.txt", &after)
+        .expect("preview large replacement");
+    assert_eq!(preview.added, 700);
+    assert_eq!(preview.removed, 700);
+    assert!(preview.truncated);
+    assert!(preview.diff.len() <= 4096, "{}", preview.diff.len());
+    assert!(preview.diff.ends_with("... (preview truncated)"));
+}
+
+#[test]
+fn mutation_preview_large_file_small_edit_keeps_precise_counts() {
+    let root = temp_test_dir("mutation-preview-large-small-edit");
+    let before = (0..1_100)
+        .map(|index| format!("line-{index:04}"))
+        .collect::<Vec<_>>();
+    let mut after = before.clone();
+    after[550] = "line-changed".to_string();
+    std::fs::write(root.join("note.txt"), before.join("\n")).expect("write large fixture");
+
+    let preview = mutation_preview::preview_write_file(&root, "note.txt", &after.join("\n"))
+        .expect("preview one-line edit");
+    assert_eq!(preview.added, 1, "{}", preview.diff);
+    assert_eq!(preview.removed, 1, "{}", preview.diff);
+    assert!(!preview.truncated, "{}", preview.diff);
+    assert!(
+        preview.diff.contains("-line-0550\n+line-changed"),
+        "{}",
+        preview.diff
+    );
 }
 
 #[test]
@@ -3038,7 +3337,6 @@ async fn sudo_preauth_runs_inside_bash_session_before_noninteractive_sudo() {
         SandboxProfile::ReadOnly,
         None,
         &[],
-        &[],
     )
     .await
     .expect("preauthed sudo command runs");
@@ -3170,7 +3468,6 @@ async fn async_tool_children_scrub_injected_only_credentials_and_prompt_override
             ),
             ("GIT_TERMINAL_PROMPT".to_string(), "1".to_string()),
         ],
-        &[],
     )
     .await
     .expect("run bash with injected environment");
@@ -3248,7 +3545,6 @@ async fn declared_pack_credentials_reach_direct_helper_but_not_arbitrary_bash() 
         SandboxProfile::DangerFullAccess,
         Some(live),
         &pack_env,
-        &[],
     )
     .await
     .expect("run direct pack helper with declared credential");
@@ -3280,7 +3576,6 @@ async fn declared_pack_credentials_reach_direct_helper_but_not_arbitrary_bash() 
         SandboxProfile::DangerFullAccess,
         None,
         &helper_without_declarations,
-        &[],
     )
     .await
     .expect("run direct pack helper without declarations");
@@ -3317,7 +3612,6 @@ async fn declared_pack_credentials_reach_direct_helper_but_not_arbitrary_bash() 
         SandboxProfile::DangerFullAccess,
         None,
         &pack_env,
-        &[],
     )
     .await
     .expect("run linked helper without declared credential");
@@ -3333,7 +3627,6 @@ async fn declared_pack_credentials_reach_direct_helper_but_not_arbitrary_bash() 
         SandboxProfile::DangerFullAccess,
         None,
         &pack_env,
-        &[],
     )
     .await
     .expect("run arbitrary bash with pack environment");
@@ -4140,7 +4433,6 @@ async fn bash_children_get_no_terminal_and_no_git_prompts() {
         None,
         SandboxProfile::WorkspaceWrite,
         None,
-        &[],
         &[],
     )
     .await
@@ -5437,7 +5729,10 @@ fn session_html_export_renders_and_escapes_transcript() -> Result<()> {
     assert!(html.contains("tool_result"), "{html}");
     assert!(html.contains("line &lt;ok&gt; &amp; done"), "{html}");
     assert!(html.contains("system prompt"), "{html}");
-    assert!(html.contains("Project context (DEXT.md"), "{html}");
+    assert!(
+        html.contains("Project-controlled guidance (DEXT.md"),
+        "{html}"
+    );
     assert!(html.contains("html export context"), "{html}");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -6155,6 +6450,30 @@ fn builtin_parallel_policy_only_allows_read_only_rounds() {
     assert!(!should_parallelize_builtin_tools(&["bash"]));
     assert!(!should_parallelize_builtin_tools(&["http", "rg"]));
     assert!(!should_parallelize_builtin_tools(&[]));
+}
+
+#[test]
+fn tool_registry_covers_every_catalog_entry_and_schema_requirement() {
+    let registry = tools::registered_tool_names().collect::<HashSet<_>>();
+    let catalog = provider_tool_definitions();
+    assert_eq!(registry.len(), catalog.len(), "registry/catalog size drift");
+    for tool in catalog {
+        assert!(
+            registry.contains(tool.name),
+            "unregistered tool {}",
+            tool.name
+        );
+        let schema_required = tool.input_schema["required"]
+            .as_array()
+            .map(|fields| fields.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert_eq!(
+            tools::required_fields(tool.name),
+            schema_required,
+            "required-field drift for {}",
+            tool.name
+        );
+    }
 }
 
 #[test]
@@ -6924,6 +7243,166 @@ fn workflow_diagnostics_render_and_ledger_are_prompt_visible() {
 }
 
 #[test]
+fn later_tool_in_round_checkpoints_state_from_earlier_mutation() {
+    let root = temp_test_dir("tool-round-sequential-checkpoint");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked fixture");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![
+                (
+                    "call-first-write".to_string(),
+                    "write_file".to_string(),
+                    json!({"path": "first.txt", "content": "first\n"}),
+                ),
+                (
+                    "call-second-write".to_string(),
+                    "bash".to_string(),
+                    json!({"command": "printf 'second\\n' > second.txt"}),
+                ),
+            ],
+            iterations: 1,
+            turn_id: "turn-sequential-checkpoint".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute sequential mutation round");
+
+    let latest = git_checkpoints::latest_checkpoint(&root)
+        .expect("list latest checkpoint")
+        .expect("latest checkpoint exists");
+    assert_eq!(latest.tool_name, "bash");
+    assert!(
+        latest
+            .untracked_snapshot
+            .iter()
+            .any(|path| path == "first.txt"),
+        "later checkpoint must include earlier mutation: {latest:?}"
+    );
+    std::fs::remove_file(root.join("first.txt")).expect("remove first output");
+    git_checkpoints::restore_worktree(&root, &latest, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore later checkpoint");
+    assert_eq!(
+        std::fs::read_to_string(root.join("first.txt")).expect("read restored first output"),
+        "first\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tool_round_records_only_successful_file_mutations_in_work_ledger() {
+    let root = temp_test_dir("tool-round-ledger-success-only");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Never);
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-denied-write".to_string(),
+                "write_file".to_string(),
+                json!({"path": "denied.txt", "content": "blocked"}),
+            )],
+            iterations: 1,
+            turn_id: "turn-denied-write".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute denied write round");
+    assert!(agent.work_ledger.files_changed.is_empty());
+    assert!(!root.join("denied.txt").exists());
+
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-successful-write".to_string(),
+                "write_file".to_string(),
+                json!({"path": "written.txt", "content": "done"}),
+            )],
+            iterations: 2,
+            turn_id: "turn-successful-write".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute successful write round");
+    assert_eq!(agent.work_ledger.files_changed, vec!["written.txt"]);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn post_tool_hooks_receive_privacy_redacted_results() {
+    let root = temp_test_dir("post-tool-hook-redaction");
+    std::fs::write(root.join("secret.txt"), "API_KEY=abcdef123456\n")
+        .expect("write secret fixture");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.privacy.enabled = true;
+    agent.hooks.post_tool.push(Hook {
+        tool_match: Some("read_file".to_string()),
+        command:
+            "case \"$DEXT_TOOL_RESULT\" in *abcdef123456*) printf RAW;; *) printf REDACTED;; esac"
+                .to_string(),
+    });
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+
+    agent
+        .execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-redacted-hook".to_string(),
+                "read_file".to_string(),
+                json!({"path": "secret.txt"}),
+            )],
+            iterations: 1,
+            turn_id: "turn-redacted-hook".to_string(),
+            objective_apply_fixes_allowed: false,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: true,
+        })
+        .await
+        .expect("execute read with post hook");
+
+    let (content, _) = last_tool_result(&agent.history).expect("tool result");
+    assert!(content.contains("[hook:post_tool]\nREDACTED"), "{content}");
+    assert!(!content.contains("abcdef123456"), "{content}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn privacy_redacts_sensitive_tool_output_and_strict_mode_blocks_secret_paths() {
     let root = temp_test_dir("privacy-policy");
     let mut agent = test_agent(&root);
@@ -7216,6 +7695,11 @@ fn approval_and_sandbox_profiles_enforce_policy() {
     agent.set_approval_profile(ApprovalProfile::AutoWrite);
     assert!(agent.tool_auto_approved("write_file", &write));
     assert!(!agent.tool_auto_approved("bash", &json!({"command": "sudo reboot"})));
+    assert!(!agent.tool_auto_approved("bash", &json!({"command": "git checkout -- ."})));
+    assert!(!agent.tool_auto_approved(
+        "bash",
+        &json!({"command": "python3 -c 'import shutil; shutil.rmtree(\"build\")'"})
+    ));
 
     agent.set_sandbox_profile(SandboxProfile::ReadOnly);
     assert!(agent.sandbox_policy_denial("write_file", &write).is_some());
@@ -7617,9 +8101,6 @@ fn doctor_reports_bounded_latest_state_without_executing_auth_references() -> Re
     let _guard = env_lock();
     let root = temp_test_dir("doctor-latest-state");
     let dext_home = root.join("home");
-    let sessions = root.join("sessions");
-    let session_dir = sessions.join("session-1");
-    std::fs::create_dir_all(&session_dir)?;
     std::fs::create_dir_all(&dext_home)?;
 
     let old_dext_home = std::env::var_os("DEXT_HOME");
@@ -7629,13 +8110,15 @@ fn doctor_reports_bounded_latest_state_without_executing_auth_references() -> Re
     let old_sandbox = std::env::var_os("DEXT_SANDBOX_PROFILE");
     unsafe {
         std::env::set_var("DEXT_HOME", &dext_home);
-        std::env::set_var("DEXT_SESSIONS_DIR", &sessions);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
         std::env::set_var("DEXT_APPROVAL", "never");
         std::env::remove_var("DEXT_TRUST");
         std::env::set_var("DEXT_SANDBOX_PROFILE", "workspace-write");
     }
 
     let result = (|| -> Result<()> {
+        let session_dir = session::latest_sessions_dir(&root).join("session-1");
+        std::fs::create_dir_all(&session_dir)?;
         let session_path = session_dir.join(format!("{LATEST_SESSION_NAME}.jsonl"));
         let session_bytes = std::fs::read(state_fixture_path("sessions", "v3.jsonl"))?;
         std::fs::write(&session_path, &session_bytes)?;
@@ -8272,7 +8755,6 @@ async fn bash_runner_emits_live_output_deltas() {
         None,
         SandboxProfile::WorkspaceWrite,
         Some(live),
-        &[],
         &[],
     )
     .await
@@ -12038,7 +12520,13 @@ fn compose_system_parts_includes_typed_shelf_registry_summary() {
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
 
-    let agent = test_agent(&root);
+    let mut agent = test_agent(&root);
+    let (_stable, env) = agent.compose_system_parts();
+    assert!(
+        !env.contains("## Dext shelves"),
+        "project shelf metadata must stay out of the prompt before approval: {env}"
+    );
+    agent.project_extensions_approved = Some(true);
     let (_stable, env) = agent.compose_system_parts();
     assert!(env.contains("## Dext shelves"), "{env}");
     assert!(
@@ -12096,7 +12584,13 @@ fn shelf_context_ability_injects_into_prompt_when_hook_opts_in() {
         std::env::set_var("DEXT_HOME", root.join("home"));
     }
 
-    let agent = test_agent(&root);
+    let mut agent = test_agent(&root);
+    let (_stable, env) = agent.compose_system_parts();
+    assert!(
+        !env.contains("ALWAYS prefer rg over grep in this repo"),
+        "project shelf context must stay out of the prompt before approval: {env}"
+    );
+    agent.project_extensions_approved = Some(true);
     let (_stable, env) = agent.compose_system_parts();
 
     unsafe {
@@ -12105,10 +12599,55 @@ fn shelf_context_ability_injects_into_prompt_when_hook_opts_in() {
     let _ = std::fs::remove_dir_all(&root);
 
     assert!(env.contains("## Shelf context"), "{env}");
+    assert!(env.contains("[project-controlled shelf context]"), "{env}");
     assert!(
         env.contains("ALWAYS prefer rg over grep in this repo"),
         "{env}"
     );
+}
+
+#[test]
+fn project_extension_approval_is_explicit_and_scoped_to_the_agent_root() {
+    let root = temp_test_dir("project-extension-approval");
+    let mut agent = test_agent(&root);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
+
+    assert!(approve_project_extensions(&mut agent));
+    assert!(approve_project_extensions(&mut agent));
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(agent.project_extensions_approved, Some(true));
+
+    let next_root = temp_test_dir("project-extension-next-root");
+    agent.session_enabled = false;
+    agent
+        .set_sandbox_root(next_root.clone())
+        .expect("switch sandbox root");
+    assert_eq!(agent.project_extensions_approved, None);
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(next_root);
+}
+
+#[test]
+fn project_extension_approval_never_profile_fails_without_prompt() {
+    let root = temp_test_dir("project-extension-never");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Never);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
+
+    assert!(!approve_project_extensions(&mut agent));
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(agent.project_extensions_approved, Some(false));
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12268,7 +12807,10 @@ fn slash_system_displays_composed_prompt_with_project_context() {
         })
         .unwrap_or_default();
     assert!(slash.contains("test-system"), "{slash}");
-    assert!(slash.contains("Project context (DEXT.md"), "{slash}");
+    assert!(
+        slash.contains("Project-controlled guidance (DEXT.md"),
+        "{slash}"
+    );
     assert!(slash.contains("slash system context"), "{slash}");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -19573,6 +20115,16 @@ fn project_pack_shadowing_user_pack_never_inherits_user_pack_credentials() -> Re
     assert!(pack.credential_env.is_empty());
     assert!(pack.credential_env_ignored);
 
+    let unapproved_summary = packs::pack_summary_for_prompt(&root, false).unwrap_or_default();
+    assert!(
+        unapproved_summary.contains("demo[user]"),
+        "{unapproved_summary}"
+    );
+    let fallback = packs::infer_pack_invocation_with_project(&root, "run demo now", false)
+        .expect("trusted user pack remains eligible before project approval");
+    assert_eq!(fallback.pack.path, user_pack);
+    assert!(!fallback.pack.is_project());
+
     restore_env_var("DEXT_HOME", old_dext_home);
     restore_env_var("DEXT_SHELVES_DIR", old_shelves_dir);
     let _ = std::fs::remove_dir_all(&root);
@@ -19781,7 +20333,16 @@ fn packs_discover_shelf_pack_and_apply_precedence() -> Result<()> {
     let prompt = packs::pack_prompt(&pack, "ship it")?;
     assert!(prompt.contains("Shelf: community"), "{prompt}");
 
-    let summary = packs::pack_summary_for_prompt(&root).unwrap_or_default();
+    let unapproved_summary = packs::pack_summary_for_prompt(&root, false).unwrap_or_default();
+    assert!(
+        unapproved_summary.contains("envpack[external-shelf]"),
+        "{unapproved_summary}"
+    );
+    assert!(
+        !unapproved_summary.contains("demo[community]"),
+        "project pack metadata stays out of the prompt before approval: {unapproved_summary}"
+    );
+    let summary = packs::pack_summary_for_prompt(&root, true).unwrap_or_default();
     assert!(summary.contains("demo[community]"), "{summary}");
 
     let registry = shelves::ShelfRegistry::discover(&root);
@@ -20216,6 +20777,67 @@ fn pack_helper_direct_spawn_policy_is_platform_safe() {
         Path::new("helper.py"),
         true
     ));
+}
+
+#[test]
+fn pack_discovery_rejects_oversized_workflows() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-oversized-workflow");
+    let pack_dir = root.join(".dext/shelves/test/packs/demo");
+    std::fs::create_dir_all(&pack_dir)?;
+    let workflow = std::fs::File::create(pack_dir.join("PACK.md"))?;
+    workflow.set_len(1024 * 1024 + 1)?;
+    let old_home = std::env::var_os("DEXT_HOME");
+    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("home"));
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+
+    assert!(packs::discover_packs(&root).is_empty());
+    assert!(packs::pack_summary_for_prompt(&root, true).is_none());
+    assert!(!packs::project_pack_invocation_requested(
+        &root,
+        "run demo now"
+    ));
+
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_discovery_rejects_symlinked_workflows() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-symlinked-workflow");
+    let outside = temp_test_dir("pack-symlinked-workflow-outside");
+    let pack_dir = root.join(".dext/shelves/test/packs/demo");
+    std::fs::create_dir_all(&pack_dir)?;
+    let outside_workflow = outside.join("PACK.md");
+    std::fs::write(&outside_workflow, "---\nname: demo\n---\n# Outside\n")?;
+    symlink(&outside_workflow, pack_dir.join("PACK.md"))?;
+    let old_home = std::env::var_os("DEXT_HOME");
+    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("home"));
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+
+    assert!(packs::discover_packs(&root).is_empty());
+    assert!(!packs::project_pack_invocation_requested(
+        &root,
+        "run demo now"
+    ));
+
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(outside);
+    Ok(())
 }
 
 #[test]

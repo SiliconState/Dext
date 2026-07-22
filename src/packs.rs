@@ -1,5 +1,7 @@
-use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use anyhow::{Context, Result, bail};
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use crate::list_render;
@@ -7,6 +9,7 @@ use crate::session::{canonicalize_or_clone, dext_state_dir};
 use crate::{byte_prefix_at_char_boundary, cap_bytes_with_hint};
 
 const PACK_PROMPT_CAP: usize = 32_000;
+const PACK_FILE_CAP: u64 = 1024 * 1024;
 const PACK_LIST_LIMIT: usize = 50;
 
 type PackDirCandidate = (PathBuf, String, Option<String>);
@@ -40,6 +43,11 @@ struct PackFrontMatter {
 impl PackInfo {
     pub(crate) fn env_var_name(&self) -> String {
         pack_env_var_name(&self.name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_project(&self) -> bool {
+        self.source.starts_with("project:")
     }
 }
 
@@ -134,13 +142,58 @@ fn parse_front_matter(text: &str) -> PackFrontMatter {
     front
 }
 
+fn read_pack_file(path: &Path) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("pack workflow is not a regular file: {}", path.display());
+    }
+    if metadata.len() > PACK_FILE_CAP {
+        bail!(
+            "pack workflow exceeds the {} byte limit: {}",
+            PACK_FILE_CAP,
+            path.display()
+        );
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspecting open pack workflow {}", path.display()))?;
+    if !opened.is_file() || opened.len() > PACK_FILE_CAP {
+        bail!(
+            "pack workflow changed or exceeds its byte limit: {}",
+            path.display()
+        );
+    }
+    let mut text = String::new();
+    file.take(PACK_FILE_CAP + 1)
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if text.len() as u64 > PACK_FILE_CAP {
+        bail!(
+            "pack workflow exceeds the {} byte limit: {}",
+            PACK_FILE_CAP,
+            path.display()
+        );
+    }
+    Ok(text)
+}
+
 fn load_pack_from_dir(dir: &Path, source: &str, shelf: Option<&str>) -> Result<Option<PackInfo>> {
     let pack_md_path = dir.join("PACK.md");
     if !pack_md_path.is_file() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&pack_md_path)
-        .with_context(|| format!("reading {}", pack_md_path.display()))?;
+    let text = read_pack_file(&pack_md_path)?;
     let front = parse_front_matter(&text);
     let name = front.name.unwrap_or_else(|| {
         dir.file_name()
@@ -255,11 +308,14 @@ fn candidate_pack_dirs(root: &Path) -> Vec<PackDirCandidate> {
     direct
 }
 
-pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
+fn discover_packs_with_project(root: &Path, include_project: bool) -> Vec<PackInfo> {
     let mut packs = Vec::new();
     let mut seen_names = HashSet::new();
     let mut seen_paths = HashSet::new();
     for (dir, source, shelf) in candidate_pack_dirs(root) {
+        if !include_project && source.starts_with("project:") {
+            continue;
+        }
         let path_key = canonicalize_or_clone(&dir);
         if !seen_paths.insert(path_key) {
             continue;
@@ -274,6 +330,10 @@ pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
     }
     packs.sort_by(|a, b| a.name.cmp(&b.name));
     packs
+}
+
+pub(crate) fn discover_packs(root: &Path) -> Vec<PackInfo> {
+    discover_packs_with_project(root, true)
 }
 
 pub(crate) fn create_pack(root: &Path, selector: &str, project: bool) -> Result<PathBuf> {
@@ -468,8 +528,7 @@ pub(crate) fn render_pack_inspect(root: &Path, selector: &str) -> Result<String>
 }
 
 pub(crate) fn pack_prompt(pack: &PackInfo, task: &str) -> Result<String> {
-    let workflow = std::fs::read_to_string(&pack.pack_md_path)
-        .with_context(|| format!("reading {}", pack.pack_md_path.display()))?;
+    let workflow = read_pack_file(&pack.pack_md_path)?;
     let workflow = cap_bytes_with_hint(
         workflow,
         PACK_PROMPT_CAP,
@@ -565,12 +624,32 @@ fn has_invocation_pattern(text: &str, name: &str) -> bool {
     patterns.iter().any(|p| text.contains(p))
 }
 
-pub(crate) fn infer_pack_invocation(root: &Path, user_input: &str) -> Option<PackInvocation> {
+pub(crate) fn project_pack_invocation_requested(root: &Path, user_input: &str) -> bool {
+    let text = normalized_words(user_input);
+    if text.contains("what is ") || text.contains("explain ") {
+        return false;
+    }
+    candidate_pack_dirs(root)
+        .into_iter()
+        .filter(|(_, source, _)| source.starts_with("project:"))
+        .filter_map(|(dir, source, shelf)| {
+            load_pack_from_dir(&dir, &source, shelf.as_deref())
+                .ok()
+                .flatten()
+        })
+        .any(|pack| has_invocation_pattern(&text, &normalize_key(&pack.name)))
+}
+
+pub(crate) fn infer_pack_invocation_with_project(
+    root: &Path,
+    user_input: &str,
+    include_project: bool,
+) -> Option<PackInvocation> {
     let text = normalized_words(user_input);
     if text.contains("what is ") || text.contains("explain ") {
         return None;
     }
-    let mut packs = discover_packs(root);
+    let mut packs = discover_packs_with_project(root, include_project);
     packs.sort_by_key(|pack| std::cmp::Reverse(pack.name.len()));
     for pack in packs {
         let name = normalize_key(&pack.name);
@@ -584,14 +663,15 @@ pub(crate) fn infer_pack_invocation(root: &Path, user_input: &str) -> Option<Pac
     None
 }
 
-pub(crate) fn pack_summary_for_prompt(root: &Path) -> Option<String> {
-    let packs = discover_packs(root);
+#[cfg(test)]
+pub(crate) fn infer_pack_invocation(root: &Path, user_input: &str) -> Option<PackInvocation> {
+    infer_pack_invocation_with_project(root, user_input, true)
+}
+
+pub(crate) fn pack_summary_for_prompt(root: &Path, include_project: bool) -> Option<String> {
+    let packs = discover_packs_with_project(root, include_project);
     if packs.is_empty() {
         return None;
-    }
-    let mut _counts: HashMap<&str, usize> = HashMap::new();
-    for pack in &packs {
-        *_counts.entry(pack.source.as_str()).or_insert(0) += 1;
     }
     let mut out = String::from("Available Dext packs: ");
     out.push_str(

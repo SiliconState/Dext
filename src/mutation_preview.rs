@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const PREVIEW_DIFF_CAP: usize = 4096;
+const PREVIEW_DIFF_LINE_BUDGET: usize = 1_024;
+const PREVIEW_TRUNCATION_MARKER: &str = "... (preview truncated)";
 const MATCH_DISPLAY_LIMIT: usize = 8;
 static TEMP_ORDINAL: AtomicU64 = AtomicU64::new(0);
 
@@ -639,74 +641,299 @@ fn compute_preview(path: PathBuf, before: &str, after: &str, is_new_file: bool) 
         };
     }
     let diff = compute_simple_diff(before, after);
-    let added = diff
-        .lines()
-        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-        .count();
-    let removed = diff
-        .lines()
-        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
-        .count();
-    let truncated = diff.len() > PREVIEW_DIFF_CAP;
     MutationPreview {
         path,
         is_new_file,
-        added,
-        removed,
-        diff: cap_string(&diff, PREVIEW_DIFF_CAP),
-        truncated,
+        added: diff.added,
+        removed: diff.removed,
+        diff: diff.text,
+        truncated: diff.truncated,
     }
 }
 
-fn compute_simple_diff(before: &str, after: &str) -> String {
-    let mut result = String::new();
-    let before_lines: Vec<&str> = before.lines().collect();
-    let after_lines: Vec<&str> = after.lines().collect();
-    let max = before_lines.len().max(after_lines.len());
-    let mut in_hunk = false;
-    for index in 0..max {
-        let before_line = before_lines.get(index);
-        let after_line = after_lines.get(index);
-        if before_line != after_line {
-            if !in_hunk {
-                if let Some(line) = index
-                    .checked_sub(1)
-                    .and_then(|previous| before_lines.get(previous))
-                {
-                    result.push_str(&format!(" {line}\n"));
-                }
-                in_hunk = true;
-            }
-            if let Some(line) = before_line {
-                result.push_str(&format!("-{line}\n"));
-            }
-            if let Some(line) = after_line {
-                result.push_str(&format!("+{line}\n"));
-            }
-        } else if in_hunk {
-            if let Some(line) = before_line.or(after_line) {
-                result.push_str(&format!(" {line}\n"));
-            }
-            in_hunk = false;
-        }
-    }
-    result
+#[derive(Clone, Copy)]
+enum DiffLine<'a> {
+    Context(&'a str),
+    Added(&'a str),
+    Removed(&'a str),
 }
 
-fn cap_string(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        return value.to_string();
-    }
-    let mut result = String::with_capacity(max + 32);
-    for line in value.lines() {
-        if result.len() + line.len() + 1 > max {
-            result.push_str("\n... (preview truncated)");
-            break;
+struct SimpleDiff {
+    text: String,
+    added: usize,
+    removed: usize,
+    truncated: bool,
+}
+
+fn compute_simple_diff(before: &str, after: &str) -> SimpleDiff {
+    let before_lines = before.lines().collect::<Vec<_>>();
+    let after_lines = after.lines().collect::<Vec<_>>();
+    let common_prefix = before_lines
+        .iter()
+        .zip(&after_lines)
+        .take_while(|(before, after)| before == after)
+        .count();
+    let max_suffix = before_lines
+        .len()
+        .min(after_lines.len())
+        .saturating_sub(common_prefix);
+    let common_suffix = before_lines
+        .iter()
+        .rev()
+        .zip(after_lines.iter().rev())
+        .take(max_suffix)
+        .take_while(|(before, after)| before == after)
+        .count();
+    let before_end = before_lines.len().saturating_sub(common_suffix);
+    let after_end = after_lines.len().saturating_sub(common_suffix);
+    let before_changed = &before_lines[common_prefix..before_end];
+    let after_changed = &after_lines[common_prefix..after_end];
+    if before_changed.len().saturating_add(after_changed.len()) > PREVIEW_DIFF_LINE_BUDGET {
+        let mut diff = SimpleDiff {
+            text: String::new(),
+            added: after_changed.len(),
+            removed: before_changed.len(),
+            truncated: false,
+        };
+        if common_prefix > 0 {
+            push_preview_diff_line(&mut diff, ' ', before_lines[common_prefix - 1]);
         }
-        result.push_str(line);
-        result.push('\n');
+        for line in before_changed {
+            push_preview_diff_line(&mut diff, '-', line);
+        }
+        for line in after_changed {
+            push_preview_diff_line(&mut diff, '+', line);
+        }
+        if common_suffix > 0 {
+            push_preview_diff_line(&mut diff, ' ', before_lines[before_end]);
+        }
+        finish_preview_diff(&mut diff);
+        return diff;
     }
-    result
+
+    let mut operations = myers_diff(before_changed, after_changed);
+    if common_prefix > 0 {
+        operations.insert(0, DiffLine::Context(before_lines[common_prefix - 1]));
+    }
+    if common_suffix > 0 {
+        operations.push(DiffLine::Context(before_lines[before_end]));
+    }
+
+    let mut diff = SimpleDiff {
+        text: String::new(),
+        added: operations
+            .iter()
+            .filter(|line| matches!(line, DiffLine::Added(_)))
+            .count(),
+        removed: operations
+            .iter()
+            .filter(|line| matches!(line, DiffLine::Removed(_)))
+            .count(),
+        truncated: false,
+    };
+    for (index, operation) in operations.iter().enumerate() {
+        let changed = !matches!(operation, DiffLine::Context(_));
+        let adjacent_to_change = operations
+            .get(index.wrapping_sub(1))
+            .is_some_and(|line| !matches!(line, DiffLine::Context(_)))
+            || operations
+                .get(index + 1)
+                .is_some_and(|line| !matches!(line, DiffLine::Context(_)));
+        if changed || adjacent_to_change {
+            match operation {
+                DiffLine::Context(line) => push_preview_diff_line(&mut diff, ' ', line),
+                DiffLine::Added(line) => push_preview_diff_line(&mut diff, '+', line),
+                DiffLine::Removed(line) => push_preview_diff_line(&mut diff, '-', line),
+            }
+        }
+    }
+
+    let missing_newline_from = if !after.is_empty()
+        && !after.ends_with('\n')
+        && (before.is_empty() || before.ends_with('\n'))
+    {
+        Some("new content")
+    } else if !before.is_empty()
+        && !before.ends_with('\n')
+        && (after.is_empty() || after.ends_with('\n'))
+    {
+        Some("old content")
+    } else {
+        None
+    };
+    if diff.added == 0 && diff.removed == 0 && before != after {
+        let before_line = before.lines().last().unwrap_or_default();
+        let after_line = after.lines().last().unwrap_or_default();
+        push_preview_diff_line(&mut diff, '-', before_line);
+        push_preview_diff_line(&mut diff, '+', after_line);
+        let missing_from = missing_newline_from.unwrap_or_else(|| {
+            if before.ends_with('\n') {
+                "new content"
+            } else {
+                "old content"
+            }
+        });
+        push_preview_diff_line(
+            &mut diff,
+            '\\',
+            &format!(" No newline at end of {missing_from}"),
+        );
+        diff.added = 1;
+        diff.removed = 1;
+    } else if let Some(missing_from) = missing_newline_from {
+        push_preview_diff_line(
+            &mut diff,
+            '\\',
+            &format!(" No newline at end of {missing_from}"),
+        );
+    }
+    finish_preview_diff(&mut diff);
+    diff
+}
+
+fn push_preview_diff_line(diff: &mut SimpleDiff, prefix: char, line: &str) {
+    let needed = prefix
+        .len_utf8()
+        .saturating_add(line.len())
+        .saturating_add(1);
+    let reserved_cap = PREVIEW_DIFF_CAP.saturating_sub(PREVIEW_TRUNCATION_MARKER.len() + 1);
+    if !diff.truncated && diff.text.len().saturating_add(needed) > PREVIEW_DIFF_CAP {
+        diff.truncated = true;
+        trim_preview_diff_front_lines(&mut diff.text, reserved_cap.saturating_sub(needed));
+    }
+    let cap = if diff.truncated {
+        reserved_cap
+    } else {
+        PREVIEW_DIFF_CAP
+    };
+    if diff.text.len().saturating_add(needed) > cap {
+        diff.truncated = true;
+        return;
+    }
+    diff.text.push(prefix);
+    diff.text.push_str(line);
+    diff.text.push('\n');
+}
+
+fn trim_preview_diff_front_lines(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let drain_end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |index| start + index + 1);
+    text.drain(..drain_end);
+}
+
+fn truncate_preview_diff_lines(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let line_end = text[..boundary].rfind('\n').map_or(0, |index| index + 1);
+    text.truncate(line_end);
+}
+
+fn finish_preview_diff(diff: &mut SimpleDiff) {
+    if !diff.truncated {
+        return;
+    }
+    let max_text = PREVIEW_DIFF_CAP.saturating_sub(PREVIEW_TRUNCATION_MARKER.len() + 1);
+    truncate_preview_diff_lines(&mut diff.text, max_text);
+    if !diff.text.is_empty() && !diff.text.ends_with('\n') {
+        diff.text.push('\n');
+    }
+    diff.text.push_str(PREVIEW_TRUNCATION_MARKER);
+}
+
+fn myers_diff<'a>(before: &[&'a str], after: &[&'a str]) -> Vec<DiffLine<'a>> {
+    let max = before.len().saturating_add(after.len());
+    if max == 0 {
+        return Vec::new();
+    }
+    let offset = max as isize;
+    let mut frontier = vec![0isize; max.saturating_mul(2).saturating_add(1)];
+    let mut trace = Vec::new();
+    let mut distance = 0usize;
+
+    'search: for d in 0..=max {
+        trace.push(frontier.clone());
+        for diagonal in (-(d as isize)..=d as isize).step_by(2) {
+            let index = (offset + diagonal) as usize;
+            let mut x = if diagonal == -(d as isize)
+                || (diagonal != d as isize && frontier[index - 1] < frontier[index + 1])
+            {
+                frontier[index + 1]
+            } else {
+                frontier[index - 1] + 1
+            };
+            let mut y = x - diagonal;
+            while x < before.len() as isize
+                && y < after.len() as isize
+                && before[x as usize] == after[y as usize]
+            {
+                x += 1;
+                y += 1;
+            }
+            frontier[index] = x;
+            if x == before.len() as isize && y == after.len() as isize {
+                distance = d;
+                break 'search;
+            }
+        }
+    }
+
+    let mut x = before.len() as isize;
+    let mut y = after.len() as isize;
+    let mut reversed = Vec::with_capacity(max);
+    for d in (1..=distance).rev() {
+        let frontier = &trace[d];
+        let diagonal = x - y;
+        let index = (offset + diagonal) as usize;
+        let previous_diagonal = if diagonal == -(d as isize)
+            || (diagonal != d as isize && frontier[index - 1] < frontier[index + 1])
+        {
+            diagonal + 1
+        } else {
+            diagonal - 1
+        };
+        let previous_x = frontier[(offset + previous_diagonal) as usize];
+        let previous_y = previous_x - previous_diagonal;
+        while x > previous_x && y > previous_y {
+            reversed.push(DiffLine::Context(before[(x - 1) as usize]));
+            x -= 1;
+            y -= 1;
+        }
+        if x == previous_x {
+            reversed.push(DiffLine::Added(after[(y - 1) as usize]));
+            y -= 1;
+        } else {
+            reversed.push(DiffLine::Removed(before[(x - 1) as usize]));
+            x -= 1;
+        }
+    }
+    while x > 0 && y > 0 {
+        reversed.push(DiffLine::Context(before[(x - 1) as usize]));
+        x -= 1;
+        y -= 1;
+    }
+    while x > 0 {
+        reversed.push(DiffLine::Removed(before[(x - 1) as usize]));
+        x -= 1;
+    }
+    while y > 0 {
+        reversed.push(DiffLine::Added(after[(y - 1) as usize]));
+        y -= 1;
+    }
+    reversed.reverse();
+    reversed
 }
 
 #[cfg(test)]

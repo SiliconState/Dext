@@ -17,8 +17,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tui_markdown::{
     Options as MarkdownOptions, StyleSheet as MarkdownStyleSheet, from_str_with_options,
@@ -50,9 +50,104 @@ const CONTEXT_BAR_CELLS: usize = 10;
 const WORK_MAP_DRAWER_MAX_ROWS: usize = 20;
 const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 18;
 const WORK_MAP_DRAWER_MIN_EDITOR_ROWS: usize = 1;
-const THINKING_BG: Color = Color::Indexed(235);
-const STEERING_BG: Color = Color::Indexed(236);
 const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
+
+#[derive(Clone, Copy)]
+struct TuiTheme {
+    thinking_bg: Color,
+    thinking_fg: Color,
+    thinking_marker: Color,
+    steering_bg: Color,
+    steering_fg: Color,
+    steering_gutter: Color,
+}
+
+const DARK_THEME: TuiTheme = TuiTheme {
+    thinking_bg: Color::Indexed(235),
+    thinking_fg: Color::Gray,
+    thinking_marker: Color::Indexed(244),
+    steering_bg: Color::Indexed(236),
+    steering_fg: Color::Indexed(215),
+    steering_gutter: Color::Indexed(214),
+};
+const LIGHT_THEME: TuiTheme = TuiTheme {
+    thinking_bg: Color::Indexed(255),
+    thinking_fg: Color::Indexed(238),
+    thinking_marker: Color::Indexed(244),
+    steering_bg: Color::Indexed(254),
+    steering_fg: Color::Indexed(94),
+    steering_gutter: Color::Indexed(130),
+};
+
+fn indexed_background_is_light(index: u8) -> bool {
+    let (red, green, blue) = match index {
+        0..=15 => [
+            (0, 0, 0),
+            (128, 0, 0),
+            (0, 128, 0),
+            (128, 128, 0),
+            (0, 0, 128),
+            (128, 0, 128),
+            (0, 128, 128),
+            (192, 192, 192),
+            (128, 128, 128),
+            (255, 0, 0),
+            (0, 255, 0),
+            (255, 255, 0),
+            (0, 0, 255),
+            (255, 0, 255),
+            (0, 255, 255),
+            (255, 255, 255),
+        ][index as usize],
+        16..=231 => {
+            let cube = index - 16;
+            let channel = |value: u8| match value {
+                0 => 0,
+                value => 55 + value * 40,
+            };
+            (
+                channel(cube / 36),
+                channel(cube % 36 / 6),
+                channel(cube % 6),
+            )
+        }
+        232..=255 => {
+            let gray = 8 + (index - 232) * 10;
+            (gray, gray, gray)
+        }
+    };
+    (u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1_000 >= 150
+}
+
+fn resolve_tui_theme(theme: Option<&str>, colorfgbg: Option<&str>) -> TuiTheme {
+    match theme.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("light") => LIGHT_THEME,
+        Some("dark") => DARK_THEME,
+        _ => colorfgbg
+            .and_then(|value| value.rsplit(';').next())
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|background| indexed_background_is_light(*background))
+            .map_or(DARK_THEME, |_| LIGHT_THEME),
+    }
+}
+
+fn tui_theme() -> &'static TuiTheme {
+    static THEME: OnceLock<TuiTheme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        resolve_tui_theme(
+            std::env::var("DEXT_THEME").ok().as_deref(),
+            std::env::var("COLORFGBG").ok().as_deref(),
+        )
+    })
+}
+
+fn thinking_bg() -> Color {
+    tui_theme().thinking_bg
+}
+
+fn steering_bg() -> Color {
+    tui_theme().steering_bg
+}
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const LIVE_BACKEND_RING_CAP: usize = 256_000;
 const LIVE_BACKEND_MAX_TOOLS: usize = 8;
@@ -2626,11 +2721,14 @@ fn live_thinking_detail_line(
     max_cells: usize,
     context_mode: ContextMode,
 ) -> Line<'static> {
-    let style = Style::default().fg(Color::Gray).bg(THINKING_BG);
+    let theme = tui_theme();
+    let style = Style::default().fg(theme.thinking_fg).bg(theme.thinking_bg);
     Line::from(vec![
         Span::styled(
             "• ",
-            Style::default().fg(Color::Indexed(244)).bg(THINKING_BG),
+            Style::default()
+                .fg(theme.thinking_marker)
+                .bg(theme.thinking_bg),
         ),
         Span::styled(
             clamp_chars(
@@ -6397,13 +6495,14 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
         }
         Line_::Steering(s) => {
             let sanitized = sanitize_display_text(s);
+            let theme = tui_theme();
             let body_style = Style::default()
-                .fg(Color::Indexed(215))
-                .bg(STEERING_BG)
+                .fg(theme.steering_fg)
+                .bg(theme.steering_bg)
                 .add_modifier(Modifier::ITALIC);
             let gutter_style = Style::default()
-                .fg(Color::Indexed(214))
-                .bg(STEERING_BG)
+                .fg(theme.steering_gutter)
+                .bg(theme.steering_bg)
                 .add_modifier(Modifier::BOLD);
             push_prefixed_wrapped_line(
                 &mut lines,
@@ -6435,11 +6534,14 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
         }
         Line_::Thinking(s) => {
             let sanitized = sanitize_display_text(s);
+            let theme = tui_theme();
             let thinking_style = Style::default()
-                .fg(Color::Gray)
-                .bg(THINKING_BG)
+                .fg(theme.thinking_fg)
+                .bg(theme.thinking_bg)
                 .add_modifier(Modifier::ITALIC);
-            let marker_style = Style::default().fg(Color::Indexed(244)).bg(THINKING_BG);
+            let marker_style = Style::default()
+                .fg(theme.thinking_marker)
+                .bg(theme.thinking_bg);
             push_thinking_body_lines(&mut lines, &sanitized, marker_style, thinking_style, width);
             let remaining = reasoning_paragraphs(&sanitized).len().saturating_sub(20);
             if remaining > 0 {
@@ -6984,8 +7086,8 @@ fn insert_transcript_items<B: Backend>(
     for item in items {
         let (text, height) = cached_transcript_render(state, item, width);
         let tint_bg = match item {
-            Line_::Thinking(_) => Some(THINKING_BG),
-            Line_::Steering(_) => Some(STEERING_BG),
+            Line_::Thinking(_) => Some(thinking_bg()),
+            Line_::Steering(_) => Some(steering_bg()),
             _ => next_transcript_tint(item, tool_tint_parity),
         };
         let text = Arc::new(text);
@@ -10919,6 +11021,24 @@ mod tests {
     }
 
     #[test]
+    fn tui_theme_override_and_background_hint_select_contrasting_palettes() {
+        let dark = resolve_tui_theme(Some("dark"), Some("0;15"));
+        let light = resolve_tui_theme(Some("light"), Some("15;0"));
+        let detected_light = resolve_tui_theme(None, Some("0;15"));
+        let detected_dark = resolve_tui_theme(None, Some("15;0"));
+        let detected_dark_indexed = resolve_tui_theme(None, Some("15;235"));
+        let detected_light_indexed = resolve_tui_theme(None, Some("0;255"));
+
+        assert_eq!(dark.thinking_bg, DARK_THEME.thinking_bg);
+        assert_eq!(light.thinking_bg, LIGHT_THEME.thinking_bg);
+        assert_eq!(detected_light.steering_bg, LIGHT_THEME.steering_bg);
+        assert_eq!(detected_dark.steering_bg, DARK_THEME.steering_bg);
+        assert_eq!(detected_dark_indexed.thinking_bg, DARK_THEME.thinking_bg);
+        assert_eq!(detected_light_indexed.thinking_bg, LIGHT_THEME.thinking_bg);
+        assert_ne!(light.thinking_fg, dark.thinking_fg);
+    }
+
+    #[test]
     fn status_spans_do_not_render_trust_indicator() {
         let state = TuiState::new(
             "test-model".to_string(),
@@ -12498,7 +12618,7 @@ mod tests {
             "live indicator should be allowed to fill/break at terminal border: {lines:?}"
         );
         let style = span_style_for(&text, "xxx").expect("streaming thinking detail");
-        assert_eq!(style.bg, Some(THINKING_BG));
+        assert_eq!(style.bg, Some(thinking_bg()));
         assert!(
             lines[1].starts_with("• "),
             "live thinking detail: {lines:?}"
@@ -12540,8 +12660,8 @@ mod tests {
         let body_style = span_style_for(&text, "checking").expect("thinking body");
         let lines = flatten_lines(&text);
 
-        assert_eq!(body_style.bg, Some(THINKING_BG));
-        assert_eq!(body_style.fg, Some(Color::Gray));
+        assert_eq!(body_style.bg, Some(thinking_bg()));
+        assert_eq!(body_style.fg, Some(tui_theme().thinking_fg));
         assert_eq!(
             lines.first().map(String::as_str),
             Some("• checking the next step")
@@ -12571,11 +12691,11 @@ mod tests {
             Some("┃ wolf = dext my bad. old names.")
         );
         assert!(lines.iter().all(|line| !line.contains(">>")));
-        assert_eq!(body_style.bg, Some(STEERING_BG));
-        assert_eq!(gutter_style.bg, Some(STEERING_BG));
-        assert_ne!(body_style.bg, Some(THINKING_BG));
-        assert_eq!(body_style.fg, Some(Color::Indexed(215)));
-        assert_eq!(gutter_style.fg, Some(Color::Indexed(214)));
+        assert_eq!(body_style.bg, Some(steering_bg()));
+        assert_eq!(gutter_style.bg, Some(steering_bg()));
+        assert_ne!(body_style.bg, Some(thinking_bg()));
+        assert_eq!(body_style.fg, Some(tui_theme().steering_fg));
+        assert_eq!(gutter_style.fg, Some(tui_theme().steering_gutter));
         assert!(gutter_style.add_modifier.contains(Modifier::BOLD));
     }
 

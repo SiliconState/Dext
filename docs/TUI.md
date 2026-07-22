@@ -25,6 +25,10 @@ Press `Ctrl+L` during ordinary idle or busy work to open the current session tod
 
 The first version is intentionally read-only. Todo edits still use the existing `todo_write` path so validation, permission, checkpoint, and session-state behavior are not duplicated in the TUI. Empty-state parsing matches Dext's generated empty-list lines exactly, so ordinary todo text cannot clear the modal accidentally. When todo progress is the live-status fallback above the composer, its battery follows the list length up to seven cells: `Todos 3/4 ■■■□` uses one cell per task, while longer lists such as `Todos 15/20 ■■■■■□□` stay capped and proportional. Partial progress always retains at least one filled and one empty cell, and the active task remains visible when space allows. The modal is rendered inside the inline viewport; `Ctrl+B` and the backend viewer remain the only alternate-screen path.
 
+## Theme
+
+Thinking and steering blocks use a contrast-aware palette. Set `DEXT_THEME=light` or `DEXT_THEME=dark` to override it. Without an override, Dext converts the terminal's `COLORFGBG` 16/256-color background index to luminance when available and otherwise keeps the dark palette.
+
 ## Status and backend viewer
 
 The main status row reserves its right edge for a live cumulative agent-active clock while Dext is handling a turn. It advances during provider waits, tool calls, permission/auth waits, and in-turn compaction; while Dext is idle awaiting user input, the clock pauses and is hidden, then resumes on the next turn. It updates through the existing redraw cadence and uses compact `7s`, `7m 05s`, and `1h 07m` forms without adding a timer thread.

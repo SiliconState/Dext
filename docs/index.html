@@ -727,7 +727,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="tools-rs" class="collapsible-header">Tools.rs — Tool Catalog <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p>Defines all provider-visible tools, their schemas, permission requirements, and parallel-safety classification.</p>
+<p>Defines all provider-visible tools and a shared <code>ToolSpec</code> registry for required fields, permission, side-effect/process, parallel-safety, and default/full-profile metadata. Wire schemas and lean descriptions stay next to the catalog; policy code consumes registry metadata instead of repeating lists.</p>
 <h3>Tool Profiles</h3>
 <table>
 <tr><th>Profile</th><th>Description</th><th>Schemas</th></tr>
@@ -761,13 +761,14 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><th>Risk</th><th>Description</th><th>Examples</th></tr>
 <tr><td><code>Read</code></td><td>Read-only operations</td><td><code>ls</code>, <code>cat</code>, <code>git status</code>, <code>http GET</code></td></tr>
 <tr><td><code>Write</code></td><td>Modifies files or state</td><td><code>write_file</code>, <code>edit_file</code>, non-dangerous bash</td></tr>
-<tr><td><code>Danger</code></td><td>Destructive or sensitive operations</td><td><code>sudo</code>, <code>rm -rf</code>, <code>git push</code>, HTTP POST/DELETE</td></tr>
+<tr><td><code>Danger</code></td><td>Destructive or sensitive operations; never auto-approved by <code>auto-write</code></td><td><code>sudo</code>, <code>rm -rf</code>, <code>git checkout</code>, <code>git stash drop/clear/pop</code>, inline/stdin interpreters, <code>git push</code>, HTTP POST/DELETE</td></tr>
 </table>
 <h3>Bash Guardrails</h3>
 <ul>
 <li>Auto-injects <code>set -o pipefail</code> if missing</li>
 <li>Blocks <code>--break-system-packages</code> pip flag (overridable)</li>
-<li>Detects sudo commands needing password and routes to local auth prompt</li>
+<li>Detects sudo commands needing password and routes them to the local auth prompt</li>
+<li>Classifies inline or stdin interpreter execution (<code>python -c</code>, <code>perl -e</code>, <code>node -e</code>/<code>-p</code>, attached forms, and stdin forms) as Danger because payload effects cannot be safely inferred from an outer command list</li>
 <li>Bash calls are atomic: Unix roots run in detached sessions/process groups; Windows roots start suspended, enter kill-on-close Job Objects, then resume. Dext cleans the full child tree after completion, timeout, or interrupt.</li>
 <li>On Windows, shell-backed tools skip Windows/WSL app aliases and select a real <code>bash.exe</code> from <code>PATH</code> (for example Git for Windows); <code>DEXT_BASH_PATH</code> provides an explicit override.</li>
 <li>Advisories: prefer <code>rg</code> over <code>grep -r</code>, prefer <code>fd</code> over <code>find</code></li>
@@ -815,7 +816,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Tool Result Rendering</h3>
 <p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints. Failed native <code>write_file</code>, <code>edit_file</code>, and <code>multi_edit</code> blocks explicitly state that no edits were applied, matching the atomic prepare-and-replace invariant. The alternate-screen backend viewer normalizes CRLF across arbitrary output chunks without introducing blank rows and visually matches the main TUI with a Dext header, agent-active clock, command summary, styled stdout/stderr lanes, output panel, command position, and compact controls. It continues to use the existing bounded ring buffer, selection, scrolling, event stream, and permission/auth priority.</p>
 <h3>Markdown Rendering</h3>
-<p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence.</p>
+<p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence. Thinking and steering blocks use a light or dark contrast palette. <code>DEXT_THEME=light|dark</code> is the explicit override; otherwise Dext converts the terminal's <code>COLORFGBG</code> 16/256-color background index to luminance when present and falls back to dark.</p>
 <h3 id="tui-dependencies">Dependency and resize contract</h3>
 <p>The exact stack is <code>ratatui 0.30.2</code>, <code>ratatui-core 0.1.2</code>, <code>tui-markdown 0.3.8</code>, <code>crossterm 0.29.0</code>, and <code>unicode-width 0.2.2</code>. Dext selects exact versions and patches exact vendored <code>ratatui-core</code> source to avoid synchronous cursor-position queries during inline replay and whole-display clears during horizontal shrink.</p>
 <p>The real-PTY regression suite verifies editable input during streaming, resize survival with populated history, zero whole-screen resize clears, bounded cursor queries, terminal-height-bounded replay chunks, and completed output after resize. Its final stream marker has a bounded 10-second wait so slower macOS CI hosts do not create false negatives. See <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a> and <a href="https://github.com/SiliconState/Dext/blob/main/vendor/ratatui-core/DEXT_PATCH.md"><code>vendor/ratatui-core/DEXT_PATCH.md</code></a> for the maintained contract and patch rationale.</p>
@@ -829,9 +830,9 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Git-native recovery checkpoints created before approved non-read-risk tool calls in Git workspaces.</p>
 <h3>Checkpoint Lifecycle</h3>
 <ol>
-<li><strong>Create</strong> — Before a tool executes, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;</code></li>
+<li><strong>Create</strong> — Immediately before each sequential tool dispatch, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;</code>; a later call in one round therefore captures state produced by earlier calls</li>
 <li><strong>Dirty state capture</strong> — If the worktree is dirty, <code>git stash create</code> captures a snapshot without touching the working tree or reflog</li>
-<li><strong>Untracked sidecar</strong> — For direct file tools, untracked files are saved to owner-private <code>.dext/checkpoints/&lt;id&gt;/</code> storage; symlinked storage paths are rejected on Unix</li>
+<li><strong>Untracked sidecars</strong> — Direct file tools preserve an untracked target. Write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> checkpoints preserve all existing untracked regular files up to 500 paths, 8 MiB per file, and 32 MiB total. Private sidecars retain owner execute state, and restore fails closed if any declared sidecar is missing. If the required snapshot cannot be created, the command is not executed. In a repository without an initial commit, writes that would overwrite existing worktree/index state also fail closed because Git has no normal restore base. A workspace with no <code>.git</code> marker remains a non-Git no-op without invoking Git; a discovered but malformed repository marker fails closed.</li>
 <li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude</li>
 </ol>
 <h3>Restore Modes</h3>
@@ -845,7 +846,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Pruning</h3>
 <p>Default: keep the 20 newest checkpoints and remove entries older than 168 hours (7 days). Pruning rebuilds local manifests, removes orphaned <code>refs/dext/checkpoints/*</code>, and deletes associated sidecar directories for bounded disk growth. Never mirror-push <code>refs/dext/*</code>.</p>
 <h3>Checkpoint Triggers</h3>
-<p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Other tools are checkpointed when <code>tool_policy::classify_command_risk()</code> returns Write or Danger (for example write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> or non-GET <code>http</code>).</p>
+<p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Other tools are checkpointed when <code>tool_policy::classify_command_risk()</code> returns Write or Danger. Required checkpoint creation is fail-closed before execution; HTTP and other non-filesystem side effects are not recoverable merely because a local Git checkpoint exists.</p>
 </div>
 </section>
 
@@ -857,7 +858,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <ol>
 <li>Read the current file content (or empty for new files)</li>
 <li>Compute the proposed content (apply edit/multi-edit transforms in memory)</li>
-<li>Generate a simple line-level diff with one context line around changed hunks</li>
+<li>Generate an alignment-aware Myers line diff with one context line around changed hunks; final-newline-only changes are explicit, and inputs above the line budget use a bounded conservative fallback</li>
+<li>Keep added/removed counts for the full proposed change even when rendered output is truncated</li>
 <li>Cap at 4,096 bytes with a truncation notice</li>
 <li>Show added/removed line counts and whether it's a new file</li>
 </ol>
@@ -898,7 +900,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="packs-rs" class="collapsible-header">Packs.rs — Pack System <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p><strong>Packs are shelf-contained workflow documents, not plugin binaries.</strong> Dext supplies the create, discover, inspect, maintain, and run lifecycle; users own the content. The runtime reads <code>PACK.md</code> and executes through the existing Dext tool surface, keeping packs provider-neutral and auditable without bloating the core binary.</p>
+<p><strong>Packs are shelf-contained workflow documents, not plugin binaries.</strong> Dext supplies the create, discover, inspect, maintain, and run lifecycle; users own the content. The runtime accepts <code>PACK.md</code> only as a regular non-symlink file no larger than 1 MiB, then applies the 32 KiB invocation-context cap and executes through the existing Dext tool surface, keeping packs provider-neutral and auditable without bloating the core binary.</p>
 
 <h3>Design Contract</h3>
 <ul>
@@ -925,7 +927,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>Explicit shelf roots: <code>DEXT_SHELVES_DIR</code></li>
 <li>User shelves: <code>~/.dext/shelves/*/packs</code></li>
 </ol>
-<p>Create reusable packs with <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>; add <code>--project</code> only for an explicitly project-local pack. The scaffold creates a minimal <code>PACK.md</code>, refuses overwrite, and is immediately available to normal inspection and invocation. Direct <code>packs/</code>, <code>.dext/packs</code>, <code>~/.dext/packs</code>, <code>DEXT_PACKS_DIR</code>, and per-pack override roots are not discovery inputs.</p>
+<p>Create reusable packs with <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>; add <code>--project</code> only for an explicitly project-local pack. The scaffold creates a minimal <code>PACK.md</code>, refuses overwrite, and is immediately available to normal inspection and explicit invocation. Direct <code>packs/</code>, <code>.dext/packs</code>, <code>~/.dext/packs</code>, <code>DEXT_PACKS_DIR</code>, and per-pack override roots are not discovery inputs.</p>
+<p>Project-local <code>PACK.md</code> content has a repository trust boundary. An explicit <code>/pack</code> or <code>dext pack</code> invocation confirms only that selected project workflow; it does not approve unrelated project shelf metadata. Conversational auto-invocation prompts once per active repository before loading project workflow text. Denied project pack metadata stays out of the model prompt and cannot shadow a same-named user or run-shelf pack. Project-local credential declarations remain ignored.</p>
 <p>The resolver deduplicates by canonicalized path and normalized pack name. Name collisions are resolved by precedence order, not random filesystem order.</p>
 
 <h3>Pack Layout and Front Matter</h3>
@@ -956,10 +959,10 @@ credential-env: [SERVICE_TOKEN]
 <li>paths for workflow and optional hooks</li>
 <li>pack-scoped environment names (<code>DEXT_PACK_DIR</code>, <code>DEXT_PACK_&lt;NAME&gt;_DIR</code>), which the runtime supplies to active-pack <code>bash</code> calls and hook processes</li>
 <li>declared credential names only, never their values</li>
-<li>full <code>PACK.md</code> workflow body</li>
+<li>capped <code>PACK.md</code> workflow body</li>
 <li>explicit user task text</li>
 </ul>
-<p>This gives the model procedural guidance without changing core runtime policy. The selected pack remains active for the session: its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own native <code>bin/</code> helper, never hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state.</p>
+<p>This gives the model procedural guidance without changing core runtime policy. Workflow loading must succeed before the selected pack becomes active, so a missing, oversized, symlinked, or otherwise invalid <code>PACK.md</code> cannot install pack hooks or environment. Once active, its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own native <code>bin/</code> helper, never hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state.</p>
 
 <h3>Execution Paths</h3>
 <ul>
@@ -1004,7 +1007,7 @@ credential-env: [SERVICE_TOKEN]
 </table>
 
 <h3>Signal and Effect Types</h3>
-<p>The shelf module defines a typed signal/effect vocabulary for in-process shelf implementations. Filesystem <code>shelf.json</code> manifests are declarative metadata: a matching load/prompt hook declaration can opt declared context into bounded prompt injection, but manifests do not register executable tools or slash commands and do not supply arbitrary effect handlers.</p>
+<p>The shelf module defines a typed signal/effect vocabulary for in-process shelf implementations. Filesystem <code>shelf.json</code> manifests must be regular non-symlink files no larger than 1 MiB and are declarative metadata: a matching load/prompt hook declaration can opt declared context into bounded prompt injection, but manifests do not register executable tools or slash commands and do not supply arbitrary effect handlers.</p>
 <table>
 <tr><th>Signals</th><th>Typical Use</th></tr>
 <tr><td><code>load</code>, <code>prompt</code>, <code>tool(before|after)</code>, <code>turn(start|end)</code>, <code>compact</code>, <code>shutdown</code></td><td>Typed lifecycle vocabulary for in-process shelves</td></tr>
@@ -1017,12 +1020,12 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>rewrite_tool</code></td><td>Typed input-rewrite effect for an in-process shelf; not executed from a static manifest</td></tr>
 <tr><td><code>state</code></td><td>Typed state effect for an in-process shelf; static manifests do not persist it</td></tr>
 </table>
-<p><code>Block</code> effects terminate in-process signal flow early. Static manifest shelves only produce context/note data for opted-in load or prompt signals.</p>
+<p><code>Block</code> effects terminate in-process signal flow early. Static manifest shelves only produce context/note data for opted-in load or prompt signals. All project <code>shelf.json</code> metadata requires one first-use confirmation per active repository; before approval it is omitted from the model prompt, cannot shadow same-key trusted user/run metadata, and cannot contribute behavioral tool effects, while approved project context is explicitly labeled repository-controlled.</p>
 
 <h3>Discovery and Scope Precedence</h3>
 <table>
 <tr><th>Scope</th><th>Rank</th><th>Location</th><th>Intent</th></tr>
-<tr><td><code>Core</code></td><td>0</td><td>Bundled shelves</td><td>Base defaults</td></tr>
+<tr><td><code>Core</code></td><td>0</td><td>In-process registration</td><td>Base defaults; release binaries do not probe build-machine source paths</td></tr>
 <tr><td><code>User</code></td><td>1</td><td><code>~/.dext/shelves</code></td><td>User-level customization</td></tr>
 <tr><td><code>Project</code></td><td>2</td><td><code>.dext/shelves</code></td><td>Repo-specific policy/context</td></tr>
 <tr><td><code>Run</code></td><td>3</td><td><code>DEXT_SHELVES_DIR</code></td><td>Per-invocation highest-priority overrides</td></tr>
@@ -1288,6 +1291,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>DEXT_HTTP_ALLOW_PRIVATE</code></td><td>false</td><td>Built-in HTTP tool only: allow private, CGNAT, and IPv6 unique-local destinations.</td></tr>
 <tr><td><code>DEXT_HTTP_ALLOW_LINK_LOCAL</code></td><td>false</td><td>Built-in HTTP tool only: allow link-local and cloud-metadata destinations.</td></tr>
 <tr><td><code>DEXT_NO_TUI</code></td><td>false</td><td>Disable inline TUI even when a terminal is available</td></tr>
+<tr><td><code>DEXT_THEME</code></td><td>auto</td><td>TUI contrast palette: <code>light</code> or <code>dark</code>; auto converts a <code>COLORFGBG</code> 16/256-color background index to luminance and otherwise uses dark.</td></tr>
 <tr><td><code>DEXT_SYSTEM</code></td><td>Built-in prompt</td><td>Override the base system prompt</td></tr>
 <tr><td><code>DEXT_SANDBOX</code></td><td><code>.</code></td><td>Override sandbox root path</td></tr>
 <tr><td><code>DEXT_HOOKS_FILE</code></td><td><code>hooks.json</code></td><td>Override project hook configuration file</td></tr>
@@ -1360,11 +1364,11 @@ credential-env: [SERVICE_TOKEN]
 <h3><code>.env</code> (~/.dext/.env or $DEXT_HOME/.env)</h3>
 <p>Optional user-owned Dext settings. Project <code>.env</code> files and parent directories are never auto-loaded, so repository content cannot silently alter runtime policy.</p>
 <h3><code>DEXT.md</code> (sandbox ancestry)</h3>
-<p>Tracked machine-facing project guidance auto-injected into the system prompt. Dext scans the sandbox root and ancestors and does not modify the file automatically.</p>
+<p>Tracked machine-facing project guidance auto-injected into the system prompt. Dext scans the sandbox root and ancestors, labels it as project-controlled guidance, and does not modify the file automatically.</p>
 <h3><code>recall.md</code> (optional sandbox ancestry)</h3>
 <p>Optional ignored prompt cache. It is auto-injected only when present; Dext does not create or update it automatically.</p>
 <h3><code>hooks.json</code> (project root or <code>DEXT_HOOKS_FILE</code>)</h3>
-<p>Project-root hooks configuration loaded from <code>hooks.json</code> by default, or from <code>DEXT_HOOKS_FILE</code> when set. This is not the same as pack <code>phooks.json</code>.</p>
+<p>Project-root hooks configuration loaded from <code>hooks.json</code> by default, or from <code>DEXT_HOOKS_FILE</code> when set. This is not the same as pack <code>phooks.json</code>. Hook execution still requires its own approval. Approved <code>post_tool</code> hooks receive privacy-redacted <code>DEXT_TOOL_RESULT</code>, not raw output.</p>
 </div>
 </section>
 
