@@ -337,7 +337,7 @@ fn temp_swap_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
@@ -371,7 +371,7 @@ fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 

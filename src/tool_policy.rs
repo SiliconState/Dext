@@ -381,39 +381,109 @@ fn collect_shell_segment_invocation(
         return;
     }
     let mut idx = 0usize;
-    while idx < segment.len()
-        && (shell_assignment_word(&segment[idx]) || shell_command_keyword(&segment[idx]))
-    {
-        idx += 1;
+    while idx < segment.len() {
+        if shell_assignment_word(&segment[idx]) || shell_command_keyword(&segment[idx]) {
+            idx += 1;
+        } else if let Some(consumed) = shell_redirection_words(&segment[idx]) {
+            idx = idx.saturating_add(consumed);
+        } else {
+            break;
+        }
     }
     loop {
         let Some(word) = segment.get(idx) else {
             return;
         };
-        match shell_command_basename(word) {
+        let wrapper_idx = idx;
+        let wrapper = shell_command_basename(word).to_ascii_lowercase();
+        let unwrapped = match wrapper.as_str() {
             "env" => {
+                if let Some(payload) = env_split_string_payload(segment, idx + 1) {
+                    invocations.push(segment[idx..].to_vec());
+                    if let Some(payload) = payload {
+                        collect_shell_command_invocations(
+                            payload,
+                            depth.saturating_add(1),
+                            invocations,
+                        );
+                    }
+                    return;
+                }
                 idx += 1;
                 skip_env_command_prefix(segment, &mut idx);
+                true
             }
-            "command" | "builtin" => {
+            "command" => {
+                if command_builtin_is_informational(segment, idx + 1) {
+                    return;
+                }
                 idx += 1;
                 skip_command_builtin_prefix(segment, &mut idx);
+                true
+            }
+            "builtin" => {
+                idx += 1;
+                skip_command_builtin_prefix(segment, &mut idx);
+                true
+            }
+            "exec" => {
+                idx += 1;
+                skip_exec_command_prefix(segment, &mut idx);
+                true
+            }
+            "nohup" => {
+                idx += 1;
+                if segment.get(idx).is_some_and(|word| word == "--") {
+                    idx += 1;
+                }
+                true
+            }
+            "timeout" => {
+                idx += 1;
+                skip_timeout_command_prefix(segment, &mut idx);
+                true
+            }
+            "nice" => {
+                idx += 1;
+                skip_nice_command_prefix(segment, &mut idx);
+                true
+            }
+            "stdbuf" => {
+                idx += 1;
+                skip_stdbuf_command_prefix(segment, &mut idx);
+                true
             }
             "time" => {
                 idx += 1;
                 skip_time_command_prefix(segment, &mut idx);
+                true
             }
-            _ => break,
+            _ => false,
+        };
+        if !unwrapped {
+            break;
+        }
+        while idx < segment.len()
+            && let Some(consumed) = shell_redirection_words(&segment[idx])
+        {
+            idx = idx.saturating_add(consumed);
+        }
+        if segment
+            .get(idx)
+            .is_some_and(|word| word.starts_with('-') && word != "-")
+        {
+            invocations.push(segment[wrapper_idx..].to_vec());
+            return;
         }
     }
     if idx >= segment.len() {
         return;
     }
     let invocation = segment[idx..].to_vec();
-    let command = shell_command_basename(&invocation[0]);
+    let command = shell_command_basename(&invocation[0]).to_ascii_lowercase();
     invocations.push(invocation.clone());
 
-    if matches!(command, "sh" | "bash" | "dash" | "ksh" | "zsh") {
+    if matches!(command.as_str(), "sh" | "bash" | "dash" | "ksh" | "zsh") {
         if let Some(payload) = shell_c_payload(&invocation) {
             collect_shell_command_invocations(payload, depth.saturating_add(1), invocations);
         }
@@ -423,6 +493,8 @@ fn collect_shell_segment_invocation(
             depth.saturating_add(1),
             invocations,
         );
+    } else if matches!(command.as_str(), "busybox" | "toybox") && invocation.len() > 1 {
+        collect_shell_segment_invocation(&invocation[1..], depth.saturating_add(1), invocations);
     } else if command == "xargs"
         && let Some(command_idx) = xargs_command_index(&invocation)
     {
@@ -611,6 +683,141 @@ fn shell_command_separator(word: &str) -> bool {
     matches!(word, "&&" | ";" | "|" | "&")
 }
 
+fn shell_redirection_words(word: &str) -> Option<usize> {
+    let mut redirection = word;
+    let fd_prefix = redirection
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map_or(0, |(idx, ch)| idx + ch.len_utf8());
+    if fd_prefix > 0 {
+        redirection = &redirection[fd_prefix..];
+    } else if let Some(close) = redirection
+        .strip_prefix('{')
+        .and_then(|rest| rest.find('}'))
+    {
+        redirection = &redirection[close + 2..];
+    }
+    for operator in [
+        "&>>", "&>", "<<<", "<<-", "<<", ">>", "<>", ">|", "<&", ">&", ">", "<",
+    ] {
+        if let Some(target) = redirection.strip_prefix(operator) {
+            return Some(if target.is_empty() { 2 } else { 1 });
+        }
+    }
+    None
+}
+
+fn env_split_string_payload(words: &[String], start: usize) -> Option<Option<&str>> {
+    let mut idx = start;
+    while idx < words.len() && !shell_command_separator(&words[idx]) {
+        let word = words[idx].as_str();
+        if matches!(word, "-S" | "--split-string") {
+            return Some(words.get(idx + 1).map(String::as_str));
+        }
+        if let Some(payload) = word
+            .strip_prefix("--split-string=")
+            .or_else(|| word.strip_prefix("-S"))
+            .filter(|payload| !payload.is_empty())
+        {
+            return Some(Some(payload));
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn skip_exec_command_prefix(words: &[String], idx: &mut usize) {
+    while *idx < words.len() {
+        let word = words[*idx].as_str();
+        match word {
+            "-a" => *idx = (*idx).saturating_add(2),
+            "--" => {
+                *idx += 1;
+                break;
+            }
+            _ if word.starts_with('-')
+                && !word.starts_with("--")
+                && word[1..].chars().all(|flag| matches!(flag, 'c' | 'l')) =>
+            {
+                *idx += 1;
+            }
+            _ => break,
+        }
+    }
+}
+
+fn skip_timeout_command_prefix(words: &[String], idx: &mut usize) {
+    while *idx < words.len() {
+        let word = words[*idx].as_str();
+        if matches!(word, "-k" | "--kill-after" | "-s" | "--signal") {
+            *idx = (*idx).saturating_add(2);
+        } else if matches!(
+            word,
+            "-v" | "--foreground" | "--preserve-status" | "--verbose"
+        ) || word.starts_with("--kill-after=")
+            || word.starts_with("--signal=")
+            || word.starts_with("-k") && word.len() > 2
+            || word.starts_with("-s") && word.len() > 2
+        {
+            *idx += 1;
+        } else if word == "--" {
+            *idx += 1;
+            break;
+        } else {
+            break;
+        }
+    }
+    if *idx < words.len() && !words[*idx].starts_with('-') {
+        *idx += 1;
+    }
+}
+
+fn skip_nice_command_prefix(words: &[String], idx: &mut usize) {
+    while *idx < words.len() {
+        let word = words[*idx].as_str();
+        if matches!(word, "-n" | "--adjustment") {
+            *idx = (*idx).saturating_add(2);
+        } else if word.starts_with("--adjustment=")
+            || word
+                .strip_prefix("-n")
+                .is_some_and(|value| !value.is_empty() && value.parse::<i32>().is_ok())
+            || word.len() > 1
+                && matches!(word.as_bytes()[0], b'-' | b'+')
+                && word[1..].chars().all(|ch| ch.is_ascii_digit())
+        {
+            *idx += 1;
+        } else if word == "--" {
+            *idx += 1;
+            break;
+        } else {
+            break;
+        }
+    }
+}
+
+fn skip_stdbuf_command_prefix(words: &[String], idx: &mut usize) {
+    while *idx < words.len() {
+        let word = words[*idx].as_str();
+        if matches!(
+            word,
+            "-i" | "--input" | "-o" | "--output" | "-e" | "--error"
+        ) {
+            *idx = (*idx).saturating_add(2);
+        } else if ["-i", "-o", "-e", "--input=", "--output=", "--error="]
+            .iter()
+            .any(|prefix| word.starts_with(prefix) && word.len() > prefix.len())
+        {
+            *idx += 1;
+        } else if word == "--" {
+            *idx += 1;
+            break;
+        } else {
+            break;
+        }
+    }
+}
+
 fn skip_env_command_prefix(words: &[String], idx: &mut usize) {
     while *idx < words.len() {
         let word = &words[*idx];
@@ -630,11 +837,20 @@ fn skip_env_command_prefix(words: &[String], idx: &mut usize) {
             *idx += 1;
             continue;
         }
-        if matches!(word.as_str(), "-u" | "--unset" | "-C" | "--chdir") {
+        if matches!(
+            word.as_str(),
+            "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0"
+        ) {
             *idx = (*idx).saturating_add(2);
             continue;
         }
-        if word.starts_with("--unset=") || word.starts_with("--chdir=") {
+        if word.starts_with("--unset=")
+            || word.starts_with("--chdir=")
+            || word.starts_with("--argv0=")
+            || word.starts_with("-u") && word.len() > 2
+            || word.starts_with("-C") && word.len() > 2
+            || word.starts_with("-a") && word.len() > 2
+        {
             *idx += 1;
             continue;
         }
@@ -661,6 +877,15 @@ fn shell_command_basename(word: &str) -> &str {
         .unwrap_or(basename)
 }
 
+fn command_builtin_is_informational(words: &[String], start: usize) -> bool {
+    words[start..]
+        .iter()
+        .take_while(|word| word.starts_with('-') && word.as_str() != "--")
+        .any(|word| {
+            !word.starts_with("--") && word[1..].chars().any(|flag| matches!(flag, 'v' | 'V'))
+        })
+}
+
 fn skip_command_builtin_prefix(words: &[String], idx: &mut usize) {
     while *idx < words.len() {
         match words[*idx].as_str() {
@@ -679,7 +904,15 @@ fn skip_time_command_prefix(words: &[String], idx: &mut usize) {
         let word = words[*idx].as_str();
         if matches!(
             word,
-            "-p" | "--portability" | "-v" | "--verbose" | "--quiet"
+            "-a" | "--append"
+                | "-p"
+                | "--portability"
+                | "-v"
+                | "--verbose"
+                | "--quiet"
+                | "-V"
+                | "--version"
+                | "--help"
         ) {
             *idx += 1;
         } else if matches!(word, "-o" | "--output" | "-f" | "--format") {
@@ -698,7 +931,23 @@ fn skip_time_command_prefix(words: &[String], idx: &mut usize) {
 fn shell_command_keyword(word: &str) -> bool {
     matches!(
         word,
-        "if" | "then" | "do" | "while" | "until" | "!" | "{" | "}" | "(" | ")"
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "do"
+            | "done"
+            | "while"
+            | "until"
+            | "for"
+            | "select"
+            | "in"
+            | "esac"
+            | "!"
+            | "{"
+            | "}"
+            | "("
+            | ")"
     )
 }
 
@@ -1146,6 +1395,15 @@ fn shell_words(command: &str) -> Vec<String> {
                     words.push(std::mem::take(&mut current));
                 }
             }
+            '&' if !in_single
+                && !in_double
+                && (current.ends_with('>') || current.ends_with('<')) =>
+            {
+                current.push(ch);
+            }
+            '&' if !in_single && !in_double && current.is_empty() && chars.peek() == Some(&'>') => {
+                current.push(ch);
+            }
             ';' | '|' | '&' if !in_single && !in_double => {
                 if !current.is_empty() {
                     words.push(std::mem::take(&mut current));
@@ -1506,7 +1764,8 @@ fn shell_search_tool_exec_escape(chunk: &str) -> bool {
             idx += 1;
             continue;
         }
-        match shell_command_basename(word) {
+        let wrapper = shell_command_basename(word).to_ascii_lowercase();
+        match wrapper.as_str() {
             "env" => {
                 idx += 1;
                 skip_env_command_prefix(&words, &mut idx);
@@ -1524,12 +1783,12 @@ fn shell_search_tool_exec_escape(chunk: &str) -> bool {
             }
             _ => {}
         }
-        let command = shell_command_basename(word);
-        if matches!(command, "fd" | "rg")
+        let command = shell_command_basename(word).to_ascii_lowercase();
+        if matches!(command.as_str(), "fd" | "rg")
             && words[idx.saturating_add(1)..]
                 .iter()
                 .take_while(|arg| !shell_command_separator(arg) && arg.as_str() != "--")
-                .any(|arg| search_tool_arg_exec_escape(command, arg))
+                .any(|arg| search_tool_arg_exec_escape(&command, arg))
         {
             return true;
         }
@@ -1543,6 +1802,7 @@ fn shell_chunk_is_read_only(chunk: &str) -> bool {
     let words = shell_words(chunk);
     let first = words.first().map(String::as_str).unwrap_or("");
     match first {
+        "command" if command_builtin_is_informational(&words, 1) => true,
         "echo" | "ls" | "cat" | "pwd" | "whoami" | "id" | "printenv" | "grep" | "head" | "tail"
         | "stat" | "which" | "basename" | "dirname" | "realpath" | "readlink" | "wc" | "sort"
         | "uniq" | "cut" | "tr" | "jq" => true,
@@ -1571,37 +1831,7 @@ fn shell_chunk_is_read_only(chunk: &str) -> bool {
             ) || w.starts_with("-fprint")
         }),
         "awk" => !chunk.contains("system("),
-        "git" => match words.get(1).map(String::as_str).unwrap_or("") {
-            "status" | "diff" | "log" | "show" | "rev-parse" => true,
-            // `git branch` only lists when every remaining arg is a list-style
-            // flag; positional args create branches and -d/-D/-m/-M/-c/-C/-f
-            // mutate them.
-            "branch" => words.iter().skip(2).all(|w| {
-                if !w.starts_with('-') {
-                    return false;
-                }
-                if let Some(flags) = w.strip_prefix('-')
-                    && !flags.starts_with('-')
-                {
-                    // Short flags may combine (-dr deletes a remote-tracking
-                    // branch), so any cluster containing a mutating letter is
-                    // a write; -a/-r/-v style listing flags stay read-only.
-                    return !flags
-                        .chars()
-                        .any(|ch| matches!(ch, 'd' | 'D' | 'm' | 'M' | 'c' | 'C' | 'f' | 'u'));
-                }
-                !matches!(
-                    w.as_str(),
-                    "--force"
-                        | "--delete"
-                        | "--move"
-                        | "--copy"
-                        | "--edit-description"
-                        | "--unset-upstream"
-                ) && !w.starts_with("--set-upstream-to")
-            }),
-            _ => false,
-        },
+        "git" => !git_invocation_is_dangerous(&words),
         _ => false,
     }
 }
@@ -1650,6 +1880,44 @@ fn shell_command_is_dangerous(command: &str) -> bool {
             || lower.contains("|bash"))
 }
 
+fn shell_interpreter_uses_stdin(invocation: &[String]) -> bool {
+    let args = &invocation[1..];
+    if args.is_empty() {
+        return true;
+    }
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if arg == "--" {
+            return args.get(idx + 1).is_none_or(|script| script == "-");
+        }
+        if arg == "-c"
+            || arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|flag| flag == 'c')
+        {
+            return args.get(idx + 1).is_none();
+        }
+        if arg == "-s"
+            || arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|flag| flag == 's')
+        {
+            return true;
+        }
+        if matches!(arg, "-O" | "-o" | "--rcfile" | "--init-file") {
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        return arg == "-";
+    }
+    true
+}
+
 fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     let Some(first) = invocation.first() else {
         return false;
@@ -1657,6 +1925,11 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     let command = shell_command_basename(first).to_ascii_lowercase();
     let command = command.as_str();
     if is_sudo_command_word(first)
+        || first.contains(['$', '`'])
+        || first.ends_with("()")
+        || invocation.get(1).is_some_and(|word| word == "()")
+        || invocation.get(1).is_some_and(|word| word == "(")
+            && invocation.get(2).is_some_and(|word| word == ")")
         || matches!(
             command,
             "rm" | "rmdir"
@@ -1669,6 +1942,29 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
                 | "poweroff"
                 | "halt"
                 | "eval"
+                | "alias"
+                | "trap"
+                | "case"
+                | "coproc"
+                | "function"
+                | "doas"
+                | "pkexec"
+                | "su"
+                | "runuser"
+                | "chroot"
+                | "systemd-run"
+                | "kill"
+                | "pkill"
+                | "killall"
+                | "mount"
+                | "umount"
+                | "unshare"
+                | "nsenter"
+                | "watch"
+                | "script"
+                | "ssh"
+                | "scp"
+                | "sftp"
         )
         || command == "dd"
         || command.starts_with("mkfs")
@@ -1676,12 +1972,25 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
         return true;
     }
 
+    if matches!(command, "sh" | "bash" | "dash" | "ksh" | "zsh")
+        && shell_interpreter_uses_stdin(invocation)
+    {
+        return true;
+    }
+    if let Some(interpreter) = interpreter_kind(command) {
+        return interpreter_inline_code_is_dangerous(interpreter, invocation);
+    }
+
     match command {
+        "env" | "command" | "builtin" | "exec" | "nohup" | "timeout" | "nice" | "stdbuf"
+        | "time" => true,
         "find" => invocation.iter().any(|arg| arg == "-delete"),
+        "fd" | "rg" => invocation
+            .iter()
+            .skip(1)
+            .any(|arg| search_tool_arg_exec_escape(command, arg)),
+        "setsid" | "parallel" => true,
         "git" => git_invocation_is_dangerous(invocation),
-        "python" | "python3" | "perl" | "node" | "nodejs" | "ruby" | "php" => {
-            interpreter_inline_code_is_dangerous(command, invocation)
-        }
         "docker" | "podman" => container_invocation_is_dangerous(invocation),
         "curl" => curl_invocation_is_dangerous(invocation),
         "wget" => wget_invocation_is_dangerous(invocation),
@@ -1713,27 +2022,48 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     }
 }
 
-fn python_arg_contains_inline_code(arg: &str) -> bool {
+fn versioned_command(command: &str, stem: &str) -> bool {
+    command.strip_prefix(stem).is_some_and(|suffix| {
+        suffix.is_empty()
+            || suffix.chars().any(|ch| ch.is_ascii_digit())
+                && suffix.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+    })
+}
+
+fn interpreter_kind(command: &str) -> Option<&'static str> {
+    if matches!(command, "py" | "pyw")
+        || versioned_command(command, "python")
+        || versioned_command(command, "pythonw")
+        || versioned_command(command, "pypy")
+    {
+        Some("python")
+    } else if versioned_command(command, "perl") {
+        Some("perl")
+    } else if versioned_command(command, "node") || versioned_command(command, "nodejs") {
+        Some("node")
+    } else if versioned_command(command, "ruby") {
+        Some("ruby")
+    } else if versioned_command(command, "php") {
+        Some("php")
+    } else {
+        None
+    }
+}
+
+fn interpreter_arg_contains_inline_code(interpreter: &str, arg: &str) -> bool {
     if arg == "-" {
         return true;
     }
-    if !arg.starts_with('-') || arg.starts_with("--") {
-        return false;
-    }
-    let flags = &arg[1..];
-    !flags.starts_with(['W', 'X', 'm']) && flags.chars().any(|flag| flag == 'c')
-}
-
-fn interpreter_inline_code_is_dangerous(command: &str, invocation: &[String]) -> bool {
-    let args = &invocation[1..];
-    if args.is_empty() {
-        return true;
-    }
-    let inline = args.iter().any(|arg| match command {
-        "python" | "python3" => python_arg_contains_inline_code(arg),
+    match interpreter {
+        "python" => {
+            if !arg.starts_with('-') || arg.starts_with("--") {
+                return false;
+            }
+            let flags = &arg[1..];
+            !flags.starts_with(['W', 'X', 'm']) && flags.chars().any(|flag| flag == 'c')
+        }
         "perl" => {
-            arg == "-"
-                || arg == "-e"
+            arg == "-e"
                 || arg == "-E"
                 || arg.starts_with("-e")
                 || arg.starts_with("-E")
@@ -1745,60 +2075,78 @@ fn interpreter_inline_code_is_dangerous(command: &str, invocation: &[String]) ->
                     && !arg.starts_with("-m")
                     && arg[1..].chars().any(|flag| matches!(flag, 'e' | 'E')))
         }
-        "node" | "nodejs" => {
-            arg == "-"
-                || matches!(arg.as_str(), "-e" | "--eval" | "-p" | "--print")
+        "node" => {
+            matches!(arg, "-e" | "--eval" | "-p" | "--print")
                 || arg.starts_with("-e")
                 || arg.starts_with("-p")
                 || arg.starts_with("--eval=")
                 || arg.starts_with("--print=")
         }
         "ruby" => {
-            arg == "-"
-                || arg == "--eval"
+            arg == "--eval"
                 || arg.starts_with("--eval=")
                 || (arg.starts_with('-')
                     && !arg.starts_with("--")
+                    && !arg.starts_with("-C")
+                    && !arg.starts_with("-E")
+                    && !arg.starts_with("-I")
+                    && !arg.starts_with("-K")
+                    && !arg.starts_with("-r")
                     && arg[1..].chars().any(|flag| flag == 'e'))
         }
         "php" => {
-            arg == "-"
-                || arg == "--run"
+            arg == "--run"
                 || arg.starts_with("--run=")
                 || (arg.starts_with('-')
                     && !arg.starts_with("--")
+                    && !arg.starts_with("-c")
+                    && !arg.starts_with("-d")
+                    && !arg.starts_with("-f")
+                    && !arg.starts_with("-z")
                     && arg[1..].chars().any(|flag| flag == 'r'))
         }
         _ => false,
-    });
-    let informational = args.iter().any(|arg| match command {
-        "python" | "python3" => matches!(arg.as_str(), "-h" | "--help" | "-V" | "--version"),
-        "perl" | "node" | "nodejs" | "php" => {
-            matches!(arg.as_str(), "-h" | "--help" | "-v" | "-V" | "--version")
-        }
-        "ruby" => matches!(arg.as_str(), "-h" | "--help" | "--version"),
-        _ => false,
-    });
-    if inline || informational {
-        return inline;
     }
-    !interpreter_has_explicit_program(command, args)
 }
 
-fn interpreter_has_explicit_program(command: &str, args: &[String]) -> bool {
+fn interpreter_informational_arg(interpreter: &str, arg: &str) -> bool {
+    match interpreter {
+        "python" => {
+            matches!(arg, "-h" | "--help" | "-V" | "--version")
+                || arg.starts_with('-') && arg[1..].chars().all(|flag| flag == 'V')
+        }
+        "perl" | "node" | "php" => {
+            matches!(arg, "-h" | "--help" | "-v" | "-V" | "--version")
+        }
+        "ruby" => matches!(arg, "-h" | "--help" | "--version"),
+        _ => false,
+    }
+}
+
+fn interpreter_inline_code_is_dangerous(interpreter: &str, invocation: &[String]) -> bool {
+    let args = &invocation[1..];
+    if args.is_empty() {
+        return true;
+    }
     let mut index = 0usize;
     while index < args.len() {
         let arg = args[index].as_str();
         if arg == "--" {
-            return args.get(index + 1).is_some_and(|next| next != "-");
+            return args.get(index + 1).is_none_or(|next| next == "-");
         }
-        match command {
-            "python" | "python3" => {
+        if interpreter_arg_contains_inline_code(interpreter, arg) {
+            return true;
+        }
+        if interpreter_informational_arg(interpreter, arg) {
+            return false;
+        }
+        match interpreter {
+            "python" => {
                 if arg == "-m" {
-                    return args.get(index + 1).is_some();
+                    return args.get(index + 1).is_none();
                 }
                 if arg.starts_with("-m") && arg.len() > 2 {
-                    return true;
+                    return false;
                 }
                 if matches!(arg, "-W" | "-X" | "--check-hash-based-pycs") {
                     index = index.saturating_add(2);
@@ -1809,7 +2157,7 @@ fn interpreter_has_explicit_program(command: &str, args: &[String]) -> bool {
                 index = index.saturating_add(2);
                 continue;
             }
-            "node" | "nodejs"
+            "node"
                 if matches!(
                     arg,
                     "-r" | "--require"
@@ -1825,7 +2173,7 @@ fn interpreter_has_explicit_program(command: &str, args: &[String]) -> bool {
             }
             "ruby" => {
                 if matches!(arg, "-S" | "--script") {
-                    return args.get(index + 1).is_some();
+                    return args.get(index + 1).is_none();
                 }
                 if matches!(
                     arg,
@@ -1837,7 +2185,10 @@ fn interpreter_has_explicit_program(command: &str, args: &[String]) -> bool {
             }
             "php" => {
                 if matches!(arg, "-f" | "--file") {
-                    return args.get(index + 1).is_some();
+                    return args.get(index + 1).is_none();
+                }
+                if arg.starts_with("-f") && arg.len() > 2 || arg.starts_with("--file=") {
+                    return false;
                 }
                 if matches!(arg, "-c" | "--php-ini" | "-d" | "--define" | "-z") {
                     index = index.saturating_add(2);
@@ -1850,44 +2201,146 @@ fn interpreter_has_explicit_program(command: &str, args: &[String]) -> bool {
             index += 1;
             continue;
         }
+        return false;
+    }
+    true
+}
+
+fn git_config_invocation_is_dangerous(args: &[String]) -> bool {
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--add"
+                | "--replace-all"
+                | "--unset"
+                | "--unset-all"
+                | "--rename-section"
+                | "--remove-section"
+                | "--edit"
+                | "-e"
+        )
+    }) {
         return true;
     }
-    false
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--get"
+                | "--get-all"
+                | "--get-regexp"
+                | "--get-urlmatch"
+                | "--list"
+                | "-l"
+                | "--get-color"
+                | "--get-colorbool"
+        )
+    }) {
+        return false;
+    }
+    let positional = args
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    match positional.first().copied() {
+        Some("get" | "get-all" | "get-regexp" | "get-urlmatch" | "list") => false,
+        Some(
+            "set" | "set-all" | "add" | "unset" | "unset-all" | "rename-section" | "remove-section"
+            | "edit",
+        ) => true,
+        Some(_) => positional.len() > 1,
+        None => false,
+    }
 }
 
 fn git_invocation_is_dangerous(invocation: &[String]) -> bool {
     let Some(subcommand_idx) = git_subcommand_index(invocation, 0) else {
-        return false;
+        return !invocation[1..]
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--version" | "-v"));
     };
+    if invocation[1..subcommand_idx].iter().any(|arg| {
+        arg == "-c"
+            || arg.starts_with("-c") && arg.len() > 2
+            || arg == "--config-env"
+            || arg.starts_with("--config-env=")
+            || matches!(arg.as_str(), "-p" | "--paginate")
+    }) {
+        return true;
+    }
     let subcommand = invocation[subcommand_idx].as_str();
     let args = &invocation[subcommand_idx.saturating_add(1)..];
+    let pager_disabled = invocation[1..subcommand_idx]
+        .iter()
+        .any(|arg| arg == "--no-pager");
     match subcommand {
-        "push" | "clean" | "checkout" => true,
-        "switch" => args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "--discard-changes" | "--force" | "--force-create" | "-C" | "-f"
-            ) || (arg.starts_with('-')
-                && !arg.starts_with("--")
-                && arg[1..].chars().any(|flag| matches!(flag, 'C' | 'f')))
-        }),
-        "stash" => args
-            .iter()
-            .find(|arg| !arg.starts_with('-'))
-            .is_some_and(|action| matches!(action.as_str(), "drop" | "clear" | "pop")),
-        "reset" => args
-            .iter()
-            .any(|arg| arg == "--hard" || arg.starts_with("--hard=")),
+        "status" | "diff" | "log" | "show" | "whatchanged" => true,
+        "grep" => {
+            !pager_disabled
+                || args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--textconv" | "--ext-diff" | "--open-files-in-pager"
+                    ) || arg.starts_with("--open-files-in-pager=")
+                })
+        }
+        "push" | "clean" | "checkout" | "rm" | "prune" | "update-ref" => true,
+        "switch" | "stash" | "reset" | "branch" | "tag" => true,
+        "config" => !pager_disabled || git_config_invocation_is_dangerous(args),
         "restore" => args
             .iter()
             .any(|arg| !arg.starts_with('-') || arg == "--worktree"),
-        "branch" => args.iter().any(|arg| {
-            matches!(arg.as_str(), "-d" | "-D" | "--delete")
-                || (arg.starts_with('-')
-                    && !arg.starts_with("--")
-                    && arg[1..].chars().any(|flag| matches!(flag, 'd' | 'D')))
-        }),
-        _ => false,
+        "reflog" => {
+            !pager_disabled
+                || args
+                    .iter()
+                    .find(|arg| !arg.starts_with('-'))
+                    .is_none_or(|action| action != "exists")
+        }
+        "remote" => {
+            !pager_disabled
+                || args
+                    .iter()
+                    .find(|arg| !arg.starts_with('-'))
+                    .is_some_and(|action| action != "get-url")
+        }
+        "notes" => {
+            !pager_disabled
+                || args
+                    .iter()
+                    .find(|arg| !arg.starts_with('-'))
+                    .is_some_and(|action| !matches!(action.as_str(), "show" | "list" | "get-ref"))
+        }
+        "replace" => {
+            !pager_disabled
+                || args.iter().any(|arg| {
+                    !arg.starts_with('-')
+                        || matches!(arg.as_str(), "-d" | "--delete" | "-f" | "--force")
+                })
+        }
+        "symbolic-ref" => {
+            !pager_disabled
+                || args.iter().any(|arg| arg == "--delete")
+                || args.iter().filter(|arg| !arg.starts_with('-')).count() > 1
+        }
+        "update-index" | "gc" => true,
+        "worktree" => {
+            !pager_disabled
+                || args
+                    .iter()
+                    .find(|arg| !arg.starts_with('-'))
+                    .is_none_or(|action| action != "list")
+        }
+        "diff-tree" => {
+            !pager_disabled
+                || args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--textconv" | "--ext-diff"))
+        }
+        "check-attr" | "check-ignore" | "check-mailmap" | "check-ref-format" | "cherry"
+        | "count-objects" | "ls-files" | "ls-tree" | "merge-base" | "name-rev" | "rev-list"
+        | "rev-parse" | "show-branch" | "show-ref" | "var" => !pager_disabled,
+        _ => true,
     }
 }
 
@@ -2306,8 +2759,21 @@ mod tests {
     #[test]
     fn command_risk_classifies_common_tool_calls() {
         assert_eq!(
-            classify_command_risk("bash", &json!({"command": "git status && rg foo src"})),
+            classify_command_risk(
+                "bash",
+                &json!({"command": "git --no-pager rev-parse --show-toplevel && rg foo src"})
+            ),
             CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "command -v rm"})),
+            CommandRisk::Read,
+            "command lookup must not be mistaken for executing its operand"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "command -V sudo"})),
+            CommandRisk::Read,
+            "verbose command lookup must not be mistaken for sudo execution"
         );
         for command in [
             "rg --pre 'sh -c evil' needle .",
@@ -2338,6 +2804,57 @@ mod tests {
             "git stash drop",
             "git stash clear",
             "git stash pop",
+            "git stash push --include-untracked",
+            "git stash apply stash@{0}",
+            "git stash branch recovery stash@{0}",
+            "git stash --keep-index",
+            "git reset --merge HEAD~1",
+            "git reset --keep HEAD~1",
+            "git branch -M replacement",
+            "git branch -C replacement-copy",
+            "git branch -f feature HEAD~1",
+            "git rm stale.txt",
+            "git tag -d old-release",
+            "git worktree remove ../old-worktree",
+            "git reflog expire --expire=now --all",
+            "git update-ref -d refs/heads/old",
+            "git remote remove origin",
+            "git remote prune origin",
+            "git notes remove HEAD",
+            "git replace -d deadbeef",
+            "git symbolic-ref --delete HEAD",
+            "git update-index --refresh",
+            "git update-index --force-remove stale.txt",
+            "git gc --auto",
+            "git gc --prune=now",
+            "git -c alias.wipe='!rm -rf build' wipe",
+            "git custom-project-alias",
+            "git help reset",
+            "git status --short",
+            "git diff --stat",
+            "git log -1 --oneline",
+            "git show --stat HEAD",
+            "git grep --textconv needle",
+            "git rev-parse HEAD",
+            "git config --get user.name",
+            "git --paginate rev-parse HEAD",
+            "git --no-pager grep --open-files-in-pager=sh needle",
+            "git --no-pager fsck --lost-found",
+            "git --no-pager describe --dirty",
+            "git --no-pager for-each-ref --format=%(signature:grade)",
+            "git config user.name NewName",
+            "git config set user.email new@example.invalid",
+            "git config --unset core.hooksPath",
+            "git switch main",
+            "git switch -c feature",
+            "git branch -m replacement",
+            "git branch --move replacement",
+            "git branch -c replacement-copy",
+            "git branch --copy replacement-copy",
+            "git tag -f release HEAD",
+            "git stash show stash@{0}",
+            "git stash create",
+            "git stash store deadbeef",
             "python3 -c 'import shutil; shutil.rmtree(\"build\")'",
             "C:/Python/python.exe -c 'import shutil; shutil.rmtree(\"build\")'",
             "python3 -c'import os; os.unlink(\"stale\")'",
@@ -2354,6 +2871,54 @@ mod tests {
             "python3 -Bc 'import os; os.unlink(\"stale\")'",
             "printf 'import os; os.unlink(\"stale\")' | python3 -v",
             "PYTHON.EXE -c 'import os; os.unlink(\"stale\")'",
+            "python3.13 -c 'import os; os.unlink(\"stale\")'",
+            "pypy3 -c 'import os; os.unlink(\"stale\")'",
+            "py.exe -3 -c 'import os; os.unlink(\"stale\")'",
+            "ENV.EXE FOO=bar PYTHON3.12.EXE -c 'import os; os.unlink(\"stale\")'",
+            "BASH.EXE -c 'rm stale.txt'",
+            "env -S 'rm -rf build'",
+            "env --split-string='git reset --hard HEAD~1'",
+            "env -uFOO rm stale.txt",
+            "env -Ctmp rm stale.txt",
+            "env -aalt rm stale.txt",
+            "exec -cl rm stale.txt",
+            "exec -a alt rm stale.txt",
+            "timeout -v -k1 5 rm stale.txt",
+            "nice -n5 rm stale.txt",
+            "nice +5 rm stale.txt",
+            "stdbuf --output=L rm stale.txt",
+            "time -a -o timing.txt rm stale.txt",
+            "time --format=%E rm stale.txt",
+            "nohup -- rm stale.txt",
+            "> output.txt rm stale.txt",
+            "2>/dev/null rm stale.txt",
+            "2>&1 rm stale.txt",
+            "&>/dev/null rm stale.txt",
+            "if false; then printf ok; else rm stale.txt; fi",
+            "setsid printf ok",
+            "parallel rm ::: stale.txt",
+            "exec rg --pre sh needle .",
+            "timeout 5 fd needle . -x rm",
+            "printf 'rm -rf build' | sh",
+            "bash -s -- positional",
+            "trap 'rm stale.txt' EXIT",
+            "case x in x) rm stale.txt;; esac",
+            "coproc rm stale.txt",
+            "coproc worker { rm stale.txt; }",
+            "function wipe { rm stale.txt; }; wipe",
+            "wipe() { rm stale.txt; }; wipe",
+            "doas rm stale.txt",
+            "pkexec rm stale.txt",
+            "systemd-run --user rm stale.txt",
+            "busybox rm stale.txt",
+            "toybox rm stale.txt",
+            "cmd=rm; $cmd stale.txt",
+            "$(printf rm) stale.txt",
+            "alias wipe='rm -rf build'",
+            "wipe () { rm stale.txt; }; wipe",
+            "kill 1234",
+            "watch printf ok",
+            "ssh host.example rm stale.txt",
             "ruby -e 'File.delete(\"stale.txt\")'",
             "php -r 'unlink(\"stale.txt\");'",
             "docker system prune",
@@ -2412,9 +2977,10 @@ mod tests {
             CommandRisk::Write,
             "nested shell remains write-risk but must not be mislabeled danger"
         );
-        assert_ne!(
+        assert_eq!(
             classify_command_risk("bash", &json!({"command": "git -C . status"})),
-            CommandRisk::Danger
+            CommandRisk::Danger,
+            "shell Git status can invoke repository-configured fsmonitor; use hardened native Git tools"
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "python3 script.py"})),
@@ -2433,26 +2999,50 @@ mod tests {
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git switch -c feature"})),
-            CommandRisk::Write,
-            "non-destructive branch creation remains ordinary write-risk"
+            CommandRisk::Danger,
+            "shell Git switch can invoke repository-configured hooks and filters"
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git stash list"})),
-            CommandRisk::Write,
-            "non-destructive stash operations are not promoted to danger"
+            CommandRisk::Danger,
+            "shell Git porcelain can invoke repository-configured pagers and helpers"
         );
-        // git branch listing is read-only; branch mutation/creation is not.
+        for command in [
+            "python3.13 script.py",
+            "py.exe -3 script.py",
+            "ruby -C tmp script.rb",
+            "ruby -Ke script.rb",
+            "php -d extension=demo script.php",
+            "php -fscript.php",
+            "bash script.sh",
+            "sh -- script.sh",
+            "git --no-pager show-ref --heads",
+            "git --no-pager config user.name",
+            "git --no-pager config get user.email",
+            "git --no-pager config --get core.hooksPath",
+            "git --no-pager remote -v",
+            "git --no-pager notes show HEAD",
+            "git --no-pager replace --list",
+            "git --no-pager symbolic-ref HEAD",
+        ] {
+            assert_ne!(
+                classify_command_risk("bash", &json!({"command": command})),
+                CommandRisk::Danger,
+                "{command}"
+            );
+        }
+        // Shell Git porcelain remains gated because repository configuration can execute pagers or helpers.
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git branch"})),
-            CommandRisk::Read
+            CommandRisk::Danger
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git branch -a -v"})),
-            CommandRisk::Read
+            CommandRisk::Danger
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git branch --show-current"})),
-            CommandRisk::Read
+            CommandRisk::Danger
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git branch -D feature"})),
@@ -2465,14 +3055,14 @@ mod tests {
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git branch new-feature"})),
-            CommandRisk::Write
+            CommandRisk::Danger
         );
         assert_eq!(
             classify_command_risk(
                 "bash",
                 &json!({"command": "git branch --set-upstream-to=origin/main"})
             ),
-            CommandRisk::Write
+            CommandRisk::Danger
         );
         assert!(command_invokes_sudo("sudo apt update"));
         assert!(command_invokes_sudo("sudo -v"));
@@ -2504,6 +3094,8 @@ mod tests {
         assert!(command_invokes_sudo("bash -c 'sudo apt update'"));
         assert!(command_invokes_sudo("echo $(sudo -n true)"));
         assert!(command_invokes_sudo("find . -exec sudo -n true \\;"));
+        assert!(!command_invokes_sudo("command -v sudo"));
+        assert!(!command_invokes_sudo("command -V sudo"));
         assert!(!command_invokes_sudo("grep sudo README.md"));
         assert!(!command_invokes_sudo("echo 'sudo apt update'"));
         assert!(!command_invokes_sudo("printf '%s' sudo"));

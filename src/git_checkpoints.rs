@@ -99,6 +99,7 @@ struct UntrackedCapturePlan {
 struct UntrackedBlobFingerprint {
     size: u64,
     source_version: UntrackedSourceVersion,
+    blob_version: UntrackedSourceVersion,
     executable: bool,
     digest: String,
 }
@@ -127,6 +128,7 @@ fn git_command(cwd: &Path, args: &[&str]) -> Result<crate::InternalCommandOutput
 struct UntrackedFiles {
     paths: Vec<String>,
     truncated: bool,
+    unsupported_paths: usize,
 }
 
 /// List untracked, not-ignored repo paths via porcelain status.
@@ -141,26 +143,42 @@ fn untracked_files(git_root: &Path) -> Result<UntrackedFiles, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let mut paths = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter_map(|record| record.strip_prefix(b"?? "))
-        .map(git_path_from_bytes)
-        .filter_map(|path| match path {
-            Ok(path) if path.starts_with(CHECKPOINTS_DIR) => None,
-            other => Some(other),
-        })
-        .map(|path| {
-            let path = path?;
-            path.into_os_string()
-                .into_string()
-                .map_err(|_| "untracked checkpoint path is not valid UTF-8".to_string())
-        })
-        .take(UNTRACKED_SNAPSHOT_CAP + 1)
-        .collect::<Result<Vec<_>, String>>()?;
-    let truncated = paths.len() > UNTRACKED_SNAPSHOT_CAP;
-    paths.truncate(UNTRACKED_SNAPSHOT_CAP);
-    Ok(UntrackedFiles { paths, truncated })
+    let mut paths = Vec::new();
+    let mut inventoried = 0usize;
+    let mut truncated = false;
+    let mut unsupported_paths = 0usize;
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let Some(raw_path) = record.strip_prefix(b"?? ") else {
+            continue;
+        };
+        let path = match git_path_from_bytes(raw_path) {
+            Ok(path) if path.starts_with(CHECKPOINTS_DIR) => continue,
+            Ok(path) => path,
+            Err(_) => {
+                inventoried = inventoried.saturating_add(1);
+                if inventoried > UNTRACKED_SNAPSHOT_CAP {
+                    truncated = true;
+                    break;
+                }
+                unsupported_paths = unsupported_paths.saturating_add(1);
+                continue;
+            }
+        };
+        inventoried = inventoried.saturating_add(1);
+        if inventoried > UNTRACKED_SNAPSHOT_CAP {
+            truncated = true;
+            break;
+        }
+        match path.into_os_string().into_string() {
+            Ok(path) => paths.push(path),
+            Err(_) => unsupported_paths = unsupported_paths.saturating_add(1),
+        }
+    }
+    Ok(UntrackedFiles {
+        paths,
+        truncated,
+        unsupported_paths,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -927,7 +945,13 @@ fn untracked_source_version(metadata: &std::fs::Metadata) -> UntrackedSourceVers
 }
 
 fn untracked_capture_warning(details: &[String]) -> Option<String> {
-    (!details.is_empty()).then(|| format!("untracked recovery is partial: {}", details.join("; ")))
+    (!details.is_empty()).then(|| {
+        crate::cap_bytes_with_hint(
+            format!("untracked recovery is partial: {}", details.join("; ")),
+            4_096,
+            "additional recovery-gap details omitted.",
+        )
+    })
 }
 
 fn plan_untracked_capture(git_root: &Path) -> Result<UntrackedCapturePlan, String> {
@@ -936,6 +960,12 @@ fn plan_untracked_capture(git_root: &Path) -> Result<UntrackedCapturePlan, Strin
     if files.truncated {
         warnings.push(format!(
             "more than {UNTRACKED_SNAPSHOT_CAP} untracked paths exist; only the first {UNTRACKED_SNAPSHOT_CAP} can be inventoried"
+        ));
+    }
+    if files.unsupported_paths > 0 {
+        warnings.push(format!(
+            "{} untracked path(s) are not valid UTF-8 and cannot be inventoried or recovered",
+            files.unsupported_paths
         ));
     }
     let mut total = 0u64;
@@ -1034,13 +1064,27 @@ fn blob_path(git_root: &Path, digest: &str) -> PathBuf {
         .join(digest)
 }
 
-fn private_blob_is_valid(git_root: &Path, digest: &str, expected_size: u64) -> bool {
+fn private_blob_metadata_version(
+    git_root: &Path,
+    digest: &str,
+    expected_size: u64,
+) -> Option<UntrackedSourceVersion> {
     if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return false;
+        return None;
     }
-    std::fs::symlink_metadata(blob_path(git_root, digest)).is_ok_and(|metadata| {
-        safe_private_file_metadata(&metadata) && metadata.len() == expected_size
-    })
+    let metadata = std::fs::symlink_metadata(blob_path(git_root, digest)).ok()?;
+    (safe_private_file_metadata(&metadata) && metadata.len() == expected_size)
+        .then(|| untracked_source_version(&metadata))
+}
+
+fn private_blob_is_valid(git_root: &Path, digest: &str, expected_size: u64) -> bool {
+    validate_private_blob(git_root, digest, expected_size).is_ok()
+}
+
+fn remove_new_checkpoint_blobs(git_root: &Path, digests: &[String]) {
+    for digest in digests {
+        let _ = std::fs::remove_file(blob_path(git_root, digest));
+    }
 }
 
 fn save_untracked_blob(
@@ -1051,7 +1095,7 @@ fn save_untracked_blob(
     source_version: &UntrackedSourceVersion,
     executable: bool,
     cache: &mut UntrackedBlobCache,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     use std::io::{Seek as _, SeekFrom};
 
     #[cfg(unix)]
@@ -1059,9 +1103,10 @@ fn save_untracked_blob(
         && cached.size == expected_size
         && cached.source_version == *source_version
         && cached.executable == executable
-        && private_blob_is_valid(git_root, &cached.digest, expected_size)
+        && private_blob_metadata_version(git_root, &cached.digest, expected_size)
+            .is_some_and(|version| version == cached.blob_version)
     {
-        return Ok(cached.digest.clone());
+        return Ok((cached.digest.clone(), false));
     }
 
     let mut options = OpenOptions::new();
@@ -1118,16 +1163,19 @@ fn save_untracked_blob(
             if safe_private_file_metadata(&metadata) && metadata.len() == expected_size =>
         {
             validate_private_blob(git_root, &digest, expected_size)?;
+            let blob_version = private_blob_metadata_version(git_root, &digest, expected_size)
+                .ok_or_else(|| format!("checkpoint blob is unsafe or corrupt: {digest}"))?;
             cache.entries.insert(
                 relative.to_string(),
                 UntrackedBlobFingerprint {
                     size: expected_size,
                     source_version: source_version.clone(),
+                    blob_version,
                     executable,
                     digest: digest.clone(),
                 },
             );
-            return Ok(digest);
+            return Ok((digest, false));
         }
         Ok(_) => {
             return Err(format!(
@@ -1142,8 +1190,14 @@ fn save_untracked_blob(
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("rewind untracked checkpoint file: {error}"))?;
     let mut output = create_private_file(&destination)?;
-    let copied = std::io::copy(&mut source, &mut output)
-        .map_err(|error| format!("write checkpoint blob: {error}"))?;
+    let copied = match std::io::copy(&mut source, &mut output) {
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(output);
+            let _ = std::fs::remove_file(&destination);
+            return Err(format!("write checkpoint blob: {error}"));
+        }
+    };
     if copied != expected_size {
         drop(output);
         let _ = std::fs::remove_file(&destination);
@@ -1152,32 +1206,38 @@ fn save_untracked_blob(
             absolute.display()
         ));
     }
-    output
-        .sync_all()
-        .map_err(|error| format!("sync checkpoint blob: {error}"))?;
+    if let Err(error) = output.sync_all() {
+        drop(output);
+        let _ = std::fs::remove_file(&destination);
+        return Err(format!("sync checkpoint blob: {error}"));
+    }
     drop(output);
     if let Err(error) = validate_private_blob(git_root, &digest, expected_size) {
         let _ = std::fs::remove_file(&destination);
         return Err(error);
     }
+    let blob_version = private_blob_metadata_version(git_root, &digest, expected_size)
+        .ok_or_else(|| format!("checkpoint blob is unsafe or corrupt: {digest}"))?;
     cache.entries.insert(
         relative.to_string(),
         UntrackedBlobFingerprint {
             size: expected_size,
             source_version: source_version.clone(),
+            blob_version,
             executable,
             digest: digest.clone(),
         },
     );
-    Ok(digest)
+    Ok((digest, true))
 }
 
 fn save_bash_untracked_sidecars(
     git_root: &Path,
     plan: &UntrackedCapturePlan,
     cache: &mut UntrackedBlobCache,
-) -> Result<Vec<UntrackedSidecar>, String> {
+) -> Result<(Vec<UntrackedSidecar>, Vec<String>), String> {
     let mut sidecars = Vec::with_capacity(plan.candidates.len());
+    let mut new_blobs = Vec::new();
     for candidate in &plan.candidates {
         match candidate {
             UntrackedCandidate::File {
@@ -1186,7 +1246,7 @@ fn save_bash_untracked_sidecars(
                 source_version,
                 executable,
             } => {
-                let digest = save_untracked_blob(
+                let (digest, created) = match save_untracked_blob(
                     git_root,
                     path,
                     &git_root.join(path),
@@ -1194,7 +1254,16 @@ fn save_bash_untracked_sidecars(
                     source_version,
                     *executable,
                     cache,
-                )?;
+                ) {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        remove_new_checkpoint_blobs(git_root, &new_blobs);
+                        return Err(error);
+                    }
+                };
+                if created {
+                    new_blobs.push(digest.clone());
+                }
                 sidecars.push(UntrackedSidecar::File {
                     path: path.clone(),
                     digest,
@@ -1215,16 +1284,27 @@ fn save_bash_untracked_sidecars(
             }
         }
     }
-    Ok(sidecars)
+    Ok((sidecars, new_blobs))
+}
+
+fn literal_git_pathspec(relative: &str) -> String {
+    format!(":(literal){relative}")
 }
 
 /// Check if a path is tracked by Git.
-fn is_tracked(git_root: &Path, rel: &Path) -> bool {
-    run_git(
-        git_root,
-        &["ls-files", "--error-unmatch", rel.to_str().unwrap_or("")],
-    )
-    .is_ok()
+fn is_tracked(git_root: &Path, rel: &Path) -> Result<bool, String> {
+    let relative = rel
+        .to_str()
+        .ok_or_else(|| format!("Git path is not valid UTF-8: {}", rel.display()))?;
+    let pathspec = literal_git_pathspec(relative);
+    let output = git_command(git_root, &["ls-files", "-z", "--", &pathspec])?;
+    if !output.success() {
+        return Err(format!(
+            "git ls-files -z -- {relative}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 fn canonicalize_with_missing_ancestors(path: &Path) -> Option<PathBuf> {
@@ -1254,6 +1334,7 @@ fn safe_repo_relative_path(path: &Path) -> bool {
         names.push(name);
     }
     if names.is_empty()
+        || path.to_string_lossy().contains('\0')
         || names
             .iter()
             .any(|name| name.to_string_lossy().eq_ignore_ascii_case(".git"))
@@ -1324,8 +1405,16 @@ fn safe_worktree_target(git_root: &Path, relative: &Path) -> Result<PathBuf, Str
     Ok(canonical_root.join(relative))
 }
 
-fn tree_has_path(git_root: &Path, oid: &str, rel: &str) -> bool {
-    run_git(git_root, &["cat-file", "-e", &format!("{oid}:{rel}")]).is_ok()
+fn tree_has_path(git_root: &Path, oid: &str, rel: &str) -> Result<bool, String> {
+    let pathspec = literal_git_pathspec(rel);
+    let output = git_command(git_root, &["ls-tree", "-z", oid, "--", &pathspec])?;
+    if !output.success() {
+        return Err(format!(
+            "git ls-tree -z {oid} -- {rel}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 fn remove_worktree_path(path: &Path) -> Result<bool, String> {
@@ -1483,7 +1572,15 @@ pub(crate) fn create_checkpoint_in_repo(
     if file_tools.contains(&tool) {
         for rel in &normalized_paths {
             let abs = git_root.join(rel);
-            if abs.is_file() && !is_tracked(git_root, rel) {
+            let tracked = match is_tracked(git_root, rel) {
+                Ok(tracked) => tracked,
+                Err(error) => {
+                    let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
+                    let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &id));
+                    return Err(error);
+                }
+            };
+            if abs.is_file() && !tracked {
                 if let Err(error) = save_untracked_sidecar(git_root, &id, &abs, rel, None) {
                     let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
                     let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &id));
@@ -1498,12 +1595,14 @@ pub(crate) fn create_checkpoint_in_repo(
     }
 
     let mut untracked_sidecars = Vec::new();
+    let mut new_untracked_blobs = Vec::new();
     let mut untracked_capture_warning = None;
     let untracked_snapshot = if let Some(plan) = untracked_plan {
         match save_bash_untracked_sidecars(git_root, &plan, blob_cache) {
-            Ok(saved) => {
+            Ok((saved, new_blobs)) => {
                 includes_untracked_sidecar = !saved.is_empty();
                 untracked_sidecars = saved;
+                new_untracked_blobs = new_blobs;
                 untracked_capture_warning = plan.warning;
             }
             Err(error) => {
@@ -1534,6 +1633,7 @@ pub(crate) fn create_checkpoint_in_repo(
     if let Err(error) = append_manifest(git_root, &cp) {
         let _ = run_git(git_root, &["update-ref", "-d", &cp.ref_name]);
         let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &cp.id));
+        remove_new_checkpoint_blobs(git_root, &new_untracked_blobs);
         return Err(error);
     }
     if let Err(error) =
@@ -1710,7 +1810,7 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
     {
         return None;
     }
-    Some(Checkpoint {
+    let checkpoint = Checkpoint {
         id: id.to_string(),
         ref_name: ref_name.to_string(),
         oid: oid.to_string(),
@@ -1722,7 +1822,9 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
         untracked_snapshot,
         untracked_sidecars,
         untracked_capture_warning,
-    })
+    };
+    validate_checkpoint(&checkpoint).ok()?;
+    Some(checkpoint)
 }
 
 fn list_checkpoints_in_repo(
@@ -1858,6 +1960,18 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
     {
         return Err("checkpoint metadata failed validation".to_string());
     }
+    if cp.paths_hint.len() > UNTRACKED_SNAPSHOT_CAP
+        || cp.untracked_snapshot.len() > UNTRACKED_SNAPSHOT_CAP
+        || cp.untracked_sidecars.len() > UNTRACKED_SNAPSHOT_CAP
+    {
+        return Err("checkpoint metadata exceeds its path-count limit".to_string());
+    }
+    let unique_paths = |paths: &[String]| {
+        paths.iter().collect::<std::collections::HashSet<_>>().len() == paths.len()
+    };
+    if !unique_paths(&cp.paths_hint) || !unique_paths(&cp.untracked_snapshot) {
+        return Err("checkpoint metadata contains duplicate paths".to_string());
+    }
     if let Some(path) = cp
         .paths_hint
         .iter()
@@ -1872,8 +1986,13 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
     {
         return Err(format!("unsafe checkpoint untracked path: {path}"));
     }
+    let mut sidecar_paths = std::collections::HashSet::new();
+    let mut regular_file_bytes = 0u64;
     for sidecar in &cp.untracked_sidecars {
         let path = sidecar.path();
+        if !sidecar_paths.insert(path) {
+            return Err(format!("duplicate checkpoint sidecar path: {path}"));
+        }
         if !safe_repo_relative_path(Path::new(path))
             || !cp
                 .untracked_snapshot
@@ -1892,11 +2011,22 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
             {
                 return Err(format!("invalid checkpoint blob digest for {path}"));
             }
-            UntrackedSidecar::Symlink { target, .. } if target.len() > SYMLINK_TARGET_CAP => {
-                return Err(format!("checkpoint symlink target is too large: {path}"));
+            UntrackedSidecar::File { size, .. } => {
+                regular_file_bytes = regular_file_bytes.saturating_add(*size);
+                if regular_file_bytes > BASH_UNTRACKED_SIDECAR_TOTAL_CAP {
+                    return Err("checkpoint sidecars exceed their total byte limit".to_string());
+                }
+            }
+            UntrackedSidecar::Symlink { target, .. }
+                if target.len() > SYMLINK_TARGET_CAP || target.contains('\0') =>
+            {
+                return Err(format!("checkpoint symlink target is invalid: {path}"));
             }
             _ => {}
         }
+    }
+    if !cp.includes_untracked_sidecar && !cp.untracked_sidecars.is_empty() {
+        return Err("checkpoint declares sidecars without enabling restore".to_string());
     }
     if cp.includes_untracked_sidecar && cp.paths_hint.is_empty() && cp.untracked_snapshot.is_empty()
     {
@@ -2025,6 +2155,12 @@ fn preview_restore_locked(git_root: &Path, cp: &Checkpoint) -> Result<String, St
     if now.truncated {
         out.push_str(&format!(
             "\nCurrent untracked-file scan capped at {UNTRACKED_SNAPSHOT_CAP} paths; listed deltas may be incomplete.\n"
+        ));
+    }
+    if now.unsupported_paths > 0 {
+        out.push_str(&format!(
+            "\nCurrent untracked-file scan omitted {} non-UTF-8 path(s); listed deltas may be incomplete.\n",
+            now.unsupported_paths
         ));
     }
     if !created.is_empty() {
@@ -2190,6 +2326,8 @@ enum PreparedSidecarRestore {
         source: PathBuf,
         relative: PathBuf,
         executable: Option<bool>,
+        digest: Option<String>,
+        size: Option<u64>,
     },
     Symlink {
         relative: PathBuf,
@@ -2364,9 +2502,41 @@ fn preflight_legacy_sidecar_restore(
             source: entry,
             relative,
             executable: None,
+            digest: None,
+            size: None,
         });
     }
     Ok(prepared)
+}
+
+fn preflight_sidecar_destination(
+    destination: &Path,
+    restoring_symlink: bool,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "refusing to replace directory during sidecar restore: {}",
+            destination.display()
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() && !restoring_symlink => Err(format!(
+            "refusing to replace symlink with checkpoint file: {}",
+            destination.display()
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(()),
+        Ok(metadata) if metadata.is_file() && !safe_restore_destination_metadata(&metadata) => {
+            Err(format!(
+                "sidecar restore destination is multiply linked: {}",
+                destination.display()
+            ))
+        }
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "sidecar restore destination is not a regular file or symlink: {}",
+            destination.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("sidecar restore destination metadata: {error}")),
+    }
 }
 
 fn preflight_sidecar_restore(
@@ -2401,23 +2571,8 @@ fn preflight_sidecar_restore(
         }
         let relative = PathBuf::from(sidecar.path());
         let destination = safe_worktree_target(git_root, &relative)?;
-        match std::fs::symlink_metadata(&destination) {
-            Ok(metadata) if metadata.is_dir() => {
-                return Err(format!(
-                    "refusing to replace directory during sidecar restore: {}",
-                    destination.display()
-                ));
-            }
-            Ok(metadata) if metadata.is_file() && !safe_restore_destination_metadata(&metadata) => {
-                return Err(format!(
-                    "sidecar restore destination is multiply linked: {}",
-                    destination.display()
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("sidecar restore destination metadata: {error}")),
-        }
+        let restoring_symlink = matches!(sidecar, UntrackedSidecar::Symlink { .. });
+        preflight_sidecar_destination(&destination, restoring_symlink)?;
         match sidecar {
             UntrackedSidecar::File {
                 digest,
@@ -2428,6 +2583,8 @@ fn preflight_sidecar_restore(
                 source: validate_private_blob(git_root, digest, *size)?,
                 relative,
                 executable: Some(*executable),
+                digest: Some(digest.clone()),
+                size: Some(*size),
             }),
             UntrackedSidecar::Symlink {
                 target,
@@ -2466,6 +2623,18 @@ pub(crate) fn restore_worktree(
     let full_restore = mode == RestoreMode::WorktreeAndIndex || cp.paths_hint.is_empty();
     let restore_paths = preflight_restore_paths(root, &git_root, cp, full_restore)?;
     let sidecar_entries = preflight_sidecar_restore(&git_root, cp, &restore_paths)?;
+    let restore_path_tree_presence = restore_paths
+        .iter()
+        .map(|(relative, _)| {
+            let relative = relative.to_str().ok_or_else(|| {
+                format!(
+                    "checkpoint restore path is not valid UTF-8: {}",
+                    relative.display()
+                )
+            })?;
+            tree_has_path(&git_root, &cp.oid, relative)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let sidecar_paths = sidecar_entries
         .iter()
         .map(PreparedSidecarRestore::relative)
@@ -2476,12 +2645,20 @@ pub(crate) fn restore_worktree(
     let mut warnings: Vec<String> = Vec::new();
 
     if !restore_paths.is_empty() {
-        for (rel, target) in &restore_paths {
+        for ((rel, target), tree_has_path) in restore_paths.iter().zip(restore_path_tree_presence) {
             let rel_str = rel.to_string_lossy().to_string();
-            let result = if tree_has_path(&git_root, &cp.oid, &rel_str) {
+            let result = if tree_has_path {
+                let pathspec = literal_git_pathspec(&rel_str);
                 run_git(
                     &git_root,
-                    &["restore", "--source", &cp.oid, "--worktree", "--", &rel_str],
+                    &[
+                        "restore",
+                        "--source",
+                        &cp.oid,
+                        "--worktree",
+                        "--",
+                        &pathspec,
+                    ],
                 )
                 .map(|_| {
                     restored.push(rel_str.clone());
@@ -2519,8 +2696,18 @@ pub(crate) fn restore_worktree(
         let relative = sidecar.relative().to_path_buf();
         let result = match sidecar {
             PreparedSidecarRestore::File {
-                source, executable, ..
-            } => copy_sidecar_file(&source, &git_root, &relative, executable),
+                source,
+                executable,
+                digest,
+                size,
+                ..
+            } => copy_sidecar_file(
+                &source,
+                &git_root,
+                &relative,
+                executable,
+                digest.as_deref().zip(size),
+            ),
             PreparedSidecarRestore::Symlink {
                 target,
                 target_is_dir,
@@ -2612,6 +2799,34 @@ fn ensure_worktree_parent_tree(git_root: &Path, relative: &Path) -> Result<PathB
     })?))
 }
 
+fn create_platform_symlink(
+    link_target: &str,
+    destination: &Path,
+    target_is_dir: bool,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = target_is_dir;
+        std::os::unix::fs::symlink(link_target, destination)
+    }
+    #[cfg(windows)]
+    {
+        if target_is_dir {
+            std::os::windows::fs::symlink_dir(link_target, destination)
+        } else {
+            std::os::windows::fs::symlink_file(link_target, destination)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (link_target, target_is_dir, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink restore is unsupported on this platform",
+        ))
+    }
+}
+
 fn restore_sidecar_symlink(
     git_root: &Path,
     relative: &Path,
@@ -2619,44 +2834,45 @@ fn restore_sidecar_symlink(
     target_is_dir: bool,
 ) -> Result<(), String> {
     let destination = ensure_worktree_parent_tree(git_root, relative)?;
-    match std::fs::symlink_metadata(&destination) {
-        Ok(metadata) if metadata.is_dir() => {
-            return Err(format!(
-                "refusing to replace directory with checkpoint symlink: {}",
-                destination.display()
-            ));
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "checkpoint symlink destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("restore");
+    let mut temp_path = None;
+    for _ in 0..16 {
+        let nonce = random_checkpoint_nonce()?;
+        let candidate = parent.join(format!(".{file_name}.dext-restore-{nonce}"));
+        match create_platform_symlink(link_target, &candidate, target_is_dir) {
+            Ok(()) => {
+                temp_path = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("restore checkpoint symlink: {error}")),
         }
-        Ok(metadata) if metadata.is_file() && !safe_restore_destination_metadata(&metadata) => {
-            return Err(format!(
-                "checkpoint symlink destination is multiply linked: {}",
-                destination.display()
-            ));
-        }
-        Ok(_) => std::fs::remove_file(&destination)
-            .map_err(|error| format!("remove existing symlink destination: {error}"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("checkpoint symlink destination metadata: {error}")),
     }
-    #[cfg(unix)]
-    {
-        let _ = target_is_dir;
-        std::os::unix::fs::symlink(link_target, &destination)
-            .map_err(|error| format!("restore checkpoint symlink: {error}"))
+    let temp_path = temp_path.ok_or_else(|| {
+        format!(
+            "could not allocate checkpoint symlink restore temp in {}",
+            parent.display()
+        )
+    })?;
+    if let Err(error) = preflight_sidecar_destination(&destination, true) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
     }
-    #[cfg(windows)]
-    {
-        if target_is_dir {
-            std::os::windows::fs::symlink_dir(link_target, &destination)
-        } else {
-            std::os::windows::fs::symlink_file(link_target, &destination)
-        }
-        .map_err(|error| format!("restore checkpoint symlink: {error}"))
+    let result = crate::session::replace_file_atomically(&temp_path, &destination)
+        .map_err(|error| format!("atomically replace checkpoint symlink: {error}"));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (link_target, target_is_dir, destination);
-        Err("symlink restore is unsupported on this platform".to_string())
-    }
+    result
 }
 
 fn copy_sidecar_file(
@@ -2664,6 +2880,7 @@ fn copy_sidecar_file(
     git_root: &Path,
     relative: &Path,
     executable: Option<bool>,
+    expected_integrity: Option<(&str, u64)>,
 ) -> Result<(), String> {
     let destination = ensure_worktree_parent_tree(git_root, relative)?;
     let metadata = std::fs::symlink_metadata(source)
@@ -2764,21 +2981,53 @@ fn copy_sidecar_file(
         )
     })?;
     let mut output = output.expect("temp path and file are created together");
-    let result = (|| -> Result<(), String> {
-        std::io::copy(&mut input, &mut output)
-            .map_err(|error| format!("copy sidecar to temp: {error}"))?;
+    let copy_result = (|| -> Result<(), String> {
+        let mut copied = 0u64;
+        let mut hasher = expected_integrity.map(|_| Sha256::new());
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = input
+                .read(&mut buffer)
+                .map_err(|error| format!("read sidecar for restore: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| format!("copy sidecar to temp: {error}"))?;
+            if let Some(hasher) = hasher.as_mut() {
+                hasher.update(&buffer[..read]);
+            }
+            copied = copied.saturating_add(read as u64);
+        }
+        if let Some((expected_digest, expected_size)) = expected_integrity {
+            let actual_digest = hasher
+                .expect("integrity request creates a hasher")
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if copied != expected_size || actual_digest != expected_digest {
+                return Err(format!(
+                    "checkpoint blob changed during restore: {expected_digest}"
+                ));
+            }
+        }
         output
             .sync_all()
             .map_err(|error| format!("sync sidecar restore temp: {error}"))?;
-        drop(output);
-        std::fs::rename(&temp_path, &destination).map_err(|error| {
+        Ok(())
+    })();
+    drop(output);
+    let result = copy_result.and_then(|()| {
+        preflight_sidecar_destination(&destination, false)?;
+        crate::session::replace_file_atomically(&temp_path, &destination).map_err(|error| {
             format!(
                 "replace restore destination {}: {error}",
                 destination.display()
             )
-        })?;
-        Ok(())
-    })();
+        })
+    });
     if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
     }

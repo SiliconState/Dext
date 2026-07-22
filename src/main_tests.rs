@@ -444,6 +444,35 @@ fn git_checkpoint_sidecar_restores_untracked_file() {
         std::fs::read_to_string(root.join("note.txt")).expect("read restored"),
         "before\n"
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_restore_handles_git_pathspec_magic_in_tracked_paths() {
+    let root = temp_test_dir("checkpoint-literal-pathspec");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    let file_name = ":(glob)name*.txt";
+    std::fs::write(root.join(file_name), "checkpoint\n").expect("write pathspec-magic path");
+    git_ok(&root, &["add", "--", &format!(":(literal){file_name}")]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &[file_name.to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    std::fs::write(root.join(file_name), "later\n").expect("mutate pathspec-magic path");
+
+    git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore pathspec-magic path");
+    assert_eq!(
+        std::fs::read_to_string(root.join(file_name)).expect("read restored pathspec-magic path"),
+        "checkpoint\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -543,6 +572,15 @@ fn arbitrary_command_checkpoint_preserves_untracked_symlink() {
         PathBuf::from("tracked.txt")
     );
 
+    std::fs::remove_file(root.join("alias.txt")).expect("replace restored symlink");
+    std::fs::write(root.join("alias.txt"), "ordinary file\n").expect("write replacement file");
+    git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
+        .expect("replace file with checkpoint symlink");
+    assert_eq!(
+        std::fs::read_link(root.join("alias.txt")).expect("read replaced checkpoint symlink"),
+        PathBuf::from("tracked.txt")
+    );
+
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -572,6 +610,87 @@ fn arbitrary_checkpoint_blobs_are_deduplicated_across_calls() {
             .expect("list blobs")
             .count(),
         1
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn arbitrary_checkpoint_cache_rejects_same_size_blob_corruption() {
+    let root = temp_test_dir("checkpoint-blob-cache-corruption");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("data.txt"), "unchanged\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    let mut cache = git_checkpoints::UntrackedBlobCache::default();
+
+    let first =
+        git_checkpoints::create_checkpoint_in_repo(&root, &root, "bash", &[], 1, false, &mut cache)
+            .expect("first checkpoint")
+            .expect("first checkpoint exists");
+    let digest = first
+        .untracked_sidecars
+        .iter()
+        .find_map(|sidecar| match sidecar {
+            git_checkpoints::UntrackedSidecar::File { path, digest, .. } if path == "data.txt" => {
+                Some(digest.clone())
+            }
+            _ => None,
+        })
+        .expect("data blob descriptor");
+    let blob = root.join(".dext/checkpoints/blobs").join(digest);
+    std::fs::write(&blob, "corrupted\n").expect("corrupt blob without changing its size");
+
+    let error =
+        git_checkpoints::create_checkpoint_in_repo(&root, &root, "bash", &[], 2, false, &mut cache)
+            .expect_err("a cached corrupt blob must never be reused");
+    assert!(error.contains("digest mismatch"), "{error}");
+    assert_eq!(
+        git_checkpoints::list_checkpoints(&root, usize::MAX)
+            .expect("list surviving checkpoints")
+            .len(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn arbitrary_checkpoint_reports_non_utf8_untracked_recovery_gap() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let root = temp_test_dir("checkpoint-non-utf8-untracked");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    let non_utf8 = root.join(std::ffi::OsString::from_vec(b"bad-\xff.txt".to_vec()));
+    std::fs::write(&non_utf8, "untracked\n").expect("write non-UTF-8 fixture");
+
+    let error = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect_err("non-UTF-8 untracked state needs explicit partial-recovery approval");
+    assert!(
+        git_checkpoints::is_partial_untracked_recovery_error(&error),
+        "{error}"
+    );
+    assert!(error.contains("not valid UTF-8"), "{error}");
+
+    let mut cache = git_checkpoints::UntrackedBlobCache::default();
+    let checkpoint =
+        git_checkpoints::create_checkpoint_in_repo(&root, &root, "bash", &[], 2, true, &mut cache)
+            .expect("approved partial checkpoint")
+            .expect("checkpoint exists");
+    assert!(
+        checkpoint
+            .untracked_capture_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("not valid UTF-8"))
     );
 
     let _ = std::fs::remove_dir_all(root);
@@ -7548,6 +7667,50 @@ fn tool_round_records_only_successful_file_mutations_in_work_ledger() {
 }
 
 #[tokio::test]
+async fn pre_tool_hooks_receive_privacy_redacted_inputs() {
+    let root = temp_test_dir("pre-tool-hook-input-redaction");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.privacy.enabled = true;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    agent.hooks.pre_tool.push(Hook {
+        tool_match: Some("write_file".to_string()),
+        command: "case \"$DEXT_TOOL_INPUT\" in *abcdef123456*) printf RAW;; *) printf REDACTED;; esac; exit 42"
+            .to_string(),
+    });
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let secret_input = ["API_", "KEY=", "abcdef123456"].concat();
+
+    agent
+        .execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-redacted-pre-hook-input".to_string(),
+                "write_file".to_string(),
+                json!({"path": "output.txt", "content": secret_input}),
+            )],
+            iterations: 1,
+            turn_id: "turn-redacted-pre-hook-input".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: true,
+        })
+        .await
+        .expect("execute write with blocking pre hook");
+
+    let (content, status) = last_tool_result(&agent.history).expect("tool result");
+    assert_eq!(status, "error");
+    assert!(content.contains("pre_tool hook blocked"), "{content}");
+    assert!(content.contains("REDACTED"), "{content}");
+    assert!(!content.contains("abcdef123456"), "{content}");
+    assert!(!root.join("output.txt").exists());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn post_tool_hooks_receive_privacy_redacted_inputs() {
     let root = temp_test_dir("post-tool-hook-input-redaction");
     let mut agent = test_agent(&root);
@@ -7928,6 +8091,11 @@ fn approval_and_sandbox_profiles_enforce_policy() {
     assert!(agent.tool_auto_approved("write_file", &write));
     assert!(!agent.tool_auto_approved("bash", &json!({"command": "sudo reboot"})));
     assert!(!agent.tool_auto_approved("bash", &json!({"command": "git checkout -- ."})));
+    assert!(!agent.tool_auto_approved("bash", &json!({"command": "git status --short"})));
+    assert!(!agent.tool_auto_approved(
+        "bash",
+        &json!({"command": "time -o timing.txt rm stale.txt"})
+    ));
     assert!(!agent.tool_auto_approved(
         "bash",
         &json!({"command": "python3 -c 'import shutil; shutil.rmtree(\"build\")'"})
@@ -12901,6 +13069,39 @@ fn project_extension_always_approval_persists_and_reset_reasks() {
     assert_eq!(second.project_extensions_approved, None);
     assert!(!approve_project_extensions(&mut second));
     assert_eq!(second_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    restore_env_var("DEXT_HOME", old_home);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn project_extension_always_approval_rejects_permissive_or_hardlinked_markers() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("project-extension-marker-integrity");
+    let home = root.join("home");
+    let old_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+    let marker = project_extensions_approval_path(&root);
+    std::fs::create_dir_all(marker.parent().expect("marker parent")).expect("create marker parent");
+    std::fs::write(&marker, "approved\n").expect("write marker");
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644))
+        .expect("make marker permissive");
+    assert!(!project_extensions_always_approved(&root));
+
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))
+        .expect("make marker private");
+    let outside_link = root.join("marker-hardlink");
+    std::fs::hard_link(&marker, &outside_link).expect("hardlink marker");
+    assert!(!project_extensions_always_approved(&root));
+    let mut agent = test_agent(&root);
+    let error = reset_project_extensions_approval(&mut agent)
+        .expect_err("reset must not unlink a multiply linked approval marker");
+    assert!(error.to_string().contains("safe private file"), "{error:#}");
 
     restore_env_var("DEXT_HOME", old_home);
     let _ = std::fs::remove_dir_all(root);

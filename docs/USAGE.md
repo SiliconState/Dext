@@ -212,7 +212,7 @@ Inside a session:
 /pack run my-pack run its workflow
 ```
 
-Conversational invocation also works when the message clearly asks to run or use a known pack, for example: `run my-pack on this task`. Conversational project-pack activation and project `shelf.json` metadata require one first-use confirmation for the active repository. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Choosing `Always` stores an owner-private project-scoped approval in Dext state; `/project-extensions status` shows it, and `/project-extensions reset` removes it or clears a session denial so the next matching use asks again. Before approval, project metadata is omitted and cannot shadow a same-named user or run-shelf pack. Dext accepts `PACK.md` and `shelf.json` only as regular non-symlink files no larger than 1 MiB; the selected workflow is then capped to 32 KiB for model context.
+Conversational invocation also works when the message clearly asks to run or use a known pack, for example: `run my-pack on this task`. Conversational project-pack activation and project `shelf.json` metadata require one first-use confirmation for the active repository. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Choosing `Always` stores a bounded owner-private, single-link project-scoped approval marker on Unix; unsafe/permissive markers are ignored, and `/project-extensions reset` refuses unsafe marker shapes while removing a safe marker or clearing a session denial. Before approval, project metadata is omitted and cannot shadow a same-named user or run-shelf pack. Dext accepts `PACK.md` and `shelf.json` only as regular non-symlink files no larger than 1 MiB; the selected workflow is then capped to 32 KiB for model context.
 
 A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke their own helpers. A pack from a user or `DEXT_SHELVES_DIR` shelf may declare exact names in the inline `credential-env` front-matter list; matching inherited values are available only to a simple direct invocation of that active pack's own native `bin/` helper. On Windows, only `.exe`/`.com` helpers qualify for this direct credential path; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Credential values are not exposed to hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, or sessions, and provider-auth names remain excluded. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
 
@@ -228,10 +228,12 @@ Git exclude file and automatically retains at most 20 checkpoints for no longer
 than seven days. They are intended for Dext write recovery, not as a replacement
 for commits. Write-risk `bash`/`awk`/`csvkit` calls inventory up to 500 existing
 untracked paths, preserve regular files up to 8 MiB each and 32 MiB total, and
-preserve bounded UTF-8 symlink targets without following them. Regular-file
-content is stored once in owner-private SHA-256-addressed blobs shared by retained
-checkpoints; unchanged size/mtime/mode can reuse a session cache, restore verifies
-blob hashes, and prune removes unreferenced blobs. Owner execute state is retained
+preserve bounded UTF-8 symlink targets without following them. Non-UTF-8 names,
+unsupported types, and path/type/size bounds are reported as explicit partial-recovery gaps.
+Regular-file content is stored once in owner-private SHA-256-addressed blobs shared by retained
+checkpoints; unchanged source paths reuse a session cache only while source and blob metadata
+fingerprints remain stable, preview/restore rehash blobs before trusting them, and prune or failed
+checkpoint creation removes unreferenced/new blobs. Owner execute state is retained
 in metadata. If path/type/size limits make untracked recovery partial, Dext asks
 separately before the command and caches approval for the current repository and
 session; approval keeps tracked/staged recovery and the bounded untracked subset,
@@ -263,7 +265,7 @@ Interactive undo commands:
 /undo --prune
 ```
 
-Normal undo restores checkpointed worktree paths and does not move `HEAD`.
+Normal undo restores checkpointed worktree paths with literal Git pathspecs and does not move `HEAD`. Sidecar files and symlinks are revalidated and atomically replaced on supported platforms.
 Moving `HEAD` requires the CLI's explicit reset-head mode.
 
 Mutation previews are shown before permission prompts for `write_file`,
@@ -316,7 +318,7 @@ dext --sandbox-profile danger-full-access
 # --sandbox accepts the same profile names, or a directory as the sandbox root
 ```
 
-Dext starts with the `ask` approval profile. Interactive frontends prompt before gated tools; non-interactive and JSON runs deny those calls instead of waiting for input. Automation that needs writes must opt in explicitly with `--approval auto-write`, `--approval always`, or `--trust`. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `DEXT_TRUST=1` is an alias for `approval=always`; false values do not override the safer fallback. Resuming a session never restores its saved trust grants over the current-run policy. `auto-write` still prompts for destructive Git checkout/switch/stash operations and inline or stdin Python/Perl/Node/Ruby/PHP code. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access.
+Dext starts with the `ask` approval profile. Interactive frontends prompt before gated tools; non-interactive and JSON runs deny those calls instead of waiting for input. Automation that needs writes must opt in explicitly with `--approval auto-write`, `--approval always`, or `--trust`. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `DEXT_TRUST=1` is an alias for `approval=always`; false values do not override the safer fallback. Resuming a session never restores its saved trust grants over the current-run policy. Destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands remain gated. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is Danger unless it uses explicit `git --no-pager` and matches a narrow direct metadata-inspection allowlist; prefer Dext’s hardened native Git tools for review operations. Recognized dynamic/wrapper command paths and inline/stdin code through common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers are Danger too. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access.
 
 For durable sessions, approved side-effect-capable tool calls receive a bounded, redacted start/terminal journal under the private session state directory. On resume, pending transcript calls are reconciled without replay: absent starts are marked `not_started`, unresolved starts are `uncertain`, and terminal entries recover their status without claiming unavailable output. `--no-session` and `--fork` deliberately omit this journal, so side-effect crash recovery is unavailable in those modes.
 

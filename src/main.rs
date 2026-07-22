@@ -21908,14 +21908,49 @@ fn project_extensions_approval_path(root: &Path) -> PathBuf {
     project_state_dir(root).join(PROJECT_EXTENSIONS_APPROVAL_FILE)
 }
 
+fn project_extensions_approval_metadata_is_private(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn project_extensions_always_approved(root: &Path) -> bool {
     let path = project_extensions_approval_path(root);
-    std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
-        !metadata.file_type().is_symlink()
-            && metadata.is_file()
-            && metadata.len() <= 16
-            && std::fs::read_to_string(&path).is_ok_and(|text| text.trim() == "approved")
-    })
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !project_extensions_approval_metadata_is_private(&metadata) || metadata.len() > 16 {
+        return false;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(file) = options.open(&path) else {
+        return false;
+    };
+    let Ok(opened) = file.metadata() else {
+        return false;
+    };
+    if !project_extensions_approval_metadata_is_private(&opened) || opened.len() > 16 {
+        return false;
+    }
+    let mut text = String::new();
+    file.take(17).read_to_string(&mut text).is_ok() && text.len() <= 16 && text.trim() == "approved"
 }
 
 fn persist_project_extensions_approval(root: &Path) -> Result<()> {
@@ -21926,8 +21961,8 @@ fn persist_project_extensions_approval(root: &Path) -> Result<()> {
 fn reset_project_extensions_approval(agent: &mut Agent) -> Result<()> {
     let path = project_extensions_approval_path(&agent.sandbox_root);
     match std::fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            anyhow::bail!("project extension approval marker is not a regular file")
+        Ok(metadata) if !project_extensions_approval_metadata_is_private(&metadata) => {
+            anyhow::bail!("project extension approval marker is not a safe private file")
         }
         Ok(_) => std::fs::remove_file(&path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
