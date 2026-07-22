@@ -604,7 +604,7 @@ fn embedded_shell_commands(command: &str) -> Vec<String> {
 }
 
 fn is_sudo_command_word(word: &str) -> bool {
-    shell_command_basename(word) == "sudo"
+    shell_command_basename(word).eq_ignore_ascii_case("sudo")
 }
 
 fn shell_command_separator(word: &str) -> bool {
@@ -650,8 +650,14 @@ fn shell_command_basename(word: &str) -> &str {
         .trim_start_matches(['(', '{'])
         .trim_end_matches([')', '}']);
     basename
-        .strip_suffix(".exe")
-        .or_else(|| basename.strip_suffix(".com"))
+        .get(..basename.len().saturating_sub(4))
+        .filter(|_| {
+            basename
+                .get(basename.len().saturating_sub(4)..)
+                .is_some_and(|suffix| {
+                    suffix.eq_ignore_ascii_case(".exe") || suffix.eq_ignore_ascii_case(".com")
+                })
+        })
         .unwrap_or(basename)
 }
 
@@ -1620,16 +1626,17 @@ fn shell_command_is_read_only(command: &str) -> bool {
 }
 
 fn shell_command_is_dangerous(command: &str) -> bool {
-    let lower = command.trim().to_ascii_lowercase();
-    if lower.is_empty() {
+    let command = command.trim();
+    if command.is_empty() {
         return true;
     }
-    if shell_command_invocations(&lower)
+    if shell_command_invocations(command)
         .iter()
         .any(|invocation| shell_invocation_is_dangerous(invocation))
     {
         return true;
     }
+    let lower = command.to_ascii_lowercase();
     if command_segments(&lower)
         .iter()
         .any(|segment| shell_search_tool_exec_escape(segment))
@@ -1647,7 +1654,8 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     let Some(first) = invocation.first() else {
         return false;
     };
-    let command = shell_command_basename(first);
+    let command = shell_command_basename(first).to_ascii_lowercase();
+    let command = command.as_str();
     if is_sudo_command_word(first)
         || matches!(
             command,
@@ -1671,7 +1679,7 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     match command {
         "find" => invocation.iter().any(|arg| arg == "-delete"),
         "git" => git_invocation_is_dangerous(invocation),
-        "python" | "python3" | "perl" | "node" | "nodejs" => {
+        "python" | "python3" | "perl" | "node" | "nodejs" | "ruby" | "php" => {
             interpreter_inline_code_is_dangerous(command, invocation)
         }
         "docker" | "podman" => container_invocation_is_dangerous(invocation),
@@ -1705,13 +1713,24 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     }
 }
 
+fn python_arg_contains_inline_code(arg: &str) -> bool {
+    if arg == "-" {
+        return true;
+    }
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return false;
+    }
+    let flags = &arg[1..];
+    !flags.starts_with(['W', 'X', 'm']) && flags.chars().any(|flag| flag == 'c')
+}
+
 fn interpreter_inline_code_is_dangerous(command: &str, invocation: &[String]) -> bool {
     let args = &invocation[1..];
     if args.is_empty() {
         return true;
     }
     let inline = args.iter().any(|arg| match command {
-        "python" | "python3" => arg == "-" || arg == "-c" || arg.starts_with("-c") && arg.len() > 2,
+        "python" | "python3" => python_arg_contains_inline_code(arg),
         "perl" => {
             arg == "-"
                 || arg == "-e"
@@ -1734,13 +1753,33 @@ fn interpreter_inline_code_is_dangerous(command: &str, invocation: &[String]) ->
                 || arg.starts_with("--eval=")
                 || arg.starts_with("--print=")
         }
+        "ruby" => {
+            arg == "-"
+                || arg == "--eval"
+                || arg.starts_with("--eval=")
+                || (arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && arg[1..].chars().any(|flag| flag == 'e'))
+        }
+        "php" => {
+            arg == "-"
+                || arg == "--run"
+                || arg.starts_with("--run=")
+                || (arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && arg[1..].chars().any(|flag| flag == 'r'))
+        }
         _ => false,
     });
-    if inline
-        || args
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "-v" | "-V" | "--version"))
-    {
+    let informational = args.iter().any(|arg| match command {
+        "python" | "python3" => matches!(arg.as_str(), "-h" | "--help" | "-V" | "--version"),
+        "perl" | "node" | "nodejs" | "php" => {
+            matches!(arg.as_str(), "-h" | "--help" | "-v" | "-V" | "--version")
+        }
+        "ruby" => matches!(arg.as_str(), "-h" | "--help" | "--version"),
+        _ => false,
+    });
+    if inline || informational {
         return inline;
     }
     !interpreter_has_explicit_program(command, args)
@@ -1784,6 +1823,27 @@ fn interpreter_has_explicit_program(command: &str, args: &[String]) -> bool {
                 index = index.saturating_add(2);
                 continue;
             }
+            "ruby" => {
+                if matches!(arg, "-S" | "--script") {
+                    return args.get(index + 1).is_some();
+                }
+                if matches!(
+                    arg,
+                    "-C" | "--directory" | "-E" | "--encoding" | "-I" | "-r"
+                ) {
+                    index = index.saturating_add(2);
+                    continue;
+                }
+            }
+            "php" => {
+                if matches!(arg, "-f" | "--file") {
+                    return args.get(index + 1).is_some();
+                }
+                if matches!(arg, "-c" | "--php-ini" | "-d" | "--define" | "-z") {
+                    index = index.saturating_add(2);
+                    continue;
+                }
+            }
             _ => {}
         }
         if arg.starts_with('-') {
@@ -1803,6 +1863,14 @@ fn git_invocation_is_dangerous(invocation: &[String]) -> bool {
     let args = &invocation[subcommand_idx.saturating_add(1)..];
     match subcommand {
         "push" | "clean" | "checkout" => true,
+        "switch" => args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--discard-changes" | "--force" | "--force-create" | "-C" | "-f"
+            ) || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|flag| matches!(flag, 'C' | 'f')))
+        }),
         "stash" => args
             .iter()
             .find(|arg| !arg.starts_with('-'))
@@ -2278,6 +2346,16 @@ mod tests {
             "perl -E'unlink \"stale.txt\"'",
             "node -e 'require(\"fs\").rmSync(\"build\", {recursive:true})'",
             "node -p 'require(\"fs\").rmSync(\"build\", {recursive:true})'",
+            "git switch --discard-changes main",
+            "git switch -C replacement main",
+            "git switch --force-create replacement main",
+            "git switch -f main",
+            "python3 -uc 'import os; os.unlink(\"stale\")'",
+            "python3 -Bc 'import os; os.unlink(\"stale\")'",
+            "printf 'import os; os.unlink(\"stale\")' | python3 -v",
+            "PYTHON.EXE -c 'import os; os.unlink(\"stale\")'",
+            "ruby -e 'File.delete(\"stale.txt\")'",
+            "php -r 'unlink(\"stale.txt\");'",
             "docker system prune",
             "curl --request=DELETE https://example.invalid/item/1",
             "curl --data=x=1 https://example.invalid/items",
@@ -2347,6 +2425,16 @@ mod tests {
             classify_command_risk("bash", &json!({"command": "python.exe script.py"})),
             CommandRisk::Write,
             "Windows-suffixed script execution remains ordinary write-risk"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "python3 -W ignore script.py"})),
+            CommandRisk::Write,
+            "Python options that consume arguments must not look like clustered -c"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "git switch -c feature"})),
+            CommandRisk::Write,
+            "non-destructive branch creation remains ordinary write-risk"
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "git stash list"})),

@@ -610,6 +610,11 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "create/discover/invoke shelf packs",
     },
     SlashCmd {
+        name: "/project-extensions",
+        args: "[status|reset]",
+        help: "inspect/reset project extension approval",
+    },
+    SlashCmd {
         name: "/hooks",
         args: "[reload]",
         help: "show/reload hooks",

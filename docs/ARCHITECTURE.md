@@ -113,7 +113,7 @@ Dext exposes a deliberately small default native tool set:
 - Git: `git_diff`, `git_commit`.
 - Tasks: `todo_read`, `todo_write`.
 
-Packs extend this tool model without changing it. Dext creates, discovers, inspects, maintains, and invokes user-authored packs under shelf roots; it ships no pack content and registers no pack as a provider-visible tool. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow. Conversational auto-invocation and all unrelated project `shelf.json` metadata require one first-use confirmation per active repository; denied project metadata stays out of the model prompt and cannot shadow same-named trusted user/run metadata, while approved project context is labeled as repository-controlled. `PACK.md` and `shelf.json` reads require regular non-symlink files no larger than 1 MiB before prompt-level caps are applied. Pack helpers then run through the regular approval and sandbox path. On Windows, only native `.exe`/`.com` pack helpers can receive narrowly declared credentials through direct spawn; script helpers run through Bash with declared credentials removed.
+Packs extend this tool model without changing it. Dext creates, discovers, inspects, maintains, and invokes user-authored packs under shelf roots; it ships no pack content and registers no pack as a provider-visible tool. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow. Conversational auto-invocation and all unrelated project `shelf.json` metadata require one first-use confirmation per active repository; `Always` persists an owner-private project-scoped decision, and `/project-extensions reset` removes it or clears a session denial so the next use asks again. Denied project metadata stays out of the model prompt and cannot shadow same-named trusted user/run metadata, while approved project context is labeled as repository-controlled. `PACK.md` and `shelf.json` reads require regular non-symlink files no larger than 1 MiB before prompt-level caps are applied. Pack helpers then run through the regular approval and sandbox path. On Windows, only native `.exe`/`.com` pack helpers can receive narrowly declared credentials through direct spawn; script helpers run through Bash with declared credentials removed.
 
 The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`. Frugal/tiny retain the default core tool capabilities while using lean schemas and smaller context/result budgets. Catalog metadata for required fields, permission/side-effect capability, external-process dispatch, parallel safety, and default/full exposure is centralized in `tools.rs`; schema-registry drift is regression-tested. Descriptions, schemas, risk-specific parsing, and per-tool summaries remain in their focused code paths rather than being forced into one oversized object.
 
@@ -148,9 +148,9 @@ Dext has three safety layers:
 
 Profiles:
 
-- Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`. `auto-write` still prompts for Danger-class shell commands; destructive Git worktree/stash operations (`checkout`, `stash drop/clear/pop`) and inline interpreter code (`python -c`, `perl -e`, `node -e`/`-p`, including stdin interpreters) are Danger.
+- Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`. `auto-write` still prompts for Danger-class shell commands; destructive Git worktree/stash operations (`checkout`, destructive `switch`, `stash drop/clear/pop`) and inline interpreter code (clustered Python `-c`, Perl/Ruby `-e`, Node `-e`/`-p`, PHP `-r`, including stdin interpreters) are Danger. Windows `.exe`/`.com` command matching is case-insensitive.
 - Sandbox: `read-only`, `workspace-write`, `danger-full-access`. On supported Linux/macOS hosts, confined profiles preserve every read available to the Dext process user. `workspace-write` permits writes only under the sandbox root, scratch/device roots, and common per-user toolchain caches; `read-only` retains only required scratch/device writes. macOS Seatbelt profiles authorize both canonical `/private/...` scratch paths and their `/var` or `/tmp` aliases so standard temp APIs remain confined but usable.
-- Tool subprocesses remove credential-shaped environment variables by default. `DEXT_INHERIT_TOOL_CREDENTIALS=1` is an explicit high-trust opt-in for model-invoked bash/external tools that require the parent credential environment; hooks and Dext-owned subprocesses always scrub credentials. Pack-declared helper credentials are narrower still, and project-local declarations are ignored. Approved `post_tool` hooks receive privacy-redacted tool output.
+- Tool subprocesses remove credential-shaped environment variables by default. `DEXT_INHERIT_TOOL_CREDENTIALS=1` is an explicit high-trust opt-in for model-invoked bash/external tools that require the parent credential environment; hooks and Dext-owned subprocesses always scrub credentials. Pack-declared helper credentials are narrower still, and project-local declarations are ignored. Approved `pre_tool` and `post_tool` hooks receive privacy-redacted tool input; `post_tool` output is redacted too.
 
 Dext starts with approval profile `ask`. Interactive frontends request approval for gated tools; non-interactive and JSON runs deny instead of blocking. Startup precedence is the last CLI policy flag, then valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `--trust` and `DEXT_TRUST=1` explicitly select `always`; resumed sessions retain their historical profile only as provenance and current-run policy clears stale grants. Approval policy and sandbox confinement are independent.
 
@@ -168,17 +168,23 @@ provider-visible tools:
   sidecars in `.dext/checkpoints/`. Dext adds `/.dext/` to the repository-local
   Git exclude and automatically retains at most 20 checkpoints for seven days.
   Direct file mutations receive path-specific restore hints. Write-risk
-  `bash`/`awk`/`csvkit` checkpoints also preserve existing untracked regular
-  files, bounded to 500 paths, 8 MiB per file, and 32 MiB total. Private
-  sidecars retain owner execute state, and restore fails closed if any declared
-  sidecar is missing. Each call is
-  checkpointed at its sequential dispatch boundary, so later calls in one round
-  include earlier mutations. If the required snapshot cannot be created, the
-  command does not execute. In repositories without an initial commit, writes
-  that would overwrite existing worktree/index state fail closed because Git has
-  no normal restore base. A workspace with no `.git` marker is treated as
-  non-Git without invoking Git; a discovered but malformed repository marker is
-  an error rather than a no-op. Never mirror-push
+  `bash`/`awk`/`csvkit` checkpoints inventory at most 500 existing untracked
+  paths, preserve regular files within 8 MiB/file and 32 MiB total bounds, and
+  preserve bounded UTF-8 symlink targets without following them. Regular-file
+  content uses owner-private SHA-256-addressed blobs shared by retained
+  checkpoints; unchanged path size/mtime/mode reuses the session cache, restore
+  rehashes blobs before mutation, and prune removes unreferenced blobs. Owner
+  execute state is descriptor metadata. If caps or unsupported file types leave
+  partial untracked recovery, Dext requests separate repository/session-scoped
+  approval and records the gap; denial blocks the call, while approval preserves
+  the tracked/staged state and bounded subset. Other checkpoint failures remain
+  fail-closed. Each call is checkpointed at its sequential dispatch boundary,
+  so later calls in one round include earlier mutations. In repositories without
+  an initial commit, writes that would overwrite existing worktree/index state
+  fail closed because Git has no normal restore base. A workspace with no `.git`
+  marker is non-Git unless ambient `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`
+  routing exists; routed-without-marker and malformed-marker cases fail loudly
+  because Dext-owned Git commands scrub routing variables. Never mirror-push
   `refs/dext/*`.
 - `/undo` and `dext undo` list, preview, and apply checkpoint restores. Normal
   restore updates worktree paths only; moving `HEAD` requires an explicit

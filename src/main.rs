@@ -40,8 +40,8 @@ use session::{
     canonicalize_read_tool_path, dext_state_dir, expand_user_path, latest_session_path,
     list_session_records_for_root, named_session_path_for_root, named_sessions_dir_for_root,
     new_session_id, parse_session_header, project_key, project_latest_session_path,
-    release_registered_locks, remove_stale_session_state_lock, render_limited_csv,
-    restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
+    project_state_dir, release_registered_locks, remove_stale_session_state_lock,
+    render_limited_csv, restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
     session_latest_session_path, session_state_lock_is_live, session_state_lock_path,
     session_todo_path, unix_timestamp_secs,
 };
@@ -11657,6 +11657,8 @@ const FRUGAL_COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 360;
 
 const HOOKS_APPROVAL_NAME: &str = "hooks";
 const PROJECT_EXTENSIONS_APPROVAL_NAME: &str = "project_extensions";
+const PROJECT_EXTENSIONS_APPROVAL_FILE: &str = "project-extensions-approved";
+const CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME: &str = "checkpoint_recovery_gap";
 
 #[derive(Deserialize, Clone, Default)]
 struct Hook {
@@ -12869,6 +12871,8 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "packs"
             | "shelf"
             | "shelves"
+            | "project-extensions"
+            | "project_extensions"
             | "help"
             | "?"
             | "version"
@@ -13940,6 +13944,8 @@ struct Agent {
     // Never serialized, logged, or shown to the model.
     git_credential: Option<LocalGitCredential>,
     checkpoint_cache: git_checkpoints::RepoRootCache,
+    checkpoint_blob_cache: git_checkpoints::UntrackedBlobCache,
+    checkpoint_partial_untracked_approved: bool,
     checkpoint_ordinal: usize,
     prompt_scan_cache: Mutex<Option<PromptScanCache>>,
     prompt_scan_epoch: u64,
@@ -14124,6 +14130,8 @@ impl Agent {
             privacy: PrivacyPolicy::from_env(),
             git_credential: None,
             checkpoint_cache: git_checkpoints::RepoRootCache::new(),
+            checkpoint_blob_cache: git_checkpoints::UntrackedBlobCache::default(),
+            checkpoint_partial_untracked_approved: false,
             checkpoint_ordinal: 0,
             prompt_scan_cache: Mutex::new(None),
             prompt_scan_epoch: 0,
@@ -15002,6 +15010,8 @@ impl Agent {
         self.hooks = Hooks::load(&self.sandbox_root);
         self.git_context = git_summary(&self.sandbox_root);
         self.checkpoint_cache = git_checkpoints::RepoRootCache::new();
+        self.checkpoint_blob_cache = git_checkpoints::UntrackedBlobCache::default();
+        self.checkpoint_partial_untracked_approved = false;
         self.checkpoint_ordinal = 0;
         self.refresh_state_paths();
         record_crash_session_id(&self.latest_session_path);
@@ -15068,15 +15078,54 @@ impl Agent {
             .map(|p| vec![p.to_string()])
             .unwrap_or_default();
         self.checkpoint_ordinal += 1;
-        match git_checkpoints::create_checkpoint_in_repo(
-            &self.sandbox_root,
-            &git_root,
-            name,
-            &paths_hint,
-            self.checkpoint_ordinal,
-        ) {
+        let create = |agent: &mut Self, allow_partial_untracked| {
+            git_checkpoints::create_checkpoint_in_repo(
+                &agent.sandbox_root,
+                &git_root,
+                name,
+                &paths_hint,
+                agent.checkpoint_ordinal,
+                allow_partial_untracked,
+                &mut agent.checkpoint_blob_cache,
+            )
+        };
+        let checkpoint = match create(self, self.checkpoint_partial_untracked_approved) {
+            Err(error)
+                if git_checkpoints::checkpoint_failure_blocks_tool(name)
+                    && git_checkpoints::is_partial_untracked_recovery_error(&error)
+                    && !self.checkpoint_partial_untracked_approved =>
+            {
+                if self.approval_profile == ApprovalProfile::Never {
+                    return Err(error);
+                }
+                let approval_input = json!({
+                    "operation": "run write-risk arbitrary commands with partial untracked-file recovery for this repository",
+                    "recovery_gap": error,
+                    "risk": "tracked and staged Git state remains checkpointed, but listed untracked paths outside bounded sidecar capture may not be recoverable"
+                });
+                match self
+                    .sink
+                    .request_permission(CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME, &approval_input)
+                {
+                    Choice::Deny => {
+                        return Err("partial checkpoint recovery was not approved".to_string());
+                    }
+                    Choice::Once | Choice::Always => {
+                        self.checkpoint_partial_untracked_approved = true;
+                        create(self, true)
+                    }
+                }
+            }
+            result => result,
+        };
+        match checkpoint {
             Ok(Some(cp)) => {
                 self.append_latest_log("checkpoint", &format!("created {}", cp.id));
+                if let Some(warning) = cp.untracked_capture_warning {
+                    self.sink.emit(AgentEvent::Warn(format!(
+                        "[checkpoint recovery gap approved] {warning}"
+                    )));
+                }
                 Ok(())
             }
             Ok(None) => {
@@ -21855,9 +21904,47 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
 
 const DIAGNOSTICS_APPROVAL_NAME: &str = "diagnostics";
 
+fn project_extensions_approval_path(root: &Path) -> PathBuf {
+    project_state_dir(root).join(PROJECT_EXTENSIONS_APPROVAL_FILE)
+}
+
+fn project_extensions_always_approved(root: &Path) -> bool {
+    let path = project_extensions_approval_path(root);
+    std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+        !metadata.file_type().is_symlink()
+            && metadata.is_file()
+            && metadata.len() <= 16
+            && std::fs::read_to_string(&path).is_ok_and(|text| text.trim() == "approved")
+    })
+}
+
+fn persist_project_extensions_approval(root: &Path) -> Result<()> {
+    atomic_write_secret(&project_extensions_approval_path(root), b"approved\n")?;
+    Ok(())
+}
+
+fn reset_project_extensions_approval(agent: &mut Agent) -> Result<()> {
+    let path = project_extensions_approval_path(&agent.sandbox_root);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            anyhow::bail!("project extension approval marker is not a regular file")
+        }
+        Ok(_) => std::fs::remove_file(&path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    agent.project_extensions_approved = None;
+    agent.prompt_scan_epoch = agent.prompt_scan_epoch.wrapping_add(1);
+    Ok(())
+}
+
 fn approve_project_extensions(agent: &mut Agent) -> bool {
     if let Some(approved) = agent.project_extensions_approved {
         return approved;
+    }
+    if project_extensions_always_approved(&agent.sandbox_root) {
+        agent.project_extensions_approved = Some(true);
+        return true;
     }
     if agent.approval_profile == ApprovalProfile::Never {
         agent.project_extensions_approved = Some(false);
@@ -21872,7 +21959,16 @@ fn approve_project_extensions(agent: &mut Agent) -> bool {
         .sink
         .request_permission(PROJECT_EXTENSIONS_APPROVAL_NAME, &input)
     {
-        Choice::Once | Choice::Always => true,
+        Choice::Once => true,
+        Choice::Always => match persist_project_extensions_approval(&agent.sandbox_root) {
+            Ok(()) => true,
+            Err(error) => {
+                agent.sink.emit(AgentEvent::Warn(format!(
+                    "could not persist project-extension approval: {error:#}"
+                )));
+                true
+            }
+        },
         Choice::Deny => false,
     };
     agent.project_extensions_approved = Some(approved);
@@ -22122,6 +22218,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(
                 w,
                 "  /shelves                  list typed shelf manifests and ability metadata"
+            );
+            let _ = writeln!(
+                w,
+                "  /project-extensions [status|reset]  inspect or reset repository extension approval"
             );
             let _ = writeln!(
                 w,
@@ -22380,6 +22480,40 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
             _ => {
                 let _ = writeln!(w, "usage: /trust [on|off|status]");
+            }
+        },
+        "project-extensions" | "project_extensions" => match arg {
+            "" | "status" => {
+                let state = if agent.project_extensions_approved == Some(true)
+                    || project_extensions_always_approved(&agent.sandbox_root)
+                {
+                    "approved"
+                } else if agent.project_extensions_approved == Some(false) {
+                    "denied for this session"
+                } else {
+                    "undecided"
+                };
+                let persistent = if project_extensions_always_approved(&agent.sandbox_root) {
+                    "yes"
+                } else {
+                    "no"
+                };
+                let _ = writeln!(w, "project extensions: {state}");
+                let _ = writeln!(w, "persistent approval: {persistent}");
+            }
+            "reset" | "ask" => match reset_project_extensions_approval(agent) {
+                Ok(()) => {
+                    let _ = writeln!(
+                        w,
+                        "project extension decision reset; the next matching use will ask again"
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(w, "could not reset project extension approval: {error:#}");
+                }
+            },
+            _ => {
+                let _ = writeln!(w, "usage: /project-extensions [status|reset]");
             }
         },
         "privacy" => match arg {

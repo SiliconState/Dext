@@ -140,6 +140,8 @@ fn test_agent(root: &Path) -> Agent {
         privacy: PrivacyPolicy::default(),
         git_credential: None,
         checkpoint_cache: git_checkpoints::RepoRootCache::new(),
+        checkpoint_blob_cache: git_checkpoints::UntrackedBlobCache::default(),
+        checkpoint_partial_untracked_approved: false,
         checkpoint_ordinal: 0,
         prompt_scan_cache: Mutex::new(None),
         prompt_scan_epoch: 0,
@@ -150,6 +152,22 @@ fn test_agent(root: &Path) -> Agent {
 struct FixedPermissionSink {
     choice: Choice,
     requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct RecordingPermissionSink {
+    choice: Choice,
+    names: Arc<Mutex<Vec<String>>>,
+}
+
+impl EventSink for RecordingPermissionSink {
+    fn emit(&mut self, _event: AgentEvent) {}
+
+    fn request_permission(&mut self, name: &str, _input: &Value) -> Choice {
+        self.names.lock().unwrap().push(name.to_string());
+        self.choice
+    }
+
+    fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
 }
 
 impl EventSink for FixedPermissionSink {
@@ -331,6 +349,27 @@ fn git_checkpoint_non_git_is_noop() {
 }
 
 #[test]
+fn git_checkpoint_env_routed_repo_without_marker_fails_loudly() {
+    let _guard = env_lock();
+    let root = temp_test_dir("checkpoint-env-routed-no-marker");
+    let routed = temp_test_dir("checkpoint-env-routed-target");
+    git_ok(&routed, &["init", "-q"]);
+    let old_git_dir = std::env::var_os("GIT_DIR");
+    unsafe {
+        std::env::set_var("GIT_DIR", routed.join(".git"));
+    }
+
+    let error = git_checkpoints::create_checkpoint(&root, "write_file", &[], 1)
+        .expect_err("ambient repository routing must not silently disable checkpoints");
+    assert!(error.contains("GIT_DIR"), "{error}");
+    assert!(error.contains("cannot safely identify"), "{error}");
+
+    restore_env_var("GIT_DIR", old_git_dir);
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(routed);
+}
+
+#[test]
 fn git_checkpoint_malformed_git_marker_fails_closed() {
     let root = temp_test_dir("checkpoint-malformed-git-marker");
     std::fs::write(root.join(".git"), "not a gitdir file\n").expect("write malformed marker");
@@ -470,6 +509,72 @@ fn git_checkpoint_unborn_head_blocks_existing_state_but_allows_new_file_targets(
             .expect("new target has no prior state to preserve");
     assert!(new_target.is_none());
     assert!(!root.join(".dext/checkpoints/manifest.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn arbitrary_command_checkpoint_preserves_untracked_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-untracked-symlink");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    symlink("tracked.txt", root.join("alias.txt")).expect("create untracked symlink");
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("symlink checkpoint")
+        .expect("checkpoint exists");
+    assert!(checkpoint.untracked_capture_warning.is_none());
+    assert!(checkpoint.untracked_sidecars.iter().any(|sidecar| matches!(
+        sidecar,
+        git_checkpoints::UntrackedSidecar::Symlink { path, target, .. }
+            if path == "alias.txt" && target == "tracked.txt"
+    )));
+
+    std::fs::remove_file(root.join("alias.txt")).expect("remove symlink");
+    git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore symlink checkpoint");
+    assert_eq!(
+        std::fs::read_link(root.join("alias.txt")).expect("read restored symlink"),
+        PathBuf::from("tracked.txt")
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn arbitrary_checkpoint_blobs_are_deduplicated_across_calls() {
+    let root = temp_test_dir("checkpoint-blob-dedup");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("data.txt"), "unchanged\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    let mut cache = git_checkpoints::UntrackedBlobCache::default();
+
+    let first =
+        git_checkpoints::create_checkpoint_in_repo(&root, &root, "bash", &[], 1, false, &mut cache)
+            .expect("first checkpoint")
+            .expect("first checkpoint exists");
+    let second =
+        git_checkpoints::create_checkpoint_in_repo(&root, &root, "bash", &[], 2, false, &mut cache)
+            .expect("second checkpoint")
+            .expect("second checkpoint exists");
+    assert_eq!(first.untracked_sidecars, second.untracked_sidecars);
+    assert_eq!(
+        std::fs::read_dir(root.join(".dext/checkpoints/blobs"))
+            .expect("list blobs")
+            .count(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -757,8 +862,17 @@ fn checkpoint_restore_fails_closed_when_one_required_sidecar_is_missing() {
     let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
         .expect("create checkpoint")
         .expect("checkpoint exists");
-    let sidecar_root = root.join(".dext/checkpoints").join(&checkpoint.id);
-    std::fs::remove_file(sidecar_root.join("two.txt")).expect("remove one sidecar");
+    let missing_blob = checkpoint
+        .untracked_sidecars
+        .iter()
+        .find_map(|sidecar| match sidecar {
+            git_checkpoints::UntrackedSidecar::File { path, digest, .. } if path == "two.txt" => {
+                Some(root.join(".dext/checkpoints/blobs").join(digest))
+            }
+            _ => None,
+        })
+        .expect("second file blob descriptor");
+    std::fs::remove_file(missing_blob).expect("remove one blob");
     std::fs::write(root.join("tracked.txt"), "after\n").expect("mutate tracked file");
 
     let error = git_checkpoints::restore_worktree(
@@ -767,7 +881,7 @@ fn checkpoint_restore_fails_closed_when_one_required_sidecar_is_missing() {
         git_checkpoints::RestoreMode::Worktree,
     )
     .expect_err("partial sidecar set must fail before restore");
-    assert!(error.contains("sidecar is missing: two.txt"), "{error}");
+    assert!(error.contains("checkpoint blob"), "{error}");
     assert_eq!(
         std::fs::read_to_string(root.join("tracked.txt")).expect("read unchanged tracked file"),
         "after\n"
@@ -1013,12 +1127,20 @@ fn checkpoint_snapshots_untracked_and_preview_names_created_files() {
         cp.untracked_snapshot
     );
     assert!(cp.includes_untracked_sidecar);
-    let sidecar = root
-        .join(".dext/checkpoints")
-        .join(&cp.id)
-        .join("existing.txt");
+    let sidecar = cp
+        .untracked_sidecars
+        .iter()
+        .find_map(|sidecar| match sidecar {
+            git_checkpoints::UntrackedSidecar::File { path, digest, .. }
+                if path == "existing.txt" =>
+            {
+                Some(root.join(".dext/checkpoints/blobs").join(digest))
+            }
+            _ => None,
+        })
+        .expect("existing file blob descriptor");
     assert_eq!(
-        std::fs::read_to_string(sidecar).expect("read bash untracked sidecar"),
+        std::fs::read_to_string(sidecar).expect("read deduplicated untracked blob"),
         "x\n"
     );
 
@@ -1053,7 +1175,7 @@ fn checkpoint_snapshots_untracked_and_preview_names_created_files() {
 }
 
 #[test]
-fn arbitrary_command_checkpoint_rejects_unbounded_untracked_content() {
+fn arbitrary_command_checkpoint_requires_opt_in_for_partial_untracked_recovery() {
     let root = temp_test_dir("checkpoint-untracked-cap");
     git_ok(&root, &["init", "-q"]);
     git_ok(&root, &["config", "user.email", "test@example.invalid"]);
@@ -1067,12 +1189,33 @@ fn arbitrary_command_checkpoint_rejects_unbounded_untracked_content() {
         .set_len(8 * 1024 * 1024 + 1)
         .expect("size oversized fixture");
     let error = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
-        .expect_err("unsafe arbitrary-command checkpoint must fail");
-    assert!(error.contains("sidecar limit"), "{error}");
+        .expect_err("partial arbitrary-command checkpoint requires explicit opt-in");
     assert!(
-        git_checkpoints::list_checkpoints(&root, usize::MAX)
-            .expect("list checkpoints")
-            .is_empty()
+        git_checkpoints::is_partial_untracked_recovery_error(&error),
+        "{error}"
+    );
+    assert!(error.contains("8 MiB per-file limit"), "{error}");
+
+    let mut cache = git_checkpoints::UntrackedBlobCache::default();
+    let checkpoint =
+        git_checkpoints::create_checkpoint_in_repo(&root, &root, "bash", &[], 2, true, &mut cache)
+            .expect("approved partial checkpoint")
+            .expect("checkpoint exists");
+    assert!(checkpoint.untracked_capture_warning.is_some());
+    assert!(checkpoint.untracked_sidecars.is_empty());
+    assert_eq!(checkpoint.untracked_snapshot, vec!["oversized.bin"]);
+
+    std::fs::remove_file(root.join("oversized.bin")).expect("remove uncaptured file");
+    let preview =
+        git_checkpoints::preview_restore(&root, &checkpoint).expect("preview partial checkpoint");
+    assert!(
+        preview.contains("untracked recovery is partial"),
+        "{preview}"
+    );
+    assert!(preview.contains("content not recoverable"), "{preview}");
+    assert!(
+        !preview.contains("sidecar content will be restored:\n  - oversized.bin"),
+        "{preview}"
     );
 }
 
@@ -1096,18 +1239,17 @@ fn arbitrary_command_checkpoint_restores_owner_executable_mode() {
     let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
         .expect("create checkpoint")
         .expect("checkpoint exists");
-    let sidecar = root
-        .join(".dext/checkpoints")
-        .join(&checkpoint.id)
-        .join("helper.sh");
-    assert_eq!(
-        std::fs::metadata(&sidecar)
-            .expect("sidecar metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
+    let descriptor = checkpoint
+        .untracked_sidecars
+        .iter()
+        .find_map(|sidecar| match sidecar {
+            git_checkpoints::UntrackedSidecar::File {
+                path, executable, ..
+            } if path == "helper.sh" => Some(*executable),
+            _ => None,
+        })
+        .expect("helper blob descriptor");
+    assert!(descriptor, "owner execute state is captured in metadata");
 
     std::fs::remove_file(&script).expect("remove script");
     git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
@@ -7243,6 +7385,50 @@ fn workflow_diagnostics_render_and_ledger_are_prompt_visible() {
 }
 
 #[test]
+fn partial_checkpoint_recovery_approval_is_repo_session_scoped() {
+    let root = temp_test_dir("checkpoint-partial-approval");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    std::fs::File::create(root.join("large.bin"))
+        .expect("create large file")
+        .set_len(8 * 1024 * 1024 + 1)
+        .expect("size large file");
+
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let names = Arc::new(Mutex::new(Vec::new()));
+    agent.set_sink(Box::new(RecordingPermissionSink {
+        choice: Choice::Once,
+        names: names.clone(),
+    }));
+
+    agent
+        .maybe_create_tool_checkpoint("bash", &json!({"command": "touch one"}))
+        .expect("approved partial checkpoint");
+    agent
+        .maybe_create_tool_checkpoint("bash", &json!({"command": "touch two"}))
+        .expect("cached partial checkpoint approval");
+    assert_eq!(
+        names.lock().unwrap().as_slice(),
+        [CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME]
+    );
+    assert!(agent.checkpoint_partial_untracked_approved);
+    assert_eq!(
+        git_checkpoints::list_checkpoints(&root, usize::MAX)
+            .expect("list checkpoints")
+            .len(),
+        2
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn later_tool_in_round_checkpoints_state_from_earlier_mutation() {
     let root = temp_test_dir("tool-round-sequential-checkpoint");
     git_ok(&root, &["init", "-q"]);
@@ -7362,10 +7548,52 @@ fn tool_round_records_only_successful_file_mutations_in_work_ledger() {
 }
 
 #[tokio::test]
+async fn post_tool_hooks_receive_privacy_redacted_inputs() {
+    let root = temp_test_dir("post-tool-hook-input-redaction");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.privacy.enabled = true;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    agent.hooks.post_tool.push(Hook {
+        tool_match: Some("write_file".to_string()),
+        command:
+            "case \"$DEXT_TOOL_INPUT\" in *abcdef123456*) printf RAW;; *) printf REDACTED;; esac"
+                .to_string(),
+    });
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let secret_input = ["API_", "KEY=", "abcdef123456"].concat();
+
+    agent
+        .execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-redacted-hook-input".to_string(),
+                "write_file".to_string(),
+                json!({"path": "output.txt", "content": secret_input}),
+            )],
+            iterations: 1,
+            turn_id: "turn-redacted-hook-input".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: true,
+        })
+        .await
+        .expect("execute write with post hook");
+
+    let (content, _) = last_tool_result(&agent.history).expect("tool result");
+    assert!(content.contains("[hook:post_tool]\nREDACTED"), "{content}");
+    assert!(!content.contains("abcdef123456"), "{content}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn post_tool_hooks_receive_privacy_redacted_results() {
     let root = temp_test_dir("post-tool-hook-redaction");
-    std::fs::write(root.join("secret.txt"), "API_KEY=abcdef123456\n")
-        .expect("write secret fixture");
+    let secret_fixture = ["API_", "KEY=", "abcdef123456", "\n"].concat();
+    std::fs::write(root.join("secret.txt"), secret_fixture).expect("write secret fixture");
     let mut agent = test_agent(&root);
     agent.session_enabled = false;
     agent.privacy.enabled = true;
@@ -7673,6 +7901,10 @@ fn slash_privacy_toggles_runtime_policy() {
     assert!(agent.privacy.enabled);
     assert!(!agent.privacy.strict_paths);
     assert_eq!(handle_slash("/privacy status", &mut agent), Some(true));
+    assert_eq!(
+        handle_slash("/project-extensions status", &mut agent),
+        Some(true)
+    );
 
     assert_eq!(handle_slash("/privacy off", &mut agent), Some(true));
     assert!(!agent.privacy.enabled);
@@ -12630,6 +12862,48 @@ fn project_extension_approval_is_explicit_and_scoped_to_the_agent_root() {
 
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(next_root);
+}
+
+#[test]
+fn project_extension_always_approval_persists_and_reset_reasks() {
+    let _guard = env_lock();
+    let root = temp_test_dir("project-extension-always");
+    let home = root.join("home");
+    let old_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+    }
+
+    let first_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut first = test_agent(&root);
+    first.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Always,
+        requests: first_requests.clone(),
+    }));
+    assert!(approve_project_extensions(&mut first));
+    assert_eq!(first_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(project_extensions_always_approved(&root));
+
+    let second_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut second = test_agent(&root);
+    second.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: second_requests.clone(),
+    }));
+    assert!(approve_project_extensions(&mut second));
+    assert_eq!(second_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    assert_eq!(
+        handle_slash("/project-extensions reset", &mut second),
+        Some(true)
+    );
+    assert!(!project_extensions_always_approved(&root));
+    assert_eq!(second.project_extensions_approved, None);
+    assert!(!approve_project_extensions(&mut second));
+    assert_eq!(second_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    restore_env_var("DEXT_HOME", old_home);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

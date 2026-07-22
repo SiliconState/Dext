@@ -252,9 +252,10 @@ impl Agent {
                         is_error: Some(true),
                     });
                 } else {
+                    let input_redacted = self.privacy.redact_text(&input_str).text;
                     let pre_env = [
                         ("DEXT_TOOL_NAME", name.as_str()),
-                        ("DEXT_TOOL_INPUT", input_str.as_str()),
+                        ("DEXT_TOOL_INPUT", input_redacted.as_str()),
                     ];
                     let mut blocked: Option<String> = None;
                     if hooks_approved {
@@ -689,9 +690,10 @@ impl Agent {
             }
 
             let post_tool_result = self.privacy.redact_text(&content).text;
+            let post_tool_input = self.privacy.redact_text(&input_str).text;
             let post_env = [
                 ("DEXT_TOOL_NAME", name.as_str()),
-                ("DEXT_TOOL_INPUT", input_str.as_str()),
+                ("DEXT_TOOL_INPUT", post_tool_input.as_str()),
                 ("DEXT_TOOL_RESULT", post_tool_result.as_str()),
             ];
             if hooks_approved {

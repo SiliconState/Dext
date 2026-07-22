@@ -565,7 +565,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <rect class="box box-green" x="515" y="44" width="150" height="56"/><text x="590" y="66" text-anchor="middle">Create ref</text><text class="muted" x="590" y="84" text-anchor="middle">refs/dext/checkpoints</text>
 <rect class="box" x="745" y="44" width="130" height="56"/><text x="810" y="66" text-anchor="middle">Manifest</text><text class="muted" x="810" y="84" text-anchor="middle">64-entry cap</text>
 <path class="line" style="marker-end:url(#arrow3)" d="M590 100 V155 H410"/><rect class="box" x="265" y="128" width="170" height="56"/><text x="350" y="150" text-anchor="middle">Dirty snapshot</text><text class="muted" x="350" y="168" text-anchor="middle">git stash create</text>
-<path class="line" style="marker-end:url(#arrow3)" d="M435 156 H570"/><rect class="box" x="570" y="128" width="180" height="56"/><text x="660" y="150" text-anchor="middle">Untracked sidecars</text><text class="muted" x="660" y="168" text-anchor="middle">direct file tools only</text>
+<path class="line" style="marker-end:url(#arrow3)" d="M435 156 H570"/><rect class="box" x="570" y="128" width="180" height="56"/><text x="660" y="150" text-anchor="middle">Untracked sidecars</text><text class="muted" x="660" y="168" text-anchor="middle">bounded + deduplicated</text>
 <path class="line" style="marker-end:url(#arrow3)" d="M660 184 V230 H455"/><rect class="box box-accent" x="320" y="204" width="160" height="56"/><text x="400" y="226" text-anchor="middle">Run mutation</text><text class="muted" x="400" y="244" text-anchor="middle">ref preserved</text>
 </svg>
 </div>
@@ -761,14 +761,14 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><th>Risk</th><th>Description</th><th>Examples</th></tr>
 <tr><td><code>Read</code></td><td>Read-only operations</td><td><code>ls</code>, <code>cat</code>, <code>git status</code>, <code>http GET</code></td></tr>
 <tr><td><code>Write</code></td><td>Modifies files or state</td><td><code>write_file</code>, <code>edit_file</code>, non-dangerous bash</td></tr>
-<tr><td><code>Danger</code></td><td>Destructive or sensitive operations; never auto-approved by <code>auto-write</code></td><td><code>sudo</code>, <code>rm -rf</code>, <code>git checkout</code>, <code>git stash drop/clear/pop</code>, inline/stdin interpreters, <code>git push</code>, HTTP POST/DELETE</td></tr>
+<tr><td><code>Danger</code></td><td>Destructive or sensitive operations; never auto-approved by <code>auto-write</code></td><td><code>sudo</code>, <code>rm -rf</code>, <code>git checkout</code>, destructive <code>git switch</code>, <code>git stash drop/clear/pop</code>, inline/stdin interpreters, <code>git push</code>, HTTP POST/DELETE</td></tr>
 </table>
 <h3>Bash Guardrails</h3>
 <ul>
 <li>Auto-injects <code>set -o pipefail</code> if missing</li>
 <li>Blocks <code>--break-system-packages</code> pip flag (overridable)</li>
 <li>Detects sudo commands needing password and routes them to the local auth prompt</li>
-<li>Classifies inline or stdin interpreter execution (<code>python -c</code>, <code>perl -e</code>, <code>node -e</code>/<code>-p</code>, attached forms, and stdin forms) as Danger because payload effects cannot be safely inferred from an outer command list</li>
+<li>Classifies inline or stdin interpreter execution (clustered Python <code>-c</code>, Perl/Ruby <code>-e</code>, Node <code>-e</code>/<code>-p</code>, PHP <code>-r</code>, attached forms, and stdin forms) as Danger because payload effects cannot be safely inferred from an outer command list. Python <code>-v</code> remains verbose and therefore does not suppress stdin detection; Windows <code>.exe</code>/<code>.com</code> matching is case-insensitive.</li>
 <li>Bash calls are atomic: Unix roots run in detached sessions/process groups; Windows roots start suspended, enter kill-on-close Job Objects, then resume. Dext cleans the full child tree after completion, timeout, or interrupt.</li>
 <li>On Windows, shell-backed tools skip Windows/WSL app aliases and select a real <code>bash.exe</code> from <code>PATH</code> (for example Git for Windows); <code>DEXT_BASH_PATH</code> provides an explicit override.</li>
 <li>Advisories: prefer <code>rg</code> over <code>grep -r</code>, prefer <code>fd</code> over <code>find</code></li>
@@ -832,7 +832,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <ol>
 <li><strong>Create</strong> — Immediately before each sequential tool dispatch, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;</code>; a later call in one round therefore captures state produced by earlier calls</li>
 <li><strong>Dirty state capture</strong> — If the worktree is dirty, <code>git stash create</code> captures a snapshot without touching the working tree or reflog</li>
-<li><strong>Untracked sidecars</strong> — Direct file tools preserve an untracked target. Write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> checkpoints preserve all existing untracked regular files up to 500 paths, 8 MiB per file, and 32 MiB total. Private sidecars retain owner execute state, and restore fails closed if any declared sidecar is missing. If the required snapshot cannot be created, the command is not executed. In a repository without an initial commit, writes that would overwrite existing worktree/index state also fail closed because Git has no normal restore base. A workspace with no <code>.git</code> marker remains a non-Git no-op without invoking Git; a discovered but malformed repository marker fails closed.</li>
+<li><strong>Untracked sidecars</strong> — Direct file tools preserve an untracked target. Write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> checkpoints inventory up to 500 existing untracked paths, preserve regular files within 8 MiB/file and 32 MiB total bounds, and preserve bounded UTF-8 symlink targets without following them. Regular-file content is stored in owner-private SHA-256-addressed blobs shared by retained checkpoints; unchanged path size/mtime/mode can reuse the session cache, restore rehashes blobs, and prune removes unreferenced blobs. Owner execute state is descriptor metadata. If path/type/size caps leave partial untracked recovery, Dext requests a separate repository/session-scoped approval: denial blocks the command, while approval preserves tracked/staged state and the bounded subset. Other checkpoint failures remain fail-closed. Repositories without an initial commit still block writes that would overwrite existing state. A workspace with no <code>.git</code> marker is non-Git unless ambient <code>GIT_DIR</code>/<code>GIT_WORK_TREE</code>/<code>GIT_COMMON_DIR</code> routing exists; routed-without-marker and malformed-marker cases fail loudly because Dext-owned Git commands scrub routing variables.</li>
 <li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude</li>
 </ol>
 <h3>Restore Modes</h3>
@@ -844,7 +844,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>ResetHead</code></td><td>Hard reset HEAD to checkpoint's original HEAD</td></tr>
 </table>
 <h3>Pruning</h3>
-<p>Default: keep the 20 newest checkpoints and remove entries older than 168 hours (7 days). Pruning rebuilds local manifests, removes orphaned <code>refs/dext/checkpoints/*</code>, and deletes associated sidecar directories for bounded disk growth. Never mirror-push <code>refs/dext/*</code>.</p>
+<p>Default: keep the 20 newest checkpoints and remove entries older than 168 hours (7 days). Pruning rebuilds local manifests, removes orphaned <code>refs/dext/checkpoints/*</code> and legacy sidecar directories, and deletes unreferenced content-addressed blobs for bounded disk growth. Never mirror-push <code>refs/dext/*</code>.</p>
 <h3>Checkpoint Triggers</h3>
 <p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Other tools are checkpointed when <code>tool_policy::classify_command_risk()</code> returns Write or Danger. Required checkpoint creation is fail-closed before execution; HTTP and other non-filesystem side effects are not recoverable merely because a local Git checkpoint exists.</p>
 </div>
@@ -928,7 +928,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>User shelves: <code>~/.dext/shelves/*/packs</code></li>
 </ol>
 <p>Create reusable packs with <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>; add <code>--project</code> only for an explicitly project-local pack. The scaffold creates a minimal <code>PACK.md</code>, refuses overwrite, and is immediately available to normal inspection and explicit invocation. Direct <code>packs/</code>, <code>.dext/packs</code>, <code>~/.dext/packs</code>, <code>DEXT_PACKS_DIR</code>, and per-pack override roots are not discovery inputs.</p>
-<p>Project-local <code>PACK.md</code> content has a repository trust boundary. An explicit <code>/pack</code> or <code>dext pack</code> invocation confirms only that selected project workflow; it does not approve unrelated project shelf metadata. Conversational auto-invocation prompts once per active repository before loading project workflow text. Denied project pack metadata stays out of the model prompt and cannot shadow a same-named user or run-shelf pack. Project-local credential declarations remain ignored.</p>
+<p>Project-local <code>PACK.md</code> content has a repository trust boundary. An explicit <code>/pack</code> or <code>dext pack</code> invocation confirms only that selected project workflow; it does not approve unrelated project shelf metadata. Conversational auto-invocation prompts once per active repository before loading project workflow text. Choosing <code>Always</code> stores an owner-private project-scoped approval in Dext state; <code>/project-extensions status</code> shows it, and <code>/project-extensions reset</code> removes it or clears a session denial so the next use asks again. Denied project pack metadata stays out of the model prompt and cannot shadow a same-named user or run-shelf pack. Project-local credential declarations remain ignored.</p>
 <p>The resolver deduplicates by canonicalized path and normalized pack name. Name collisions are resolved by precedence order, not random filesystem order.</p>
 
 <h3>Pack Layout and Front Matter</h3>
@@ -1020,7 +1020,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>rewrite_tool</code></td><td>Typed input-rewrite effect for an in-process shelf; not executed from a static manifest</td></tr>
 <tr><td><code>state</code></td><td>Typed state effect for an in-process shelf; static manifests do not persist it</td></tr>
 </table>
-<p><code>Block</code> effects terminate in-process signal flow early. Static manifest shelves only produce context/note data for opted-in load or prompt signals. All project <code>shelf.json</code> metadata requires one first-use confirmation per active repository; before approval it is omitted from the model prompt, cannot shadow same-key trusted user/run metadata, and cannot contribute behavioral tool effects, while approved project context is explicitly labeled repository-controlled.</p>
+<p><code>Block</code> effects terminate in-process signal flow early. Static manifest shelves only produce context/note data for opted-in load or prompt signals. All project <code>shelf.json</code> metadata requires one first-use confirmation per active repository. Choosing <code>Always</code> persists an owner-private project-scoped decision in Dext state; <code>/project-extensions status</code> reports it, and <code>/project-extensions reset</code> removes it or clears a session denial. Before approval, project metadata is omitted from the model prompt, cannot shadow same-key trusted user/run metadata, and cannot contribute behavioral tool effects, while approved project context is explicitly labeled repository-controlled.</p>
 
 <h3>Discovery and Scope Precedence</h3>
 <table>
@@ -1192,6 +1192,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>/budget [cap]</code></td><td>Set or show budget cap</td></tr>
 <tr><td><code>/pack create|list|inspect|run</code></td><td>Create or use shelf-contained packs</td></tr>
 <tr><td><code>/shelves</code></td><td>Show shelf registry</td></tr>
+<tr><td><code>/project-extensions [status|reset]</code></td><td>Inspect or reset repository-scoped project extension approval</td></tr>
 <tr><td><code>/undo [--list|--apply|&lt;id&gt;]</code></td><td>Recovery checkpoint preview/apply management</td></tr>
 </table>
 </div>
@@ -1368,7 +1369,7 @@ credential-env: [SERVICE_TOKEN]
 <h3><code>recall.md</code> (optional sandbox ancestry)</h3>
 <p>Optional ignored prompt cache. It is auto-injected only when present; Dext does not create or update it automatically.</p>
 <h3><code>hooks.json</code> (project root or <code>DEXT_HOOKS_FILE</code>)</h3>
-<p>Project-root hooks configuration loaded from <code>hooks.json</code> by default, or from <code>DEXT_HOOKS_FILE</code> when set. This is not the same as pack <code>phooks.json</code>. Hook execution still requires its own approval. Approved <code>post_tool</code> hooks receive privacy-redacted <code>DEXT_TOOL_RESULT</code>, not raw output.</p>
+<p>Project-root hooks configuration loaded from <code>hooks.json</code> by default, or from <code>DEXT_HOOKS_FILE</code> when set. This is not the same as pack <code>phooks.json</code>. Hook execution still requires its own approval. Approved <code>pre_tool</code> and <code>post_tool</code> hooks receive privacy-redacted <code>DEXT_TOOL_INPUT</code>; approved <code>post_tool</code> hooks also receive privacy-redacted <code>DEXT_TOOL_RESULT</code>, not raw input or output.</p>
 </div>
 </section>
 

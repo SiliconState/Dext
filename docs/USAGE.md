@@ -212,7 +212,7 @@ Inside a session:
 /pack run my-pack run its workflow
 ```
 
-Conversational invocation also works when the message clearly asks to run or use a known pack, for example: `run my-pack on this task`. Conversational project-pack activation and project `shelf.json` metadata require one first-use confirmation for the active repository. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Before approval, project metadata is omitted and cannot shadow a same-named user or run-shelf pack. Dext accepts `PACK.md` and `shelf.json` only as regular non-symlink files no larger than 1 MiB; the selected workflow is then capped to 32 KiB for model context.
+Conversational invocation also works when the message clearly asks to run or use a known pack, for example: `run my-pack on this task`. Conversational project-pack activation and project `shelf.json` metadata require one first-use confirmation for the active repository. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Choosing `Always` stores an owner-private project-scoped approval in Dext state; `/project-extensions status` shows it, and `/project-extensions reset` removes it or clears a session denial so the next matching use asks again. Before approval, project metadata is omitted and cannot shadow a same-named user or run-shelf pack. Dext accepts `PACK.md` and `shelf.json` only as regular non-symlink files no larger than 1 MiB; the selected workflow is then capped to 32 KiB for model context.
 
 A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke their own helpers. A pack from a user or `DEXT_SHELVES_DIR` shelf may declare exact names in the inline `credential-env` front-matter list; matching inherited values are available only to a simple direct invocation of that active pack's own native `bin/` helper. On Windows, only `.exe`/`.com` helpers qualify for this direct credential path; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Credential values are not exposed to hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, or sessions, and provider-auth names remain excluded. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
 
@@ -226,15 +226,22 @@ under `refs/dext/checkpoints/` and owner-private local manifests and sidecars
 under `.dext/checkpoints/` on Unix. Dext adds `/.dext/` to the repository-local
 Git exclude file and automatically retains at most 20 checkpoints for no longer
 than seven days. They are intended for Dext write recovery, not as a replacement
-for commits. Write-risk `bash`/`awk`/`csvkit` calls preserve existing untracked
-regular files up to 500 paths, 8 MiB per file, and 32 MiB total. Private sidecars
-retain owner execute state, and restore fails closed if any declared sidecar is
-missing. If the required
-snapshot fails, the call does not run. In a Git repository without an initial
-commit, Dext also blocks writes that would overwrite existing worktree/index
-state because there is no normal Git restore base. A workspace with no `.git`
-marker remains a non-Git no-op without invoking Git; a discovered but malformed
-repository marker fails closed. Never mirror-push `refs/dext/*`.
+for commits. Write-risk `bash`/`awk`/`csvkit` calls inventory up to 500 existing
+untracked paths, preserve regular files up to 8 MiB each and 32 MiB total, and
+preserve bounded UTF-8 symlink targets without following them. Regular-file
+content is stored once in owner-private SHA-256-addressed blobs shared by retained
+checkpoints; unchanged size/mtime/mode can reuse a session cache, restore verifies
+blob hashes, and prune removes unreferenced blobs. Owner execute state is retained
+in metadata. If path/type/size limits make untracked recovery partial, Dext asks
+separately before the command and caches approval for the current repository and
+session; approval keeps tracked/staged recovery and the bounded untracked subset,
+while denial blocks the command. Other checkpoint failures remain fail-closed. In
+a Git repository without an initial commit, Dext also blocks writes that would
+overwrite existing worktree/index state because there is no normal Git restore
+base. A workspace with no `.git` marker remains a non-Git no-op unless ambient
+`GIT_DIR`, `GIT_WORK_TREE`, or `GIT_COMMON_DIR` routing is set; routed-without-marker
+and malformed-marker cases fail loudly because Dext-owned Git commands scrub those
+variables. Never mirror-push `refs/dext/*`.
 
 CLI undo commands:
 
@@ -309,7 +316,7 @@ dext --sandbox-profile danger-full-access
 # --sandbox accepts the same profile names, or a directory as the sandbox root
 ```
 
-Dext starts with the `ask` approval profile. Interactive frontends prompt before gated tools; non-interactive and JSON runs deny those calls instead of waiting for input. Automation that needs writes must opt in explicitly with `--approval auto-write`, `--approval always`, or `--trust`. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `DEXT_TRUST=1` is an alias for `approval=always`; false values do not override the safer fallback. Resuming a session never restores its saved trust grants over the current-run policy. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access.
+Dext starts with the `ask` approval profile. Interactive frontends prompt before gated tools; non-interactive and JSON runs deny those calls instead of waiting for input. Automation that needs writes must opt in explicitly with `--approval auto-write`, `--approval always`, or `--trust`. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `DEXT_TRUST=1` is an alias for `approval=always`; false values do not override the safer fallback. Resuming a session never restores its saved trust grants over the current-run policy. `auto-write` still prompts for destructive Git checkout/switch/stash operations and inline or stdin Python/Perl/Node/Ruby/PHP code. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access.
 
 For durable sessions, approved side-effect-capable tool calls receive a bounded, redacted start/terminal journal under the private session state directory. On resume, pending transcript calls are reconciled without replay: absent starts are marked `not_started`, unresolved starts are `uncertain`, and terminal entries recover their status without claiming unavailable output. `--no-session` and `--fork` deliberately omit this journal, so side-effect crash recovery is unavailable in those modes.
 
@@ -380,7 +387,7 @@ CHATGPT_ACCESS_TOKEN=...
 
 Provider credentials are available to Dext's own HTTP client, but credential-shaped environment variables (`*_API_KEY`, `*_TOKEN`, `*_PASSWORD`, client secrets, cloud credentials, SSH agent variables, and related known names) are removed from agent-run subprocesses by default. Set `DEXT_INHERIT_TOOL_CREDENTIALS=1` only for a trusted model-invoked bash or external tool that explicitly requires the parent credential environment. Hooks, diagnostics, evals, checkpoints, browser launchers, and other Dext-owned subprocesses remain scrubbed even with that opt-in.
 
-Privacy redaction is enabled by default while user-readable files remain readable. Before tool results enter model context or session logs, Dext replaces private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers. Ordinary unlabeled long numbers and decimal market/HTTP values are not treated as cards. A compact redaction note is appended only when a value was actually replaced. Set `DEXT_PRIVACY=strict` or use `/privacy strict` to additionally block sensitive-looking native read paths. Set `DEXT_PRIVACY=0` or use `/privacy off` only when raw, unredacted local data is intentionally required. On supported Linux/macOS hosts, kernel sandboxing preserves reads available to the Dext process user while confining writes: `read-only` permits only required scratch/device writes, and `workspace-write` additionally permits writes to the sandbox and common toolchain caches. `danger-full-access` intentionally disables this confinement. Dext warns at startup and in `dext doctor` when a confined profile cannot apply kernel enforcement; in that fallback, native write guards remain but shell and external-tool subprocesses are unconfined.
+Privacy redaction is enabled by default while user-readable files remain readable. Before approved hooks run, `DEXT_TOOL_INPUT` is privacy-redacted for both `pre_tool` and `post_tool`, and `DEXT_TOOL_RESULT` is redacted for `post_tool`. Before tool results enter model context or session logs, Dext replaces private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers. Ordinary unlabeled long numbers and decimal market/HTTP values are not treated as cards. A compact redaction note is appended only when a value was actually replaced. Set `DEXT_PRIVACY=strict` or use `/privacy strict` to additionally block sensitive-looking native read paths. Set `DEXT_PRIVACY=0` or use `/privacy off` only when raw, unredacted local data is intentionally required. On supported Linux/macOS hosts, kernel sandboxing preserves reads available to the Dext process user while confining writes: `read-only` permits only required scratch/device writes, and `workspace-write` additionally permits writes to the sandbox and common toolchain caches. `danger-full-access` intentionally disables this confinement. Dext warns at startup and in `dext doctor` when a confined profile cannot apply kernel enforcement; in that fallback, native write guards remain but shell and external-tool subprocesses are unconfined.
 
 The complete Dext release suite is a deliberate exception to normal confined agent work. Under `workspace-write`, shared `/tmp`, arbitrary pseudo-terminals (`/dev/ptmx` and `/dev/pts`), and Cargo metadata such as `~/.cargo/.crates.toml` remain unwritable. Self-hosted `cargo test` can therefore show widespread temporary-directory failures and cascading shared-lock poisoning; `tui_smoke` cannot allocate its PTYs; and `cargo install` cannot update Cargo's install registry. Run those final commands directly in a trusted host terminal, or start a separate controlled Dext process with `dext --sandbox-profile danger-full-access --approval always`. Setting the profile only inside an already-confined shell cannot relax its inherited kernel sandbox. Keep the default hardening intact; see [`RELEASING.md`](RELEASING.md).
 
