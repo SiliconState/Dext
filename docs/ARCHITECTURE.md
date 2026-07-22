@@ -148,7 +148,7 @@ Dext has three safety layers:
 
 Profiles:
 
-- Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`. `auto-write` still prompts for Danger-class shell commands. Destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands are Danger. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is also Danger unless it uses explicit `git --no-pager` and matches a narrow direct metadata-inspection allowlist; use hardened native Git tools for review operations. Recognized dynamic/wrapper command paths and inline/stdin interpreter code are Danger too. Interpreter matching covers attached/clustered flags and common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers; Windows `.exe`/`.com` command and wrapper matching is case-insensitive.
+- Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`. `auto-write` still prompts for Danger-class shell commands. Destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands are Danger. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is also Danger unless it uses explicit `git --no-pager` and matches a narrow direct metadata-inspection allowlist; use hardened native Git tools for review operations. Recognized dynamic/wrapper command paths and inline/stdin interpreter code, including shell input redirections and heredocs, are Danger too. Interpreter matching covers attached/clustered flags and common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers; Windows `.exe`/`.com` command and wrapper matching is case-insensitive.
 - Sandbox: `read-only`, `workspace-write`, `danger-full-access`. On supported Linux/macOS hosts, confined profiles preserve every read available to the Dext process user. `workspace-write` permits writes only under the sandbox root, scratch/device roots, and common per-user toolchain caches; `read-only` retains only required scratch/device writes. macOS Seatbelt profiles authorize both canonical `/private/...` scratch paths and their `/var` or `/tmp` aliases so standard temp APIs remain confined but usable.
 - Tool subprocesses remove credential-shaped environment variables by default. `DEXT_INHERIT_TOOL_CREDENTIALS=1` is an explicit high-trust opt-in for model-invoked bash/external tools that require the parent credential environment; hooks and Dext-owned subprocesses always scrub credentials. Pack-declared helper credentials are narrower still, and project-local declarations are ignored. Approved `pre_tool` and `post_tool` hooks receive privacy-redacted tool input; `post_tool` output is redacted too.
 
@@ -174,7 +174,9 @@ provider-visible tools:
   content uses owner-private SHA-256-addressed blobs shared by retained
   checkpoints; unchanged source paths reuse the session cache only while both source and blob
   metadata fingerprints remain stable. Preview and restore rehash blobs before trusting them;
-  pruning or a failed checkpoint creation removes unreferenced/new blobs. Owner execute state is
+  pruning or a failed checkpoint creation removes valid unreferenced/new blobs; malformed or unsafe
+  blob-directory entries remain untouched and emit bounded warnings without stopping other retention
+  cleanup. Owner execute state is
   descriptor metadata. Non-UTF-8 names, unsupported types, and path/type/size caps are explicit
   partial-recovery gaps. If any such gap remains, Dext requests separate repository/session-scoped
   approval and records the gap; denial blocks the call, while approval preserves

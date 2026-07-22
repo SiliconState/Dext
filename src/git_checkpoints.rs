@@ -1636,10 +1636,13 @@ pub(crate) fn create_checkpoint_in_repo(
         remove_new_checkpoint_blobs(git_root, &new_untracked_blobs);
         return Err(error);
     }
-    if let Err(error) =
-        prune_checkpoint_refs(git_root, DEFAULT_PRUNE_KEEP, DEFAULT_PRUNE_MAX_AGE_HOURS)
-    {
-        eprintln!("[checkpoint] retention warning: {error}");
+    match prune_checkpoint_refs(git_root, DEFAULT_PRUNE_KEEP, DEFAULT_PRUNE_MAX_AGE_HOURS) {
+        Ok(outcome) => {
+            for warning in outcome.warnings {
+                eprintln!("[checkpoint] retention warning: {warning}");
+            }
+        }
+        Err(error) => eprintln!("[checkpoint] retention warning: {error}"),
     }
 
     Ok(Some(cp))
@@ -3064,6 +3067,23 @@ fn walk_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
 struct PruneOutcome {
     checkpoints_removed: usize,
     orphan_sidecars_removed: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Default)]
+struct BlobPruneOutcome {
+    removed: usize,
+    warnings: Vec<String>,
+}
+
+const PRUNE_WARNING_CAP: usize = 8;
+
+fn record_prune_warning(warnings: &mut Vec<String>, warning: String) {
+    if warnings.len() < PRUNE_WARNING_CAP {
+        warnings.push(warning);
+    } else if warnings.len() == PRUNE_WARNING_CAP {
+        warnings.push("additional checkpoint prune warnings omitted".to_string());
+    }
 }
 
 fn prune_checkpoint_refs(
@@ -3093,18 +3113,24 @@ fn prune_checkpoint_refs(
         run_git(git_root, &["update-ref", "-d", &cp.ref_name])?;
     }
     write_checkpoint_manifest(git_root, &remaining)?;
-    let orphan_sidecars_removed = prune_orphan_sidecars(git_root, &remaining)?;
+    let sidecar_outcome = prune_orphan_sidecars(git_root, &remaining)?;
     Ok(PruneOutcome {
         checkpoints_removed: expired.len(),
-        orphan_sidecars_removed,
+        orphan_sidecars_removed: sidecar_outcome.removed,
+        warnings: sidecar_outcome.warnings,
     })
 }
 
-fn prune_orphan_blobs(git_root: &Path, remaining: &[Checkpoint]) -> Result<usize, String> {
+fn prune_orphan_blobs(
+    git_root: &Path,
+    remaining: &[Checkpoint],
+) -> Result<BlobPruneOutcome, String> {
     let dir = checkpoints_manifest_dir(git_root).join(BLOBS_DIR);
     let metadata = match std::fs::symlink_metadata(&dir) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BlobPruneOutcome::default());
+        }
         Err(error) => return Err(format!("checkpoint blob directory metadata: {error}")),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -3118,40 +3144,81 @@ fn prune_orphan_blobs(git_root: &Path, remaining: &[Checkpoint]) -> Result<usize
             UntrackedSidecar::Symlink { .. } => None,
         })
         .collect::<std::collections::HashSet<_>>();
-    let mut removed = 0usize;
+    let mut outcome = BlobPruneOutcome::default();
     for entry in
         std::fs::read_dir(&dir).map_err(|error| format!("checkpoint blob dir read: {error}"))?
     {
-        let entry = entry.map_err(|error| format!("checkpoint blob dir entry: {error}"))?;
-        let name = entry.file_name();
-        let Some(digest) = name.to_str() else {
-            return Err("checkpoint blob name is not valid UTF-8".to_string());
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!("skip unreadable checkpoint blob directory entry: {error}"),
+                );
+                continue;
+            }
         };
+        let name = entry.file_name();
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("checkpoint blob metadata: {error}"))?;
+        let Some(digest) = name.to_str() else {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip checkpoint blob with non-UTF-8 name: {}",
+                    path.display()
+                ),
+            );
+            continue;
+        };
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "skip unreadable checkpoint blob {}: {error}",
+                        path.display()
+                    ),
+                );
+                continue;
+            }
+        };
         if digest.len() != 64
             || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
             || !safe_private_file_metadata(&metadata)
         {
-            return Err(format!("unsafe checkpoint blob entry: {}", path.display()));
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!("skip unsafe checkpoint blob entry: {}", path.display()),
+            );
+            continue;
         }
         if !referenced.contains(digest) {
-            std::fs::remove_file(&path)
-                .map_err(|error| format!("remove orphan checkpoint blob: {error}"))?;
-            removed += 1;
+            match std::fs::remove_file(&path) {
+                Ok(()) => outcome.removed += 1,
+                Err(error) => record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "could not remove orphan checkpoint blob {}: {error}",
+                        path.display()
+                    ),
+                ),
+            }
         }
     }
-    Ok(removed)
+    Ok(outcome)
 }
 
-fn prune_orphan_sidecars(git_root: &Path, remaining: &[Checkpoint]) -> Result<usize, String> {
+fn prune_orphan_sidecars(
+    git_root: &Path,
+    remaining: &[Checkpoint],
+) -> Result<BlobPruneOutcome, String> {
     let dir = checkpoints_manifest_dir(git_root);
     let remaining_ids = remaining
         .iter()
         .map(|checkpoint| checkpoint.id.as_str())
         .collect::<std::collections::HashSet<_>>();
-    let mut removed = prune_orphan_blobs(git_root, remaining)?;
+    let mut outcome = prune_orphan_blobs(git_root, remaining)?;
     for entry in std::fs::read_dir(&dir).map_err(|error| format!("checkpoint dir read: {error}"))? {
         let entry = entry.map_err(|error| format!("checkpoint dir entry: {error}"))?;
         let name = entry.file_name();
@@ -3167,11 +3234,11 @@ fn prune_orphan_sidecars(git_root: &Path, remaining: &[Checkpoint]) -> Result<us
         if metadata.file_type().is_symlink() {
             std::fs::remove_file(&path)
                 .map_err(|error| format!("remove orphan checkpoint symlink: {error}"))?;
-            removed += 1;
+            outcome.removed += 1;
         } else if metadata.is_dir() {
             std::fs::remove_dir_all(&path)
                 .map_err(|error| format!("remove orphan checkpoint sidecar: {error}"))?;
-            removed += 1;
+            outcome.removed += 1;
         } else {
             return Err(format!(
                 "unexpected checkpoint sidecar entry: {}",
@@ -3179,7 +3246,7 @@ fn prune_orphan_sidecars(git_root: &Path, remaining: &[Checkpoint]) -> Result<us
             ));
         }
     }
-    Ok(removed)
+    Ok(outcome)
 }
 
 pub(crate) fn prune(
@@ -3195,9 +3262,11 @@ pub(crate) fn prune(
     ensure_checkpoint_git_exclude(&git_root)?;
     let keep = keep.unwrap_or(DEFAULT_PRUNE_KEEP);
     let max_age = max_age_hours.unwrap_or(DEFAULT_PRUNE_MAX_AGE_HOURS);
-    let outcome = prune_checkpoint_refs(&git_root, keep, max_age)?;
-    let mut removed = outcome.checkpoints_removed;
-    let mut orphan_sidecars_removed = outcome.orphan_sidecars_removed;
+    let PruneOutcome {
+        checkpoints_removed: mut removed,
+        mut orphan_sidecars_removed,
+        mut warnings,
+    } = prune_checkpoint_refs(&git_root, keep, max_age)?;
     let cps = list_checkpoints_in_repo(&git_root, usize::MAX, true, None)?;
 
     // Reconcile refs created outside the private manifest, then rewrite the
@@ -3219,11 +3288,17 @@ pub(crate) fn prune(
         }
     }
 
-    orphan_sidecars_removed += prune_orphan_sidecars(&git_root, &remaining)?;
+    let sidecar_outcome = prune_orphan_sidecars(&git_root, &remaining)?;
+    orphan_sidecars_removed += sidecar_outcome.removed;
+    for warning in sidecar_outcome.warnings {
+        if !warnings.contains(&warning) {
+            record_prune_warning(&mut warnings, warning);
+        }
+    }
 
     write_checkpoint_manifest(&git_root, &remaining)?;
 
-    Ok(format!(
+    let mut result = format!(
         "pruned {removed} checkpoint(s) and {orphan_sidecars_removed} orphan sidecar entr{}, {} remaining",
         if orphan_sidecars_removed == 1 {
             "y"
@@ -3231,7 +3306,15 @@ pub(crate) fn prune(
             "ies"
         },
         remaining.len()
-    ))
+    );
+    if !warnings.is_empty() {
+        result.push_str("\nwarnings:");
+        for warning in warnings {
+            result.push_str("\n  ");
+            result.push_str(&warning);
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn find_checkpoint(root: &Path, id_or_ref: &str) -> Result<Option<Checkpoint>, String> {

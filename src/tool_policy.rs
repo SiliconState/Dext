@@ -712,6 +712,9 @@ fn env_split_string_payload(words: &[String], start: usize) -> Option<Option<&st
     let mut idx = start;
     while idx < words.len() && !shell_command_separator(&words[idx]) {
         let word = words[idx].as_str();
+        if word == "--" {
+            return None;
+        }
         if matches!(word, "-S" | "--split-string") {
             return Some(words.get(idx + 1).map(String::as_str));
         }
@@ -722,7 +725,39 @@ fn env_split_string_payload(words: &[String], start: usize) -> Option<Option<&st
         {
             return Some(Some(payload));
         }
-        idx += 1;
+        if shell_assignment_word(word)
+            || matches!(
+                word,
+                "-" | "-i"
+                    | "--ignore-environment"
+                    | "-0"
+                    | "--null"
+                    | "-v"
+                    | "--debug"
+                    | "--list-signal-handling"
+            )
+            || word.starts_with("--block-signal=")
+            || word.starts_with("--default-signal=")
+            || word.starts_with("--ignore-signal=")
+        {
+            idx += 1;
+            continue;
+        }
+        if matches!(word, "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0") {
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if word.starts_with("--unset=")
+            || word.starts_with("--chdir=")
+            || word.starts_with("--argv0=")
+            || word.starts_with("-u") && word.len() > 2
+            || word.starts_with("-C") && word.len() > 2
+            || word.starts_with("-a") && word.len() > 2
+        {
+            idx += 1;
+            continue;
+        }
+        return None;
     }
     None
 }
@@ -1889,7 +1924,17 @@ fn shell_interpreter_uses_stdin(invocation: &[String]) -> bool {
     while idx < args.len() {
         let arg = args[idx].as_str();
         if arg == "--" {
-            return args.get(idx + 1).is_none_or(|script| script == "-");
+            idx += 1;
+            while idx < args.len()
+                && let Some(consumed) = shell_redirection_words(&args[idx])
+            {
+                idx = idx.saturating_add(consumed);
+            }
+            return args.get(idx).is_none_or(|script| script == "-");
+        }
+        if let Some(consumed) = shell_redirection_words(arg) {
+            idx = idx.saturating_add(consumed);
+            continue;
         }
         if arg == "-c"
             || arg.starts_with('-')
@@ -2132,7 +2177,17 @@ fn interpreter_inline_code_is_dangerous(interpreter: &str, invocation: &[String]
     while index < args.len() {
         let arg = args[index].as_str();
         if arg == "--" {
-            return args.get(index + 1).is_none_or(|next| next == "-");
+            index += 1;
+            while index < args.len()
+                && let Some(consumed) = shell_redirection_words(&args[index])
+            {
+                index = index.saturating_add(consumed);
+            }
+            return args.get(index).is_none_or(|next| next == "-");
+        }
+        if let Some(consumed) = shell_redirection_words(arg) {
+            index = index.saturating_add(consumed);
+            continue;
         }
         if interpreter_arg_contains_inline_code(interpreter, arg) {
             return true;
@@ -2856,6 +2911,13 @@ mod tests {
             "git stash create",
             "git stash store deadbeef",
             "python3 -c 'import shutil; shutil.rmtree(\"build\")'",
+            "python3 <<'PY'\nimport os\nos.unlink('stale')\nPY",
+            "python3 -- <<'PY'\nimport os\nos.unlink('stale')\nPY",
+            "python3 < script.py",
+            "perl <<'PL'\nCORE::unlink('stale')\nPL",
+            "node <<'JS'\nrequire('fs').unlinkSync('stale')\nJS",
+            "ruby <<'RB'\nFile.delete('stale')\nRB",
+            "php <<'PHP'\nunlink('stale');\nPHP",
             "C:/Python/python.exe -c 'import shutil; shutil.rmtree(\"build\")'",
             "python3 -c'import os; os.unlink(\"stale\")'",
             "printf 'import os; os.unlink(\"stale\")' | python3",
@@ -2949,6 +3011,19 @@ mod tests {
                 &json!({"pattern": "needle", "extra_args": ["-HIx", "touch"]})
             ),
             CommandRisk::Danger
+        );
+        assert_eq!(
+            classify_command_risk(
+                "bash",
+                &json!({"command": "env FOO=1 tar -Sxf archive.tar"})
+            ),
+            CommandRisk::Write,
+            "wrapped command arguments must not be parsed as env split-string options"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "env -- tar -Sxf archive.tar"})),
+            CommandRisk::Write,
+            "env option parsing stops at the command separator"
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "cargo test --release"})),

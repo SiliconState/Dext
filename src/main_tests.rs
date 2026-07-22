@@ -1513,6 +1513,54 @@ fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
 }
 
 #[test]
+fn checkpoint_prune_skips_unsafe_blob_entries_without_stalling_retention() {
+    let root = temp_test_dir("checkpoint-prune-unsafe-blob");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("data.txt"), "checkpoint data\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let blobs = root.join(".dext/checkpoints/blobs");
+    let unsafe_entry = blobs.join("not-a-digest");
+    std::fs::write(&unsafe_entry, "retain for inspection\n").expect("write unsafe blob entry");
+
+    let first = git_checkpoints::prune(&root, Some(0), None).expect("prune around unsafe blob");
+    assert!(first.contains("pruned 1 checkpoint"), "{first}");
+    assert!(first.contains("1 orphan sidecar entry"), "{first}");
+    assert!(
+        first.contains("skip unsafe checkpoint blob entry"),
+        "{first}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&blobs)
+            .expect("read blob directory")
+            .count(),
+        1,
+        "the unsafe entry should be the only retained blob artifact"
+    );
+    assert!(unsafe_entry.exists(), "unsafe entry must remain untouched");
+
+    let second =
+        git_checkpoints::prune(&root, None, None).expect("repeat prune around unsafe blob");
+    assert!(
+        second.contains("skip unsafe checkpoint blob entry"),
+        "{second}"
+    );
+    assert!(
+        unsafe_entry.exists(),
+        "repeat prune must not remove unsafe entry"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn checkpoint_lookup_rejects_ambiguous_or_empty_prefixes() {
     let root = temp_test_dir("checkpoint-lookup-ambiguity");
     git_ok(&root, &["init", "-q"]);
