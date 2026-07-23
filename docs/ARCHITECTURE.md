@@ -169,7 +169,8 @@ provider-visible tools:
   be current-user-owned, `.dext` must not be group/world-writable, and managed checkpoint
   directories are owner-private. Locked Unix mutations may repair modes only on current-user-owned
   managed directories; inspection does not repair them, restore rejects unsafe sidecar/blob containers,
-  and prune retains unsafe artifact directories with bounded warnings. Dext adds `/.dext/` to the repository-local
+  and prune retains unsafe artifact directory trees with bounded warnings while unlinking only an orphan
+  top-level sidecar symlink without following it. Dext adds `/.dext/` to the repository-local
   Git exclude and automatically retains at most 20 checkpoints for seven days.
   Direct file mutations receive path-specific restore hints. Write-risk
   `bash`/`awk`/`csvkit` checkpoints inventory at most 500 existing untracked
@@ -179,9 +180,12 @@ provider-visible tools:
   checkpoints; unchanged source paths reuse the session cache only while both source and blob
   metadata fingerprints remain stable. Preview and restore rehash blobs before trusting them;
   pruning or a failed checkpoint creation removes valid unreferenced/new blobs; malformed or unsafe
-  blob- or sidecar-directory entries remain untouched and emit bounded warnings without stopping other
-  retention cleanup. Owner execute state is
-  descriptor metadata. Non-UTF-8 names, unsupported types, and path/type/size caps are explicit
+  blob entries and sidecar directory trees remain untouched and emit bounded warnings without stopping other
+  retention cleanup, while an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked
+  without following it. Owner execute state is descriptor metadata. Current manifests record exact
+  direct-sidecar membership; older manifests without that field fail conservatively before mutation
+  when a missing artifact is ambiguous rather than deleting current path content. Non-UTF-8 names,
+  unsupported types, and path/type/size caps are explicit
   partial-recovery gaps. If any such gap remains, Dext requests separate repository/session-scoped
   approval and records the gap; denial blocks the call, while approval preserves
   the tracked/staged state and bounded subset. Other checkpoint failures remain

@@ -542,6 +542,29 @@ fn git_checkpoint_unborn_head_blocks_existing_state_but_allows_new_file_targets(
 
 #[cfg(unix)]
 #[test]
+fn git_checkpoint_unborn_head_treats_dangling_symlink_target_as_prior_state() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-unborn-dangling-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    symlink("missing-target", root.join("dangling.txt")).expect("create dangling target symlink");
+
+    let error =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["dangling.txt".to_string()], 1)
+            .expect_err("dangling target is existing prior state in an unborn repository");
+    assert!(error.contains("no initial commit"), "{error}");
+    assert!(
+        std::fs::symlink_metadata(root.join("dangling.txt")).is_ok(),
+        "checkpoint gate must leave the dangling symlink untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
 fn arbitrary_command_checkpoint_preserves_untracked_symlink() {
     use std::os::unix::fs::symlink;
 
@@ -1031,6 +1054,17 @@ fn checkpoint_restore_rejects_non_private_legacy_sidecar_directory() {
         .expect("make sidecar directory non-private");
     std::fs::write(root.join("note.txt"), "after\n").expect("mutate note");
 
+    let preview = git_checkpoints::preview_restore(&root, &checkpoint)
+        .expect("preview reports unavailable unsafe sidecar");
+    assert!(
+        preview.contains("expected untracked sidecar content is unavailable"),
+        "{preview}"
+    );
+    assert!(
+        !preview.contains("sidecar content present; restore will recreate it"),
+        "{preview}"
+    );
+
     let error = git_checkpoints::restore_worktree(
         &root,
         &checkpoint,
@@ -1082,6 +1116,225 @@ fn checkpoint_restore_fails_closed_when_required_sidecar_is_missing() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_restore_fails_closed_before_mutation_when_one_legacy_sidecar_is_missing() {
+    let root = temp_test_dir("checkpoint-legacy-sidecar-partially-missing");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("one.txt"), "one-before\n").expect("write first untracked");
+    std::fs::write(root.join("two.txt"), "two-before\n").expect("write second untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    std::fs::write(root.join("tracked.txt"), "tracked-checkpoint\n")
+        .expect("write tracked checkpoint state");
+
+    let checkpoint = git_checkpoints::create_checkpoint(
+        &root,
+        "multi_edit",
+        &[
+            "tracked.txt".to_string(),
+            "one.txt".to_string(),
+            "two.txt".to_string(),
+        ],
+        1,
+    )
+    .expect("create mixed checkpoint")
+    .expect("checkpoint exists");
+    assert!(checkpoint.untracked_snapshot.is_empty());
+    assert_eq!(
+        checkpoint.legacy_sidecar_paths.as_deref(),
+        Some(["one.txt".to_string(), "two.txt".to_string()].as_slice())
+    );
+    std::fs::remove_file(
+        root.join(".dext/checkpoints")
+            .join(&checkpoint.id)
+            .join("two.txt"),
+    )
+    .expect("remove one legacy sidecar");
+    std::fs::write(root.join("tracked.txt"), "tracked-after\n").expect("mutate tracked");
+    std::fs::write(root.join("one.txt"), "one-after\n").expect("mutate first untracked");
+    std::fs::write(root.join("two.txt"), "two-after\n").expect("mutate second untracked");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("missing legacy sidecar must fail before any restore mutation");
+    assert!(error.contains("sidecar is missing: two.txt"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read unchanged tracked"),
+        "tracked-after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("one.txt")).expect("read unchanged first untracked"),
+        "one-after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("two.txt")).expect("read unchanged second untracked"),
+        "two-after\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_restore_fails_closed_for_ambiguous_missing_legacy_manifest_sidecar() {
+    let root = temp_test_dir("checkpoint-old-manifest-sidecar-partially-missing");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("one.txt"), "one-before\n").expect("write first untracked");
+    std::fs::write(root.join("two.txt"), "two-before\n").expect("write second untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    std::fs::write(root.join("tracked.txt"), "tracked-checkpoint\n")
+        .expect("write tracked checkpoint state");
+
+    let mut checkpoint = git_checkpoints::create_checkpoint(
+        &root,
+        "multi_edit",
+        &[
+            "tracked.txt".to_string(),
+            "one.txt".to_string(),
+            "two.txt".to_string(),
+        ],
+        1,
+    )
+    .expect("create mixed checkpoint")
+    .expect("checkpoint exists");
+    checkpoint.legacy_sidecar_paths = None;
+    std::fs::remove_file(
+        root.join(".dext/checkpoints")
+            .join(&checkpoint.id)
+            .join("two.txt"),
+    )
+    .expect("remove one old-manifest sidecar");
+    std::fs::write(root.join("tracked.txt"), "tracked-after\n").expect("mutate tracked");
+    std::fs::write(root.join("one.txt"), "one-after\n").expect("mutate first untracked");
+    std::fs::write(root.join("two.txt"), "two-after\n").expect("mutate second untracked");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("ambiguous old-manifest sidecar gap must fail before restore");
+    assert!(
+        error.contains("legacy checkpoint sidecar is missing or was not recorded: two.txt"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read unchanged tracked"),
+        "tracked-after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("one.txt")).expect("read unchanged first untracked"),
+        "one-after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("two.txt")).expect("read unchanged second untracked"),
+        "two-after\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_creation_rejects_invalid_tool_names_and_oversized_hint_sets_without_storage() {
+    let root = temp_test_dir("checkpoint-invalid-creation-metadata");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let invalid_tool = git_checkpoints::create_checkpoint(&root, "bad\ttool", &[], 1)
+        .expect_err("tab-delimited tool names must be rejected before storage mutation");
+    assert!(
+        invalid_tool.contains("invalid checkpoint tool name"),
+        "{invalid_tool}"
+    );
+    assert!(!root.join(".dext").exists());
+
+    let too_many_paths = (0..=500)
+        .map(|index| format!("path-{index}.txt"))
+        .collect::<Vec<_>>();
+    let oversized = git_checkpoints::create_checkpoint(&root, "write_file", &too_many_paths, 2)
+        .expect_err("oversized checkpoint hint sets must be rejected before storage mutation");
+    assert!(oversized.contains("500-path limit"), "{oversized}");
+    assert!(!root.join(".dext").exists());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_restore_rejects_extra_legacy_sidecar_outside_recorded_membership() {
+    let root = temp_test_dir("checkpoint-extra-legacy-sidecar");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "note-before\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    std::fs::write(root.join("tracked.txt"), "tracked-checkpoint\n")
+        .expect("write tracked checkpoint state");
+
+    let checkpoint = git_checkpoints::create_checkpoint(
+        &root,
+        "multi_edit",
+        &["tracked.txt".to_string(), "note.txt".to_string()],
+        1,
+    )
+    .expect("create mixed checkpoint")
+    .expect("checkpoint exists");
+    assert!(checkpoint.untracked_snapshot.is_empty());
+    assert_eq!(
+        checkpoint.legacy_sidecar_paths.as_deref(),
+        Some(["note.txt".to_string()].as_slice())
+    );
+    let sidecar_dir = root.join(".dext/checkpoints").join(&checkpoint.id);
+    std::fs::write(sidecar_dir.join("tracked.txt"), "injected\n")
+        .expect("inject extra legacy sidecar");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            sidecar_dir.join("tracked.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("make injected sidecar private");
+    }
+    std::fs::write(root.join("tracked.txt"), "tracked-after\n").expect("mutate tracked");
+    std::fs::write(root.join("note.txt"), "note-after\n").expect("mutate note");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("extra sidecar outside recorded membership must fail before restore");
+    assert!(
+        error.contains("targets undeclared path: tracked.txt"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read unchanged tracked"),
+        "tracked-after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).expect("read unchanged note"),
+        "note-after\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1647,7 +1900,14 @@ fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
         std::fs::set_permissions(&orphan_sidecar, std::fs::Permissions::from_mode(0o700))
             .expect("make orphan sidecar private");
     }
-    std::fs::write(orphan_sidecar.join("data"), "orphan\n").expect("write orphan sidecar");
+    let orphan_file = orphan_sidecar.join("data");
+    std::fs::write(&orphan_file, "orphan\n").expect("write orphan sidecar");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&orphan_file, std::fs::Permissions::from_mode(0o600))
+            .expect("make orphan sidecar file private");
+    }
 
     let result = git_checkpoints::prune(&root, None, None).expect("prune checkpoints");
     assert!(result.contains("pruned 1 checkpoint"), "{result}");
@@ -1838,6 +2098,105 @@ fn checkpoint_prune_reports_unsafe_retained_sidecar_shape() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_prune_retains_symlinked_blob_root_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-prune-symlinked-blob-root");
+    let outside = temp_test_dir("checkpoint-prune-symlinked-blob-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("data.txt"), "checkpoint data\n").expect("write untracked");
+    std::fs::write(outside.join("keep.txt"), "keep\n").expect("write outside file");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let blobs = root.join(".dext/checkpoints/blobs");
+    std::fs::remove_dir_all(&blobs).expect("remove real blob directory");
+    symlink(&outside, &blobs).expect("symlink blob root outside repository");
+
+    let result = git_checkpoints::prune(&root, Some(0), None)
+        .expect("prune while retaining unsafe blob root");
+    assert!(result.contains("pruned 1 checkpoint"), "{result}");
+    assert!(
+        result.contains("skip unsafe checkpoint blob path"),
+        "{result}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&blobs).is_ok_and(|metadata| metadata.file_type().is_symlink()),
+        "unsafe blob-root symlink must remain for inspection"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("keep.txt")).expect("read outside file"),
+        "keep\n"
+    );
+    assert!(
+        git_checkpoints::find_checkpoint(&root, &checkpoint.id)
+            .expect("query pruned checkpoint")
+            .is_none(),
+        "retention should still remove the expired checkpoint"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_prune_reports_nested_symlink_in_retained_sidecar() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-prune-retained-nested-symlink");
+    let outside = temp_test_dir("checkpoint-prune-retained-nested-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "before\n").expect("write untracked");
+    std::fs::write(outside.join("keep.txt"), "keep\n").expect("write outside file");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["note.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    let sidecar_dir = root.join(".dext/checkpoints").join(&checkpoint.id);
+    let nested = sidecar_dir.join("outside-link");
+    symlink(&outside, &nested).expect("create nested retained sidecar symlink");
+
+    let result = git_checkpoints::prune(&root, None, None)
+        .expect("prune around unsafe retained sidecar tree");
+    assert!(
+        result.contains("skip unsafe retained checkpoint sidecar"),
+        "{result}"
+    );
+    assert!(result.contains("unsafe sidecar symlink"), "{result}");
+    assert!(
+        std::fs::symlink_metadata(&nested).is_ok(),
+        "unsafe retained sidecar tree must remain intact"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("keep.txt")).expect("read outside file"),
+        "keep\n"
+    );
+    assert!(
+        git_checkpoints::find_checkpoint(&root, &checkpoint.id)
+            .expect("query retained checkpoint")
+            .is_some(),
+        "manifest-backed checkpoint must remain"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 #[test]
@@ -2092,6 +2451,49 @@ fn checkpoint_prune_unlinks_orphan_sidecar_symlink_without_following_it() {
     let result = git_checkpoints::prune(&root, None, None).expect("prune orphan symlink");
     assert!(result.contains("1 orphan sidecar entry"), "{result}");
     assert!(!orphan.exists(), "orphan symlink should be unlinked");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("keep.txt")).expect("read outside file"),
+        "keep\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_prune_retains_orphan_sidecar_tree_with_nested_symlink() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let root = temp_test_dir("checkpoint-prune-nested-sidecar-symlink");
+    let outside = temp_test_dir("checkpoint-prune-nested-sidecar-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(outside.join("keep.txt"), "keep\n").expect("write outside file");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::prune(&root, None, None).expect("initialize checkpoint storage");
+
+    let orphan = root.join(".dext/checkpoints/orphan_nested");
+    std::fs::create_dir(&orphan).expect("create orphan sidecar directory");
+    std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o700))
+        .expect("make orphan sidecar directory private");
+    let nested = orphan.join("outside-link");
+    symlink(&outside, &nested).expect("create nested sidecar symlink");
+
+    let result = git_checkpoints::prune(&root, None, None)
+        .expect("prune around unsafe nested sidecar symlink");
+    assert!(
+        result.contains("skip unsafe orphan checkpoint sidecar"),
+        "{result}"
+    );
+    assert!(result.contains("unsafe sidecar symlink"), "{result}");
+    assert!(
+        std::fs::symlink_metadata(&nested).is_ok(),
+        "unsafe orphan tree must remain intact for inspection"
+    );
     assert_eq!(
         std::fs::read_to_string(outside.join("keep.txt")).expect("read outside file"),
         "keep\n"

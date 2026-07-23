@@ -228,7 +228,8 @@ on Unix they must be current-user-owned, `.dext` must not be group/world-writabl
 and managed checkpoint, sidecar, and blob directories are owner-private. Locked
 Unix mutations may repair modes only on current-user-owned managed directories;
 inspection does not repair them, restore rejects unsafe sidecar/blob containers,
-and prune retains unsafe artifact directories with bounded warnings. Dext adds
+and prune retains unsafe artifact directory trees with bounded warnings while unlinking only
+an orphan top-level sidecar symlink without following it. Dext adds
 `/.dext/` to the repository-local
 Git exclude file and automatically retains at most 20 checkpoints for no longer
 than seven days. They are intended for Dext write recovery, not as a replacement
@@ -239,9 +240,12 @@ unsupported types, and path/type/size bounds are reported as explicit partial-re
 Regular-file content is stored once in owner-private SHA-256-addressed blobs shared by retained
 checkpoints; unchanged source paths reuse a session cache only while source and blob metadata
 fingerprints remain stable, preview/restore rehash blobs before trusting them, and prune or failed
-checkpoint creation removes valid unreferenced/new blobs. Malformed or unsafe blob- or
-sidecar-directory entries remain untouched and produce bounded warnings without stopping other
-retention cleanup. Owner execute state is retained in metadata. If path/type/size limits make
+checkpoint creation removes valid unreferenced/new blobs. Malformed or unsafe blob entries and
+sidecar directory trees remain untouched and produce bounded warnings without stopping other
+retention cleanup; an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked
+without following it. Owner execute state is retained in metadata. Current manifests record exact
+direct-sidecar membership; older manifests that lack that field fail conservatively before mutation
+when a missing artifact is ambiguous rather than deleting current path content. If path/type/size limits make
 untracked recovery partial, Dext asks
 separately before the command and caches approval for the current repository and
 session; approval keeps tracked/staged recovery and the bounded untracked subset,

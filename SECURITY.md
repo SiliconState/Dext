@@ -91,16 +91,19 @@ Also scan untracked and ignored files before deciding what to preserve locally v
   current-user-owned, `.dext` must not be group/world-writable, and checkpoint, sidecar, and blob
   directories are owner-private. Locked mutating operations may repair modes only on managed directories
   already owned by the current user; observational inspection never repairs them, restore rejects
-  unsafe sidecar/blob containers, and pruning retains unsafe artifact directories with bounded
-  warnings. Regular-file content is stored
+  unsafe sidecar/blob containers, and pruning retains unsafe artifact directory trees with bounded
+  warnings while unlinking only an orphan top-level sidecar symlink without following it. Regular-file content is stored
   once in owner-private SHA-256-addressed blobs and reused only while both source and blob metadata
   fingerprints remain unchanged; restore and preview rehash blobs, retained checkpoints share
   unchanged blobs, and pruning or a failed checkpoint creation removes valid unreferenced/new blobs.
-  Unsafe or malformed entries in the blob or sidecar directories remain untouched for inspection and
-  produce bounded warnings without stopping other retention cleanup.
+  Unsafe or malformed blob entries and sidecar directory trees remain untouched for inspection and
+  produce bounded warnings without stopping other retention cleanup; an orphan top-level sidecar
+  symlink with a valid checkpoint ID is unlinked without following it.
   Owner execute state is retained in metadata, blob integrity is verified before restore and while
   copying into the atomic replacement, and restore fails closed if any declared sidecar is missing
-  or corrupt. When path/type/size caps leave partial untracked
+  or corrupt. Current manifests record exact direct-sidecar membership; older manifests that lack
+  that field fail conservatively before mutation when a missing artifact is ambiguous rather than
+  deleting current path content. When path/type/size caps leave partial untracked
   recovery, Dext asks separately before the command, caches approval only for the current
   repository/session, and keeps tracked/staged recovery plus the bounded subset; denial blocks the
   command. Other checkpoint/storage failures remain fail-closed. Checkpoints are created at
