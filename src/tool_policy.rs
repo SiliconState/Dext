@@ -1963,6 +1963,12 @@ fn shell_interpreter_uses_stdin(invocation: &[String]) -> bool {
     true
 }
 
+fn shell_command_word_is_dynamic(word: &str) -> bool {
+    word.contains([
+        '$', '`', '*', '?', '[', ']', '{', '}', '(', ')', '<', '>', '~',
+    ])
+}
+
 fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     let Some(first) = invocation.first() else {
         return false;
@@ -1970,7 +1976,7 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
     let command = shell_command_basename(first).to_ascii_lowercase();
     let command = command.as_str();
     if is_sudo_command_word(first)
-        || first.contains(['$', '`'])
+        || shell_command_word_is_dynamic(first)
         || first.ends_with("()")
         || invocation.get(1).is_some_and(|word| word == "()")
         || invocation.get(1).is_some_and(|word| word == "(")
@@ -2037,12 +2043,7 @@ fn shell_invocation_is_dangerous(invocation: &[String]) -> bool {
         "setsid" | "parallel" => true,
         "git" => git_invocation_is_dangerous(invocation),
         "docker" | "podman" => container_invocation_is_dangerous(invocation),
-        "curl" => curl_invocation_is_dangerous(invocation),
-        "wget" => wget_invocation_is_dangerous(invocation),
-        "http" | "xh" => invocation
-            .iter()
-            .skip(1)
-            .any(|arg| http_method_is_dangerous(arg)),
+        "curl" | "wget" | "http" | "xh" => shell_network_client_is_dangerous(invocation),
         "terraform" | "tofu" => invocation
             .iter()
             .skip(1)
@@ -2330,21 +2331,11 @@ fn git_invocation_is_dangerous(invocation: &[String]) -> bool {
         .any(|arg| arg == "--no-pager");
     match subcommand {
         "status" | "diff" | "log" | "show" | "whatchanged" => true,
-        "grep" => {
-            !pager_disabled
-                || args.iter().any(|arg| {
-                    matches!(
-                        arg.as_str(),
-                        "--textconv" | "--ext-diff" | "--open-files-in-pager"
-                    ) || arg.starts_with("--open-files-in-pager=")
-                })
-        }
+        "grep" => true,
         "push" | "clean" | "checkout" | "rm" | "prune" | "update-ref" => true,
         "switch" | "stash" | "reset" | "branch" | "tag" => true,
         "config" => !pager_disabled || git_config_invocation_is_dangerous(args),
-        "restore" => args
-            .iter()
-            .any(|arg| !arg.starts_with('-') || arg == "--worktree"),
+        "restore" => true,
         "reflog" => {
             !pager_disabled
                 || args
@@ -2386,15 +2377,10 @@ fn git_invocation_is_dangerous(invocation: &[String]) -> bool {
                     .find(|arg| !arg.starts_with('-'))
                     .is_none_or(|action| action != "list")
         }
-        "diff-tree" => {
-            !pager_disabled
-                || args
-                    .iter()
-                    .any(|arg| matches!(arg.as_str(), "--textconv" | "--ext-diff"))
-        }
-        "check-attr" | "check-ignore" | "check-mailmap" | "check-ref-format" | "cherry"
-        | "count-objects" | "ls-files" | "ls-tree" | "merge-base" | "name-rev" | "rev-list"
-        | "rev-parse" | "show-branch" | "show-ref" | "var" => !pager_disabled,
+        "diff-tree" | "check-attr" | "check-ignore" | "ls-files" => true,
+        "check-mailmap" | "check-ref-format" | "cherry" | "count-objects" | "ls-tree"
+        | "merge-base" | "name-rev" | "rev-list" | "rev-parse" | "show-branch" | "show-ref"
+        | "var" => !pager_disabled,
         _ => true,
     }
 }
@@ -2441,101 +2427,15 @@ fn container_invocation_is_dangerous(invocation: &[String]) -> bool {
     })
 }
 
-fn curl_invocation_is_dangerous(invocation: &[String]) -> bool {
-    let mut idx = 1usize;
-    while idx < invocation.len() {
-        let arg = invocation[idx].as_str();
-        if let Some(method) = arg.strip_prefix("--request=") {
-            if http_method_is_dangerous(method) {
-                return true;
-            }
-        } else if arg == "--request" || arg == "-X" {
-            if invocation
-                .get(idx + 1)
-                .is_some_and(|method| http_method_is_dangerous(method))
-            {
-                return true;
-            }
-            idx = idx.saturating_add(1);
-        } else if let Some(method) = arg.strip_prefix("-X") {
-            if !method.is_empty() && http_method_is_dangerous(method) {
-                return true;
-            }
-        } else if matches!(
-            arg,
-            "-d" | "--data"
-                | "--data-ascii"
-                | "--data-binary"
-                | "--data-raw"
-                | "--data-urlencode"
-                | "-F"
-                | "--form"
-                | "--form-string"
-                | "-T"
-                | "--upload-file"
-                | "--json"
-        ) || [
-            "--data=",
-            "--data-ascii=",
-            "--data-binary=",
-            "--data-raw=",
-            "--data-urlencode=",
-            "--form=",
-            "--form-string=",
-            "--upload-file=",
-            "--json=",
-        ]
-        .iter()
-        .any(|prefix| arg.starts_with(prefix))
-        {
-            return true;
-        }
-        idx += 1;
-    }
-    false
-}
-
-fn wget_invocation_is_dangerous(invocation: &[String]) -> bool {
-    let mut idx = 1usize;
-    while idx < invocation.len() {
-        let arg = invocation[idx].as_str();
-        if matches!(
-            arg,
-            "--post-data" | "--post-file" | "--body-data" | "--body-file"
-        ) || [
-            "--post-data=",
-            "--post-file=",
-            "--body-data=",
-            "--body-file=",
-        ]
-        .iter()
-        .any(|prefix| arg.starts_with(prefix))
-        {
-            return true;
-        }
-        if arg == "--method" {
-            if invocation
-                .get(idx + 1)
-                .is_some_and(|method| http_method_is_dangerous(method))
-            {
-                return true;
-            }
-            idx = idx.saturating_add(1);
-        } else if let Some(method) = arg.strip_prefix("--method=")
-            && http_method_is_dangerous(method)
-        {
-            return true;
-        }
-        idx += 1;
-    }
-    false
-}
-
-fn http_method_is_dangerous(method: &str) -> bool {
-    matches!(
-        method.to_ascii_uppercase().as_str(),
-        "POST" | "PUT" | "PATCH" | "DELETE" | "CONNECT"
-    )
+fn shell_network_client_is_dangerous(invocation: &[String]) -> bool {
+    let args = &invocation[1..];
+    args.is_empty()
+        || !args.iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "-V" | "--version" | "-h" | "--help" | "--manual"
+            )
+        })
 }
 
 fn classify_bash_command_risk(command: &str) -> CommandRisk {
@@ -2897,6 +2797,13 @@ mod tests {
             "git --no-pager fsck --lost-found",
             "git --no-pager describe --dirty",
             "git --no-pager for-each-ref --format=%(signature:grade)",
+            "git --no-pager grep base",
+            "git --no-pager diff-tree HEAD",
+            "git --no-pager ls-files",
+            "git --no-pager check-ignore tracked.txt",
+            "git --no-pager check-attr diff -- tracked.txt",
+            "git restore --pathspec-from-file=paths.txt",
+            "printf 'tracked.txt\\n' | git restore --pathspec-from-file=-",
             "git config user.name NewName",
             "git config set user.email new@example.invalid",
             "git config --unset core.hooksPath",
@@ -2912,6 +2819,7 @@ mod tests {
             "git stash store deadbeef",
             "python3 -c 'import shutil; shutil.rmtree(\"build\")'",
             "python3 <<'PY'\nimport os\nos.unlink('stale')\nPY",
+            "python3<<'PY'\nimport os\nos.unlink('stale')\nPY",
             "python3 -- <<'PY'\nimport os\nos.unlink('stale')\nPY",
             "python3 < script.py",
             "perl <<'PL'\nCORE::unlink('stale')\nPL",
@@ -2975,6 +2883,11 @@ mod tests {
             "busybox rm stale.txt",
             "toybox rm stale.txt",
             "cmd=rm; $cmd stale.txt",
+            "r{m,mdir} stale.txt",
+            "/bin/r? stale.txt",
+            "rm>removed.log stale.txt",
+            "/bin/[r]m stale.txt",
+            "~/bin/wipe stale.txt",
             "$(printf rm) stale.txt",
             "alias wipe='rm -rf build'",
             "wipe () { rm stale.txt; }; wipe",
@@ -2984,10 +2897,20 @@ mod tests {
             "ruby -e 'File.delete(\"stale.txt\")'",
             "php -r 'unlink(\"stale.txt\");'",
             "docker system prune",
+            "curl https://example.invalid/items",
+            "curl -q -dvalue https://example.invalid/items",
+            "curl -q -Ffile=@data.txt https://example.invalid/items",
+            "curl -q -Tdata.txt https://example.invalid/items",
+            "curl -q -Krequest.conf https://example.invalid/items",
             "curl --request=DELETE https://example.invalid/item/1",
             "curl --data=x=1 https://example.invalid/items",
             "curl --json={} https://example.invalid/items",
+            "wget https://example.invalid/items",
+            "wget --no-config -e post_data=x https://example.invalid/items",
             "wget --method=PATCH --body-data=x https://example.invalid/items",
+            "http GET https://example.invalid/items",
+            "http https://example.invalid/items name=value",
+            "xh GET https://example.invalid/items",
             "http POST https://example.invalid/items",
             "kubectl delete pod example",
             "terraform destroy -auto-approve",
@@ -3024,6 +2947,37 @@ mod tests {
             classify_command_risk("bash", &json!({"command": "env -- tar -Sxf archive.tar"})),
             CommandRisk::Write,
             "env option parsing stops at the command separator"
+        );
+        assert_eq!(
+            classify_command_risk(
+                "bash",
+                &json!({"command": "curl -q https://example.invalid/items"})
+            ),
+            CommandRisk::Danger,
+            "actual shell curl requests remain gated; use the native HTTP tool for reads"
+        );
+        assert_eq!(
+            classify_command_risk(
+                "bash",
+                &json!({"command": "wget --no-config https://example.invalid/items"})
+            ),
+            CommandRisk::Danger,
+            "actual shell wget requests remain gated; use the native HTTP tool for reads"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "http --version"})),
+            CommandRisk::Write,
+            "informational HTTPie invocation must not be promoted to Danger"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "curl --version"})),
+            CommandRisk::Write,
+            "informational curl invocation must not be promoted to Danger"
+        );
+        assert_eq!(
+            classify_command_risk("bash", &json!({"command": "wget --help"})),
+            CommandRisk::Write,
+            "informational wget invocation must not be promoted to Danger"
         );
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "cargo test --release"})),

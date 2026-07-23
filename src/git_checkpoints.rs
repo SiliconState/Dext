@@ -336,12 +336,54 @@ fn checkpoints_manifest_dir(git_root: &Path) -> PathBuf {
     git_root.join(CHECKPOINTS_DIR)
 }
 
+fn private_dir_owned_by_current_user(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return false;
+        }
+    }
+    true
+}
+
+fn safe_checkpoint_storage_parent_metadata(metadata: &std::fs::Metadata) -> bool {
+    if !private_dir_owned_by_current_user(metadata) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn safe_private_dir_metadata(metadata: &std::fs::Metadata) -> bool {
+    if !private_dir_owned_by_current_user(metadata) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if !private_dir_owned_by_current_user(&metadata) {
                 return Err(format!(
-                    "private directory path is not a real directory: {}",
+                    "private directory path is not a real directory owned by the current user: {}",
                     path.display()
                 ));
             }
@@ -371,15 +413,23 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("chmod private directory {}: {e}", path.display()))?;
     }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("private directory metadata {}: {error}", path.display()))?;
+    if !safe_private_dir_metadata(&metadata) {
+        return Err(format!(
+            "private directory path is not owner-private: {}",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
 fn ensure_checkpoint_storage(git_root: &Path) -> Result<(), String> {
     let dext_dir = git_root.join(".dext");
     match std::fs::symlink_metadata(&dext_dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        Ok(metadata) if !safe_checkpoint_storage_parent_metadata(&metadata) => {
             return Err(format!(
-                "checkpoint storage parent is not a real directory: {}",
+                "checkpoint storage parent is not a safe current-user-owned directory: {}",
                 dext_dir.display()
             ));
         }
@@ -406,11 +456,21 @@ fn ensure_checkpoint_storage(git_root: &Path) -> Result<(), String> {
 }
 
 fn checkpoint_storage_exists(git_root: &Path) -> Result<bool, String> {
-    for path in [git_root.join(".dext"), checkpoints_manifest_dir(git_root)] {
+    let paths = [
+        (git_root.join(".dext"), false),
+        (checkpoints_manifest_dir(git_root), true),
+    ];
+    for (path, must_be_private) in paths {
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Ok(metadata)
+                if if must_be_private {
+                    !safe_private_dir_metadata(&metadata)
+                } else {
+                    !safe_checkpoint_storage_parent_metadata(&metadata)
+                } =>
+            {
                 return Err(format!(
-                    "checkpoint storage path is not a real directory: {}",
+                    "checkpoint storage path is not owner-safe: {}",
                     path.display()
                 ));
             }
@@ -1058,10 +1118,25 @@ fn plan_untracked_capture(git_root: &Path) -> Result<UntrackedCapturePlan, Strin
     })
 }
 
+fn checkpoint_blob_dir(git_root: &Path) -> PathBuf {
+    checkpoints_manifest_dir(git_root).join(BLOBS_DIR)
+}
+
 fn blob_path(git_root: &Path, digest: &str) -> PathBuf {
-    checkpoints_manifest_dir(git_root)
-        .join(BLOBS_DIR)
-        .join(digest)
+    checkpoint_blob_dir(git_root).join(digest)
+}
+
+fn validate_private_blob_dir(git_root: &Path) -> Result<PathBuf, String> {
+    let dir = checkpoint_blob_dir(git_root);
+    let metadata = std::fs::symlink_metadata(&dir)
+        .map_err(|error| format!("checkpoint blob directory metadata: {error}"))?;
+    if !safe_private_dir_metadata(&metadata) {
+        return Err(format!(
+            "checkpoint blob directory is not owner-private: {}",
+            dir.display()
+        ));
+    }
+    Ok(dir)
 }
 
 fn private_blob_metadata_version(
@@ -1072,7 +1147,8 @@ fn private_blob_metadata_version(
     if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let metadata = std::fs::symlink_metadata(blob_path(git_root, digest)).ok()?;
+    let dir = validate_private_blob_dir(git_root).ok()?;
+    let metadata = std::fs::symlink_metadata(dir.join(digest)).ok()?;
     (safe_private_file_metadata(&metadata) && metadata.len() == expected_size)
         .then(|| untracked_source_version(&metadata))
 }
@@ -1097,6 +1173,9 @@ fn save_untracked_blob(
     cache: &mut UntrackedBlobCache,
 ) -> Result<(String, bool), String> {
     use std::io::{Seek as _, SeekFrom};
+
+    let blobs = checkpoint_blob_dir(git_root);
+    ensure_private_dir(&blobs)?;
 
     #[cfg(unix)]
     if let Some(cached) = cache.entries.get(relative)
@@ -1155,8 +1234,6 @@ fn save_untracked_blob(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let blobs = checkpoints_manifest_dir(git_root).join(BLOBS_DIR);
-    ensure_private_dir(&blobs)?;
     let destination = blob_path(git_root, &digest);
     match std::fs::symlink_metadata(&destination) {
         Ok(metadata)
@@ -2352,7 +2429,8 @@ fn validate_private_blob(
     digest: &str,
     expected_size: u64,
 ) -> Result<PathBuf, String> {
-    let path = blob_path(git_root, digest);
+    let dir = validate_private_blob_dir(git_root)?;
+    let path = dir.join(digest);
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2413,8 +2491,8 @@ fn preflight_legacy_sidecar_restore(
         }
         Err(error) => return Err(format!("checkpoint sidecar metadata: {error}")),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("checkpoint sidecar directory is unsafe".to_string());
+    if !safe_private_dir_metadata(&metadata) {
+        return Err("checkpoint sidecar directory is not owner-private".to_string());
     }
     let entries = walk_dir(&sdir)?;
     if entries.is_empty() {
@@ -3040,8 +3118,11 @@ fn copy_sidecar_file(
 fn walk_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let metadata =
         std::fs::symlink_metadata(dir).map_err(|e| format!("directory metadata: {e}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!("unsafe sidecar directory: {}", dir.display()));
+    if !safe_private_dir_metadata(&metadata) {
+        return Err(format!(
+            "unsafe non-private sidecar directory: {}",
+            dir.display()
+        ));
     }
     let mut result = Vec::new();
     let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))?;
@@ -3125,7 +3206,7 @@ fn prune_orphan_blobs(
     git_root: &Path,
     remaining: &[Checkpoint],
 ) -> Result<BlobPruneOutcome, String> {
-    let dir = checkpoints_manifest_dir(git_root).join(BLOBS_DIR);
+    let dir = checkpoint_blob_dir(git_root);
     let metadata = match std::fs::symlink_metadata(&dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3135,6 +3216,14 @@ fn prune_orphan_blobs(
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("checkpoint blob path is not a real directory".to_string());
+    }
+    if !safe_private_dir_metadata(&metadata) {
+        let mut outcome = BlobPruneOutcome::default();
+        record_prune_warning(
+            &mut outcome.warnings,
+            format!("skip unsafe checkpoint blob directory: {}", dir.display()),
+        );
+        return Ok(outcome);
     }
     let referenced = remaining
         .iter()
@@ -3220,30 +3309,95 @@ fn prune_orphan_sidecars(
         .collect::<std::collections::HashSet<_>>();
     let mut outcome = prune_orphan_blobs(git_root, remaining)?;
     for entry in std::fs::read_dir(&dir).map_err(|error| format!("checkpoint dir read: {error}"))? {
-        let entry = entry.map_err(|error| format!("checkpoint dir entry: {error}"))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!("skip unreadable checkpoint sidecar directory entry: {error}"),
+                );
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(id) = name.to_str() else {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip checkpoint sidecar with non-UTF-8 name: {}",
+                    entry.path().display()
+                ),
+            );
             continue;
         };
-        if id == BLOBS_DIR || !safe_checkpoint_id(id) || remaining_ids.contains(id) {
+        if matches!(id, BLOBS_DIR | "manifest.txt" | "operation.lock") {
             continue;
         }
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("checkpoint sidecar metadata: {error}"))?;
-        if metadata.file_type().is_symlink() {
+        if !safe_checkpoint_id(id) {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip malformed checkpoint sidecar entry: {}",
+                    path.display()
+                ),
+            );
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "skip unreadable checkpoint sidecar {}: {error}",
+                        path.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        if remaining_ids.contains(id) {
+            if !safe_private_dir_metadata(&metadata) {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "skip unsafe retained checkpoint sidecar: {}",
+                        path.display()
+                    ),
+                );
+            }
+            continue;
+        }
+        let removal = if metadata.file_type().is_symlink() {
             std::fs::remove_file(&path)
-                .map_err(|error| format!("remove orphan checkpoint symlink: {error}"))?;
-            outcome.removed += 1;
-        } else if metadata.is_dir() {
+        } else if safe_private_dir_metadata(&metadata) {
             std::fs::remove_dir_all(&path)
-                .map_err(|error| format!("remove orphan checkpoint sidecar: {error}"))?;
-            outcome.removed += 1;
+        } else if metadata.is_dir() {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!("skip unsafe orphan checkpoint sidecar: {}", path.display()),
+            );
+            continue;
         } else {
-            return Err(format!(
-                "unexpected checkpoint sidecar entry: {}",
-                path.display()
-            ));
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip unexpected checkpoint sidecar entry: {}",
+                    path.display()
+                ),
+            );
+            continue;
+        };
+        match removal {
+            Ok(()) => outcome.removed += 1,
+            Err(error) => record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "could not remove orphan checkpoint sidecar {}: {error}",
+                    path.display()
+                ),
+            ),
         }
     }
     Ok(outcome)

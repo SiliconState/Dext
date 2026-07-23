@@ -223,7 +223,13 @@ create lightweight recovery checkpoints immediately before each sequential dispa
 later call in one tool round captures state produced by earlier calls. Direct
 file mutations receive path-specific restore hints. Checkpoints use hidden refs
 under `refs/dext/checkpoints/` and owner-private local manifests and sidecars
-under `.dext/checkpoints/` on Unix. Dext adds `/.dext/` to the repository-local
+under `.dext/checkpoints/` on Unix. Storage containers must be real directories;
+on Unix they must be current-user-owned, `.dext` must not be group/world-writable,
+and managed checkpoint, sidecar, and blob directories are owner-private. Locked
+Unix mutations may repair modes only on current-user-owned managed directories;
+inspection does not repair them, restore rejects unsafe sidecar/blob containers,
+and prune retains unsafe artifact directories with bounded warnings. Dext adds
+`/.dext/` to the repository-local
 Git exclude file and automatically retains at most 20 checkpoints for no longer
 than seven days. They are intended for Dext write recovery, not as a replacement
 for commits. Write-risk `bash`/`awk`/`csvkit` calls inventory up to 500 existing
@@ -233,9 +239,10 @@ unsupported types, and path/type/size bounds are reported as explicit partial-re
 Regular-file content is stored once in owner-private SHA-256-addressed blobs shared by retained
 checkpoints; unchanged source paths reuse a session cache only while source and blob metadata
 fingerprints remain stable, preview/restore rehash blobs before trusting them, and prune or failed
-checkpoint creation removes valid unreferenced/new blobs. Malformed or unsafe blob-directory entries
-remain untouched and produce bounded warnings without stopping other retention cleanup. Owner execute state is retained
-in metadata. If path/type/size limits make untracked recovery partial, Dext asks
+checkpoint creation removes valid unreferenced/new blobs. Malformed or unsafe blob- or
+sidecar-directory entries remain untouched and produce bounded warnings without stopping other
+retention cleanup. Owner execute state is retained in metadata. If path/type/size limits make
+untracked recovery partial, Dext asks
 separately before the command and caches approval for the current repository and
 session; approval keeps tracked/staged recovery and the bounded untracked subset,
 while denial blocks the command. Other checkpoint failures remain fail-closed. In
@@ -319,7 +326,7 @@ dext --sandbox-profile danger-full-access
 # --sandbox accepts the same profile names, or a directory as the sandbox root
 ```
 
-Dext starts with the `ask` approval profile. Interactive frontends prompt before gated tools; non-interactive and JSON runs deny those calls instead of waiting for input. Automation that needs writes must opt in explicitly with `--approval auto-write`, `--approval always`, or `--trust`. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `DEXT_TRUST=1` is an alias for `approval=always`; false values do not override the safer fallback. Resuming a session never restores its saved trust grants over the current-run policy. Destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands remain gated. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is Danger unless it uses explicit `git --no-pager` and matches a narrow direct metadata-inspection allowlist; prefer Dext’s hardened native Git tools for review operations. Recognized dynamic/wrapper command paths and inline/stdin code—including shell input redirections and heredocs—through common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers are Danger too. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access.
+Dext starts with the `ask` approval profile. Interactive frontends prompt before gated tools; non-interactive and JSON runs deny those calls instead of waiting for input. Automation that needs writes must opt in explicitly with `--approval auto-write`, `--approval always`, or `--trust`. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `ask`. `DEXT_TRUST=1` is an alias for `approval=always`; false values do not override the safer fallback. Resuming a session never restores its saved trust grants over the current-run policy. Destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands remain gated. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is Danger unless it uses explicit `git --no-pager` and matches a narrow helper-free metadata-inspection allowlist; commands such as `grep`, `diff-tree`, `ls-files`, `check-ignore`, and `check-attr` remain gated because they can invoke fsmonitor. Prefer Dext’s hardened native Git tools for review operations. Recognized dynamic/wrapper command paths and inline/stdin code—including shell input redirections and heredocs—through common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers are Danger too. Dynamic command words include variable/command, glob, brace, tilde, and attached-redirection expansion forms. Actual shell curl/wget/HTTPie/XH requests are gated because startup configuration and request bodies are not safely inferable; use Dext’s native `http` tool for read requests. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access.
 
 For durable sessions, approved side-effect-capable tool calls receive a bounded, redacted start/terminal journal under the private session state directory. On resume, pending transcript calls are reconciled without replay: absent starts are marked `not_started`, unresolved starts are `uncertain`, and terminal entries recover their status without claiming unavailable output. `--no-session` and `--fork` deliberately omit this journal, so side-effect crash recovery is unavailable in those modes.
 

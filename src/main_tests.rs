@@ -730,7 +730,10 @@ fn checkpoint_rejects_symlinked_storage_root() {
         Err(error) => error,
         Ok(_) => panic!("symlinked checkpoint storage must be rejected"),
     };
-    assert!(error.contains("not a real directory"), "{error}");
+    assert!(
+        error.contains("not a safe current-user-owned directory"),
+        "{error}"
+    );
     assert!(!outside.join("checkpoints").exists());
     let refs = git_test_command(&root)
         .args([
@@ -747,6 +750,80 @@ fn checkpoint_rejects_symlinked_storage_root() {
     let _ = std::fs::remove_file(root.join(".dext"));
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rejects_group_writable_storage_parent() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("checkpoint-storage-parent-permissions");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    let dext_dir = root.join(".dext");
+    std::fs::create_dir(&dext_dir).expect("create checkpoint storage parent");
+    std::fs::set_permissions(&dext_dir, std::fs::Permissions::from_mode(0o770))
+        .expect("make checkpoint storage parent group-writable");
+
+    let error = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect_err("group-writable checkpoint storage parent must be rejected");
+    assert!(
+        error.contains("not a safe current-user-owned directory"),
+        "{error}"
+    );
+    assert!(!dext_dir.join("checkpoints").exists());
+    let refs = git_test_command(&root)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/dext/checkpoints",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("list checkpoint refs");
+    assert!(refs.status.success());
+    assert!(refs.stdout.is_empty(), "checkpoint ref must not be created");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_inspection_rejects_non_private_storage_without_repairing_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("checkpoint-storage-inspection-permissions");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let checkpoints = root.join(".dext/checkpoints");
+    std::fs::set_permissions(&checkpoints, std::fs::Permissions::from_mode(0o755))
+        .expect("make checkpoint storage non-private");
+
+    let inspect_error = git_checkpoints::inspect_checkpoints(&root, 10)
+        .expect_err("doctor inspection must reject non-private checkpoint storage");
+    assert!(inspect_error.contains("not owner-safe"), "{inspect_error}");
+    let list_error = git_checkpoints::list_checkpoints(&root, 10)
+        .expect_err("listing must reject non-private checkpoint storage");
+    assert!(list_error.contains("not owner-safe"), "{list_error}");
+    let mode = std::fs::metadata(&checkpoints)
+        .expect("checkpoint storage metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o755, "read-only inspection must not repair modes");
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -931,6 +1008,47 @@ fn checkpoint_restore_rejects_symlinked_sidecar_files() {
     let _ = std::fs::remove_dir_all(&outside);
 }
 
+#[cfg(unix)]
+#[test]
+fn checkpoint_restore_rejects_non_private_legacy_sidecar_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("checkpoint-sidecar-permissions");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "before\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["note.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    let sidecar_dir = root.join(".dext/checkpoints").join(&checkpoint.id);
+    std::fs::set_permissions(&sidecar_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("make sidecar directory non-private");
+    std::fs::write(root.join("note.txt"), "after\n").expect("mutate note");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("non-private sidecar directory must fail before restore");
+    assert!(
+        error.contains("sidecar directory is not owner-private"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).expect("read unchanged note"),
+        "after\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn checkpoint_restore_fails_closed_when_required_sidecar_is_missing() {
     let root = temp_test_dir("checkpoint-sidecar-missing");
@@ -1003,6 +1121,51 @@ fn checkpoint_restore_fails_closed_when_one_required_sidecar_is_missing() {
     assert!(error.contains("checkpoint blob"), "{error}");
     assert_eq!(
         std::fs::read_to_string(root.join("tracked.txt")).expect("read unchanged tracked file"),
+        "after\n"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_restore_rejects_non_private_blob_directory_before_mutation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("checkpoint-blob-directory-permissions");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("note.txt"), "before\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let blobs = root.join(".dext/checkpoints/blobs");
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755))
+        .expect("make blob directory non-private");
+    std::fs::write(root.join("tracked.txt"), "after\n").expect("mutate tracked file");
+    std::fs::write(root.join("note.txt"), "after\n").expect("mutate untracked file");
+
+    let error = git_checkpoints::restore_worktree(
+        &root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("non-private blob directory must fail before restore");
+    assert!(
+        error.contains("blob directory is not owner-private"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("tracked.txt")).expect("read unchanged tracked file"),
+        "after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("note.txt")).expect("read unchanged untracked file"),
         "after\n"
     );
 
@@ -1478,6 +1641,12 @@ fn checkpoint_prune_removes_refs_missing_from_private_manifest() {
     git_ok(&root, &["update-ref", sibling, "HEAD"]);
     let orphan_sidecar = root.join(".dext/checkpoints/orphan_sidecar");
     std::fs::create_dir(&orphan_sidecar).expect("create orphan sidecar");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&orphan_sidecar, std::fs::Permissions::from_mode(0o700))
+            .expect("make orphan sidecar private");
+    }
     std::fs::write(orphan_sidecar.join("data"), "orphan\n").expect("write orphan sidecar");
 
     let result = git_checkpoints::prune(&root, None, None).expect("prune checkpoints");
@@ -1529,12 +1698,19 @@ fn checkpoint_prune_skips_unsafe_blob_entries_without_stalling_retention() {
     let blobs = root.join(".dext/checkpoints/blobs");
     let unsafe_entry = blobs.join("not-a-digest");
     std::fs::write(&unsafe_entry, "retain for inspection\n").expect("write unsafe blob entry");
+    let unsafe_sidecar = root.join(".dext/checkpoints/stray_sidecar");
+    std::fs::write(&unsafe_sidecar, "retain for inspection\n")
+        .expect("write unexpected sidecar entry");
 
     let first = git_checkpoints::prune(&root, Some(0), None).expect("prune around unsafe blob");
     assert!(first.contains("pruned 1 checkpoint"), "{first}");
     assert!(first.contains("1 orphan sidecar entry"), "{first}");
     assert!(
         first.contains("skip unsafe checkpoint blob entry"),
+        "{first}"
+    );
+    assert!(
+        first.contains("skip unexpected checkpoint sidecar entry"),
         "{first}"
     );
     assert_eq!(
@@ -1545,6 +1721,10 @@ fn checkpoint_prune_skips_unsafe_blob_entries_without_stalling_retention() {
         "the unsafe entry should be the only retained blob artifact"
     );
     assert!(unsafe_entry.exists(), "unsafe entry must remain untouched");
+    assert!(
+        unsafe_sidecar.exists(),
+        "unexpected sidecar entry must remain untouched"
+    );
 
     let second =
         git_checkpoints::prune(&root, None, None).expect("repeat prune around unsafe blob");
@@ -1553,8 +1733,108 @@ fn checkpoint_prune_skips_unsafe_blob_entries_without_stalling_retention() {
         "{second}"
     );
     assert!(
+        second.contains("skip unexpected checkpoint sidecar entry"),
+        "{second}"
+    );
+    assert!(
         unsafe_entry.exists(),
-        "repeat prune must not remove unsafe entry"
+        "repeat prune must not remove unsafe blob entry"
+    );
+    assert!(
+        unsafe_sidecar.exists(),
+        "repeat prune must not remove unexpected sidecar entry"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_prune_skips_non_private_blob_and_retained_sidecar_directories() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("checkpoint-prune-directory-permissions");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    std::fs::write(root.join("data.txt"), "checkpoint data\n").expect("write untracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let checkpoints = root.join(".dext/checkpoints");
+    let blobs = checkpoints.join("blobs");
+    std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755))
+        .expect("make blob directory non-private");
+    let retained_sidecar = checkpoints.join(&checkpoint.id);
+    std::fs::create_dir(&retained_sidecar).expect("create retained sidecar directory");
+    std::fs::set_permissions(&retained_sidecar, std::fs::Permissions::from_mode(0o755))
+        .expect("make retained sidecar directory non-private");
+    let orphan_sidecar = checkpoints.join("orphan_sidecar");
+    std::fs::create_dir(&orphan_sidecar).expect("create private orphan sidecar");
+    std::fs::set_permissions(&orphan_sidecar, std::fs::Permissions::from_mode(0o700))
+        .expect("make orphan sidecar private");
+
+    let result = git_checkpoints::prune(&root, None, None).expect("prune unsafe directories");
+    assert!(
+        result.contains("skip unsafe checkpoint blob directory"),
+        "{result}"
+    );
+    assert!(
+        result.contains("skip unsafe retained checkpoint sidecar"),
+        "{result}"
+    );
+    assert!(result.contains("1 orphan sidecar entry"), "{result}");
+    assert!(
+        blobs.is_dir(),
+        "unsafe blob directory must remain untouched"
+    );
+    assert!(
+        retained_sidecar.is_dir(),
+        "unsafe retained sidecar must remain untouched"
+    );
+    assert!(
+        !orphan_sidecar.exists(),
+        "private orphan sidecar should still be removed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_prune_reports_unsafe_retained_sidecar_shape() {
+    let root = temp_test_dir("checkpoint-prune-retained-sidecar-shape");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let unsafe_sidecar = root.join(".dext/checkpoints").join(&checkpoint.id);
+    std::fs::write(&unsafe_sidecar, "retain for inspection\n")
+        .expect("write unsafe retained sidecar shape");
+
+    let result = git_checkpoints::prune(&root, None, None).expect("prune retained checkpoint");
+    assert!(
+        result.contains("skip unsafe retained checkpoint sidecar"),
+        "{result}"
+    );
+    assert!(
+        unsafe_sidecar.exists(),
+        "unsafe retained entry stays untouched"
+    );
+    assert_eq!(
+        git_checkpoints::list_checkpoints(&root, usize::MAX)
+            .expect("list retained checkpoints")
+            .len(),
+        1
     );
 
     let _ = std::fs::remove_dir_all(&root);
