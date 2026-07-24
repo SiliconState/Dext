@@ -92,6 +92,8 @@ pub(crate) enum RequestContract {
         alias = "openai-compatible"
     )]
     OpenAiChatCompletions,
+    #[serde(rename = "openai-responses", alias = "responses")]
+    OpenAiResponses,
     #[serde(rename = "chatgpt-responses", alias = "chatgpt", alias = "codex")]
     ChatGptResponses,
 }
@@ -108,15 +110,20 @@ impl RequestContract {
     pub(crate) fn api_provider(self) -> ApiProvider {
         match self {
             Self::AnthropicMessages => ApiProvider::Anthropic,
-            Self::OpenAiChatCompletions => ApiProvider::OpenAi,
+            Self::OpenAiChatCompletions | Self::OpenAiResponses => ApiProvider::OpenAi,
             Self::ChatGptResponses => ApiProvider::ChatGpt,
         }
+    }
+
+    pub(crate) fn is_responses(self) -> bool {
+        matches!(self, Self::OpenAiResponses | Self::ChatGptResponses)
     }
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AnthropicMessages => "anthropic-messages",
             Self::OpenAiChatCompletions => "openai-chat-completions",
+            Self::OpenAiResponses => "openai-responses",
             Self::ChatGptResponses => "chatgpt-responses",
         }
     }
@@ -145,6 +152,7 @@ pub(crate) struct ModelSpec {
     pub(crate) context_window: Option<u64>,
     pub(crate) max_output_tokens: Option<u32>,
     pub(crate) effort_levels: Vec<String>,
+    pub(crate) reasoning_modes: Vec<String>,
     pub(crate) capabilities: ModelCapabilities,
     pub(crate) pricing: Option<ModelPricing>,
 }
@@ -154,6 +162,7 @@ pub(crate) struct ResolvedModelSpec {
     pub(crate) context_window: Option<u64>,
     pub(crate) max_output_tokens: Option<u32>,
     pub(crate) effort_levels: Vec<String>,
+    pub(crate) reasoning_modes: Vec<String>,
     pub(crate) tools: bool,
     pub(crate) reasoning: bool,
     pub(crate) image_input: bool,
@@ -397,17 +406,29 @@ fn model_pricing(input: f64, output: f64, cache_read: f64, cache_create: f64) ->
     }
 }
 
-fn gpt_5_6_model_specs(include_unsuffixed_alias: bool) -> HashMap<String, ModelSpec> {
+fn gpt_5_6_model_specs(
+    include_unsuffixed_alias: bool,
+    include_max_effort_and_pro_mode: bool,
+) -> HashMap<String, ModelSpec> {
     let spec = |pricing: ModelPricing| ModelSpec {
         context_window: Some(1_050_000),
         max_output_tokens: Some(128_000),
-        effort_levels: vec![
-            "none".to_string(),
-            "low".to_string(),
-            "medium".to_string(),
-            "high".to_string(),
-            "xhigh".to_string(),
-        ],
+        effort_levels: if include_max_effort_and_pro_mode {
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else {
+            ["none", "low", "medium", "high", "xhigh"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        },
+        reasoning_modes: if include_max_effort_and_pro_mode {
+            vec!["standard".to_string(), "pro".to_string()]
+        } else {
+            Vec::new()
+        },
         capabilities: ModelCapabilities {
             tools: Some(true),
             reasoning: Some(true),
@@ -453,16 +474,12 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
             Some(model_pricing(1.0, 5.0, 0.1, 1.25))
         }
         "anthropic" if model.contains("haiku") => Some(model_pricing(0.8, 4.0, 0.08, 1.0)),
-        "openai" | "chatgpt" if model.starts_with("gpt-5.6-sol") => {
-            Some(model_pricing(5.0, 30.0, 0.5, 6.25))
-        }
+        "openai" | "chatgpt" if model == "gpt-5.6-sol" => Some(model_pricing(5.0, 30.0, 0.5, 6.25)),
         "openai" | "chatgpt" if model == "gpt-5.6" => Some(model_pricing(5.0, 30.0, 0.5, 6.25)),
-        "openai" | "chatgpt" if model.starts_with("gpt-5.6-terra") => {
+        "openai" | "chatgpt" if model == "gpt-5.6-terra" => {
             Some(model_pricing(2.5, 15.0, 0.25, 3.125))
         }
-        "openai" | "chatgpt" if model.starts_with("gpt-5.6-luna") => {
-            Some(model_pricing(1.0, 6.0, 0.1, 1.25))
-        }
+        "openai" | "chatgpt" if model == "gpt-5.6-luna" => Some(model_pricing(1.0, 6.0, 0.1, 1.25)),
         "openai" | "chatgpt" if model.starts_with("gpt-5.4-mini") => {
             Some(model_pricing(0.25, 2.0, 0.025, 0.25))
         }
@@ -514,7 +531,9 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
             image_input: Some(
                 matches!(
                     contract,
-                    RequestContract::AnthropicMessages | RequestContract::ChatGptResponses
+                    RequestContract::AnthropicMessages
+                        | RequestContract::OpenAiResponses
+                        | RequestContract::ChatGptResponses
                 ) || provider_id == "openai",
             ),
             prompt_cache: Some(matches!(
@@ -641,7 +660,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "gpt-5.6-sol".to_string(),
             )]),
             model_defaults: ModelSpec::default(),
-            model_specs: gpt_5_6_model_specs(false),
+            model_specs: gpt_5_6_model_specs(false, false),
         },
         ProviderProfile {
             id: "openai".to_string(),
@@ -684,9 +703,14 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             },
             model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::OpenAiChatCompletions),
-            model_aliases: HashMap::new(),
+            model_aliases: HashMap::from([
+                ("gpt56".to_string(), "gpt-5.6".to_string()),
+                ("gpt56sol".to_string(), "gpt-5.6-sol".to_string()),
+                ("gpt56terra".to_string(), "gpt-5.6-terra".to_string()),
+                ("gpt56luna".to_string(), "gpt-5.6-luna".to_string()),
+            ]),
             model_defaults: ModelSpec::default(),
-            model_specs: gpt_5_6_model_specs(true),
+            model_specs: gpt_5_6_model_specs(true, true),
         },
         ProviderProfile {
             id: "anthropic".to_string(),
@@ -751,6 +775,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 context_window: Some(262_144),
                 max_output_tokens: Some(32_768),
                 effort_levels: Vec::new(),
+                reasoning_modes: Vec::new(),
                 capabilities: ModelCapabilities {
                     tools: Some(true),
                     reasoning: Some(true),
@@ -765,6 +790,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                     context_window: Some(1_048_576),
                     max_output_tokens: Some(131_072),
                     effort_levels: vec!["max".to_string()],
+                    reasoning_modes: Vec::new(),
                     capabilities: ModelCapabilities {
                         tools: Some(true),
                         reasoning: Some(true),
@@ -2016,6 +2042,52 @@ pub(crate) fn request_contract_for_profile(profile: &ProviderProfile) -> Request
         .unwrap_or_else(|| RequestContract::for_api_provider(profile.api_provider))
 }
 
+pub(crate) fn is_gpt_5_6_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
+}
+
+fn is_official_openai_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("api.openai.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && matches!(url.path().trim_end_matches('/'), "" | "/v1")
+}
+
+pub(crate) fn official_openai_gpt_5_6_responses(
+    profile: &ProviderProfile,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    canonical_provider_id(&profile.id) == "openai"
+        && is_official_openai_base_url(base_url)
+        && is_gpt_5_6_model(model)
+}
+
+pub(crate) fn effective_request_contract(
+    profile: &ProviderProfile,
+    base_url: &str,
+    model: &str,
+) -> RequestContract {
+    let configured = request_contract_for_profile(profile);
+    if configured == RequestContract::OpenAiChatCompletions
+        && official_openai_gpt_5_6_responses(profile, base_url, model)
+    {
+        RequestContract::OpenAiResponses
+    } else {
+        configured
+    }
+}
+
 fn normalize_model_alias_key(raw: &str) -> String {
     raw.trim().to_ascii_lowercase().replace(['_', ' '], "-")
 }
@@ -2039,6 +2111,9 @@ fn merge_model_spec(base: &mut ModelSpec, overlay: ModelSpec) {
     }
     if !overlay.effort_levels.is_empty() {
         base.effort_levels = overlay.effort_levels;
+    }
+    if !overlay.reasoning_modes.is_empty() {
+        base.reasoning_modes = overlay.reasoning_modes;
     }
     for (target, value) in [
         (&mut base.capabilities.tools, overlay.capabilities.tools),
@@ -2068,6 +2143,7 @@ fn normalize_model_spec(mut spec: ModelSpec) -> ModelSpec {
     spec.context_window = spec.context_window.filter(|value| *value > 0);
     spec.max_output_tokens = spec.max_output_tokens.filter(|value| *value > 0);
     spec.effort_levels = normalize_effort_levels(spec.effort_levels);
+    spec.reasoning_modes = normalize_effort_levels(spec.reasoning_modes);
     spec.pricing = spec.pricing.filter(|pricing| {
         [
             pricing.input_usd_per_mtok,
@@ -2099,6 +2175,10 @@ pub(crate) fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> Reso
                 .cloned()
         })
         .unwrap_or_else(|| defaults.effort_levels.clone());
+    let reasoning_modes = explicit
+        .filter(|spec| !spec.reasoning_modes.is_empty())
+        .map(|spec| spec.reasoning_modes.clone())
+        .unwrap_or_else(|| defaults.reasoning_modes.clone());
     let contract = request_contract_for_profile(profile);
     ResolvedModelSpec {
         context_window: explicit
@@ -2110,6 +2190,7 @@ pub(crate) fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> Reso
             .and_then(|spec| spec.max_output_tokens)
             .or(defaults.max_output_tokens),
         effort_levels,
+        reasoning_modes,
         tools: capability(
             explicit.and_then(|spec| spec.capabilities.tools),
             defaults.capabilities.tools,
@@ -2128,7 +2209,10 @@ pub(crate) fn resolve_model_spec(profile: &ProviderProfile, model: &str) -> Reso
         prompt_cache: capability(
             explicit.and_then(|spec| spec.capabilities.prompt_cache),
             defaults.capabilities.prompt_cache,
-            contract == RequestContract::ChatGptResponses,
+            matches!(
+                contract,
+                RequestContract::OpenAiResponses | RequestContract::ChatGptResponses
+            ),
         ),
         pricing: explicit
             .and_then(|spec| spec.pricing.clone())
@@ -2282,6 +2366,13 @@ pub(crate) fn provider_request_url(base_url: &str, contract: RequestContract) ->
                 format!("{base}/v1/chat/completions")
             }
         }
+        RequestContract::OpenAiResponses => {
+            if base.ends_with("/v1") {
+                format!("{base}/responses")
+            } else {
+                format!("{base}/v1/responses")
+            }
+        }
         RequestContract::ChatGptResponses => {
             if base.ends_with("/codex/responses") {
                 base.to_string()
@@ -2345,9 +2436,10 @@ pub(crate) fn chatgpt_reasoning_effort(
     effort: crate::ThinkingEffort,
 ) -> Option<&'static str> {
     let raw = effort.as_str();
-    if model.starts_with("gpt-5.6") {
+    if is_gpt_5_6_model(model) {
         return Some(match effort {
             crate::ThinkingEffort::Off => "none",
+            crate::ThinkingEffort::Minimal => "low",
             crate::ThinkingEffort::Low => "low",
             crate::ThinkingEffort::Medium => "medium",
             crate::ThinkingEffort::High => "high",
@@ -2356,6 +2448,9 @@ pub(crate) fn chatgpt_reasoning_effort(
     }
     if effort == crate::ThinkingEffort::Off {
         return None;
+    }
+    if effort == crate::ThinkingEffort::Minimal {
+        return Some("low");
     }
     if model.starts_with("gpt-5.2")
         || model.starts_with("gpt-5.3")
@@ -2389,14 +2484,13 @@ pub(crate) fn chatgpt_reasoning_effort(
 
 pub(crate) fn build_chatgpt_request(
     model: &str,
-    thinking_effort: crate::ThinkingEffort,
+    reasoning_effort: Option<&str>,
     system_text: &str,
     session_id: &str,
     input: Vec<Value>,
     tools: Vec<Value>,
 ) -> Value {
     let model = normalize_chatgpt_model_slug(model);
-    let effort = chatgpt_reasoning_effort(&model, thinking_effort);
     // The ChatGPT codex backend rejects max_output_tokens with HTTP 400
     // ("Unsupported parameter"), so this request must never carry an output
     // cap — not even from DEXT_MAX_OUTPUT_TOKENS or catalog model specs.
@@ -2410,7 +2504,7 @@ pub(crate) fn build_chatgpt_request(
         "text": { "verbosity": "medium" },
         "prompt_cache_key": session_id,
     });
-    if let Some(effort) = effort {
+    if let Some(effort) = reasoning_effort {
         body.as_object_mut()
             .expect("chatgpt request body is always an object")
             .insert(
@@ -2429,11 +2523,60 @@ pub(crate) fn build_chatgpt_request(
     body
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenAiResponsesReasoning<'a> {
+    pub(crate) effort: &'a str,
+    pub(crate) mode: Option<&'a str>,
+    pub(crate) include_encrypted_content: bool,
+}
+
+pub(crate) fn build_openai_responses_request(
+    model: &str,
+    reasoning: Option<OpenAiResponsesReasoning<'_>>,
+    system_text: &str,
+    prompt_cache_key: &str,
+    input: Vec<Value>,
+    tools: Vec<Value>,
+    max_output_tokens: u32,
+) -> Value {
+    let mut body = json!({
+        "model": model.trim(),
+        "store": false,
+        "stream": true,
+        "instructions": system_text,
+        "input": input,
+        "max_output_tokens": max_output_tokens,
+        "text": { "verbosity": "medium" },
+        "prompt_cache_key": prompt_cache_key,
+    });
+    if let Some(reasoning) = reasoning {
+        body["reasoning"] = json!({
+            "effort": reasoning.effort,
+            "summary": "auto",
+        });
+        if reasoning.include_encrypted_content {
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        if let Some(reasoning_mode) = reasoning.mode {
+            body["reasoning"]["mode"] = json!(reasoning_mode);
+        }
+    }
+    if !tools.is_empty() {
+        let object = body
+            .as_object_mut()
+            .expect("OpenAI Responses request body is always an object");
+        object.insert("tool_choice".to_string(), json!("auto"));
+        object.insert("parallel_tool_calls".to_string(), json!(true));
+        object.insert("tools".to_string(), json!(tools));
+    }
+    body
+}
+
 pub(crate) fn build_chatgpt_summary_request(
     model: &str,
     compact_system: &str,
     user_text: &str,
-    reasoning_supported: bool,
+    reasoning_effort: Option<&str>,
 ) -> Value {
     let mut body = json!({
         "model": normalize_chatgpt_model_slug(model),
@@ -2450,12 +2593,12 @@ pub(crate) fn build_chatgpt_summary_request(
         "tool_choice": "none",
         "parallel_tool_calls": false,
     });
-    if reasoning_supported {
+    if let Some(reasoning_effort) = reasoning_effort {
         body.as_object_mut()
             .expect("chatgpt summary request body is always an object")
             .insert(
                 "reasoning".to_string(),
-                json!({ "effort": "low", "summary": "auto" }),
+                json!({ "effort": reasoning_effort, "summary": "auto" }),
             );
     }
     body

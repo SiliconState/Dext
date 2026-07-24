@@ -7,7 +7,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::{
     DEFAULT_SYSTEM, LATEST_LOG_ARCHIVE_MAX, LATEST_LOG_CAP, LATEST_SESSION_NAME, LOG_DETAIL_CAP,
-    SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort,
+    ReasoningMode, SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort,
     byte_prefix_at_char_boundary, byte_suffix_at_char_boundary, cap_bytes_with_hint,
 };
 
@@ -972,6 +972,10 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         thinking_effort: meta["thinking_effort"]
             .as_str()
             .and_then(ThinkingEffort::parse)
+            .unwrap_or_default(),
+        reasoning_mode: meta["reasoning_mode"]
+            .as_str()
+            .and_then(ReasoningMode::parse)
             .unwrap_or_default(),
         compact_threshold_chars: meta["compact_threshold_chars"]
             .as_u64()

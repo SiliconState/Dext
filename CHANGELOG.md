@@ -80,8 +80,14 @@
   successfully completed terminal response; incomplete, failed, truncated, or
   bare-`[DONE]` call streams cannot reach execution.
 - Added GPT-5.6 Sol, Terra, and Luna to the ChatGPT and OpenAI catalogs with
-  model-specific context/output limits, aliases, native `none` through `xhigh`
-  reasoning, long-context pricing, and OpenAI `max_completion_tokens` shaping.
+  model-specific context/output limits, aliases, long-context pricing, and
+  provider-isolated reasoning controls. Official OpenAI API-key GPT-5.6 requests
+  now use `/v1/responses`: `--effort max` sends native `reasoning.effort=max`,
+  while independent `--reasoning-mode standard|pro` / `/reasoning-mode` control
+  `reasoning.mode`; summaries use the same contract. ChatGPT OAuth retains its
+  Codex Responses contract, `none` through `xhigh` effort (`max` maps to
+  `xhigh`), and receives no Platform-only mode field. Other models, custom
+  endpoints, and built-in providers retain their prior request shapes.
 - Added versioned durable-state compatibility fixtures for sessions, provider
   catalog, auth store, tool journal, todo/settings, and checkpoint manifests.
 - Extended `dext doctor` with structured policy/source, sandbox enforcement,
@@ -118,6 +124,32 @@
 
 ### Fixed
 
+- Recovery checkpoint loading now accepts Dext's bounded pre-JSON 8/9-field
+  manifest rows, preserving each row's original field count until normal
+  retention compacts it instead of blocking write-risk tools after an upgrade.
+  Pre-JSON direct hints retain their historical single-path/comma semantics;
+  absolute hints must resolve inside the repository, while relative hints require
+  an exact historical sidecar match or fail closed.
+  Preview omits untracked snapshot entries with unsafe host-native targets,
+  malformed or partly current JSON rows still fail closed, and runtime manifest
+  reads are capped at 16 MiB.
+- Official OpenAI GPT-5.6 Responses requests use flat function tools with
+  `strict:false`, explicitly request opaque encrypted reasoning state for
+  stateless tool continuation, preserve valid returned state only across the
+  current tool turn, and reject or recover incomplete/content-filter terminal
+  states without executing unfinished calls. Content-filter terminals discard
+  visible output, tool calls, and opaque reasoning state. GPT-5.6 compaction now
+  preserves the selected Standard/Pro mode, and Responses main requests and
+  summaries resolve effort through the selected model's advertised levels before
+  nearest-level fallback; `off` sends `none` only when the model advertises it.
+  This avoids unsupported raw effort values and avoids promoting Low/Medium to
+  High when exact levels exist. OpenAI-local `gpt56*` aliases now resolve consistently;
+  only the four supported GPT-5.6 ids auto-select the official Responses route
+  or supported-variant effort mapping. `DEXT_COMPACT_MODEL` aliases are
+  normalized before routing, reasoning-capable Responses summaries retain the
+  larger summary allowance even when main effort is Off, explicitly
+  non-reasoning Responses models omit the reasoning object, and summary usage is
+  priced against the resolved summary model instead of the main model.
 - ChatGPT/Codex `response.failed` events now retain a bounded provider message so
   generic request-ID failures that explicitly say the request can be retried use
   Dext's existing capped pre-output stream retry instead of being misclassified

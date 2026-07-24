@@ -78,9 +78,15 @@ Credentials are stored in Dext state, not in the repository. Do not commit proje
 
 ### Provider catalog metadata
 
-`~/.dext/providers.json` is auto-normalized to catalog v2 while continuing to accept v1 profiles. A provider may set `request_contract` to `anthropic-messages`, `openai-chat-completions`, or `chatgpt-responses`; this controls request and response routing independently of the provider id. Optional `model_aliases`, `model_defaults`, and per-model `model_specs` supply canonical ids, context/output limits, effort levels, capabilities (`tools`, `reasoning`, `image_input`, and `prompt_cache`), and pricing. Explicit per-model metadata takes precedence; context hints embedded in model names (such as `-128k` or `[1m]`) take precedence over provider-wide context defaults. Built-in metadata only fills omitted values. Legacy `context_window`, `model_context_windows`, and `model_effort_levels` fields remain accepted. `DEXT_PROMPT_CACHE=on|off` overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.
+`~/.dext/providers.json` is auto-normalized to catalog v2 while continuing to accept v1 profiles. A provider may set `request_contract` to `anthropic-messages`, `openai-chat-completions`, `openai-responses`, or `chatgpt-responses`; this controls request and response routing independently of the provider id. Optional `model_aliases`, `model_defaults`, and per-model `model_specs` supply canonical ids, context/output limits, effort levels, reasoning modes, capabilities (`tools`, `reasoning`, `image_input`, and `prompt_cache`), and pricing. Explicit per-model metadata takes precedence; a selected effort uses an exact advertised level when available and otherwise clamps to the nearest supported level. Responses main turns and summaries both use the selected model's resolved levels; Off sends `none` only when advertised, otherwise the reasoning object is omitted. Context hints embedded in model names (such as `-128k` or `[1m]`) take precedence over provider-wide context defaults. Built-in metadata only fills omitted values. Legacy `context_window`, `model_context_windows`, and `model_effort_levels` fields remain accepted. `DEXT_PROMPT_CACHE=on|off` overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.
 
-The built-in ChatGPT and OpenAI API catalogs include `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; OpenAI also retains the official unsuffixed `gpt-5.6` Sol alias, while ChatGPT normalizes that shorthand to `gpt-5.6-sol`. Each variant declares a 1,050,000-token context window, 128,000-token output metadata, and native reasoning levels from `none` through `xhigh` (`max` maps to `xhigh`). OpenAI requests use `max_completion_tokens`; ChatGPT/Codex requests deliberately omit the unsupported `max_output_tokens` field. Built-in input/cached-input/output prices per million tokens are Sol `$5/$0.50/$30`, Terra `$2.50/$0.25/$15`, and Luna `$1/$0.10/$6`; above 272,000 input tokens, Dext applies the documented 2× input/cache and 1.5× output tier unless explicit pricing overrides are set.
+The built-in ChatGPT and OpenAI API catalogs include `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; OpenAI also retains the official unsuffixed `gpt-5.6` Sol id, while ChatGPT normalizes it to `gpt-5.6-sol`. Shorthands are `gpt56`/`gpt56sol`, `gpt56terra`, and `gpt56luna`. Each variant declares a 1,050,000-token context window and 128,000-token output metadata.
+
+On the official API-key `openai` provider at `api.openai.com`, the four listed GPT-5.6 ids use `/v1/responses`; unknown `gpt-5.6-*` suffixes do not silently inherit that route. Effort and execution mode are independent: `--effort off|minimal|low|medium|high|xhigh|max` maps through the selected model's advertised levels to native `reasoning.effort` values from `none` through literal `max`, while `--reasoning-mode standard|pro`, `DEXT_REASONING_MODE`, or `/reasoning-mode` sets `reasoning.mode` (default `standard`). Normal requests and compaction summaries use the Responses reasoning object and `max_output_tokens`; summaries resolve their own model's effort metadata and preserve the selected Standard/Pro mode. Function tools use the flat Responses shape with `strict:false`, and tool-bearing stateless requests ask the provider for opaque `reasoning.encrypted_content` so Dext can replay it within the current tool turn. Content-filter terminals discard visible output, function calls, and opaque reasoning state instead of replaying it. The selected mode is shown as `/pro` in the status row and `/status` reports whether it is active. `DEXT_COMPACT_MODEL` is normalized through the active provider; its request contract, reasoning capability, effort levels, mode, and usage pricing are based on the resolved summary model rather than the main conversation model.
+
+The OAuth-backed `chatgpt` provider remains on the Codex Responses contract. Its GPT-5.6 effort levels are `none`, `low`, `medium`, `high`, and `xhigh`; selecting Dext `max` maps to `xhigh`. Dext does not send the Platform-only `reasoning.mode` or `max_output_tokens` fields to that backend. A selected reasoning mode remains visible but inactive after switching to ChatGPT, a non-GPT-5.6 model, a custom endpoint, or any other provider; those request shapes are unchanged.
+
+Built-in input/cached-input/output prices per million tokens are Sol `$5/$0.50/$30`, Terra `$2.50/$0.25/$15`, and Luna `$1/$0.10/$6`; above 272,000 input tokens, Dext applies the documented 2× input/cache and 1.5× output tier unless explicit pricing overrides are set.
 
 The built-in Kimi Code catalog uses Anthropic Messages semantics at `https://api.kimi.com/coding`, defaults to K3, and reports zero incremental token cost because access is covered by the coding plan. Verified K3 metadata enables adaptive thinking with `max` effort and preserves empty thinking signatures required by that model; these compatibility rules do not apply to generic/custom Anthropic profiles.
 
@@ -127,6 +133,8 @@ Useful slash commands:
 /approval ask                 ask before privileged tools
 /sandbox-profile read-only    prevent write operations
 /context tiny                 skinny local/token mode
+/effort max                  select maximum model effort
+/reasoning-mode pro          select GPT-5.6 Pro mode; active only on official OpenAI Responses
 /compact status               inspect compaction threshold/history size
 /preview simple              show direct file-tool mutation previews
 /undo                        preview latest Dext Git checkpoint
@@ -153,6 +161,7 @@ dext "inspect this repo and list missing tests"
 printf 'summarize stdin\n' | dext -p
 dext --output json "return a short answer"
 dext --output stream-json "run a small diagnostic"
+DEXT_PROVIDER=openai DEXT_MODEL=gpt-5.6-terra dext --effort max --reasoning-mode pro "solve this"
 dext --preview simple "make a small documented edit"
 dext undo --list
 dext pack create personal/my-pack
@@ -245,7 +254,14 @@ sidecar directory trees remain untouched and produce bounded warnings without st
 retention cleanup; an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked
 without following it. Owner execute state is retained in metadata. Current manifests record exact
 direct-sidecar membership; older manifests that lack that field fail conservatively before mutation
-when a missing artifact is ambiguous rather than deleting current path content. If path/type/size limits make
+when a missing artifact is ambiguous rather than deleting current path content. Dext also reads its
+bounded pre-JSON 8/9-field manifest rows so upgrades do not block new checkpoints and preserves each
+retained row's original field count. Pre-JSON direct hints keep their historical single-path/comma
+semantics: absolute hints must resolve inside the repository, while relative hints require one exact
+historical sidecar match or preview/apply fails closed. Untracked
+preview entries with unsafe host-native targets are omitted; malformed or partly current JSON rows
+remain fail-closed. Runtime manifest reads are capped at 16 MiB, and normal retention compacts legacy
+rows away. If path/type/size limits make
 untracked recovery partial, Dext asks
 separately before the command and caches approval for the current repository and
 session; approval keeps tracked/staged recovery and the bounded untracked subset,
@@ -438,6 +454,10 @@ DEXT_TOOLSET=default
 DEXT_TOOL_PROFILE=lean
 DEXT_MUTATION_PREVIEW=simple
 DEXT_THINKING_EFFORT=off
+DEXT_REASONING_MODE=standard
+# Optional same-provider compaction model; aliases are normalized and usage is
+# priced against the resolved summary model.
+# DEXT_COMPACT_MODEL=gpt56luna
 DEXT_BUDGET_CAP='$5'
 # Optional pricing overrides in USD per million tokens (local defaults to zero
 # cost unless these are set):

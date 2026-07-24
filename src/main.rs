@@ -20,14 +20,16 @@ mod main_tests;
 
 use anyhow::{Context, Result};
 use provider::{
-    ApiProvider, ModelPricing, ProviderProfile, RequestContract, ResolvedModelSpec,
-    ResolvedProviderConfig, apply_provider_headers, auth_store_path, build_chatgpt_request,
-    build_chatgpt_summary_request, built_in_provider_profiles, cancel_pending_oauth_login,
-    canonical_provider_id, extract_oauth_code_from_callback, find_provider_profile,
-    handle_auth_cli, is_official_kimi_profile, list_models_for_available_providers,
-    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
-    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
-    provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
+    ApiProvider, ModelPricing, OpenAiResponsesReasoning, ProviderProfile, RequestContract,
+    ResolvedModelSpec, ResolvedProviderConfig, apply_provider_headers, auth_store_path,
+    build_chatgpt_request, build_chatgpt_summary_request, build_openai_responses_request,
+    built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
+    effective_request_contract, extract_oauth_code_from_callback, find_provider_profile,
+    handle_auth_cli, is_gpt_5_6_model, is_official_kimi_profile,
+    list_models_for_available_providers, list_models_for_provider, load_auth_store,
+    load_provider_catalog, login_provider, logout_provider, looks_like_login_secret_input,
+    normalize_provider_model_value, official_openai_gpt_5_6_responses, provider_auth_status,
+    provider_catalog_path, provider_id_from_selector, provider_request_url,
     refresh_local_llama_context_window, render_provider_list, render_provider_picker,
     request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
     resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
@@ -165,6 +167,7 @@ fn millis_u64(duration: std::time::Duration) -> u64 {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ThinkingEffort {
     Off,
+    Minimal,
     Low,
     #[default]
     Medium,
@@ -177,6 +180,7 @@ impl ThinkingEffort {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -190,6 +194,7 @@ impl ThinkingEffort {
             Self::Off => {
                 "Disable provider-side reasoning controls where supported; answer directly."
             }
+            Self::Minimal => "Use the least available reasoning beyond none.",
             Self::Low => "Keep reasoning concise and deliver a direct answer quickly.",
             Self::Medium => "Use balanced reasoning depth and concise explanations.",
             Self::High => "Reason carefully through edge cases before answering.",
@@ -205,6 +210,7 @@ impl ThinkingEffort {
     fn parse(v: &str) -> Option<Self> {
         match v.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "disable" | "disabled" | "0" => Some(Self::Off),
+            "minimal" | "min" => Some(Self::Minimal),
             "low" | "l" => Some(Self::Low),
             "medium" | "med" | "m" | "default" => Some(Self::Medium),
             "high" | "h" => Some(Self::High),
@@ -217,6 +223,7 @@ impl ThinkingEffort {
     fn cycle(self, step: i8) -> Self {
         let levels = [
             Self::Off,
+            Self::Minimal,
             Self::Low,
             Self::Medium,
             Self::High,
@@ -227,6 +234,38 @@ impl ThinkingEffort {
         let len = levels.len() as i32;
         let next = (idx + i32::from(step)).rem_euclid(len) as usize;
         levels[next]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReasoningMode {
+    #[default]
+    Standard,
+    Pro,
+}
+
+impl ReasoningMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Pro => "pro",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "standard" | "std" | "default" => Some(Self::Standard),
+            "pro" | "professional" => Some(Self::Pro),
+            _ => None,
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            Self::Standard => Self::Pro,
+            Self::Pro => Self::Standard,
+        }
     }
 }
 
@@ -259,7 +298,7 @@ fn stream_error_body(err: &anyhow::Error) -> String {
 }
 
 fn chatgpt_incomplete_reason(contract: RequestContract, stop_reason: Option<&str>) -> Option<&str> {
-    if contract != RequestContract::ChatGptResponses {
+    if !contract.is_responses() {
         return None;
     }
     match stop_reason? {
@@ -664,9 +703,10 @@ fn crash_event_breadcrumb(event: &AgentEvent) -> Option<String> {
             commands,
             model_changed,
             effort_changed,
+            mode_changed,
             stream_aborted,
         } => Some(format!(
-            "runtime_control_applied:{commands}:model={model_changed}:effort={effort_changed}:abort={stream_aborted}"
+            "runtime_control_applied:{commands}:model={model_changed}:effort={effort_changed}:mode={mode_changed}:abort={stream_aborted}"
         )),
         AgentEvent::SteeringReceived { messages, .. } => {
             Some(format!("steering:messages={messages}"))
@@ -1485,6 +1525,7 @@ enum SlashUiUpdate {
     None,
     ModelProvider,
     ThinkingEffort,
+    ReasoningMode,
     ApprovalProfile,
 }
 
@@ -1881,6 +1922,9 @@ enum AgentEvent {
     ThinkingEffortChanged {
         effort: ThinkingEffort,
     },
+    ReasoningModeChanged {
+        mode: ReasoningMode,
+    },
     ApprovalProfileChanged {
         profile: ApprovalProfile,
     },
@@ -1889,6 +1933,7 @@ enum AgentEvent {
         commands: usize,
         model_changed: bool,
         effort_changed: bool,
+        mode_changed: bool,
         stream_aborted: bool,
     },
     Info(String),
@@ -2029,6 +2074,7 @@ impl EventSink for ConsoleSink {
             AgentEvent::ExternalTelemetry { .. } => {}
             AgentEvent::TurnDiagnostics { .. } => {}
             AgentEvent::ThinkingEffortChanged { .. } => {}
+            AgentEvent::ReasoningModeChanged { .. } => {}
             AgentEvent::ApprovalProfileChanged { .. } => {}
             AgentEvent::RuntimeControl(s) => println!("{s}"),
             AgentEvent::RuntimeControlApplied { stream_aborted, .. } => {
@@ -2384,6 +2430,9 @@ enum Block {
     RedactedThinking {
         data: String,
     },
+    ResponsesReasoning {
+        item: Value,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -2622,6 +2671,7 @@ fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
             Block::Text { text } | Block::PartialStream { text } => text.len(),
             Block::Thinking { text, .. } => text.len(),
             Block::RedactedThinking { data } => data.len(),
+            Block::ResponsesReasoning { item } => json_byte_len(item),
             Block::ToolUse { input, .. } => json_byte_len(input),
             Block::ToolResult { content, .. } => content.len(),
         })
@@ -3500,10 +3550,38 @@ pub(crate) struct WireTool {
     cache_control: Option<CacheControl>,
 }
 
+fn valid_openai_reasoning_item(item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    object.get("type").and_then(Value::as_str) == Some("reasoning")
+        && object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+        && object
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.is_empty())
+}
+
+fn openai_responses_reasoning_effort(effort: ThinkingEffort) -> &'static str {
+    match effort {
+        ThinkingEffort::Off => "none",
+        ThinkingEffort::Minimal => "minimal",
+        ThinkingEffort::Low => "low",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::XHigh => "xhigh",
+        ThinkingEffort::Max => "max",
+    }
+}
+
 fn openai_reasoning_effort(model: &str, effort: ThinkingEffort) -> Option<&'static str> {
-    if model.trim().to_ascii_lowercase().starts_with("gpt-5.6") {
+    if is_gpt_5_6_model(model) {
         return Some(match effort {
             ThinkingEffort::Off => "none",
+            ThinkingEffort::Minimal => "minimal",
             ThinkingEffort::Low => "low",
             ThinkingEffort::Medium => "medium",
             ThinkingEffort::High => "high",
@@ -3512,7 +3590,7 @@ fn openai_reasoning_effort(model: &str, effort: ThinkingEffort) -> Option<&'stat
     }
     match effort {
         ThinkingEffort::Off => None,
-        ThinkingEffort::Low => Some("low"),
+        ThinkingEffort::Minimal | ThinkingEffort::Low => Some("low"),
         ThinkingEffort::Medium => Some("medium"),
         ThinkingEffort::High | ThinkingEffort::XHigh | ThinkingEffort::Max => Some("high"),
     }
@@ -3573,7 +3651,7 @@ fn llama_tool_grammar_for(
 fn anthropic_thinking_budget_tokens(effort: ThinkingEffort) -> Option<u32> {
     match effort {
         ThinkingEffort::Off => None,
-        ThinkingEffort::Low => Some(1_024),
+        ThinkingEffort::Minimal | ThinkingEffort::Low => Some(1_024),
         ThinkingEffort::Medium => Some(2_048),
         ThinkingEffort::High => Some(4_096),
         ThinkingEffort::XHigh | ThinkingEffort::Max => Some(8_192),
@@ -3600,12 +3678,18 @@ fn map_effort_to_provider_levels(levels: &[String], effort: ThinkingEffort) -> O
     };
     match effort {
         ThinkingEffort::Off => None,
-        ThinkingEffort::Low | ThinkingEffort::Medium | ThinkingEffort::High => {
-            pick(&["high", effort.as_str(), "medium", "low"]).or_else(|| levels.first().cloned())
-        }
-        ThinkingEffort::XHigh | ThinkingEffort::Max => {
-            pick(&["max", "xhigh", "high"]).or_else(|| levels.last().cloned())
-        }
+        ThinkingEffort::Minimal => pick(&["minimal", "low", "medium", "high", "xhigh", "max"])
+            .or_else(|| levels.first().cloned()),
+        ThinkingEffort::Low => pick(&["low", "minimal", "medium", "high", "xhigh", "max"])
+            .or_else(|| levels.first().cloned()),
+        ThinkingEffort::Medium => pick(&["medium", "low", "high", "minimal", "xhigh", "max"])
+            .or_else(|| levels.first().cloned()),
+        ThinkingEffort::High => pick(&["high", "medium", "xhigh", "max", "low", "minimal"])
+            .or_else(|| levels.last().cloned()),
+        ThinkingEffort::XHigh => pick(&["xhigh", "high", "max", "medium", "low", "minimal"])
+            .or_else(|| levels.last().cloned()),
+        ThinkingEffort::Max => pick(&["max", "xhigh", "high", "medium", "low", "minimal"])
+            .or_else(|| levels.last().cloned()),
     }
 }
 
@@ -3621,7 +3705,7 @@ fn provider_model_output_config_effort(
 fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option<String> {
     let effort = match effort {
         ThinkingEffort::Off => return None,
-        ThinkingEffort::Low => "low",
+        ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
         ThinkingEffort::Medium => "medium",
         ThinkingEffort::High => "high",
         ThinkingEffort::XHigh => {
@@ -4151,7 +4235,7 @@ fn gpt_5_6_long_context_pricing(
     if matches!(
         canonical_provider_id(provider_id).as_str(),
         "openai" | "chatgpt"
-    ) && normalize_price_model(model).starts_with("gpt-5.6")
+    ) && is_gpt_5_6_model(model)
         && usage.total_input_tokens() > 272_000
         && !pricing_env_override_is_set()
         && openai_pricing(&normalize_price_model(model)).is_some_and(|official| {
@@ -4194,11 +4278,11 @@ fn normalize_price_model(model: &str) -> String {
 }
 
 fn openai_pricing(model: &str) -> Option<UsagePricing> {
-    if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
+    if matches!(model, "gpt-5.6" | "gpt-5.6-sol") {
         Some(UsagePricing::new(5.0, 30.0, 0.5, 6.25))
-    } else if model.starts_with("gpt-5.6-terra") {
+    } else if model == "gpt-5.6-terra" {
         Some(UsagePricing::new(2.5, 15.0, 0.25, 3.125))
-    } else if model.starts_with("gpt-5.6-luna") {
+    } else if model == "gpt-5.6-luna" {
         Some(UsagePricing::new(1.0, 6.0, 0.1, 1.25))
     } else if model.starts_with("gpt-5.4-mini") {
         Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
@@ -11630,11 +11714,14 @@ Keep each section concise. Capture the user's overall goal, key decisions and wh
 const COMPACT_SUMMARY_MAX_TOKENS: u32 = 2_048;
 const COMPACT_SUMMARY_MAX_TOKENS_THINKING: u32 = 8_192;
 
-fn compact_summary_max_tokens(thinking_effort: ThinkingEffort) -> u32 {
-    if thinking_effort == ThinkingEffort::Off {
-        COMPACT_SUMMARY_MAX_TOKENS
-    } else {
+fn compact_summary_max_tokens(
+    thinking_effort: ThinkingEffort,
+    summary_reasoning_enabled: bool,
+) -> u32 {
+    if thinking_effort != ThinkingEffort::Off || summary_reasoning_enabled {
         COMPACT_SUMMARY_MAX_TOKENS_THINKING
+    } else {
+        COMPACT_SUMMARY_MAX_TOKENS
     }
 }
 
@@ -12109,6 +12196,8 @@ struct SessionProvenance {
     api_provider: ApiProvider,
     model: String,
     thinking_effort: ThinkingEffort,
+    #[serde(default)]
+    reasoning_mode: ReasoningMode,
     approval_profile: ApprovalProfile,
     #[serde(default)]
     approval_policy_source: ApprovalPolicySource,
@@ -12155,6 +12244,8 @@ struct SessionHeader {
     #[serde(default)]
     thinking_effort: ThinkingEffort,
     #[serde(default)]
+    reasoning_mode: ReasoningMode,
+    #[serde(default)]
     compact_threshold_chars: Option<usize>,
     #[serde(default)]
     compact_threshold_percent: Option<u8>,
@@ -12200,6 +12291,7 @@ impl Default for SessionHeader {
             sandbox: None,
             usage: Usage::default(),
             thinking_effort: ThinkingEffort::default(),
+            reasoning_mode: ReasoningMode::default(),
             compact_threshold_chars: None,
             compact_threshold_percent: None,
             approval_profile: ApprovalProfile::default(),
@@ -12838,7 +12930,10 @@ fn parse_runtime_control_command(text: &str) -> Option<(&str, &str)> {
 }
 
 fn runtime_control_command_accepts(cmd: &str) -> bool {
-    matches!(cmd, "model" | "effort" | "think" | "thinking")
+    matches!(
+        cmd,
+        "model" | "effort" | "think" | "thinking" | "reasoning-mode" | "reasoning_mode" | "rmode"
+    )
 }
 
 pub(crate) fn parse_active_runtime_control_sequence(text: &str) -> Option<Vec<String>> {
@@ -12904,6 +12999,9 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "effort"
             | "think"
             | "thinking"
+            | "reasoning-mode"
+            | "reasoning_mode"
+            | "rmode"
             | "context"
             | "context-mode"
             | "tool-profile"
@@ -12970,7 +13068,7 @@ fn unsupported_busy_slash_message(text: &str) -> String {
         .filter(|cmd| !cmd.is_empty())
         .unwrap_or("command");
     format!(
-        "queued slash command /{cmd} not run while agent is busy; only /model and /effort (/think) are active runtime controls"
+        "queued slash command /{cmd} not run while agent is busy; only /model, /effort (/think), and /reasoning-mode are active runtime controls"
     )
 }
 
@@ -13081,9 +13179,43 @@ fn apply_runtime_control_command(
                     }
                 }
                 None => emit(
-                    "usage: /effort [off|low|medium|high|xhigh|max|next|prev|status]".to_string(),
+                    "usage: /effort [off|minimal|low|medium|high|xhigh|max|next|prev|status]"
+                        .to_string(),
                 ),
             },
+        }
+        return true;
+    }
+
+    let mode_arg = matches!(cmd, "reasoning-mode" | "reasoning_mode" | "rmode").then_some(arg);
+    if let Some(arg) = mode_arg {
+        let selected = match arg.to_ascii_lowercase().as_str() {
+            "" | "status" => agent.reasoning_mode(),
+            "next" | "+" | "prev" | "previous" | "-" => agent.cycle_reasoning_mode(),
+            _ => match ReasoningMode::parse(arg) {
+                Some(mode) => {
+                    agent.set_reasoning_mode(mode);
+                    mode
+                }
+                None => {
+                    emit("usage: /reasoning-mode [standard|pro|next|prev|status]".to_string());
+                    return true;
+                }
+            },
+        };
+        let active = agent.effective_reasoning_mode();
+        if active == Some(selected.as_str()) {
+            emit(format!(
+                "reasoning mode: {} (active for the next official OpenAI GPT-5.6 Responses request)",
+                selected.as_str()
+            ));
+        } else {
+            emit(format!(
+                "reasoning mode: {} (selected, inactive for {}/{}; no mode field will be sent)",
+                selected.as_str(),
+                agent.provider_id,
+                agent.model
+            ));
         }
         return true;
     }
@@ -13096,6 +13228,8 @@ struct AppliedRuntimeControls {
     commands: usize,
     changed_model: bool,
     changed_effort: bool,
+    changed_mode: bool,
+    effective_mode_changed: bool,
     aborted_stream: bool,
 }
 
@@ -13108,6 +13242,8 @@ fn finish_active_runtime_controls(
     for message in messages {
         let before_model = (agent.provider_id.clone(), agent.model.clone());
         let before_effort = agent.thinking_effort();
+        let before_mode = agent.reasoning_mode();
+        let before_effective_mode = agent.effective_reasoning_mode();
         let mut notes = Vec::new();
         let handled = apply_runtime_control_command(agent, &message, |msg| notes.push(msg));
         for note in notes {
@@ -13123,6 +13259,12 @@ fn finish_active_runtime_controls(
             if agent.thinking_effort() != before_effort {
                 applied.changed_effort = true;
             }
+            if agent.reasoning_mode() != before_mode {
+                applied.changed_mode = true;
+            }
+            if agent.effective_reasoning_mode() != before_effective_mode {
+                applied.effective_mode_changed = true;
+            }
         } else {
             agent.sink.emit(AgentEvent::Warn(format!(
                 "unsupported active runtime control: {}",
@@ -13134,10 +13276,15 @@ fn finish_active_runtime_controls(
         agent.sink.emit(AgentEvent::ThinkingEffortChanged {
             effort: agent.thinking_effort(),
         });
+        agent.sink.emit(AgentEvent::ReasoningModeChanged {
+            mode: agent.reasoning_mode(),
+        });
         if applied.changed_model {
             agent.emit_runtime_provider_state();
         }
-        if abort_stream && (applied.changed_model || applied.changed_effort) {
+        if abort_stream
+            && (applied.changed_model || applied.changed_effort || applied.effective_mode_changed)
+        {
             applied.aborted_stream = true;
             agent.sink.emit(AgentEvent::Warn(
                 "[runtime control] current provider stream stopped; continuing immediately with updated runtime"
@@ -13146,16 +13293,24 @@ fn finish_active_runtime_controls(
             agent.append_latest_log(
                 "runtime_control_abort_stream",
                 &format!(
-                    "commands={} model_changed={} effort_changed={}",
-                    applied.commands, applied.changed_model, applied.changed_effort
+                    "commands={} model_changed={} effort_changed={} mode_changed={} effective_mode_changed={}",
+                    applied.commands,
+                    applied.changed_model,
+                    applied.changed_effort,
+                    applied.changed_mode,
+                    applied.effective_mode_changed
                 ),
             );
         } else {
             agent.append_latest_log(
                 "runtime_control_applied",
                 &format!(
-                    "commands={} model_changed={} effort_changed={}",
-                    applied.commands, applied.changed_model, applied.changed_effort
+                    "commands={} model_changed={} effort_changed={} mode_changed={} effective_mode_changed={}",
+                    applied.commands,
+                    applied.changed_model,
+                    applied.changed_effort,
+                    applied.changed_mode,
+                    applied.effective_mode_changed
                 ),
             );
         }
@@ -13163,6 +13318,7 @@ fn finish_active_runtime_controls(
             commands: applied.commands,
             model_changed: applied.changed_model,
             effort_changed: applied.changed_effort,
+            mode_changed: applied.changed_mode,
             stream_aborted: applied.aborted_stream,
         });
         agent.checkpoint_latest_session("after_runtime_control");
@@ -13203,6 +13359,39 @@ fn apply_runtime_control_for_stream(
 
 fn try_apply_runtime_controls_for_stream(agent: &mut Agent) -> AppliedRuntimeControls {
     apply_runtime_control_for_stream(agent, None)
+}
+
+fn build_responses_summary_body(
+    contract: RequestContract,
+    model: &str,
+    user_text: &str,
+    reasoning_effort: Option<&str>,
+    reasoning_mode: Option<&str>,
+    max_output_tokens: u32,
+) -> Value {
+    match contract {
+        RequestContract::ChatGptResponses => {
+            build_chatgpt_summary_request(model, COMPACT_SYSTEM, user_text, reasoning_effort)
+        }
+        RequestContract::OpenAiResponses => build_openai_responses_request(
+            model,
+            reasoning_effort.map(|effort| OpenAiResponsesReasoning {
+                effort,
+                mode: reasoning_mode,
+                include_encrypted_content: false,
+            }),
+            COMPACT_SYSTEM,
+            "dext-compact",
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": user_text }],
+            })],
+            Vec::new(),
+            max_output_tokens,
+        ),
+        _ => unreachable!("Responses summary requires a Responses contract"),
+    }
 }
 
 fn compaction_user_text_with_evidence(transcript: &str, evidence: &str) -> String {
@@ -13428,7 +13617,9 @@ fn render_transcript_for_summary(msgs: &[Message], context_mode: ContextMode) ->
                         out.push_str(&format!("[{}→partial_stream] {t}\n", m.role));
                     }
                 }
-                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
+                Block::Thinking { .. }
+                | Block::RedactedThinking { .. }
+                | Block::ResponsesReasoning { .. } => {}
                 Block::ToolUse { name, input, .. } => {
                     let s = input.to_string();
                     let truncated: String = s.chars().take(tool_use_cap).collect();
@@ -13879,6 +14070,7 @@ struct Agent {
     model: String,
     api_provider: ApiProvider,
     thinking_effort: ThinkingEffort,
+    reasoning_mode: ReasoningMode,
     system: String,
     history: Vec<Message>,
     tools: Vec<Tool>,
@@ -13997,6 +14189,10 @@ impl Agent {
             .ok()
             .and_then(|v| ThinkingEffort::parse(&v))
             .unwrap_or_default();
+        let reasoning_mode = std::env::var("DEXT_REASONING_MODE")
+            .ok()
+            .and_then(|v| ReasoningMode::parse(&v))
+            .unwrap_or_default();
         let configured_context_mode = std::env::var("DEXT_CONTEXT_MODE")
             .ok()
             .and_then(|value| ContextMode::parse(&value));
@@ -14074,6 +14270,7 @@ impl Agent {
             model,
             api_provider,
             thinking_effort,
+            reasoning_mode,
             system,
             history: Vec::new(),
             tools,
@@ -14324,11 +14521,15 @@ impl Agent {
         })
     }
 
+    fn request_contract_for_model(&self, model: &str) -> RequestContract {
+        self.provider_profile.as_ref().map_or_else(
+            || RequestContract::for_api_provider(self.api_provider),
+            |profile| effective_request_contract(profile, &self.base_url, model),
+        )
+    }
+
     fn request_contract(&self) -> RequestContract {
-        self.provider_profile
-            .as_ref()
-            .map(request_contract_for_profile)
-            .unwrap_or_else(|| RequestContract::for_api_provider(self.api_provider))
+        self.request_contract_for_model(&self.model)
     }
 
     fn route_api_provider(&self) -> ApiProvider {
@@ -14369,13 +14570,13 @@ impl Agent {
         }
         self.resolved_model_spec().map_or_else(
             || {
-                contract == RequestContract::ChatGptResponses
+                contract.is_responses()
                     || (contract == RequestContract::AnthropicMessages
                         && anthropic_prompt_cache_supported(&self.provider_id, &self.model))
             },
             |spec| {
                 if spec.source == "legacy" {
-                    contract == RequestContract::ChatGptResponses
+                    contract.is_responses()
                         || (contract == RequestContract::AnthropicMessages
                             && anthropic_prompt_cache_supported(&self.provider_id, &self.model))
                 } else {
@@ -14385,10 +14586,37 @@ impl Agent {
         )
     }
 
-    fn model_supports_reasoning(&self, model: &str) -> bool {
-        self.provider_profile
+    fn responses_reasoning_effort_for_model(
+        &self,
+        model: &str,
+        effort: ThinkingEffort,
+    ) -> Option<String> {
+        let spec = self
+            .provider_profile
             .as_ref()
-            .is_none_or(|profile| resolve_model_spec(profile, model).reasoning)
+            .map(|profile| resolve_model_spec(profile, model));
+        if spec.as_ref().is_some_and(|spec| !spec.reasoning) {
+            return None;
+        }
+        if let Some(spec) = spec.as_ref().filter(|spec| !spec.effort_levels.is_empty()) {
+            if effort == ThinkingEffort::Off {
+                return spec
+                    .effort_levels
+                    .iter()
+                    .any(|level| level == "none")
+                    .then(|| "none".to_string());
+            }
+            return map_effort_to_provider_levels(&spec.effort_levels, effort);
+        }
+        match self.request_contract_for_model(model) {
+            RequestContract::OpenAiResponses => {
+                Some(openai_responses_reasoning_effort(effort).to_string())
+            }
+            RequestContract::ChatGptResponses => {
+                provider::chatgpt_reasoning_effort(model, effort).map(str::to_string)
+            }
+            _ => None,
+        }
     }
 
     fn model_supports_image_input(&self) -> bool {
@@ -14422,16 +14650,23 @@ impl Agent {
         }
     }
 
-    fn finalize_usage_metrics(&self, usage: &mut Usage) {
-        let model_spec = self.resolved_model_spec();
+    fn finalize_usage_metrics_for_model(&self, usage: &mut Usage, model: &str) {
+        let model_spec = self
+            .provider_profile
+            .as_ref()
+            .map(|profile| resolve_model_spec(profile, model));
         *usage = usage_with_current_pricing(
             *usage,
             &self.provider_id,
-            self.route_api_provider(),
+            self.request_contract_for_model(model).api_provider(),
             &self.base_url,
-            &self.model,
+            model,
             model_spec.as_ref().and_then(|spec| spec.pricing.as_ref()),
         );
+    }
+
+    fn finalize_usage_metrics(&self, usage: &mut Usage) {
+        self.finalize_usage_metrics_for_model(usage, &self.model);
     }
 
     fn finalize_turn_usage_metrics(&self, usage: &mut Usage, blocks: &[Block]) {
@@ -14530,7 +14765,7 @@ impl Agent {
 
     fn provider_status_line(&self) -> String {
         format!(
-            "provider={} contract={} api={} model={} spec={} tools={} reasoning={} image_input={} prompt_cache={} auth={} base={}",
+            "provider={} contract={} api={} model={} spec={} tools={} reasoning={} effort={} reasoning_mode={} mode_active={} image_input={} prompt_cache={} auth={} base={}",
             self.provider_id,
             self.request_contract().as_str(),
             self.route_api_provider().as_str(),
@@ -14538,6 +14773,9 @@ impl Agent {
             self.model_spec_source(),
             self.model_supports_tools(),
             self.resolved_model_spec().is_none_or(|spec| spec.reasoning),
+            self.thinking_effort.as_str(),
+            self.reasoning_mode.as_str(),
+            self.reasoning_mode_is_active(),
             self.model_supports_image_input(),
             self.model_supports_prompt_cache(),
             self.key_source,
@@ -14686,7 +14924,7 @@ impl Agent {
         &self,
         current: ThinkingEffort,
     ) -> Option<(ThinkingEffort, String)> {
-        if self.request_contract() != RequestContract::ChatGptResponses {
+        if !self.request_contract().is_responses() {
             return None;
         }
         let reduced = match current {
@@ -14694,12 +14932,12 @@ impl Agent {
                 ThinkingEffort::Medium
             }
             ThinkingEffort::Medium => ThinkingEffort::Low,
-            ThinkingEffort::Low | ThinkingEffort::Off => return None,
+            ThinkingEffort::Minimal | ThinkingEffort::Low | ThinkingEffort::Off => return None,
         };
         Some((
             reduced,
             format!(
-                "provider recovery: ChatGPT ended a response without producing an executable function call; reduced reasoning effort from {} to {} for the retry",
+                "provider recovery: Responses API ended a response without producing an executable function call; reduced reasoning effort from {} to {} for the retry",
                 current.as_str(),
                 reduced.as_str()
             ),
@@ -14855,6 +15093,31 @@ impl Agent {
         self.thinking_effort
     }
 
+    pub(crate) fn reasoning_mode(&self) -> ReasoningMode {
+        self.reasoning_mode
+    }
+
+    fn reasoning_mode_for_model(&self, model: &str) -> Option<&'static str> {
+        let profile = self.provider_profile.as_ref()?;
+        let spec = resolve_model_spec(profile, model);
+        (self.request_contract_for_model(model) == RequestContract::OpenAiResponses
+            && official_openai_gpt_5_6_responses(profile, &self.base_url, model)
+            && spec.reasoning
+            && spec
+                .reasoning_modes
+                .iter()
+                .any(|mode| mode == self.reasoning_mode.as_str()))
+        .then(|| self.reasoning_mode.as_str())
+    }
+
+    fn reasoning_mode_is_active(&self) -> bool {
+        self.reasoning_mode_for_model(&self.model).is_some()
+    }
+
+    fn effective_reasoning_mode(&self) -> Option<&'static str> {
+        self.reasoning_mode_for_model(&self.model)
+    }
+
     fn compact_threshold_chars(&self) -> usize {
         history_char_budget_with_window(
             self.context_window_tokens(),
@@ -14903,6 +15166,19 @@ impl Agent {
         }
         self.thinking_effort = effort;
         true
+    }
+
+    fn set_reasoning_mode(&mut self, mode: ReasoningMode) -> bool {
+        if self.reasoning_mode == mode {
+            return false;
+        }
+        self.reasoning_mode = mode;
+        true
+    }
+
+    fn cycle_reasoning_mode(&mut self) -> ReasoningMode {
+        self.reasoning_mode = self.reasoning_mode.cycle();
+        self.reasoning_mode
     }
 
     fn cycle_thinking_effort(&mut self, step: i8) -> ThinkingEffort {
@@ -16137,13 +16413,33 @@ impl Agent {
         tools::wire_tools_chatgpt(&self.tools, self.wire_tool_profile())
     }
 
+    fn wire_tools_openai_responses(&self) -> Vec<Value> {
+        let mut tools = self.wire_tools_chatgpt();
+        for tool in &mut tools {
+            tool["strict"] = json!(false);
+        }
+        tools
+    }
+
     fn history_to_chatgpt_input(&self) -> Vec<Value> {
+        self.history_to_responses_input(false)
+    }
+
+    fn history_to_openai_responses_input(&self) -> Vec<Value> {
+        self.history_to_responses_input(true)
+    }
+
+    fn history_to_responses_input(&self, preserve_reasoning_items: bool) -> Vec<Value> {
         let history = self.provider_context_history();
+        let current_turn_start = history
+            .iter()
+            .rposition(is_fresh_user_prompt_message)
+            .unwrap_or(0);
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let mut items = Vec::new();
         let mut msg_counter = 0usize;
 
-        for msg in history {
+        for (message_index, msg) in history.iter().enumerate() {
             for block in &msg.content {
                 match block {
                     Block::Text { text } if text.trim().is_empty() => continue,
@@ -16189,6 +16485,13 @@ impl Agent {
                             "call_id": tool_use_id,
                             "output": content,
                         }));
+                    }
+                    Block::ResponsesReasoning { item }
+                        if preserve_reasoning_items
+                            && message_index >= current_turn_start
+                            && valid_openai_reasoning_item(item) =>
+                    {
+                        items.push(item.clone());
                     }
                     Block::PartialStream { text } => {
                         items.push(json!({
@@ -16243,15 +16546,53 @@ impl Agent {
         let max_output_tokens = self.request_max_output_tokens();
         let url = provider_request_url(&self.base_url, contract);
         match contract {
+            RequestContract::OpenAiResponses => {
+                let mut input = self.history_to_openai_responses_input();
+                append_runtime_env_chatgpt_item(&mut input, sys_env);
+                let reasoning_mode = self.effective_reasoning_mode();
+                let tools = self.wire_tools_openai_responses();
+                let include_encrypted_content = !tools.is_empty()
+                    && self.provider_profile.as_ref().is_some_and(|profile| {
+                        official_openai_gpt_5_6_responses(profile, &self.base_url, &self.model)
+                    });
+                let reasoning_effort =
+                    self.responses_reasoning_effort_for_model(&self.model, effort);
+                let reasoning =
+                    reasoning_effort
+                        .as_deref()
+                        .map(|effort| OpenAiResponsesReasoning {
+                            effort,
+                            mode: reasoning_mode,
+                            include_encrypted_content,
+                        });
+                let mut body = build_openai_responses_request(
+                    &self.model,
+                    reasoning,
+                    sys_stable,
+                    chatgpt_session_id,
+                    input,
+                    tools,
+                    max_output_tokens,
+                );
+                if !self.model_supports_prompt_cache()
+                    && let Some(object) = body.as_object_mut()
+                {
+                    object.remove("prompt_cache_key");
+                }
+                let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
+                Ok((url, bytes))
+            }
             RequestContract::ChatGptResponses => {
                 // Instructions carry only the stable system text; volatile env
                 // state rides as a transient trailing input item so the prefix
                 // stays byte-stable for the Responses API's implicit caching.
                 let mut input = self.history_to_chatgpt_input();
                 append_runtime_env_chatgpt_item(&mut input, sys_env);
+                let reasoning_effort =
+                    self.responses_reasoning_effort_for_model(&self.model, effort);
                 let mut body = build_chatgpt_request(
                     &self.model,
-                    effort,
+                    reasoning_effort.as_deref(),
                     sys_stable,
                     chatgpt_session_id,
                     input,
@@ -16396,7 +16737,10 @@ impl Agent {
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
         match self.request_contract() {
             RequestContract::OpenAiChatCompletions => self.read_stream_oai(resp).await,
-            RequestContract::ChatGptResponses => self.read_stream_chatgpt(resp).await,
+            RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
+                self.read_stream_responses(resp, self.request_contract())
+                    .await
+            }
             RequestContract::AnthropicMessages => self.read_stream(resp).await,
         }
     }
@@ -16447,6 +16791,7 @@ impl Agent {
             sandbox: Some(self.sandbox_root.display().to_string()),
             usage: self.priced_session_usage(),
             thinking_effort: self.thinking_effort,
+            reasoning_mode: self.reasoning_mode,
             compact_threshold_chars: self.compact_threshold_override(),
             compact_threshold_percent: self.compact_threshold_override_percent(),
             approval_profile: self.approval_profile,
@@ -16511,6 +16856,7 @@ impl Agent {
             api_provider: self.route_api_provider(),
             model: self.model.clone(),
             thinking_effort: self.thinking_effort,
+            reasoning_mode: self.reasoning_mode,
             approval_profile: self.approval_profile,
             approval_policy_source: self.approval_policy_source,
             sandbox_profile: self.sandbox_profile,
@@ -16626,6 +16972,7 @@ impl Agent {
             sandbox,
             usage,
             thinking_effort,
+            reasoning_mode,
             compact_threshold_chars,
             compact_threshold_percent,
             approval_profile,
@@ -16654,7 +17001,11 @@ impl Agent {
                     .with_context(|| format!("bad message on line {}", i + 2))?,
             );
         }
-        if provenance.api_provider == ApiProvider::ChatGpt {
+        if provenance.api_provider == ApiProvider::ChatGpt
+            || (provenance.api_provider == ApiProvider::OpenAi
+                && canonical_provider_id(&provenance.provider) == "openai"
+                && is_gpt_5_6_model(&model))
+        {
             normalize_restored_chatgpt_reasoning(&mut hist);
         }
         let source_journal = tool_journal::load_for_session_file(path)
@@ -16675,6 +17026,7 @@ impl Agent {
             .collect();
         self.session_usage = usage;
         self.thinking_effort = thinking_effort;
+        self.reasoning_mode = reasoning_mode;
         self.compact_threshold_percent =
             compact_threshold_percent.filter(|v| (1..=100).contains(v));
         self.compact_threshold_chars = self
@@ -16794,6 +17146,7 @@ impl Agent {
                         // trigger — otherwise stored reasoning would force
                         // compaction of context that is never actually sent.
                         Block::Thinking { .. } | Block::RedactedThinking { .. } => 0,
+                        Block::ResponsesReasoning { item } => json_byte_len(item),
                         Block::ToolUse { input, .. } => json_byte_len(input),
                         Block::ToolResult { content, .. } => content.len(),
                     })
@@ -16892,6 +17245,7 @@ impl Agent {
                     Block::Text { text } | Block::PartialStream { text } => text.len(),
                     Block::Thinking { text, .. } => text.len(),
                     Block::RedactedThinking { data } => data.len(),
+                    Block::ResponsesReasoning { item } => json_byte_len(item),
                     Block::ToolUse { id, name, input } => {
                         id.len() + name.len() + json_byte_len(input)
                     }
@@ -16933,11 +17287,16 @@ impl Agent {
     /// points it at a cheaper slug on the same provider (e.g. claude-haiku-4-5,
     /// glm-4.6) so compaction doesn't pay flagship rates for a terse digest.
     fn compact_summary_model(&self) -> String {
-        std::env::var("DEXT_COMPACT_MODEL")
+        let model = std::env::var("DEXT_COMPACT_MODEL")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| self.model.clone())
+            .unwrap_or_else(|| self.model.clone());
+        self.provider_profile
+            .as_ref()
+            .map_or(model.clone(), |profile| {
+                normalize_provider_model_value(profile, &model)
+            })
     }
 
     fn split_compaction_inputs(&self, old: &[Message]) -> (Vec<Message>, Vec<Message>) {
@@ -17020,7 +17379,9 @@ impl Agent {
                         is_error: *is_error,
                         metadata: metadata.clone(),
                     }),
-                    Block::Thinking { .. } | Block::RedactedThinking { .. } => None,
+                    Block::Thinking { .. }
+                    | Block::RedactedThinking { .. }
+                    | Block::ResponsesReasoning { .. } => None,
                 })
                 .collect();
 
@@ -17043,26 +17404,36 @@ impl Agent {
         let transcript = render_transcript_for_summary(old, self.context_mode);
         let user_text = compaction_user_text_with_evidence(&transcript, evidence);
         let summary_model = self.compact_summary_model();
-        let summary_reasoning_supported = self.model_supports_reasoning(&summary_model);
-        let summary_max_tokens = compact_summary_max_tokens(self.thinking_effort);
 
         #[derive(PartialEq, Eq)]
         enum SummaryParse {
             Anthropic,
             OpenAi,
-            ChatGptSse,
+            Responses(RequestContract),
         }
 
-        let request_contract = self.request_contract();
-        let is_chatgpt_summary = request_contract == RequestContract::ChatGptResponses;
-        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if is_chatgpt_summary {
-            let body = build_chatgpt_summary_request(
+        let summary_contract = self.request_contract_for_model(&summary_model);
+        let is_responses_summary = summary_contract.is_responses();
+        let summary_reasoning_effort = is_responses_summary
+            .then(|| self.responses_reasoning_effort_for_model(&summary_model, ThinkingEffort::Low))
+            .flatten();
+        let summary_reasoning_enabled = summary_reasoning_effort.is_some();
+        let summary_max_tokens =
+            compact_summary_max_tokens(self.thinking_effort, summary_reasoning_enabled);
+        let summary_reasoning_mode = self.reasoning_mode_for_model(&summary_model);
+        let make_responses_summary_body = || {
+            build_responses_summary_body(
+                summary_contract,
                 &summary_model,
-                COMPACT_SYSTEM,
                 &user_text,
-                summary_reasoning_supported,
-            );
-            let url = provider_request_url(&self.base_url, self.request_contract());
+                summary_reasoning_effort.as_deref(),
+                summary_reasoning_mode,
+                summary_max_tokens,
+            )
+        };
+        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if is_responses_summary {
+            let body = make_responses_summary_body();
+            let url = provider_request_url(&self.base_url, summary_contract);
             let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
             let req = apply_provider_headers(
                 self.http_client()
@@ -17070,7 +17441,7 @@ impl Agent {
                     .header("content-type", "application/json")
                     .header("accept", "text/event-stream")
                     .body(bytes),
-                self.request_contract(),
+                summary_contract,
                 &self.api_key,
                 self.provider_profile
                     .as_ref()
@@ -17079,9 +17450,9 @@ impl Agent {
             )?;
             (
                 send_provider_request(req, self.first_byte_timeout()).await?,
-                SummaryParse::ChatGptSse,
+                SummaryParse::Responses(summary_contract),
             )
-        } else if request_contract == RequestContract::OpenAiChatCompletions {
+        } else if summary_contract == RequestContract::OpenAiChatCompletions {
             let reasoning_effort = None;
             let messages = vec![
                 OaiMessage {
@@ -17117,10 +17488,7 @@ impl Agent {
             };
             let mut req = self
                 .http_client()
-                .post(provider_request_url(
-                    &self.base_url,
-                    self.request_contract(),
-                ))
+                .post(provider_request_url(&self.base_url, summary_contract))
                 .header("content-type", "application/json")
                 .json(&body);
             if !self.api_key.trim().is_empty() {
@@ -17152,13 +17520,10 @@ impl Agent {
             };
             let req = apply_provider_headers(
                 self.http_client()
-                    .post(provider_request_url(
-                        &self.base_url,
-                        self.request_contract(),
-                    ))
+                    .post(provider_request_url(&self.base_url, summary_contract))
                     .header("content-type", "application/json")
                     .json(&body),
-                self.request_contract(),
+                summary_contract,
                 &self.api_key,
                 self.provider_profile
                     .as_ref()
@@ -17179,16 +17544,20 @@ impl Agent {
             anyhow::bail!("summary {}", http_status_error(status, &text));
         }
 
-        if parse_mode == SummaryParse::ChatGptSse {
+        let responses_contract = match parse_mode {
+            SummaryParse::Responses(contract) => Some(contract),
+            _ => None,
+        };
+        if let Some(responses_contract) = responses_contract {
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
-                match self.read_stream_chatgpt(resp).await {
+                match self.read_stream_responses(resp, responses_contract).await {
                     Ok((blocks, _finish_reason, mut usage)) => {
                         let fallback_input =
                             ((user_text.len() as u64).saturating_add(3) / 4).max(1);
                         Self::fill_missing_usage_metrics(&mut usage, fallback_input, &blocks);
-                        self.finalize_usage_metrics(&mut usage);
+                        self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
                         let text = blocks
                             .into_iter()
                             .filter_map(|b| match b {
@@ -17220,13 +17589,8 @@ impl Agent {
                                 reason: format!("{} summary stream error", plan.label()),
                             });
                             let _ = self.interrupt_aware_sleep(wait).await;
-                            let body = build_chatgpt_summary_request(
-                                &summary_model,
-                                COMPACT_SYSTEM,
-                                &user_text,
-                                summary_reasoning_supported,
-                            );
-                            let url = provider_request_url(&self.base_url, self.request_contract());
+                            let body = make_responses_summary_body();
+                            let url = provider_request_url(&self.base_url, summary_contract);
                             let bytes =
                                 serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                             let req = apply_provider_headers(
@@ -17235,7 +17599,7 @@ impl Agent {
                                     .header("content-type", "application/json")
                                     .header("accept", "text/event-stream")
                                     .body(bytes),
-                                self.request_contract(),
+                                summary_contract,
                                 &self.api_key,
                                 self.provider_profile.as_ref().is_some_and(|profile| {
                                     is_official_kimi_profile(profile, &self.base_url)
@@ -17265,11 +17629,11 @@ impl Agent {
 
         let json = read_provider_json_body(resp, self.stream_idle_timeout()).await?;
         match parse_mode {
-            SummaryParse::ChatGptSse => unreachable!("handled above"),
+            SummaryParse::Responses(_) => unreachable!("handled above"),
             SummaryParse::OpenAi => {
                 let text = openai_summary_text_from_response(&json)?;
                 let mut usage = Usage::parse_openai(&json["usage"]);
-                self.finalize_usage_metrics(&mut usage);
+                self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
                 Ok((text, usage))
             }
             SummaryParse::Anthropic => {
@@ -17289,7 +17653,7 @@ impl Agent {
                     anyhow::bail!("summary response had no text: {json}");
                 }
                 let mut usage = Usage::parse(&json["usage"]);
-                self.finalize_usage_metrics(&mut usage);
+                self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
                 Ok((text, usage))
             }
         }
@@ -17725,7 +18089,10 @@ impl Agent {
             }
             iterations += 1;
             let runtime_controls = apply_queued_runtime_controls(self);
-            if runtime_controls.changed_model || runtime_controls.changed_effort {
+            if runtime_controls.changed_model
+                || runtime_controls.changed_effort
+                || runtime_controls.effective_mode_changed
+            {
                 incomplete_response_recoveries = 0;
                 request_effort_override = None;
             }
@@ -17733,14 +18100,13 @@ impl Agent {
                 continue;
             }
 
-            let chatgpt_session_id = (self.request_contract() == RequestContract::ChatGptResponses)
-                .then(|| {
-                    format!(
-                        "dext-{}-{}",
-                        self.provider_id,
-                        project_key(&self.sandbox_root)
-                    )
-                });
+            let chatgpt_session_id = self.request_contract().is_responses().then(|| {
+                format!(
+                    "dext-{}-{}",
+                    self.provider_id,
+                    project_key(&self.sandbox_root)
+                )
+            });
             self.partial_stream_text = None;
             let (sys_stable, sys_env) = self.compose_system_parts();
             // Only the stable text lives in the system prompt (with a cache
@@ -18035,7 +18401,7 @@ impl Agent {
                             }
                             continue 'stream_retry;
                         }
-                        if self.request_contract() == RequestContract::ChatGptResponses {
+                        if self.request_contract().is_responses() {
                             let partial_blocks = self.partial_chatgpt_stream_blocks();
                             if maybe_preserve_partial_stream(
                                 &partial_blocks,
@@ -18136,7 +18502,7 @@ impl Agent {
             {
                 last_retry_reason = Some(format!("incomplete response ({reason})"));
                 if reason == "content_filter" {
-                    let note = "[provider recovery halted] ChatGPT ended the response because of its content filter. No function call was executed; revise the request or switch models."
+                    let note = "[provider recovery halted] The Responses API ended the response because of its content filter. No function call was executed; revise the request or switch models."
                         .to_string();
                     self.sink.emit(AgentEvent::Warn(note.clone()));
                     self.append_latest_log("incomplete_response_content_filter", &note);
@@ -18150,7 +18516,7 @@ impl Agent {
                 incomplete_response_recoveries = incomplete_response_recoveries.saturating_add(1);
                 if incomplete_response_recoveries > MAX_INCOMPLETE_RESPONSE_RECOVERIES {
                     let note = format!(
-                        "[provider recovery halted] ChatGPT kept returning incomplete responses after {MAX_INCOMPLETE_RESPONSE_RECOVERIES} automatic recovery requests. The session remains usable; retry with `continue`, lower `/effort`, or switch models."
+                        "[provider recovery halted] The Responses API kept returning incomplete responses after {MAX_INCOMPLETE_RESPONSE_RECOVERIES} automatic recovery requests. The session remains usable; retry with `continue`, lower `/effort`, or switch models."
                     );
                     self.sink.emit(AgentEvent::Warn(note.clone()));
                     self.append_latest_log("incomplete_response_halt", &note);
@@ -18602,9 +18968,7 @@ impl Agent {
         if contract != RequestContract::AnthropicMessages {
             for block in &parsed.blocks {
                 match block {
-                    Block::Thinking { text, .. }
-                        if contract == RequestContract::ChatGptResponses =>
-                    {
+                    Block::Thinking { text, .. } if contract.is_responses() => {
                         self.sink
                             .emit(AgentEvent::ThinkingBlockComplete(text.clone()));
                     }
@@ -18683,12 +19047,12 @@ impl Agent {
         blocks
     }
 
-    async fn read_stream_chatgpt(
+    async fn read_stream_responses(
         &mut self,
         resp: reqwest::Response,
+        contract: RequestContract,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        self.read_provider_stream(resp, RequestContract::ChatGptResponses)
-            .await
+        self.read_provider_stream(resp, contract).await
     }
 }
 
@@ -19025,6 +19389,7 @@ fn render_session_block_html(out: &mut String, block: &Block) {
                 html_escape(&summarize_inline(data, 160))
             );
         }
+        Block::ResponsesReasoning { .. } => {}
         Block::ToolUse { id, name, input } => {
             let input = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
             let _ = write!(
@@ -19214,7 +19579,9 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
                         analysis.failures.push(summarize_inline(content, 180));
                     }
                 }
-                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
+                Block::Thinking { .. }
+                | Block::RedactedThinking { .. }
+                | Block::ResponsesReasoning { .. } => {}
             }
         }
     }
@@ -19550,7 +19917,9 @@ fn build_session_work_map(source: &Path, header: &SessionHeader, history: &[Mess
                         }),
                     );
                 }
-                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
+                Block::Thinking { .. }
+                | Block::RedactedThinking { .. }
+                | Block::ResponsesReasoning { .. } => {}
             }
         }
     }
@@ -20438,6 +20807,11 @@ fn render_session_analysis(
         );
         let _ = writeln!(
             out,
+            "- reasoning_mode: {}",
+            header.provenance.reasoning_mode.as_str()
+        );
+        let _ = writeln!(
+            out,
             "- system_prompt_hash: {}",
             summarize_inline(&header.provenance.system_prompt_hash, 24)
         );
@@ -20516,6 +20890,7 @@ fn grep_session_history(history: &[Message], needle: &str) -> Vec<String> {
                         ));
                     }
                 }
+                Block::ResponsesReasoning { .. } => {}
                 Block::ToolUse { name, input, .. } => {
                     let haystack = format!("{name} {input}");
                     if haystack.to_ascii_lowercase().contains(&needle_lower) {
@@ -22296,7 +22671,11 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "── Context & diagnostics ──");
             let _ = writeln!(
                 w,
-                "  /effort [level]           set model reasoning depth/tool persistence: off|low|medium|high|xhigh|max"
+                "  /effort [level]           set model reasoning depth/tool persistence: off|minimal|low|medium|high|xhigh|max"
+            );
+            let _ = writeln!(
+                w,
+                "  /reasoning-mode [mode]    select standard|pro (active only for official OpenAI GPT-5.6 Responses)"
             );
             let _ = writeln!(
                 w,
@@ -22414,6 +22793,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         Block::Text { .. } => "text",
                         Block::Thinking { .. } => "thinking",
                         Block::RedactedThinking { .. } => "redacted_thinking",
+                        Block::ResponsesReasoning { .. } => "responses_reasoning",
                         Block::ToolUse { .. } => "tool_use",
                         Block::ToolResult { .. } => "tool_result",
                         Block::PartialStream { .. } => "partial_stream",
@@ -22856,7 +23236,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     None => {
                         let _ = writeln!(
                             w,
-                            "usage: /effort [off|low|medium|high|xhigh|max|next|prev|status]"
+                            "usage: /effort [off|minimal|low|medium|high|xhigh|max|next|prev|status]"
                         );
                         None
                     }
@@ -22872,6 +23252,38 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 if changed {
                     ui_update = SlashUiUpdate::ThinkingEffort;
                 }
+            }
+        }
+        "reasoning-mode" | "reasoning_mode" | "rmode" => {
+            let old = agent.reasoning_mode();
+            let next = match arg.to_ascii_lowercase().as_str() {
+                "" | "status" => Some(old),
+                "next" | "+" | "prev" | "previous" | "-" => Some(agent.cycle_reasoning_mode()),
+                _ => ReasoningMode::parse(arg),
+            };
+            if let Some(mode) = next {
+                let changed = mode != old;
+                agent.set_reasoning_mode(mode);
+                if agent.effective_reasoning_mode() == Some(mode.as_str()) {
+                    let _ = writeln!(
+                        w,
+                        "reasoning mode: {} (active for official OpenAI GPT-5.6 Responses)",
+                        mode.as_str()
+                    );
+                } else {
+                    let _ = writeln!(
+                        w,
+                        "reasoning mode: {} (selected, inactive for {}/{}; no mode field is sent)",
+                        mode.as_str(),
+                        agent.provider_id,
+                        agent.model
+                    );
+                }
+                if changed {
+                    ui_update = SlashUiUpdate::ReasoningMode;
+                }
+            } else {
+                let _ = writeln!(w, "usage: /reasoning-mode [standard|pro|next|prev|status]");
             }
         }
         "context" | "context-mode" => {
@@ -23532,6 +23944,9 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         SlashUiUpdate::ThinkingEffort => agent.sink.emit(AgentEvent::ThinkingEffortChanged {
             effort: agent.thinking_effort(),
         }),
+        SlashUiUpdate::ReasoningMode => agent.sink.emit(AgentEvent::ReasoningModeChanged {
+            mode: agent.reasoning_mode(),
+        }),
         SlashUiUpdate::ApprovalProfile => agent.sink.emit(AgentEvent::ApprovalProfileChanged {
             profile: agent.approval_profile(),
         }),
@@ -23578,6 +23993,7 @@ fn approx_tokens_for_message(m: &Message) -> usize {
             Block::Text { text } | Block::PartialStream { text } => text.len(),
             Block::Thinking { text, .. } => text.len(),
             Block::RedactedThinking { data } => data.len(),
+            Block::ResponsesReasoning { item } => json_byte_len(item),
             Block::ToolUse { input, name, .. } => json_byte_len(input) + name.len(),
             Block::ToolResult { content, .. } => content.len(),
         })
@@ -23612,6 +24028,7 @@ fn render_tokens_report(history: &[Message]) -> String {
                 Block::Text { .. } => "text",
                 Block::Thinking { .. } => "thinking",
                 Block::RedactedThinking { .. } => "redacted_thinking",
+                Block::ResponsesReasoning { .. } => "responses_reasoning",
                 Block::ToolUse { .. } => "tool_use",
                 Block::ToolResult { .. } => "tool_result",
                 Block::PartialStream { .. } => "partial_stream",
@@ -24314,6 +24731,7 @@ pub(crate) struct CliOptions {
     pub(crate) budget_cap: Option<BudgetCap>,
     pub(crate) sandbox_profile: Option<SandboxProfile>,
     pub(crate) thinking_effort: Option<ThinkingEffort>,
+    pub(crate) reasoning_mode: Option<ReasoningMode>,
     pub(crate) context_mode: Option<ContextMode>,
     pub(crate) tool_context_profile: Option<ToolContextProfile>,
     pub(crate) tool_profile: Option<ToolProfile>,
@@ -24335,6 +24753,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut budget_cap: Option<BudgetCap> = None;
     let mut sandbox_profile: Option<SandboxProfile> = None;
     let mut thinking_effort: Option<ThinkingEffort> = None;
+    let mut reasoning_mode: Option<ReasoningMode> = None;
     let mut context_mode: Option<ContextMode> = None;
     let mut tool_context_profile: Option<ToolContextProfile> = None;
     let mut tool_profile: Option<ToolProfile> = None;
@@ -24473,12 +24892,21 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--effort" | "--thinking-effort" => {
                 i += 1;
                 let value = argv.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--effort requires off|low|medium|high|xhigh|max")
+                    anyhow::anyhow!("--effort requires off|minimal|low|medium|high|xhigh|max")
                 })?;
                 thinking_effort = Some(ThinkingEffort::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh|max)"
+                        "invalid thinking effort '{value}' (expected off|minimal|low|medium|high|xhigh|max)"
                     )
+                })?);
+            }
+            "--reasoning-mode" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--reasoning-mode requires standard|pro"))?;
+                reasoning_mode = Some(ReasoningMode::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("invalid reasoning mode '{value}' (expected standard|pro)")
                 })?);
             }
             "--output" => {
@@ -24520,8 +24948,14 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .unwrap_or_default();
                 thinking_effort = Some(ThinkingEffort::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh|max)"
+                        "invalid thinking effort '{value}' (expected off|minimal|low|medium|high|xhigh|max)"
                     )
+                })?);
+            }
+            _ if arg.starts_with("--reasoning-mode=") => {
+                let value = arg.trim_start_matches("--reasoning-mode=");
+                reasoning_mode = Some(ReasoningMode::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("invalid reasoning mode '{value}' (expected standard|pro)")
                 })?);
             }
             _ if arg.starts_with("--context-mode=") => {
@@ -24632,6 +25066,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         budget_cap,
         sandbox_profile,
         thinking_effort,
+        reasoning_mode,
         context_mode,
         tool_context_profile,
         tool_profile,
@@ -24866,7 +25301,10 @@ async fn main() -> Result<()> {
         println!("       dext --preview off|simple|git  mutation preview mode");
         println!("       dext --sandbox read-only|workspace-write|danger-full-access");
         println!(
-            "       dext --effort off|low|medium|high|xhigh|max  set provider reasoning effort"
+            "       dext --effort off|minimal|low|medium|high|xhigh|max  set provider reasoning effort"
+        );
+        println!(
+            "       dext --reasoning-mode standard|pro  select GPT-5.6 Responses execution mode"
         );
         println!(
             "       dext --frugal        minimize prompt/tool/history context for lower token cost"
@@ -24887,7 +25325,7 @@ async fn main() -> Result<()> {
         println!("       dext undo --apply <id>   non-interactive apply");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
         );
         return Ok(());
     }
@@ -24945,6 +25383,9 @@ async fn main() -> Result<()> {
     if let Some(effort) = opts.thinking_effort {
         agent.set_thinking_effort(effort);
     }
+    if let Some(mode) = opts.reasoning_mode {
+        agent.set_reasoning_mode(mode);
+    }
     if let Some(mode) = opts.context_mode {
         agent.set_context_mode(mode);
     }
@@ -24976,6 +25417,22 @@ async fn main() -> Result<()> {
         };
         match loaded {
             Ok(path) => {
+                let configured_effort = opts.thinking_effort.or_else(|| {
+                    std::env::var("DEXT_THINKING_EFFORT")
+                        .ok()
+                        .and_then(|value| ThinkingEffort::parse(&value))
+                });
+                if let Some(effort) = configured_effort {
+                    agent.set_thinking_effort(effort);
+                }
+                let configured_reasoning_mode = opts.reasoning_mode.or_else(|| {
+                    std::env::var("DEXT_REASONING_MODE")
+                        .ok()
+                        .and_then(|value| ReasoningMode::parse(&value))
+                });
+                if let Some(mode) = configured_reasoning_mode {
+                    agent.set_reasoning_mode(mode);
+                }
                 let configured_context_mode = opts.context_mode.or_else(|| {
                     std::env::var("DEXT_CONTEXT_MODE")
                         .ok()

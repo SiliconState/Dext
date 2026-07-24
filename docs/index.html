@@ -599,7 +599,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Key Enums and Structs</h3>
 <table>
 <tr><th>Type</th><th>Defined In</th><th>Purpose</th></tr>
-<tr><td><code>ThinkingEffort</code></td><td>main.rs</td><td>Reasoning depth: Off, Low, Medium, High, XHigh, Max</td></tr>
+<tr><td><code>ThinkingEffort</code></td><td>main.rs</td><td>Reasoning depth: Off, Minimal, Low, Medium, High, XHigh, Max</td></tr>
+<tr><td><code>ReasoningMode</code></td><td>main.rs</td><td>Independent Standard or Pro execution mode; active only for official OpenAI GPT-5.6 Responses requests</td></tr>
 <tr><td><code>OutputMode</code></td><td>main.rs</td><td>Text, Json, StreamJson — output format for non-interactive mode</td></tr>
 <tr><td><code>ApprovalProfile</code></td><td>main.rs</td><td>Ask, AutoRead, AutoWrite, Never, Always — permission gating</td></tr>
 <tr><td><code>SandboxProfile</code></td><td>main.rs</td><td>ReadOnly, WorkspaceWrite, DangerFullAccess</td></tr>
@@ -631,13 +632,15 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <table>
 <tr><th>Provider</th><th>API</th><th>Request Builder</th></tr>
 <tr><td>Anthropic / GLM / Kimi Code</td><td>Messages API (<code>/v1/messages</code>)</td><td><code>Request</code> struct with <code>AnthropicThinking</code></td></tr>
-<tr><td>OpenAI / DeepSeek / Local</td><td>Chat Completions (<code>/v1/chat/completions</code>)</td><td><code>OaiRequest</code> with <code>reasoning_effort</code></td></tr>
-<tr><td>ChatGPT / Codex</td><td>Responses API (<code>/codex/responses</code>)</td><td><code>build_chatgpt_request()</code></td></tr>
+<tr><td>Official OpenAI GPT-5.6 / explicit custom Responses profiles</td><td>Responses API (<code>/v1/responses</code>)</td><td><code>build_openai_responses_request()</code>; official GPT-5.6 adds independent <code>reasoning.effort</code> and <code>reasoning.mode</code></td></tr>
+<tr><td>Other OpenAI / DeepSeek / Local</td><td>Chat Completions (<code>/v1/chat/completions</code>)</td><td><code>OaiRequest</code> with provider-compatible <code>reasoning_effort</code></td></tr>
+<tr><td>ChatGPT / Codex</td><td>Codex Responses API (<code>/codex/responses</code>)</td><td><code>build_chatgpt_request()</code>; no Platform-only mode field</td></tr>
 </table>
 <h3>Transport Deadlines and Body Bounds</h3>
 <p>The shared provider client uses a 15-second connect timeout. Cloud requests allow 180 seconds to first response headers and 90 seconds between stream chunks; local llama.cpp requests default to 600 seconds and 300 seconds respectively. <code>DEXT_PROVIDER_CONNECT_TIMEOUT_SECS</code>, <code>DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS</code>, and <code>DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS</code> accept positive overrides. Initial requests and compaction retries use the same first-byte policy. Non-stream compaction responses use the stream-idle deadline while reading and reject JSON bodies above 4 MiB; provider error diagnostics stop at 4,000 bytes.</p>
 <p><code>src/sse.rs</code> limits its in-progress input buffer to one configured event plus at most four delimiter bytes before rejection. One large network read may still contain many valid small events; the decoder drains complete frames incrementally rather than rejecting by chunk size.</p>
-<p>ChatGPT Responses terminal events with <code>status=incomplete</code> are recoverable rather than fatal protocol errors. Dext executes only function calls that reached a streamed completion event and discards truncated calls, ignoring complete-looking terminal snapshots for those unfinished calls. Discarded live text/thinking preview state is reset; interactive warnings identify the recovery. If no executable call remains, Dext issues a bounded continuation request with a concise runtime hint; provider-reported content filtering halts immediately instead of retrying. Recovery lowers ChatGPT reasoning effort for that request only (for example, <code>xhigh</code> to <code>medium</code>) without changing the user-selected effort or consuming the normal tool-iteration budget. After three unsuccessful continuation requests, Dext halts the turn with guidance while keeping the session usable.</p>
+<p>Responses terminal events with <code>status=incomplete</code> are recoverable rather than fatal protocol errors. Dext executes only function calls that reached a streamed completion event and discards truncated calls, ignoring complete-looking terminal snapshots for those unfinished calls. Discarded live text/thinking preview state is reset; a content-filter terminal also discards function calls and opaque encrypted reasoning state. Interactive warnings identify the recovery. If no executable call remains, Dext issues a bounded continuation request with a concise runtime hint; provider-reported content filtering halts immediately instead of retrying. Recovery lowers reasoning effort for that request only (for example, <code>xhigh</code> to <code>medium</code>) without changing the user-selected effort or consuming the normal tool-iteration budget. After three unsuccessful continuation requests, Dext halts the turn with guidance while keeping the session usable.</p>
+<p>Official OpenAI GPT-5.6 uses stateless Responses requests with <code>store:false</code>. Tool-bearing requests explicitly include <code>reasoning.encrypted_content</code>; when the provider returns a valid opaque reasoning item, Dext retains it in session history and replays it only within the current user/tool turn. Older-turn reasoning and malformed or placeholder items are omitted. ChatGPT/Codex input continues to omit persisted reasoning items. OpenAI Responses tools use the flat function shape with <code>strict:false</code>; ChatGPT/Codex tools retain their existing flat <code>strict:null</code> shape.</p>
 <h3>Session Persistence</h3>
 <p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). This header is the replay anchor for deterministic restore behavior.</p>
 <h3>Eval Harness</h3>
@@ -690,7 +693,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Three wire-format families:</p>
 <ul>
 <li><code>Anthropic</code> — Anthropic Messages API (also used by GLM via <code>api.z.ai/api/anthropic</code>)</li>
-<li><code>OpenAi</code> — OpenAI Chat Completions API (also used by DeepSeek, local llama.cpp)</li>
+<li><code>OpenAi</code> — OpenAI-compatible APIs. Ordinary models use Chat Completions; the built-in official <code>openai</code> profile routes GPT-5.6 at <code>api.openai.com</code> through the Platform Responses API.</li>
 <li><code>ChatGpt</code> — ChatGPT Responses API (OAuth-backed)</li>
 </ul>
 <h3>Built-in Providers</h3>
@@ -720,6 +723,10 @@ dext --frugal --effort off    # low-token mode</code></pre>
 </ol>
 <h3>ChatGPT Model Normalization</h3>
 <p>Compact aliases are canonicalized (for example <code>gpt5codex</code> → <code>gpt-5-codex</code> and ChatGPT <code>gpt-5.6</code> → <code>gpt-5.6-sol</code>). GLM models get an automatic <code>glm-</code> prefix when omitted, and model-name context hints such as <code>[1m]</code> are honored.</p>
+<h3>GPT-5.6 Responses Controls</h3>
+<p>The built-in OpenAI and ChatGPT catalogs include <code>gpt-5.6-sol</code>, <code>gpt-5.6-terra</code>, and <code>gpt-5.6-luna</code>; OpenAI also keeps the official unsuffixed <code>gpt-5.6</code> Sol id, while ChatGPT normalizes it to <code>gpt-5.6-sol</code>. Compact aliases are <code>gpt56</code>/<code>gpt56sol</code>, <code>gpt56terra</code>, and <code>gpt56luna</code>. All variants declare 1,050,000-token context and 128,000-token output metadata.</p>
+<p>For API-key OpenAI at the official endpoint, the four listed GPT-5.6 ids use <code>/v1/responses</code>; unknown <code>gpt-5.6-*</code> suffixes do not silently inherit that route. GPT-5.6 effort levels are <code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, and native <code>max</code>. Standard versus Pro is an independent model mode, defaults to Standard, and is carried inside the Responses <code>reasoning</code> object. Main turns and compaction summaries resolve effort through the selected model's advertised levels; unsupported selections clamp, and Off emits <code>none</code> only when advertised. Summaries preserve the selected Standard/Pro mode and receive Dext's reasoning-aware summary allowance whenever the summary model resolves a Responses reasoning effort, even when main-turn effort is Off. Tool-bearing stateless requests ask for opaque encrypted reasoning state so current-turn function-call continuation can replay it. <code>DEXT_COMPACT_MODEL</code> is normalized through the active provider; request contract, reasoning capability, effort levels, mode, and usage pricing come from the resolved summary model. This capability-scoped route does not change custom OpenAI-compatible endpoints or non-GPT-5.6 models.</p>
+<p>ChatGPT OAuth retains its Codex Responses contract and GPT-5.6 levels from <code>none</code> through <code>xhigh</code>; Dext <code>max</code> maps to <code>xhigh</code>. It receives neither <code>reasoning.mode</code> nor <code>max_output_tokens</code>. Other built-in providers retain their prior model-specific request shaping.</p>
 <h3>Authentication</h3>
 <p>Credentials stored in <code>~/.dext/auth.json</code>. Two types: <code>ApiKey</code> (plain key, supports env var refs and <code>!command</code> secret references) and <code>OAuth</code> (access token + refresh token + expiry, used by ChatGPT). Provider/profile resolution merges built-ins with user catalog overrides while pruning retired bundled providers.</p>
 </div>
@@ -746,7 +753,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <ul>
 <li><code>wire_tools()</code> — Anthropic format with <code>cache_control: ephemeral</code></li>
 <li><code>wire_tools_oai()</code> — OpenAI <code>function</code> type format</li>
-<li><code>wire_tools_chatgpt()</code> — ChatGPT flattened format with <code>strict: null</code></li>
+<li><code>wire_tools_chatgpt()</code> — ChatGPT flattened Responses format with <code>strict: null</code></li>
+<li><code>wire_tools_openai_responses()</code> — OpenAI Platform flattened Responses format with <code>strict: false</code></li>
 </ul>
 <p>Runtime-only pack and shelf commands are intentionally separate from provider-visible tools. Packs act as modular battery packs: Dext creates, discovers, inspects, maintains, and invokes shelf-contained workflows through the existing tool, approval, and sandbox surface. Dext ships no pack content and adds no pack-specific provider-visible tools.</p>
 </div>
@@ -787,7 +795,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Layout</h3>
 <ul>
 <li><strong>Transcript area</strong> — Scrollable message history with user, assistant, tool, thinking, and steering lines</li>
-<li><strong>Live status bar</strong> — Provider, model, thinking effort, approval profile, context pressure, usage stats</li>
+<li><strong>Live status bar</strong> — Provider, model, thinking effort and selected <code>/pro</code> mode when applicable, approval profile, context pressure, usage stats</li>
 <li><strong>Input panel</strong> — Multi-line text input with history (200 entries), completion for slash commands</li>
 <li><strong>Work map drawer</strong> — Collapsible work-ledger visualization</li>
 </ul>
@@ -833,7 +841,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li><strong>Create</strong> — Immediately before each sequential tool dispatch, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;-&lt;random-nonce&gt;</code>; a later call in one round therefore captures state produced by earlier calls</li>
 <li><strong>Dirty state capture</strong> — If the worktree is dirty, <code>git stash create</code> captures a snapshot without touching the working tree or reflog</li>
 <li><strong>Untracked sidecars</strong> — Direct file tools preserve an untracked target. Write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> checkpoints inventory up to 500 existing untracked paths, preserve regular files within 8 MiB/file and 32 MiB total bounds, and preserve bounded UTF-8 symlink targets without following them. Non-UTF-8 names, unsupported types, and path/type/size bounds are explicit partial-recovery gaps. Checkpoint storage containers must be real directories; on Unix they must be current-user-owned, <code>.dext</code> must not be group/world-writable, and managed checkpoint, sidecar, and blob directories are owner-private. Locked Unix mutations may repair modes only on current-user-owned managed directories; inspection does not repair them, restore rejects unsafe sidecar/blob containers, and pruning retains unsafe artifact directory trees with bounded warnings while unlinking only an orphan top-level sidecar symlink without following it. Regular-file content is stored in owner-private SHA-256-addressed blobs shared by retained checkpoints; unchanged source paths reuse the session cache only while source and blob metadata fingerprints remain stable, preview/restore rehash blobs before trusting them, and prune or failed checkpoint creation removes valid unreferenced/new blobs. Malformed or unsafe blob entries and sidecar directory trees remain untouched and produce bounded warnings without stopping other retention cleanup; an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked without following it. Owner execute state is descriptor metadata. Current manifests record exact direct-sidecar membership; older manifests without that field fail conservatively before mutation when a missing artifact is ambiguous rather than deleting current path content. A recovery gap triggers separate repository/session-scoped approval: denial blocks the command, while approval preserves tracked/staged state and the bounded subset. Other checkpoint failures remain fail-closed. Repositories without an initial commit still block writes that would overwrite existing state. A workspace with no <code>.git</code> marker is non-Git unless ambient <code>GIT_DIR</code>/<code>GIT_WORK_TREE</code>/<code>GIT_COMMON_DIR</code> routing exists; routed-without-marker and malformed-marker cases fail loudly because Dext-owned Git commands scrub routing variables.</li>
-<li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude</li>
+<li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude. Dext accepts its bounded pre-JSON 8/9-field rows during upgrades and preserves each retained row's original field count. Pre-JSON direct hints keep their historical single-path/comma semantics: absolute hints must resolve inside the repository, while relative hints require one exact historical sidecar match or preview/apply fails closed. Untracked preview entries with unsafe host-native targets are omitted; malformed or partly current JSON rows remain fail-closed. Runtime manifest reads are capped at 16 MiB, and normal retention compacts legacy rows away.</li>
 </ol>
 <h3>Restore Modes</h3>
 <table>
@@ -1122,7 +1130,8 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>dext --sandbox read-only|workspace-write|danger-full-access</code></td><td>Set sandbox profile</td></tr>
 <tr><td><code>dext --eval</code></td><td>Run eval harness</td></tr>
 <tr><td><code>dext --output json|stream-json</code></td><td>Machine-readable output</td></tr>
-<tr><td><code>dext --effort off|low|medium|high|xhigh|max</code></td><td>Thinking effort</td></tr>
+<tr><td><code>dext --effort off|minimal|low|medium|high|xhigh|max</code></td><td>Model reasoning effort; supported levels are clamped per model</td></tr>
+<tr><td><code>dext --reasoning-mode standard|pro</code></td><td>Select GPT-5.6 execution mode; sent only by official OpenAI Responses requests</td></tr>
 <tr><td><code>dext --approval ask|auto-read|auto-write|never|always</code></td><td>Approval profile</td></tr>
 <tr><td><code>dext --trust</code></td><td>Explicitly select approval <code>always</code></td></tr>
 <tr><td><code>dext --no-trust</code></td><td>Explicitly select the default <code>ask</code> approval profile</td></tr>
@@ -1169,7 +1178,8 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>/sandbox [path]</code></td><td>Show or change sandbox root</td></tr>
 <tr><td><code>/sandbox-profile [profile]</code></td><td>Set sandbox: read-only, workspace-write, danger-full-access</td></tr>
 <tr><td><code>/privacy [on|strict|off|status]</code></td><td>Control local redaction and optional strict native-read path blocking</td></tr>
-<tr><td><code>/effort [level]</code></td><td>Set thinking effort: off, low, medium, high, xhigh, max</td></tr>
+<tr><td><code>/effort [level]</code></td><td>Set thinking effort: off, minimal, low, medium, high, xhigh, max</td></tr>
+<tr><td><code>/reasoning-mode [standard|pro|next|prev|status]</code></td><td>Select or inspect GPT-5.6 execution mode; reports inactive outside official OpenAI Responses</td></tr>
 <tr><td><code>/model [name]</code></td><td>Show or change model</td></tr>
 <tr><td><code>/provider [id]</code></td><td>Show or change provider</td></tr>
 <tr><td><code>/models</code></td><td>List available models</td></tr>
@@ -1271,6 +1281,10 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>ANTHROPIC_BASE_URL</code></td><td>Profile default</td><td>Override Anthropic-family base URL</td></tr>
 <tr><td><code>OPENAI_BASE_URL</code></td><td>Profile default</td><td>Override OpenAI-family base URL</td></tr>
 <tr><td><code>DEXT_CONTEXT_MODE</code></td><td>standard</td><td>Context mode: standard, frugal, tiny</td></tr>
+<tr><td><code>DEXT_THINKING_EFFORT</code></td><td>medium</td><td>Model reasoning effort: off, minimal, low, medium, high, xhigh, max</td></tr>
+<tr><td><code>DEXT_REASONING_MODE</code></td><td>standard</td><td>Selected GPT-5.6 execution mode: standard or pro; sent only by the capability-scoped official OpenAI Responses route</td></tr>
+<tr><td><code>DEXT_COMPACT_MODEL</code></td><td>Active model</td><td>Optional same-provider summary model; normalized through the provider and used for summary request contract, reasoning capability, mode, and usage pricing</td></tr>
+<tr><td><code>DEXT_MAX_OUTPUT_TOKENS</code></td><td>Model/default cap</td><td>Positive streaming output-token override; ChatGPT/Codex deliberately omits the unsupported field</td></tr>
 <tr><td><code>DEXT_TOOLSET</code></td><td>default</td><td>Provider-visible tool count profile: default, full</td></tr>
 <tr><td><code>DEXT_TOOL_PROFILE</code></td><td>lean</td><td>Tool schema profile: full, lean</td></tr>
 <tr><td><code>DEXT_MUTATION_PREVIEW</code></td><td>simple</td><td>Mutation preview mode: off, simple, git</td></tr>
@@ -1321,12 +1335,12 @@ credential-env: [SERVICE_TOKEN]
 <ul>
 <li>Uses the OpenAI OAuth flow with a local callback server on port 1455</li>
 <li>Catalog models include GPT-5.6 Sol/Terra/Luna, gpt-5.4 and 5.4-mini, gpt-5.5, Codex variants, gpt-5/mini, gpt-4.1, gpt-4o/mini, o3/o3-mini, and o4-mini.</li>
-<li>GPT-5.6 variants declare 1.05M context and 128K output metadata; other models use the provider fallback or explicit model overrides. Auth: <code>dext auth login chatgpt</code> or <code>CHATGPT_ACCESS_TOKEN</code>.</li>
+<li>GPT-5.6 variants declare 1.05M context and 128K output metadata. This OAuth backend accepts reasoning effort through <code>xhigh</code>; Dext <code>max</code> maps to <code>xhigh</code>, and selected Standard/Pro mode is not sent. Auth: <code>dext auth login chatgpt</code> or <code>CHATGPT_ACCESS_TOKEN</code>.</li>
 </ul>
 <h3>OpenAI API</h3>
 <ul>
-<li>Standard OpenAI Platform API using API-key auth</li>
-<li>Catalog models include the official gpt-5.6 Sol alias plus Sol/Terra/Luna variants, gpt-5/mini, gpt-4.1/mini, gpt-4o/mini, o3/o3-mini, and o4-mini. Model-specific metadata overrides the 400K provider fallback.</li>
+<li>Standard OpenAI Platform API using API-key auth. The built-in official endpoint routes GPT-5.6 through <code>/v1/responses</code>; other models retain Chat Completions.</li>
+<li>Catalog models include the official <code>gpt-5.6</code> Sol id plus Sol/Terra/Luna variants, gpt-5/mini, gpt-4.1/mini, gpt-4o/mini, o3/o3-mini, and o4-mini. GPT-5.6 exposes native <code>minimal</code> through <code>max</code> effort plus independent Standard/Pro mode; model-specific metadata overrides the 400K provider fallback.</li>
 <li>Auth: API key via <code>OPENAI_API_KEY</code> or <code>dext auth login openai &lt;key&gt;</code></li>
 </ul>
 <h3>Anthropic</h3>
@@ -1357,7 +1371,7 @@ credential-env: [SERVICE_TOKEN]
 <p>Provider catalogs and auth stores are read through bounded non-symlink regular-file checks. On Unix, foreign ownership is rejected; group/world-writable provider catalogs are rejected; owner-owned auth files with loose mode are repaired to <code>0600</code> before parsing. <code>dext doctor</code> uses bounded, no-follow, inode-stable inspection and reports the same ownership/mode policy without repairing files.</p>
 <h3><code>providers.json</code> (~/.dext/providers.json)</h3>
 <p>Provider catalog with merged built-in + custom profiles. Editable via <code>/provider</code> and <code>/model</code> commands. Auto-normalized on load.</p>
-<p>Catalog v2 profiles may set <code>request_contract</code> to <code>anthropic-messages</code>, <code>openai-chat-completions</code>, or <code>chatgpt-responses</code>. Optional <code>model_aliases</code>, <code>model_defaults</code>, and <code>model_specs</code> provide canonical model ids, limits, effort levels, capabilities, and pricing. Explicit per-model metadata wins; context hints in model names such as <code>-128k</code> and <code>[1m]</code> win over provider-wide context defaults. Built-in metadata only fills omissions, and v1 profile fields remain accepted. <code>DEXT_PROMPT_CACHE=on|off</code> overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.</p>
+<p>Catalog v2 profiles may set <code>request_contract</code> to <code>anthropic-messages</code>, <code>openai-chat-completions</code>, <code>openai-responses</code>, or <code>chatgpt-responses</code>. Optional <code>model_aliases</code>, <code>model_defaults</code>, and <code>model_specs</code> provide canonical model ids, limits, effort levels, reasoning modes, capabilities, and pricing. Explicit per-model metadata wins; a selected effort uses an exact advertised level when available and otherwise clamps to the nearest supported level. Responses main turns and summaries both use this resolved effort metadata; Off sends <code>none</code> only when advertised, otherwise the reasoning object is omitted. Context hints in model names such as <code>-128k</code> and <code>[1m]</code> win over provider-wide context defaults. Built-in metadata only fills omissions, and v1 profile fields remain accepted. The built-in official OpenAI profile selects <code>openai-responses</code> automatically only for GPT-5.6 at <code>api.openai.com</code>; custom profiles may select it explicitly without inheriting GPT-5.6-only Standard/Pro behavior. <code>DEXT_PROMPT_CACHE=on|off</code> overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.</p>
 <h3><code>auth.json</code> (~/.dext/auth.json)</h3>
 <p>API-key entries may reference a parent environment variable by name or intentionally run a <code>!command</code> through <code>bash -lc</code>. Treat write access to this store as code-execution authority.</p>
 <p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types. Credential-shaped parent environment variables are removed from agent-run subprocesses by default. <code>DEXT_INHERIT_TOOL_CREDENTIALS=1</code> opts in only trusted model-invoked bash/external tools; hooks and Dext-owned subprocesses remain scrubbed.</p>

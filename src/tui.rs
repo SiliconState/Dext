@@ -27,12 +27,13 @@ use tui_markdown::{
 use crate::provider::{curated_provider_models, provider_has_available_credentials};
 use crate::{
     Agent, AgentEvent, ApprovalProfile, Choice, ContextMode, EventSink,
-    HISTORY_CHAR_BUDGET_END_TURN_PERCENT, LocalAuthSecret, ThinkingEffort, Usage, WorkMapEventKind,
-    canonical_provider_id, clear_secret_string, handle_slash, history_char_budget_with_window,
-    load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
-    packs, parse_active_runtime_control_sequence, parse_compact_slash, provider_auth_status,
-    pseudo_tool_redaction_marker, redact_pseudo_tool_protocol_text, resolve_active_provider_id,
-    summarize_call, text_line_looks_like_pseudo_tool_syntax, tui_git_summary,
+    HISTORY_CHAR_BUDGET_END_TURN_PERCENT, LocalAuthSecret, ReasoningMode, ThinkingEffort, Usage,
+    WorkMapEventKind, canonical_provider_id, clear_secret_string, handle_slash,
+    history_char_budget_with_window, load_auth_store, load_provider_catalog, model_context_window,
+    orchestrator::ExternalTelemetry, packs, parse_active_runtime_control_sequence,
+    parse_compact_slash, provider_auth_status, pseudo_tool_redaction_marker,
+    redact_pseudo_tool_protocol_text, resolve_active_provider_id, summarize_call,
+    text_line_looks_like_pseudo_tool_syntax, tui_git_summary,
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
@@ -537,7 +538,12 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/effort",
         args: "[level]",
-        help: "off|low|medium|high|xhigh|max",
+        help: "off|minimal|low|medium|high|xhigh|max",
+    },
+    SlashCmd {
+        name: "/reasoning-mode",
+        args: "[standard|pro|next|prev|status]",
+        help: "GPT-5.6 execution mode",
     },
     SlashCmd {
         name: "/compact",
@@ -628,7 +634,8 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
 
 static TRUST_ARGS: &[&str] = &["on", "off", "status"];
 static TOOLS_ARGS: &[&str] = &["default", "full", "status"];
-static EFFORT_ARGS: &[&str] = &["off", "low", "medium", "high", "xhigh", "max"];
+static EFFORT_ARGS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+static REASONING_MODE_ARGS: &[&str] = &["standard", "pro", "next", "prev", "status"];
 static WORK_MAP_SESSION_ARGS: &[&str] = &["current", "latest"];
 const SLASH_COMPLETION_MAX_VISIBLE: usize = 7;
 
@@ -824,6 +831,7 @@ fn slash_completions(input: &str) -> Vec<SlashCompletion> {
             "trust" => Some(TRUST_ARGS),
             "tools" => Some(TOOLS_ARGS),
             "effort" => Some(EFFORT_ARGS),
+            "reasoning-mode" => Some(REASONING_MODE_ARGS),
             "map" | "focus" => Some(WORK_MAP_SESSION_ARGS),
             _ => None,
         };
@@ -947,6 +955,7 @@ struct TuiState {
     frame_count: u64,
     approval_profile: ApprovalProfile,
     thinking_effort: ThinkingEffort,
+    reasoning_mode: ReasoningMode,
     last_expandable: Option<ExpandableBlock>,
     show_help: bool,
     show_todos: bool,
@@ -1073,6 +1082,7 @@ impl TuiState {
             frame_count: 0,
             approval_profile,
             thinking_effort,
+            reasoning_mode: ReasoningMode::default(),
             context_mode: ContextMode::Standard,
             last_expandable: None,
             show_help: false,
@@ -2205,6 +2215,10 @@ impl TuiState {
                 self.push_debug_event(format!("thinking effort changed · {}", effort.as_str()));
                 self.thinking_effort = effort;
             }
+            AgentEvent::ReasoningModeChanged { mode } => {
+                self.push_debug_event(format!("reasoning mode changed · {}", mode.as_str()));
+                self.reasoning_mode = mode;
+            }
             AgentEvent::ApprovalProfileChanged { profile } => {
                 self.push_debug_event(format!("approval profile changed · {}", profile.as_str()));
                 self.approval_profile = profile;
@@ -2940,6 +2954,12 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
         state.thinking_effort.as_str().to_string(),
         Style::default().fg(Color::Magenta),
     ));
+    if state.reasoning_mode == ReasoningMode::Pro {
+        spans.push(Span::styled(
+            "/pro",
+            Style::default().fg(Color::LightMagenta),
+        ));
+    }
 
     match state.approval_profile {
         ApprovalProfile::Ask | ApprovalProfile::Always => {}
@@ -5789,6 +5809,7 @@ fn welcome_session_index(root: &std::path::Path, session_id: &str, session_enabl
 fn welcome_effort_label(effort: ThinkingEffort) -> &'static str {
     match effort {
         ThinkingEffort::Off => "Off",
+        ThinkingEffort::Minimal => "Minimal",
         ThinkingEffort::Low => "Low",
         ThinkingEffort::Medium => "Medium",
         ThinkingEffort::High => "High",
@@ -9827,6 +9848,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let sandbox = agent.sandbox_root.display().to_string();
     let approval_profile = agent.approval_profile();
     let thinking_effort = agent.thinking_effort();
+    let reasoning_mode = agent.reasoning_mode();
     let context_mode = agent.context_mode;
     let session_index = welcome_session_index(
         &agent.sandbox_root,
@@ -9901,6 +9923,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         thinking_effort,
     );
     state.context_mode = context_mode;
+    state.reasoning_mode = reasoning_mode;
     agent.git_context = git_context.clone();
     state.git_branch = git_context.clone();
     state.git_refresh_in_flight = git_probe_pending;
@@ -11119,6 +11142,30 @@ mod tests {
             line.find("Branch(Main (dirty))").unwrap() < line.find("GPT-5.5").unwrap(),
             "{line}"
         );
+    }
+
+    #[test]
+    fn status_bar_shows_selected_pro_mode_without_cluttering_standard() {
+        let mut state = TuiState::new(
+            "gpt-5.6-sol".to_string(),
+            model_context_window("gpt-5.6-sol"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Max,
+        );
+        let standard = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+        assert!(standard.contains("max"), "{standard}");
+        assert!(!standard.contains("/pro"), "{standard}");
+
+        state.reasoning_mode = ReasoningMode::Pro;
+        let pro = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+        assert!(pro.contains("max/pro"), "{pro}");
     }
 
     #[test]
@@ -12766,6 +12813,7 @@ mod tests {
             commands: 1,
             model_changed: false,
             effort_changed: true,
+            mode_changed: false,
             stream_aborted: true,
         });
 
@@ -13947,6 +13995,28 @@ mod tests {
     #[cfg(not(unix))]
     fn keyboard_enhancement_is_off_for_non_unix() {
         assert!(!terminal_supports_keyboard_enhancement());
+    }
+
+    #[test]
+    fn slash_completion_exposes_reasoning_controls_and_all_effort_levels() {
+        let command_texts = slash_completions("/reason")
+            .into_iter()
+            .map(|completion| completion.text)
+            .collect::<Vec<_>>();
+        assert_eq!(command_texts, ["/reasoning-mode"]);
+
+        let mode_texts = slash_completions("/reasoning-mode ")
+            .into_iter()
+            .map(|completion| completion.text)
+            .collect::<Vec<_>>();
+        assert!(mode_texts.contains(&"/reasoning-mode pro".to_string()));
+        assert!(mode_texts.contains(&"/reasoning-mode status".to_string()));
+
+        let effort_texts = slash_completions("/effort min")
+            .into_iter()
+            .map(|completion| completion.text)
+            .collect::<Vec<_>>();
+        assert_eq!(effort_texts, ["/effort minimal"]);
     }
 
     #[test]

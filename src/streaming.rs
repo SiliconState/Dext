@@ -74,6 +74,8 @@ struct ChatGptState {
     reasoning_emitted: String,
     text_in_progress: bool,
     reasoning_in_progress: bool,
+    reasoning_items: BTreeMap<String, Value>,
+    reasoning_item_order: Vec<String>,
     tool_calls: BTreeMap<String, ToolCallParts>,
     tool_call_order: Vec<String>,
     stop_reason: Option<String>,
@@ -101,7 +103,9 @@ impl ProviderStreamParser {
                 preserve_timing_cache,
                 ..OpenAiState::default()
             }),
-            RequestContract::ChatGptResponses => ProviderState::ChatGpt(ChatGptState::default()),
+            RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
+                ProviderState::ChatGpt(ChatGptState::default())
+            }
         };
         Self { contract, state }
     }
@@ -1130,6 +1134,8 @@ fn parse_chatgpt_frame(
                     call.arguments = arguments.to_string();
                     call.done = true;
                 }
+            } else if item_type == "reasoning" && contract == RequestContract::OpenAiResponses {
+                capture_openai_reasoning_item(contract, event, state, item)?;
             }
         }
         "response.function_call_arguments.done" => {
@@ -1240,6 +1246,10 @@ fn parse_chatgpt_frame(
                         })?,
                         "output item type",
                     )?;
+                    if output_type == "reasoning" && contract == RequestContract::OpenAiResponses {
+                        capture_openai_reasoning_item(contract, event, state, output)?;
+                        continue;
+                    }
                     if output_type != "function_call" {
                         continue;
                     }
@@ -1342,6 +1352,10 @@ fn parse_chatgpt_frame(
                 state
                     .tool_calls
                     .retain(|item_id, _| accepted_function_items.contains(item_id));
+                if discard_all_response_content {
+                    state.reasoning_items.clear();
+                    state.reasoning_item_order.clear();
+                }
                 if state.text_in_progress
                     || (discard_all_response_content && !state.text.is_empty())
                 {
@@ -1381,6 +1395,37 @@ fn parse_chatgpt_frame(
     Ok(updates)
 }
 
+fn capture_openai_reasoning_item(
+    contract: RequestContract,
+    event: &str,
+    state: &mut ChatGptState,
+    item: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let item = Value::Object(item.clone());
+    if !crate::valid_openai_reasoning_item(&item) {
+        return Ok(());
+    }
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("validated reasoning item id")
+        .to_string();
+    if let Some(previous) = state.reasoning_items.get(&id)
+        && previous.get("encrypted_content") != item.get("encrypted_content")
+    {
+        return Err(protocol_error(
+            contract,
+            event,
+            "reasoning item conflicted with prior streamed state",
+        ));
+    }
+    if !state.reasoning_items.contains_key(&id) {
+        state.reasoning_item_order.push(id.clone());
+    }
+    state.reasoning_items.insert(id, item);
+    Ok(())
+}
+
 fn chatgpt_item_id<'a>(
     contract: RequestContract,
     event: &str,
@@ -1409,6 +1454,14 @@ fn finish_chatgpt(contract: RequestContract, mut state: ChatGptState) -> Result<
         ));
     }
     let mut blocks = Vec::new();
+    if contract == RequestContract::OpenAiResponses {
+        for id in &state.reasoning_item_order {
+            let item = state.reasoning_items.remove(id).ok_or_else(|| {
+                protocol_error(contract, "finalize", "reasoning item disappeared")
+            })?;
+            blocks.push(Block::ResponsesReasoning { item });
+        }
+    }
     if !state.reasoning.is_empty() {
         let reasoning = normalize_reasoning_summary_text(&state.reasoning);
         if !reasoning.is_empty() {
@@ -1592,6 +1645,60 @@ mod tests {
             .unwrap();
         let error = parser.finish().unwrap_err().to_string();
         assert!(error.contains("arguments must be a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn openai_responses_preserves_encrypted_reasoning_but_ignores_placeholders() {
+        let mut parser = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+        for data in [
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"encrypted-state","summary":[]}]}}"#,
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::ResponsesReasoning { item }]
+                if item["id"] == "rs_1"
+                    && item["encrypted_content"] == "encrypted-state"
+        ));
+
+        let mut filtered = ProviderStreamParser::new(RequestContract::OpenAiResponses, false);
+        for data in [
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_filtered","encrypted_content":"filtered-state","summary":[]}}"#,
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}"#,
+        ] {
+            filtered
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = filtered.finish().unwrap();
+        assert_eq!(
+            parsed.stop_reason.as_deref(),
+            Some("incomplete:content_filter")
+        );
+        assert!(parsed.blocks.is_empty(), "{:?}", parsed.blocks);
+
+        let mut chatgpt = ProviderStreamParser::new(RequestContract::ChatGptResponses, false);
+        chatgpt
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(
+                    r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"encrypted-state","summary":[]}]}}"#
+                        .to_string(),
+                ),
+            })
+            .unwrap();
+        assert!(chatgpt.finish().unwrap().blocks.is_empty());
     }
 
     #[test]

@@ -82,6 +82,7 @@ fn test_agent(root: &Path) -> Agent {
         model: "test-model".to_string(),
         api_provider: ApiProvider::Anthropic,
         thinking_effort: ThinkingEffort::Medium,
+        reasoning_mode: ReasoningMode::Standard,
         system: "test-system".to_string(),
         history: Vec::new(),
         tools: provider_tool_definitions()
@@ -876,6 +877,8 @@ fn checkpoint_skips_external_hints_and_restore_ignores_them() {
             .expect("create checkpoint")
             .expect("checkpoint exists");
     checkpoint.paths_hint = vec![outside_file.display().to_string()];
+    checkpoint.manifest_encoding = git_checkpoints::CheckpointManifestEncoding::PreJsonEightFields;
+    checkpoint.legacy_sidecar_paths = None;
     let error = git_checkpoints::restore_worktree(
         &root,
         &checkpoint,
@@ -883,10 +886,225 @@ fn checkpoint_skips_external_hints_and_restore_ignores_them() {
     )
     .expect_err("unsafe manifest path must fail before restore");
     assert!(error.contains("unsafe checkpoint path"), "{error}");
+    let preview_error = git_checkpoints::preview_restore(&root, &checkpoint)
+        .expect_err("preview must enforce the same path confinement as apply");
+    assert!(
+        preview_error.contains("unsafe checkpoint path"),
+        "{preview_error}"
+    );
     assert_eq!(
         std::fs::read_to_string(&outside_file).expect("read outside"),
         "outside\n"
     );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_allows_host_relative_backslash_and_drive_looking_names() {
+    let root = temp_test_dir("checkpoint-host-relative-windows-looking-names");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    for (ordinal, name) in [r"C:\notes.txt", r"\draft.txt"].into_iter().enumerate() {
+        std::fs::write(root.join(name), "before\n").expect("write unusual untracked file");
+        let checkpoint = git_checkpoints::create_checkpoint(
+            &root,
+            "write_file",
+            &[name.to_string()],
+            ordinal + 1,
+        )
+        .expect("create checkpoint for host-relative unusual name")
+        .expect("checkpoint exists");
+        std::fs::write(root.join(name), "after\n").expect("change unusual untracked file");
+        git_checkpoints::restore_worktree(
+            &root,
+            &checkpoint,
+            git_checkpoints::RestoreMode::Worktree,
+        )
+        .expect("restore host-relative unusual name");
+        assert_eq!(
+            std::fs::read_to_string(root.join(name)).expect("read restored unusual file"),
+            "before\n"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_pre_json_absolute_hint_inside_repository_previews_and_restores() {
+    let root = temp_test_dir("checkpoint-pre-json-absolute-inside");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    let tracked = root.join("tracked.txt");
+    std::fs::write(&tracked, "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let mut checkpoint =
+        git_checkpoints::create_checkpoint(&root, "write_file", &["tracked.txt".to_string()], 1)
+            .expect("create checkpoint")
+            .expect("checkpoint exists");
+    checkpoint.paths_hint = vec![tracked.display().to_string()];
+    checkpoint.manifest_encoding = git_checkpoints::CheckpointManifestEncoding::PreJsonEightFields;
+    checkpoint.legacy_sidecar_paths = None;
+    std::fs::write(&tracked, "changed\n").expect("change tracked");
+
+    let preview = git_checkpoints::preview_restore(&root, &checkpoint)
+        .expect("preview absolute legacy hint inside repository");
+    assert!(preview.contains("Paths: tracked.txt"), "{preview}");
+    assert!(
+        !preview.contains(&tracked.display().to_string()),
+        "{preview}"
+    );
+    git_checkpoints::restore_worktree(&root, &checkpoint, git_checkpoints::RestoreMode::Worktree)
+        .expect("restore absolute legacy hint inside repository");
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("read tracked"),
+        "base\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_pre_json_nested_root_hint_resolves_sidecar_backed_target() {
+    let root = temp_test_dir("checkpoint-pre-json-nested-root");
+    let sandbox_root = root.join("nested");
+    std::fs::create_dir(&sandbox_root).expect("create nested sandbox root");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    let target = sandbox_root.join("target.txt");
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked base");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    std::fs::write(&target, "nested checkpoint\n").expect("write nested untracked state");
+    let mut checkpoint = git_checkpoints::create_checkpoint(
+        &sandbox_root,
+        "write_file",
+        &["target.txt".to_string()],
+        1,
+    )
+    .expect("create checkpoint from nested sandbox root")
+    .expect("checkpoint exists");
+    checkpoint.paths_hint = vec!["target.txt".to_string()];
+    checkpoint.manifest_encoding = git_checkpoints::CheckpointManifestEncoding::PreJsonEightFields;
+    checkpoint.legacy_sidecar_paths = None;
+    std::fs::write(&target, "nested later\n").expect("change nested target");
+
+    let preview = git_checkpoints::preview_restore(&sandbox_root, &checkpoint)
+        .expect("preview nested-root pre-JSON hint");
+    assert!(preview.contains("Paths: nested/target.txt"), "{preview}");
+    git_checkpoints::restore_worktree(
+        &sandbox_root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect("restore nested-root pre-JSON hint");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read nested target"),
+        "nested checkpoint\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_pre_json_nested_root_hint_fails_closed_without_sidecar_evidence() {
+    let root = temp_test_dir("checkpoint-pre-json-nested-no-sidecar");
+    let sandbox_root = root.join("nested");
+    std::fs::create_dir(&sandbox_root).expect("create nested sandbox root");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    let nested_target = sandbox_root.join("target.txt");
+    std::fs::write(&nested_target, "nested base\n").expect("write nested tracked");
+    git_ok(&root, &["add", "nested/target.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let mut checkpoint = git_checkpoints::create_checkpoint(
+        &sandbox_root,
+        "write_file",
+        &["target.txt".to_string()],
+        1,
+    )
+    .expect("create checkpoint from nested sandbox root")
+    .expect("checkpoint exists");
+    checkpoint.paths_hint = vec!["target.txt".to_string()];
+    checkpoint.manifest_encoding = git_checkpoints::CheckpointManifestEncoding::PreJsonEightFields;
+    checkpoint.legacy_sidecar_paths = None;
+    std::fs::write(&nested_target, "nested later\n").expect("change nested target");
+
+    let preview_error = git_checkpoints::preview_restore(&sandbox_root, &checkpoint)
+        .expect_err("relative legacy tracked hint lacks exact sandbox-root evidence");
+    assert!(
+        preview_error.contains("no sidecar-backed exact target"),
+        "{preview_error}"
+    );
+    let restore_error = git_checkpoints::restore_worktree(
+        &sandbox_root,
+        &checkpoint,
+        git_checkpoints::RestoreMode::Worktree,
+    )
+    .expect_err("relative legacy tracked hint must fail before mutation");
+    assert!(
+        restore_error.contains("no sidecar-backed exact target"),
+        "{restore_error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&nested_target).expect("read nested target"),
+        "nested later\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_preview_skips_pre_json_untracked_paths_with_unsafe_targets() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-pre-json-preview-paths");
+    let outside = temp_test_dir("checkpoint-pre-json-preview-outside");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    symlink(&outside, root.join("outside-link")).expect("link unsafe preview parent");
+
+    let mut checkpoint = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    checkpoint.manifest_encoding = git_checkpoints::CheckpointManifestEncoding::PreJsonNineFields;
+    checkpoint.legacy_sidecar_paths = None;
+    checkpoint.untracked_sidecars.clear();
+    checkpoint.untracked_snapshot = vec![
+        "outside-link/missing.txt".to_string(),
+        r"C:\outside\missing.txt".to_string(),
+        "missing-inside.txt".to_string(),
+    ];
+
+    let preview = git_checkpoints::preview_restore(&root, &checkpoint)
+        .expect("preview safe subset of pre-JSON untracked paths");
+    assert!(
+        preview.contains("Skipped 1 checkpoint untracked path(s)"),
+        "{preview}"
+    );
+    assert!(preview.contains("missing-inside.txt"), "{preview}");
+    assert!(!preview.contains("outside-link/missing.txt"), "{preview}");
+    assert!(preview.contains(r"C:\outside\missing.txt"), "{preview}");
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&outside);
@@ -2345,6 +2563,127 @@ fn checkpoint_missing_ref_fixture_fails_closed_without_project_mutation() {
 }
 
 #[test]
+fn checkpoint_creation_accepts_and_preserves_pre_json_manifest_entries() {
+    let root = temp_test_dir("checkpoint-pre-json-manifest");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let first = git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create first checkpoint")
+        .expect("first checkpoint exists");
+    let second = git_checkpoints::create_checkpoint(&root, "bash", &[], 2)
+        .expect("create second checkpoint")
+        .expect("second checkpoint exists");
+    let pre_json_eight = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\tfalse\t",
+        first.id, first.ref_name, first.oid, first.tool_name, first.created_at_ms, first.head
+    );
+    let pre_json_nine = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\tfalse\t\t",
+        second.id, second.ref_name, second.oid, second.tool_name, second.created_at_ms, second.head
+    );
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    std::fs::write(&manifest, format!("{pre_json_eight}\n{pre_json_nine}\n"))
+        .expect("install pre-JSON manifest");
+
+    let third = git_checkpoints::create_checkpoint(&root, "bash", &[], 3)
+        .expect("append after pre-JSON checkpoints")
+        .expect("third checkpoint exists");
+    let checkpoints =
+        git_checkpoints::list_checkpoints(&root, usize::MAX).expect("list mixed manifest");
+    assert_eq!(checkpoints.len(), 3);
+    assert!(checkpoints.iter().any(|checkpoint| {
+        checkpoint.id == first.id
+            && checkpoint.manifest_encoding
+                == git_checkpoints::CheckpointManifestEncoding::PreJsonEightFields
+    }));
+    assert!(checkpoints.iter().any(|checkpoint| {
+        checkpoint.id == second.id
+            && checkpoint.manifest_encoding
+                == git_checkpoints::CheckpointManifestEncoding::PreJsonNineFields
+    }));
+    assert!(checkpoints.iter().any(|checkpoint| {
+        checkpoint.id == third.id
+            && checkpoint.manifest_encoding == git_checkpoints::CheckpointManifestEncoding::Current
+    }));
+    let retained = std::fs::read_to_string(&manifest).expect("read retained mixed manifest");
+    let retained = retained.lines().collect::<Vec<_>>();
+    assert_eq!(retained[0], pre_json_eight);
+    assert_eq!(retained[1], pre_json_nine);
+    assert_eq!(retained[0].split('\t').count(), 8);
+    assert_eq!(retained[1].split('\t').count(), 9);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkpoint_oversized_manifest_fails_before_allocating_or_creating_ref() {
+    let root = temp_test_dir("checkpoint-oversized-manifest");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("initialize checkpoint storage")
+        .expect("checkpoint exists");
+
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    let oversized_len = 16 * 1024 * 1024 + 1;
+    let oversized = std::fs::File::create(&manifest).expect("replace manifest");
+    oversized
+        .set_len(oversized_len)
+        .expect("size oversized manifest");
+    let refs_before = git_test_command(&root)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/dext/checkpoints/",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("list refs before");
+    assert!(refs_before.status.success());
+
+    let list_error = git_checkpoints::list_checkpoints(&root, usize::MAX)
+        .expect_err("oversized runtime manifest must be bounded");
+    assert!(
+        list_error.contains("16777216-byte inspection bound"),
+        "{list_error}"
+    );
+    let create_error = git_checkpoints::create_checkpoint(&root, "bash", &[], 2)
+        .expect_err("checkpoint append must reject oversized manifest");
+    assert!(
+        create_error.contains("16777216-byte inspection bound"),
+        "{create_error}"
+    );
+    let refs_after = git_test_command(&root)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/dext/checkpoints/",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("list refs after");
+    assert!(refs_after.status.success());
+    assert_eq!(refs_after.stdout, refs_before.stdout);
+    assert_eq!(
+        std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .len(),
+        oversized_len
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn checkpoint_corrupt_manifest_fails_closed_without_leaking_new_ref() {
     use std::io::Write as _;
 
@@ -3657,6 +3996,7 @@ fn block_contains_marker(block: &Block, marker: &str) -> bool {
             text.contains(marker)
         }
         Block::RedactedThinking { data } => data.contains(marker),
+        Block::ResponsesReasoning { item } => item.to_string().contains(marker),
         Block::ToolUse { name, input, .. } => {
             name.contains(marker) || input.to_string().contains(marker)
         }
@@ -5207,7 +5547,7 @@ fn busy_console_input_withholds_potential_local_secret_from_steering() {
     };
     assert_eq!(
         unsupported_busy_slash_message(&warning),
-        "queued slash command /compact not run while agent is busy; only /model and /effort (/think) are active runtime controls"
+        "queued slash command /compact not run while agent is busy; only /model, /effort (/think), and /reasoning-mode are active runtime controls"
     );
     assert!(runtime_control_rx.try_recv().is_err());
     assert!(steering_rx.try_recv().is_err());
@@ -5692,6 +6032,7 @@ fn runtime_control_events_serialize_for_stream_json() {
         commands: 2,
         model_changed: true,
         effort_changed: true,
+        mode_changed: true,
         stream_aborted: true,
     };
     let value = serde_json::to_value(ev).expect("serialize event");
@@ -5699,6 +6040,7 @@ fn runtime_control_events_serialize_for_stream_json() {
     assert_eq!(value["data"]["commands"], 2);
     assert_eq!(value["data"]["model_changed"], true);
     assert_eq!(value["data"]["effort_changed"], true);
+    assert_eq!(value["data"]["mode_changed"], true);
     assert_eq!(value["data"]["stream_aborted"], true);
 }
 
@@ -5783,7 +6125,7 @@ fn non_tui_busy_input_routes_steering_and_runtime_controls_immediately() {
     };
     assert_eq!(
         unsupported_busy_slash_message(&warning),
-        "queued slash command /compact not run while agent is busy; only /model and /effort (/think) are active runtime controls"
+        "queued slash command /compact not run while agent is busy; only /model, /effort (/think), and /reasoning-mode are active runtime controls"
     );
     assert!(steering_rx.try_recv().is_err());
     assert!(runtime_control_rx.try_recv().is_err());
@@ -6472,6 +6814,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         let mut saved = test_agent(&sandbox);
         saved.model = "saved-model".to_string();
         saved.thinking_effort = ThinkingEffort::XHigh;
+        saved.reasoning_mode = ReasoningMode::Pro;
         saved.context_mode = ContextMode::Standard;
         saved.tool_context_profile = ToolContextProfile::Full;
         saved.tool_profile = ToolProfile::Full;
@@ -6624,6 +6967,7 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
 
         assert_eq!(loaded.model, "saved-model");
         assert_eq!(loaded.thinking_effort, ThinkingEffort::XHigh);
+        assert_eq!(loaded.reasoning_mode, ReasoningMode::Pro);
         assert_eq!(loaded.context_mode, ContextMode::Standard);
         assert_eq!(loaded.tool_context_profile(), ToolContextProfile::Full);
         assert_eq!(loaded.tool_profile, ToolProfile::Full);
@@ -8940,15 +9284,27 @@ fn full_toolset_env_exposes_specialized_tools() -> Result<()> {
 fn thinking_effort_parse_and_cycle() {
     assert_eq!(ThinkingEffort::parse("off"), Some(ThinkingEffort::Off));
     assert_eq!(ThinkingEffort::parse("none"), Some(ThinkingEffort::Off));
+    assert_eq!(
+        ThinkingEffort::parse("minimal"),
+        Some(ThinkingEffort::Minimal)
+    );
     assert_eq!(ThinkingEffort::parse("low"), Some(ThinkingEffort::Low));
     assert_eq!(ThinkingEffort::parse("MED"), Some(ThinkingEffort::Medium));
     assert_eq!(ThinkingEffort::parse("x-high"), Some(ThinkingEffort::XHigh));
     assert_eq!(ThinkingEffort::parse("maximum"), Some(ThinkingEffort::Max));
     assert_eq!(ThinkingEffort::parse("unknown"), None);
     assert_eq!(ThinkingEffort::Off.cycle(-1), ThinkingEffort::Max);
-    assert_eq!(ThinkingEffort::Low.cycle(-1), ThinkingEffort::Off);
+    assert_eq!(ThinkingEffort::Minimal.cycle(-1), ThinkingEffort::Off);
+    assert_eq!(ThinkingEffort::Low.cycle(-1), ThinkingEffort::Minimal);
     assert_eq!(ThinkingEffort::XHigh.cycle(1), ThinkingEffort::Max);
     assert_eq!(ThinkingEffort::Max.cycle(1), ThinkingEffort::Off);
+    assert_eq!(
+        ReasoningMode::parse("standard"),
+        Some(ReasoningMode::Standard)
+    );
+    assert_eq!(ReasoningMode::parse("pro"), Some(ReasoningMode::Pro));
+    assert_eq!(ReasoningMode::Standard.cycle(), ReasoningMode::Pro);
+    assert_eq!(ReasoningMode::Pro.cycle(), ReasoningMode::Standard);
 }
 
 #[test]
@@ -12585,6 +12941,10 @@ fn chatgpt_incomplete_reason_is_contract_scoped() {
         Some("unknown")
     );
     assert_eq!(
+        chatgpt_incomplete_reason(RequestContract::OpenAiResponses, Some("incomplete")),
+        Some("unknown")
+    );
+    assert_eq!(
         chatgpt_incomplete_reason(RequestContract::OpenAiChatCompletions, Some("incomplete")),
         None
     );
@@ -12820,6 +13180,50 @@ fn runtime_control_command_updates_effort_mid_run() {
 }
 
 #[test]
+fn runtime_reasoning_mode_is_active_only_for_official_openai_gpt_5_6() {
+    let root = temp_test_dir("runtime-reasoning-mode");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let mut out = Vec::new();
+
+    assert!(apply_runtime_control_command(
+        &mut agent,
+        "/reasoning-mode pro",
+        |message| out.push(message)
+    ));
+    assert_eq!(agent.reasoning_mode(), ReasoningMode::Pro);
+    assert!(
+        out.iter().any(|message| message.contains("inactive")),
+        "{out:?}"
+    );
+
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile");
+    agent.provider_id = "openai".to_string();
+    agent.provider_profile = Some(profile);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "https://api.openai.com".to_string();
+    agent.model = "gpt-5.6-sol".to_string();
+    out.clear();
+    assert!(apply_runtime_control_command(
+        &mut agent,
+        "/reasoning-mode status",
+        |message| out.push(message)
+    ));
+    assert_eq!(agent.effective_reasoning_mode(), Some("pro"));
+    assert!(
+        out.iter().any(|message| message.contains("active")),
+        "{out:?}"
+    );
+
+    agent.model = "gpt-5".to_string();
+    assert_eq!(agent.effective_reasoning_mode(), None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("runtime-control-model-provider");
@@ -12925,7 +13329,7 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
 
     let chatgpt = build_chatgpt_request(
         "gpt-5.4",
-        ThinkingEffort::Off,
+        None,
         "sys",
         "sess-1",
         vec![json!({"type":"message","role":"user","content":[]} )],
@@ -12943,6 +13347,10 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
         openai_reasoning_effort("gpt-5.6-luna", ThinkingEffort::Max),
         Some("xhigh")
     );
+    assert_eq!(
+        openai_reasoning_effort("gpt-5.6-preview", ThinkingEffort::Max),
+        Some("high")
+    );
     assert!(anthropic_thinking_budget_tokens(ThinkingEffort::Off).is_none());
     assert_eq!(clamp_thinking_budget_below_max(8_192, 8_192), Some(6_144));
     assert_eq!(clamp_thinking_budget_below_max(4_096, 4_096), Some(3_072));
@@ -12954,7 +13362,7 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
 }
 
 #[test]
-fn gpt_5_6_openai_request_uses_native_reasoning_and_completion_cap() -> Result<()> {
+fn gpt_5_6_openai_request_uses_responses_pro_mode_and_true_max_effort() -> Result<()> {
     let root = std::env::current_dir()?.canonicalize()?;
     let profile = built_in_provider_profiles()
         .into_iter()
@@ -12966,17 +13374,82 @@ fn gpt_5_6_openai_request_uses_native_reasoning_and_completion_cap() -> Result<(
     agent.api_provider = ApiProvider::OpenAi;
     agent.base_url = "https://api.openai.com".to_string();
     agent.model = "gpt-5.6-terra".to_string();
-    agent.thinking_effort = ThinkingEffort::Off;
+    agent.thinking_effort = ThinkingEffort::Max;
+    agent.reasoning_mode = ReasoningMode::Pro;
 
-    let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let (url, body) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
     let body: Value = serde_json::from_slice(&body)?;
-    assert_eq!(body["reasoning_effort"], "none", "{body}");
-    assert_eq!(body["max_completion_tokens"], 128_000, "{body}");
-    assert!(body.get("max_tokens").is_none(), "{body}");
+    assert_eq!(url, "https://api.openai.com/v1/responses");
+    assert_eq!(body["reasoning"]["effort"], "max", "{body}");
+    assert_eq!(body["reasoning"]["mode"], "pro", "{body}");
+    assert_eq!(body["reasoning"]["summary"], "auto", "{body}");
+    assert_eq!(body["max_output_tokens"], 128_000, "{body}");
+    assert_eq!(body["prompt_cache_key"], "session-key", "{body}");
+    assert_eq!(body["include"][0], "reasoning.encrypted_content", "{body}");
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
+    assert!(body.get("max_completion_tokens").is_none(), "{body}");
+    let tools = body["tools"].as_array().expect("OpenAI Responses tools");
+    assert!(!tools.is_empty());
+    assert!(
+        tools.iter().all(|tool| tool["strict"] == false),
+        "{tools:?}"
+    );
+
+    let status = agent.provider_status_line();
+    assert!(status.contains("reasoning_mode=pro"), "{status}");
+    assert!(status.contains("mode_active=true"), "{status}");
+
+    agent.thinking_effort = ThinkingEffort::Minimal;
+    agent.reasoning_mode = ReasoningMode::Standard;
+    let (_, body) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["reasoning"]["effort"], "minimal", "{body}");
+    assert_eq!(body["reasoning"]["mode"], "standard", "{body}");
+
+    agent.thinking_effort = ThinkingEffort::Off;
+    let (_, body) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["reasoning"]["effort"], "none", "{body}");
+    assert_eq!(body["reasoning"]["mode"], "standard", "{body}");
+
+    agent.reasoning_mode = ReasoningMode::Pro;
+    let summary = build_responses_summary_body(
+        agent.request_contract_for_model(&agent.model),
+        &agent.model,
+        "resume this work",
+        Some("low"),
+        agent.reasoning_mode_for_model(&agent.model),
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+    );
+    assert_eq!(summary["reasoning"]["effort"], "low", "{summary}");
+    assert_eq!(summary["reasoning"]["mode"], "pro", "{summary}");
+    assert_eq!(
+        summary["max_output_tokens"], COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+        "{summary}"
+    );
+    assert!(summary.get("include").is_none(), "{summary}");
+    assert!(summary.get("tools").is_none(), "{summary}");
+
+    let non_reasoning_summary = build_responses_summary_body(
+        RequestContract::OpenAiResponses,
+        &agent.model,
+        "resume this work",
+        None,
+        Some("pro"),
+        COMPACT_SUMMARY_MAX_TOKENS,
+    );
+    assert!(
+        non_reasoning_summary.get("reasoning").is_none(),
+        "{non_reasoning_summary}"
+    );
+    assert!(
+        non_reasoning_summary.get("include").is_none(),
+        "{non_reasoning_summary}"
+    );
 
     let chatgpt = build_chatgpt_request(
         "gpt-5.6-luna",
-        ThinkingEffort::Off,
+        Some("none"),
         "sys",
         "sess-1",
         vec![json!({"type":"message","role":"user","content":[]})],
@@ -12987,8 +13460,95 @@ fn gpt_5_6_openai_request_uses_native_reasoning_and_completion_cap() -> Result<(
         chatgpt_reasoning_effort("gpt-5.6-sol", ThinkingEffort::Max),
         Some("xhigh")
     );
+    assert_eq!(
+        chatgpt_reasoning_effort("gpt-5.6-preview", ThinkingEffort::Max),
+        Some("max")
+    );
 
     Ok(())
+}
+
+#[test]
+fn compact_model_alias_uses_its_own_responses_mode_and_pricing() -> Result<()> {
+    let _guard = env_lock();
+    let old_compact_model = std::env::var_os("DEXT_COMPACT_MODEL");
+    unsafe { std::env::set_var("DEXT_COMPACT_MODEL", "gpt56luna") };
+
+    let root = std::env::current_dir()?.canonicalize()?;
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "openai".to_string();
+    agent.provider_profile = Some(profile);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "https://api.openai.com".to_string();
+    agent.model = "gpt-5.6-sol".to_string();
+    agent.reasoning_mode = ReasoningMode::Pro;
+
+    let summary_model = agent.compact_summary_model();
+    assert_eq!(summary_model, "gpt-5.6-luna");
+    assert_eq!(
+        agent.request_contract_for_model(&summary_model),
+        RequestContract::OpenAiResponses
+    );
+    assert_eq!(agent.reasoning_mode_for_model(&summary_model), Some("pro"));
+
+    let mut usage = Usage {
+        input: 100_000,
+        output: 10_000,
+        ..Usage::default()
+    };
+    agent.finalize_usage_metrics_for_model(&mut usage, &summary_model);
+    assert!(
+        (usage.cost_usd.expect("summary cost") - 0.16).abs() < 1e-12,
+        "{:?}",
+        usage.cost_usd
+    );
+
+    restore_env_var("DEXT_COMPACT_MODEL", old_compact_model);
+    Ok(())
+}
+
+#[test]
+fn provider_effort_mapping_prefers_exact_levels_before_clamping() {
+    let levels = ["minimal", "low", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for (effort, expected) in [
+        (ThinkingEffort::Minimal, "minimal"),
+        (ThinkingEffort::Low, "low"),
+        (ThinkingEffort::Medium, "medium"),
+        (ThinkingEffort::High, "high"),
+        (ThinkingEffort::XHigh, "xhigh"),
+        (ThinkingEffort::Max, "max"),
+    ] {
+        assert_eq!(
+            map_effort_to_provider_levels(&levels, effort).as_deref(),
+            Some(expected),
+            "{}",
+            effort.as_str()
+        );
+    }
+    assert_eq!(
+        map_effort_to_provider_levels(
+            &["low".to_string(), "medium".to_string(), "high".to_string()],
+            ThinkingEffort::Minimal,
+        )
+        .as_deref(),
+        Some("low")
+    );
+    assert_eq!(
+        map_effort_to_provider_levels(
+            &["low".to_string(), "medium".to_string()],
+            ThinkingEffort::High,
+        )
+        .as_deref(),
+        Some("medium")
+    );
+    assert!(map_effort_to_provider_levels(&levels, ThinkingEffort::Off).is_none());
 }
 
 #[test]
@@ -14175,11 +14735,13 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
         .expect("parse v1 session header");
     assert_eq!(legacy.version, SESSION_FORMAT_VERSION);
     assert_eq!(legacy.model, "legacy");
+    assert_eq!(legacy.reasoning_mode, ReasoningMode::Standard);
 
     let v2 = parse_session_header(r#"{"version":2,"model":"v2","system":"system"}"#)
         .expect("parse v2 session header");
     assert_eq!(v2.version, SESSION_FORMAT_VERSION);
     assert_eq!(v2.model, "v2");
+    assert_eq!(v2.reasoning_mode, ReasoningMode::Standard);
 
     let current = parse_session_header(
         r#"{"version":3,"model":"v3","system":"system","context_mode":"Tiny"}"#,
@@ -15045,6 +15607,22 @@ fn tiny_context_mode_sets_distinct_system_prompt() {
 }
 
 #[test]
+fn parse_cli_options_accepts_reasoning_mode_and_minimal_effort() -> Result<()> {
+    let opts = parse_cli_options(vec![
+        "--effort".to_string(),
+        "minimal".to_string(),
+        "--reasoning-mode=pro".to_string(),
+    ])?;
+    assert_eq!(opts.thinking_effort, Some(ThinkingEffort::Minimal));
+    assert_eq!(opts.reasoning_mode, Some(ReasoningMode::Pro));
+
+    let opts = parse_cli_options(vec!["--reasoning-mode".to_string(), "standard".to_string()])?;
+    assert_eq!(opts.reasoning_mode, Some(ReasoningMode::Standard));
+    assert!(parse_cli_options(vec!["--reasoning-mode=turbo".to_string()]).is_err());
+    Ok(())
+}
+
+#[test]
 fn parse_cli_options_accepts_tiny_alias_without_positional_leak() -> Result<()> {
     let opts = parse_cli_options(vec!["--tiny".to_string(), "do task".to_string()])?;
 
@@ -15846,6 +16424,15 @@ fn gpt_5_6_pricing_applies_documented_long_context_tier() {
         );
         assert_eq!(priced.cost_usd, Some(expected), "{model}");
     }
+    let unknown_suffix = usage_with_current_pricing(
+        usage,
+        "openai",
+        ApiProvider::OpenAi,
+        "https://api.openai.com",
+        "gpt-5.6-preview",
+        None,
+    );
+    assert_eq!(unknown_suffix.cost_usd, Some(1.375));
 
     let threshold_usage = Usage {
         input: 272_000,
@@ -17924,6 +18511,17 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
             resolve_provider_model_selection(&catalog, &store, "glm", "chatgpt/gpt-5-4")?;
         assert_eq!(explicit.provider_id, "chatgpt");
         assert_eq!(explicit.model, "gpt-5.4");
+
+        store.providers.insert(
+            "openai".to_string(),
+            StoredCredential::ApiKey {
+                key: "openai-test-key".to_string(),
+            },
+        );
+        let openai_alias =
+            resolve_provider_model_selection(&catalog, &store, "glm", "openai/gpt56terra")?;
+        assert_eq!(openai_alias.provider_id, "openai");
+        assert_eq!(openai_alias.model, "gpt-5.6-terra");
         Ok(())
     })();
 
@@ -18724,6 +19322,19 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         normalize_provider_model_value(&openai, "gpt-5.6"),
         "gpt-5.6"
     );
+    assert_eq!(normalize_provider_model_value(&openai, "gpt56"), "gpt-5.6");
+    assert_eq!(
+        normalize_provider_model_value(&openai, "gpt56sol"),
+        "gpt-5.6-sol"
+    );
+    assert_eq!(
+        normalize_provider_model_value(&openai, "gpt56terra"),
+        "gpt-5.6-terra"
+    );
+    assert_eq!(
+        normalize_provider_model_value(&openai, "gpt56luna"),
+        "gpt-5.6-luna"
+    );
     for profile in [&chatgpt, &openai] {
         for (model, input, cached, output) in [
             ("gpt-5.6-sol", 5.0, 0.5, 30.0),
@@ -18735,11 +19346,18 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
             assert_eq!(spec.context_window, Some(1_050_000), "{model}");
             assert_eq!(spec.max_output_tokens, Some(128_000), "{model}");
             assert!(spec.tools && spec.reasoning && spec.image_input && spec.prompt_cache);
-            assert_eq!(
-                spec.effort_levels,
-                ["none", "low", "medium", "high", "xhigh"],
-                "{model}"
-            );
+            let expected_efforts: &[&str] = if profile.id == "openai" {
+                &["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            } else {
+                &["none", "low", "medium", "high", "xhigh"]
+            };
+            assert_eq!(spec.effort_levels, expected_efforts, "{model}");
+            let expected_modes: &[&str] = if profile.id == "openai" {
+                &["standard", "pro"]
+            } else {
+                &[]
+            };
+            assert_eq!(spec.reasoning_modes, expected_modes, "{model}");
             let pricing = spec.pricing.expect("gpt-5.6 pricing");
             assert_eq!(pricing.input_usd_per_mtok, input, "{model}");
             assert_eq!(pricing.cache_read_usd_per_mtok, cached, "{model}");
@@ -18750,6 +19368,11 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
     let alias_spec = resolve_model_spec(&openai, "gpt-5.6");
     assert_eq!(alias_spec.context_window, Some(1_050_000));
     assert_eq!(alias_spec.max_output_tokens, Some(128_000));
+    assert_eq!(
+        alias_spec.effort_levels,
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    );
+    assert_eq!(alias_spec.reasoning_modes, ["standard", "pro"]);
 
     let mut legacy = chatgpt.clone();
     legacy.request_contract = Some(RequestContract::OpenAiChatCompletions);
@@ -18820,6 +19443,128 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
 }
 
 #[test]
+fn gpt_5_6_responses_routing_is_official_openai_only() -> Result<()> {
+    let profiles = built_in_provider_profiles();
+    for profile in &profiles {
+        let configured = request_contract_for_profile(profile);
+        let model = if profile.id == "openai" {
+            "gpt-5.6-sol"
+        } else {
+            profile.default_model.as_str()
+        };
+        let expected = if profile.id == "openai" {
+            RequestContract::OpenAiResponses
+        } else {
+            configured
+        };
+        assert_eq!(
+            effective_request_contract(profile, &profile.base_url, model),
+            expected,
+            "{} must retain its provider contract",
+            profile.id
+        );
+    }
+
+    let openai = profiles
+        .iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile");
+    for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        assert_eq!(
+            effective_request_contract(openai, "https://api.openai.com/v1", model),
+            RequestContract::OpenAiResponses,
+            "{model}"
+        );
+    }
+    for (base_url, model) in [
+        ("https://api.openai.com", "gpt-5"),
+        ("https://api.openai.com", "gpt-5.60"),
+        ("https://api.openai.com", "gpt-5.6-preview"),
+        ("https://api.openai.com", "gpt-5.6-terrra"),
+        ("http://api.openai.com", "gpt-5.6"),
+        ("https://api.openai.com/v2", "gpt-5.6"),
+        ("https://api.openai.com/v1?proxy=1", "gpt-5.6"),
+        ("https://api.openai.com.evil.test", "gpt-5.6"),
+    ] {
+        assert_eq!(
+            effective_request_contract(openai, base_url, model),
+            RequestContract::OpenAiChatCompletions,
+            "{base_url} {model}"
+        );
+    }
+
+    let mut custom = openai.clone();
+    custom.id = "custom-openai".to_string();
+    custom.request_contract = Some(RequestContract::OpenAiChatCompletions);
+    assert_eq!(
+        effective_request_contract(&custom, "https://api.openai.com", "gpt-5.6"),
+        RequestContract::OpenAiChatCompletions
+    );
+
+    custom.request_contract = Some(RequestContract::OpenAiResponses);
+    custom.base_url = "https://example.test".to_string();
+    let mut custom = crate::provider::normalize_provider_profile(custom)
+        .expect("custom Responses profile should normalize");
+    custom
+        .model_specs
+        .get_mut("gpt-5.6-sol")
+        .expect("custom GPT-5.6 spec")
+        .effort_levels = vec!["high".to_string()];
+    assert_eq!(
+        request_contract_for_profile(&custom),
+        RequestContract::OpenAiResponses
+    );
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = custom.id.clone();
+    agent.provider_profile = Some(custom);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "https://example.test".to_string();
+    agent.model = "gpt-5.6-sol".to_string();
+    agent.reasoning_mode = ReasoningMode::Pro;
+    agent.thinking_effort = ThinkingEffort::Max;
+    let (url, body) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(url, "https://example.test/v1/responses");
+    assert!(body["reasoning"].get("mode").is_none(), "{body}");
+    assert_eq!(body["reasoning"]["effort"], "high", "{body}");
+    assert!(body.get("include").is_none(), "{body}");
+
+    let summary_effort =
+        agent.responses_reasoning_effort_for_model(&agent.model, ThinkingEffort::Low);
+    assert_eq!(summary_effort.as_deref(), Some("high"));
+    let summary = build_responses_summary_body(
+        agent.request_contract(),
+        &agent.model,
+        "resume this work",
+        summary_effort.as_deref(),
+        agent.reasoning_mode_for_model(&agent.model),
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+    );
+    assert_eq!(summary["reasoning"]["effort"], "high", "{summary}");
+    assert!(summary["reasoning"].get("mode").is_none(), "{summary}");
+
+    agent.thinking_effort = ThinkingEffort::Off;
+    let (_, body) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(body.get("reasoning").is_none(), "{body}");
+
+    agent.thinking_effort = ThinkingEffort::Max;
+    agent
+        .provider_profile
+        .as_mut()
+        .and_then(|profile| profile.model_specs.get_mut("gpt-5.6-sol"))
+        .expect("custom model spec")
+        .capabilities
+        .reasoning = Some(false);
+    let (_, body) = agent.build_streaming_request("sys", "env", &[], &[], "session")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(body.get("reasoning").is_none(), "{body}");
+    assert!(body.get("include").is_none(), "{body}");
+    Ok(())
+}
+
+#[test]
 fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Result<()> {
     let root = temp_test_dir("profile-request-metadata");
     let root = std::fs::canonicalize(&root)?;
@@ -18834,7 +19579,7 @@ fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Resul
     spec.max_output_tokens = Some(1_234);
     spec.capabilities = ModelCapabilities {
         tools: Some(false),
-        reasoning: Some(false),
+        reasoning: Some(true),
         image_input: Some(false),
         prompt_cache: Some(false),
     };
@@ -18853,6 +19598,24 @@ fn request_capabilities_and_pricing_come_from_active_profile_metadata() -> Resul
     agent.provider_profile = Some(profile);
     agent.thinking_effort = ThinkingEffort::XHigh;
 
+    agent
+        .provider_profile
+        .as_mut()
+        .and_then(|profile| profile.model_specs.get_mut("gpt-5.4"))
+        .expect("ChatGPT model spec")
+        .effort_levels = vec!["low".to_string()];
+    agent.thinking_effort = ThinkingEffort::Max;
+    let (_, body) = agent.build_streaming_request("sys", "env", &[], &[], "sess")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["reasoning"]["effort"], "low", "{body}");
+
+    agent
+        .provider_profile
+        .as_mut()
+        .and_then(|profile| profile.model_specs.get_mut("gpt-5.4"))
+        .expect("ChatGPT model spec")
+        .capabilities
+        .reasoning = Some(false);
     let (url, body) = agent.build_streaming_request("sys", "env", &[], &[], "sess")?;
     let body: Value = serde_json::from_slice(&body)?;
     assert!(url.ends_with("/codex/responses"), "{url}");
@@ -20100,6 +20863,74 @@ fn chatgpt_input_serializes_function_call_without_id_field() {
 }
 
 #[test]
+fn openai_responses_replays_only_current_turn_encrypted_reasoning() {
+    let root = temp_test_dir("openai-responses-reasoning-replay");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let reasoning = |id: &str, encrypted_content: &str| Block::ResponsesReasoning {
+        item: json!({
+            "type": "reasoning",
+            "id": id,
+            "encrypted_content": encrypted_content,
+            "summary": [],
+        }),
+    };
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "old task".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![reasoning("rs_old", "enc-old")],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "new task".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                reasoning("rs_current", "enc-current"),
+                Block::ToolUse {
+                    id: "call_current".to_string(),
+                    name: "todo_read".to_string(),
+                    input: json!({}),
+                },
+            ],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_current", "done", None)],
+        },
+    ];
+
+    let openai_items = agent.history_to_openai_responses_input();
+    let reasoning_ids = openai_items
+        .iter()
+        .filter(|item| item["type"] == "reasoning")
+        .filter_map(|item| item["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(reasoning_ids, ["rs_current"]);
+    assert!(
+        openai_items
+            .iter()
+            .any(|item| item["type"] == "function_call_output")
+    );
+
+    let chatgpt_items = agent.history_to_chatgpt_input();
+    assert!(
+        chatgpt_items.iter().all(|item| item["type"] != "reasoning"),
+        "{chatgpt_items:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn chatgpt_input_strips_orphaned_tool_results_without_matching_tool_use() {
     // Regression: ChatGPT Responses API returns HTTP 400 "No tool call found for
     // function call output with call_id ..." when a function_call_output references
@@ -20161,8 +20992,12 @@ fn chatgpt_summary_request_body_matches_current_responses_api_expectations() {
     agent.api_provider = ApiProvider::ChatGpt;
     agent.model = "gpt-5.4".to_string();
 
-    let body =
-        build_chatgpt_summary_request(&agent.model, COMPACT_SYSTEM, "resume this work", true);
+    let body = build_chatgpt_summary_request(
+        &agent.model,
+        COMPACT_SYSTEM,
+        "resume this work",
+        Some("low"),
+    );
     assert_eq!(body["store"], false, "store must be false");
     assert_eq!(body["stream"], true, "summary requests must stream");
     assert_eq!(body["tool_choice"], "none", "summary should disable tools");
@@ -20178,7 +21013,7 @@ fn chatgpt_summary_request_body_matches_current_responses_api_expectations() {
     assert_eq!(body["reasoning"]["effort"], "low", "missing low effort");
     assert_eq!(body["reasoning"]["summary"], "auto", "missing summary mode");
 
-    let body = build_chatgpt_summary_request("gpt-4o", COMPACT_SYSTEM, "resume this work", false);
+    let body = build_chatgpt_summary_request("gpt-4o", COMPACT_SYSTEM, "resume this work", None);
     assert!(body.get("reasoning").is_none(), "{body}");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -20283,7 +21118,7 @@ fn chatgpt_request_body_maps_xhigh_to_actual_reasoning_effort_and_summary() {
 
     let body = build_chatgpt_request(
         &agent.model,
-        agent.thinking_effort,
+        Some("xhigh"),
         "sys",
         "sess-1",
         agent.history_to_chatgpt_input(),
@@ -20539,7 +21374,10 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
     let resp = reqwest::get(format!("http://{addr}/stream"))
         .await
         .expect("response");
-    let (blocks, _stop, _usage) = agent.read_stream_chatgpt(resp).await.expect("parse stream");
+    let (blocks, _stop, _usage) = agent
+        .read_stream_responses(resp, RequestContract::ChatGptResponses)
+        .await
+        .expect("parse stream");
     assert!(
         matches!(
             blocks.first(),
@@ -20751,6 +21589,13 @@ fn chatgpt_tools_are_responses_api_shape() {
             "tool must not be chat-completions shape: {t}"
         );
     }
+
+    let openai_tools = agent.wire_tools_openai_responses();
+    assert_eq!(openai_tools.len(), tools.len());
+    assert!(
+        openai_tools.iter().all(|tool| tool["strict"] == false),
+        "{openai_tools:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -22554,11 +23399,15 @@ fn compose_system_parts_includes_context_state_section() {
 #[test]
 fn compact_summary_thinking_budget_and_reasoning_fallbacks() {
     assert_eq!(
-        compact_summary_max_tokens(ThinkingEffort::Off),
+        compact_summary_max_tokens(ThinkingEffort::Off, false),
         COMPACT_SUMMARY_MAX_TOKENS
     );
     assert_eq!(
-        compact_summary_max_tokens(ThinkingEffort::High),
+        compact_summary_max_tokens(ThinkingEffort::Off, true),
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING
+    );
+    assert_eq!(
+        compact_summary_max_tokens(ThinkingEffort::High, false),
         COMPACT_SUMMARY_MAX_TOKENS_THINKING
     );
     assert!(
