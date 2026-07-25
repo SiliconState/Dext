@@ -212,7 +212,7 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "http",
-            description: "HTTP request via Dext's built-in client. Args are HTTPie-ish, e.g. ['GET','https://api.x','Auth:Bearer abc'] or ['POST','url','name=john']. Response output is capped. Add --extract-text (or --text) to strip HTML/script/style noise and pretty-print JSON for research pages.",
+            description: "HTTP request via Dext's built-in client. Args are HTTPie-ish, e.g. ['GET','https://api.x','Auth:Bearer abc'] or ['POST','url','name=john']. Raw output is capped; decoded response reads stop at exact safety ceilings. Add --extract-text (or --text) to read a bounded source head, strip HTML/script/style noise, and pretty-print JSON for research pages. Duplicate, transport/framing, and method-override headers plus URL credentials are rejected. Headerless/bodyless GET or HEAD may follow validated cross-origin redirects; sensitive requests remain same-origin.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

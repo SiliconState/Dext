@@ -4,6 +4,25 @@
 
 ### Changed
 
+- Hardened and accelerated the built-in `http` client without changing provider,
+  OAuth, or local-context transport: HTTP/2 and gzip/Brotli decoding are enabled
+  only for the tool; connect/read inactivity, resolver work, total request time,
+  response source, and declared body sizes are bounded; `--extract-text` reads a
+  128 KB head instead of draining oversized pages; and raw output retains its
+  smaller head/tail context cap. One bounded 60-second DNS cache retains at
+  most 32 addresses only after validating each complete DNS answer and limits
+  lingering libc lookups. IPv4 current-network/broadcast, IP multicast, and
+  IPv6 unspecified destinations remain blocked under every trusted-network
+  override. Duplicate,
+  transport/framing, and method-override headers plus URL credentials are
+  rejected while ordinary headers can override defaults. Headerless/bodyless
+  GET and HEAD requests may follow validated cross-origin redirects without an
+  automatic `Referer`; HTTPS downgrades are blocked, while requests with custom
+  headers, bodies, or other methods remain same-origin so arbitrary credentials
+  and 307/308 bodies cannot be replayed across origins. URL details are removed
+  from transport errors, body-bearing nominal read methods require Danger
+  approval, and HTTPie-style delimiters are resolved by their earliest operator
+  so padded auth headers and typed/query values are not misclassified.
 - Upgraded the terminal stack to exact Ratatui 0.30.2, ratatui-core 0.1.2,
   tui-markdown 0.3.8, Crossterm 0.29.0, and unicode-width 0.2.2 versions.
   Dext carries a narrow exact-source ratatui-core compatibility patch for its

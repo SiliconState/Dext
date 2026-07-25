@@ -938,6 +938,13 @@ pub(crate) fn parse_llama_context_window(value: &Value) -> Option<u64> {
     best.map(|(_, tokens)| tokens)
 }
 
+fn provider_blocking_http_client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .http1_only()
+}
+
 fn fetch_llama_context_window(client: &reqwest::blocking::Client, base_url: &str) -> Option<u64> {
     for path in LLAMA_CONTEXT_DISCOVERY_PATHS {
         let Ok(resp) = client.get(llama_endpoint_url(base_url, path)).send() else {
@@ -983,7 +990,7 @@ pub(crate) fn refresh_local_llama_context_window(
     let tokens = std::thread::Builder::new()
         .name("dext-local-context-probe".to_string())
         .spawn(move || {
-            let client = reqwest::blocking::Client::builder()
+            let client = provider_blocking_http_client_builder()
                 .timeout(LLAMA_CONTEXT_DISCOVERY_TIMEOUT)
                 .build()
                 .ok()?;
@@ -4151,7 +4158,9 @@ fn exchange_oauth_code(
     code_verifier: &str,
     redirect_uri: &str,
 ) -> Result<ExchangedTokens> {
-    let client = reqwest::blocking::Client::new();
+    let client = provider_blocking_http_client_builder()
+        .build()
+        .context("build OAuth HTTP client")?;
     let params = [
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -4195,7 +4204,9 @@ fn exchange_oauth_refresh_token(
     client_id: &str,
     refresh_token: &str,
 ) -> Result<ExchangedTokens> {
-    let client = reqwest::blocking::Client::new();
+    let client = provider_blocking_http_client_builder()
+        .build()
+        .context("build OAuth HTTP client")?;
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),

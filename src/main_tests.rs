@@ -11128,9 +11128,15 @@ fn prepare_http_tool_request_parses_httpie_style_args() {
                 "POST",
                 "https://example.com/api?existing=1",
                 "Accept: application/json",
+                "Authorization: Basic dXNlcjpwYXNz==",
                 "page==2",
+                "at==12:30",
+                "marker==left:=right",
                 "name=john",
-                "count:=3"
+                "callback=https://example.org/hook",
+                "expression=a==b",
+                "count:=3",
+                "note:=\"a==b\""
             ]
         }),
         std::time::Duration::from_secs(30),
@@ -11141,19 +11147,316 @@ fn prepare_http_tool_request_parses_httpie_style_args() {
     assert_eq!(request.output_mode, HttpOutputMode::Raw);
     assert_eq!(
         request.url.as_str(),
-        "https://example.com/api?existing=1&page=2"
+        "https://example.com/api?existing=1&page=2&at=12%3A30&marker=left%3A%3Dright"
     );
     assert_eq!(
-        request.headers,
-        vec![("Accept".to_string(), "application/json".to_string())]
+        request
+            .headers
+            .get(reqwest::header::ACCEPT)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Basic dXNlcjpwYXNz==")
     );
     match request.body.expect("json body") {
         HttpToolBody::Json(Value::Object(map)) => {
             assert_eq!(map.get("name"), Some(&Value::String("john".to_string())));
+            assert_eq!(
+                map.get("callback"),
+                Some(&Value::String("https://example.org/hook".to_string()))
+            );
+            assert_eq!(
+                map.get("expression"),
+                Some(&Value::String("a==b".to_string()))
+            );
             assert_eq!(map.get("count"), Some(&Value::from(3)));
+            assert_eq!(map.get("note"), Some(&Value::String("a==b".to_string())));
         }
         other => panic!("expected json body, got {other:?}"),
     }
+}
+
+#[test]
+fn prepare_http_tool_request_rejects_duplicate_and_transport_headers() {
+    for args in [
+        vec![
+            "GET",
+            "https://example.com",
+            "Accept:text/plain",
+            "accept:application/json",
+        ],
+        vec!["GET", "https://example.com", "Host:internal.example"],
+        vec!["POST", "https://example.com", "Content-Length:0"],
+        vec!["POST", "https://example.com", "Transfer-Encoding:chunked"],
+        vec!["GET", "https://example.com", "Connection:keep-alive"],
+        vec!["GET", "https://example.com", "Keep-Alive:timeout=5"],
+        vec!["GET", "https://example.com", "HTTP2-Settings:x"],
+        vec!["POST", "https://example.com", "X-HTTP-Method-Override:GET"],
+        vec!["GET", "https://example.com", "Proxy-Authorization:x"],
+        vec!["GET", "https://example.com", "--headers"],
+    ] {
+        let input = json!({"args": args});
+        let error = prepare_http_tool_request(&input, Duration::from_secs(30))
+            .err()
+            .expect("unsafe or duplicate header must be rejected");
+        assert!(
+            error.contains("duplicate http header")
+                || error.contains("controlled by Dext")
+                || error.contains("unsupported http arg"),
+            "{error}"
+        );
+    }
+
+    let request = prepare_http_tool_request(
+        &json!({"args": ["GET", "https://example.com", "User-Agent:research-client"]}),
+        Duration::from_secs(30),
+    )
+    .expect("user agent override");
+    assert_eq!(
+        request
+            .headers
+            .get(reqwest::header::USER_AGENT)
+            .and_then(|value| value.to_str().ok()),
+        Some("research-client")
+    );
+
+    let error = prepare_http_tool_request(
+        &json!({"args": ["GET", "https://user:password@example.com/private"]}),
+        Duration::from_secs(30),
+    )
+    .err()
+    .expect("URL credentials must be rejected");
+    assert!(error.contains("URL-embedded credentials"), "{error}");
+    assert!(!error.contains("password"), "{error}");
+    for args in [
+        vec![
+            "POST",
+            "https://example.com",
+            "--form",
+            "form=value",
+            "--json",
+            "json=value",
+        ],
+        vec!["POST", "https://example.com", "--form", "--json"],
+        vec!["POST", "https://example.com", "--json", "--form"],
+    ] {
+        let mixed_body = prepare_http_tool_request(&json!({"args": args}), Duration::from_secs(30))
+            .err()
+            .expect("mixed form and JSON modes must be rejected");
+        assert!(
+            mixed_body.contains("cannot combine JSON and form"),
+            "{mixed_body}"
+        );
+    }
+
+    for args in [
+        vec![
+            "POST",
+            "https://example.com",
+            "--ignore-stdin",
+            "--data=explicit",
+        ],
+        vec![
+            "POST",
+            "https://example.com",
+            "--data=explicit",
+            "--ignore-stdin",
+        ],
+    ] {
+        let request = prepare_http_tool_request(
+            &json!({"args": args, "stdin": "ignored"}),
+            Duration::from_secs(30),
+        )
+        .expect("ignore-stdin must not discard explicit data");
+        assert!(matches!(
+            request.body,
+            Some(HttpToolBody::Raw(ref body)) if body == "explicit"
+        ));
+    }
+    let oversized = prepare_http_tool_request(
+        &json!({
+            "args": ["POST", "https://example.com"],
+            "stdin": "x".repeat(HTTP_REQUEST_INPUT_MAX + 1)
+        }),
+        Duration::from_secs(30),
+    )
+    .err()
+    .expect("oversized HTTP input must be rejected locally");
+    assert!(oversized.contains("http input exceeds"), "{oversized}");
+}
+
+#[test]
+fn prepare_http_tool_request_rejects_invalid_or_unrepresentable_timeouts() {
+    for value in ["0", "-1", "NaN", "inf", "1e300", "1e-100", "600.000000001"] {
+        let input = json!({"args": ["GET", "https://example.com", format!("--timeout={value}")]});
+        let error = prepare_http_tool_request(&input, Duration::from_secs(30))
+            .err()
+            .expect("invalid timeout must be rejected");
+        assert!(error.contains("invalid http timeout"), "{error}");
+    }
+    let request = prepare_http_tool_request(
+        &json!({"args": ["GET", "https://example.com", "--extract-text"]}),
+        Duration::from_secs(HTTP_TOOL_TIMEOUT_MAX.as_secs() + 1),
+    )
+    .expect("default timeout is clamped");
+    assert_eq!(request.timeout, HTTP_TOOL_TIMEOUT_MAX);
+
+    let request = prepare_http_tool_request(
+        &json!({"args": ["GET", "HTTPS://example.com/path"]}),
+        Duration::from_secs(30),
+    )
+    .expect("URL schemes are case-insensitive");
+    assert_eq!(request.url.as_str(), "https://example.com/path");
+
+    let error = prepare_http_tool_request(
+        &json!({"args": ["GET", "https://[::1"]}),
+        Duration::from_secs(30),
+    )
+    .err()
+    .expect("malformed URL must be rejected");
+    assert!(error.starts_with("invalid URL:"), "{error}");
+}
+
+#[test]
+fn validate_http_wire_request_enforces_exact_limits() {
+    let url_prefix = "https://example.com/";
+    let exact_url = format!(
+        "{url_prefix}{}",
+        "x".repeat(HTTP_REQUEST_URL_MAX - url_prefix.len())
+    );
+    let exact_url_request = reqwest::Request::new(
+        reqwest::Method::GET,
+        reqwest::Url::parse(&exact_url).expect("exact-limit URL"),
+    );
+    validate_http_wire_request(&exact_url_request).expect("exact URL limit");
+    let oversized_url = format!("{exact_url}x");
+    let oversized_url_request = reqwest::Request::new(
+        reqwest::Method::GET,
+        reqwest::Url::parse(&oversized_url).expect("oversized URL"),
+    );
+    assert!(
+        validate_http_wire_request(&oversized_url_request)
+            .expect_err("oversized URL")
+            .contains("URL exceeds")
+    );
+
+    let base_url = reqwest::Url::parse("https://example.com/").unwrap();
+    let mut exact_count = reqwest::Request::new(reqwest::Method::GET, base_url.clone());
+    for index in 0..HTTP_REQUEST_HEADER_MAX_COUNT {
+        exact_count.headers_mut().insert(
+            reqwest::header::HeaderName::from_bytes(format!("x-{index}").as_bytes()).unwrap(),
+            reqwest::header::HeaderValue::from_static("x"),
+        );
+    }
+    validate_http_wire_request(&exact_count).expect("exact header-count limit");
+    exact_count.headers_mut().insert(
+        reqwest::header::HeaderName::from_static("x-over-limit"),
+        reqwest::header::HeaderValue::from_static("x"),
+    );
+    assert!(
+        validate_http_wire_request(&exact_count)
+            .expect_err("oversized header count")
+            .contains("header limit")
+    );
+
+    let header_name = reqwest::header::HeaderName::from_static("x-boundary");
+    let mut exact_headers = reqwest::Request::new(reqwest::Method::GET, base_url.clone());
+    exact_headers.headers_mut().insert(
+        header_name.clone(),
+        reqwest::header::HeaderValue::from_bytes(&vec![
+            b'x';
+            HTTP_REQUEST_HEADER_MAX_BYTES
+                - header_name.as_str().len()
+        ])
+        .unwrap(),
+    );
+    validate_http_wire_request(&exact_headers).expect("exact header-byte limit");
+    exact_headers.headers_mut().insert(
+        header_name,
+        reqwest::header::HeaderValue::from_bytes(&vec![
+            b'x';
+            HTTP_REQUEST_HEADER_MAX_BYTES
+                - "x-boundary".len()
+                + 1
+        ])
+        .unwrap(),
+    );
+    assert!(
+        validate_http_wire_request(&exact_headers)
+            .expect_err("oversized header bytes")
+            .contains("headers exceed")
+    );
+
+    let mut exact_body = reqwest::Request::new(reqwest::Method::POST, base_url.clone());
+    *exact_body.body_mut() = Some(reqwest::Body::from(vec![b'x'; HTTP_REQUEST_WIRE_BODY_MAX]));
+    validate_http_wire_request(&exact_body).expect("exact body limit");
+    let mut oversized_body = reqwest::Request::new(reqwest::Method::POST, base_url);
+    *oversized_body.body_mut() = Some(reqwest::Body::from(vec![
+        b'x';
+        HTTP_REQUEST_WIRE_BODY_MAX + 1
+    ]));
+    assert!(
+        validate_http_wire_request(&oversized_body)
+            .expect_err("oversized body")
+            .contains("body exceeds")
+    );
+}
+
+#[test]
+fn http_redirect_cross_origin_detection_is_transition_scoped() {
+    let https = reqwest::Url::parse("https://example.com/start").unwrap();
+    let https_next = reqwest::Url::parse("https://example.com/next").unwrap();
+    let http = reqwest::Url::parse("http://example.com/plaintext").unwrap();
+    let other_host = reqwest::Url::parse("https://other.example.com/next").unwrap();
+    let other_port = reqwest::Url::parse("https://example.com:8443/next").unwrap();
+
+    assert!(http_tool_redirect_crosses_origin(
+        &http,
+        std::slice::from_ref(&https)
+    ));
+    assert!(http_tool_redirect_crosses_origin(
+        &other_host,
+        std::slice::from_ref(&https)
+    ));
+    assert!(http_tool_redirect_crosses_origin(
+        &other_port,
+        std::slice::from_ref(&https)
+    ));
+    assert!(!http_tool_redirect_crosses_origin(
+        &https_next,
+        std::slice::from_ref(&https)
+    ));
+    assert!(!http_tool_redirect_crosses_origin(&http, &[]));
+
+    let sensitive =
+        reqwest::Url::parse("https://user:password@example.com/private?token=secret#fragment")
+            .unwrap();
+    assert_eq!(http_tool_url_origin(&sensitive), "https://example.com");
+}
+
+#[test]
+fn http_response_body_semantics_cover_method_and_status_exclusions() {
+    assert!(http_response_has_body(
+        &reqwest::Method::GET,
+        reqwest::StatusCode::OK
+    ));
+    for status in [
+        reqwest::StatusCode::CONTINUE,
+        reqwest::StatusCode::NO_CONTENT,
+        reqwest::StatusCode::RESET_CONTENT,
+        reqwest::StatusCode::NOT_MODIFIED,
+    ] {
+        assert!(!http_response_has_body(&reqwest::Method::GET, status));
+    }
+    assert!(!http_response_has_body(
+        &reqwest::Method::HEAD,
+        reqwest::StatusCode::OK
+    ));
 }
 
 #[test]
@@ -11216,9 +11519,18 @@ fn http_tool_blocks_local_and_internal_destinations_by_default() {
             "metadata alias",
         ),
         ("http://127.0.0.1:1/", "loopback"),
-        ("http://0.0.0.0:1/", "unspecified"),
+        ("http://127.1:1/", "loopback"),
+        ("http://2130706433:1/", "loopback"),
+        ("http://0177.0.0.1:1/", "loopback"),
+        ("http://0x7f.0.0.1:1/", "loopback"),
+        ("http://0.0.0.0:1/", "current-network"),
+        ("http://0.1.2.3:1/", "current-network"),
+        ("http://224.0.0.1:1/", "multicast"),
+        ("http://255.255.255.255:1/", "broadcast"),
         ("http://[::1]:1/", "loopback"),
         ("http://[::]:1/", "unspecified"),
+        ("http://[ff02::1]:1/", "multicast"),
+        ("http://[fec0::1]:1/", "site-local"),
         ("http://10.0.0.1/", "private"),
         ("http://172.16.0.1/", "private"),
         ("http://192.168.0.1/", "private"),
@@ -11238,7 +11550,6 @@ fn http_tool_blocks_local_and_internal_destinations_by_default() {
     }
     for target in [
         "http://127.0.0.1:1/",
-        "http://0.0.0.0:1/",
         "http://10.0.0.1/",
         "http://100.64.0.1/",
         "http://169.254.169.254/latest/meta-data/",
@@ -11246,6 +11557,21 @@ fn http_tool_blocks_local_and_internal_destinations_by_default() {
     ] {
         let url = reqwest::Url::parse(target).unwrap();
         assert!(validate_http_tool_destination(&url).is_ok(), "{target}");
+    }
+
+    for target in [
+        "http://0.0.0.0:1/",
+        "http://0.1.2.3:1/",
+        "http://224.0.0.1:1/",
+        "http://255.255.255.255:1/",
+        "http://[::]:1/",
+        "http://[ff02::1]:1/",
+    ] {
+        let url = reqwest::Url::parse(target).unwrap();
+        assert!(
+            validate_http_tool_destination(&url).is_err(),
+            "non-unicast target must remain blocked despite network overrides: {target}"
+        );
     }
 
     restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old_link_local);
@@ -11303,6 +11629,28 @@ fn http_tool_network_overrides_are_independent() {
     restore_env_var(HTTP_TOOL_ALLOW_LINK_LOCAL_ENV, old_link_local);
     restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
     restore_env_var(HTTP_TOOL_ALLOW_PRIVATE_ENV, old_private);
+}
+
+#[test]
+fn http_dns_validates_addresses_beyond_retention_prefix() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::remove_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV) };
+
+    let mut addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 0); 40];
+    assert_eq!(
+        collect_validated_http_addrs("example.com", addrs.clone().into_iter())
+            .expect("public address set")
+            .len(),
+        HTTP_DNS_ADDR_MAX
+    );
+    addrs.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    let error = collect_validated_http_addrs("example.com", addrs.into_iter())
+        .expect_err("blocked address after retained prefix must reject the full set");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("loopback"), "{error}");
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -11367,7 +11715,7 @@ async fn builtin_http_client_ignores_proxy_environment() {
     let direct_server = spawn_server(direct, "direct", stop.clone());
     let proxy_server = spawn_server(proxy, "proxied", stop.clone());
 
-    let response = build_http_tool_client()
+    let response = build_http_tool_client(true, HttpToolResolver::default())
         .get(format!("http://127.0.0.1:{direct_port}/"))
         .timeout(std::time::Duration::from_secs(3))
         .send()
@@ -11426,6 +11774,10 @@ fn builtin_http_tool_enforces_exact_redirect_limit() {
                     assert!(read > 0, "client closed before sending redirect headers");
                     request.extend_from_slice(&buf[..read]);
                 }
+                if handled > 0 {
+                    let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    assert!(!headers.contains("referer:"), "{headers}");
+                }
 
                 let response = if handled < redirects {
                     format!(
@@ -11447,7 +11799,7 @@ fn builtin_http_tool_enforces_exact_redirect_limit() {
         let result = tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async {
-                build_http_tool_client()
+                build_http_tool_client(false, HttpToolResolver::default())
                     .get(format!("http://{addr}/hop/0"))
                     .timeout(std::time::Duration::from_secs(5))
                     .send()
@@ -11532,6 +11884,348 @@ fn builtin_http_tool_blocks_redirect_to_link_local_metadata() {
     assert!(out.contains("169.254.169.254"), "{out}");
     server.join().expect("server thread");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_http_tool_interrupts_while_waiting_for_response_headers() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled response server");
+    let addr = listener.local_addr().expect("stalled response addr");
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let server_interrupt = interrupt.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept stalled request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set stalled request timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).expect("read stalled request");
+            assert!(read > 0, "client closed before request headers completed");
+            request.extend_from_slice(&buf[..read]);
+        }
+        server_interrupt.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(250));
+    });
+
+    let error = execute_http_tool_async(
+        &json!({"args": [format!("http://{addr}/stalled")]}),
+        interrupt,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("interrupt must cancel response-header wait");
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    server.join().expect("stalled response server");
+    assert!(error.contains("killed by interrupt"), "{error}");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_http_tool_refuses_oversized_declared_body_before_reading_it() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind oversized response server");
+    let addr = listener.local_addr().expect("oversized response addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept oversized request");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).expect("read oversized request");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            HTTP_BODY_READ_CEILING + 1
+        )
+        .expect("write oversized headers");
+    });
+
+    let error = execute_http_tool_async(
+        &json!({"args": [format!("http://{addr}/oversized")]}),
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("oversized declared body must be refused");
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    server.join().expect("oversized response server");
+    assert!(error.contains("safety ceiling"), "{error}");
+    assert!(
+        error.contains(&HTTP_BODY_READ_CEILING.to_string()),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_http_tool_allows_oversized_head_representation_metadata() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind HEAD response server");
+    let addr = listener.local_addr().expect("HEAD response addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept HEAD request");
+        let mut request = [0u8; 1024];
+        let read = stream.read(&mut request).expect("read HEAD request");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(
+            request.starts_with("HEAD /metadata HTTP/1.1\r\n"),
+            "{request}"
+        );
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            HTTP_BODY_READ_CEILING + 1
+        )
+        .expect("write HEAD response");
+    });
+
+    let output = execute_http_tool_async(
+        &json!({"args": ["HEAD", format!("http://{addr}/metadata")]}),
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("HEAD metadata must not be treated as a response body");
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    server.join().expect("HEAD response server");
+    assert_eq!(output, "HTTP 200 OK");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_http_tool_decompresses_gzip_inside_text_read_cap() {
+    const GZIP_HTML: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb3, 0xc9, 0x28, 0xc9, 0xcd,
+        0xb1, 0xb3, 0x49, 0xca, 0x4f, 0xa9, 0xb4, 0xb3, 0xc9, 0x30, 0xb4, 0x73, 0xce, 0xcf, 0x2d,
+        0x28, 0x4a, 0x2d, 0x2e, 0x4e, 0x4d, 0x51, 0x00, 0x52, 0xa9, 0x89, 0x45, 0xc9, 0x19, 0x36,
+        0xfa, 0x40, 0x71, 0x1b, 0x7d, 0x88, 0x12, 0x7d, 0xb0, 0x7a, 0x00, 0xc0, 0xd8, 0x03, 0x37,
+        0x36, 0x00, 0x00, 0x00,
+    ];
+
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind gzip server");
+    let addr = listener.local_addr().expect("gzip server addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept gzip request");
+        let mut request = [0u8; 1024];
+        let read = stream.read(&mut request).expect("read gzip request");
+        let headers = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+        assert!(headers.contains("accept-encoding:"), "{headers}");
+        assert!(headers.contains("gzip"), "{headers}");
+        assert!(headers.contains("br"), "{headers}");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            GZIP_HTML.len()
+        )
+        .expect("write gzip headers");
+        stream.write_all(GZIP_HTML).expect("write gzip body");
+    });
+
+    let output = execute_http_tool_async(
+        &json!({"args": [format!("http://{addr}/gzip"), "--extract-text"]}),
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("gzip extraction");
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    server.join().expect("gzip server");
+    assert!(output.contains("Compressed research"), "{output}");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_http_tool_text_mode_drops_chunked_body_at_source_cap() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind capped response server");
+    let addr = listener.local_addr().expect("capped response addr");
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept capped request");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).expect("read capped request");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .expect("write capped response headers");
+        let chunk = vec![b'x'; 16 * 1024];
+        for _ in 0..8 {
+            write!(stream, "{:x}\r\n", chunk.len()).expect("write chunk size");
+            stream.write_all(&chunk).expect("write response chunk");
+            stream.write_all(b"\r\n").expect("finish response chunk");
+        }
+        stream.flush().expect("flush capped response");
+        resume_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client should return before server EOF");
+    });
+
+    let output = execute_http_tool_async(
+        &json!({"args": [format!("http://{addr}/chunked"), "--extract-text"]}),
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("capped text extraction");
+    resume_tx.send(()).expect("release capped response server");
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    server.join().expect("capped response server");
+    assert!(
+        output.contains(&format!(
+            "source read stopped at the {HTTP_EXTRACT_INPUT_CAP}-byte extraction safety ceiling"
+        )),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_http_redirect_allows_plain_cross_origin_get_without_referer() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
+    let destination = TcpListener::bind("127.0.0.1:0").expect("bind redirect destination");
+    let destination_addr = destination.local_addr().expect("redirect destination addr");
+    let origin = TcpListener::bind("127.0.0.1:0").expect("bind redirect origin");
+    let origin_addr = origin.local_addr().expect("redirect origin addr");
+
+    let origin_server = std::thread::spawn(move || {
+        let (mut stream, _) = origin.accept().expect("accept redirect origin request");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).expect("read origin request");
+        write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: http://{destination_addr}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write origin redirect");
+    });
+    let destination_server = std::thread::spawn(move || {
+        let (mut stream, _) = destination.accept().expect("accept redirect destination");
+        let mut request = [0u8; 2048];
+        let read = stream.read(&mut request).expect("read destination request");
+        let headers = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+        assert!(headers.starts_with("get /final http/1.1\r\n"), "{headers}");
+        assert!(!headers.contains("referer:"), "{headers}");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone")
+            .expect("write redirect destination response");
+    });
+
+    let output = execute_http_tool_async(
+        &json!({"args": [format!("http://{origin_addr}/start")]}),
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("plain cross-origin GET redirect");
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    origin_server.join().expect("redirect origin server");
+    destination_server
+        .join()
+        .expect("redirect destination server");
+    assert_eq!(output, "done");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn builtin_http_redirect_blocks_cross_origin_header_and_body_replay() {
+    let _guard = env_lock();
+    let old_loopback = std::env::var_os(HTTP_TOOL_ALLOW_LOOPBACK_ENV);
+    unsafe { std::env::set_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, "1") };
+    let destination = TcpListener::bind("127.0.0.1:0").expect("bind redirect destination");
+    let destination_addr = destination.local_addr().expect("redirect destination addr");
+    let origin = TcpListener::bind("127.0.0.1:0").expect("bind redirect origin");
+    let origin_addr = origin.local_addr().expect("redirect origin addr");
+
+    let origin_server = std::thread::spawn(move || {
+        let (mut stream, _) = origin.accept().expect("accept redirect origin request");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).expect("read origin request headers");
+            assert!(read > 0, "client closed before sending origin headers");
+            request.extend_from_slice(&buf[..read]);
+        }
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("origin header terminator")
+            + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .expect("origin content length");
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buf).expect("read origin request body");
+            assert!(read > 0, "client closed before sending origin body");
+            request.extend_from_slice(&buf[..read]);
+        }
+        let body = String::from_utf8_lossy(&request[header_end..header_end + content_length]);
+        assert!(headers.starts_with("post /start http/1.1\r\n"), "{headers}");
+        assert!(
+            headers.contains("authorization: bearer test-value"),
+            "{headers}"
+        );
+        assert!(headers.contains("x-api-key: test-key"), "{headers}");
+        assert_eq!(body, "sensitive-body");
+        write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{destination_addr}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write origin redirect");
+    });
+
+    let error = execute_http_tool_async(
+        &json!({
+            "args": [
+                "POST",
+                format!("http://{origin_addr}/start"),
+                "Authorization:Bearer test-value",
+                "X-API-Key:test-key",
+                "--data=sensitive-body"
+            ]
+        }),
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("cross-origin redirect must fail closed");
+
+    restore_env_var(HTTP_TOOL_ALLOW_LOOPBACK_ENV, old_loopback);
+    origin_server.join().expect("redirect origin server");
+    destination
+        .set_nonblocking(true)
+        .expect("set redirect destination nonblocking");
+    assert!(
+        matches!(destination.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+        "cross-origin destination must not receive a replayed request"
+    );
+    assert!(
+        error.contains("blocked cross-origin http redirect"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -23154,6 +23848,8 @@ fn html_entity_decode_preserves_multibyte_utf8() {
         html_entity_decode_minimal("a&b &unknown; &"),
         "a&b &unknown; &"
     );
+    let adversarial = "&".repeat(10_000);
+    assert_eq!(html_entity_decode_minimal(&adversarial), adversarial);
 
     let text = extract_html_text("<p>caf\u{e9} &amp; cr\u{e8}me</p>");
     assert!(text.contains("caf\u{e9} & cr\u{e8}me"), "{text}");

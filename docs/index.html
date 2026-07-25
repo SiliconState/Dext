@@ -1070,7 +1070,7 @@ credential-env: [SERVICE_TOKEN]
 <li>Bash guardrails and sudo detection</li>
 <li>Checkpoint creation and restore logic</li>
 <li>Objective tracking and satisfaction assessment</li>
-<li>URL host extraction, proxy isolation, destination policy, and exact redirect limits; redirect fixtures use bounded blocking reads on accepted sockets for consistent Windows behavior</li>
+<li>URL parsing/error redaction, proxy isolation, shared bounded DNS reuse/lookups, destination policy, dangerous/duplicate header rejection, exact decoded-body caps, bodyless response semantics, safe cross-origin GET/HEAD redirects, sensitive redirect replay blocking, and automatic-<code>Referer</code> suppression; redirect fixtures use bounded blocking reads on accepted sockets for consistent Windows behavior</li>
 </ul>
 <p>Run with: <code>cargo test --release --locked</code></p>
 <h3>Real-PTY TUI Regression Suite (tests/tui_smoke.rs)</h3>
@@ -1241,7 +1241,7 @@ credential-env: [SERVICE_TOKEN]
 <h3>HTTP</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
-<tr><td><code>http</code></td><td>Varies</td><td>HTTPie-style client. Loopback, private/CGNAT, unique-local, link-local, and metadata destinations are blocked after DNS resolution and across redirects unless narrowly opted in.</td></tr>
+<tr><td><code>http</code></td><td>Varies</td><td>HTTPie-style client with HTTP/2 and gzip/Brotli decoding; provider, OAuth, and local-context clients retain HTTP/1/no-auto-decompression behavior. The entire DNS answer is validated before one shared 256-entry cache retains at most 32 addresses per host; connect, lookup, idle-read, 10-minute total-request, redirect, and exact decoded-response bounds apply. <code>--extract-text</code> reads at most 128 KB of source. Duplicate/framing/method-override headers and URL credentials are rejected; errors omit URLs; automatic <code>Referer</code> and HTTPS downgrades are disabled. Headerless/bodyless GET and HEAD requests may follow validated cross-origin redirects, while sensitive requests remain same-origin. GET, HEAD, and OPTIONS requests with raw bodies are Danger-class. IPv4 current-network/broadcast, IP multicast, and IPv6 unspecified destinations are always blocked. Loopback, private/CGNAT, unique-local, link-local, and metadata destinations are blocked unless narrowly opted in.</td></tr>
 </table>
 <h3>Git Operations</h3>
 <table>
@@ -1301,7 +1301,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>DEXT_EXTERNAL_TIMEOUT_SECS</code></td><td>60</td><td>Default timeout for external tools</td></tr>
 <tr><td><code>DEXT_HOOK_TIMEOUT_SECS</code></td><td>60</td><td>Default timeout for hook commands</td></tr>
 <tr><td><code>DEXT_TRUST</code></td><td>false</td><td>Explicit alias for approval <code>always</code> when set to a true value; false values do not override the default <code>ask</code> profile.</td></tr>
-<tr><td><code>DEXT_HTTP_ALLOW_LOOPBACK</code></td><td>false</td><td>Built-in HTTP tool only: allow loopback and unspecified/local destinations.</td></tr>
+<tr><td><code>DEXT_HTTP_ALLOW_LOOPBACK</code></td><td>false</td><td>Built-in HTTP tool only: allow loopback destinations. Unspecified/current-network, multicast, and broadcast destinations remain blocked.</td></tr>
 <tr><td><code>DEXT_HTTP_ALLOW_PRIVATE</code></td><td>false</td><td>Built-in HTTP tool only: allow private, CGNAT, and IPv6 unique-local destinations.</td></tr>
 <tr><td><code>DEXT_HTTP_ALLOW_LINK_LOCAL</code></td><td>false</td><td>Built-in HTTP tool only: allow link-local and cloud-metadata destinations.</td></tr>
 <tr><td><code>DEXT_NO_TUI</code></td><td>false</td><td>Disable inline TUI even when a terminal is available</td></tr>

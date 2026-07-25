@@ -3064,16 +3064,10 @@ fn classify_bash_command_risk(command: &str) -> CommandRisk {
 }
 
 fn classify_http_risk(input: &Value) -> CommandRisk {
-    let method = input["args"]
-        .as_array()
-        .and_then(|args| args.first())
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    match method.as_str() {
-        "GET" | "HEAD" | "OPTIONS" => CommandRisk::Read,
-        "POST" | "PUT" | "PATCH" | "DELETE" => CommandRisk::Danger,
-        _ => CommandRisk::Danger,
+    if crate::http_tool_request_is_read_only(input) {
+        CommandRisk::Read
+    } else {
+        CommandRisk::Danger
     }
 }
 
@@ -3907,8 +3901,43 @@ mod tests {
             CommandRisk::Read
         );
         assert_eq!(
-            classify_command_risk("http", &json!({"args": ["POST", "https://example.com"]})),
-            CommandRisk::Danger
+            classify_command_risk("http", &json!({"args": ["HTTPS://example.com"]})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk(
+                "http",
+                &json!({
+                    "args": ["GET", "https://example.com", "--ignore-stdin"],
+                    "stdin": "ignored"
+                })
+            ),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk(
+                "http",
+                &json!({"args": ["GET", "https://example.com", "Accept:application/json"]})
+            ),
+            CommandRisk::Read
+        );
+        for input in [
+            json!({"args": ["GET", "https://example.com", "Authorization:Bearer secret"]}),
+            json!({"args": ["GET", "https://example.com", "X-Custom:value"]}),
+            json!({"args": ["POST", "https://example.com"]}),
+            json!({"args": ["GET", "https://example.com", "--data=mutating"]}),
+            json!({"args": ["GET", "https://example.com", "payload:={\"mutating\":true}"]}),
+            json!({"args": ["HEAD", "https://example.com"], "stdin": "mutating"}),
+            json!({"args": ["--extract-text"]}),
+        ] {
+            assert_eq!(classify_command_risk("http", &input), CommandRisk::Danger);
+        }
+        assert_eq!(
+            classify_command_risk(
+                "http",
+                &json!({"args": ["--extract-text", "https://example.com"]})
+            ),
+            CommandRisk::Read
         );
         assert_eq!(
             classify_command_risk("edit_file", &json!({"path": "src/main.rs"})),

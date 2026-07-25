@@ -69,6 +69,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const TOOL_RESULT_CAP: usize = 12_000;
 const FRUGAL_TOOL_RESULT_CAP: usize = 6_000;
@@ -86,7 +87,20 @@ const LSP_DIAGNOSTIC_FILE_BYTE_CAP: u64 = 1_048_576;
 const LSP_DIAGNOSTIC_TOTAL_BYTE_CAP: u64 = 8_388_608;
 const HTTP_EXTRACT_INPUT_CAP: usize = 128_000;
 const HTTP_EXTRACT_OUTPUT_CAP: usize = 24_000;
+const HTTP_REQUEST_INPUT_MAX: usize = 256_000;
+const HTTP_REQUEST_ARG_MAX: usize = 1_024;
+const HTTP_REQUEST_URL_MAX: usize = 256_000;
+const HTTP_REQUEST_HEADER_MAX_COUNT: usize = 128;
+const HTTP_REQUEST_HEADER_MAX_BYTES: usize = 64 * 1024;
+const HTTP_REQUEST_WIRE_BODY_MAX: usize = 256_000;
+const HTTP_RESPONSE_HTTP2_HEADER_MAX_BYTES: u32 = 16 * 1024;
+const HTTP_BODY_READ_CEILING: usize = 8 * 1024 * 1024;
 const HTTP_TOOL_REDIRECT_LIMIT: usize = 10;
+const HTTP_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const HTTP_DNS_CACHE_MAX_ENTRIES: usize = 256;
+const HTTP_DNS_ADDR_MAX: usize = 32;
+const HTTP_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_TOOL_TIMEOUT_MAX: Duration = Duration::from_secs(10 * 60);
 const HTTP_TOOL_ALLOW_LINK_LOCAL_ENV: &str = "DEXT_HTTP_ALLOW_LINK_LOCAL";
 const HTTP_TOOL_ALLOW_LOOPBACK_ENV: &str = "DEXT_HTTP_ALLOW_LOOPBACK";
 const HTTP_TOOL_ALLOW_PRIVATE_ENV: &str = "DEXT_HTTP_ALLOW_PRIVATE";
@@ -957,6 +971,7 @@ struct LimitedByteCapture {
     tail: Vec<u8>,
     observed_bytes: usize,
     truncated: bool,
+    stopped_early: bool,
 }
 
 impl LimitedByteCapture {
@@ -1028,14 +1043,37 @@ impl LimitedByteCapture {
         self.push_tail(rest);
     }
 
+    fn push_head(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.observed_bytes += chunk.len();
+        let remaining = self.cap.saturating_sub(self.head.len());
+        self.head
+            .extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+        if chunk.len() > remaining {
+            self.truncated = true;
+        }
+    }
+
+    fn mark_stopped_early(&mut self) {
+        self.truncated = true;
+        self.stopped_early = true;
+    }
+
     fn render(&self, label: &str) -> String {
         let mut out = String::from_utf8_lossy(&self.head).to_string();
         if self.truncated {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
+            let stopped = if self.stopped_early {
+                " read stopped at safety ceiling;"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "\n…[{label} capped after {} bytes observed; kept first {} and last {}]\n",
+                "\n…[{label} capped after {} bytes observed;{stopped} kept first {} and last {}]\n",
                 self.observed_bytes,
                 self.head.len(),
                 self.tail.len()
@@ -6060,6 +6098,9 @@ fn provider_stream_idle_timeout(local: bool) -> std::time::Duration {
 fn build_provider_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(provider_connect_timeout())
+        .no_gzip()
+        .no_brotli()
+        .http1_only()
         .build()
         .expect("build provider HTTP client")
 }
@@ -6857,46 +6898,149 @@ enum HttpOutputMode {
 struct PreparedHttpToolRequest {
     method: reqwest::Method,
     url: reqwest::Url,
-    headers: Vec<(String, String)>,
+    headers: reqwest::header::HeaderMap,
     body: Option<HttpToolBody>,
     timeout: std::time::Duration,
     output_mode: HttpOutputMode,
 }
 
-fn http_tool_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
+fn http_tool_redirect_crosses_origin(next: &reqwest::Url, previous: &[reqwest::Url]) -> bool {
+    previous.last().is_some_and(|previous| {
+        next.scheme() != previous.scheme()
+            || next.host_str() != previous.host_str()
+            || next.port_or_known_default() != previous.port_or_known_default()
+    })
+}
+
+fn http_tool_redirect_downgrades_https(next: &reqwest::Url, previous: &[reqwest::Url]) -> bool {
+    next.scheme() == "http"
+        && previous
+            .last()
+            .is_some_and(|previous| previous.scheme() == "https")
+}
+
+fn http_tool_url_origin(url: &reqwest::Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+fn http_tool_redirect_policy(allow_cross_origin: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > HTTP_TOOL_REDIRECT_LIMIT {
             return attempt.error("too many redirects");
         }
         if let Err(reason) = validate_http_tool_destination(attempt.url()) {
-            let url = attempt.url().to_string();
-            return attempt.error(format!("blocked http redirect to {url}: {reason}"));
+            let destination = http_tool_url_origin(attempt.url());
+            return attempt.error(format!("blocked http redirect to {destination}: {reason}"));
+        }
+        if !attempt.url().username().is_empty() || attempt.url().password().is_some() {
+            return attempt.error("blocked http redirect containing URL credentials");
+        }
+        if http_tool_redirect_downgrades_https(attempt.url(), attempt.previous()) {
+            return attempt.error("blocked HTTPS-to-HTTP redirect downgrade");
+        }
+        if http_tool_redirect_crosses_origin(attempt.url(), attempt.previous())
+            && !allow_cross_origin
+        {
+            let destination = http_tool_url_origin(attempt.url());
+            return attempt.error(format!(
+                "blocked cross-origin http redirect to {destination}"
+            ));
         }
         attempt.follow()
     })
 }
 
-fn build_http_tool_client() -> reqwest::Client {
+fn build_http_tool_client(allow_cross_origin: bool, resolver: HttpToolResolver) -> reqwest::Client {
     reqwest::Client::builder()
         // Proxy-side DNS would bypass the resolver checks below, so the
         // security-scoped built-in client must connect directly.
         .no_proxy()
-        .dns_resolver(Arc::new(HttpToolResolver))
-        .redirect(http_tool_redirect_policy())
+        .dns_resolver(Arc::new(resolver))
+        .redirect(http_tool_redirect_policy(allow_cross_origin))
+        .referer(false)
+        .http2_max_header_list_size(HTTP_RESPONSE_HTTP2_HEADER_MAX_BYTES)
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(4)
         .build()
         .expect("build http tool client")
 }
 
-fn http_tool_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(build_http_tool_client)
+struct HttpToolClients {
+    same_origin: reqwest::Client,
+    safe_cross_origin: reqwest::Client,
 }
 
-struct HttpToolResolver;
+fn http_tool_client(allow_cross_origin: bool) -> &'static reqwest::Client {
+    static CLIENTS: OnceLock<HttpToolClients> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| {
+        let resolver = HttpToolResolver::default();
+        HttpToolClients {
+            same_origin: build_http_tool_client(false, resolver.clone()),
+            safe_cross_origin: build_http_tool_client(true, resolver),
+        }
+    });
+    if allow_cross_origin {
+        &clients.safe_cross_origin
+    } else {
+        &clients.same_origin
+    }
+}
+
+#[derive(Clone)]
+struct HttpDnsCacheEntry {
+    addrs: Vec<SocketAddr>,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct HttpToolResolver {
+    cache: Arc<Mutex<HashMap<String, HttpDnsCacheEntry>>>,
+    lookup_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for HttpToolResolver {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            lookup_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        }
+    }
+}
+
+fn collect_validated_http_addrs(
+    host: &str,
+    addrs: impl Iterator<Item = SocketAddr>,
+) -> io::Result<Vec<SocketAddr>> {
+    let mut retained = Vec::with_capacity(HTTP_DNS_ADDR_MAX);
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if let Some(reason) = http_tool_blocked_ip_reason(addr.ip()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("host '{host}' resolves to {} ({reason})", addr.ip()),
+            ));
+        }
+        if retained.len() < HTTP_DNS_ADDR_MAX {
+            retained.push(addr);
+        }
+    }
+    if !resolved_any {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("HTTP DNS lookup for {host} returned no addresses"),
+        ));
+    }
+    Ok(retained)
+}
 
 impl reqwest::dns::Resolve for HttpToolResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let cache = Arc::clone(&self.cache);
+        let lookup_slots = Arc::clone(&self.lookup_slots);
         Box::pin(async move {
             if !http_tool_allow_link_local() && http_tool_metadata_host(&host) {
                 return Err(io::Error::new(
@@ -6918,19 +7062,69 @@ impl reqwest::dns::Resolve for HttpToolResolver {
                 return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
             }
 
+            let cached = cache
+                .lock()
+                .map_err(|_| io::Error::other("HTTP DNS cache lock poisoned"))?
+                .get(&host)
+                .filter(|entry| entry.expires_at > Instant::now())
+                .map(|entry| entry.addrs.clone());
+            if let Some(addrs) = cached {
+                if let Some(reason) = http_tool_blocked_addrs_reason(&host, &addrs) {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason).into());
+                }
+                return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
+            }
+
+            let lookup_deadline = tokio::time::Instant::now() + HTTP_DNS_LOOKUP_TIMEOUT;
+            let permit = tokio::time::timeout_at(lookup_deadline, lookup_slots.acquire_owned())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "HTTP DNS lookup queue timed out")
+                })?
+                .map_err(|_| io::Error::other("HTTP DNS lookup limiter closed"))?;
             let host_for_lookup = host.clone();
-            let addrs = tokio::task::spawn_blocking(move || {
+            let lookup = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 (host_for_lookup.as_str(), 0)
                     .to_socket_addrs()
-                    .map(|iter| iter.collect::<Vec<SocketAddr>>())
-            })
-            .await
-            .map_err(|e| io::Error::other(format!("HTTP DNS resolver task failed: {e}")))?
-            .map_err(|e| io::Error::other(format!("HTTP DNS lookup for {host} failed: {e}")))?;
+                    .and_then(|iter| collect_validated_http_addrs(&host_for_lookup, iter))
+            });
+            let addrs = tokio::time::timeout_at(lookup_deadline, lookup)
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("HTTP DNS lookup for {host} timed out"),
+                    )
+                })?
+                .map_err(|e| io::Error::other(format!("HTTP DNS resolver task failed: {e}")))?
+                .map_err(|e| io::Error::other(format!("HTTP DNS lookup for {host} failed: {e}")))?;
 
             if let Some(reason) = http_tool_blocked_addrs_reason(&host, &addrs) {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason).into());
             }
+
+            let now = Instant::now();
+            let mut entries = cache
+                .lock()
+                .map_err(|_| io::Error::other("HTTP DNS cache lock poisoned"))?;
+            entries.retain(|_, entry| entry.expires_at > now);
+            if entries.len() >= HTTP_DNS_CACHE_MAX_ENTRIES
+                && !entries.contains_key(&host)
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .map(|(host, _)| host.clone())
+            {
+                entries.remove(&oldest);
+            }
+            entries.insert(
+                host,
+                HttpDnsCacheEntry {
+                    addrs: addrs.clone(),
+                    expires_at: now + HTTP_DNS_CACHE_TTL,
+                },
+            );
 
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
@@ -6995,8 +7189,8 @@ fn http_tool_blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => http_tool_blocked_ipv4_reason(v4),
         IpAddr::V6(v6) => {
-            if v6.is_unspecified() && !http_tool_allow_loopback() {
-                return Some("IPv6 unspecified/local address");
+            if v6.is_unspecified() {
+                return Some("IPv6 unspecified address");
             }
             if let Some(v4) = http_tool_ipv6_embedded_ipv4(v6)
                 && http_tool_blocked_ipv4_reason(v4).is_some()
@@ -7007,10 +7201,15 @@ fn http_tool_blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
             if v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
                 return (!http_tool_allow_link_local()).then_some("AWS IPv6 metadata address");
             }
+            if v6.is_multicast() {
+                return Some("IPv6 multicast address");
+            }
             if v6.is_loopback() && !http_tool_allow_loopback() {
                 Some("IPv6 loopback address")
             } else if first & 0xfe00 == 0xfc00 && !http_tool_allow_private() {
                 Some("IPv6 unique-local address")
+            } else if first & 0xffc0 == 0xfec0 && !http_tool_allow_private() {
+                Some("IPv6 deprecated site-local address")
             } else if first & 0xffc0 == 0xfe80 && !http_tool_allow_link_local() {
                 Some("IPv6 link-local address")
             } else {
@@ -7026,11 +7225,21 @@ fn http_tool_ipv4_is_shared(v4: Ipv4Addr) -> bool {
 }
 
 fn http_tool_blocked_ipv4_reason(v4: Ipv4Addr) -> Option<&'static str> {
+    let [first, _, _, _] = v4.octets();
+    if first == 0 {
+        return Some("IPv4 current-network address");
+    }
+    if v4 == Ipv4Addr::BROADCAST {
+        return Some("IPv4 limited broadcast address");
+    }
+    if v4.is_multicast() {
+        return Some("IPv4 multicast address");
+    }
     if v4 == Ipv4Addr::new(100, 100, 100, 200) {
         return (!http_tool_allow_link_local()).then_some("cloud metadata address");
     }
-    if v4.is_unspecified() && !http_tool_allow_loopback() {
-        Some("IPv4 unspecified/local address")
+    if v4.is_unspecified() {
+        Some("IPv4 unspecified address")
     } else if v4.is_loopback() && !http_tool_allow_loopback() {
         Some("IPv4 loopback address")
     } else if v4.is_link_local() && !http_tool_allow_link_local() {
@@ -7059,26 +7268,115 @@ fn http_tool_ipv6_embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 
 fn parse_http_method_token(token: &str) -> Option<reqwest::Method> {
     let upper = token.trim().to_ascii_uppercase();
-    if upper.is_empty() || upper.contains("://") {
+    if upper.is_empty() || upper.starts_with('-') || upper.contains("://") {
         return None;
     }
     reqwest::Method::from_bytes(upper.as_bytes()).ok()
 }
 
+fn is_http_url_arg(token: &str) -> bool {
+    token
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || token
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpBodyMode {
+    Auto,
+    Json,
+    Form,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpItemKind {
+    Plain,
+    Query,
+    Json,
+}
+
+fn split_http_item(token: &str) -> Option<(HttpItemKind, &str, &str)> {
+    let (offset, _, kind, operator_len) = [
+        token
+            .find("==")
+            .map(|offset| (offset, 0, HttpItemKind::Query, 2)),
+        token
+            .find(":=")
+            .map(|offset| (offset, 0, HttpItemKind::Json, 2)),
+        token
+            .find('=')
+            .map(|offset| (offset, 1, HttpItemKind::Plain, 1)),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|(offset, priority, _, _)| (*offset, *priority))?;
+    Some((kind, &token[..offset], &token[offset + operator_len..]))
+}
+
 fn split_http_header_arg(token: &str) -> Option<(String, String)> {
-    if token.contains("://")
-        || token.starts_with(':')
-        || token.contains("==")
-        || token.contains(":=")
-    {
+    if is_http_url_arg(token) || token.starts_with(':') {
         return None;
     }
     let (name, value) = token.split_once(':')?;
+    let colon = name.len();
+    if split_http_item(token).is_some_and(|(_, key, _)| key.len() <= colon) {
+        return None;
+    }
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
     Some((name.to_string(), value.trim().to_string()))
+}
+
+fn http_tool_blocked_request_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "keep-alive"
+            | "http2-settings"
+            | "x-http-method"
+            | "x-http-method-override"
+            | "x-method-override"
+            | "expect"
+    )
+}
+
+fn insert_http_tool_header(
+    headers: &mut reqwest::header::HeaderMap,
+    name: String,
+    value: String,
+) -> std::result::Result<(), String> {
+    let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| format!("invalid http header name '{name}'"))?;
+    if http_tool_blocked_request_header(&name) {
+        return Err(format!(
+            "http header '{}' is controlled by Dext's transport",
+            name.as_str()
+        ));
+    }
+    if headers.contains_key(&name) {
+        return Err(format!("duplicate http header '{}'", name.as_str()));
+    }
+    if headers.len() >= HTTP_REQUEST_HEADER_MAX_COUNT {
+        return Err(format!(
+            "http request exceeds the {HTTP_REQUEST_HEADER_MAX_COUNT}-header limit"
+        ));
+    }
+    let value = reqwest::header::HeaderValue::from_str(&value)
+        .map_err(|_| format!("invalid value for http header '{}'", name.as_str()))?;
+    headers.insert(name, value);
+    Ok(())
 }
 
 fn parse_http_timeout_value(raw: &str) -> std::result::Result<std::time::Duration, String> {
@@ -7089,14 +7387,52 @@ fn parse_http_timeout_value(raw: &str) -> std::result::Result<std::time::Duratio
     if !secs.is_finite() || secs <= 0.0 {
         return Err(format!("invalid http timeout '{raw}'"));
     }
-    Ok(std::time::Duration::from_secs_f64(secs))
+    let timeout = std::time::Duration::try_from_secs_f64(secs)
+        .map_err(|_| format!("invalid http timeout '{raw}'"))?;
+    if timeout.is_zero() || timeout > HTTP_TOOL_TIMEOUT_MAX {
+        return Err(format!("invalid http timeout '{raw}'"));
+    }
+    Ok(timeout)
 }
 
 fn prepare_http_tool_request(
     input: &Value,
     default_timeout: std::time::Duration,
 ) -> std::result::Result<PreparedHttpToolRequest, String> {
-    let args = str_array(&input["args"]);
+    let raw_args = input["args"]
+        .as_array()
+        .ok_or_else(|| "http args must be an array".to_string())?;
+    if raw_args.len() > HTTP_REQUEST_ARG_MAX {
+        return Err(format!(
+            "http input exceeds the {HTTP_REQUEST_ARG_MAX}-argument limit"
+        ));
+    }
+    let stdin_body = match input.get("stdin") {
+        Some(Value::String(stdin)) => {
+            if stdin.len() > HTTP_REQUEST_INPUT_MAX {
+                return Err(format!(
+                    "http input exceeds the {HTTP_REQUEST_INPUT_MAX}-byte limit"
+                ));
+            }
+            Some(stdin.clone())
+        }
+        Some(Value::Null) | None => None,
+        Some(_) => return Err("http stdin must be a string".to_string()),
+    };
+    let mut input_size = stdin_body.as_ref().map_or(0, String::len);
+    let mut args = Vec::with_capacity(raw_args.len());
+    for arg in raw_args {
+        let arg = arg
+            .as_str()
+            .ok_or_else(|| "http args must contain only strings".to_string())?;
+        input_size = input_size.saturating_add(arg.len());
+        if input_size > HTTP_REQUEST_INPUT_MAX {
+            return Err(format!(
+                "http input exceeds the {HTTP_REQUEST_INPUT_MAX}-byte limit"
+            ));
+        }
+        args.push(arg.to_string());
+    }
     if args.is_empty() {
         return Err("missing args".to_string());
     }
@@ -7110,34 +7446,41 @@ fn prepare_http_tool_request(
     };
 
     let mut url: Option<String> = None;
-    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut headers = reqwest::header::HeaderMap::new();
     let mut query_pairs: Vec<(String, String)> = Vec::new();
     let mut json_items: serde_json::Map<String, Value> = serde_json::Map::new();
     let mut form_fields: Vec<(String, String)> = Vec::new();
-    let mut raw_body = input["stdin"].as_str().map(String::from);
-    let mut form_mode = false;
-    let mut timeout = default_timeout;
+    let mut ignore_stdin = false;
+    let mut explicit_raw_body: Option<String> = None;
+    let mut body_mode = HttpBodyMode::Auto;
+    let mut timeout = default_timeout.min(HTTP_TOOL_TIMEOUT_MAX);
     let mut output_mode = HttpOutputMode::Raw;
 
     while idx < args.len() {
         let token = &args[idx];
         match token.as_str() {
             "--form" | "-f" => {
-                form_mode = true;
+                if body_mode == HttpBodyMode::Json || !json_items.is_empty() {
+                    return Err("cannot combine JSON and form request modes".to_string());
+                }
+                body_mode = HttpBodyMode::Form;
                 idx += 1;
                 continue;
             }
             "--json" | "-j" => {
-                form_mode = false;
+                if body_mode == HttpBodyMode::Form || !form_fields.is_empty() {
+                    return Err("cannot combine JSON and form request modes".to_string());
+                }
+                body_mode = HttpBodyMode::Json;
                 idx += 1;
                 continue;
             }
-            "--follow" | "-F" | "--headers" | "-h" | "--body" | "-b" | "--check-status" => {
+            "--follow" | "-F" | "--body" | "-b" | "--check-status" => {
                 idx += 1;
                 continue;
             }
             "--ignore-stdin" => {
-                raw_body = None;
+                ignore_stdin = true;
                 idx += 1;
                 continue;
             }
@@ -7158,10 +7501,10 @@ fn prepare_http_tool_request(
                 let Some(value) = args.get(idx + 1) else {
                     return Err(format!("missing value after {token}"));
                 };
-                if raw_body.is_some() {
+                if explicit_raw_body.is_some() {
                     return Err("http request body specified more than once".to_string());
                 }
-                raw_body = Some(value.clone());
+                explicit_raw_body = Some(value.clone());
                 idx += 2;
                 continue;
             }
@@ -7174,66 +7517,69 @@ fn prepare_http_tool_request(
             continue;
         }
         if let Some(value) = token.strip_prefix("--data=") {
-            if raw_body.is_some() {
+            if explicit_raw_body.is_some() {
                 return Err("http request body specified more than once".to_string());
             }
-            raw_body = Some(value.to_string());
+            explicit_raw_body = Some(value.to_string());
             idx += 1;
             continue;
         }
         if let Some(value) = token.strip_prefix("--raw=") {
-            if raw_body.is_some() {
+            if explicit_raw_body.is_some() {
                 return Err("http request body specified more than once".to_string());
             }
-            raw_body = Some(value.to_string());
+            explicit_raw_body = Some(value.to_string());
             idx += 1;
             continue;
         }
 
-        if url.is_none() && (token.starts_with("http://") || token.starts_with("https://")) {
+        if url.is_none() && is_http_url_arg(token) {
             url = Some(token.clone());
             idx += 1;
             continue;
         }
-        if let Some((key, value)) = token.split_once("==") {
-            let key = key.trim();
-            if key.is_empty() {
-                return Err(format!("invalid query arg: {token}"));
-            }
-            query_pairs.push((key.to_string(), value.to_string()));
-            idx += 1;
-            continue;
-        }
-        if let Some((key, value)) = token.split_once(":=") {
-            let key = key.trim();
-            if key.is_empty() {
-                return Err(format!("invalid JSON arg: {token}"));
-            }
-            let parsed = serde_json::from_str::<Value>(value)
-                .map_err(|e| format!("invalid JSON value for {key}: {e}"))?;
-            json_items.insert(key.to_string(), parsed);
-            idx += 1;
-            continue;
-        }
         if let Some((name, value)) = split_http_header_arg(token) {
-            headers.push((name, value));
+            insert_http_tool_header(&mut headers, name, value)?;
             idx += 1;
             continue;
         }
-        if let Some((key, value)) = token.split_once('=') {
+        if let Some((kind, key, value)) = split_http_item(token) {
             let key = key.trim();
             if key.is_empty() {
                 return Err(format!("invalid request item: {token}"));
             }
-            if matches!(
-                method,
-                reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
-            ) {
-                query_pairs.push((key.to_string(), value.to_string()));
-            } else if form_mode {
-                form_fields.push((key.to_string(), value.to_string()));
-            } else {
-                json_items.insert(key.to_string(), Value::String(value.to_string()));
+            match kind {
+                HttpItemKind::Query => {
+                    query_pairs.push((key.to_string(), value.to_string()));
+                }
+                HttpItemKind::Json => {
+                    if body_mode == HttpBodyMode::Form {
+                        return Err("cannot combine JSON and form request modes".to_string());
+                    }
+                    body_mode = HttpBodyMode::Json;
+                    let parsed = serde_json::from_str::<Value>(value)
+                        .map_err(|e| format!("invalid JSON value for {key}: {e}"))?;
+                    json_items.insert(key.to_string(), parsed);
+                }
+                HttpItemKind::Plain => match body_mode {
+                    HttpBodyMode::Form => {
+                        form_fields.push((key.to_string(), value.to_string()));
+                    }
+                    HttpBodyMode::Json => {
+                        json_items.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                    HttpBodyMode::Auto
+                        if matches!(
+                            method,
+                            reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+                        ) =>
+                    {
+                        query_pairs.push((key.to_string(), value.to_string()));
+                    }
+                    HttpBodyMode::Auto => {
+                        json_items.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                },
             }
             idx += 1;
             continue;
@@ -7245,17 +7591,39 @@ fn prepare_http_tool_request(
     }
 
     let raw_url = url.ok_or_else(|| "missing URL".to_string())?;
+    let stdin_body = (!ignore_stdin).then_some(stdin_body).flatten();
+    if explicit_raw_body.is_some() && stdin_body.is_some() {
+        return Err("http request body specified more than once".to_string());
+    }
+    let raw_body = explicit_raw_body.or(stdin_body);
+    if raw_body.is_some() && body_mode != HttpBodyMode::Auto {
+        return Err("cannot combine raw body/stdin with JSON or form mode".to_string());
+    }
     if raw_body.is_some() && (!json_items.is_empty() || !form_fields.is_empty()) {
         return Err("cannot combine raw body/stdin with key=value request items".to_string());
     }
+    if !json_items.is_empty() && !form_fields.is_empty() {
+        return Err("cannot combine JSON and form request modes".to_string());
+    }
 
-    let mut url =
-        reqwest::Url::parse(&raw_url).map_err(|e| format!("invalid URL '{raw_url}': {e}"))?;
+    let mut url = reqwest::Url::parse(&raw_url).map_err(|e| format!("invalid URL: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "URL-embedded credentials are not supported; use an explicit Authorization header"
+                .to_string(),
+        );
+    }
     if !query_pairs.is_empty() {
         let mut pairs = url.query_pairs_mut();
         for (key, value) in query_pairs {
             pairs.append_pair(&key, &value);
         }
+    }
+
+    if url.as_str().len() > HTTP_REQUEST_URL_MAX {
+        return Err(format!(
+            "http URL exceeds the {HTTP_REQUEST_URL_MAX}-byte limit"
+        ));
     }
 
     let body = if !form_fields.is_empty() {
@@ -7276,24 +7644,99 @@ fn prepare_http_tool_request(
     })
 }
 
+fn http_tool_header_is_read_only(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept"
+            | "accept-encoding"
+            | "accept-language"
+            | "cache-control"
+            | "if-match"
+            | "if-modified-since"
+            | "if-none-match"
+            | "if-range"
+            | "if-unmodified-since"
+            | "range"
+            | "user-agent"
+    )
+}
+
+fn http_tool_request_is_read_only(input: &Value) -> bool {
+    prepare_http_tool_request(input, Duration::from_secs(1)).is_ok_and(|request| {
+        matches!(
+            request.method,
+            reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+        ) && request.body.is_none()
+            && request.headers.keys().all(http_tool_header_is_read_only)
+    })
+}
+
+fn http_response_has_body(method: &reqwest::Method, status: reqwest::StatusCode) -> bool {
+    method != reqwest::Method::HEAD
+        && !status.is_informational()
+        && !matches!(
+            status,
+            reqwest::StatusCode::NO_CONTENT
+                | reqwest::StatusCode::RESET_CONTENT
+                | reqwest::StatusCode::NOT_MODIFIED
+        )
+}
+
 async fn read_http_response_limited(
     resp: reqwest::Response,
     interrupt: Arc<AtomicBool>,
-) -> std::result::Result<String, String> {
+    output_mode: HttpOutputMode,
+    response_has_body: bool,
+) -> std::result::Result<(String, bool), String> {
+    if !response_has_body {
+        return Ok((String::new(), false));
+    }
+    let content_length = resp.content_length();
+    if content_length.is_some_and(|length| length > HTTP_BODY_READ_CEILING as u64) {
+        return Err(format!(
+            "HTTP response body exceeds the {HTTP_BODY_READ_CEILING}-byte safety ceiling"
+        ));
+    }
+
+    let read_ceiling = match output_mode {
+        HttpOutputMode::Raw => HTTP_BODY_READ_CEILING,
+        HttpOutputMode::Text => HTTP_EXTRACT_INPUT_CAP,
+    };
+    let capture_cap = match output_mode {
+        HttpOutputMode::Raw => PROCESS_STREAM_CAPTURE_CAP,
+        HttpOutputMode::Text => HTTP_EXTRACT_INPUT_CAP,
+    };
     let mut stream = resp.bytes_stream();
-    let mut capture = LimitedByteCapture::new(PROCESS_STREAM_CAPTURE_CAP);
+    let mut capture = LimitedByteCapture::new(capture_cap);
     loop {
         match read_stream_next_chunk(&mut stream, &interrupt, "killed by interrupt (^C)").await {
-            Ok(Some(chunk)) => capture.push(&chunk),
+            Ok(Some(chunk)) => {
+                let remaining = read_ceiling.saturating_sub(capture.observed_bytes);
+                let take = remaining.min(chunk.len());
+                match output_mode {
+                    HttpOutputMode::Raw => capture.push(&chunk[..take]),
+                    HttpOutputMode::Text => capture.push_head(&chunk[..take]),
+                }
+                if take < chunk.len() || capture.observed_bytes == read_ceiling {
+                    if take < chunk.len() || content_length != Some(capture.observed_bytes as u64) {
+                        capture.mark_stopped_early();
+                    }
+                    break;
+                }
+            }
             Ok(None) => break,
             Err(e) => return Err(e.to_string()),
         }
     }
-    Ok(capture.render("body"))
+    let stopped_early = capture.stopped_early;
+    let body = match output_mode {
+        HttpOutputMode::Raw => capture.render("body"),
+        HttpOutputMode::Text => String::from_utf8_lossy(&capture.head).into_owned(),
+    };
+    Ok((body, stopped_early))
 }
 
-fn html_entity_decode_minimal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn append_html_entity_decoded(out: &mut String, s: &str) {
     let mut i = 0usize;
     while let Some(ch) = s[i..].chars().next() {
         if ch != '&' {
@@ -7301,12 +7744,18 @@ fn html_entity_decode_minimal(s: &str) -> String {
             i += ch.len_utf8();
             continue;
         }
-        let Some(rel_end) = s[i..].find(';') else {
+        let entity_source = &s[i + 1..];
+        let Some(rel_end) = entity_source
+            .as_bytes()
+            .iter()
+            .take(32)
+            .position(|byte| *byte == b';')
+        else {
             out.push('&');
             i += 1;
             continue;
         };
-        let end = i + rel_end;
+        let end = i + 1 + rel_end;
         let entity = &s[i + 1..end];
         let decoded = match entity {
             "amp" => Some('&'),
@@ -7316,8 +7765,9 @@ fn html_entity_decode_minimal(s: &str) -> String {
             "apos" | "#39" => Some('\''),
             "nbsp" => Some(' '),
             _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-                let value = &entity[2..];
-                u32::from_str_radix(value, 16).ok().and_then(char::from_u32)
+                u32::from_str_radix(&entity[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
             }
             _ if entity.starts_with('#') => {
                 entity[1..].parse::<u32>().ok().and_then(char::from_u32)
@@ -7332,18 +7782,22 @@ fn html_entity_decode_minimal(s: &str) -> String {
             i += 1;
         }
     }
+}
+
+#[cfg(test)]
+fn html_entity_decode_minimal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    append_html_entity_decoded(&mut out, s);
     out
 }
 
 fn push_text_with_space(out: &mut String, text: &str) {
-    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if trimmed.is_empty() {
-        return;
+    for word in text.split_whitespace() {
+        if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        append_html_entity_decoded(out, word);
     }
-    if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
-        out.push(' ');
-    }
-    out.push_str(&html_entity_decode_minimal(&trimmed));
 }
 
 fn extract_html_text(html: &str) -> String {
@@ -7419,13 +7873,11 @@ fn extract_html_text(html: &str) -> String {
     }
 
     let mut compact = String::new();
-    let mut blank = false;
     for line in out.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if !compact.is_empty() && !blank {
+        if !compact.is_empty() {
             compact.push('\n');
         }
         compact.push_str(line);
-        blank = false;
     }
     cap_bytes_with_hint(
         compact,
@@ -7434,9 +7886,15 @@ fn extract_html_text(html: &str) -> String {
     )
 }
 
+fn ascii_prefix_contains_ignore_case(haystack: &str, needle: &[u8], prefix_cap: usize) -> bool {
+    haystack.as_bytes()[..haystack.len().min(prefix_cap)]
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn extract_response_text(body: String, content_type: Option<&str>) -> String {
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
-    if ct.contains("text/html") || body.to_ascii_lowercase().contains("<html") {
+    if ct.contains("text/html") || ascii_prefix_contains_ignore_case(&body, b"<html", 4_096) {
         extract_html_text(&body)
     } else if ct.contains("application/json") || ct.contains("+json") {
         match serde_json::from_str::<Value>(&body) {
@@ -7471,6 +7929,7 @@ fn http_status_error(status: reqwest::StatusCode, text: &str) -> String {
 }
 
 fn format_http_request_error(err: reqwest::Error) -> String {
+    let err = err.without_url();
     let mut message = format!("HTTP request failed: {err}");
     let mut source = std::error::Error::source(&err);
     while let Some(err) = source {
@@ -7484,6 +7943,61 @@ fn format_http_request_error(err: reqwest::Error) -> String {
     message
 }
 
+fn validate_http_wire_request(request: &reqwest::Request) -> std::result::Result<(), String> {
+    if request.url().as_str().len() > HTTP_REQUEST_URL_MAX {
+        return Err(format!(
+            "http URL exceeds the {HTTP_REQUEST_URL_MAX}-byte limit"
+        ));
+    }
+    if request.headers().len() > HTTP_REQUEST_HEADER_MAX_COUNT {
+        return Err(format!(
+            "http request exceeds the {HTTP_REQUEST_HEADER_MAX_COUNT}-header limit"
+        ));
+    }
+    let header_bytes = request
+        .headers()
+        .iter()
+        .fold(0usize, |size, (name, value)| {
+            size.saturating_add(name.as_str().len())
+                .saturating_add(value.as_bytes().len())
+        });
+    if header_bytes > HTTP_REQUEST_HEADER_MAX_BYTES {
+        return Err(format!(
+            "http request headers exceed the {HTTP_REQUEST_HEADER_MAX_BYTES}-byte limit"
+        ));
+    }
+    if let Some(body) = request.body() {
+        let bytes = body
+            .as_bytes()
+            .ok_or_else(|| "http request body could not be bounded".to_string())?;
+        if bytes.len() > HTTP_REQUEST_WIRE_BODY_MAX {
+            return Err(format!(
+                "http request body exceeds the {HTTP_REQUEST_WIRE_BODY_MAX}-byte limit"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn send_http_request_interruptible(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    interrupt: &AtomicBool,
+) -> std::result::Result<reqwest::Response, String> {
+    let request = client.execute(request);
+    tokio::pin!(request);
+    let mut ticker = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        if interrupt.load(Ordering::SeqCst) {
+            return Err("killed by interrupt (^C)".to_string());
+        }
+        tokio::select! {
+            response = &mut request => return response.map_err(format_http_request_error),
+            _ = ticker.tick() => {}
+        }
+    }
+}
+
 async fn execute_http_tool_async(
     input: &Value,
     interrupt: Arc<AtomicBool>,
@@ -7495,13 +8009,19 @@ async fn execute_http_tool_async(
         return Err("killed by interrupt (^C)".to_string());
     }
 
-    let mut req = http_tool_client()
-        .request(request.method, request.url)
+    let allow_cross_origin_redirects =
+        matches!(request.method, reqwest::Method::GET | reqwest::Method::HEAD)
+            && request.headers.is_empty()
+            && request.body.is_none();
+    let mut headers = request.headers;
+    headers
+        .entry(reqwest::header::USER_AGENT)
+        .or_insert(reqwest::header::HeaderValue::from_static("dext/http"));
+    let client = http_tool_client(allow_cross_origin_redirects);
+    let mut req = client
+        .request(request.method.clone(), request.url)
         .timeout(request.timeout)
-        .header(reqwest::header::USER_AGENT, "dext/http");
-    for (name, value) in request.headers {
-        req = req.header(name, value);
-    }
+        .headers(headers);
     match request.body {
         Some(HttpToolBody::Json(value)) => {
             req = req.json(&value);
@@ -7515,19 +8035,28 @@ async fn execute_http_tool_async(
         None => {}
     }
 
-    let resp = req.send().await.map_err(format_http_request_error)?;
+    let req = req.build().map_err(format_http_request_error)?;
+    validate_http_wire_request(&req)?;
+    let resp = send_http_request_interruptible(client, req, &interrupt).await?;
     let status = resp.status();
+    let response_has_body = http_response_has_body(&request.method, status);
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body = read_http_response_limited(resp, interrupt).await?;
-    let body = if request.output_mode == HttpOutputMode::Text {
+    let (body, stopped_early) =
+        read_http_response_limited(resp, interrupt, request.output_mode, response_has_body).await?;
+    let mut body = if request.output_mode == HttpOutputMode::Text {
         extract_response_text(body, content_type.as_deref())
     } else {
         body
     };
+    if stopped_early && request.output_mode == HttpOutputMode::Text {
+        body.push_str(&format!(
+            "\n\n…[source read stopped at the {HTTP_EXTRACT_INPUT_CAP}-byte extraction safety ceiling; narrow the source for later content.]"
+        ));
+    }
 
     if status.is_success() {
         if body.trim().is_empty() {
