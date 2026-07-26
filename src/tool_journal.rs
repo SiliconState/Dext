@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn persists_bounded_redacted_metadata_without_raw_input_or_output() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let _guard = crate::test_env_lock();
         let root = temp_dir("roundtrip");
         let session_id = "session-1";
         let input = serde_json::json!({"command": "printf super-secret-value"});
@@ -537,7 +537,7 @@ mod tests {
     fn rejects_symlink_and_permissive_journal_paths() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let _guard = crate::test_env_lock();
 
         let root = temp_dir("unsafe-path");
         let session_id = "session-1";
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn rejects_corrupt_and_future_journals() {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let _guard = crate::test_env_lock();
         let root = temp_dir("versions");
         let session_id = "session-1";
         let dir = crate::session::session_state_dir(&root, session_id);

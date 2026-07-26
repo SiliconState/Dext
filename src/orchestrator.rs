@@ -452,6 +452,41 @@ fn contains_word_sequence(text: &str, sequence: &[&str]) -> bool {
         .any(|window| window == sequence)
 }
 
+fn contains_non_negated_sequence(text: &str, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return false;
+    }
+    let words = normalized_words(text);
+    words
+        .windows(sequence.len())
+        .enumerate()
+        .any(|(index, window)| {
+            window == sequence
+                && !words[index.saturating_sub(4)..index]
+                    .iter()
+                    .any(|previous| {
+                        matches!(
+                            *previous,
+                            "not"
+                                | "never"
+                                | "no"
+                                | "without"
+                                | "cannot"
+                                | "cant"
+                                | "isn"
+                                | "wasn"
+                                | "weren"
+                                | "hasn"
+                                | "haven"
+                                | "hadn"
+                                | "didn"
+                                | "couldn"
+                                | "wouldn"
+                        )
+                    })
+        })
+}
+
 fn any_word_starts_with(words: &[&str], prefixes: &[&str]) -> bool {
     words
         .iter()
@@ -589,7 +624,12 @@ impl ObjectiveTracker {
         if commit_requested {
             checkpoints.push("commit requested changes".to_string());
         }
-        if any_word_starts_with(&words, &["test", "verif"]) {
+        if words.iter().any(|word| {
+            matches!(
+                *word,
+                "test" | "tests" | "testing" | "verify" | "verification"
+            )
+        }) {
             checkpoints.push("run verification checks".to_string());
         }
         if any_word_starts_with(&words, &["log", "document"]) {
@@ -843,13 +883,21 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                     "ruff",
                     "mypy",
                 ],
-            ) || contains_any(
-                &evidence.assistant_text,
-                &["verified", "tests passed", "test result", "checked with"],
-            ) || contains_any(
-                &evidence.tool_result_text,
-                &["test result: ok", "tests passed", "0 failed"],
-            )
+            ) || contains_non_negated_sequence(&evidence.assistant_text, &["verified"])
+                || [
+                    &["checks", "pass"][..],
+                    &["checks", "passed"],
+                    &["tests", "pass"],
+                    &["tests", "passed"],
+                    &["checked", "with"],
+                ]
+                .iter()
+                .any(|sequence| contains_non_negated_sequence(&evidence.assistant_text, sequence))
+                || contains_any(
+                    &evidence.tool_result_text,
+                    &["test result: ok", "tests passed"],
+                )
+                || contains_word_sequence(&evidence.tool_result_text, &["0", "failed"])
         }
         "log decisions and follow-up improvements" => {
             evidence.tool_names.contains("todo_write")
@@ -1680,6 +1728,13 @@ mod tests {
             vec!["deliver requested outcome with verifiable steps".to_string()]
         );
 
+        let factual = ObjectiveTracker::from_user_prompt("it did IPO, this verifiable info");
+        assert!(
+            !factual
+                .checkpoints
+                .contains(&"run verification checks".to_string())
+        );
+
         let cleanup_mention = ObjectiveTracker::from_user_prompt("what cleanup is still pending?");
         assert!(!cleanup_mention.apply_fixes_allowed());
 
@@ -2015,7 +2070,7 @@ mod tests {
     #[test]
     fn objective_runtime_reminder_lists_missing_checkpoints() {
         let tracker = ObjectiveTracker::from_user_prompt("Implement the fix and test it");
-        let history = vec![
+        let mut history = vec![
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::ToolUse {
@@ -2028,7 +2083,8 @@ mod tests {
             crate::Message {
                 role: "assistant".to_string(),
                 content: vec![crate::Block::Text {
-                    text: "Implemented the requested change.".to_string(),
+                    text: "Implemented the requested change; one external estimate remains unverified."
+                        .to_string(),
                 }],
             },
         ];
@@ -2052,6 +2108,40 @@ mod tests {
         );
         let reminder = objective_runtime_reminder(&tracker, &history).expect("reminder");
         assert!(reminder.contains("run verification checks"), "{reminder}");
+
+        let still_unverified = vec![
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::ToolUse {
+                    id: "tool-edit".to_string(),
+                    name: "edit_file".to_string(),
+                    input: json!({"path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+                }],
+            },
+            successful_tool_result("tool-edit", "updated src/main.rs"),
+            crate::Message {
+                role: "assistant".to_string(),
+                content: vec![crate::Block::Text {
+                    text: "The implementation is not verified; not all checks pass.".to_string(),
+                }],
+            },
+        ];
+        let negated = tracker.assess_history(&still_unverified);
+        assert!(
+            negated
+                .unresolved
+                .iter()
+                .any(|item| item == "run verification checks"),
+            "{negated:?}"
+        );
+
+        history.push(crate::Message {
+            role: "assistant".to_string(),
+            content: vec![crate::Block::Text {
+                text: "All 14 reconciliation checks pass.".to_string(),
+            }],
+        });
+        assert!(objective_runtime_reminder(&tracker, &history).is_none());
     }
 
     #[test]

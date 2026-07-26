@@ -906,7 +906,7 @@ mod tests {
             return;
         }
 
-        let _guard = crate::test_env_lock().lock().expect("environment lock");
+        let _guard = crate::test_env_lock();
         let old_home = std::env::var_os("HOME");
         let base = temp_dir("adversarial-write-matrix");
         let workspace = base.join("workspace");
@@ -1088,7 +1088,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn writable_roots_exclude_unrelated_home_content() {
-        let _guard = crate::test_env_lock().lock().expect("environment lock");
+        let _guard = crate::test_env_lock();
         let old_home = std::env::var_os("HOME");
         let base = temp_dir("writable-roots");
         let home = base.join("home");

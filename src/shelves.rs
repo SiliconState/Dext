@@ -1406,7 +1406,7 @@ mod tests {
 
     #[test]
     fn registry_discovers_manifests_and_resolves_precedence() {
-        let _guard = crate::test_env_lock().lock().unwrap();
+        let _guard = crate::test_env_lock();
         let root = std::env::temp_dir().join(format!(
             "dext-shelf-registry-{}-{}",
             std::process::id(),

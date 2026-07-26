@@ -254,14 +254,13 @@ sidecar directory trees remain untouched and produce bounded warnings without st
 retention cleanup; an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked
 without following it. Owner execute state is retained in metadata. Current manifests record exact
 direct-sidecar membership; older manifests that lack that field fail conservatively before mutation
-when a missing artifact is ambiguous rather than deleting current path content. Dext also reads its
-bounded pre-JSON 8/9-field manifest rows so upgrades do not block new checkpoints and preserves each
-retained row's original field count. Pre-JSON direct hints keep their historical single-path/comma
-semantics: absolute hints must resolve inside the repository, while relative hints require one exact
-historical sidecar match or preview/apply fails closed. Untracked
-preview entries with unsafe host-native targets are omitted; malformed or partly current JSON rows
-remain fail-closed. Runtime manifest reads are capped at 16 MiB, and normal retention compacts legacy
-rows away. If path/type/size limits make
+when a missing artifact is ambiguous rather than deleting current path content. A recognized retired
+8/9-field pre-JSON row is skipped with a warning rather than failing the whole listing, so one stale
+row cannot disable `/undo` or block write-risk tools. Recognition requires an intact header, and its
+recorded OID must match any live checkpoint ref; mismatches and other corrupt or tampered rows fail
+closed. Normal retention removes an integrity-matched retired ref when it compacts that row. Untracked
+preview entries with unsafe host-native targets are omitted; a malformed field fails its row rather
+than degrading it. Runtime manifest reads are capped at 16 MiB. If path/type/size limits make
 untracked recovery partial, Dext asks
 separately before the command and caches approval for the current repository and
 session; approval keeps tracked/staged recovery and the bounded untracked subset,

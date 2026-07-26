@@ -3097,7 +3097,7 @@ mod tests {
     use serde_json::json;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env_lock().lock().expect("env lock")
+        crate::test_env_lock()
     }
 
     #[test]

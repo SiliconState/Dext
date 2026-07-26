@@ -4,6 +4,17 @@
 
 ### Changed
 
+- The pack and shelf registry summaries moved from the volatile environment tail
+  into the cached system block, so they are no longer re-billed at full input
+  rate on every tool round. The shared prompt-scan cache is rebuilt each user
+  turn and invalidated after mutation-capable tools or approved hooks, keeping
+  tool-created or edited packs visible on the next provider request; shelf
+  summary generation is also cached instead of recomputed per request.
+- Objective checkpoints now avoid treating the descriptive word `verifiable` as
+  a verification request, recognize explicit non-code verification reports such
+  as “checks pass,” and refresh the work ledger immediately after each tool
+  round. This prevents a completed custom verification from remaining
+  `[unresolved]` in the next model request.
 - Hardened and accelerated the built-in `http` client without changing provider,
   OAuth, or local-context transport: HTTP/2 and gzip/Brotli decoding are enabled
   only for the tool; connect/read inactivity, resolver work, total request time,
@@ -45,6 +56,20 @@
 
 ### Removed
 
+- Retired the pre-JSON 8- and 9-field checkpoint manifest encodings and the
+  9-field JSON form; only the 11- and 12-field rows this build writes are
+  accepted. This deletes the second, weaker path-validation rule those rows
+  selected — a manifest can no longer choose how strictly its own paths are
+  checked — along with the ambiguous relative-hint resolution they required.
+  A recognized retired row is skipped with a warning instead of failing the
+  whole listing, so one stale row can no longer take out `/undo` and block every
+  write-risk tool. Recognition requires an intact checkpoint header; the
+  recorded OID must match any live ref, and normal retention removes the matched
+  retired ref with its manifest row. Genuine corruption or tampering still
+  fails closed. The `legacy_sidecar_paths`
+  field is renamed `direct_sidecar_paths`: despite the old name it is the
+  current encoding's exact sidecar-membership index and is load-bearing for
+  fail-closed restore.
 - Removed the subagent feature completely: `/subagent` slash command,
   `subagent-runtime` CLI subcommand, detached/inline runners, steering,
   quality gates, TUI state, session artifacts dir, and all associated
@@ -143,15 +168,20 @@
 
 ### Fixed
 
-- Recovery checkpoint loading now accepts Dext's bounded pre-JSON 8/9-field
-  manifest rows, preserving each row's original field count until normal
-  retention compacts it instead of blocking write-risk tools after an upgrade.
-  Pre-JSON direct hints retain their historical single-path/comma semantics;
-  absolute hints must resolve inside the repository, while relative hints require
-  an exact historical sidecar match or fail closed.
-  Preview omits untracked snapshot entries with unsafe host-native targets,
-  malformed or partly current JSON rows still fail closed, and runtime manifest
-  reads are capped at 16 MiB.
+- Interrupting a parallel built-in tool round now actually cancels it. Queued
+  calls previously acquired their concurrency permit and began executing after
+  Ctrl-C, `read_file`/`rg`/`fd` had no cancellation path at all, and the round
+  waiter noticed an interrupt only after some task completed. The waiter now
+  polls cancellation independently of task completion, in-flight tasks are
+  aborted, a call that wins its permit after the interrupt refuses to start,
+  and every abandoned `tool_use` id is reported as interrupted rather than as
+  an unknown outcome.
+- Recovery checkpoint loading no longer blocks write-risk tools on a recognized
+  retired manifest row: preview omits untracked snapshot entries with unsafe
+  host-native targets, malformed rows fail closed, and runtime manifest reads
+  are capped at 16 MiB. Matched retired refs are removed when retention compacts
+  their rows. (The pre-JSON row support this entry originally described was
+  retired before release; see Removed.)
 - Official OpenAI GPT-5.6 Responses requests use flat function tools with
   `strict:false`, explicitly request opaque encrypted reasoning state for
   stateless tool continuation, preserve valid returned state only across the

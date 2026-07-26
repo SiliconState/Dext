@@ -1,10 +1,15 @@
+mod crash;
+mod events;
 mod git_checkpoints;
 mod list_render;
 mod mutation_preview;
 mod orchestrator;
 mod packs;
+mod privacy;
+mod process_tree;
 mod provider;
 mod sandbox;
+mod secret_redactor;
 mod session;
 mod shelves;
 mod sse;
@@ -14,25 +19,35 @@ mod tool_policy;
 mod tool_round;
 mod tools;
 mod tui;
+mod usage;
 
 #[cfg(test)]
 mod main_tests;
 
+// Glob re-export so the extracted items keep their `crate::X` paths for every
+// sibling module, and the extraction stays a pure move.
+pub(crate) use crash::*;
+pub(crate) use events::*;
+pub(crate) use privacy::*;
+pub(crate) use process_tree::*;
+pub(crate) use secret_redactor::*;
+pub(crate) use usage::*;
+
 use anyhow::{Context, Result};
 use provider::{
-    ApiProvider, ModelPricing, OpenAiResponsesReasoning, ProviderProfile, RequestContract,
-    ResolvedModelSpec, ResolvedProviderConfig, apply_provider_headers, auth_store_path,
-    build_chatgpt_request, build_chatgpt_summary_request, build_openai_responses_request,
-    built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
-    effective_request_contract, extract_oauth_code_from_callback, find_provider_profile,
-    handle_auth_cli, is_gpt_5_6_model, is_official_kimi_profile,
-    list_models_for_available_providers, list_models_for_provider, load_auth_store,
-    load_provider_catalog, login_provider, logout_provider, looks_like_login_secret_input,
-    normalize_provider_model_value, official_openai_gpt_5_6_responses, provider_auth_status,
-    provider_catalog_path, provider_id_from_selector, provider_request_url,
-    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
-    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
-    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
+    ApiProvider, OpenAiResponsesReasoning, ProviderProfile, RequestContract, ResolvedModelSpec,
+    ResolvedProviderConfig, apply_provider_headers, auth_store_path, build_chatgpt_request,
+    build_chatgpt_summary_request, build_openai_responses_request, built_in_provider_profiles,
+    cancel_pending_oauth_login, canonical_provider_id, effective_request_contract,
+    extract_oauth_code_from_callback, find_provider_profile, handle_auth_cli, is_gpt_5_6_model,
+    is_official_kimi_profile, list_models_for_available_providers, list_models_for_provider,
+    load_auth_store, load_provider_catalog, login_provider, logout_provider,
+    looks_like_login_secret_input, normalize_provider_model_value,
+    official_openai_gpt_5_6_responses, provider_auth_status, provider_catalog_path,
+    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
+    render_provider_list, render_provider_picker, request_contract_for_profile,
+    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
+    resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 #[cfg(unix)]
@@ -157,20 +172,24 @@ const PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
 const LOCAL_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 // Consecutive 5xx responses from one provider before it is disabled for the turn.
 const MAX_CONSECUTIVE_SERVER_ERRORS: usize = 3;
-const DEFAULT_INPUT_USD_PER_MTOK: f64 = 1.0;
-const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 5.0;
-const DEFAULT_CACHE_READ_USD_PER_MTOK: f64 = 0.1;
-const DEFAULT_CACHE_CREATE_USD_PER_MTOK: f64 = 1.25;
 const SESSION_HTML_STYLE: &str = r#"body{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:980px;margin:2rem auto;padding:0 1rem;background:#0f1115;color:#e6edf3}a{color:#8ab4ff}.meta{color:#9aa4b2;margin-bottom:1.5rem}.msg{border:1px solid #283241;border-radius:12px;margin:1rem 0;padding:1rem;background:#151922}.role{font-weight:700;text-transform:uppercase;font-size:.8rem;letter-spacing:.08em;margin-bottom:.6rem;color:#9aa4b2}.user{border-left:4px solid #7dd3fc}.assistant{border-left:4px solid #a78bfa}.tool{border-left:4px solid #f59e0b}.thinking{color:#9aa4b2}.block{white-space:pre-wrap;line-height:1.45}.tool-name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#fbbf24}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b0d12;border:1px solid #283241;border-radius:8px;padding:.8rem}code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.err{color:#fca5a5}.ok{color:#86efac}summary{cursor:pointer}.footer{margin:2rem 0;color:#687385;font-size:.85rem}"#;
 
 fn api_family_label(contract: RequestContract) -> &'static str {
     contract.as_str()
 }
 
+/// Serializes tests that mutate process-wide environment variables.
+///
+/// Poisoning is deliberately ignored. A panicking test can leave an env var it
+/// set behind, but honouring the poison would turn that one real failure into a
+/// cascade of unrelated ones across every module and bury the actual cause —
+/// and every test here restores what it sets on the non-panicking path.
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn millis_u64(duration: std::time::Duration) -> u64 {
@@ -631,257 +650,6 @@ fn maybe_preserve_partial_stream(
         content: visible_blocks,
     });
     true
-}
-
-fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
-    payload
-        .downcast_ref::<&'static str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-}
-
-fn panic_message_is_broken_pipe(message: &str) -> bool {
-    (message.starts_with("failed printing to stdout: ")
-        || message.starts_with("failed printing to stderr: "))
-        && message.contains("Broken pipe")
-}
-
-fn panic_info_is_broken_pipe(info: &std::panic::PanicHookInfo<'_>) -> bool {
-    panic_payload_text(info.payload()).is_some_and(panic_message_is_broken_pipe)
-}
-
-#[derive(Default)]
-struct CrashRuntimeState {
-    current_session_id: Option<String>,
-    last_event_ids: Vec<String>,
-}
-
-fn crash_runtime_state() -> &'static Mutex<CrashRuntimeState> {
-    static STATE: OnceLock<Mutex<CrashRuntimeState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(CrashRuntimeState::default()))
-}
-
-fn generated_session_id_from_path(path: &Path) -> Option<String> {
-    if path.file_stem()?.to_str()? != LATEST_SESSION_NAME || path.extension()?.to_str()? != "jsonl"
-    {
-        return None;
-    }
-    let candidate = path.parent()?.file_name()?.to_str()?;
-    let mut parts = candidate.split('-');
-    let timestamp = parts.next()?;
-    let pid = parts.next()?;
-    let nonce = parts.next()?;
-    if parts.next().is_some()
-        || timestamp.parse::<u64>().is_err()
-        || pid.parse::<u32>().is_err()
-        || nonce.len() != 12
-        || !nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
-    Some(candidate.to_string())
-}
-
-fn record_crash_session_id(path: &Path) {
-    let session_id = generated_session_id_from_path(path);
-    if let Ok(mut state) = crash_runtime_state().lock() {
-        state.current_session_id = session_id;
-    }
-}
-
-fn crash_event_breadcrumb(event: &AgentEvent) -> Option<String> {
-    match event {
-        AgentEvent::TurnStart => Some("turn_start".to_string()),
-        AgentEvent::ToolCallPreview { .. } => Some("tool_preview".to_string()),
-        AgentEvent::ToolCallStart { .. } => Some("tool_start".to_string()),
-        AgentEvent::ToolCallResult { ok, .. } => Some(format!("tool_result:ok={ok}")),
-        AgentEvent::ToolOutputDelta { .. } => None,
-        AgentEvent::ToolBatchStart { call_ids, .. } => {
-            Some(format!("tool_batch_start:count={}", call_ids.len()))
-        }
-        AgentEvent::ToolBatchEnd {
-            call_ids, failed, ..
-        } => Some(format!(
-            "tool_batch_end:count={}:failed={failed}",
-            call_ids.len()
-        )),
-        AgentEvent::HttpRetry { attempt, .. } => Some(format!("http_retry:{attempt}")),
-        AgentEvent::CompactStart => Some("compact_start".to_string()),
-        AgentEvent::CompactEnd { before, after } => Some(format!("compact_end:{before}->{after}")),
-        AgentEvent::CompactFailed { .. } => Some("compact_failed".to_string()),
-        AgentEvent::Interrupted => Some("interrupted".to_string()),
-        AgentEvent::RuntimeControl(_) => Some("runtime_control".to_string()),
-        AgentEvent::RuntimeControlApplied {
-            commands,
-            model_changed,
-            effort_changed,
-            mode_changed,
-            stream_aborted,
-        } => Some(format!(
-            "runtime_control_applied:{commands}:model={model_changed}:effort={effort_changed}:mode={mode_changed}:abort={stream_aborted}"
-        )),
-        AgentEvent::SteeringReceived { messages, .. } => {
-            Some(format!("steering:messages={messages}"))
-        }
-        AgentEvent::TurnEnd { failed, .. } => Some(if *failed {
-            "turn_end:failed".to_string()
-        } else {
-            "turn_end".to_string()
-        }),
-        _ => None,
-    }
-}
-
-pub(crate) fn record_crash_event(event: &AgentEvent) {
-    let Some(label) = crash_event_breadcrumb(event) else {
-        return;
-    };
-    if let Ok(mut state) = crash_runtime_state().lock() {
-        state.last_event_ids.push(label);
-        if state.last_event_ids.len() > 24 {
-            let excess = state.last_event_ids.len() - 24;
-            state.last_event_ids.drain(0..excess);
-        }
-    }
-}
-
-fn crash_snapshot_body(id: &str, location: Option<(&str, u32, u32)>) -> Value {
-    let runtime = crash_runtime_state().try_lock().ok().map(|state| {
-        json!({
-            "current_session_id": state.current_session_id,
-            "last_event_ids": state.last_event_ids,
-            "input_buffer_state": null,
-            "active_modal": null,
-        })
-    });
-    let parse_terminal_dimension = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-    };
-    let backtrace_enabled = std::env::var("RUST_BACKTRACE")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "full"));
-    let location = location.map(|(file, line, column)| {
-        json!({
-            "file_sha256": sha256_hex_str(file),
-            "line": line,
-            "column": column,
-        })
-    });
-    json!({
-        "id": id,
-        "panic": "panic captured; free-form payload omitted",
-        "location": location,
-        "terminal": {
-            "columns": parse_terminal_dimension("COLUMNS"),
-            "lines": parse_terminal_dimension("LINES"),
-        },
-        "pid": std::process::id(),
-        "runtime": runtime,
-        "backtrace_enabled": backtrace_enabled,
-    })
-}
-
-fn ensure_private_crash_dir(path: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "crash directory is not a real directory: {}",
-                    path.display()
-                ),
-            ));
-        }
-        #[cfg(unix)]
-        Ok(metadata)
-            if {
-                use std::os::unix::fs::MetadataExt as _;
-                metadata.uid() != unsafe { libc::geteuid() }
-            } =>
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "crash directory is not owned by the current user",
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(false);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
-            builder.create(path)?;
-        }
-        Err(error) => return Err(error),
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn write_private_crash_snapshot(path: &Path, body: &Value) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "crash path has no parent"))?;
-    ensure_private_crash_dir(parent)?;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "crash snapshot path is not a regular file: {}",
-                    path.display()
-                ),
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let bytes = serde_json::to_vec_pretty(body).map_err(io::Error::other)?;
-    atomic_write_secret(path, &bytes)
-}
-
-fn new_crash_id() -> Option<String> {
-    let mut nonce = [0u8; 6];
-    getrandom::fill(&mut nonce).ok()?;
-    let nonce = nonce
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Some(format!(
-        "crash-{}-{}-{nonce}",
-        unix_timestamp_secs(),
-        std::process::id()
-    ))
-}
-
-fn crash_snapshot_notice(id: &str) -> String {
-    format!("[dext crash snapshot id: {id}]")
-}
-
-fn write_crash_snapshot(info: &std::panic::PanicHookInfo<'_>) -> Option<String> {
-    let id = new_crash_id()?;
-    let path = dext_state_dir().join("crashes").join(format!("{id}.json"));
-    let location = info
-        .location()
-        .map(|loc| (loc.file(), loc.line(), loc.column()));
-    let body = crash_snapshot_body(&id, location);
-    write_private_crash_snapshot(&path, &body).ok()?;
-    Some(id)
 }
 
 fn byte_prefix_at_char_boundary(s: &str, max_bytes: usize) -> &str {
@@ -1635,384 +1403,6 @@ fn route_interactive_input_line(
         InteractiveInputRoute::Submitted
     } else {
         InteractiveInputRoute::Dropped
-    }
-}
-
-pub(crate) fn text_is_potential_local_secret(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed.contains("accessToken") || trimmed.contains("access_token") {
-        return true;
-    }
-    if slash_login_contains_secret(trimmed) {
-        return true;
-    }
-    if contains_secretish_assignment(trimmed) {
-        return true;
-    }
-    if let Some(token) = strip_bearer_token(trimmed) {
-        return token.chars().count() >= 8;
-    }
-    if contains_known_secret_token(trimmed) {
-        return true;
-    }
-    if trimmed.starts_with('/') || trimmed.starts_with('{') {
-        return false;
-    }
-    if looks_like_public_clipboard_reference(trimmed) {
-        return false;
-    }
-    false
-}
-
-fn contains_secretish_assignment(text: &str) -> bool {
-    text.split(|c: char| c.is_whitespace() || matches!(c, '&' | '?' | ';' | ','))
-        .chain(text.lines())
-        .any(secretish_assignment_has_value)
-}
-
-fn secretish_assignment_has_value(segment: &str) -> bool {
-    let trimmed = segment.trim_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '{' | '}' | '[' | ']' | '(' | ')')
-    });
-    let Some((key, value)) = trimmed.split_once('=').or_else(|| trimmed.split_once(':')) else {
-        return false;
-    };
-    let key = key
-        .trim()
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-        .rsplit(['/', '.'])
-        .next()
-        .unwrap_or(key);
-    let value = value.trim().trim_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '{' | '}' | '[' | ']' | '(' | ')')
-    });
-    let value_len = value.chars().count();
-    (secretish_key_name(key) && value_len >= 6) || (secretish_code_key(key) && value_len >= 12)
-}
-
-fn compact_key_name(key: &str) -> String {
-    key.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn secretish_key_name(key: &str) -> bool {
-    let compact = compact_key_name(key);
-    compact == "auth"
-        || compact == "authorization"
-        || compact == "passwd"
-        || compact == "pwd"
-        || compact == "privatekey"
-        || compact.ends_with("apikey")
-        || compact.ends_with("token")
-        || compact.contains("password")
-        || compact.contains("secret")
-}
-
-fn secretish_code_key(key: &str) -> bool {
-    matches!(
-        compact_key_name(key).as_str(),
-        "code" | "oauthcode" | "authorizationcode"
-    )
-}
-
-fn strip_bearer_token(text: &str) -> Option<&str> {
-    let prefix_len = "bearer".len();
-    let prefix = text.get(..prefix_len)?;
-    let rest = text.get(prefix_len..)?;
-    if prefix.eq_ignore_ascii_case("bearer") && rest.chars().next().is_some_and(char::is_whitespace)
-    {
-        Some(rest.trim_start()).filter(|token| !token.is_empty())
-    } else {
-        None
-    }
-}
-
-fn contains_known_secret_token(text: &str) -> bool {
-    text.split(|c: char| {
-        c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '&' | '=' | ':' | ';' | ',' | '#')
-    })
-    .any(|raw| {
-        let token = raw.trim_matches(|c: char| {
-            c.is_whitespace()
-                || matches!(
-                    c,
-                    '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
-                )
-        });
-        let len = token.chars().count();
-        if len < 8 {
-            return false;
-        }
-        let lower = token.to_ascii_lowercase();
-        lower.starts_with("sk-")
-            || lower.starts_with("sk_")
-            || lower.starts_with("xoxb-")
-            || lower.starts_with("xoxp-")
-            || lower.starts_with("ghp_")
-            || lower.starts_with("github_pat_")
-            || lower.starts_with("glpat-")
-            || lower.starts_with("ya29.")
-            || (lower.starts_with("ac_") && len >= 16)
-            || (token.starts_with("AIza") && len >= 20)
-    })
-}
-
-fn looks_like_public_clipboard_reference(text: &str) -> bool {
-    let mut saw_reference = false;
-    for token in text.split_whitespace().map(|token| {
-        token.trim_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>'))
-    }) {
-        if token.is_empty() {
-            continue;
-        }
-        if !(looks_like_url_reference(token)
-            || looks_like_social_handle(token)
-            || looks_like_git_sha(token))
-        {
-            return false;
-        }
-        saw_reference = true;
-    }
-    saw_reference
-}
-
-fn looks_like_url_reference(token: &str) -> bool {
-    let lower = token.to_ascii_lowercase();
-    if lower.contains("://") {
-        return !url_authority_has_userinfo(token);
-    }
-    if lower.starts_with("www.") {
-        return true;
-    }
-    token.split_once('/').is_some_and(|(host, rest)| {
-        if host.contains('@') {
-            return false;
-        }
-        let host = host.split(':').next().unwrap_or(host);
-        !rest.is_empty() && looks_like_domain_name(host)
-    })
-}
-
-fn url_authority_has_userinfo(token: &str) -> bool {
-    let Some((_, rest)) = token.split_once("://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    authority.contains('@')
-}
-
-fn looks_like_domain_name(host: &str) -> bool {
-    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
-        return false;
-    }
-    let Some(tld) = host.rsplit('.').next() else {
-        return false;
-    };
-    (2..=24).contains(&tld.len())
-        && tld.chars().all(|c| c.is_ascii_alphabetic())
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
-}
-
-fn looks_like_social_handle(token: &str) -> bool {
-    let Some(handle) = token.strip_prefix('@') else {
-        return (3..=15).contains(&token.len())
-            && token.contains('_')
-            && token.chars().any(|c| c.is_ascii_digit())
-            && token.chars().any(|c| c.is_ascii_lowercase())
-            && token
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    };
-    !handle.is_empty()
-        && handle.len() <= 15
-        && handle
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn looks_like_git_sha(token: &str) -> bool {
-    let len = token.len();
-    matches!(len, 7..=12 | 40) && token.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn slash_login_contains_secret(trimmed: &str) -> bool {
-    let mut parts = trimmed.split_whitespace();
-    let Some(cmd) = parts.next() else {
-        return false;
-    };
-    if cmd != "/login" {
-        return false;
-    }
-    let args: Vec<&str> = parts.collect();
-    if args.len() < 2 {
-        return false;
-    }
-    let secret = args[1..].join(" ");
-    let lowered = secret.trim().to_ascii_lowercase();
-    if provider::login_arg_requests_web_flow(&lowered)
-        || provider::login_arg_requests_import(&lowered)
-    {
-        return false;
-    }
-    true
-}
-
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkMapEventKind {
-    Map,
-    Packet,
-    Focus,
-    Tracks,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(tag = "event", content = "data", rename_all = "snake_case")]
-enum AgentEvent {
-    TurnStart,
-    HistoryContextUpdated {
-        chars: usize,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tokens: Option<u64>,
-    },
-    TextDelta(String),
-    TextBlockComplete(String),
-    ThinkingDelta(String),
-    ThinkingBlockComplete(String),
-    ToolCallPreview {
-        call_id: String,
-        name: String,
-        summary: String,
-    },
-    ToolCallStart {
-        call_id: String,
-        name: String,
-        summary: String,
-    },
-    ToolCallResult {
-        call_id: String,
-        name: String,
-        ok: bool,
-        preview: String,
-        content: String,
-    },
-    ToolOutputDelta {
-        call_id: String,
-        name: String,
-        stream: String,
-        text: String,
-    },
-    LocalAuthPrompt {
-        tool: String,
-        message: String,
-    },
-    LoginInputMode {
-        provider: Option<String>,
-    },
-    ToolBatchStart {
-        batch_id: String,
-        call_ids: Vec<String>,
-        labels: Vec<String>,
-    },
-    ToolBatchEnd {
-        batch_id: String,
-        call_ids: Vec<String>,
-        labels: Vec<String>,
-        failed: usize,
-    },
-    UsageUpdate {
-        turn: Usage,
-        session: Usage,
-    },
-    HttpRetry {
-        attempt: u32,
-        wait_secs: u64,
-        reason: String,
-    },
-    ExternalTelemetry {
-        telemetry: orchestrator::ExternalTelemetry,
-    },
-    TurnDiagnostics {
-        provider: String,
-        api_family: String,
-        auth_source: String,
-        model: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context_window: Option<u64>,
-        last_retry_reason: Option<String>,
-        workaround_fired: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        turn_duration_ms: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context_mode: Option<ContextMode>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tool_profile: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        compacted: Option<bool>,
-    },
-    ThinkingEffortChanged {
-        effort: ThinkingEffort,
-    },
-    ReasoningModeChanged {
-        mode: ReasoningMode,
-    },
-    ApprovalProfileChanged {
-        profile: ApprovalProfile,
-    },
-    RuntimeControl(String),
-    RuntimeControlApplied {
-        commands: usize,
-        model_changed: bool,
-        effort_changed: bool,
-        mode_changed: bool,
-        stream_aborted: bool,
-    },
-    Info(String),
-    Warn(String),
-    Error(String),
-    Slash(String),
-    WorkMap {
-        kind: WorkMapEventKind,
-        text: String,
-        waypoint_ids: Vec<String>,
-        selector: Option<String>,
-    },
-    TurnEnd {
-        usage: Usage,
-        failed: bool,
-    },
-    CompactStart,
-    CompactEnd {
-        before: usize,
-        after: usize,
-    },
-    CompactFailed {
-        message: String,
-    },
-    Interrupted,
-    SteeringReceived {
-        messages: usize,
-        preview: String,
-    },
-}
-
-trait EventSink: Send + Sync {
-    fn emit(&mut self, event: AgentEvent);
-    fn request_permission(&mut self, name: &str, input: &Value) -> Choice;
-    fn local_auth_prompt(&mut self, tool: &str, message: &str);
-    fn live_output_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
-        None
-    }
-    fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
-        self.local_auth_prompt(tool, message);
-        LocalAuthSecret::Unavailable
     }
 }
 
@@ -2829,703 +2219,6 @@ impl FocusMode {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(default)]
-struct PrivacyPolicy {
-    enabled: bool,
-    strict_paths: bool,
-    findings: PrivacyFindingCounts,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(default)]
-struct PrivacyFindingCounts {
-    ssn: u64,
-    credit_card: u64,
-    api_key: u64,
-    private_key: u64,
-    account_number: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PrivacyRedaction {
-    text: String,
-    counts: PrivacyFindingCounts,
-}
-
-impl Default for PrivacyPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            strict_paths: false,
-            findings: PrivacyFindingCounts::default(),
-        }
-    }
-}
-
-impl PrivacyPolicy {
-    fn from_env() -> Self {
-        let mut policy = Self::default();
-        if let Ok(v) = std::env::var("DEXT_PRIVACY") {
-            let normalized = v.trim().to_ascii_lowercase();
-            policy.enabled = !matches!(normalized.as_str(), "0" | "false" | "no" | "off");
-            if normalized == "strict" {
-                policy.enabled = true;
-                policy.strict_paths = true;
-            }
-        }
-        policy
-    }
-
-    fn mode_label(&self) -> &'static str {
-        if !self.enabled {
-            "off"
-        } else if self.strict_paths {
-            "strict"
-        } else {
-            "redact"
-        }
-    }
-
-    fn prompt_status_line(&self) -> String {
-        if !self.enabled {
-            "privacy=off".to_string()
-        } else if self.strict_paths {
-            "privacy=strict (sensitive-looking native read paths are blocked; other tool output is redacted before model context/session logs)".to_string()
-        } else {
-            "privacy=redact (user-readable files remain readable; private keys, secret assignments, and labeled SSNs/cards/accounts are redacted before model context/session logs)".to_string()
-        }
-    }
-
-    fn status_text(&self) -> String {
-        let mut out = format!(
-            "privacy: {}\nstrict path guard: {}\nredacts: private keys, secret assignments, explicitly labeled SSNs/payment-card/account identifiers",
-            self.mode_label(),
-            if self.strict_paths { "on" } else { "off" }
-        );
-        if self.findings.total() > 0 {
-            out.push_str(&format!(
-                "\nredacted this session: {}",
-                self.findings.summary()
-            ));
-        }
-        out
-    }
-
-    fn redact_text(&self, text: &str) -> PrivacyRedaction {
-        if !self.enabled || text.is_empty() {
-            return PrivacyRedaction {
-                text: text.to_string(),
-                counts: PrivacyFindingCounts::default(),
-            };
-        }
-        redact_sensitive_text(text)
-    }
-
-    fn redact_log_detail(&self, text: &str) -> String {
-        if !self.enabled || text.is_empty() {
-            return text.to_string();
-        }
-        redact_sensitive_text(text).text
-    }
-
-    fn apply_tool_output(
-        &mut self,
-        _tool_name: &str,
-        _input: &Value,
-        content: String,
-    ) -> PrivacyRedaction {
-        let mut redacted = self.redact_text(&content);
-        if self.enabled && redacted.counts.total() > 0 {
-            let summary = redacted.counts.summary();
-            self.findings.add(&redacted.counts);
-            redacted.text.push_str(&format!(
-                "\n\n[privacy: redacted {summary}; raw values withheld]"
-            ));
-        }
-        redacted
-    }
-
-    fn path_denial(&mut self, tool_name: &str, input: &Value, root: &Path) -> Option<String> {
-        if !(self.enabled
-            && self.strict_paths
-            && matches!(
-                tool_name,
-                "read_file" | "read_symbol" | "fd" | "rg" | "jq" | "git_diff" | "git_log"
-            ))
-        {
-            return None;
-        }
-        let path = match tool_name {
-            "fd" | "rg" => input["path"].as_str().unwrap_or("."),
-            _ => input["path"].as_str()?,
-        };
-        let resolved_sensitive = canonicalize_read_tool_path(root, path)
-            .ok()
-            .is_some_and(|resolved| privacy_sensitive_path(&resolved.to_string_lossy()));
-        let sensitive_search_scope =
-            matches!(tool_name, "fd" | "rg") && privacy_sensitive_search_scope(tool_name, input);
-        if !privacy_sensitive_path(path) && !resolved_sensitive && !sensitive_search_scope {
-            return None;
-        }
-        self.findings.private_key = self.findings.private_key.saturating_add(1);
-        if sensitive_search_scope && !privacy_sensitive_path(path) && !resolved_sensitive {
-            Some(format!(
-                "[privacy] blocked {tool_name} because strict path mode does not allow hidden, ignored, symlink-following, or sensitive-glob search scope. Raw file content and sensitive paths withheld. Use `/privacy on` for redaction-only reads, or `/privacy off` for raw reads."
-            ))
-        } else {
-            Some(format!(
-                "[privacy] blocked {tool_name} for sensitive-looking path `{path}` because strict path mode is enabled. Raw file content withheld. Use `/privacy on` for redaction-only reads, or `/privacy off` for raw reads."
-            ))
-        }
-    }
-}
-
-fn privacy_sensitive_search_scope(tool_name: &str, input: &Value) -> bool {
-    if tool_name == "fd"
-        && input["pattern"]
-            .as_str()
-            .is_some_and(privacy_sensitive_path)
-    {
-        return true;
-    }
-    let args = str_array(&input["extra_args"]);
-    let mut expect_glob = false;
-    for arg in args {
-        if expect_glob {
-            if privacy_sensitive_path(&arg) {
-                return true;
-            }
-            expect_glob = false;
-            continue;
-        }
-        if matches!(arg.as_str(), "-g" | "--glob" | "--iglob") {
-            expect_glob = true;
-            continue;
-        }
-        if let Some(glob) = arg
-            .strip_prefix("--glob=")
-            .or_else(|| arg.strip_prefix("--iglob="))
-            && privacy_sensitive_path(glob)
-        {
-            return true;
-        }
-        if matches!(
-            arg.as_str(),
-            "-H" | "--hidden"
-                | "-L"
-                | "--follow"
-                | "-u"
-                | "-uu"
-                | "-uuu"
-                | "--no-ignore"
-                | "--no-ignore-vcs"
-                | "--no-ignore-global"
-                | "--no-ignore-parent"
-                | "--no-ignore-dot"
-                | "--no-ignore-exclude"
-                | "--no-ignore-files"
-        ) {
-            return true;
-        }
-        if arg.starts_with('-')
-            && !arg.starts_with("--")
-            && arg[1..].chars().any(|flag| matches!(flag, 'H' | 'L' | 'u'))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-impl PrivacyFindingCounts {
-    fn add(&mut self, other: &Self) {
-        self.ssn = self.ssn.saturating_add(other.ssn);
-        self.credit_card = self.credit_card.saturating_add(other.credit_card);
-        self.api_key = self.api_key.saturating_add(other.api_key);
-        self.private_key = self.private_key.saturating_add(other.private_key);
-        self.account_number = self.account_number.saturating_add(other.account_number);
-    }
-
-    fn total(&self) -> u64 {
-        self.ssn
-            .saturating_add(self.credit_card)
-            .saturating_add(self.api_key)
-            .saturating_add(self.private_key)
-            .saturating_add(self.account_number)
-    }
-
-    fn summary(&self) -> String {
-        let mut parts = Vec::new();
-        if self.ssn > 0 {
-            parts.push(format!("{} SSN", self.ssn));
-        }
-        if self.credit_card > 0 {
-            parts.push(format!("{} payment-card", self.credit_card));
-        }
-        if self.api_key > 0 {
-            parts.push(format!("{} API/token", self.api_key));
-        }
-        if self.private_key > 0 {
-            parts.push(format!("{} private-key/path", self.private_key));
-        }
-        if self.account_number > 0 {
-            parts.push(format!("{} account identifier", self.account_number));
-        }
-        if parts.is_empty() {
-            "0 items".to_string()
-        } else {
-            parts.join(", ")
-        }
-    }
-}
-
-fn redact_sensitive_text(text: &str) -> PrivacyRedaction {
-    let mut counts = PrivacyFindingCounts::default();
-    let mut out = redact_private_key_blocks(text, &mut counts);
-    out = redact_secret_assignments(&out, &mut counts);
-    out = redact_digit_sequences(&out, &mut counts);
-    PrivacyRedaction { text: out, counts }
-}
-
-fn redact_private_key_blocks(text: &str, counts: &mut PrivacyFindingCounts) -> String {
-    if !text.contains("PRIVATE KEY-----") {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut in_key = false;
-    for segment in text.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let line_ending = &segment[line.len()..];
-        let trimmed = line.trim();
-        if !in_key && trimmed.starts_with("-----BEGIN ") && trimmed.contains("PRIVATE KEY-----") {
-            counts.private_key = counts.private_key.saturating_add(1);
-            out.push_str("[REDACTED_PRIVATE_KEY]");
-            out.push_str(line_ending);
-            in_key = true;
-            continue;
-        }
-        if in_key {
-            if trimmed.starts_with("-----END ") && trimmed.contains("PRIVATE KEY-----") {
-                in_key = false;
-            }
-            continue;
-        }
-        out.push_str(segment);
-    }
-    out
-}
-
-fn redact_secret_assignments(text: &str, counts: &mut PrivacyFindingCounts) -> String {
-    let mut spans = Vec::new();
-    let mut line_start = 0usize;
-    for segment in text.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        for (start, end) in secret_assignment_value_spans(line) {
-            counts.api_key = counts.api_key.saturating_add(1);
-            spans.push((
-                line_start.saturating_add(start),
-                line_start.saturating_add(end),
-                "[REDACTED_SECRET]",
-            ));
-        }
-        line_start = line_start.saturating_add(segment.len());
-    }
-    redact_by_labeled_spans(text, spans)
-}
-
-fn secret_assignment_value_spans(line: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut scan_from = 0usize;
-    while scan_from < line.len() {
-        let Some((delimiter_offset, ch)) = line[scan_from..]
-            .char_indices()
-            .find(|(_, ch)| matches!(ch, '=' | ':'))
-        else {
-            break;
-        };
-        let delimiter = scan_from.saturating_add(delimiter_offset);
-        scan_from = delimiter.saturating_add(ch.len_utf8());
-        if ch == '=' && line[delimiter..].starts_with("==") {
-            continue;
-        }
-        let prefix = line[..delimiter].trim_end();
-        let key = prefix
-            .rsplit(|ch: char| ch.is_whitespace() || matches!(ch, '{' | '[' | '(' | ',' | ';'))
-            .next()
-            .unwrap_or(prefix)
-            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
-        if !redaction_secret_key_name(key) {
-            continue;
-        }
-        let Some((start, end)) = secret_assignment_candidate_span(line, scan_from) else {
-            continue;
-        };
-        scan_from = end.max(scan_from);
-        if secret_assignment_value_looks_real(&line[start..end]) {
-            spans.push((start, end));
-        }
-    }
-    spans
-}
-
-fn secret_assignment_candidate_span(line: &str, value_start: usize) -> Option<(usize, usize)> {
-    let value = line.get(value_start..)?;
-    let leading_ws = value.len().saturating_sub(value.trim_start().len());
-    let mut start = value_start.saturating_add(leading_ws);
-    let first = line.get(start..)?.chars().next()?;
-    if matches!(first, '"' | '\'' | '`') {
-        start = start.saturating_add(first.len_utf8());
-        let mut escaped = false;
-        for (offset, ch) in line.get(start..)?.char_indices() {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == first {
-                return (offset > 0).then_some((start, start.saturating_add(offset)));
-            }
-        }
-        return None;
-    }
-
-    if line
-        .get(start..start.saturating_add("bearer".len()))
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
-        && line
-            .get(start.saturating_add("bearer".len())..)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(char::is_whitespace)
-    {
-        start = start.saturating_add("bearer".len());
-        let rest = line.get(start..)?;
-        start = start.saturating_add(rest.len().saturating_sub(rest.trim_start().len()));
-    }
-
-    let end = line
-        .get(start..)?
-        .char_indices()
-        .find_map(|(offset, ch)| {
-            (ch.is_whitespace() || matches!(ch, ',' | ';' | '&' | '}' | ']' | ')'))
-                .then_some(start.saturating_add(offset))
-        })
-        .unwrap_or(line.len());
-    (end > start).then_some((start, end))
-}
-
-fn redaction_secret_key_name(key: &str) -> bool {
-    let compact = compact_key_name(key);
-    matches!(
-        compact.as_str(),
-        "auth"
-            | "authorization"
-            | "passwd"
-            | "pwd"
-            | "password"
-            | "privatekey"
-            | "apikey"
-            | "accesstoken"
-            | "authtoken"
-            | "bearertoken"
-            | "clientsecret"
-            | "consumersecret"
-            | "secretkey"
-            | "awssecretaccesskey"
-    ) || compact.ends_with("apikey")
-        || compact.ends_with("accesstoken")
-        || compact.ends_with("authtoken")
-        || compact.ends_with("password")
-        || compact.ends_with("token")
-}
-
-fn secret_assignment_value_looks_real(value: &str) -> bool {
-    let value = value
-        .trim()
-        .trim_end_matches([',', ';'])
-        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
-    let bearer = strip_bearer_token(value);
-    let candidate = bearer.unwrap_or(value);
-    if candidate.len() < 6 || candidate.chars().any(char::is_whitespace) {
-        return false;
-    }
-    let lower = candidate.to_ascii_lowercase();
-    !matches!(
-        lower.as_str(),
-        "string"
-            | "str"
-            | "none"
-            | "null"
-            | "true"
-            | "false"
-            | "secret"
-            | "password"
-            | "token"
-            | "api-key"
-            | "apikey"
-            | "env_var_name"
-            | "!command"
-    ) && !lower.starts_with("[redacted")
-        && !lower.starts_with("<redacted")
-        && !lower.starts_with("example")
-        && !candidate.starts_with('$')
-        && !candidate.starts_with('<')
-        && !candidate.starts_with("env::")
-        && !candidate.starts_with("std::env")
-}
-
-fn redact_digit_sequences(text: &str, counts: &mut PrivacyFindingCounts) -> String {
-    let mut spans = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut digits = String::new();
-    let mut digit_count = 0usize;
-    for (idx, ch) in text.char_indices() {
-        if ch.is_ascii_digit() {
-            if start.is_none() {
-                start = Some(idx);
-                digits.clear();
-                digit_count = 0;
-            }
-            digits.push(ch);
-            digit_count += 1;
-        } else if start.is_some() && matches!(ch, ' ' | '-') {
-            digits.push(ch);
-        } else if let Some(s) = start.take() {
-            classify_digit_span(text, s, idx, &digits, digit_count, &mut spans, counts);
-            digits.clear();
-            digit_count = 0;
-        }
-    }
-    if let Some(s) = start {
-        classify_digit_span(
-            text,
-            s,
-            text.len(),
-            &digits,
-            digit_count,
-            &mut spans,
-            counts,
-        );
-    }
-    redact_by_labeled_spans(text, spans)
-}
-
-fn classify_digit_span(
-    text: &str,
-    start: usize,
-    _end: usize,
-    raw_digits: &str,
-    digit_count: usize,
-    spans: &mut Vec<(usize, usize, &'static str)>,
-    counts: &mut PrivacyFindingCounts,
-) {
-    let raw_digits = raw_digits.trim_end_matches([' ', '-']);
-    let end = start.saturating_add(raw_digits.len());
-    if digit_count < 9
-        || !byte_boundary_ok(text.as_bytes(), start, end)
-        || numeric_span_touches_decimal(text, start, end)
-    {
-        return;
-    }
-    let digits: String = raw_digits.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digit_count == 9 && looks_like_ssn_context(text, start) && valid_ssn_digits(&digits) {
-        counts.ssn = counts.ssn.saturating_add(1);
-        spans.push((start, end, "[REDACTED_SSN]"));
-    } else if (13..=19).contains(&digit_count)
-        && luhn_valid(&digits)
-        && looks_like_card_context(text, start)
-    {
-        counts.credit_card = counts.credit_card.saturating_add(1);
-        spans.push((start, end, "[REDACTED_CARD]"));
-    } else if (9..=34).contains(&digit_count) && looks_like_account_context(text, start) {
-        counts.account_number = counts.account_number.saturating_add(1);
-        spans.push((start, end, "[REDACTED_ACCOUNT]"));
-    }
-}
-
-fn byte_boundary_ok(bytes: &[u8], start: usize, end: usize) -> bool {
-    let before = start.checked_sub(1).and_then(|i| bytes.get(i)).copied();
-    let after = bytes.get(end).copied();
-    !before.is_some_and(|b| b.is_ascii_alphanumeric())
-        && !after.is_some_and(|b| b.is_ascii_alphanumeric())
-}
-
-fn redact_by_labeled_spans(text: &str, mut spans: Vec<(usize, usize, &'static str)>) -> String {
-    if spans.is_empty() {
-        return text.to_string();
-    }
-    spans.sort_by_key(|(s, _, _)| *s);
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0usize;
-    for (start, end, replacement) in spans {
-        if start < last {
-            continue;
-        }
-        out.push_str(&text[last..start]);
-        out.push_str(replacement);
-        last = end;
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
-fn normalized_numeric_label_before(text: &str, start: usize) -> String {
-    let line_prefix = text[..start]
-        .rsplit_once('\n')
-        .map_or(&text[..start], |(_, line)| line);
-    let suffix = byte_suffix_at_char_boundary(line_prefix, 64);
-    let normalized: String = suffix
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn numeric_label_matches(text: &str, start: usize, labels: &[&str]) -> bool {
-    let label = normalized_numeric_label_before(text, start);
-    labels.iter().any(|candidate| {
-        label == *candidate
-            || label
-                .strip_suffix(candidate)
-                .is_some_and(|prefix| prefix.ends_with(' '))
-    })
-}
-
-fn looks_like_ssn_context(text: &str, start: usize) -> bool {
-    numeric_label_matches(
-        text,
-        start,
-        &["ssn", "social security", "social security number"],
-    )
-}
-
-fn looks_like_card_context(text: &str, start: usize) -> bool {
-    numeric_label_matches(
-        text,
-        start,
-        &[
-            "card",
-            "card number",
-            "cardnumber",
-            "credit card",
-            "credit card number",
-            "creditcard",
-            "creditcardnumber",
-            "debit card",
-            "payment card",
-            "pan",
-        ],
-    )
-}
-
-fn looks_like_account_context(text: &str, start: usize) -> bool {
-    numeric_label_matches(
-        text,
-        start,
-        &[
-            "account",
-            "account number",
-            "accountnumber",
-            "acct",
-            "acct number",
-            "acctnumber",
-            "routing",
-            "routing number",
-            "routingnumber",
-            "iban",
-            "member id",
-            "memberid",
-            "customer id",
-            "customerid",
-        ],
-    )
-}
-
-fn numeric_span_touches_decimal(text: &str, start: usize, end: usize) -> bool {
-    text[..start]
-        .chars()
-        .next_back()
-        .is_some_and(|ch| matches!(ch, '.' | '_'))
-        || text[end..]
-            .chars()
-            .next()
-            .is_some_and(|ch| matches!(ch, '.' | '_'))
-}
-
-fn valid_ssn_digits(digits: &str) -> bool {
-    if digits.len() != 9 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
-    }
-    let area = digits[..3].parse::<u16>().unwrap_or(0);
-    let group = digits[3..5].parse::<u8>().unwrap_or(0);
-    let serial = digits[5..].parse::<u16>().unwrap_or(0);
-    (1..=899).contains(&area) && area != 666 && group != 0 && serial != 0
-}
-
-fn luhn_valid(digits: &str) -> bool {
-    let mut sum = 0u32;
-    let mut double = false;
-    for ch in digits.chars().rev() {
-        let Some(mut n) = ch.to_digit(10) else {
-            return false;
-        };
-        if double {
-            n *= 2;
-            if n > 9 {
-                n -= 9;
-            }
-        }
-        sum += n;
-        double = !double;
-    }
-    sum > 0 && sum.is_multiple_of(10)
-}
-
-fn privacy_sensitive_path(path: &str) -> bool {
-    let path = Path::new(path);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        file_name.as_str(),
-        ".env"
-            | ".git-credentials"
-            | ".netrc"
-            | ".npmrc"
-            | ".pypirc"
-            | "auth.json"
-            | "credentials"
-            | "credentials.json"
-            | "id_dsa"
-            | "id_ecdsa"
-            | "id_ed25519"
-            | "id_rsa"
-            | "providers.json"
-    ) || file_name.ends_with(".pem")
-        || file_name.ends_with(".key")
-        || file_name.ends_with(".p12")
-        || file_name.ends_with(".pfx")
-    {
-        return true;
-    }
-    path.components().any(|component| match component {
-        Component::Normal(name) => matches!(
-            name.to_string_lossy().to_ascii_lowercase().as_str(),
-            ".aws" | ".gnupg" | ".ssh" | "secrets"
-        ),
-        _ => false,
-    })
-}
-
 #[derive(Serialize, Deserialize, Clone)]
 struct Message {
     role: String,
@@ -3984,556 +2677,6 @@ pub(crate) struct OaiFunctionDef {
     parameters: Value,
 }
 
-#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
-struct Usage {
-    // Provider usage is normalized into disjoint input buckets:
-    // - Anthropic: input_tokens plus cache_creation/read_input_tokens.
-    // - OpenAI/ChatGPT: prompt/input tokens minus cached_tokens, with cached_tokens as cache_read.
-    // - Z.ai/GLM: Anthropic-compatible fields when present; otherwise no cache buckets.
-    // - local llama.cpp: timings.prompt_n as new prompt input and timings.cache_n as cache_read.
-    input: u64,
-    output: u64,
-    cache_create: u64,
-    cache_read: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cost_usd: Option<f64>,
-}
-
-impl Usage {
-    fn add(&mut self, o: Usage) {
-        let lhs_cost = self.cost_usd;
-        let rhs_cost = o.cost_usd;
-        let lhs_tokens = self.total_tokens();
-        let rhs_tokens = o.total_tokens();
-        self.input += o.input;
-        self.output += o.output;
-        self.cache_create += o.cache_create;
-        self.cache_read += o.cache_read;
-        self.cost_usd = match (lhs_cost, rhs_cost) {
-            (Some(a), Some(b)) => Some(a + b),
-            (Some(a), None) if rhs_tokens == 0 => Some(a),
-            (None, Some(b)) if lhs_tokens == 0 => Some(b),
-            (None, None) if lhs_tokens == 0 && rhs_tokens == 0 => None,
-            _ => None,
-        };
-    }
-
-    fn actual_input_tokens(&self) -> u64 {
-        self.input
-    }
-
-    fn cached_input_tokens(&self) -> u64 {
-        self.cache_create.saturating_add(self.cache_read)
-    }
-
-    fn total_input_tokens(&self) -> u64 {
-        self.input.saturating_add(self.cached_input_tokens())
-    }
-
-    fn billed_tokens(&self) -> u64 {
-        self.total_input_tokens().saturating_add(self.output)
-    }
-
-    fn context_tokens(&self) -> u64 {
-        self.billed_tokens()
-    }
-
-    fn total_tokens(&self) -> u64 {
-        self.billed_tokens()
-    }
-
-    fn estimated_cost_usd(&self) -> f64 {
-        if let Some(cost) = self.cost_usd {
-            return cost;
-        }
-        let per_mtok = 1_000_000.0;
-        (self.input as f64 / per_mtok) * DEFAULT_INPUT_USD_PER_MTOK
-            + (self.output as f64 / per_mtok) * DEFAULT_OUTPUT_USD_PER_MTOK
-            + (self.cache_read as f64 / per_mtok) * DEFAULT_CACHE_READ_USD_PER_MTOK
-            + (self.cache_create as f64 / per_mtok) * DEFAULT_CACHE_CREATE_USD_PER_MTOK
-    }
-
-    fn parse(v: &Value) -> Self {
-        let cache_create = v["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-        let cache_read = v["cache_read_input_tokens"].as_u64().unwrap_or(0);
-        let input = if let Some(input) = v["input_tokens"].as_u64() {
-            input
-        } else {
-            v["prompt_tokens"]
-                .as_u64()
-                .unwrap_or(0)
-                .saturating_sub(cache_create)
-                .saturating_sub(cache_read)
-        };
-        let output = v["output_tokens"]
-            .as_u64()
-            .or_else(|| v["completion_tokens"].as_u64())
-            .unwrap_or(0);
-        Self {
-            input,
-            output,
-            cache_create,
-            cache_read,
-            cost_usd: parse_usage_cost(v),
-        }
-    }
-
-    fn parse_openai(v: &Value) -> Self {
-        let prompt_cache_hit = v["prompt_cache_hit_tokens"].as_u64().unwrap_or(0);
-        let prompt_cache_miss = v["prompt_cache_miss_tokens"].as_u64();
-        let total_input = v["prompt_tokens"]
-            .as_u64()
-            .or_else(|| v["input_tokens"].as_u64())
-            .or_else(|| prompt_cache_miss.map(|miss| miss.saturating_add(prompt_cache_hit)))
-            .unwrap_or(0);
-        let output = v["completion_tokens"]
-            .as_u64()
-            .or_else(|| v["output_tokens"].as_u64())
-            .or_else(|| v["completion_tokens_details"]["accepted_prediction_tokens"].as_u64())
-            .unwrap_or(0);
-        let cache_read = v
-            .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                v.get("input_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-            })
-            .or_else(|| v["cache_read_input_tokens"].as_u64())
-            .or_else(|| v["cached_tokens"].as_u64())
-            .or(Some(prompt_cache_hit).filter(|tokens| *tokens > 0))
-            .unwrap_or(0);
-        let cache_create = v["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-        let cost_usd = parse_usage_cost(v);
-        Self {
-            input: total_input
-                .saturating_sub(cache_read)
-                .saturating_sub(cache_create),
-            output,
-            cache_create,
-            cache_read,
-            cost_usd,
-        }
-    }
-
-    fn parse_openai_timings(v: &Value) -> Option<Self> {
-        let cache_read = v["cache_n"].as_u64().unwrap_or(0);
-        let input = v["prompt_n"].as_u64().unwrap_or(0);
-        let output = v["predicted_n"].as_u64().unwrap_or(0);
-        (cache_read > 0 || input > 0 || output > 0).then_some(Self {
-            input,
-            output,
-            cache_create: 0,
-            cache_read,
-            cost_usd: None,
-        })
-    }
-
-    fn line(&self) -> String {
-        let mut input = format!("input={}", self.total_input_tokens());
-        if self.cached_input_tokens() > 0 {
-            input.push_str(&format!(
-                " new_in={} cache_r={} cache_w={}",
-                self.actual_input_tokens(),
-                self.cache_read,
-                self.cache_create
-            ));
-        }
-        format!(
-            "{} out={} total={} est=${:.4}",
-            input,
-            self.output,
-            self.total_tokens(),
-            self.estimated_cost_usd()
-        )
-    }
-}
-
-fn parse_usage_cost(v: &Value) -> Option<f64> {
-    v["cost"]
-        .as_f64()
-        .or_else(|| v["cost_usd"].as_f64())
-        .or_else(|| v["total_cost"].as_f64())
-        .or_else(|| v["total_cost_usd"].as_f64())
-        .filter(|cost| cost.is_finite() && *cost >= 0.0)
-}
-
-#[derive(Clone, Copy)]
-struct UsagePricing {
-    input: f64,
-    output: f64,
-    cache_read: f64,
-    cache_create: f64,
-}
-
-impl UsagePricing {
-    const fn new(input: f64, output: f64, cache_read: f64, cache_create: f64) -> Self {
-        Self {
-            input,
-            output,
-            cache_read,
-            cache_create,
-        }
-    }
-
-    const fn zero() -> Self {
-        Self::new(0.0, 0.0, 0.0, 0.0)
-    }
-
-    fn scaled(self, input: f64, output: f64) -> Self {
-        Self::new(
-            self.input * input,
-            self.output * output,
-            self.cache_read * input,
-            self.cache_create * input,
-        )
-    }
-
-    fn estimate(self, usage: Usage) -> f64 {
-        let per_mtok = 1_000_000.0;
-        (usage.input as f64 / per_mtok) * self.input
-            + (usage.output as f64 / per_mtok) * self.output
-            + (usage.cache_read as f64 / per_mtok) * self.cache_read
-            + (usage.cache_create as f64 / per_mtok) * self.cache_create
-    }
-}
-
-impl From<&ModelPricing> for UsagePricing {
-    fn from(pricing: &ModelPricing) -> Self {
-        Self::new(
-            pricing.input_usd_per_mtok,
-            pricing.output_usd_per_mtok,
-            pricing.cache_read_usd_per_mtok,
-            pricing.cache_create_usd_per_mtok,
-        )
-    }
-}
-
-impl Default for UsagePricing {
-    fn default() -> Self {
-        Self::new(
-            DEFAULT_INPUT_USD_PER_MTOK,
-            DEFAULT_OUTPUT_USD_PER_MTOK,
-            DEFAULT_CACHE_READ_USD_PER_MTOK,
-            DEFAULT_CACHE_CREATE_USD_PER_MTOK,
-        )
-    }
-}
-
-fn provider_cost_estimate_overrides_wire_cost(
-    provider_id: &str,
-    api_provider: ApiProvider,
-    model: &str,
-) -> bool {
-    api_provider == ApiProvider::Anthropic && anthropic_prompt_cache_supported(provider_id, model)
-}
-
-fn usage_pricing_for(
-    provider_id: &str,
-    api_provider: ApiProvider,
-    base_url: &str,
-    model: &str,
-) -> UsagePricing {
-    let base = if provider::is_local_llama_provider(provider_id, api_provider, base_url) {
-        UsagePricing::zero()
-    } else {
-        let provider = canonical_provider_id(provider_id);
-        let model = normalize_price_model(model);
-        match provider.as_str() {
-            "openai" | "chatgpt" => openai_pricing(&model).unwrap_or_default(),
-            "anthropic" | "glm" => anthropic_pricing(&model).unwrap_or_default(),
-            "deepseek" => deepseek_pricing(&model).unwrap_or_default(),
-            _ if api_provider == ApiProvider::Anthropic => {
-                anthropic_pricing(&model).unwrap_or_default()
-            }
-            _ => UsagePricing::default(),
-        }
-    };
-    usage_pricing_from_env(base)
-}
-
-fn pricing_env_override_is_set() -> bool {
-    [
-        "DEXT_INPUT_USD_PER_MTOK",
-        "DEXT_OUTPUT_USD_PER_MTOK",
-        "DEXT_CACHE_READ_USD_PER_MTOK",
-        "DEXT_CACHE_CREATE_USD_PER_MTOK",
-    ]
-    .into_iter()
-    .any(|name| env_f64(name).is_some())
-}
-
-fn gpt_5_6_long_context_pricing(
-    provider_id: &str,
-    model: &str,
-    usage: Usage,
-    pricing: UsagePricing,
-) -> UsagePricing {
-    if matches!(
-        canonical_provider_id(provider_id).as_str(),
-        "openai" | "chatgpt"
-    ) && is_gpt_5_6_model(model)
-        && usage.total_input_tokens() > 272_000
-        && !pricing_env_override_is_set()
-        && openai_pricing(&normalize_price_model(model)).is_some_and(|official| {
-            pricing.input == official.input
-                && pricing.output == official.output
-                && pricing.cache_read == official.cache_read
-                && pricing.cache_create == official.cache_create
-        })
-    {
-        pricing.scaled(2.0, 1.5)
-    } else {
-        pricing
-    }
-}
-
-fn usage_with_current_pricing(
-    mut usage: Usage,
-    provider_id: &str,
-    api_provider: ApiProvider,
-    base_url: &str,
-    model: &str,
-    model_pricing: Option<&ModelPricing>,
-) -> Usage {
-    if usage.total_tokens() > 0
-        && (provider_cost_estimate_overrides_wire_cost(provider_id, api_provider, model)
-            || usage.cost_usd.is_none())
-    {
-        let pricing = model_pricing.map_or_else(
-            || usage_pricing_for(provider_id, api_provider, base_url, model),
-            |pricing| usage_pricing_from_env(UsagePricing::from(pricing)),
-        );
-        let pricing = gpt_5_6_long_context_pricing(provider_id, model, usage, pricing);
-        usage.cost_usd = Some(pricing.estimate(usage));
-    }
-    usage
-}
-
-fn normalize_price_model(model: &str) -> String {
-    model.trim().to_ascii_lowercase()
-}
-
-fn openai_pricing(model: &str) -> Option<UsagePricing> {
-    if matches!(model, "gpt-5.6" | "gpt-5.6-sol") {
-        Some(UsagePricing::new(5.0, 30.0, 0.5, 6.25))
-    } else if model == "gpt-5.6-terra" {
-        Some(UsagePricing::new(2.5, 15.0, 0.25, 3.125))
-    } else if model == "gpt-5.6-luna" {
-        Some(UsagePricing::new(1.0, 6.0, 0.1, 1.25))
-    } else if model.starts_with("gpt-5.4-mini") {
-        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
-    } else if model.starts_with("gpt-5.4") {
-        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
-    } else if model.starts_with("gpt-5.3-codex-spark") {
-        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
-    } else if model.starts_with("gpt-5.3-codex") {
-        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
-    } else if model.starts_with("gpt-5-mini") {
-        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
-    } else if model.starts_with("gpt-5-nano") {
-        Some(UsagePricing::new(0.05, 0.4, 0.005, 0.05))
-    } else if model.starts_with("gpt-5") {
-        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
-    } else if model.starts_with("gpt-4.1-mini") {
-        Some(UsagePricing::new(0.4, 1.6, 0.1, 0.4))
-    } else if model.starts_with("gpt-4.1-nano") {
-        Some(UsagePricing::new(0.1, 0.4, 0.025, 0.1))
-    } else if model.starts_with("gpt-4.1") {
-        Some(UsagePricing::new(2.0, 8.0, 0.5, 2.0))
-    } else if model.starts_with("gpt-4o-mini") {
-        Some(UsagePricing::new(0.15, 0.6, 0.075, 0.15))
-    } else if model.starts_with("gpt-4o") {
-        Some(UsagePricing::new(2.5, 10.0, 1.25, 2.5))
-    } else if model.starts_with("o3-mini") || model.starts_with("o4-mini") {
-        Some(UsagePricing::new(1.1, 4.4, 0.55, 1.1))
-    } else if model.starts_with("o3") {
-        Some(UsagePricing::new(2.0, 8.0, 0.5, 2.0))
-    } else {
-        None
-    }
-}
-
-fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
-    if model.starts_with("glm-") {
-        return Some(UsagePricing::default());
-    }
-    if model.contains("fable") {
-        // Inferred from Anthropic Console billing for claude-fable-5 until public rates are listed.
-        Some(UsagePricing::new(
-            11.721718363700392,
-            58.60859181850196,
-            1.1721718363700393,
-            14.65214795462549,
-        ))
-    } else if model.contains("opus") {
-        Some(UsagePricing::new(15.0, 75.0, 1.5, 18.75))
-    } else if model.contains("sonnet") {
-        Some(UsagePricing::new(3.0, 15.0, 0.3, 3.75))
-    } else if model.contains("haiku-4-5") || model.contains("haiku-4.5") {
-        Some(UsagePricing::new(1.0, 5.0, 0.1, 1.25))
-    } else if model.contains("haiku") {
-        Some(UsagePricing::new(0.8, 4.0, 0.08, 1.0))
-    } else {
-        None
-    }
-}
-
-fn deepseek_pricing(model: &str) -> Option<UsagePricing> {
-    if model.contains("reasoner") {
-        Some(UsagePricing::new(0.55, 2.19, 0.14, 0.55))
-    } else if model.contains("chat") {
-        Some(UsagePricing::new(0.27, 1.1, 0.07, 0.27))
-    } else {
-        None
-    }
-}
-
-fn usage_pricing_from_env(default: UsagePricing) -> UsagePricing {
-    UsagePricing {
-        input: env_f64("DEXT_INPUT_USD_PER_MTOK").unwrap_or(default.input),
-        output: env_f64("DEXT_OUTPUT_USD_PER_MTOK").unwrap_or(default.output),
-        cache_read: env_f64("DEXT_CACHE_READ_USD_PER_MTOK").unwrap_or(default.cache_read),
-        cache_create: env_f64("DEXT_CACHE_CREATE_USD_PER_MTOK").unwrap_or(default.cache_create),
-    }
-}
-
-fn env_f64(name: &str) -> Option<f64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BudgetCap {
-    usd: Option<f64>,
-    tokens: Option<u64>,
-}
-
-impl BudgetCap {
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        let raw = raw.trim();
-        if raw.eq_ignore_ascii_case("off")
-            || raw.eq_ignore_ascii_case("none")
-            || raw.eq_ignore_ascii_case("disabled")
-            || raw == "0"
-        {
-            return None;
-        }
-        let parts: Vec<&str> = raw
-            .split([',', '+'])
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .collect();
-        if parts.len() > 1 {
-            let mut cap = Self {
-                usd: None,
-                tokens: None,
-            };
-            for part in parts {
-                let parsed = Self::parse_one(part)?;
-                cap.usd = cap.usd.or(parsed.usd);
-                cap.tokens = cap.tokens.or(parsed.tokens);
-            }
-            return (cap.usd.is_some() || cap.tokens.is_some()).then_some(cap);
-        }
-        Self::parse_one(raw)
-    }
-
-    fn parse_one(raw: &str) -> Option<Self> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("$") {
-            return parse_positive_f64(rest).map(|usd| Self {
-                usd: Some(usd),
-                tokens: None,
-            });
-        }
-        if let Some(rest) = lower
-            .strip_suffix("usd")
-            .or_else(|| lower.strip_suffix("dollars"))
-            .or_else(|| lower.strip_suffix("dollar"))
-        {
-            return parse_positive_f64(rest.trim()).map(|usd| Self {
-                usd: Some(usd),
-                tokens: None,
-            });
-        }
-        if let Some(rest) = lower
-            .strip_suffix("tok")
-            .or_else(|| lower.strip_suffix("tokens"))
-            .or_else(|| lower.strip_suffix("token"))
-        {
-            return parse_token_count(rest.trim()).map(|tokens| Self {
-                usd: None,
-                tokens: Some(tokens),
-            });
-        }
-        parse_positive_f64(&lower).map(|usd| Self {
-            usd: Some(usd),
-            tokens: None,
-        })
-    }
-
-    fn from_env() -> Option<Self> {
-        std::env::var("DEXT_BUDGET_CAP")
-            .ok()
-            .and_then(|v| Self::parse(&v))
-    }
-
-    fn exceeded(&self, usage: Usage) -> Option<String> {
-        if let Some(tokens) = self.tokens {
-            let used = usage.total_tokens();
-            if used >= tokens {
-                return Some(format!("token budget cap reached: {used}/{tokens} tokens"));
-            }
-        }
-        if let Some(usd) = self.usd {
-            let used = usage.estimated_cost_usd();
-            if used >= usd {
-                return Some(format!("budget cap reached: ${used:.4}/${usd:.4}"));
-            }
-        }
-        None
-    }
-
-    fn line(self) -> String {
-        match (self.usd, self.tokens) {
-            (Some(usd), Some(tokens)) => format!("${usd:.4} or {tokens} tokens"),
-            (Some(usd), None) => format!("${usd:.4}"),
-            (None, Some(tokens)) => format!("{tokens} tokens"),
-            (None, None) => "off".to_string(),
-        }
-    }
-}
-
-fn parse_positive_f64(raw: &str) -> Option<f64> {
-    let value = raw.trim().parse::<f64>().ok()?;
-    (value.is_finite() && value > 0.0).then_some(value)
-}
-
-fn parse_token_count(raw: &str) -> Option<u64> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let (number, mult) = if let Some(n) = trimmed.strip_suffix('k') {
-        (n, 1_000.0)
-    } else if let Some(n) = trimmed.strip_suffix('m') {
-        (n, 1_000_000.0)
-    } else {
-        (trimmed, 1.0)
-    };
-    let value = parse_positive_f64(number)?;
-    let tokens = (value * mult).round();
-    (tokens.is_finite() && tokens >= 1.0 && tokens <= u64::MAX as f64).then_some(tokens as u64)
-}
-
 pub(crate) fn normalize_reasoning_summary_text(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
     let mut remaining = text;
@@ -4904,90 +3047,6 @@ where
     capture
 }
 
-const PACK_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED_PACK_CREDENTIAL]";
-
-struct SecretByteRedactor {
-    patterns: Vec<Vec<u8>>,
-    pending: Vec<u8>,
-    max_pattern_len: usize,
-}
-
-impl SecretByteRedactor {
-    fn new(patterns: Vec<Vec<u8>>) -> Self {
-        let patterns = patterns
-            .into_iter()
-            .filter(|pattern| !pattern.is_empty())
-            .collect::<Vec<_>>();
-        let max_pattern_len = patterns.iter().map(Vec::len).max().unwrap_or(0);
-        Self {
-            patterns,
-            pending: Vec::new(),
-            max_pattern_len,
-        }
-    }
-
-    fn push<F>(&mut self, bytes: &[u8], mut emit: F)
-    where
-        F: FnMut(&[u8]),
-    {
-        self.pending.extend_from_slice(bytes);
-        self.drain(false, &mut emit);
-    }
-
-    fn finish<F>(&mut self, mut emit: F)
-    where
-        F: FnMut(&[u8]),
-    {
-        self.drain(true, &mut emit);
-    }
-
-    fn drain<F>(&mut self, finish: bool, emit: &mut F)
-    where
-        F: FnMut(&[u8]),
-    {
-        loop {
-            let found = self
-                .patterns
-                .iter()
-                .filter_map(|pattern| {
-                    self.pending
-                        .windows(pattern.len())
-                        .position(|window| window == pattern)
-                        .map(|position| (position, pattern.len()))
-                })
-                .min_by_key(|(position, length)| (*position, std::cmp::Reverse(*length)));
-            if let Some((position, length)) = found {
-                let candidate = &self.pending[position..];
-                let could_extend = !finish
-                    && self.patterns.iter().any(|pattern| {
-                        pattern.len() > candidate.len() && pattern.starts_with(candidate)
-                    });
-                if could_extend {
-                    emit(&self.pending[..position]);
-                    self.pending.drain(..position);
-                    break;
-                }
-                emit(&self.pending[..position]);
-                emit(PACK_CREDENTIAL_REDACTION);
-                self.pending.drain(..position + length);
-                continue;
-            }
-
-            let keep = if finish {
-                0
-            } else {
-                self.max_pattern_len.saturating_sub(1)
-            };
-            let emit_len = self.pending.len().saturating_sub(keep);
-            if emit_len > 0 {
-                emit(&self.pending[..emit_len]);
-                self.pending.drain(..emit_len);
-            }
-            break;
-        }
-    }
-}
-
 async fn collect_async_limited_redacted<R>(
     mut reader: R,
     cap: usize,
@@ -5010,264 +3069,6 @@ where
     }
     redactor.finish(|bytes| capture.push(bytes));
     capture
-}
-
-// Children run in a new *session*, not merely a new process group: setsid()
-// also detaches them from Dext's controlling terminal, so nothing they spawn
-// can read from or paint over the TUI via /dev/tty (git credential prompts
-// did exactly that — the prompt text garbled the input box while git hung on
-// a terminal read that could never be answered). setsid() implies a fresh
-// process group with pgid == pid, so the pgid-based cleanup in
-// terminate_process_group_after_exit keeps working unchanged; setpgid is the
-// fallback if setsid is ever refused.
-#[cfg(unix)]
-fn detach_session_pre_exec() -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
-    || {
-        let setsid_result = unsafe { libc::setsid() };
-        if setsid_result != -1 {
-            return Ok(());
-        }
-        if unsafe { libc::setpgid(0, 0) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn configure_std_process_group(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-    unsafe {
-        cmd.pre_exec(detach_session_pre_exec());
-    }
-}
-
-#[cfg(windows)]
-fn configure_std_process_group(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_std_process_group(_cmd: &mut Command) {}
-
-#[cfg(unix)]
-fn configure_tokio_process_group(cmd: &mut tokio::process::Command) {
-    unsafe {
-        cmd.pre_exec(detach_session_pre_exec());
-    }
-}
-
-#[cfg(windows)]
-fn configure_tokio_process_group(cmd: &mut tokio::process::Command) {
-    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_tokio_process_group(_cmd: &mut tokio::process::Command) {}
-
-#[cfg(windows)]
-fn resume_windows_process(pid: u32) -> io::Result<()> {
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-        System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
-                Thread32Next,
-            },
-            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
-        },
-    };
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut present = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while present {
-        if entry.th32OwnerProcessID == pid {
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if thread.is_null() {
-                let error = io::Error::last_os_error();
-                unsafe {
-                    CloseHandle(snapshot);
-                }
-                return Err(error);
-            }
-            let resumed = unsafe { ResumeThread(thread) };
-            let error = (resumed == u32::MAX).then(io::Error::last_os_error);
-            unsafe {
-                CloseHandle(thread);
-                CloseHandle(snapshot);
-            }
-            return error.map_or(Ok(()), Err);
-        }
-        present = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
-    }
-    unsafe {
-        CloseHandle(snapshot);
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "suspended child thread was not found",
-    ))
-}
-
-struct ChildProcessTree {
-    #[cfg(unix)]
-    pid: u32,
-    #[cfg(windows)]
-    job: usize,
-}
-
-impl ChildProcessTree {
-    fn for_std(child: &std::process::Child) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            Ok(Self { pid: child.id() })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle as _;
-            Self::for_windows_process(child.as_raw_handle() as _, child.id())
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = child;
-            Ok(Self {})
-        }
-    }
-
-    fn for_tokio(child: &tokio::process::Child) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            child
-                .id()
-                .map(|pid| Self { pid })
-                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))
-        }
-        #[cfg(windows)]
-        {
-            let process = child
-                .raw_handle()
-                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))?;
-            let pid = child
-                .id()
-                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))?;
-            Self::for_windows_process(process as _, pid)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = child;
-            Ok(Self {})
-        }
-    }
-
-    #[cfg(windows)]
-    fn for_windows_process(
-        process: windows_sys::Win32::Foundation::HANDLE,
-        pid: u32,
-    ) -> io::Result<Self> {
-        use windows_sys::Win32::{
-            Foundation::CloseHandle,
-            System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
-            },
-        };
-
-        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if job.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&limits).cast(),
-                std::mem::size_of_val(&limits) as u32,
-            )
-        };
-        if configured == 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                CloseHandle(job);
-            }
-            return Err(error);
-        }
-        if unsafe { AssignProcessToJobObject(job, process) } == 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                CloseHandle(job);
-            }
-            return Err(error);
-        }
-        if let Err(error) = resume_windows_process(pid) {
-            unsafe {
-                CloseHandle(job);
-            }
-            return Err(error);
-        }
-        Ok(Self { job: job as usize })
-    }
-
-    fn terminate_after_root_exit(&self) {
-        #[cfg(unix)]
-        {
-            signal_process_group(self.pid, libc::SIGTERM);
-            signal_process_group(self.pid, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
-        }
-    }
-
-    fn terminate_std_child(&self, child: &mut std::process::Child) {
-        #[cfg(unix)]
-        {
-            signal_process_group(self.pid, libc::SIGTERM);
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            signal_process_group(self.pid, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    async fn terminate_tokio_child(&self, child: &mut tokio::process::Child) {
-        #[cfg(unix)]
-        {
-            signal_process_group(self.pid, libc::SIGTERM);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            signal_process_group(self.pid, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
-        }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
-}
-
-impl Drop for ChildProcessTree {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.job as _);
-        }
-    }
 }
 
 /// Forbid interactive credential prompting in tool children. They have no
@@ -5628,14 +3429,6 @@ pub(crate) fn harden_internal_command_env(cmd: &mut Command) {
     deny_interactive_prompt_env_std(cmd);
     scrub_credentials_from_std_command_unconditionally(cmd);
     scrub_startup_env_from_std_command(cmd);
-}
-
-#[cfg(unix)]
-fn signal_process_group(pid: u32, signal: libc::c_int) {
-    let pgid = -(pid as libc::pid_t);
-    unsafe {
-        let _ = libc::kill(pgid, signal);
-    }
 }
 
 fn run_sync_command_limited_with_scratch(
@@ -11501,6 +9294,13 @@ async fn execute_builtin_call(
     live_output: Option<LiveToolOutput>,
     pack_env: Vec<(String, String)>,
 ) -> std::result::Result<String, String> {
+    // The blocking builtin path below cannot be cancelled once it starts, so
+    // this is the last point where an already-interrupted call can be stopped.
+    // It is also the gate for a parallel-round task that won its concurrency
+    // permit after the user hit Ctrl-C.
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(format!("{name} was not executed: interrupted by user"));
+    }
     if name == "bash" {
         let cmd = input["command"].as_str().unwrap_or("").to_string();
         let guarded = tool_policy::apply_bash_guardrails(&cmd)?;
@@ -12002,6 +9802,14 @@ fn persist_tool_journal_terminal(
         })
 }
 
+fn decimal_width(value: u64) -> usize {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
+}
+
 fn json_byte_len(v: &Value) -> usize {
     match v {
         Value::Null => 4,
@@ -12012,12 +9820,22 @@ fn json_byte_len(v: &Value) -> usize {
                 5
             }
         }
-        Value::Number(n) => n.to_string().len(),
+        // Integers are the overwhelming majority of numbers in tool payloads,
+        // and their decimal width is arithmetic — only floats need serde_json's
+        // formatter, and only they pay for an allocation.
+        Value::Number(n) => match (n.as_u64(), n.as_i64()) {
+            (Some(u), _) => decimal_width(u),
+            (_, Some(i)) => 1 + decimal_width(i.unsigned_abs()),
+            _ => n.to_string().len(),
+        },
         Value::String(s) => {
+            // Every escaped character here is ASCII, and a UTF-8 continuation
+            // byte can never collide with one, so counting bytes avoids
+            // decoding the string without changing the result.
             s.len()
                 + 2
-                + s.chars()
-                    .filter(|c| matches!(c, '"' | '\\' | '\n' | '\r' | '\t'))
+                + s.bytes()
+                    .filter(|b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t'))
                     .count()
         }
         Value::Array(a) => {
@@ -12152,6 +9970,7 @@ struct PromptScanCache {
     dext_md: PromptContextScan,
     recall: PromptContextScan,
     pack_summary: Option<String>,
+    shelf_summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -12159,6 +9978,76 @@ struct SystemParts {
     stable: String,
     env: String,
     prompt_sources: Vec<PathBuf>,
+}
+
+/// Per-mode caps for the volatile env block. `None` omits the section outright
+/// (and skips computing it); `suffix` completes the "<section> trimmed for
+/// {suffix}." hint every capped section shares.
+struct EnvCaps {
+    /// Byte cap paired with how many todo items to summarize.
+    todos: Option<(usize, usize)>,
+    ledger: usize,
+    context_state: usize,
+    health: Option<usize>,
+    budget_cap: bool,
+    packs: Option<usize>,
+    shelves: Option<usize>,
+    /// Byte cap paired with its own hint suffix: frugal says "frugal budget"
+    /// here while every other hint in that mode says "frugal context". Carried
+    /// so this refactor stays byte-identical; normalize it only as a deliberate
+    /// prompt change.
+    shelf_context: Option<(usize, &'static str)>,
+    suffix: &'static str,
+}
+
+impl EnvCaps {
+    const TINY: Self = Self {
+        todos: None,
+        ledger: 600,
+        context_state: 800,
+        health: None,
+        budget_cap: false,
+        packs: None,
+        shelves: None,
+        shelf_context: None,
+        suffix: "tiny context",
+    };
+
+    const FRUGAL: Self = Self {
+        todos: Some((600, 3)),
+        ledger: 1_200,
+        context_state: 1_200,
+        health: Some(600),
+        budget_cap: true,
+        packs: Some(600),
+        shelves: Some(700),
+        shelf_context: Some((600, "frugal budget")),
+        suffix: "frugal context",
+    };
+
+    const FULL: Self = Self {
+        todos: Some((900, 5)),
+        ledger: 2_000,
+        context_state: 1_800,
+        health: Some(800),
+        budget_cap: true,
+        packs: Some(600),
+        shelves: Some(700),
+        shelf_context: Some((1_200, "prompt budget")),
+        suffix: "prompt budget",
+    };
+}
+
+/// Appends `\n## {heading}\n{body}` with `body` capped and a trailing newline
+/// guaranteed — the shape every env section repeats.
+fn push_env_section(env: &mut String, heading: &str, body: String, cap: usize, hint: &str) {
+    env.push_str("\n## ");
+    env.push_str(heading);
+    env.push('\n');
+    env.push_str(&cap_bytes_with_hint(body, cap, hint));
+    if !env.ends_with('\n') {
+        env.push('\n');
+    }
 }
 
 const READ_ONLY_TOOLS: &[&str] = &[
@@ -13293,6 +11182,10 @@ fn render_context_state_prompt(history: &[Message], ledger: &WorkLedger) -> Stri
         }
     }
 
+    // Every strategy row is emitted even at zero use: an absent entry means
+    // either "never used" or "reset by a worktree mutation", and the explicit
+    // "0/N used · OK" is what tells the model a previously exhausted budget is
+    // available again. Dropping idle rows would erase that affordance.
     let budgets = context_strategy_budget_usage(&actions);
     out.push_str("Strategy budget:\n");
     for strategy in [
@@ -15808,6 +13701,11 @@ impl Agent {
         if root_changed {
             self.allowed.clear();
             self.project_extensions_approved = None;
+            // The prompt scan cache is keyed on the epoch and on stat
+            // signatures for the *previous* root's ancestor chain, which stay
+            // current after a move. Without this bump a new root could be
+            // served the old root's DEXT.md, recall, pack, and shelf sections.
+            self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         }
         self.suppress_pack_activation = false;
         self.sandbox_root = root;
@@ -16053,13 +13951,24 @@ impl Agent {
     /// and revalidated with cheap stats between tool rounds. compose runs once
     /// per provider request; without the cache it would repeat the ancestor
     /// walks and pack-directory reads on every round of a turn.
-    fn prompt_scans(&self) -> (PromptContextSections, PromptContextSections, Option<String>) {
+    fn prompt_scans(
+        &self,
+    ) -> (
+        PromptContextSections,
+        PromptContextSections,
+        Option<String>,
+        Option<String>,
+    ) {
         let Ok(mut guard) = self.prompt_scan_cache.lock() else {
             return (
                 prompt_context_files(&self.sandbox_root, "DEXT.md"),
                 prompt_context_files(&self.sandbox_root, "recall.md"),
                 packs::pack_summary_for_prompt(
                     &self.sandbox_root,
+                    self.project_extensions_approved == Some(true),
+                ),
+                shelves::registry_summary_for_prompt(
+                    &self.shelf_registry,
                     self.project_extensions_approved == Some(true),
                 ),
             );
@@ -16074,6 +13983,7 @@ impl Agent {
                 cache.dext_md.sections.clone(),
                 cache.recall.sections.clone(),
                 cache.pack_summary.clone(),
+                cache.shelf_summary.clone(),
             );
         }
         let dext_md = scan_prompt_context_files(&self.sandbox_root, "DEXT.md");
@@ -16082,10 +13992,15 @@ impl Agent {
             &self.sandbox_root,
             self.project_extensions_approved == Some(true),
         );
+        let shelf_summary = shelves::registry_summary_for_prompt(
+            &self.shelf_registry,
+            self.project_extensions_approved == Some(true),
+        );
         let result = (
             dext_md.sections.clone(),
             recall.sections.clone(),
             pack_summary.clone(),
+            shelf_summary.clone(),
         );
         *guard = Some(PromptScanCache {
             epoch: self.prompt_scan_epoch,
@@ -16093,11 +14008,20 @@ impl Agent {
             dext_md,
             recall,
             pack_summary,
+            shelf_summary,
         });
         result
     }
 
     fn compose_system_details(&self) -> SystemParts {
+        let tiny = self.context_mode.is_tiny();
+        let caps = if tiny {
+            EnvCaps::TINY
+        } else if self.context_mode.is_frugal() {
+            EnvCaps::FRUGAL
+        } else {
+            EnvCaps::FULL
+        };
         let mut stable = self.system.clone();
         if self.context_mode.is_frugal()
             && !self.context_mode.is_tiny()
@@ -16114,7 +14038,8 @@ impl Agent {
             PROJECT_CONTEXT_CAP
         };
         let mut prompt_sources = Vec::new();
-        let (dext_md_sections, recall_sections, cached_pack_summary) = self.prompt_scans();
+        let (dext_md_sections, recall_sections, cached_pack_summary, cached_shelf_summary) =
+            self.prompt_scans();
         for (label, path, content) in &dext_md_sections {
             if context_budget == 0 {
                 break;
@@ -16163,325 +14088,132 @@ impl Agent {
             }
         }
 
-        let mut env = String::from("## Environment\n");
-        if self.context_mode.is_tiny() {
-            if let Some(git) = &self.git_context {
-                env.push_str(&format!(
-                    "cwd={} os={} git={} provider={} model={} effort={} context={} schemas={} approval={} sandbox={}\n",
-                    self.sandbox_root.display(),
-                    std::env::consts::OS,
-                    git,
-                    self.provider_id,
-                    self.model,
-                    self.thinking_effort.as_str(),
-                    self.context_mode.as_str(),
-                    self.wire_tool_profile().as_str(),
-                    self.approval_profile.as_str(),
-                    self.sandbox_profile.as_str()
-                ));
-            } else {
-                env.push_str(&format!(
-                    "cwd={} os={} provider={} model={} effort={} context={} schemas={} approval={} sandbox={}\n",
-                    self.sandbox_root.display(),
-                    std::env::consts::OS,
-                    self.provider_id,
-                    self.model,
-                    self.thinking_effort.as_str(),
-                    self.context_mode.as_str(),
-                    self.wire_tool_profile().as_str(),
-                    self.approval_profile.as_str(),
-                    self.sandbox_profile.as_str()
-                ));
-            }
-            env.push_str(&format!(
-                "compact={} active={}\n",
-                self.compact_threshold_chars(),
-                self.active_compact_threshold_chars()
+        // Packs and shelves only change when prompt_scan_epoch bumps, so they
+        // belong in the cached system block instead of the tail that is
+        // re-billed at full input rate on every tool round.
+        if let Some(cap) = caps.packs
+            && let Some(pack_summary) = cached_pack_summary
+        {
+            stable.push_str("\n\n## Dext packs\n");
+            stable.push_str(&cap_bytes_with_hint(
+                pack_summary,
+                cap,
+                &format!("pack summary trimmed for {}.", caps.suffix),
             ));
-            let ledger = self.work_ledger_prompt();
-            if !ledger.trim().is_empty() {
-                env.push_str("\n## Work ledger\n");
-                env.push_str(&cap_bytes_with_hint(
-                    ledger,
-                    600,
-                    "work ledger trimmed for tiny context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            let context_state = self.context_state_prompt();
-            if !context_state.trim().is_empty() {
-                env.push_str("\n## Context State\n");
-                env.push_str(&cap_bytes_with_hint(
-                    context_state,
-                    800,
-                    "context state trimmed for tiny context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            env.push_str(&self.privacy.prompt_status_line());
-            env.push('\n');
-            return SystemParts {
-                stable,
-                env,
-                prompt_sources,
-            };
         }
-        if self.context_mode.is_frugal() {
-            if let Some(git) = &self.git_context {
-                env.push_str(&format!(
-                    "cwd={} os={} git={} provider={} model={} effort={} context={} toolset={} schemas={} approval={} sandbox={}\n",
-                    self.sandbox_root.display(),
-                    std::env::consts::OS,
-                    git,
-                    self.provider_id,
-                    self.model,
-                    self.thinking_effort.as_str(),
-                    self.context_mode.as_str(),
-                    self.tool_context_profile().as_str(),
-                    self.wire_tool_profile().as_str(),
-                    self.approval_profile.as_str(),
-                    self.sandbox_profile.as_str()
-                ));
-            } else {
-                env.push_str(&format!(
-                    "cwd={} os={} provider={} model={} effort={} context={} toolset={} schemas={} approval={} sandbox={}\n",
-                    self.sandbox_root.display(),
-                    std::env::consts::OS,
-                    self.provider_id,
-                    self.model,
-                    self.thinking_effort.as_str(),
-                    self.context_mode.as_str(),
-                    self.tool_context_profile().as_str(),
-                    self.wire_tool_profile().as_str(),
-                    self.approval_profile.as_str(),
-                    self.sandbox_profile.as_str()
-                ));
-            }
-            env.push_str(&format!(
-                "history_compact_threshold_chars={} active_history_compact_threshold_chars={}\n",
-                self.compact_threshold_chars(),
-                self.active_compact_threshold_chars()
+        if let Some(cap) = caps.shelves
+            && let Some(shelf_summary) = cached_shelf_summary
+        {
+            stable.push_str("\n\n## Dext shelves\n");
+            stable.push_str(&cap_bytes_with_hint(
+                shelf_summary,
+                cap,
+                &format!("shelf registry summary trimmed for {}.", caps.suffix),
             ));
-            if let Some(todo) = read_session_todo_summary(&self.sandbox_root, &self.session_id, 3) {
-                env.push_str("\n## Project todos\n");
-                env.push_str(&cap_bytes_with_hint(
-                    todo,
-                    600,
-                    "project todo summary trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            let ledger = self.work_ledger_prompt();
-            if !ledger.trim().is_empty() {
-                env.push_str("\n## Work ledger\n");
-                env.push_str(&cap_bytes_with_hint(
-                    ledger,
-                    1_200,
-                    "work ledger trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            let context_state = self.context_state_prompt();
-            if !context_state.trim().is_empty() {
-                env.push_str("\n## Context State\n");
-                env.push_str(&cap_bytes_with_hint(
-                    context_state,
-                    1_200,
-                    "context state trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            let health = self.provider_health_prompt();
-            if !health.trim().is_empty() {
-                env.push_str("\n## Provider health\n");
-                env.push_str(&cap_bytes_with_hint(
-                    health,
-                    600,
-                    "provider health trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            if let Some(cap) = self.budget_cap {
-                env.push_str(&format!("budget_cap={}\n", cap.line()));
-            }
-            if let Some(pack_summary) = cached_pack_summary.clone() {
-                env.push_str("\n## Dext packs\n");
-                env.push_str(&cap_bytes_with_hint(
-                    pack_summary,
-                    600,
-                    "pack summary trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            if let Some(shelf_summary) = shelves::registry_summary_for_prompt(
-                &self.shelf_registry,
-                self.project_extensions_approved == Some(true),
-            ) {
-                env.push_str("\n## Dext shelves\n");
-                env.push_str(&cap_bytes_with_hint(
-                    shelf_summary,
-                    700,
-                    "shelf registry summary trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            if let Some(shelf_context) = self.shelf_context_section() {
-                env.push_str("\n## Shelf context\n");
-                env.push_str(&cap_bytes_with_hint(
-                    shelf_context,
-                    600,
-                    "shelf context trimmed for frugal budget.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            env.push_str(&self.privacy.prompt_status_line());
-            env.push('\n');
-            return SystemParts {
-                stable,
-                env,
-                prompt_sources,
-            };
         }
 
         let mut env = String::from("## Environment\n");
+        env.push_str(&format!(
+            "cwd={} os={}",
+            self.sandbox_root.display(),
+            std::env::consts::OS
+        ));
         if let Some(git) = &self.git_context {
+            env.push_str(&format!(" git={git}"));
+        }
+        env.push_str(&format!(
+            " provider={} model={} effort={} context={}",
+            self.provider_id,
+            self.model,
+            self.thinking_effort.as_str(),
+            self.context_mode.as_str()
+        ));
+        // Tiny drops the toolset profile and abbreviates the threshold keys.
+        if !tiny {
             env.push_str(&format!(
-                "cwd={} os={} git={} provider={} model={} effort={} context={} toolset={} schemas={} approval={} sandbox={}\n",
-                self.sandbox_root.display(),
-                std::env::consts::OS,
-                git,
-                self.provider_id,
-                self.model,
-                self.thinking_effort.as_str(),
-                self.context_mode.as_str(),
-                self.tool_context_profile().as_str(),
-                self.wire_tool_profile().as_str(),
-                self.approval_profile.as_str(),
-                self.sandbox_profile.as_str()
-            ));
-        } else {
-            env.push_str(&format!(
-                "cwd={} os={} provider={} model={} effort={} context={} toolset={} schemas={} approval={} sandbox={}\n",
-                self.sandbox_root.display(),
-                std::env::consts::OS,
-                self.provider_id,
-                self.model,
-                self.thinking_effort.as_str(),
-                self.context_mode.as_str(),
-                self.tool_context_profile().as_str(),
-                self.wire_tool_profile().as_str(),
-                self.approval_profile.as_str(),
-                self.sandbox_profile.as_str()
+                " toolset={}",
+                self.tool_context_profile().as_str()
             ));
         }
         env.push_str(&format!(
-            "history_compact_threshold_chars={} active_history_compact_threshold_chars={}\n",
+            " schemas={} approval={} sandbox={}\n",
+            self.wire_tool_profile().as_str(),
+            self.approval_profile.as_str(),
+            self.sandbox_profile.as_str()
+        ));
+        let (compact_key, active_key) = if tiny {
+            ("compact", "active")
+        } else {
+            (
+                "history_compact_threshold_chars",
+                "active_history_compact_threshold_chars",
+            )
+        };
+        env.push_str(&format!(
+            "{compact_key}={} {active_key}={}\n",
             self.compact_threshold_chars(),
             self.active_compact_threshold_chars()
         ));
-        if let Some(todo) = read_session_todo_summary(&self.sandbox_root, &self.session_id, 5) {
-            env.push_str("\n## Project todos\n");
-            env.push_str(&cap_bytes_with_hint(
+
+        if let Some((cap, items)) = caps.todos
+            && let Some(todo) =
+                read_session_todo_summary(&self.sandbox_root, &self.session_id, items)
+        {
+            push_env_section(
+                &mut env,
+                "Project todos",
                 todo,
-                900,
-                "project todo summary trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
+                cap,
+                &format!("project todo summary trimmed for {}.", caps.suffix),
+            );
         }
         let ledger = self.work_ledger_prompt();
         if !ledger.trim().is_empty() {
-            env.push_str("\n## Work ledger\n");
-            env.push_str(&cap_bytes_with_hint(
+            push_env_section(
+                &mut env,
+                "Work ledger",
                 ledger,
-                2_000,
-                "work ledger trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
+                caps.ledger,
+                &format!("work ledger trimmed for {}.", caps.suffix),
+            );
         }
         let context_state = self.context_state_prompt();
         if !context_state.trim().is_empty() {
-            env.push_str("\n## Context State\n");
-            env.push_str(&cap_bytes_with_hint(
+            push_env_section(
+                &mut env,
+                "Context State",
                 context_state,
-                1_800,
-                "context state trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
+                caps.context_state,
+                &format!("context state trimmed for {}.", caps.suffix),
+            );
+        }
+        if let Some(cap) = caps.health {
+            let health = self.provider_health_prompt();
+            if !health.trim().is_empty() {
+                push_env_section(
+                    &mut env,
+                    "Provider health",
+                    health,
+                    cap,
+                    &format!("provider health trimmed for {}.", caps.suffix),
+                );
             }
         }
-        let health = self.provider_health_prompt();
-        if !health.trim().is_empty() {
-            env.push_str("\n## Provider health\n");
-            env.push_str(&cap_bytes_with_hint(
-                health,
-                800,
-                "provider health trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
-        }
-        if let Some(cap) = self.budget_cap {
+        if caps.budget_cap
+            && let Some(cap) = self.budget_cap
+        {
             env.push_str(&format!("budget_cap={}\n", cap.line()));
         }
-        if let Some(pack_summary) = cached_pack_summary {
-            env.push_str("\n## Dext packs\n");
-            env.push_str(&cap_bytes_with_hint(
-                pack_summary,
-                600,
-                "pack summary trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
-        }
-        if let Some(shelf_summary) = shelves::registry_summary_for_prompt(
-            &self.shelf_registry,
-            self.project_extensions_approved == Some(true),
-        ) {
-            env.push_str("\n## Dext shelves\n");
-            env.push_str(&cap_bytes_with_hint(
-                shelf_summary,
-                700,
-                "shelf registry summary trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
-        }
-        if let Some(shelf_context) = self.shelf_context_section() {
-            env.push_str("\n## Shelf context\n");
-            env.push_str(&cap_bytes_with_hint(
+        if let Some((cap, suffix)) = caps.shelf_context
+            && let Some(shelf_context) = self.shelf_context_section()
+        {
+            push_env_section(
+                &mut env,
+                "Shelf context",
                 shelf_context,
-                1_200,
-                "shelf context trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
+                cap,
+                &format!("shelf context trimmed for {suffix}."),
+            );
         }
         env.push_str(&self.privacy.prompt_status_line());
         env.push('\n');
@@ -19241,6 +16973,9 @@ impl Agent {
             denied_signatures = next_denied_signatures;
             hooks_approval_decided = next_hooks_approval_decided;
             hooks_approved = next_hooks_approved;
+
+            let coverage = objective.assess_history(&self.history);
+            self.sync_work_ledger_with_objective_coverage(&coverage);
 
             if let Some(halt) = turn_state.empty_tool_call_halt_message() {
                 self.sink.emit(AgentEvent::Warn(halt.clone()));

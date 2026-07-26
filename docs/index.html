@@ -227,6 +227,11 @@ pre code{background:none;border:none;padding:0;color:inherit;font-size:inherit;w
 .diagram-svg .line{stroke:var(--dim);stroke-width:1.5;fill:none;marker-end:url(#arrow)}
 .diagram-svg .line-accent{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#arrowAccent)}
 .diagram-svg .lane{stroke:var(--border);stroke-dasharray:4 4;stroke-width:1}
+/* each diagram carries its own marker defs so no SVG depends on another */
+#tool-execution-sequence .line{marker-end:url(#arrow2)}
+#checkpoint-sequence .line{marker-end:url(#arrow3)}
+#turn-loop-flowchart .line{marker-end:url(#arrow4)}
+#checkpoint-flowchart .line{marker-end:url(#arrow5)}
 .diagram-notes{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.9rem}
 .diagram-note{border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:.42rem .85rem;font-size:.78rem;color:var(--dim)}
 .diagram-note strong{color:var(--text);font-weight:600}
@@ -488,6 +493,12 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>src/packs.rs</code></td><td>Pack discovery, invocation, conversational pack inference</td></tr>
 <tr><td><code>src/shelves.rs</code></td><td>Typed shelf registry with ability metadata, signals, and effects</td></tr>
 <tr><td><code>src/tool_policy.rs</code></td><td>Command risk classification, input validation, bash guardrails</td></tr>
+<tr><td><code>src/privacy.rs</code></td><td>Privacy policy, sensitive-path denial, secret/PII redaction</td></tr>
+<tr><td><code>src/usage.rs</code></td><td>Token usage normalization, per-model pricing, budget caps</td></tr>
+<tr><td><code>src/events.rs</code></td><td><code>AgentEvent</code> stream and the <code>EventSink</code> front-end trait</td></tr>
+<tr><td><code>src/crash.rs</code></td><td>Panic hook, redacted owner-only crash snapshots, event breadcrumbs</td></tr>
+<tr><td><code>src/process_tree.rs</code></td><td>Child session detachment and whole-tree teardown</td></tr>
+<tr><td><code>src/secret_redactor.rs</code></td><td>Streaming credential scrubbing for child-process output</td></tr>
 <tr><td><code>deny.toml</code></td><td>Dependency-license allowlist enforced by security and release workflows</td></tr>
 <tr><td><code>benches/dext_bench.rs</code></td><td>Criterion performance harness</td></tr>
 <tr><td><code>tests/tui_smoke.rs</code></td><td>PTY-backed launch, multiline input, streaming, and resize regression tests</td></tr>
@@ -525,62 +536,70 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <rect class="box box-accent" x="365" y="22" width="170" height="42"/><text x="450" y="48" text-anchor="middle">Provider Builder</text>
 <rect class="box box-accent" x="560" y="22" width="140" height="42"/><text x="630" y="48" text-anchor="middle">Provider SSE</text>
 <rect class="box box-accent" x="735" y="22" width="130" height="42"/><text x="800" y="48" text-anchor="middle">State/Session</text>
-<path class="line-accent" d="M90 95 H250"/><text class="muted" x="170" y="88" text-anchor="middle">prompt or steering</text>
+<path class="line-accent" d="M90 95 H260"/><text class="muted" x="175" y="88" text-anchor="middle">prompt or steering</text>
 <path class="line" d="M260 120 H450"/><text class="muted" x="355" y="113" text-anchor="middle">system + DEXT.md + optional recall + tools</text>
 <path class="line" d="M450 145 H630"/><text class="muted" x="540" y="138" text-anchor="middle">HTTP request</text>
-<path class="line-accent" d="M630 175 H270"/><text class="muted" x="450" y="168" text-anchor="middle">stream blocks: text / thinking / tool_use</text>
+<path class="line-accent" d="M630 175 H260"/><text class="muted" x="445" y="168" text-anchor="middle">stream blocks: text / thinking / tool_use</text>
 <rect class="box box-green" x="185" y="205" width="150" height="54"/><text x="260" y="227" text-anchor="middle">Parse blocks</text><text class="muted" x="260" y="246" text-anchor="middle">append text/thinking</text>
 <path class="line" d="M335 232 H505"/><rect class="box box-warn" x="505" y="205" width="160" height="54"/><text x="585" y="227" text-anchor="middle">Tool path</text><text class="muted" x="585" y="246" text-anchor="middle">validate + approve</text>
-<path class="line" d="M665 232 H790"/><rect class="box" x="715" y="280" width="170" height="58"/><text x="800" y="303" text-anchor="middle">Persist JSONL/log</text><text class="muted" x="800" y="322" text-anchor="middle">usage, ledger, health</text>
-<path class="line" d="M800 338 C800 375 260 375 260 292"/><text class="muted" x="505" y="392" text-anchor="middle">next provider call after tool_result, or final response</text>
+<path class="line" d="M665 232 H800 V280"/><rect class="box" x="715" y="280" width="170" height="58"/><text x="800" y="303" text-anchor="middle">Persist JSONL/log</text><text class="muted" x="800" y="322" text-anchor="middle">usage, ledger, health</text>
+<path class="line" d="M800 338 C800 392 260 392 260 259"/><text class="muted" x="505" y="400" text-anchor="middle">next provider call after tool_result, or final response</text>
 </svg>
 <div class="diagram-notes"><div class="diagram-note"><strong>Safe boundary:</strong> steering is injected between stream/tool cycles, not mid-mutation.</div><div class="diagram-note"><strong>Compaction:</strong> history compacts after safe checkpoints when context pressure is high.</div><div class="diagram-note"><strong>Evidence:</strong> session headers persist provider/tool/runtime provenance.</div></div>
 </div>
 
 <div class="diagram-panel" id="tool-execution-sequence">
-<h4>Tool Execution Sequence — validation, policy, checkpoint, result</h4>
-<svg class="diagram-svg" viewBox="0 0 900 360" role="img" aria-label="Tool execution sequence diagram">
+<h4>Tool Execution Sequence — validation, preview, approval, checkpoint, result</h4>
+<svg class="diagram-svg" viewBox="0 0 900 330" role="img" aria-label="Tool execution sequence diagram">
 <defs><marker id="arrow2" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="var(--dim)"/></marker></defs>
-<g class="diagram-svg"><path class="line" style="marker-end:url(#arrow2)" d="M80 68 H220"/><path class="line" style="marker-end:url(#arrow2)" d="M330 68 H470"/><path class="line" style="marker-end:url(#arrow2)" d="M580 68 H720"/>
-<rect class="box box-accent" x="20" y="42" width="120" height="52"/><text x="80" y="64" text-anchor="middle">tool_use</text><text class="muted" x="80" y="82" text-anchor="middle">name + JSON</text>
-<rect class="box" x="220" y="42" width="110" height="52"/><text x="275" y="64" text-anchor="middle">Validate</text><text class="muted" x="275" y="82" text-anchor="middle">required fields</text>
-<rect class="box box-warn" x="470" y="42" width="110" height="52"/><text x="525" y="64" text-anchor="middle">Classify</text><text class="muted" x="525" y="82" text-anchor="middle">Read/Write/Danger</text>
-<rect class="box box-danger" x="720" y="42" width="140" height="52"/><text x="790" y="64" text-anchor="middle">Permission</text><text class="muted" x="790" y="82" text-anchor="middle">profile + sandbox</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M790 94 V150 H700"/><rect class="box box-green" x="540" y="124" width="160" height="52"/><text x="620" y="146" text-anchor="middle">Checkpoint?</text><text class="muted" x="620" y="164" text-anchor="middle">non-read risk in Git repo</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M540 150 H395"/><rect class="box" x="245" y="124" width="150" height="52"/><text x="320" y="146" text-anchor="middle">Preview?</text><text class="muted" x="320" y="164" text-anchor="middle">direct file tools</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M320 176 V235 H455"/><rect class="box box-accent" x="455" y="210" width="150" height="52"/><text x="530" y="232" text-anchor="middle">Execute</text><text class="muted" x="530" y="250" text-anchor="middle">native or subprocess</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M605 236 H735"/><rect class="box box-green" x="735" y="210" width="135" height="52"/><text x="802" y="232" text-anchor="middle">tool_result</text><text class="muted" x="802" y="250" text-anchor="middle">capped output</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M790 94 C790 300 135 300 135 95"/><text class="muted" x="420" y="318" text-anchor="middle">denied/invalid branches return immediate error tool_result</text></g>
+<path class="line" d="M165 68 H225"/><path class="line" d="M355 68 H415"/><path class="line" d="M590 68 H650"/>
+<rect class="box box-accent" x="25" y="40" width="140" height="56"/><text x="95" y="66" text-anchor="middle">tool_use</text><text class="muted" x="95" y="84" text-anchor="middle">name + JSON args</text>
+<rect class="box" x="225" y="40" width="130" height="56"/><text x="290" y="66" text-anchor="middle">Validate</text><text class="muted" x="290" y="84" text-anchor="middle">required fields</text>
+<rect class="box box-warn" x="415" y="40" width="175" height="56"/><text x="502" y="66" text-anchor="middle">Classify</text><text class="muted" x="502" y="84" text-anchor="middle">Read / Write / Danger</text>
+<rect class="box" x="650" y="40" width="175" height="56"/><text x="737" y="66" text-anchor="middle">Preview</text><text class="muted" x="737" y="84" text-anchor="middle">direct file mutations</text>
+<path class="line" d="M737 96 V158"/>
+<path class="line" d="M655 186 H600"/><path class="line" d="M400 186 H345"/>
+<rect class="box box-danger" x="655" y="158" width="165" height="56"/><text x="737" y="184" text-anchor="middle">Permission</text><text class="muted" x="737" y="202" text-anchor="middle">profile + sandbox</text>
+<rect class="box box-green" x="400" y="158" width="200" height="56"/><text x="500" y="184" text-anchor="middle">Checkpoint</text><text class="muted" x="500" y="202" text-anchor="middle">write-risk call in a Git repo</text>
+<rect class="box box-accent" x="175" y="158" width="170" height="56"/><text x="260" y="184" text-anchor="middle">Execute</text><text class="muted" x="260" y="202" text-anchor="middle">native or subprocess</text>
+<path class="line" d="M260 214 V250"/>
+<rect class="box box-green" x="175" y="250" width="170" height="56"/><text x="260" y="276" text-anchor="middle">tool_result</text><text class="muted" x="260" y="294" text-anchor="middle">capped output</text>
+<path class="line" d="M737 214 V278 H345"/><text class="muted" x="545" y="270" text-anchor="middle">denied, invalid, or interrupted → error tool_result</text>
 </svg>
-<div class="diagram-notes"><div class="diagram-note"><strong>Parallelism:</strong> only all-read batches (<code>read_file</code>, <code>rg</code>, <code>git_diff</code>, etc.) parallelize.</div><div class="diagram-note"><strong>HTTP:</strong> GET/HEAD/OPTIONS are read; POST/PUT/PATCH/DELETE are danger.</div><div class="diagram-note"><strong>Auth guard:</strong> outputs are scanned for 401/403/invalid-key markers.</div></div>
+<div class="diagram-notes"><div class="diagram-note"><strong>Preview first:</strong> <code>write_file</code>, <code>edit_file</code>, and <code>multi_edit</code> render their diff before the approval prompt, and the approved executor reuses that same prepared mutation.</div><div class="diagram-note"><strong>Parallelism:</strong> only all-read batches (<code>read_file</code>, <code>rg</code>, <code>git_diff</code>, etc.) parallelize; checkpoints stay on the sequential dispatch boundary.</div><div class="diagram-note"><strong>HTTP:</strong> GET/HEAD/OPTIONS are read, POST/PUT/PATCH/DELETE are danger, and a nominal read carrying a body is danger too.</div><div class="diagram-note"><strong>Auth guard:</strong> outputs are scanned for 401/403/invalid-key markers.</div></div>
 </div>
 
 <div class="diagram-panel" id="checkpoint-sequence">
 <h4>Checkpoint Lifecycle — Git recovery before mutation</h4>
-<svg class="diagram-svg" viewBox="0 0 900 300" role="img" aria-label="Checkpoint lifecycle diagram">
+<svg class="diagram-svg" viewBox="0 0 900 240" role="img" aria-label="Checkpoint lifecycle diagram">
 <defs><marker id="arrow3" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="var(--dim)"/></marker></defs>
-<path class="line" style="marker-end:url(#arrow3)" d="M120 72 H260"/><path class="line" style="marker-end:url(#arrow3)" d="M380 72 H520"/><path class="line" style="marker-end:url(#arrow3)" d="M650 72 H775"/>
-<rect class="box box-warn" x="30" y="44" width="150" height="56"/><text x="105" y="66" text-anchor="middle">Approved mutation</text><text class="muted" x="105" y="84" text-anchor="middle">write/danger risk</text>
-<rect class="box" x="250" y="44" width="140" height="56"/><text x="320" y="66" text-anchor="middle">Resolve Git root</text><text class="muted" x="320" y="84" text-anchor="middle">cached per session</text>
-<rect class="box box-green" x="515" y="44" width="150" height="56"/><text x="590" y="66" text-anchor="middle">Create ref</text><text class="muted" x="590" y="84" text-anchor="middle">refs/dext/checkpoints</text>
-<rect class="box" x="745" y="44" width="130" height="56"/><text x="810" y="66" text-anchor="middle">Manifest</text><text class="muted" x="810" y="84" text-anchor="middle">64-entry cap</text>
-<path class="line" style="marker-end:url(#arrow3)" d="M590 100 V155 H410"/><rect class="box" x="265" y="128" width="170" height="56"/><text x="350" y="150" text-anchor="middle">Dirty snapshot</text><text class="muted" x="350" y="168" text-anchor="middle">git stash create</text>
-<path class="line" style="marker-end:url(#arrow3)" d="M435 156 H570"/><rect class="box" x="570" y="128" width="180" height="56"/><text x="660" y="150" text-anchor="middle">Untracked sidecars</text><text class="muted" x="660" y="168" text-anchor="middle">bounded + deduplicated</text>
-<path class="line" style="marker-end:url(#arrow3)" d="M660 184 V230 H455"/><rect class="box box-accent" x="320" y="204" width="160" height="56"/><text x="400" y="226" text-anchor="middle">Run mutation</text><text class="muted" x="400" y="244" text-anchor="middle">ref preserved</text>
+<path class="line" d="M185 68 H245"/><path class="line" d="M395 68 H455"/><path class="line" d="M605 68 H665"/>
+<rect class="box box-warn" x="25" y="40" width="160" height="56"/><text x="105" y="66" text-anchor="middle">Approved mutation</text><text class="muted" x="105" y="84" text-anchor="middle">write or danger risk</text>
+<rect class="box" x="245" y="40" width="150" height="56"/><text x="320" y="66" text-anchor="middle">Resolve Git root</text><text class="muted" x="320" y="84" text-anchor="middle">cached per session</text>
+<rect class="box" x="455" y="40" width="150" height="56"/><text x="530" y="66" text-anchor="middle">Dirty snapshot</text><text class="muted" x="530" y="84" text-anchor="middle">git stash create</text>
+<rect class="box box-green" x="665" y="40" width="185" height="56"/><text x="757" y="66" text-anchor="middle">Create ref</text><text class="muted" x="757" y="84" text-anchor="middle">refs/dext/checkpoints</text>
+<path class="line" d="M757 96 V158"/>
+<path class="line" d="M620 186 H550"/><path class="line" d="M380 186 H300"/>
+<rect class="box" x="620" y="158" width="200" height="56"/><text x="720" y="184" text-anchor="middle">Untracked sidecars</text><text class="muted" x="720" y="202" text-anchor="middle">SHA-256 blobs, bounded</text>
+<rect class="box" x="380" y="158" width="170" height="56"/><text x="465" y="184" text-anchor="middle">Manifest</text><text class="muted" x="465" y="202" text-anchor="middle">append, then retention</text>
+<rect class="box box-accent" x="140" y="158" width="160" height="56"/><text x="220" y="184" text-anchor="middle">Run mutation</text><text class="muted" x="220" y="202" text-anchor="middle">ref preserved</text>
 </svg>
+<div class="diagram-notes"><div class="diagram-note"><strong>Retention:</strong> 20 checkpoints for seven days; runtime manifest reads are capped at 16 MiB.</div><div class="diagram-note"><strong>Capture bounds:</strong> arbitrary-command checkpoints inventory at most 500 untracked paths within 8 MiB per file and 32 MiB per checkpoint.</div><div class="diagram-note"><strong>Ordering:</strong> each call is checkpointed at its own sequential dispatch boundary, so later calls in a round include earlier mutations.</div></div>
 </div>
 
 <div class="diagram-panel" id="turn-loop-flowchart">
 <h4>Turn Loop Flowchart — branch points</h4>
-<svg class="diagram-svg" viewBox="0 0 860 360" role="img" aria-label="Turn loop flowchart">
+<svg class="diagram-svg" viewBox="0 0 860 390" role="img" aria-label="Turn loop flowchart">
 <defs><marker id="arrow4" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="var(--dim)"/></marker></defs>
 <rect class="box box-accent" x="335" y="20" width="190" height="44"/><text x="430" y="47" text-anchor="middle">Start turn</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M430 64 V95"/><rect class="box" x="315" y="95" width="230" height="50"/><text x="430" y="116" text-anchor="middle">Build runtime context</text><text class="muted" x="430" y="133" text-anchor="middle">prompt, tools, ledger, provider</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M430 145 V175"/><polygon points="430,175 545,225 430,275 315,225" fill="var(--warn-bg)" stroke="var(--orange)" stroke-width="1.4"/><text x="430" y="221" text-anchor="middle">Provider block?</text><text class="muted" x="430" y="240" text-anchor="middle">text or tool_use</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M315 225 H165"/><rect class="box box-green" x="45" y="200" width="120" height="50"/><text x="105" y="222" text-anchor="middle">Text</text><text class="muted" x="105" y="240" text-anchor="middle">append stream</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M545 225 H695"/><rect class="box box-warn" x="695" y="200" width="130" height="50"/><text x="760" y="222" text-anchor="middle">Tool</text><text class="muted" x="760" y="240" text-anchor="middle">policy + result</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M105 250 C105 320 360 320 390 286"/><path class="line" style="marker-end:url(#arrow4)" d="M760 250 C760 320 500 320 470 286"/><rect class="box" x="335" y="292" width="190" height="44"/><text x="430" y="319" text-anchor="middle">Persist / compact / idle</text>
+<path class="line" d="M430 64 V95"/><rect class="box" x="315" y="95" width="230" height="50"/><text x="430" y="116" text-anchor="middle">Build runtime context</text><text class="muted" x="430" y="133" text-anchor="middle">prompt, tools, ledger, provider</text>
+<path class="line" d="M430 145 V175"/><polygon points="430,175 545,225 430,275 315,225" fill="var(--warn-bg)" stroke="var(--orange)" stroke-width="1.4"/><text x="430" y="221" text-anchor="middle">Provider block?</text><text class="muted" x="430" y="240" text-anchor="middle">text or tool_use</text>
+<path class="line" d="M315 225 H165"/><rect class="box box-green" x="45" y="200" width="120" height="50"/><text x="105" y="222" text-anchor="middle">Text</text><text class="muted" x="105" y="240" text-anchor="middle">append stream</text>
+<path class="line" d="M545 225 H695"/><rect class="box box-warn" x="695" y="200" width="130" height="50"/><text x="760" y="222" text-anchor="middle">Tool</text><text class="muted" x="760" y="240" text-anchor="middle">policy + result</text>
+<path class="line" d="M105 250 V314 H335"/><path class="line" d="M760 250 V314 H525"/><rect class="box" x="335" y="292" width="190" height="44"/><text x="430" y="319" text-anchor="middle">Persist / compact / idle</text>
+<path class="line" d="M430 336 V370 H25 V42 H335"/><text class="muted" x="205" y="363" text-anchor="middle">loop until the final response</text>
 </svg>
+<div class="diagram-notes"><div class="diagram-note"><strong>Steering:</strong> queued input is injected between stream and tool cycles, never mid-mutation.</div><div class="diagram-note"><strong>Compaction:</strong> runs on the loop edge, after a safe checkpoint, when history approaches the model-aware budget.</div></div>
 </div>
 
 <div class="diagram-panel" id="checkpoint-flowchart">
@@ -588,12 +607,13 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <svg class="diagram-svg" viewBox="0 0 860 300" role="img" aria-label="Checkpoint restore flowchart">
 <defs><marker id="arrow5" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="var(--dim)"/></marker></defs>
 <rect class="box box-accent" x="35" y="55" width="150" height="54"/><text x="110" y="77" text-anchor="middle">/undo or CLI</text><text class="muted" x="110" y="95" text-anchor="middle">latest or id</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M185 82 H300"/><polygon points="360,45 450,82 360,119 270,82" fill="var(--warn-bg)" stroke="var(--orange)" stroke-width="1.4"/><text x="360" y="78" text-anchor="middle">mode?</text><text class="muted" x="360" y="96" text-anchor="middle">preview/apply/reset</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M360 119 V178 H225"/><rect class="box box-green" x="65" y="154" width="160" height="54"/><text x="145" y="176" text-anchor="middle">Preview</text><text class="muted" x="145" y="194" text-anchor="middle">stat + capped diff</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M450 82 H570"/><rect class="box box-warn" x="570" y="55" width="150" height="54"/><text x="645" y="77" text-anchor="middle">Worktree apply</text><text class="muted" x="645" y="95" text-anchor="middle">paths or whole tree</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M645 109 V160"/><rect class="box" x="565" y="160" width="160" height="54"/><text x="645" y="182" text-anchor="middle">Restore sidecars</text><text class="muted" x="645" y="200" text-anchor="middle">untracked copies</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M450 82 C520 25 670 25 760 55"/><rect class="box box-danger" x="720" y="55" width="120" height="54"/><text x="780" y="77" text-anchor="middle">ResetHead</text><text class="muted" x="780" y="95" text-anchor="middle">git reset --hard</text>
+<path class="line" d="M185 82 H270"/><polygon points="360,45 450,82 360,119 270,82" fill="var(--warn-bg)" stroke="var(--orange)" stroke-width="1.4"/><text x="360" y="78" text-anchor="middle">mode?</text><text class="muted" x="360" y="96" text-anchor="middle">preview/apply/reset</text>
+<path class="line" d="M360 119 V178 H225"/><rect class="box box-green" x="65" y="154" width="160" height="54"/><text x="145" y="176" text-anchor="middle">Preview</text><text class="muted" x="145" y="194" text-anchor="middle">stat + capped diff</text>
+<path class="line" d="M450 82 H570"/><rect class="box box-warn" x="570" y="55" width="150" height="54"/><text x="645" y="77" text-anchor="middle">Worktree apply</text><text class="muted" x="645" y="95" text-anchor="middle">paths or whole tree</text>
+<path class="line" d="M645 109 V160"/><rect class="box" x="565" y="160" width="160" height="54"/><text x="645" y="182" text-anchor="middle">Restore sidecars</text><text class="muted" x="645" y="200" text-anchor="middle">untracked copies</text>
+<path class="line" d="M450 82 C520 25 690 25 792 55"/><rect class="box box-danger" x="735" y="55" width="115" height="54"/><text x="792" y="77" text-anchor="middle">ResetHead</text><text class="muted" x="792" y="95" text-anchor="middle">git reset --hard</text>
 </svg>
+<div class="diagram-notes"><div class="diagram-note"><strong>Default is safe:</strong> a normal restore updates worktree paths only; moving <code>HEAD</code> requires the explicit reset-head mode.</div><div class="diagram-note"><strong>Verified content:</strong> blobs are rehashed before and during restore, and the checkpoint ref is retained either way.</div></div>
 </div>
 
 <h3>Key Enums and Structs</h3>
@@ -606,12 +626,12 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>SandboxProfile</code></td><td>main.rs</td><td>ReadOnly, WorkspaceWrite, DangerFullAccess</td></tr>
 <tr><td><code>ContextMode</code></td><td>main.rs</td><td>Standard, Frugal, Tiny — context window management</td></tr>
 <tr><td><code>MutationPreviewMode</code></td><td>main.rs</td><td>Off, Simple, Git — diff preview before mutations</td></tr>
-<tr><td><code>Usage</code></td><td>main.rs</td><td>Token tracking: input, output, cache_create, cache_read</td></tr>
-<tr><td><code>BudgetCap</code></td><td>main.rs</td><td>Session budget limits in USD or tokens</td></tr>
+<tr><td><code>Usage</code></td><td>usage.rs</td><td>Token tracking: input, output, cache_create, cache_read</td></tr>
+<tr><td><code>BudgetCap</code></td><td>usage.rs</td><td>Session budget limits in USD or tokens</td></tr>
 <tr><td><code>WorkLedger</code></td><td>main.rs</td><td>Objective, phase, decisions, pending/done/blocked items</td></tr>
 <tr><td><code>SessionHeader</code></td><td>main.rs</td><td>Persisted session metadata with full provenance</td></tr>
 <tr><td><code>Message / Block</code></td><td>main.rs</td><td>Conversation history: Text, Thinking, ToolUse, ToolResult</td></tr>
-<tr><td><code>AgentEvent</code></td><td>main.rs</td><td>Event stream: TurnStart, TextDelta, ToolCallResult, etc.</td></tr>
+<tr><td><code>AgentEvent</code></td><td>events.rs</td><td>Event stream: TurnStart, TextDelta, ToolCallResult, etc.</td></tr>
 </table>
 
 <section class="collapsible-section">
@@ -621,10 +641,10 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Agent Loop</h3>
 <p>The central <code>Agent</code> struct drives a turn-based loop:</p>
 <ol>
-<li><strong>Prompt composition</strong> — Builds the system prompt from <code>DEXT.md</code>, project context, tool catalog, session header, work ledger, shelf abilities, and recall cache.</li>
+<li><strong>Prompt composition</strong> — Builds the system prompt from <code>DEXT.md</code>, project context, tool catalog, session header, work ledger, shelf abilities, and recall cache. Composition splits into a cached stable block and a volatile environment tail that rides after the cache breakpoint. Turn-stable sections — project guidance, recall, and the pack and shelf registry summaries — stay in the cached block; mutation-capable tool rounds and approved hooks invalidate pack discovery before the next request. Only per-round state (work ledger, context state, provider health, todos, shelf context) is re-sent at full input rate. Per-mode caps for the tail come from one table, so <code>tiny</code>, <code>frugal</code>, and full modes differ only in caps and hint wording.</li>
 <li><strong>History management</strong> — Maintains a <code>Vec&lt;Message&gt;</code> with automatic compaction when context pressure exceeds configurable thresholds (default: 90% at end-turn, 80% after safe tool-result checkpoints).</li>
 <li><strong>Provider dispatch</strong> — Sends streaming requests to the active provider. Applies connect, first-byte, and between-chunk idle deadlines, then parses bounded SSE frames into <code>Block</code> variants.</li>
-<li><strong>Tool execution</strong> — Dispatches <code>tool_use</code> blocks to native Rust implementations. Supports parallel execution for read-only tools.</li>
+<li><strong>Tool execution</strong> — Dispatches <code>tool_use</code> blocks to native Rust implementations. Supports parallel execution for read-only tools. The round waiter observes interrupts independently of task completion, aborts in-flight tasks, and prevents a call that wins its concurrency permit after the interrupt from starting; every abandoned <code>tool_use</code> id still returns a matching interrupted result.</li>
 <li><strong>Permission gating</strong> — Routes tool calls through <code>EventSink::request_permission()</code> based on the active <code>ApprovalProfile</code> and tool risk classification.</li>
 <li><strong>Steering</strong> — Active-turn user input is routed to a steering channel, injected at safe boundaries.</li>
 </ol>
@@ -840,8 +860,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <ol>
 <li><strong>Create</strong> — Immediately before each sequential tool dispatch, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;-&lt;random-nonce&gt;</code>; a later call in one round therefore captures state produced by earlier calls</li>
 <li><strong>Dirty state capture</strong> — If the worktree is dirty, <code>git stash create</code> captures a snapshot without touching the working tree or reflog</li>
-<li><strong>Untracked sidecars</strong> — Direct file tools preserve an untracked target. Write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> checkpoints inventory up to 500 existing untracked paths, preserve regular files within 8 MiB/file and 32 MiB total bounds, and preserve bounded UTF-8 symlink targets without following them. Non-UTF-8 names, unsupported types, and path/type/size bounds are explicit partial-recovery gaps. Checkpoint storage containers must be real directories; on Unix they must be current-user-owned, <code>.dext</code> must not be group/world-writable, and managed checkpoint, sidecar, and blob directories are owner-private. Locked Unix mutations may repair modes only on current-user-owned managed directories; inspection does not repair them, restore rejects unsafe sidecar/blob containers, and pruning retains unsafe artifact directory trees with bounded warnings while unlinking only an orphan top-level sidecar symlink without following it. Regular-file content is stored in owner-private SHA-256-addressed blobs shared by retained checkpoints; unchanged source paths reuse the session cache only while source and blob metadata fingerprints remain stable, preview/restore rehash blobs before trusting them, and prune or failed checkpoint creation removes valid unreferenced/new blobs. Malformed or unsafe blob entries and sidecar directory trees remain untouched and produce bounded warnings without stopping other retention cleanup; an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked without following it. Owner execute state is descriptor metadata. Current manifests record exact direct-sidecar membership; older manifests without that field fail conservatively before mutation when a missing artifact is ambiguous rather than deleting current path content. A recovery gap triggers separate repository/session-scoped approval: denial blocks the command, while approval preserves tracked/staged state and the bounded subset. Other checkpoint failures remain fail-closed. Repositories without an initial commit still block writes that would overwrite existing state. A workspace with no <code>.git</code> marker is non-Git unless ambient <code>GIT_DIR</code>/<code>GIT_WORK_TREE</code>/<code>GIT_COMMON_DIR</code> routing exists; routed-without-marker and malformed-marker cases fail loudly because Dext-owned Git commands scrub routing variables.</li>
-<li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude. Dext accepts its bounded pre-JSON 8/9-field rows during upgrades and preserves each retained row's original field count. Pre-JSON direct hints keep their historical single-path/comma semantics: absolute hints must resolve inside the repository, while relative hints require one exact historical sidecar match or preview/apply fails closed. Untracked preview entries with unsafe host-native targets are omitted; malformed or partly current JSON rows remain fail-closed. Runtime manifest reads are capped at 16 MiB, and normal retention compacts legacy rows away.</li>
+<li><strong>Untracked sidecars</strong> — Direct file tools preserve an untracked target. Write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> checkpoints inventory up to 500 existing untracked paths, preserve regular files within 8 MiB/file and 32 MiB total bounds, and preserve bounded UTF-8 symlink targets without following them. Non-UTF-8 names, unsupported types, and path/type/size bounds are explicit partial-recovery gaps. Checkpoint storage containers must be real directories; on Unix they must be current-user-owned, <code>.dext</code> must not be group/world-writable, and managed checkpoint, sidecar, and blob directories are owner-private. Locked Unix mutations may repair modes only on current-user-owned managed directories; inspection does not repair them, restore rejects unsafe sidecar/blob containers, and pruning retains unsafe artifact directory trees with bounded warnings while unlinking only an orphan top-level sidecar symlink without following it. Regular-file content is stored in owner-private SHA-256-addressed blobs shared by retained checkpoints; unchanged source paths reuse the session cache only while source and blob metadata fingerprints remain stable, preview/restore rehash blobs before trusting them, and prune or failed checkpoint creation removes valid unreferenced/new blobs. Malformed or unsafe blob entries and sidecar directory trees remain untouched and produce bounded warnings without stopping other retention cleanup; an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked without following it. Owner execute state is descriptor metadata. Manifest rows carry 11 or 12 tab-separated fields; the retired pre-JSON 8/9-field encodings are no longer parsed, so every path in a manifest is validated by one repo-relative rule with no weaker alternative a row can select. Current 12-field manifests record exact direct-sidecar membership; 11-field manifests without that field fail conservatively before mutation when a missing artifact is ambiguous rather than deleting current path content. A recognized retired row — identified only by an intact checkpoint header — is skipped with a warning so one stale row cannot disable <code>/undo</code> or block write-risk tools. Its recorded OID must match any live checkpoint ref; normal retention removes an integrity-matched retired ref when compacting the row, while mismatches and other corrupt or tampered rows fail the manifest closed. A recovery gap triggers separate repository/session-scoped approval: denial blocks the command, while approval preserves tracked/staged state and the bounded subset. Other checkpoint failures remain fail-closed. Repositories without an initial commit still block writes that would overwrite existing state. A workspace with no <code>.git</code> marker is non-Git unless ambient <code>GIT_DIR</code>/<code>GIT_WORK_TREE</code>/<code>GIT_COMMON_DIR</code> routing exists; routed-without-marker and malformed-marker cases fail loudly because Dext-owned Git commands scrub routing variables.</li>
+<li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude. Rows are tab-separated with 11 or 12 fields; a 12-field row adds the exact direct-sidecar membership index. Untracked preview entries with unsafe host-native targets are omitted, and a malformed field fails its row closed rather than degrading it. Runtime manifest reads are capped at 16 MiB, and normal retention compacts recognized retired rows while removing their integrity-matched live refs.</li>
 </ol>
 <h3>Restore Modes</h3>
 <table>
@@ -898,7 +918,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li><strong>Feasibility guard</strong> — Requires single-item probes before bulk external collection</li>
 </ul>
 <h3>Objective Tracker</h3>
-<p>Parses user prompts to extract checkpoints (plan, analyze, implement, verify, document). Tracks satisfaction by examining tool usage patterns, bash commands, and assistant text.</p>
+<p>Parses user prompts to extract checkpoints (plan, analyze, implement, verify, document). Exact verification keywords avoid turning descriptive morphology such as <code>verifiable</code> into new work. Satisfaction is refreshed after every tool round and is derived from tool usage, bash commands, and explicit completion reports such as “checks pass,” so the next model request does not receive a stale <code>[unresolved]</code> checkpoint after custom checks pass.</p>
 <h3>Adaptive Caps</h3>
 <p>Tool UI content and result caps scale down dynamically based on context pressure: ≥90% → 25%, ≥75% → 50%, ≥60% → 75% of default. This preserves critical evidence near context limits while reducing prompt bloat.</p>
 </div>

@@ -4768,7 +4768,7 @@ mod tests {
 
     #[test]
     fn kimi_device_id_is_stable_uuid_and_ascii_headers_are_safe() -> Result<()> {
-        let _guard = crate::test_env_lock().lock().expect("env lock");
+        let _guard = crate::test_env_lock();
         let home = temp_home("device-id");
         let old_home = std::env::var_os("DEXT_HOME");
         unsafe { std::env::set_var("DEXT_HOME", &home) };

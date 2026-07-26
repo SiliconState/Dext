@@ -1,1 +1,1 @@
-fixture-sidecar	refs/dext/checkpoints/session/fixture-sidecar	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	write_file	1	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	true	["note.txt"]	[]
+fixture-sidecar	refs/dext/checkpoints/session/fixture-sidecar	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	write_file	1	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	true	["note.txt"]	[]	[]	null	["note.txt"]

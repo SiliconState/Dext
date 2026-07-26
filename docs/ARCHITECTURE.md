@@ -20,12 +20,14 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Slash commands.
   - Built-in tool implementations.
   - Eval harness.
-  - Prompt/context assembly, compaction, and event emission.
+  - Prompt/context assembly and compaction; turn-stable guidance/pack/shelf prompt sections are cached separately from the volatile per-round environment tail.
+  - Event emission through the sinks it owns.
 
 - `src/git_checkpoints.rs`
   - Git repository discovery for recovery snapshots.
   - Hidden checkpoint refs under `refs/dext/checkpoints/`.
   - Local checkpoint manifests and untracked-file sidecars under `.dext/checkpoints/`.
+  - Strict current-row parsing plus integrity-checked retirement of recognized pre-JSON rows and their matched refs.
   - Undo list/preview/apply/prune helpers used by `/undo` and `dext undo`.
 
 - `src/mutation_preview.rs`
@@ -54,6 +56,8 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `src/tool_round.rs`
   - Tool-call planning, approval inputs, checkpoint/journal boundaries, dispatch, and result normalization.
+  - Interrupt-aware parallel read execution that returns one result for every provider tool-call ID even when queued tasks are aborted.
+  - Post-mutation invalidation of cached pack discovery before the next provider request.
   - Narrow runtime context supplied by `Agent`, which remains the facade.
 
 - `src/tool_journal.rs`
@@ -96,6 +100,24 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - `ShelfManifest`, `PackManifest`, and provider-neutral ability metadata.
   - Scope-precedence resolution and bounded context injection for manifest-only shelves.
   - In-process shelf implementations can participate in the typed signal/effect loop; filesystem manifests do not register executable tools, commands, or arbitrary effect handlers.
+
+- `src/privacy.rs`
+  - Privacy policy, sensitive-path denial, and secret/PII redaction for anything that may leave the machine.
+
+- `src/usage.rs`
+  - Per-provider token-usage normalization into disjoint input buckets, per-model pricing, and the spend/token budget cap.
+
+- `src/events.rs`
+  - The `AgentEvent` stream and the `EventSink` trait each front end implements. The sinks themselves stay with the console I/O layer in `main.rs`.
+
+- `src/crash.rs`
+  - Panic hook, redacted owner-only crash snapshots, and the bounded event breadcrumb trail they record.
+
+- `src/process_tree.rs`
+  - Child session/process-group detachment and whole-tree teardown after exit, timeout, or interrupt.
+
+- `src/secret_redactor.rs`
+  - Streaming credential scrubbing for child-process output, holding back only enough tail bytes to catch a pattern split across reads.
 
 - `vendor/ratatui-core/`
   - Exact upstream `ratatui-core 0.1.2` source selected through `[patch.crates-io]`.

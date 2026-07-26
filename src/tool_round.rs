@@ -401,66 +401,127 @@ impl Agent {
         let mut builtin_outputs: HashMap<usize, std::result::Result<String, String>> =
             HashMap::new();
         if parallel_builtin_round {
-            let builtin_handles: Vec<(
+            let mut builtin_tasks: tokio::task::JoinSet<(
                 usize,
-                tokio::task::JoinHandle<std::result::Result<String, String>>,
-            )> = builtin_indices
-                .iter()
-                .map(|idx| {
-                    let root = self.sandbox_root.clone();
-                    let n = plans[*idx].name.clone();
-                    let inp = plans[*idx].input.clone();
-                    let summary = plans[*idx].summary.clone();
-                    self.sink.emit(AgentEvent::ToolCallStart {
-                        call_id: plans[*idx].event_call_id.clone(),
-                        name: n.clone(),
-                        summary: summary.clone(),
-                    });
-                    self.append_latest_log("tool_start", &summary);
-                    builtin_started_at.insert(*idx, std::time::Instant::now());
-                    let interrupt = self.interrupt.clone();
-                    let sem = self.builtin_semaphore.clone();
-                    let read_cache = read_cache.clone();
-                    let session_id = self.session_id.clone();
-                    let sandbox_profile = self.sandbox_profile;
-                    let pack_env = self.pack_hook_env.clone();
-                    let git_credential =
-                        stored_git_credential_for_bash_call(&n, &inp, self.git_credential.as_ref());
-                    if git_credential.is_some() {
-                        builtin_git_cred_used.insert(*idx);
-                    }
-                    let handle = tokio::spawn(async move {
-                        let _permit = match sem.acquire_owned().await {
-                            Ok(p) => p,
-                            Err(e) => return Err(format!("builtin semaphore closed: {e}")),
-                        };
-                        execute_builtin_call(
-                            n,
-                            inp,
-                            root,
-                            interrupt,
-                            Some(read_cache),
-                            Some(session_id),
-                            None,
-                            git_credential,
-                            None,
-                            sandbox_profile,
-                            hooks_approved,
-                            None,
-                            pack_env,
-                        )
-                        .await
-                    });
-                    (*idx, handle)
-                })
-                .collect();
+                std::result::Result<String, String>,
+            )> = tokio::task::JoinSet::new();
+            let mut pending: HashSet<usize> = builtin_indices.iter().copied().collect();
+            for idx in builtin_indices.iter().copied() {
+                let root = self.sandbox_root.clone();
+                let n = plans[idx].name.clone();
+                let inp = plans[idx].input.clone();
+                let summary = plans[idx].summary.clone();
+                self.sink.emit(AgentEvent::ToolCallStart {
+                    call_id: plans[idx].event_call_id.clone(),
+                    name: n.clone(),
+                    summary: summary.clone(),
+                });
+                self.append_latest_log("tool_start", &summary);
+                builtin_started_at.insert(idx, std::time::Instant::now());
+                let interrupt = self.interrupt.clone();
+                let sem = self.builtin_semaphore.clone();
+                let read_cache = read_cache.clone();
+                let session_id = self.session_id.clone();
+                let sandbox_profile = self.sandbox_profile;
+                let pack_env = self.pack_hook_env.clone();
+                let git_credential =
+                    stored_git_credential_for_bash_call(&n, &inp, self.git_credential.as_ref());
+                if git_credential.is_some() {
+                    builtin_git_cred_used.insert(idx);
+                }
+                builtin_tasks.spawn(async move {
+                    let _permit = match sem.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(e) => return (idx, Err(format!("builtin semaphore closed: {e}"))),
+                    };
+                    // The permit can be granted long after an interrupt
+                    // arrived; `execute_builtin_call` re-reads the flag before
+                    // it does anything, so a queued call short-circuits here
+                    // rather than starting work the user already cancelled.
+                    let outcome = execute_builtin_call(
+                        n,
+                        inp,
+                        root,
+                        interrupt,
+                        Some(read_cache),
+                        Some(session_id),
+                        None,
+                        git_credential,
+                        None,
+                        sandbox_profile,
+                        hooks_approved,
+                        None,
+                        pack_env,
+                    )
+                    .await;
+                    (idx, outcome)
+                });
+            }
 
-            for (idx, handle) in builtin_handles {
-                let r = match handle.await {
-                    Ok(v) => v,
-                    Err(e) => Err(format!("task panic: {e}")),
+            let mut task_panic: Option<String> = None;
+            while !builtin_tasks.is_empty() {
+                let next = tokio::select! {
+                    joined = builtin_tasks.join_next() => Some(joined),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => None,
                 };
-                builtin_outputs.insert(idx, r);
+                match next {
+                    Some(Some(Ok((idx, outcome)))) => {
+                        pending.remove(&idx);
+                        builtin_outputs.insert(idx, outcome);
+                    }
+                    // A JoinError carries no index, so the backfill below is
+                    // what keeps every call paired with a result.
+                    Some(Some(Err(e))) if !e.is_cancelled() => {
+                        let message = format!("task panic: {e}");
+                        self.append_latest_log("tool_task_panic", &message);
+                        task_panic = Some(message);
+                    }
+                    Some(Some(Err(_))) => {}
+                    Some(None) => break,
+                    None if !self.interrupt.load(Ordering::SeqCst) => continue,
+                    None => {
+                        builtin_tasks.abort_all();
+                        break;
+                    }
+                }
+                if self.interrupt.load(Ordering::SeqCst) {
+                    builtin_tasks.abort_all();
+                    break;
+                }
+            }
+            if self.interrupt.load(Ordering::SeqCst) {
+                builtin_tasks.abort_all();
+                // Calls that already finished did real work; keep their
+                // results instead of reporting them as abandoned. This
+                // never blocks: it takes only what is already complete.
+                while let Some(joined) = builtin_tasks.try_join_next() {
+                    if let Ok((idx, outcome)) = joined {
+                        pending.remove(&idx);
+                        builtin_outputs.insert(idx, outcome);
+                    }
+                }
+            }
+            drop(builtin_tasks);
+
+            // Every tool_use id must receive a matching tool_result block, so
+            // calls abandoned by an interrupt or a panicked task still get an
+            // explicit outcome rather than silently going missing.
+            if !pending.is_empty() {
+                let interrupted = self.interrupt.load(Ordering::SeqCst);
+                if interrupted {
+                    self.append_latest_log("tool_round_interrupted", "during tool execution");
+                }
+                for idx in std::mem::take(&mut pending) {
+                    let name = &plans[idx].name;
+                    let message = if interrupted {
+                        format!("{name} did not complete: interrupted by user")
+                    } else if let Some(panic) = task_panic.as_deref() {
+                        format!("{name} did not produce a result: {panic}")
+                    } else {
+                        format!("{name} did not produce a result: the tool task ended unexpectedly")
+                    };
+                    builtin_outputs.insert(idx, Err(message));
+                }
             }
         } else {
             for idx in builtin_indices {
@@ -634,6 +695,7 @@ impl Agent {
         let mut results = Vec::new();
         let mut round_external_failures: usize = 0;
         let mut mutation_succeeded = false;
+        let mut extension_state_may_have_changed = hooks_approved && !self.hooks.is_empty();
         for (idx, p) in plans.into_iter().enumerate() {
             let PlannedCall {
                 tool_use_id,
@@ -713,6 +775,22 @@ impl Agent {
             }
 
             let ok = !is_error.unwrap_or(false);
+            if ran_builtin
+                && matches!(
+                    name.as_str(),
+                    "write_file"
+                        | "edit_file"
+                        | "multi_edit"
+                        | "bash"
+                        | "awk"
+                        | "csvkit"
+                        | "git_commit"
+                )
+            {
+                // Even a failed process may have changed extension files before
+                // reporting its error.
+                extension_state_may_have_changed = true;
+            }
             if ok
                 && ran_builtin
                 && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
@@ -921,6 +999,17 @@ impl Agent {
             anyhow::bail!(
                 "side-effect outcome recovery is unresolved; inspect the tool journal before retrying: {detail}"
             );
+        }
+
+        if extension_state_may_have_changed {
+            // Pack discovery and the typed shelf registry are cached across
+            // provider requests in one turn. Tools and approved hooks can
+            // create, remove, or edit PACK.md/shelf.json even when their
+            // eventual outcome is an error.
+            self.shelf_registry = shelves::ShelfRegistry::discover(&self.sandbox_root);
+            if let Ok(mut cache) = self.prompt_scan_cache.lock() {
+                *cache = None;
+            }
         }
 
         Ok(ToolRoundOutcome {

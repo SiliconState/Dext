@@ -43,13 +43,6 @@ impl UntrackedSidecar {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CheckpointManifestEncoding {
-    Current,
-    PreJsonEightFields,
-    PreJsonNineFields,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct Checkpoint {
     pub id: String,
@@ -64,8 +57,11 @@ pub(crate) struct Checkpoint {
     /// taken. Arbitrary-command checkpoints also preserve bounded regular-file
     /// content for these paths in the checkpoint sidecar.
     pub untracked_snapshot: Vec<String>,
-    pub manifest_encoding: CheckpointManifestEncoding,
-    pub legacy_sidecar_paths: Option<Vec<String>>,
+    /// Exact membership index of the sidecars a direct file tool preserved for
+    /// this checkpoint. `None` marks a manifest row written before the field
+    /// existed, where a missing sidecar is ambiguous and restore must fail
+    /// conservatively rather than delete current path content.
+    pub direct_sidecar_paths: Option<Vec<String>>,
     pub untracked_sidecars: Vec<UntrackedSidecar>,
     pub untracked_capture_warning: Option<String>,
 }
@@ -1449,117 +1445,16 @@ fn manifest_repo_relative_path(root: &Path, git_root: &Path, path: &str) -> Opti
     }
 }
 
-fn legacy_hint_candidate(path: &Path, hint: &Path) -> Option<PathBuf> {
-    let path_components = path
-        .components()
-        .map(|component| match component {
-            Component::Normal(name) => Some(name),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let hint_components = hint
-        .components()
-        .map(|component| match component {
-            Component::Normal(name) => Some(name),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    (!hint_components.is_empty() && path_components.ends_with(&hint_components))
-        .then(|| path_components.iter().collect())
-}
-
-fn legacy_checkpoint_sidecar_paths(
-    git_root: &Path,
-    cp: &Checkpoint,
-) -> Result<std::collections::BTreeSet<PathBuf>, String> {
-    let mut paths = std::collections::BTreeSet::new();
-    if !cp.includes_untracked_sidecar {
-        return Ok(paths);
-    }
-
-    let sdir = sidecar_dir(git_root, &cp.id);
-    match std::fs::symlink_metadata(&sdir) {
-        Ok(metadata) if safe_private_dir_metadata(&metadata) => {
-            for entry in walk_dir(&sdir)? {
-                let relative = entry
-                    .strip_prefix(&sdir)
-                    .map_err(|_| "checkpoint sidecar escapes its storage directory".to_string())?;
-                paths.insert(relative.to_path_buf());
-            }
-        }
-        Ok(_) => return Err("checkpoint sidecar directory is not owner-private".to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("checkpoint sidecar metadata: {error}")),
-    }
-    Ok(paths)
-}
-
-fn checkpoint_hint_repo_relative_path(
-    root: &Path,
-    git_root: &Path,
-    cp: &Checkpoint,
-    path: &str,
-    legacy_sidecar_paths: Option<&std::collections::BTreeSet<PathBuf>>,
-) -> Result<PathBuf, String> {
-    let unsafe_path = || format!("unsafe checkpoint path: {path}");
-    if cp.manifest_encoding == CheckpointManifestEncoding::Current {
-        return manifest_repo_relative_path(root, git_root, path).ok_or_else(unsafe_path);
-    }
-    if Path::new(path).is_absolute() {
-        return resolve_user_repo_path(root, git_root, path).ok_or_else(unsafe_path);
-    }
-
-    let hint = PathBuf::from(path);
-    let legacy_sidecar_paths = legacy_sidecar_paths
-        .ok_or_else(|| "legacy checkpoint sidecar path index is unavailable".to_string())?;
-    if let Some(active_relative) = resolve_user_repo_path(root, git_root, path)
-        && legacy_sidecar_paths.contains(&active_relative)
-    {
-        return Ok(active_relative);
-    }
-    let mut candidates = legacy_sidecar_paths
-        .iter()
-        .filter_map(|source| legacy_hint_candidate(source, &hint))
-        .collect::<std::collections::BTreeSet<_>>();
-    if candidates.len() == 1 {
-        return candidates
-            .pop_first()
-            .ok_or_else(|| "legacy checkpoint candidate disappeared".to_string());
-    }
-    if candidates.is_empty() {
-        Err(format!(
-            "pre-JSON checkpoint relative path has no sidecar-backed exact target: {path}"
-        ))
-    } else {
-        Err(format!(
-            "ambiguous pre-JSON checkpoint path matches multiple prior targets: {path}"
-        ))
-    }
-}
-
 fn checkpoint_restore_paths(
     root: &Path,
     git_root: &Path,
     cp: &Checkpoint,
 ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let needs_legacy_sidecar_index = cp.manifest_encoding != CheckpointManifestEncoding::Current
-        && cp
-            .paths_hint
-            .iter()
-            .any(|path| !Path::new(path).is_absolute());
-    let legacy_sidecar_paths = needs_legacy_sidecar_index
-        .then(|| legacy_checkpoint_sidecar_paths(git_root, cp))
-        .transpose()?;
     cp.paths_hint
         .iter()
         .map(|path| {
-            let relative = checkpoint_hint_repo_relative_path(
-                root,
-                git_root,
-                cp,
-                path,
-                legacy_sidecar_paths.as_ref(),
-            )?;
+            let relative = manifest_repo_relative_path(root, git_root, path)
+                .ok_or_else(|| format!("unsafe checkpoint path: {path}"))?;
             let target = safe_worktree_target(git_root, &relative)?;
             Ok((relative, target))
         })
@@ -1786,7 +1681,7 @@ pub(crate) fn create_checkpoint_in_repo(
     create_checkpoint_ref(git_root, &ref_name, &oid)?;
 
     let mut includes_untracked_sidecar = false;
-    let mut legacy_sidecar_paths = Vec::new();
+    let mut direct_sidecar_paths = Vec::new();
     if file_tools.contains(&tool) {
         for (rel, rel_string) in normalized_paths.iter().zip(&normalized_path_strings) {
             let abs = git_root.join(rel);
@@ -1808,7 +1703,7 @@ pub(crate) fn create_checkpoint_in_repo(
                     ));
                 }
                 includes_untracked_sidecar = true;
-                legacy_sidecar_paths.push(rel_string.clone());
+                direct_sidecar_paths.push(rel_string.clone());
             }
         }
     }
@@ -1845,8 +1740,7 @@ pub(crate) fn create_checkpoint_in_repo(
         paths_hint: normalized_path_strings,
         includes_untracked_sidecar,
         untracked_snapshot,
-        manifest_encoding: CheckpointManifestEncoding::Current,
-        legacy_sidecar_paths: Some(legacy_sidecar_paths),
+        direct_sidecar_paths: Some(direct_sidecar_paths),
         untracked_sidecars,
         untracked_capture_warning,
     };
@@ -1871,6 +1765,12 @@ pub(crate) fn create_checkpoint_in_repo(
 
 fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
     ensure_checkpoint_storage(git_root)?;
+    // Validate every existing row against the live ref namespace before adding a
+    // new recovery point. The caller has already created `cp.ref_name`, but an
+    // unmanifested ref is ignored here and removed by the caller if validation
+    // fails. This keeps an OID-tampered old row from degrading into a retention
+    // warning while a new write-risk tool is allowed to proceed.
+    let _ = list_checkpoints_in_repo(git_root, usize::MAX, false, None)?;
     let dir = checkpoints_manifest_dir(git_root);
     let manifest_path = dir.join("manifest.txt");
     let mut content = match std::fs::symlink_metadata(&manifest_path) {
@@ -1894,14 +1794,23 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        let existing =
-            parse_manifest_line(line.strip_suffix('\r').unwrap_or(line)).ok_or_else(|| {
-                format!(
-                    "invalid checkpoint manifest entry at line {}",
-                    line_index + 1
-                )
-            })?;
-        if !ids.insert(existing.id) || !refs.insert(existing.ref_name) {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // A row from a retired encoding is kept verbatim by this append, so it
+        // must not block a new checkpoint; its identity still participates in
+        // the uniqueness check.
+        let (id, ref_name) = match parse_manifest_line(line) {
+            Some(existing) => (existing.id, existing.ref_name),
+            None => {
+                let retired = retired_manifest_row(line).ok_or_else(|| {
+                    format!(
+                        "invalid checkpoint manifest entry at line {}",
+                        line_index + 1
+                    )
+                })?;
+                (retired.id.to_string(), retired.ref_name.to_string())
+            }
+        };
+        if !ids.insert(id) || !refs.insert(ref_name) {
             return Err(format!(
                 "duplicate checkpoint metadata in manifest at line {}",
                 line_index + 1
@@ -1923,33 +1832,6 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
 }
 
 fn format_manifest_line(cp: &Checkpoint) -> String {
-    if cp.manifest_encoding == CheckpointManifestEncoding::PreJsonEightFields {
-        return format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            cp.id,
-            cp.ref_name,
-            cp.oid,
-            cp.tool_name,
-            cp.created_at_ms,
-            cp.head,
-            cp.includes_untracked_sidecar,
-            cp.paths_hint.join(","),
-        );
-    }
-    if cp.manifest_encoding == CheckpointManifestEncoding::PreJsonNineFields {
-        return format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            cp.id,
-            cp.ref_name,
-            cp.oid,
-            cp.tool_name,
-            cp.created_at_ms,
-            cp.head,
-            cp.includes_untracked_sidecar,
-            cp.paths_hint.join(","),
-            cp.untracked_snapshot.join("\u{1f}"),
-        );
-    }
     let paths = serde_json::to_string(&cp.paths_hint).unwrap_or_else(|_| "[]".to_string());
     let untracked =
         serde_json::to_string(&cp.untracked_snapshot).unwrap_or_else(|_| "[]".to_string());
@@ -1957,8 +1839,8 @@ fn format_manifest_line(cp: &Checkpoint) -> String {
         serde_json::to_string(&cp.untracked_sidecars).unwrap_or_else(|_| "[]".to_string());
     let warning =
         serde_json::to_string(&cp.untracked_capture_warning).unwrap_or_else(|_| "null".to_string());
-    let legacy_sidecars = cp
-        .legacy_sidecar_paths
+    let direct_sidecars = cp
+        .direct_sidecar_paths
         .as_ref()
         .map(|paths| serde_json::to_string(paths).unwrap_or_else(|_| "[]".to_string()));
     let mut line = format!(
@@ -1975,9 +1857,9 @@ fn format_manifest_line(cp: &Checkpoint) -> String {
         sidecars,
         warning,
     );
-    if let Some(legacy_sidecars) = legacy_sidecars {
+    if let Some(direct_sidecars) = direct_sidecars {
         line.push('\t');
-        line.push_str(&legacy_sidecars);
+        line.push_str(&direct_sidecars);
     }
     line
 }
@@ -2026,104 +1908,55 @@ fn valid_checkpoint_tool_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn safe_pre_json_manifest_path(path: &Path) -> bool {
-    if path.as_os_str().is_empty() || path.to_string_lossy().chars().any(char::is_control) {
-        return false;
-    }
-    let mut has_name = false;
-    for component in path.components() {
-        if let Component::Normal(name) = component {
-            if name.to_string_lossy().eq_ignore_ascii_case(".git") {
-                return false;
-            }
-            has_name = true;
-        }
-    }
-    has_name
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetiredManifestRow<'a> {
+    id: &'a str,
+    ref_name: &'a str,
+    oid: &'a str,
 }
 
-fn safe_pre_json_untracked_path(path: &Path) -> bool {
-    if path.as_os_str().is_empty() || path.to_string_lossy().chars().any(char::is_control) {
-        return false;
+/// Header metadata of a row written by a retired Dext manifest encoding (the
+/// 8- and 9-field pre-JSON forms). Recognition requires an intact checkpoint
+/// header, so genuine corruption or tampering still fails the manifest closed
+/// instead of being quietly skipped.
+fn retired_manifest_row(line: &str) -> Option<RetiredManifestRow<'_>> {
+    let parts: Vec<&str> = line.splitn(13, '\t').collect();
+    if !matches!(parts.len(), 8 | 9) {
+        return None;
     }
-    let mut has_name = false;
-    for component in path.components() {
-        let Component::Normal(name) = component else {
-            return false;
-        };
-        if name.to_string_lossy().eq_ignore_ascii_case(".git") {
-            return false;
-        }
-        has_name = true;
+    // A current row truncated to 8 or 9 fields would still carry an intact
+    // header, but its path-hint field is a JSON array and no pre-JSON writer
+    // emitted one. Rejecting those keeps truncation fatal rather than skippable.
+    if parts[7].trim_start().starts_with('[') {
+        return None;
     }
-    has_name
-}
-
-fn looks_like_json_array_field(value: &str) -> bool {
-    value.trim_start().starts_with('[')
+    (safe_checkpoint_id(parts[0])
+        && checkpoint_ref_valid(parts[1], parts[0])
+        && valid_object_id(parts[2])
+        && valid_checkpoint_tool_name(parts[3])
+        && parts[4].parse::<u128>().is_ok()
+        && valid_object_id(parts[5])
+        && matches!(parts[6], "true" | "false"))
+    .then_some(RetiredManifestRow {
+        id: parts[0],
+        ref_name: parts[1],
+        oid: parts[2],
+    })
 }
 
 fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
     let parts: Vec<&str> = line.splitn(13, '\t').collect();
-    if !matches!(parts.len(), 8 | 9 | 11 | 12) {
+    if !matches!(parts.len(), 11 | 12) {
         return None;
     }
-    let (paths_hint, untracked_snapshot, manifest_encoding) = match parts.len() {
-        8 => (
-            (!parts[7].is_empty())
-                .then(|| parts[7].to_string())
-                .into_iter()
-                .collect(),
-            Vec::new(),
-            CheckpointManifestEncoding::PreJsonEightFields,
-        ),
-        9 => {
-            let paths_json = serde_json::from_str::<Vec<String>>(parts[7]);
-            let untracked_json = serde_json::from_str::<Vec<String>>(parts[8]);
-            match (paths_json, untracked_json) {
-                (Ok(paths), Ok(untracked)) => {
-                    (paths, untracked, CheckpointManifestEncoding::Current)
-                }
-                (paths, untracked)
-                    if paths.is_ok()
-                        || untracked.is_ok()
-                        || looks_like_json_array_field(parts[7])
-                        || looks_like_json_array_field(parts[8]) =>
-                {
-                    return None;
-                }
-                _ => (
-                    (!parts[7].is_empty())
-                        .then(|| parts[7].to_string())
-                        .into_iter()
-                        .collect(),
-                    parts[8]
-                        .split('\u{1f}')
-                        .filter(|path| !path.is_empty())
-                        .map(String::from)
-                        .collect(),
-                    CheckpointManifestEncoding::PreJsonNineFields,
-                ),
-            }
-        }
-        11 | 12 => (
-            serde_json::from_str::<Vec<String>>(parts[7]).ok()?,
-            serde_json::from_str::<Vec<String>>(parts[8]).ok()?,
-            CheckpointManifestEncoding::Current,
-        ),
-        _ => return None,
-    };
-    let untracked_sidecars = if parts.len() >= 11 {
-        serde_json::from_str::<Vec<UntrackedSidecar>>(parts[9]).ok()?
-    } else {
-        Vec::new()
-    };
-    let untracked_capture_warning = if parts.len() >= 11 {
-        serde_json::from_str::<Option<String>>(parts[10]).ok()?
-    } else {
-        None
-    };
-    let legacy_sidecar_paths = if parts.len() == 12 {
+    let paths_hint = serde_json::from_str::<Vec<String>>(parts[7]).ok()?;
+    let untracked_snapshot = serde_json::from_str::<Vec<String>>(parts[8]).ok()?;
+    let untracked_sidecars = serde_json::from_str::<Vec<UntrackedSidecar>>(parts[9]).ok()?;
+    let untracked_capture_warning = serde_json::from_str::<Option<String>>(parts[10]).ok()?;
+    // Field 12 is the exact direct-sidecar membership index. Rows written
+    // before it existed parse as None, which makes restore fail closed on an
+    // ambiguous missing sidecar instead of guessing.
+    let direct_sidecar_paths = if parts.len() == 12 {
         Some(serde_json::from_str::<Vec<String>>(parts[11]).ok()?)
     } else {
         None
@@ -2132,28 +1965,18 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
     let ref_name = parts[1];
     let oid = parts[2];
     let head = parts[5];
-    let pre_json_manifest = manifest_encoding != CheckpointManifestEncoding::Current;
-    let valid_hint = |path: &String| {
-        safe_repo_relative_path(Path::new(path))
-            || (pre_json_manifest && safe_pre_json_manifest_path(Path::new(path)))
-    };
-    let valid_snapshot = |path: &String| {
-        safe_repo_relative_path(Path::new(path))
-            || (pre_json_manifest && safe_pre_json_untracked_path(Path::new(path)))
-    };
+    let safe_relative = |path: &String| safe_repo_relative_path(Path::new(path));
     if !safe_checkpoint_id(id)
         || !checkpoint_ref_valid(ref_name, id)
         || !valid_object_id(oid)
         || !valid_object_id(head)
         || !valid_checkpoint_tool_name(parts[3])
         || !matches!(parts[6], "true" | "false")
-        || !paths_hint.iter().all(valid_hint)
-        || !untracked_snapshot.iter().all(valid_snapshot)
-        || !legacy_sidecar_paths.as_deref().is_none_or(|paths| {
-            paths
-                .iter()
-                .all(|path| safe_repo_relative_path(Path::new(path)))
-        })
+        || !paths_hint.iter().all(safe_relative)
+        || !untracked_snapshot.iter().all(safe_relative)
+        || !direct_sidecar_paths
+            .as_deref()
+            .is_none_or(|paths| paths.iter().all(safe_relative))
         || !untracked_sidecars.iter().all(|sidecar| {
             safe_repo_relative_path(Path::new(sidecar.path()))
                 && match sidecar {
@@ -2182,8 +2005,7 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
         paths_hint,
         includes_untracked_sidecar: parts[6] == "true",
         untracked_snapshot,
-        manifest_encoding,
-        legacy_sidecar_paths,
+        direct_sidecar_paths,
         untracked_sidecars,
         untracked_capture_warning,
     };
@@ -2196,7 +2018,7 @@ fn list_checkpoints_in_repo(
     limit: usize,
     tolerate_missing_refs: bool,
     manifest_max_bytes: Option<u64>,
-) -> Result<Vec<Checkpoint>, String> {
+) -> Result<(Vec<Checkpoint>, Vec<String>), String> {
     let manifest_path = checkpoints_manifest_dir(git_root).join("manifest.txt");
     let content = match std::fs::symlink_metadata(&manifest_path) {
         Ok(metadata) if !safe_private_file_metadata(&metadata) => {
@@ -2245,17 +2067,52 @@ fn list_checkpoints_in_repo(
     let mut cps = Vec::new();
     let mut ids = std::collections::HashSet::new();
     let mut manifest_refs = std::collections::HashSet::new();
+    let mut unreadable: Vec<usize> = Vec::new();
+    let mut retired_refs = Vec::new();
     for (line_index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let checkpoint =
-            parse_manifest_line(line.strip_suffix('\r').unwrap_or(line)).ok_or_else(|| {
-                format!(
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let checkpoint = match parse_manifest_line(line) {
+            Some(checkpoint) => checkpoint,
+            // A row from a retired encoding is one this build also cannot
+            // restore from, so failing the whole listing would take out /undo
+            // and block every write-risk tool to protect a checkpoint that is
+            // already unusable. Skip it and say so. Anything else is corruption
+            // or tampering and still fails closed.
+            None => {
+                if let Some(retired) = retired_manifest_row(line) {
+                    if !ids.insert(retired.id.to_string()) {
+                        return Err(format!(
+                            "duplicate checkpoint id in manifest: {}",
+                            retired.id
+                        ));
+                    }
+                    if !manifest_refs.insert(retired.ref_name.to_string()) {
+                        return Err(format!(
+                            "duplicate checkpoint ref in manifest: {}",
+                            retired.ref_name
+                        ));
+                    }
+                    if let Some(ref_oid) = existing_refs.get(retired.ref_name) {
+                        if ref_oid != retired.oid {
+                            return Err(format!(
+                                "checkpoint ref no longer matches manifest OID: {}",
+                                retired.ref_name
+                            ));
+                        }
+                        retired_refs.push(retired.ref_name.to_string());
+                    }
+                    unreadable.push(line_index + 1);
+                    continue;
+                }
+                return Err(format!(
                     "invalid checkpoint manifest entry at line {}",
                     line_index + 1
-                )
-            })?;
+                ));
+            }
+        };
         if !ids.insert(checkpoint.id.clone()) {
             return Err(format!(
                 "duplicate checkpoint id in manifest: {}",
@@ -2283,6 +2140,30 @@ fn list_checkpoints_in_repo(
             ));
         }
     }
+    // Every write-risk tool call reaches this through automatic retention, and
+    // stderr is shared with the inline TUI, so the notice is emitted at most
+    // once per process instead of once per checkpoint.
+    static WARNED_UNREADABLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !unreadable.is_empty() && !WARNED_UNREADABLE.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        let shown = unreadable
+            .iter()
+            .take(8)
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (entry_noun, line_noun) = if unreadable.len() == 1 {
+            ("entry", "line")
+        } else {
+            ("entries", "lines")
+        };
+        eprintln!(
+            "[checkpoint] skipped {} unreadable manifest {entry_noun} ({line_noun} {shown}{}); those recovery points cannot be restored by this build",
+            unreadable.len(),
+            if unreadable.len() > 8 { ", …" } else { "" },
+        );
+    }
     // Newest first. Manifest append order breaks ties when several checkpoints
     // share the same millisecond timestamp.
     cps.sort_by_key(|(line_index, checkpoint)| {
@@ -2293,7 +2174,7 @@ fn list_checkpoints_in_repo(
         .map(|(_, checkpoint)| checkpoint)
         .collect::<Vec<_>>();
     cps.truncate(limit);
-    Ok(cps)
+    Ok((cps, retired_refs))
 }
 
 pub(crate) fn inspect_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
@@ -2310,6 +2191,7 @@ pub(crate) fn inspect_checkpoints(root: &Path, limit: usize) -> Result<Vec<Check
         return Err("checkpoint manifest exceeds the doctor inspection bound".to_string());
     }
     list_checkpoints_in_repo(&git_root, limit, false, Some(256 * 1024))
+        .map(|(checkpoints, _)| checkpoints)
 }
 
 pub(crate) fn list_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
@@ -2320,7 +2202,7 @@ pub(crate) fn list_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoi
         return Ok(Vec::new());
     }
     let _operation_lock = CheckpointOperationLock::acquire(&git_root)?;
-    list_checkpoints_in_repo(&git_root, limit, false, None)
+    list_checkpoints_in_repo(&git_root, limit, false, None).map(|(checkpoints, _)| checkpoints)
 }
 
 fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
@@ -2335,7 +2217,7 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
     if cp.paths_hint.len() > UNTRACKED_SNAPSHOT_CAP
         || cp.untracked_snapshot.len() > UNTRACKED_SNAPSHOT_CAP
         || cp
-            .legacy_sidecar_paths
+            .direct_sidecar_paths
             .as_deref()
             .is_some_and(|paths| paths.len() > UNTRACKED_SNAPSHOT_CAP)
         || cp.untracked_sidecars.len() > UNTRACKED_SNAPSHOT_CAP
@@ -2348,54 +2230,37 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
     if !unique_paths(&cp.paths_hint)
         || !unique_paths(&cp.untracked_snapshot)
         || cp
-            .legacy_sidecar_paths
+            .direct_sidecar_paths
             .as_deref()
             .is_some_and(|paths| !unique_paths(paths))
     {
         return Err("checkpoint metadata contains duplicate paths".to_string());
     }
-    let pre_json_manifest = cp.manifest_encoding != CheckpointManifestEncoding::Current;
     let direct_file_tool = matches!(
         cp.tool_name.as_str(),
         "write_file" | "edit_file" | "multi_edit"
     );
-    if (direct_file_tool && cp.paths_hint.is_empty())
-        || (pre_json_manifest && cp.paths_hint.len() > 1)
-        || (cp.manifest_encoding == CheckpointManifestEncoding::PreJsonEightFields
-            && !cp.untracked_snapshot.is_empty())
-        || (pre_json_manifest
-            && (cp.legacy_sidecar_paths.is_some()
-                || !cp.untracked_sidecars.is_empty()
-                || cp.untracked_capture_warning.is_some()))
-    {
-        return Err("checkpoint metadata does not match its manifest encoding".to_string());
+    if direct_file_tool && cp.paths_hint.is_empty() {
+        return Err(format!(
+            "checkpoint for direct file tool {} records no path hint",
+            cp.tool_name
+        ));
     }
-    let valid_hint = |path: &&String| {
-        safe_repo_relative_path(Path::new(path))
-            || (pre_json_manifest && safe_pre_json_manifest_path(Path::new(path)))
-    };
-    let valid_snapshot = |path: &&String| {
-        safe_repo_relative_path(Path::new(path))
-            || (pre_json_manifest && safe_pre_json_untracked_path(Path::new(path)))
-    };
-    if let Some(path) = cp.paths_hint.iter().find(|path| !valid_hint(path)) {
+    let unsafe_relative = |path: &&String| !safe_repo_relative_path(Path::new(path));
+    if let Some(path) = cp.paths_hint.iter().find(unsafe_relative) {
         return Err(format!("unsafe checkpoint path: {path}"));
     }
-    if let Some(path) = cp
-        .untracked_snapshot
-        .iter()
-        .find(|path| !valid_snapshot(path))
-    {
+    if let Some(path) = cp.untracked_snapshot.iter().find(unsafe_relative) {
         return Err(format!("unsafe checkpoint untracked path: {path}"));
     }
-    if let Some(path) = cp.legacy_sidecar_paths.as_deref().and_then(|paths| {
+    if let Some(path) = cp.direct_sidecar_paths.as_deref().and_then(|paths| {
         paths.iter().find(|path| {
             !safe_repo_relative_path(Path::new(path))
                 || !cp.paths_hint.iter().any(|hint| hint == *path)
         })
     }) {
         return Err(format!(
-            "unsafe or undeclared legacy checkpoint sidecar path: {path}"
+            "unsafe or undeclared direct checkpoint sidecar path: {path}"
         ));
     }
     let mut sidecar_paths = std::collections::HashSet::new();
@@ -2439,7 +2304,7 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
     }
     if !cp.includes_untracked_sidecar
         && (cp
-            .legacy_sidecar_paths
+            .direct_sidecar_paths
             .as_deref()
             .is_some_and(|paths| !paths.is_empty())
             || !cp.untracked_sidecars.is_empty())
@@ -2447,12 +2312,12 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
         return Err("checkpoint declares sidecars without enabling restore".to_string());
     }
     if cp
-        .legacy_sidecar_paths
+        .direct_sidecar_paths
         .as_deref()
         .is_some_and(|paths| !paths.is_empty())
         && !cp.untracked_sidecars.is_empty()
     {
-        return Err("checkpoint mixes legacy and content-addressed sidecars".to_string());
+        return Err("checkpoint mixes direct and content-addressed sidecars".to_string());
     }
     if cp.includes_untracked_sidecar && cp.paths_hint.is_empty() && cp.untracked_snapshot.is_empty()
     {
@@ -2580,7 +2445,7 @@ fn preview_restore_locked(root: &Path, git_root: &Path, cp: &Checkpoint) -> Resu
         .iter()
         .map(UntrackedSidecar::path)
         .chain(
-            cp.legacy_sidecar_paths
+            cp.direct_sidecar_paths
                 .as_deref()
                 .into_iter()
                 .flatten()
@@ -2590,7 +2455,7 @@ fn preview_restore_locked(root: &Path, git_root: &Path, cp: &Checkpoint) -> Resu
             preview_restore_paths
                 .iter()
                 .filter(|_| {
-                    cp.legacy_sidecar_paths.is_none()
+                    cp.direct_sidecar_paths.is_none()
                         && cp.includes_untracked_sidecar
                         && cp.untracked_sidecars.is_empty()
                 })
@@ -2846,7 +2711,7 @@ fn validate_private_blob(
     Ok(path)
 }
 
-fn preflight_legacy_sidecar_restore(
+fn preflight_direct_sidecar_restore(
     git_root: &Path,
     cp: &Checkpoint,
     restore_paths: &[(PathBuf, PathBuf)],
@@ -2889,7 +2754,7 @@ fn preflight_legacy_sidecar_restore(
             .map(|(relative, _)| relative.as_path())
             .collect::<std::collections::HashSet<_>>()
     };
-    let allowed = if let Some(declared) = cp.legacy_sidecar_paths.as_deref() {
+    let allowed = if let Some(declared) = cp.direct_sidecar_paths.as_deref() {
         declared
             .iter()
             .map(String::as_str)
@@ -2907,7 +2772,8 @@ fn preflight_legacy_sidecar_restore(
                 .map_err(|_| "checkpoint sidecar escapes its storage directory".to_string())
         })
         .collect::<Result<std::collections::HashSet<_>, String>>()?;
-    if cp.legacy_sidecar_paths.is_some() {
+    if cp.direct_sidecar_paths.is_some() {
+        // Exact membership was recorded, so a missing sidecar is unambiguous.
         if let Some(missing) = allowed.iter().find(|path| !present.contains(*path)) {
             return Err(format!(
                 "required untracked checkpoint sidecar is missing: {}",
@@ -2915,16 +2781,17 @@ fn preflight_legacy_sidecar_restore(
             ));
         }
     } else {
+        // Without the membership index a missing sidecar is ambiguous: the path
+        // may have been tracked at checkpoint time (so no sidecar was ever
+        // written) rather than lost. Accept only that case, proven against the
+        // checkpoint tree, and fail closed otherwise.
         for missing in allowed.difference(&present) {
             let relative = missing.to_str().ok_or_else(|| {
-                format!(
-                    "legacy checkpoint path is not valid UTF-8: {}",
-                    missing.display()
-                )
+                format!("checkpoint path is not valid UTF-8: {}", missing.display())
             })?;
             if restore_paths.is_empty() || !tree_has_path(git_root, &cp.oid, relative)? {
                 return Err(format!(
-                    "required legacy checkpoint sidecar is missing or was not recorded: {}",
+                    "required checkpoint sidecar is missing or was not recorded: {}",
                     missing.display()
                 ));
             }
@@ -3029,7 +2896,7 @@ fn preflight_sidecar_restore(
     validate_destinations: bool,
 ) -> Result<Vec<PreparedSidecarRestore>, String> {
     if cp.untracked_sidecars.is_empty() {
-        return preflight_legacy_sidecar_restore(
+        return preflight_direct_sidecar_restore(
             git_root,
             cp,
             restore_paths,
@@ -3607,7 +3474,7 @@ fn prune_checkpoint_refs(
     ensure_checkpoint_storage(git_root)?;
     let now = now_ms();
     let max_age_ms = (max_age_hours as u128) * 3_600_000;
-    let cps = list_checkpoints_in_repo(git_root, usize::MAX, true, None)?;
+    let (cps, retired_refs) = list_checkpoints_in_repo(git_root, usize::MAX, true, None)?;
     let mut remaining = Vec::with_capacity(cps.len());
     let mut expired = Vec::new();
     for (i, cp) in cps.into_iter().enumerate() {
@@ -3621,14 +3488,21 @@ fn prune_checkpoint_refs(
     // Delete refs before compacting the manifest. If a ref deletion fails, the
     // original manifest still names every live checkpoint ref. A later manifest
     // write failure can leave stale entries for already-deleted refs, which list
-    // and the next prune safely ignore; it cannot leave an unmanifested live ref.
+    // and the next prune safely ignore.
+    //
+    // Recognized retired rows are safe to reclaim only after their recorded OID
+    // was matched to the live ref during listing. Unrecognized parse failures
+    // never reach this rewrite, and a retired row/ref mismatch fails closed.
     for cp in &expired {
         run_git(git_root, &["update-ref", "-d", &cp.ref_name])?;
+    }
+    for ref_name in &retired_refs {
+        run_git(git_root, &["update-ref", "-d", ref_name])?;
     }
     write_checkpoint_manifest(git_root, &remaining)?;
     let sidecar_outcome = prune_orphan_sidecars(git_root, &remaining)?;
     Ok(PruneOutcome {
-        checkpoints_removed: expired.len(),
+        checkpoints_removed: expired.len().saturating_add(retired_refs.len()),
         orphan_sidecars_removed: sidecar_outcome.removed,
         warnings: sidecar_outcome.warnings,
     })
@@ -3887,7 +3761,7 @@ pub(crate) fn prune(
         mut orphan_sidecars_removed,
         mut warnings,
     } = prune_checkpoint_refs(&git_root, keep, max_age)?;
-    let cps = list_checkpoints_in_repo(&git_root, usize::MAX, true, None)?;
+    let (cps, _) = list_checkpoints_in_repo(&git_root, usize::MAX, true, None)?;
 
     // Reconcile refs created outside the private manifest, then rewrite the
     // manifest after all namespace cleanup while the repository lock is held.
@@ -4109,22 +3983,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_schema_distinguishes_legacy_and_exact_sidecar_membership() {
+    fn manifest_schema_distinguishes_absent_and_exact_sidecar_membership() {
         let oid = "a".repeat(40);
         let digest = "b".repeat(64);
-        let pre_json_eight_line = format!(
-            "fixture-eight\trefs/dext/checkpoints/session/fixture-eight\t{oid}\twrite_file\t0\t{oid}\tfalse\t/home/legacy/outside.txt"
-        );
-        let pre_json_nine_line = format!(
-            "fixture-pre-json\trefs/dext/checkpoints/session/fixture-pre-json\t{oid}\tbash\t1\t{oid}\tfalse\t\t.dext/checkpoints/manifest.txt\u{1f}notes.txt"
-        );
-        let comma_pre_json_line = format!(
-            "fixture-comma\trefs/dext/checkpoints/session/fixture-comma\t{oid}\twrite_file\t2\t{oid}\tfalse\treports/a,b.txt"
-        );
-        let legacy_nine = format!(
-            "fixture-nine\trefs/dext/checkpoints/session/fixture-nine\t{oid}\twrite_file\t1\t{oid}\ttrue\t[\"note.txt\"]\t[]"
-        );
-        let legacy_eleven = format!(
+        let eleven_without_membership = format!(
             "fixture-eleven\trefs/dext/checkpoints/session/fixture-eleven\t{oid}\tbash\t2\t{oid}\ttrue\t[]\t[\"note.txt\"]\t[{{\"kind\":\"file\",\"path\":\"note.txt\",\"digest\":\"{digest}\",\"size\":0,\"executable\":false}}]\tnull"
         );
         let current_direct = format!(
@@ -4134,59 +3996,18 @@ mod tests {
             "fixture-current\trefs/dext/checkpoints/session/fixture-current\t{oid}\twrite_file\t4\t{oid}\tfalse\t[\"tracked.txt\"]\t[]\t[]\tnull\t[]"
         );
 
-        let pre_json_eight =
-            parse_manifest_line(&pre_json_eight_line).expect("parse 8-field pre-JSON manifest");
-        assert_eq!(
-            pre_json_eight.manifest_encoding,
-            CheckpointManifestEncoding::PreJsonEightFields
-        );
-        assert_eq!(
-            pre_json_eight.paths_hint,
-            ["/home/legacy/outside.txt".to_string()]
-        );
-        assert_eq!(format_manifest_line(&pre_json_eight), pre_json_eight_line);
-
-        let pre_json_nine =
-            parse_manifest_line(&pre_json_nine_line).expect("parse 9-field pre-JSON manifest");
-        assert_eq!(
-            pre_json_nine.manifest_encoding,
-            CheckpointManifestEncoding::PreJsonNineFields
-        );
-        assert_eq!(
-            pre_json_nine.untracked_snapshot,
-            [
-                ".dext/checkpoints/manifest.txt".to_string(),
-                "notes.txt".to_string()
-            ]
-        );
-        assert_eq!(format_manifest_line(&pre_json_nine), pre_json_nine_line);
-
-        let comma_pre_json =
-            parse_manifest_line(&comma_pre_json_line).expect("parse comma-bearing pre-JSON hint");
-        assert_eq!(
-            comma_pre_json.paths_hint,
-            ["reports/a,b.txt".to_string()],
-            "the runtime only ever emitted one direct path hint; commas belong to that path"
-        );
-        assert_eq!(format_manifest_line(&comma_pre_json), comma_pre_json_line);
-
-        let legacy_nine = parse_manifest_line(&legacy_nine).expect("parse 9-field manifest");
-        assert_eq!(
-            legacy_nine.manifest_encoding,
-            CheckpointManifestEncoding::Current
-        );
-        assert_eq!(legacy_nine.legacy_sidecar_paths, None);
-        assert_eq!(format_manifest_line(&legacy_nine).split('\t').count(), 11);
-
-        let legacy_eleven = parse_manifest_line(&legacy_eleven).expect("parse 11-field manifest");
-        assert_eq!(legacy_eleven.legacy_sidecar_paths, None);
-        assert_eq!(legacy_eleven.untracked_sidecars.len(), 1);
-        assert_eq!(format_manifest_line(&legacy_eleven).split('\t').count(), 11);
+        // An 11-field row predates the membership index, so it round-trips
+        // without one and restore must treat a missing sidecar as ambiguous.
+        let eleven = parse_manifest_line(&eleven_without_membership)
+            .expect("parse 11-field manifest without membership");
+        assert_eq!(eleven.direct_sidecar_paths, None);
+        assert_eq!(eleven.untracked_sidecars.len(), 1);
+        assert_eq!(format_manifest_line(&eleven).split('\t').count(), 11);
 
         let current_direct =
             parse_manifest_line(&current_direct).expect("parse 12-field direct-sidecar manifest");
         assert_eq!(
-            current_direct.legacy_sidecar_paths.as_deref(),
+            current_direct.direct_sidecar_paths.as_deref(),
             Some(["note.txt".to_string()].as_slice())
         );
         assert_eq!(
@@ -4194,11 +4015,13 @@ mod tests {
             12
         );
 
+        // Empty-but-present membership is distinct from absent membership: it
+        // proves no sidecar was written, so restore need not fail conservatively.
         let current_without_direct_sidecars = parse_manifest_line(&current_without_direct_sidecars)
             .expect("parse 12-field manifest with exact empty membership");
         assert_eq!(
             current_without_direct_sidecars
-                .legacy_sidecar_paths
+                .direct_sidecar_paths
                 .as_deref(),
             Some([].as_slice())
         );
@@ -4209,22 +4032,66 @@ mod tests {
             12
         );
 
+        // The retired pre-JSON encodings are no longer accepted at all.
+        let pre_json_eight = format!(
+            "fixture-eight\trefs/dext/checkpoints/session/fixture-eight\t{oid}\twrite_file\t0\t{oid}\tfalse\t/home/legacy/outside.txt"
+        );
+        let pre_json_nine = format!(
+            "fixture-pre-json\trefs/dext/checkpoints/session/fixture-pre-json\t{oid}\tbash\t1\t{oid}\tfalse\t\t.dext/checkpoints/manifest.txt\u{1f}notes.txt"
+        );
+        let json_nine = format!(
+            "fixture-nine\trefs/dext/checkpoints/session/fixture-nine\t{oid}\twrite_file\t1\t{oid}\ttrue\t[\"note.txt\"]\t[]"
+        );
+        for retired in [&pre_json_eight, &pre_json_nine, &json_nine] {
+            assert!(
+                parse_manifest_line(retired).is_none(),
+                "retired manifest encoding must not parse: {retired}"
+            );
+        }
+
+        // Skipping is reserved for rows a retired Dext writer actually emitted.
+        // The 8- and 9-field pre-JSON rows qualify; the 9-field JSON row does
+        // not, because its bracketed path field marks it as a truncated current
+        // row, which must stay fatal rather than become silently skippable.
+        assert_eq!(
+            retired_manifest_row(&pre_json_eight),
+            Some(RetiredManifestRow {
+                id: "fixture-eight",
+                ref_name: "refs/dext/checkpoints/session/fixture-eight",
+                oid: &oid,
+            })
+        );
+        assert!(retired_manifest_row(&pre_json_nine).is_some());
+        assert!(
+            retired_manifest_row(&json_nine).is_none(),
+            "a JSON path field means a truncated current row, not a retired one"
+        );
+        for not_retired in [
+            "corrupt manifest line",
+            "",
+            &format!("../escape\trefs/dext/checkpoints/session/x\t{oid}\tbash\t1\t{oid}\tfalse\t"),
+            &format!(
+                "fixture-eight\trefs/dext/checkpoints/session/fixture-eight\t{oid}\tbash\tNOTANUMBER\t{oid}\tfalse\t"
+            ),
+            &format!(
+                "fixture-eight\trefs/dext/checkpoints/session/fixture-eight\t{oid}\tbash\t1\t{oid}\tmaybe\t"
+            ),
+        ] {
+            assert!(
+                retired_manifest_row(not_retired).is_none(),
+                "a damaged header must not be mistaken for a retired row: {not_retired}"
+            );
+        }
+
         let malformed_current = format!(
-            "fixture-malformed\trefs/dext/checkpoints/session/fixture-malformed\t{oid}\tbash\t5\t{oid}\tfalse\t[\"note.txt\"\t[]"
+            "fixture-malformed\trefs/dext/checkpoints/session/fixture-malformed\t{oid}\tbash\t5\t{oid}\tfalse\t[\"note.txt\"\t[]\t[]\tnull"
         );
         assert!(
             parse_manifest_line(&malformed_current).is_none(),
-            "JSON-shaped current rows must not fall back to the pre-JSON parser"
-        );
-        let truncated_pre_json = format!(
-            "fixture-truncated\trefs/dext/checkpoints/session/fixture-truncated\t{oid}\tbash\t7\t{oid}\tfalse"
-        );
-        assert!(
-            parse_manifest_line(&truncated_pre_json).is_none(),
-            "no Dext writer emitted 7-field rows; a missing trailing field is truncation"
+            "a malformed JSON field fails the row rather than degrading it"
         );
         let empty_direct_current = format!(
-            "fixture-empty-direct\trefs/dext/checkpoints/session/fixture-empty-direct\t{oid}\twrite_file\t9\t{oid}\tfalse\t[]\t[]"
+            "fixture-empty-direct\trefs/dext/checkpoints/session/fixture-empty-direct\t{oid}\twrite_file\t9\t{oid}\tfalse\t[]\t[]\t[]\tnull"
         );
         assert!(
             parse_manifest_line(&empty_direct_current).is_none(),

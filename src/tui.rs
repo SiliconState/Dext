@@ -10287,7 +10287,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env_lock().lock().expect("env lock")
+        crate::test_env_lock()
     }
 
     fn tool_line(
