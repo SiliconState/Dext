@@ -18,16 +18,17 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Agent state and loop.
   - CLI parsing, top-level command dispatch, and structured `dext doctor` rendering.
   - Slash commands.
-  - Built-in tool implementations.
+  - Built-in tool implementations, including bounded, cancellation-aware native file reads and an 8 MiB `read_symbol` source-input ceiling.
   - Eval harness.
-  - Prompt/context assembly and compaction; turn-stable guidance/pack/shelf prompt sections are cached separately from the volatile per-round environment tail.
+  - Prompt/context assembly and compaction; turn-stable guidance/pack/shelf prompt sections are cached separately from the volatile per-round environment tail, and each ancestor guidance/recall file is bounded at 1 MiB for both prompt loading and provenance hashing.
   - Event emission through the sinks it owns.
 
 - `src/git_checkpoints.rs`
   - Git repository discovery for recovery snapshots.
   - Hidden checkpoint refs under `refs/dext/checkpoints/`.
   - Local checkpoint manifests and untracked-file sidecars under `.dext/checkpoints/`.
-  - Strict current-row parsing plus integrity-checked retirement of recognized pre-JSON rows and their matched refs.
+  - Strict current-row parsing plus full-grammar, integrity-checked retirement of recognized pre-JSON rows and their matched refs.
+  - Manifest-first retention compaction so failed ref cleanup leaves only harmless orphan refs instead of manifest entries naming deleted refs.
   - Undo list/preview/apply/prune helpers used by `/undo` and `dext undo`.
 
 - `src/mutation_preview.rs`
@@ -56,7 +57,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `src/tool_round.rs`
   - Tool-call planning, approval inputs, checkpoint/journal boundaries, dispatch, and result normalization.
-  - Interrupt-aware parallel read execution that returns one result for every provider tool-call ID even when queued tasks are aborted.
+  - Interrupt-aware parallel read execution that returns one result for every provider tool-call ID even when queued tasks are aborted; native blocking reads observe the shared cancellation flag between bounded chunks.
   - Post-mutation invalidation of cached pack discovery before the next provider request.
   - Narrow runtime context supplied by `Agent`, which remains the facade.
 
@@ -87,7 +88,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `src/tui.rs`
   - Inline Ratatui UI in the regular terminal buffer.
-  - Transcript rendering, input box, status/live areas, permission prompts, slash completions, and the read-only `Ctrl+L` todo modal.
+  - Transcript rendering, input box, status/live areas, permission prompts, slash completions, and the read-only `Ctrl+L` todo modal; todo state loading shares the 256 KiB runtime bound.
   - See [`TUI.md`](TUI.md) for the renderer contract, exact dependency stack, compatibility patch, and PTY gate.
 
 - `src/packs.rs`
@@ -102,10 +103,10 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - In-process shelf implementations can participate in the typed signal/effect loop; filesystem manifests do not register executable tools, commands, or arbitrary effect handlers.
 
 - `src/privacy.rs`
-  - Privacy policy, sensitive-path denial, and secret/PII redaction for anything that may leave the machine.
+  - Privacy policy, sensitive-path/search-scope denial, and secret/PII redaction for anything that may leave the machine.
 
 - `src/usage.rs`
-  - Per-provider token-usage normalization into disjoint input buckets, per-model pricing, and the spend/token budget cap.
+  - Per-provider token-usage normalization into disjoint input buckets, per-model pricing, and spend/token budget caps with at most one cap per dimension.
 
 - `src/events.rs`
   - The `AgentEvent` stream and the `EventSink` trait each front end implements. The sinks themselves stay with the console I/O layer in `main.rs`.
@@ -114,7 +115,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Panic hook, redacted owner-only crash snapshots, and the bounded event breadcrumb trail they record.
 
 - `src/process_tree.rs`
-  - Child session/process-group detachment and whole-tree teardown after exit, timeout, or interrupt.
+  - Child session/process-group detachment and whole-tree teardown after exit, timeout, interrupt, task cancellation, or guard drop.
 
 - `src/secret_redactor.rs`
   - Streaming credential scrubbing for child-process output, holding back only enough tail bytes to catch a pattern split across reads.
@@ -139,7 +140,7 @@ Packs extend this tool model without changing it. Dext creates, discovers, inspe
 
 The full catalog still implements specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`) for opt-in use via `--toolset full`, `DEXT_TOOLSET=full`, or `/tools full`. Frugal/tiny retain the default core tool capabilities while using lean schemas and smaller context/result budgets. Catalog metadata for required fields, permission/side-effect capability, external-process dispatch, parallel safety, and default/full exposure is centralized in `tools.rs`; schema-registry drift is regression-tested. Descriptions, schemas, risk-specific parsing, and per-tool summaries remain in their focused code paths rather than being forced into one oversized object.
 
-Bash is intentionally transaction-like: Dext cleans the complete child process tree after the shell exits, times out, or is interrupted. Unix children run in a detached session/process group; Windows children start suspended, enter a kill-on-close Job Object, and resume only after assignment. On Windows, shell-backed tools require a real Bash implementation such as Git for Windows; every shell execution path uses the same resolver, Dext skips Windows/WSL app aliases when selecting `bash.exe` from `PATH`, and `DEXT_BASH_PATH` can select an explicit executable. Cross-platform path rendering strips Windows verbatim prefixes, uses forward slashes for Git/shell arguments, and filters Unix, drive-letter, and UNC absolute paths from session work ledgers. Shell backgrounding (`cmd &`), `nohup`, and `disown` are therefore not a supported way to keep servers alive across tool calls. Unix `setsid`-style detaches are also unsupported because they escape process-group cleanup. If the user explicitly needs a persistent local service, prefer OS supervision without adding a Dext daemon tool. On Linux with systemd, use `systemd-run --user --unit=dext-<name> --same-dir <cmd>`, inspect with `systemctl --user status dext-<name>`/`journalctl --user-unit dext-<name>`, and stop it with `systemctl --user stop dext-<name>` when finished. Keep unit names prefixed with `dext-`; on platforms without systemd, use the platform's native supervisor or avoid a persistent service.
+Bash is intentionally transaction-like: Dext cleans the complete child process tree after the shell exits, times out, is interrupted, or an in-flight process-tree guard is dropped during task cancellation/unwinding. Unix children run in a detached session/process group; Windows children start suspended, enter a kill-on-close Job Object, and resume only after assignment. On Windows, shell-backed tools require a real Bash implementation such as Git for Windows; every shell execution path uses the same resolver, Dext skips Windows/WSL app aliases when selecting `bash.exe` from `PATH`, and `DEXT_BASH_PATH` can select an explicit executable. Cross-platform path rendering strips Windows verbatim prefixes, uses forward slashes for Git/shell arguments, and filters Unix, drive-letter, and UNC absolute paths from session work ledgers. Shell backgrounding (`cmd &`), `nohup`, and `disown` are therefore not a supported way to keep servers alive across tool calls. Unix `setsid`-style detaches are also unsupported because they escape process-group cleanup. If the user explicitly needs a persistent local service, prefer OS supervision without adding a Dext daemon tool. On Linux with systemd, use `systemd-run --user --unit=dext-<name> --same-dir <cmd>`, inspect with `systemctl --user status dext-<name>`/`journalctl --user-unit dext-<name>`, and stop it with `systemctl --user stop dext-<name>` when finished. Keep unit names prefixed with `dext-`; on platforms without systemd, use the platform's native supervisor or avoid a persistent service.
 
 Provider transport uses a 15-second connect deadline, a first-header deadline of 180 seconds for cloud providers or 600 seconds for local llama.cpp, and an idle deadline of 90 seconds for cloud streams/bodies or 300 seconds for local ones. Positive `DEXT_PROVIDER_CONNECT_TIMEOUT_SECS`, `DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS`, and `DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS` values override those defaults. Initial calls and retries share the same policy. Non-stream summary JSON is capped at 4 MiB and provider error diagnostics at 4,000 bytes. SSE framing bounds in-progress allocation before appending oversized chunks while incrementally accepting one large read containing many valid events.
 
@@ -158,7 +159,7 @@ Dext distinguishes project files from runtime state:
 - Named sessions can be stored under `DEXT_SESSIONS_DIR`.
 - Session exports (`dext-session-*.jsonl`, `dext-session-*.html`) are ignored by Git.
 
-Session JSONL files include header provenance, exposed tools, approval/sandbox context, provider health, ledger entries, and message history. They may contain sensitive prompts or tool output; do not publish them blindly.
+Session JSONL files include header provenance, exposed tools, approval/sandbox context, provider health, ledger entries, and message history. Invalid persisted usage costs or empty/non-positive budget caps are rejected on load rather than influencing resumed budget enforcement. They may contain sensitive prompts or tool output; do not publish them blindly.
 
 ## Safety model
 
@@ -206,7 +207,10 @@ provider-visible tools:
   retention cleanup, while an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked
   without following it. Owner execute state is descriptor metadata. Current manifests record exact
   direct-sidecar membership; older manifests without that field fail conservatively before mutation
-  when a missing artifact is ambiguous rather than deleting current path content. Non-UTF-8 names,
+  when a missing artifact is ambiguous rather than deleting current path content. Recognized retired
+  rows must match the complete retired field grammar and any live ref's recorded OID. Retention
+  publishes the compacted manifest before deleting expired/retired refs or artifacts, so a cleanup
+  failure leaves only orphan state rather than a manifest naming a deleted recovery point. Non-UTF-8 names,
   unsupported types, and path/type/size caps are explicit
   partial-recovery gaps. If any such gap remains, Dext requests separate repository/session-scoped
   approval and records the gap; denial blocks the call, while approval preserves

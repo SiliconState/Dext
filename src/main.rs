@@ -92,6 +92,9 @@ const TEXT_TOOL_CAPTURE_CAP: usize = 10_000;
 const FRUGAL_TEXT_TOOL_CAPTURE_CAP: usize = 6_000;
 const READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 16_000;
 const FRUGAL_READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 10_000;
+const READ_SYMBOL_INPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const PROMPT_CONTEXT_FILE_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const TODO_STATE_MAX_BYTES: usize = 256 * 1024;
 const PROCESS_STREAM_CAPTURE_CAP: usize = 6_000;
 const LIVE_OUTPUT_EVENT_QUEUE_CAP: usize = 256;
 const READ_SYMBOL_SUGGESTION_LIMIT: usize = 5;
@@ -700,14 +703,18 @@ impl LimitedTextCapture {
     }
 
     fn try_push_unit(&mut self, unit: &str) -> bool {
-        self.observed_bytes += unit.len();
-        if self.kept.len() + unit.len() <= self.cap {
-            self.kept.push_str(unit);
+        self.try_push_observed_unit(unit, unit.len())
+    }
+
+    fn try_push_observed_unit(&mut self, unit_prefix: &str, observed_len: usize) -> bool {
+        self.observed_bytes = self.observed_bytes.saturating_add(observed_len);
+        if observed_len == unit_prefix.len() && self.kept.len() + unit_prefix.len() <= self.cap {
+            self.kept.push_str(unit_prefix);
             return true;
         }
         if self.kept.is_empty() {
             self.kept
-                .push_str(byte_prefix_at_char_boundary(unit, self.cap));
+                .push_str(byte_prefix_at_char_boundary(unit_prefix, self.cap));
         }
         self.truncated = true;
         false
@@ -1070,7 +1077,16 @@ impl ReadFileCache {
                 return None;
             }
         }
-        Some(capture.finish(""))
+        let mut out = capture.finish("");
+        let next_line = offset.saturating_add(limit);
+        if cached.lines.contains_key(&next_line) {
+            out.push_str(&format!(
+                "\n…[more lines remain; pass offset={next_line} to continue]\n"
+            ));
+        } else if cached.eof_at.is_none_or(|last| next_line <= last) {
+            return None;
+        }
+        Some(out)
     }
 
     fn record_window(
@@ -1106,6 +1122,147 @@ fn regular_file_metadata(path: &Path) -> std::result::Result<std::fs::Metadata, 
         return Err(format!("{} is not a regular file", path.display()));
     }
     Ok(metadata)
+}
+
+pub(crate) fn read_utf8_file_with_limit(
+    path: &Path,
+    max_bytes: usize,
+    interrupt: Option<&AtomicBool>,
+    label: &str,
+) -> std::result::Result<String, String> {
+    let metadata = regular_file_metadata(path)?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(format!(
+            "{} exceeds the {label} {} byte input limit",
+            path.display(),
+            max_bytes
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|error| format!("{error}"))?;
+    let opened = file.metadata().map_err(|error| format!("{error}"))?;
+    if !opened.is_file() || opened.len() > max_bytes as u64 {
+        return Err(format!(
+            "{} changed or exceeds the {label} {} byte input limit",
+            path.display(),
+            max_bytes
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if interrupt.is_some_and(|interrupt| interrupt.load(Ordering::Relaxed)) {
+            return Err(format!("{label} interrupted by user"));
+        }
+        let read = file.read(&mut chunk).map_err(|error| format!("{error}"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > max_bytes {
+            return Err(format!(
+                "{} grew beyond the {label} {} byte input limit",
+                path.display(),
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8(bytes).map_err(|error| format!("{error}"))
+}
+
+pub(crate) fn read_utf8_regular_file_with_limit(
+    path: &Path,
+    max_bytes: usize,
+    interrupt: Option<&AtomicBool>,
+    label: &str,
+) -> std::result::Result<String, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| format!("{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{} is not a regular non-symlink file",
+            path.display()
+        ));
+    }
+    read_utf8_file_with_limit(path, max_bytes, interrupt, label)
+}
+
+fn read_bounded_utf8_line<R: BufRead>(
+    reader: &mut R,
+    retain_limit: usize,
+    interrupt: Option<&AtomicBool>,
+) -> std::result::Result<Option<(String, usize, bool)>, String> {
+    let mut retained = Vec::with_capacity(retain_limit.min(8 * 1024));
+    let mut utf8_tail = Vec::with_capacity(4);
+    let mut observed = 0usize;
+    let mut saw_bytes = false;
+    let mut ended_with_newline = false;
+
+    loop {
+        if interrupt.is_some_and(|interrupt| interrupt.load(Ordering::Relaxed)) {
+            return Err("read_file interrupted by user".to_string());
+        }
+        let available = reader.fill_buf().map_err(|error| format!("{error}"))?;
+        if available.is_empty() {
+            break;
+        }
+        saw_bytes = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let content = &available[..content_len];
+        let keep = retain_limit.saturating_sub(retained.len()).min(content_len);
+        retained.extend_from_slice(&content[..keep]);
+        observed = observed.saturating_add(content_len);
+
+        let mut validation = Vec::with_capacity(utf8_tail.len().saturating_add(content_len));
+        validation.extend_from_slice(&utf8_tail);
+        validation.extend_from_slice(content);
+        utf8_tail.clear();
+        if let Err(error) = std::str::from_utf8(&validation) {
+            if error.error_len().is_some() {
+                return Err(format!(
+                    "invalid utf-8 sequence at byte {}",
+                    error.valid_up_to()
+                ));
+            }
+            utf8_tail.extend_from_slice(&validation[error.valid_up_to()..]);
+        }
+
+        let consumed = newline.map_or(content_len, |position| position + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            ended_with_newline = true;
+            break;
+        }
+    }
+
+    if !saw_bytes {
+        return Ok(None);
+    }
+    if !utf8_tail.is_empty() {
+        return Err("incomplete utf-8 sequence at end of line".to_string());
+    }
+    let truncated = observed > retained.len();
+    if ended_with_newline && !truncated && retained.last() == Some(&b'\r') {
+        retained.pop();
+        observed = observed.saturating_sub(1);
+    }
+    let line = match String::from_utf8(retained) {
+        Ok(line) => line,
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).expect("validated UTF-8 prefix")
+        }
+        Err(error) => return Err(format!("{error}")),
+    };
+    Ok(Some((line, observed, truncated)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1586,6 +1743,10 @@ impl JsonSink {
         }
     }
 
+    fn records_crash_events_directly(&self) -> bool {
+        self.mode != OutputMode::Text
+    }
+
     fn emit_json_line(value: &Value) {
         if let Ok(line) = serde_json::to_string(value) {
             println!("{line}");
@@ -1595,7 +1756,9 @@ impl JsonSink {
 
 impl EventSink for JsonSink {
     fn emit(&mut self, event: AgentEvent) {
-        record_crash_event(&event);
+        if self.records_crash_events_directly() {
+            record_crash_event(&event);
+        }
         match self.mode {
             OutputMode::Text => self.inner.emit(event),
             OutputMode::StreamJson => {
@@ -7471,7 +7634,7 @@ fn tool_result_context_cap(
 #[cfg(test)]
 fn execute_tool(name: &str, input: &Value, root: &Path) -> std::result::Result<String, String> {
     let prepared_mutation = mutation_preview::prepare_tool_mutation(name, input, root)?;
-    execute_tool_with_cache(name, input, root, None, None, prepared_mutation)
+    execute_tool_with_cache(name, input, root, None, None, None, prepared_mutation)
 }
 
 fn todo_status_counts(items: &[Value]) -> (usize, usize, usize) {
@@ -7508,7 +7671,8 @@ fn render_todo_list(items: &[Value]) -> String {
 }
 
 fn read_todo_counts(path: &Path) -> Option<(usize, usize, usize)> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content =
+        read_utf8_regular_file_with_limit(path, TODO_STATE_MAX_BYTES, None, "todo state").ok()?;
     let todos = serde_json::from_str::<Value>(&content).ok()?;
     let items = todos.as_array()?;
     Some(todo_status_counts(items))
@@ -7546,6 +7710,7 @@ fn execute_tool_with_cache(
     name: &str,
     input: &Value,
     root: &Path,
+    interrupt: Option<&AtomicBool>,
     read_cache: Option<&Arc<Mutex<ReadFileCache>>>,
     session_id: Option<&str>,
     prepared_mutation: Option<mutation_preview::PreparedMutation>,
@@ -7554,8 +7719,24 @@ fn execute_tool_with_cache(
         "read_file" => {
             let path = input["path"].as_str().ok_or("missing path")?;
             let path = canonical_read_path(root, path)?;
-            let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
-            let limit = input["limit"].as_u64().map(|v| v as usize);
+            let offset = match input["offset"].as_u64() {
+                Some(value) => usize::try_from(value)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or("offset must be a positive integer")?,
+                None if input["offset"].is_null() => 1,
+                None => return Err("offset must be a positive integer".to_string()),
+            };
+            let limit = match input["limit"].as_u64() {
+                Some(value) => Some(
+                    usize::try_from(value)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or("limit must be a positive integer")?,
+                ),
+                None if input["limit"].is_null() => None,
+                None => return Err("limit must be a positive integer".to_string()),
+            };
             let explicit_window = input["offset"].is_u64() && limit.is_some();
             let cap = if explicit_window {
                 effective_read_file_explicit_capture_cap()
@@ -7573,36 +7754,68 @@ fn execute_tool_with_cache(
             }
 
             let file = std::fs::File::open(&path).map_err(|e| format!("{e}"))?;
-            let reader = std::io::BufReader::new(file);
+            let mut reader = std::io::BufReader::new(file);
             let mut capture = LimitedTextCapture::new(cap);
             let mut emitted = 0usize;
-            let mut remaining = 0usize;
+            let mut more_lines = false;
             let mut next_offset = None;
+            let mut oversized_line = None;
             let mut cached_lines: Vec<(usize, String)> = Vec::new();
             let mut eof_at = None;
 
-            for (i, line) in reader.lines().enumerate() {
-                let line_no = i + 1;
-                let line = line.map_err(|e| format!("{e}"))?;
+            let mut line_no = 0usize;
+            loop {
+                if line_no >= offset.saturating_sub(1)
+                    && limit.is_some_and(|max_lines| emitted >= max_lines)
+                {
+                    if interrupt.is_some_and(|interrupt| interrupt.load(Ordering::Relaxed)) {
+                        return Err("read_file interrupted by user".to_string());
+                    }
+                    more_lines = !reader
+                        .fill_buf()
+                        .map_err(|error| format!("{error}"))?
+                        .is_empty();
+                    break;
+                }
+
+                let next_line_no = line_no.saturating_add(1);
+                let prefix = format!("{next_line_no}\t");
+                let retain_limit = if next_line_no < offset {
+                    0
+                } else {
+                    cap.saturating_sub(capture.kept.len())
+                        .saturating_sub(prefix.len())
+                        .saturating_sub(1)
+                };
+                let Some((line, observed_line_bytes, truncated)) =
+                    read_bounded_utf8_line(&mut reader, retain_limit, interrupt)?
+                else {
+                    break;
+                };
+                line_no = next_line_no;
                 if line_no < offset {
                     continue;
                 }
-                if let Some(max_lines) = limit
-                    && emitted >= max_lines
-                {
-                    remaining += 1;
-                    continue;
-                }
-                let rendered = format!("{line_no}\t{line}\n");
-                if !capture.try_push_unit(&rendered) {
-                    next_offset = Some(line_no.max(offset + emitted));
+                let rendered = format!("{prefix}{line}\n");
+                let observed_rendered_bytes = prefix
+                    .len()
+                    .saturating_add(observed_line_bytes)
+                    .saturating_add(1);
+                let captured = capture.try_push_observed_unit(&rendered, observed_rendered_bytes);
+                if truncated || !captured {
+                    if observed_rendered_bytes > cap {
+                        oversized_line = Some(line_no);
+                        next_offset = Some(line_no.saturating_add(1));
+                    } else {
+                        next_offset = Some(line_no.max(offset.saturating_add(emitted)));
+                    }
                     break;
                 }
                 cached_lines.push((line_no, line));
                 emitted += 1;
             }
-            if next_offset.is_none() && remaining == 0 {
-                eof_at = Some(offset.saturating_add(emitted).saturating_sub(1));
+            if next_offset.is_none() && !more_lines {
+                eof_at = Some(line_no);
             }
             if let Some(cache) = read_cache
                 && let Ok(mut cache) = cache.lock()
@@ -7611,14 +7824,20 @@ fn execute_tool_with_cache(
             }
 
             if let Some(next_offset) = next_offset {
-                Ok(capture.finish(&format!(
-                    "Pass offset={next_offset} and maybe a smaller limit to continue."
-                )))
+                let hint = oversized_line.map_or_else(
+                    || format!("Pass offset={next_offset} and maybe a smaller limit to continue."),
+                    |line_no| {
+                        format!(
+                            "Line {line_no} exceeds the per-call capture cap; pass offset={next_offset} to continue after it."
+                        )
+                    },
+                );
+                Ok(capture.finish(&hint))
             } else {
                 let mut out = capture.finish("");
-                if remaining > 0 {
+                if more_lines {
                     out.push_str(&format!(
-                        "\n…[{remaining} more lines remain; pass offset={} to continue]\n",
+                        "\n…[more lines remain; pass offset={} to continue]\n",
                         offset + emitted
                     ));
                 }
@@ -7631,18 +7850,40 @@ fn execute_tool_with_cache(
                 .as_str()
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let line_no = input["line"]
-                .as_u64()
-                .filter(|line| *line > 0)
-                .map(|v| v as usize);
+            let line_no = match input["line"].as_u64() {
+                Some(value) => Some(
+                    usize::try_from(value)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or("line must be a positive integer")?,
+                ),
+                None if input["line"].is_null() => None,
+                None => return Err("line must be a positive integer".to_string()),
+            };
             let selector_count = (symbol.is_some() as usize) + (line_no.is_some() as usize);
             if selector_count != 1 {
                 return Err("provide exactly one of symbol or line".to_string());
             }
-            let context = input["context"].as_u64().unwrap_or(5).min(50) as usize;
+            let context = match input["context"].as_u64() {
+                Some(value) if value <= 50 => value as usize,
+                Some(_) => return Err("context must be an integer from 0 through 50".to_string()),
+                None if input["context"].is_null() => 5,
+                None => return Err("context must be an integer from 0 through 50".to_string()),
+            };
             let path = canonical_read_path(root, path_str)?;
-            let _metadata = regular_file_metadata(&path)?;
-            let content = std::fs::read_to_string(&path).map_err(|e| format!("{e}"))?;
+            let content = read_utf8_file_with_limit(
+                &path,
+                READ_SYMBOL_INPUT_MAX_BYTES,
+                interrupt,
+                "read_symbol",
+            )
+            .map_err(|error| {
+                if error.contains("input limit") {
+                    format!("{error}; use rg and focused read_file windows instead")
+                } else {
+                    error
+                }
+            })?;
             let starts = source_line_starts(&content);
             if starts.is_empty() {
                 return Err(format!("{} is empty", path.display()));
@@ -7730,8 +7971,13 @@ fn execute_tool_with_cache(
             if !todo_path.exists() {
                 return Ok("(no todos — use todo_write to create a task list)".to_string());
             }
-            let content =
-                std::fs::read_to_string(todo_path).map_err(|e| format!("read todo: {e}"))?;
+            let content = read_utf8_regular_file_with_limit(
+                todo_path,
+                TODO_STATE_MAX_BYTES,
+                interrupt,
+                "todo_read",
+            )
+            .map_err(|e| format!("read todo: {e}"))?;
             let todos: Value =
                 serde_json::from_str(&content).map_err(|e| format!("parse todo: {e}"))?;
             let items = todos.as_array().ok_or("todo: expected array")?;
@@ -7761,6 +8007,11 @@ fn execute_tool_with_cache(
                 read_todo_counts(&todo_path).or_else(|| read_todo_counts(&project_todo_path));
             let content = serde_json::to_string_pretty(&json!(validated))
                 .map_err(|e| format!("serialize todo: {e}"))?;
+            if content.len() > TODO_STATE_MAX_BYTES {
+                return Err(format!(
+                    "todo state exceeds the {TODO_STATE_MAX_BYTES} byte limit"
+                ));
+            }
             atomic_write_bytes(&todo_path, content.as_bytes())
                 .map_err(|e| format!("write todo: {e}"))?;
 
@@ -9385,6 +9636,7 @@ async fn execute_builtin_call(
                 &name,
                 &input,
                 &root,
+                Some(interrupt.as_ref()),
                 read_cache.as_ref(),
                 session_id.as_deref(),
                 prepared_mutation,
@@ -9899,6 +10151,12 @@ const TINY_SYSTEM: &str = "You are dext tiny, a terse CLI agent. Use exposed too
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
 
+fn prompt_context_file_hash(path: &Path) -> Option<String> {
+    read_utf8_regular_file_with_limit(path, PROMPT_CONTEXT_FILE_MAX_BYTES, None, "prompt context")
+        .ok()
+        .map(|content| sha256_hex_bytes(content.as_bytes()))
+}
+
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     scan_prompt_context_files(root, filename).sections
 }
@@ -9915,8 +10173,8 @@ struct PromptContextScan {
 }
 
 fn prompt_file_signature(path: &Path) -> Option<(std::time::SystemTime, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
         return None;
     }
     Some((meta.modified().ok()?, meta.len()))
@@ -9929,9 +10187,12 @@ fn scan_prompt_context_files(root: &Path, filename: &str) -> PromptContextScan {
         let candidate = dir.join(filename);
         scan.signature
             .push((candidate.clone(), prompt_file_signature(&candidate)));
-        if candidate.exists()
-            && let Ok(content) = std::fs::read_to_string(&candidate)
-        {
+        if let Ok(content) = read_utf8_regular_file_with_limit(
+            &candidate,
+            PROMPT_CONTEXT_FILE_MAX_BYTES,
+            None,
+            "prompt context",
+        ) {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
                 let display = dir.strip_prefix(root).unwrap_or(dir).display();
@@ -10060,7 +10321,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 fn todo_summary_from_path(path: &Path, max_items: usize) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content =
+        read_utf8_regular_file_with_limit(path, TODO_STATE_MAX_BYTES, None, "todo summary").ok()?;
     let todos = serde_json::from_str::<Value>(&content).ok()?;
     let items = todos.as_array()?;
     if items.is_empty() {
@@ -12674,7 +12936,7 @@ impl Agent {
             git_summary(&sandbox_root)
         };
         let tool_profile = ToolProfile::from_env();
-        let budget_cap = BudgetCap::from_env();
+        let budget_cap = BudgetCap::from_env().map_err(anyhow::Error::msg)?;
         let tool_context_profile = ToolContextProfile::from_env().effective(context_mode);
         let tools: Vec<Tool> = provider_tool_definitions()
             .into_iter()
@@ -15084,7 +15346,7 @@ impl Agent {
         let mut prompt_sources = Vec::new();
         let dext_md_root = self.sandbox_root.join("DEXT.md");
         let recall_root = self.sandbox_root.join("recall.md");
-        let dext_md_hash = std::fs::read(&dext_md_root).ok().map(|bytes| {
+        let dext_md_hash = prompt_context_file_hash(&dext_md_root).inspect(|_| {
             if !details
                 .prompt_sources
                 .iter()
@@ -15092,9 +15354,8 @@ impl Agent {
             {
                 prompt_sources.push(dext_md_root.display().to_string());
             }
-            sha256_hex_bytes(&bytes)
         });
-        let recall_hash = std::fs::read(&recall_root).ok().map(|bytes| {
+        let recall_hash = prompt_context_file_hash(&recall_root).inspect(|_| {
             if !details
                 .prompt_sources
                 .iter()
@@ -15102,7 +15363,6 @@ impl Agent {
             {
                 prompt_sources.push(recall_root.display().to_string());
             }
-            sha256_hex_bytes(&bytes)
         });
         prompt_sources.extend(
             details

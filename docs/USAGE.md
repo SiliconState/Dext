@@ -256,9 +256,11 @@ without following it. Owner execute state is retained in metadata. Current manif
 direct-sidecar membership; older manifests that lack that field fail conservatively before mutation
 when a missing artifact is ambiguous rather than deleting current path content. A recognized retired
 8/9-field pre-JSON row is skipped with a warning rather than failing the whole listing, so one stale
-row cannot disable `/undo` or block write-risk tools. Recognition requires an intact header, and its
-recorded OID must match any live checkpoint ref; mismatches and other corrupt or tampered rows fail
-closed. Normal retention removes an integrity-matched retired ref when it compacts that row. Untracked
+row cannot disable `/undo` or block write-risk tools. Recognition requires an intact header and valid
+retired field grammar, and its recorded OID must match any live checkpoint ref; mismatches and other
+corrupt or tampered rows fail closed. Normal retention writes the compacted manifest before deleting
+expired or integrity-matched retired refs, so a later ref-cleanup failure leaves only harmless orphan
+refs rather than a manifest naming an already-deleted recovery point. Untracked
 preview entries with unsafe host-native targets are omitted; a malformed field fails its row rather
 than degrading it. Runtime manifest reads are capped at 16 MiB. If path/type/size limits make
 untracked recovery partial, Dext asks
@@ -324,9 +326,14 @@ dext --toolset full
 DEXT_TOOLSET=full dext
 dext --budget '$2'
 dext --budget 200000t
+dext --budget '$2 + 200000t'  # stop at either dimension
 ```
 
 Frugal mode uses lean schemas by default, keeps the selected toolset, applies smaller caps, and compacts context more aggressively. Tiny mode uses a condensed prompt and caps history around 80% of the detected model window (bounded 8k–32k chars). Explicit `--toolset` and `--tool-profile` choices remain available in every context mode. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
+
+Budget caps accept the documented compact `t` suffix as well as `tok`, reject duplicate dollar or token dimensions in combined caps instead of silently keeping one value, and reject empty combined components. An invalid `DEXT_BUDGET_CAP` fails startup instead of silently disabling the guard.
+
+Native `read_file` windows require positive integer offsets/limits, stop once they detect additional data beyond an explicit limit, and check cancellation between bounded input chunks, including within very long lines. `read_symbol` validates its line/context selectors, checks cancellation while loading, and rejects source files above 8 MiB; use `rg` plus focused `read_file` windows for larger files.
 
 `/usage`, `/status`, JSON output, and session headers report provider token usage after each completed model request. Anthropic-family responses use input/output/cache counters, OpenAI-compatible streaming requests ask for usage chunks, and local llama.cpp uses streamed `timings.cache_n/prompt_n/predicted_n` so cached-prefix reuse is counted separately from new prompt tokens. Dollar estimates use provider/model price tables or the `DEXT_*_USD_PER_MTOK` environment overrides listed below; local defaults to zero dollar cost.
 
@@ -416,7 +423,7 @@ CHATGPT_ACCESS_TOKEN=...
 
 Provider credentials are available to Dext's own HTTP client, but credential-shaped environment variables (`*_API_KEY`, `*_TOKEN`, `*_PASSWORD`, client secrets, cloud credentials, SSH agent variables, and related known names) are removed from agent-run subprocesses by default. Set `DEXT_INHERIT_TOOL_CREDENTIALS=1` only for a trusted model-invoked bash or external tool that explicitly requires the parent credential environment. Hooks, diagnostics, evals, checkpoints, browser launchers, and other Dext-owned subprocesses remain scrubbed even with that opt-in.
 
-Privacy redaction is enabled by default while user-readable files remain readable. Before approved hooks run, `DEXT_TOOL_INPUT` is privacy-redacted for both `pre_tool` and `post_tool`, and `DEXT_TOOL_RESULT` is redacted for `post_tool`. Before tool results enter model context or session logs, Dext replaces private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers. Ordinary unlabeled long numbers and decimal market/HTTP values are not treated as cards. A compact redaction note is appended only when a value was actually replaced. Set `DEXT_PRIVACY=strict` or use `/privacy strict` to additionally block sensitive-looking native read paths. Set `DEXT_PRIVACY=0` or use `/privacy off` only when raw, unredacted local data is intentionally required. On supported Linux/macOS hosts, kernel sandboxing preserves reads available to the Dext process user while confining writes: `read-only` permits only required scratch/device writes, and `workspace-write` additionally permits writes to the sandbox and common toolchain caches. `danger-full-access` intentionally disables this confinement. Dext warns at startup and in `dext doctor` when a confined profile cannot apply kernel enforcement; in that fallback, native write guards remain but shell and external-tool subprocesses are unconfined.
+Privacy redaction is enabled by default while user-readable files remain readable. Before approved hooks run, `DEXT_TOOL_INPUT` is privacy-redacted for both `pre_tool` and `post_tool`, and `DEXT_TOOL_RESULT` is redacted for `post_tool`. Before tool results enter model context or session logs, Dext replaces private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers. Ordinary unlabeled long numbers and decimal market/HTTP values are not treated as cards. A compact redaction note is appended only when a value was actually replaced. Set `DEXT_PRIVACY=strict` or use `/privacy strict` to additionally block sensitive-looking native read paths and hidden, ignored, symlink-following, or sensitive-glob search scopes, including compact/combined ripgrep forms such as `-g.env` and `-ig .env` plus wildcard-prefixed sensitive globs such as `*.env`. Set `DEXT_PRIVACY=0` or use `/privacy off` only when raw, unredacted local data is intentionally required. On supported Linux/macOS hosts, kernel sandboxing preserves reads available to the Dext process user while confining writes: `read-only` permits only required scratch/device writes, and `workspace-write` additionally permits writes to the sandbox and common toolchain caches. `danger-full-access` intentionally disables this confinement. Dext warns at startup and in `dext doctor` when a confined profile cannot apply kernel enforcement; in that fallback, native write guards remain but shell and external-tool subprocesses are unconfined.
 
 The complete Dext release suite is a deliberate exception to normal confined agent work. Under `workspace-write`, shared `/tmp`, arbitrary pseudo-terminals (`/dev/ptmx` and `/dev/pts`), and Cargo metadata such as `~/.cargo/.crates.toml` remain unwritable. Self-hosted `cargo test` can therefore show widespread temporary-directory failures and cascading shared-lock poisoning; `tui_smoke` cannot allocate its PTYs; and `cargo install` cannot update Cargo's install registry. Run those final commands directly in a trusted host terminal, or start a separate controlled Dext process with `dext --sandbox-profile danger-full-access --approval always`. Setting the profile only inside an already-confined shell cannot relax its inherited kernel sandbox. Keep the default hardening intact; see [`RELEASING.md`](RELEASING.md).
 

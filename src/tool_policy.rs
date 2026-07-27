@@ -329,14 +329,40 @@ pub(crate) fn tool_input_issue(name: &str, input: &Value) -> Option<String> {
             }
             None
         }
+        "read_file" => {
+            for field in ["offset", "limit"] {
+                if input[field].is_null() {
+                    continue;
+                }
+                let Some(value) = input[field].as_u64() else {
+                    return Some(format!("{field} must be a positive integer"));
+                };
+                if value == 0 || usize::try_from(value).is_err() {
+                    return Some(format!("{field} must be a positive integer"));
+                }
+            }
+            None
+        }
         "read_symbol" => {
+            if !input["symbol"].is_null() && !input["symbol"].is_string() {
+                return Some("symbol must be a string".to_string());
+            }
+            if !input["line"].is_null()
+                && !input["line"]
+                    .as_u64()
+                    .is_some_and(|line| line > 0 && usize::try_from(line).is_ok())
+            {
+                return Some("line must be a positive integer".to_string());
+            }
+            if !input["context"].is_null()
+                && input["context"].as_u64().is_none_or(|context| context > 50)
+            {
+                return Some("context must be an integer from 0 through 50".to_string());
+            }
             let has_symbol = input["symbol"]
                 .as_str()
                 .is_some_and(|s| !s.trim().is_empty());
             let has_line = input["line"].as_u64().is_some_and(|line| line > 0);
-            if input["line"].as_i64().is_some_and(|line| line <= 0) {
-                return Some("line must be a positive integer".to_string());
-            }
             match (has_symbol, has_line) {
                 (true, false) | (false, true) => None,
                 (false, false) => Some("provide symbol or line".to_string()),
@@ -1610,14 +1636,57 @@ pub(crate) fn output_has_auth_failure_markers(output: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn search_short_option_takes_value(name: &str, flag: char) -> bool {
+    match name {
+        "fd" => matches!(flag, 'd' | 't' | 'e' | 'E' | 'c' | 'j' | 'S' | 'o'),
+        "rg" => matches!(
+            flag,
+            'A' | 'B' | 'C' | 'E' | 'e' | 'f' | 'g' | 'j' | 'm' | 'M' | 'r' | 't' | 'T'
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) fn search_short_value_option<'a>(name: &str, arg: &'a str) -> Option<(char, &'a str)> {
+    let short = arg
+        .strip_prefix('-')
+        .filter(|value| !value.starts_with('-'))?;
+    for (index, flag) in short.char_indices() {
+        if search_short_option_takes_value(name, flag) {
+            return Some((flag, &short[index + flag.len_utf8()..]));
+        }
+    }
+    None
+}
+
+pub(crate) fn search_short_flag_present(name: &str, arg: &str, targets: &[char]) -> bool {
+    let Some(short) = arg
+        .strip_prefix('-')
+        .filter(|value| !value.starts_with('-'))
+    else {
+        return false;
+    };
+    for (index, flag) in short.char_indices() {
+        if targets.contains(&flag) {
+            return true;
+        }
+        if search_short_option_takes_value(name, flag)
+            && index.saturating_add(flag.len_utf8()) < short.len()
+        {
+            return false;
+        }
+    }
+    false
+}
+
+pub(crate) fn rg_attached_glob(arg: &str) -> Option<&str> {
+    let (flag, value) = search_short_value_option("rg", arg)?;
+    (flag == 'g' && !value.is_empty()).then_some(value)
+}
+
 pub(crate) fn search_tool_arg_exec_escape(name: &str, arg: &str) -> bool {
     match name {
-        "fd" => {
-            arg.starts_with("--exec")
-                || (arg.starts_with('-')
-                    && !arg.starts_with("--")
-                    && arg[1..].chars().any(|flag| matches!(flag, 'x' | 'X')))
-        }
+        "fd" => arg.starts_with("--exec") || search_short_flag_present(name, arg, &['x', 'X']),
         "rg" => {
             matches!(
                 arg,
@@ -1626,12 +1695,14 @@ pub(crate) fn search_tool_arg_exec_escape(name: &str, arg: &str) -> bool {
                 || arg.starts_with("--pre-glob=")
                 || arg.starts_with("--search-zip=")
                 || arg.starts_with("--hostname-bin=")
-                || (arg.starts_with('-')
-                    && !arg.starts_with("--")
-                    && arg[1..].chars().any(|flag| flag == 'z'))
+                || search_short_flag_present(name, arg, &['z'])
         }
         _ => false,
     }
+}
+
+fn rg_attached_pattern_operand(arg: &str) -> bool {
+    search_short_flag_present("rg", arg, &['e', 'f'])
 }
 
 fn search_tool_arg_changes_operands(name: &str, arg: &str) -> bool {
@@ -1649,12 +1720,16 @@ fn search_tool_arg_changes_operands(name: &str, arg: &str) -> bool {
             ) || arg.starts_with("--regexp=")
                 || arg.starts_with("--file=")
                 || arg.starts_with("--config-path=")
+                || rg_attached_pattern_operand(arg)
         }
         _ => false,
     }
 }
 
-fn search_tool_option_takes_value(name: &str, arg: &str) -> bool {
+pub(crate) fn search_tool_option_takes_value(name: &str, arg: &str) -> bool {
+    if search_short_value_option(name, arg).is_some_and(|(_, value)| value.is_empty()) {
+        return true;
+    }
     match name {
         "fd" => matches!(
             arg,

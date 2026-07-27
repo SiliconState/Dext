@@ -79,22 +79,22 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute or relative file path"},
-                    "offset": {"type": "integer", "description": "1-indexed start line (default 1)"},
-                    "limit": {"type": "integer", "description": "max lines to return"}
+                    "offset": {"type": "integer", "minimum": 1, "description": "1-indexed start line (default 1)"},
+                    "limit": {"type": "integer", "minimum": 1, "description": "max lines to return"}
                 },
                 "required": ["path"]
             }),
         },
         Tool {
             name: "read_symbol",
-            description: "Read a source symbol by name, or the enclosing block around a 1-indexed line number. Returns a line-numbered block plus context. May inspect absolute paths outside the sandbox read-only; writes remain confined. Lightweight fast text/range heuristic; use rg first for exact symbols or line hits.",
+            description: "Read a source symbol by name, or the enclosing block around a 1-indexed line number. Returns a line-numbered block plus context. May inspect absolute paths outside the sandbox read-only; writes remain confined. Source input is capped at 8 MiB and observes cancellation while loading. Lightweight fast text/range heuristic; use rg first for exact symbols or line hits.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute or relative source file path"},
                     "symbol": {"type": "string", "description": "Function/type/impl/constant name to locate. Mutually exclusive with line."},
-                    "line": {"type": "integer", "description": "1-indexed line number; returns the enclosing block or paragraph. Mutually exclusive with symbol."},
-                    "context": {"type": "integer", "description": "lines of context before/after the block (default 5, max 50)"}
+                    "line": {"type": "integer", "minimum": 1, "description": "1-indexed line number; returns the enclosing block or paragraph. Mutually exclusive with symbol."},
+                    "context": {"type": "integer", "minimum": 0, "maximum": 50, "description": "lines of context before/after the block (default 5, max 50)"}
                 },
                 "required": ["path"]
             }),

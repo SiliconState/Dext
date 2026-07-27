@@ -893,6 +893,16 @@ pub(crate) fn render_limited_lines(
     out
 }
 
+fn validate_session_header_accounting(header: &SessionHeader) -> Result<()> {
+    if !header.usage.is_valid() {
+        anyhow::bail!("session usage contains an invalid cost");
+    }
+    if header.budget_cap.is_some_and(|cap| !cap.is_valid()) {
+        anyhow::bail!("session budget cap is invalid");
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
     let meta: serde_json::Value = serde_json::from_str(line).context("bad session header")?;
     let object = meta
@@ -919,6 +929,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
                 header.context_mode_explicit = true;
             }
             header.version = SESSION_FORMAT_VERSION;
+            validate_session_header_accounting(&header)?;
             return Ok(header);
         }
         Err(error) if source_version == SESSION_FORMAT_VERSION => {
@@ -927,7 +938,20 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         Err(_) => {}
     }
 
-    Ok(SessionHeader {
+    let legacy_usage = if meta["usage"].is_null() {
+        crate::Usage::default()
+    } else {
+        serde_json::from_value(meta["usage"].clone()).context("invalid legacy session usage")?
+    };
+    let legacy_budget_cap = if meta["budget_cap"].is_null() {
+        None
+    } else {
+        Some(
+            serde_json::from_value(meta["budget_cap"].clone())
+                .context("invalid legacy session budget cap")?,
+        )
+    };
+    let header = SessionHeader {
         version: SESSION_FORMAT_VERSION,
         model: meta["model"].as_str().unwrap_or("glm-5.2[1m]").to_string(),
         system: meta["system"]
@@ -968,7 +992,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             })
             .unwrap_or_default(),
         sandbox: meta["sandbox"].as_str().map(String::from),
-        usage: serde_json::from_value(meta["usage"].clone()).unwrap_or_default(),
+        usage: legacy_usage,
         thinking_effort: meta["thinking_effort"]
             .as_str()
             .and_then(ThinkingEffort::parse)
@@ -993,11 +1017,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .as_str()
             .and_then(crate::SandboxProfile::parse)
             .unwrap_or_default(),
-        budget_cap: if meta["budget_cap"].is_null() {
-            None
-        } else {
-            serde_json::from_value(meta["budget_cap"].clone()).ok()
-        },
+        budget_cap: legacy_budget_cap,
         context_mode: meta["context_mode"]
             .as_str()
             .and_then(crate::ContextMode::parse)
@@ -1024,5 +1044,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .ok()
             .flatten(),
         privacy: serde_json::from_value(meta["privacy"].clone()).unwrap_or_default(),
-    })
+    };
+    validate_session_header_accounting(&header)?;
+    Ok(header)
 }

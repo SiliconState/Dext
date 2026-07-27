@@ -2549,7 +2549,13 @@ fn todo_progress_from_content(content: &str) -> Option<TodoProgress> {
 }
 
 fn todo_items_from_path(path: &std::path::Path) -> Option<Vec<TodoItem>> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = crate::read_utf8_regular_file_with_limit(
+        path,
+        crate::TODO_STATE_MAX_BYTES,
+        None,
+        "todo view",
+    )
+    .ok()?;
     let items = serde_json::from_str::<Value>(&content).ok()?;
     let items = items.as_array()?;
     Some(

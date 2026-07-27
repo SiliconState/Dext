@@ -1915,19 +1915,70 @@ struct RetiredManifestRow<'a> {
     oid: &'a str,
 }
 
+fn retired_manifest_path_valid(path: &str, untracked: bool) -> bool {
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return false;
+    }
+    let mut has_name = false;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(name) => {
+                if name.to_string_lossy().eq_ignore_ascii_case(".git") {
+                    return false;
+                }
+                has_name = true;
+            }
+            _ if untracked => return false,
+            _ => {}
+        }
+    }
+    has_name
+}
+
+fn retired_manifest_fields_valid(parts: &[&str]) -> bool {
+    let paths_hint = (!parts[7].is_empty()).then_some(parts[7]);
+    let untracked_snapshot = parts
+        .get(8)
+        .into_iter()
+        .flat_map(|field| field.split('\u{1f}'))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let unique_snapshot = untracked_snapshot
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        == untracked_snapshot.len();
+    let direct_file_tool = matches!(parts[3], "write_file" | "edit_file" | "multi_edit");
+
+    paths_hint.is_none_or(|path| retired_manifest_path_valid(path, false))
+        && untracked_snapshot.len() <= UNTRACKED_SNAPSHOT_CAP
+        && unique_snapshot
+        && untracked_snapshot
+            .iter()
+            .all(|path| retired_manifest_path_valid(path, true))
+        && (!direct_file_tool || paths_hint.is_some())
+        && (parts[6] == "false" || paths_hint.is_some() || !untracked_snapshot.is_empty())
+}
+
 /// Header metadata of a row written by a retired Dext manifest encoding (the
 /// 8- and 9-field pre-JSON forms). Recognition requires an intact checkpoint
-/// header, so genuine corruption or tampering still fails the manifest closed
-/// instead of being quietly skipped.
+/// header and valid retired field grammar, so genuine corruption or tampering
+/// still fails the manifest closed instead of being quietly skipped.
 fn retired_manifest_row(line: &str) -> Option<RetiredManifestRow<'_>> {
     let parts: Vec<&str> = line.splitn(13, '\t').collect();
     if !matches!(parts.len(), 8 | 9) {
         return None;
     }
     // A current row truncated to 8 or 9 fields would still carry an intact
-    // header, but its path-hint field is a JSON array and no pre-JSON writer
-    // emitted one. Rejecting those keeps truncation fatal rather than skippable.
-    if parts[7].trim_start().starts_with('[') {
+    // header, but its path fields are JSON arrays and no pre-JSON writer
+    // emitted those. Rejecting either array-shaped field keeps truncation fatal
+    // rather than skippable even if the other field was damaged.
+    if parts[7].trim_start().starts_with('[')
+        || parts
+            .get(8)
+            .is_some_and(|field| field.trim_start().starts_with('['))
+    {
         return None;
     }
     (safe_checkpoint_id(parts[0])
@@ -1936,7 +1987,8 @@ fn retired_manifest_row(line: &str) -> Option<RetiredManifestRow<'_>> {
         && valid_checkpoint_tool_name(parts[3])
         && parts[4].parse::<u128>().is_ok()
         && valid_object_id(parts[5])
-        && matches!(parts[6], "true" | "false"))
+        && matches!(parts[6], "true" | "false")
+        && retired_manifest_fields_valid(&parts))
     .then_some(RetiredManifestRow {
         id: parts[0],
         ref_name: parts[1],
@@ -3479,30 +3531,34 @@ fn prune_checkpoint_refs(
     let mut expired = Vec::new();
     for (i, cp) in cps.into_iter().enumerate() {
         let age = now.saturating_sub(cp.created_at_ms);
-        if i >= keep || age > max_age_ms {
-            expired.push(cp);
-        } else {
+        if i < keep && age <= max_age_ms {
             remaining.push(cp);
+        } else {
+            expired.push(cp);
         }
     }
-    // Delete refs before compacting the manifest. If a ref deletion fails, the
-    // original manifest still names every live checkpoint ref. A later manifest
-    // write failure can leave stale entries for already-deleted refs, which list
-    // and the next prune safely ignore.
+    // Commit the compacted manifest before deleting any refs. If the manifest
+    // write fails, every live recovery ref remains named. If later ref cleanup
+    // fails, only an orphan ref is left; ordinary listing and /undo still see a
+    // self-consistent manifest instead of failing on a missing named ref.
     //
-    // Recognized retired rows are safe to reclaim only after their recorded OID
-    // was matched to the live ref during listing. Unrecognized parse failures
-    // never reach this rewrite, and a retired row/ref mismatch fails closed.
-    for cp in &expired {
-        run_git(git_root, &["update-ref", "-d", &cp.ref_name])?;
-    }
-    for ref_name in &retired_refs {
-        run_git(git_root, &["update-ref", "-d", ref_name])?;
-    }
+    // Recognized retired rows are safe to reclaim only after their full retired
+    // grammar was validated and their recorded OID matched the live ref during
+    // listing. Unrecognized parse failures never reach this rewrite, and a
+    // retired row/ref mismatch fails closed.
     write_checkpoint_manifest(git_root, &remaining)?;
+    let mut checkpoints_removed = 0usize;
+    for checkpoint in expired {
+        run_git(git_root, &["update-ref", "-d", &checkpoint.ref_name])?;
+        checkpoints_removed = checkpoints_removed.saturating_add(1);
+    }
+    for ref_name in retired_refs {
+        run_git(git_root, &["update-ref", "-d", &ref_name])?;
+        checkpoints_removed = checkpoints_removed.saturating_add(1);
+    }
     let sidecar_outcome = prune_orphan_sidecars(git_root, &remaining)?;
     Ok(PruneOutcome {
-        checkpoints_removed: expired.len().saturating_add(retired_refs.len()),
+        checkpoints_removed,
         orphan_sidecars_removed: sidecar_outcome.removed,
         warnings: sidecar_outcome.warnings,
     })
@@ -3769,6 +3825,9 @@ pub(crate) fn prune(
         .into_iter()
         .filter(|cp| run_git(&git_root, &["rev-parse", "--verify", &cp.ref_name]).is_ok())
         .collect();
+    // Publish the reconciled manifest before deleting refs or artifacts. Any
+    // later cleanup failure then leaves only recoverable orphan state.
+    write_checkpoint_manifest(&git_root, &remaining)?;
     let remaining_refs: std::collections::HashSet<&str> =
         remaining.iter().map(|cp| cp.ref_name.as_str()).collect();
     let refs = run_git(
@@ -3789,8 +3848,6 @@ pub(crate) fn prune(
             record_prune_warning(&mut warnings, warning);
         }
     }
-
-    write_checkpoint_manifest(&git_root, &remaining)?;
 
     let mut result = format!(
         "pruned {removed} checkpoint(s) and {orphan_sidecars_removed} orphan sidecar entr{}, {} remaining",
@@ -4042,7 +4099,15 @@ mod tests {
         let json_nine = format!(
             "fixture-nine\trefs/dext/checkpoints/session/fixture-nine\t{oid}\twrite_file\t1\t{oid}\ttrue\t[\"note.txt\"]\t[]"
         );
-        for retired in [&pre_json_eight, &pre_json_nine, &json_nine] {
+        let json_nine_snapshot = format!(
+            "fixture-nine-snapshot\trefs/dext/checkpoints/session/fixture-nine-snapshot\t{oid}\twrite_file\t1\t{oid}\ttrue\tdamaged\t[]"
+        );
+        for retired in [
+            &pre_json_eight,
+            &pre_json_nine,
+            &json_nine,
+            &json_nine_snapshot,
+        ] {
             assert!(
                 parse_manifest_line(retired).is_none(),
                 "retired manifest encoding must not parse: {retired}"
@@ -4065,6 +4130,10 @@ mod tests {
         assert!(
             retired_manifest_row(&json_nine).is_none(),
             "a JSON path field means a truncated current row, not a retired one"
+        );
+        assert!(
+            retired_manifest_row(&json_nine_snapshot).is_none(),
+            "a JSON snapshot field means a damaged truncated current row, not a retired one"
         );
         for not_retired in [
             "corrupt manifest line",

@@ -9047,6 +9047,7 @@ fn privacy_redacts_sensitive_tool_output_and_strict_mode_blocks_secret_paths() {
         assert!(denial.contains(tool), "{denial}");
     }
     for (tool, input) in [
+        ("fd", json!({"pattern": ".env", "extra_args": ["--glob"]})),
         ("fd", json!({"pattern": ".*", "extra_args": ["--hidden"]})),
         ("fd", json!({"pattern": ".*", "extra_args": ["-uuu"]})),
         (
@@ -9056,6 +9057,20 @@ fn privacy_redacts_sensitive_tool_output_and_strict_mode_blocks_secret_paths() {
         (
             "rg",
             json!({"pattern": "token", "extra_args": ["--glob=.env"]}),
+        ),
+        (
+            "rg",
+            json!({"pattern": "token", "extra_args": ["--glob=*.env"]}),
+        ),
+        (
+            "rg",
+            json!({"pattern": "token", "extra_args": ["--glob=.env.*"]}),
+        ),
+        ("rg", json!({"pattern": "token", "extra_args": ["-g.env"]})),
+        ("rg", json!({"pattern": "token", "extra_args": ["-ig.env"]})),
+        (
+            "rg",
+            json!({"pattern": "token", "extra_args": ["-ig", ".env"]}),
         ),
     ] {
         let denial = agent
@@ -9069,23 +9084,53 @@ fn privacy_redacts_sensitive_tool_output_and_strict_mode_blocks_secret_paths() {
             .privacy
             .path_denial(
                 "rg",
-                &json!({"pattern": "needle", "path": ".", "extra_args": ["-i"]}),
+                &json!({"pattern": "needle", "path": ".", "extra_args": ["-m", "1", "-H"]}),
                 &root,
             )
-            .is_none(),
-        "ordinary strict-mode code search must remain available"
+            .is_some(),
+        "strict privacy must resume option parsing after a separate short-option value"
     );
     assert!(
         agent
             .privacy
-            .path_denial("fd", &json!({"pattern": "\\.rs$", "path": "."}), &root)
+            .path_denial(
+                "rg",
+                &json!({"pattern": "needle", "path": ".", "extra_args": ["-mH"]}),
+                &root,
+            )
             .is_none(),
-        "ordinary strict-mode file discovery must remain available"
+        "letters inside an attached option value must not be parsed as hidden/ignore flags"
     );
 
+    assert!(
+        agent
+            .privacy
+            .path_denial(
+                "fd",
+                &json!({"pattern": "build", "path": ".", "extra_args": ["--glob"]}),
+                &root,
+            )
+            .is_none(),
+        "fd's boolean --glob flag must apply to its pattern without consuming a value"
+    );
+    assert!(
+        agent
+            .privacy
+            .path_denial(
+                "fd",
+                &json!({"pattern": "build", "path": ".", "extra_args": ["--glob", "--hidden"]}),
+                &root,
+            )
+            .is_some(),
+        "fd's boolean --glob flag must not hide the following --hidden option"
+    );
     assert!(privacy_sensitive_path("/tmp/.ssh/config"));
     assert!(privacy_sensitive_path("config/providers.json"));
+    assert!(privacy_sensitive_path("config/.env.local"));
     assert!(privacy_sensitive_path("private.key"));
+    assert!(!privacy_sensitive_search_glob("!.env"));
+    assert!(privacy_sensitive_search_glob("*.env"));
+    assert!(privacy_sensitive_search_glob("**/id_*"));
     assert!(!privacy_sensitive_path("src/private_api.rs"));
     assert!(!privacy_sensitive_path(
         "docs/credential-safe-subprocesses.md"
@@ -10566,6 +10611,31 @@ fn assert_process_dead(pid: libc::pid_t, label: &str) {
 }
 
 #[cfg(unix)]
+#[test]
+fn child_process_tree_drop_reaps_unfinished_process_group() -> Result<()> {
+    let root = temp_test_dir("process-tree-drop-cleanup");
+    let mut command = Command::new(bash_executable_path());
+    command
+        .arg("-lc")
+        .arg("sleep 30")
+        .current_dir(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    configure_std_process_group(&mut command);
+    let mut child = command.spawn()?;
+    let pid = child.id() as libc::pid_t;
+    let process_tree = ChildProcessTree::for_std(&child)?;
+
+    drop(process_tree);
+    let _ = child.wait();
+    assert_process_dead(pid, "dropped process-tree guard");
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn bash_process_lifecycle_matrix_reaps_background_nohup_and_disown_descendants() {
     let root = temp_test_dir("bash-descendant-lifecycle");
@@ -10783,6 +10853,7 @@ fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
         "read_file",
         &json!({"path": "big.txt", "offset": 1, "limit": 110}),
         &root,
+        None,
         Some(&cache),
         None,
         None,
@@ -10828,6 +10899,7 @@ fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
         "read_file",
         &json!({"path": "big.txt", "offset": 10, "limit": 10}),
         &root,
+        None,
         Some(&cache),
         None,
         None,
@@ -10838,6 +10910,154 @@ fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_file_cache_records_the_actual_eof_when_offset_is_past_it() {
+    let root = temp_test_dir("read-file-cache-past-eof");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(root.join("short.txt"), "one\ntwo\nthree\n").expect("write fixture");
+    let path = std::fs::canonicalize(root.join("short.txt")).expect("canonical file");
+    let signature = file_signature_from_metadata(&std::fs::metadata(&path).expect("metadata"));
+    let cache = Arc::new(Mutex::new(ReadFileCache::default()));
+
+    let output = execute_tool_with_cache(
+        "read_file",
+        &json!({"path": "short.txt", "offset": 10, "limit": 1}),
+        &root,
+        None,
+        Some(&cache),
+        None,
+        None,
+    )
+    .expect("past-EOF read should succeed");
+    assert!(output.is_empty(), "{output}");
+    assert_eq!(
+        cache
+            .lock()
+            .expect("cache lock")
+            .files
+            .get(&path)
+            .and_then(|file| file.eof_at),
+        Some(3)
+    );
+    assert_eq!(
+        cache.lock().expect("cache lock").get_window(
+            &path,
+            signature,
+            4,
+            1,
+            READ_FILE_EXPLICIT_CAPTURE_CAP,
+        ),
+        Some(String::new())
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_file_honors_an_inflight_interrupt() {
+    let root = temp_test_dir("read-file-inflight-interrupt");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let path = root.join("large.txt");
+    let mut file = std::fs::File::create(&path).expect("create large fixture");
+    use std::io::Write as _;
+    for _ in 0..200_000 {
+        writeln!(file, "0123456789abcdef").expect("write fixture line");
+    }
+    drop(file);
+
+    let interrupt = AtomicBool::new(true);
+    let error = execute_tool_with_cache(
+        "read_file",
+        &json!({"path": "large.txt", "offset": 1, "limit": 200_000}),
+        &root,
+        Some(&interrupt),
+        None,
+        None,
+        None,
+    )
+    .expect_err("interrupt must stop the blocking read loop");
+    assert!(error.contains("interrupted by user"), "{error}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_file_limit_stops_after_detecting_one_more_line() {
+    let root = temp_test_dir("read-file-limit-stops-early");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut content = String::from("first\nsecond\n");
+    content.push_str(&"tail\n".repeat(50_000));
+    std::fs::write(root.join("large.txt"), content).expect("write fixture");
+
+    let out = execute_tool(
+        "read_file",
+        &json!({"path": "large.txt", "offset": 1, "limit": 1}),
+        &root,
+    )
+    .expect("bounded read should succeed");
+    assert!(out.contains("1\tfirst"), "{out}");
+    assert!(out.contains("more lines remain; pass offset=2"), "{out}");
+    assert!(!out.contains("50001"), "{out}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_file_oversized_single_line_resumes_after_that_line() {
+    let root = temp_test_dir("read-file-oversized-line");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let content = format!("{}\nafter\n", "x".repeat(TEXT_TOOL_CAPTURE_CAP * 2));
+    std::fs::write(root.join("large.txt"), content).expect("write fixture");
+
+    let out = execute_tool("read_file", &json!({"path": "large.txt"}), &root)
+        .expect("bounded read should succeed");
+    assert!(out.contains("Line 1 exceeds"), "{out}");
+    assert!(out.contains("offset=2"), "{out}");
+
+    let resumed = execute_tool(
+        "read_file",
+        &json!({"path": "large.txt", "offset": 2, "limit": 1}),
+        &root,
+    )
+    .expect("resume should advance beyond oversized line");
+    assert!(resumed.contains("2\tafter"), "{resumed}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_symbol_honors_interrupt_and_input_bound() {
+    let root = temp_test_dir("read-symbol-bounds");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(root.join("small.rs"), "fn target() {}\n").expect("write small fixture");
+    let interrupt = AtomicBool::new(true);
+    let interrupted = execute_tool_with_cache(
+        "read_symbol",
+        &json!({"path": "small.rs", "symbol": "target"}),
+        &root,
+        Some(&interrupt),
+        None,
+        None,
+        None,
+    )
+    .expect_err("interrupt must stop read_symbol");
+    assert!(interrupted.contains("interrupted by user"), "{interrupted}");
+
+    let oversized = root.join("oversized.rs");
+    let file = std::fs::File::create(&oversized).expect("create oversized fixture");
+    file.set_len(READ_SYMBOL_INPUT_MAX_BYTES as u64 + 1)
+        .expect("size oversized fixture");
+    let error = execute_tool(
+        "read_symbol",
+        &json!({"path": "oversized.rs", "line": 1}),
+        &root,
+    )
+    .expect_err("oversized input must be rejected");
+    assert!(error.contains("input limit"), "{error}");
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -10927,6 +11147,28 @@ fn read_symbol_requires_exactly_one_selector() {
     .expect("both selectors should be rejected");
     assert!(both.contains("only one"), "{both}");
 
+    for input in [
+        json!({"path": "lib.rs", "line": 0}),
+        json!({"path": "lib.rs", "line": "12"}),
+        json!({"path": "lib.rs", "symbol": 12}),
+        json!({"path": "lib.rs", "line": 12, "context": 51}),
+    ] {
+        assert!(
+            tool_policy::tool_input_issue("read_symbol", &input).is_some(),
+            "invalid selector accepted: {input}"
+        );
+    }
+    for input in [
+        json!({"path": "lib.rs", "offset": 0}),
+        json!({"path": "lib.rs", "limit": 0}),
+        json!({"path": "lib.rs", "limit": "10"}),
+    ] {
+        assert!(
+            tool_policy::tool_input_issue("read_file", &input).is_some(),
+            "invalid read window accepted: {input}"
+        );
+    }
+
     let root = temp_test_dir("read-symbol-selector-validation");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     std::fs::write(root.join("lib.rs"), "fn target() {}\n").expect("write source");
@@ -10937,6 +11179,9 @@ fn read_symbol_requires_exactly_one_selector() {
     )
     .expect_err("runtime should reject ambiguous selector");
     assert!(err.contains("exactly one"), "{err}");
+    let zero_limit = execute_tool("read_file", &json!({"path": "lib.rs", "limit": 0}), &root)
+        .expect_err("runtime must reject a non-advancing read window");
+    assert!(zero_limit.contains("positive integer"), "{zero_limit}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -12805,6 +13050,11 @@ fn search_tools_reject_subprocess_exec_flags() {
         ("rg", vec!["../outside"]),
         ("rg", vec!["--files"]),
         ("rg", vec!["--regexp=alternate"]),
+        ("rg", vec!["-ealternate"]),
+        ("rg", vec!["-iealternate"]),
+        ("rg", vec!["-fpatterns.txt"]),
+        ("rg", vec!["-ifpatterns.txt"]),
+        ("rg", vec!["-ig"]),
     ] {
         let err = prepare_external_tool(
             name,
@@ -12817,14 +13067,19 @@ fn search_tools_reject_subprocess_exec_flags() {
         )
         .expect_err("extra_args must not add or replace search operands");
         assert!(
-            err.contains("search operands") || err.contains("positional"),
+            err.contains("search operands")
+                || err.contains("positional")
+                || err.contains("requires a value"),
             "{name}: {err}"
         );
     }
 
     for (name, extra_args) in [
         ("fd", vec!["-H", "-t", "f", "--glob"]),
+        ("fd", vec!["-ejsx"]),
         ("rg", vec!["-i", "--glob", "*.rs", "--max-count", "3"]),
+        ("rg", vec!["-ig", "*.rs"]),
+        ("rg", vec!["-g*.gz"]),
     ] {
         prepare_external_tool(
             name,
@@ -15573,6 +15828,18 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
     );
     assert!(parse_session_header(r#"{"version":"3"}"#).is_err());
     assert!(parse_session_header("[]").is_err());
+    assert!(
+        parse_session_header(
+            r#"{"version":3,"model":"bad","system":"system","usage":{"cost_usd":-1.0}}"#
+        )
+        .is_err()
+    );
+    assert!(
+        parse_session_header(
+            r#"{"version":3,"model":"bad","system":"system","budget_cap":{"usd":0.0,"tokens":null}}"#
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -16506,6 +16773,13 @@ fn json_permission_always_denies_without_delegating_to_console() {
 }
 
 #[test]
+fn json_sink_crash_recording_ownership_avoids_text_delegation_duplicates() {
+    assert!(!JsonSink::new(OutputMode::Text, false, true).records_crash_events_directly());
+    assert!(JsonSink::new(OutputMode::Json, false, true).records_crash_events_directly());
+    assert!(JsonSink::new(OutputMode::StreamJson, false, true).records_crash_events_directly());
+}
+
+#[test]
 fn approval_policy_resolver_is_fail_safe_and_has_fixed_precedence() {
     let resolved = resolve_approval_policy(None, None, None);
     assert_eq!(resolved.profile, ApprovalProfile::Ask);
@@ -17418,6 +17692,68 @@ fn usage_add_drops_exact_cost_when_mixing_unpriced_nonzero_usage() {
 }
 
 #[test]
+fn usage_add_saturates_counts_and_drops_non_finite_cost() {
+    let mut usage = Usage {
+        input: u64::MAX,
+        output: u64::MAX,
+        cache_create: u64::MAX,
+        cache_read: u64::MAX,
+        cost_usd: Some(f64::MAX),
+    };
+    usage.add(Usage {
+        input: 1,
+        output: 1,
+        cache_create: 1,
+        cache_read: 1,
+        cost_usd: Some(f64::MAX),
+    });
+
+    assert_eq!(usage.input, u64::MAX);
+    assert_eq!(usage.output, u64::MAX);
+    assert_eq!(usage.cache_create, u64::MAX);
+    assert_eq!(usage.cache_read, u64::MAX);
+    assert_eq!(usage.cost_usd, None);
+}
+
+#[test]
+fn budget_cap_rejects_duplicate_dimensions_in_combined_caps() {
+    assert_eq!(
+        BudgetCap::parse("200000t").and_then(|cap| cap.tokens),
+        Some(200_000)
+    );
+    assert!(BudgetCap::parse("$1 + $2").is_none());
+    assert!(BudgetCap::parse("100k tokens + 200k tokens").is_none());
+    assert!(BudgetCap::parse("$1 +").is_none());
+    assert!(BudgetCap::parse(",200k tokens").is_none());
+    assert!(parse_token_count("18446744073709551615").is_none());
+
+    let combined = BudgetCap::parse("$1 + 200k tokens").expect("one cap per dimension");
+    assert_eq!(combined.usd, Some(1.0));
+    assert_eq!(combined.tokens, Some(200_000));
+}
+
+#[test]
+fn budget_cap_environment_rejects_invalid_values_instead_of_disabling_the_guard() {
+    let _guard = env_lock();
+    let old = std::env::var_os("DEXT_BUDGET_CAP");
+
+    unsafe { std::env::set_var("DEXT_BUDGET_CAP", "$1 + $2") };
+    assert!(BudgetCap::from_env().is_err());
+
+    unsafe { std::env::set_var("DEXT_BUDGET_CAP", "off") };
+    assert_eq!(BudgetCap::from_env().expect("parse off"), None);
+
+    unsafe { std::env::set_var("DEXT_BUDGET_CAP", "$1 + 200kt") };
+    let cap = BudgetCap::from_env()
+        .expect("parse valid environment cap")
+        .expect("cap enabled");
+    assert_eq!(cap.usd, Some(1.0));
+    assert_eq!(cap.tokens, Some(200_000));
+
+    restore_env_var("DEXT_BUDGET_CAP", old);
+}
+
+#[test]
 fn usage_fallback_estimates_missing_output_when_input_usage_is_present() {
     let root = temp_test_dir("usage-fallback-output");
     let agent = test_agent(&root);
@@ -18046,6 +18382,13 @@ fn todo_and_compact_settings_state_fixtures_validate_without_rewriting_rejection
             .expect_err("non-array todo fixture must fail");
         assert!(error.contains("expected array"), "{error}");
         assert_eq!(std::fs::read(&todo_path)?, corrupt_todo);
+
+        let oversized_todo = std::fs::File::create(&todo_path)?;
+        oversized_todo.set_len(TODO_STATE_MAX_BYTES as u64 + 1)?;
+        drop(oversized_todo);
+        let error = execute_tool("todo_read", &json!({}), &root)
+            .expect_err("oversized todo state must fail before allocation");
+        assert!(error.contains("input limit"), "{error}");
 
         let settings_path = compact_threshold_settings_path();
         std::fs::create_dir_all(settings_path.parent().context("settings parent")?)?;
@@ -24407,6 +24750,52 @@ fn prompt_scan_cache_revalidates_on_file_change() -> Result<()> {
     assert!(
         dext.iter().any(|(_, _, c)| c.contains("use rg")),
         "{dext:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn prompt_context_hash_uses_the_same_file_safety_bound_as_prompt_loading() -> Result<()> {
+    let root = temp_test_dir("prompt-context-hash-bound");
+    let regular = root.join("DEXT.md");
+    std::fs::write(&regular, "safe guidance")?;
+    assert_eq!(
+        prompt_context_file_hash(&regular).as_deref(),
+        Some(sha256_hex_bytes(b"safe guidance").as_str())
+    );
+
+    let oversized = root.join("recall.md");
+    let file = std::fs::File::create(&oversized)?;
+    file.set_len(PROMPT_CONTEXT_FILE_MAX_BYTES as u64 + 1)?;
+    drop(file);
+    assert_eq!(prompt_context_file_hash(&oversized), None);
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&regular, root.join("linked.md"))?;
+        assert_eq!(prompt_context_file_hash(&root.join("linked.md")), None);
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn prompt_scan_skips_oversized_context_files() -> Result<()> {
+    let root = temp_test_dir("prompt-scan-oversized");
+    let root = std::fs::canonicalize(&root)?;
+    let file = std::fs::File::create(root.join("DEXT.md"))?;
+    file.set_len(PROMPT_CONTEXT_FILE_MAX_BYTES as u64 + 1)?;
+    drop(file);
+
+    let agent = test_agent(&root);
+    let (dext, _, _, _) = agent.prompt_scans();
+    assert!(
+        dext.iter()
+            .all(|(_, path, _)| path != &root.join("DEXT.md")),
+        "oversized context must not enter prompt: {dext:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

@@ -392,31 +392,49 @@ impl PrivacyPolicy {
 }
 
 pub(crate) fn privacy_sensitive_search_scope(tool_name: &str, input: &Value) -> bool {
+    let pattern = input["pattern"].as_str();
     if tool_name == "fd"
-        && input["pattern"]
-            .as_str()
-            .is_some_and(privacy_sensitive_path)
+        && pattern.is_some_and(|pattern| {
+            privacy_sensitive_path(pattern) || privacy_sensitive_search_glob(pattern)
+        })
     {
         return true;
     }
     let args = str_array(&input["extra_args"]);
     let mut expect_glob = false;
+    let mut skip_value = false;
     for arg in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
         if expect_glob {
-            if privacy_sensitive_path(&arg) {
+            if privacy_sensitive_search_glob(&arg) {
                 return true;
             }
             expect_glob = false;
             continue;
         }
-        if matches!(arg.as_str(), "-g" | "--glob" | "--iglob") {
+        if tool_name == "rg" && matches!(arg.as_str(), "-g" | "--glob" | "--iglob") {
+            expect_glob = true;
+            continue;
+        }
+        if tool_name == "rg"
+            && crate::tool_policy::search_short_value_option("rg", &arg)
+                .is_some_and(|(flag, value)| flag == 'g' && value.is_empty())
+        {
             expect_glob = true;
             continue;
         }
         if let Some(glob) = arg
             .strip_prefix("--glob=")
             .or_else(|| arg.strip_prefix("--iglob="))
-            && privacy_sensitive_path(glob)
+            .or_else(|| {
+                (tool_name == "rg")
+                    .then(|| crate::tool_policy::rg_attached_glob(&arg))
+                    .flatten()
+            })
+            && privacy_sensitive_search_glob(glob)
         {
             return true;
         }
@@ -438,12 +456,10 @@ pub(crate) fn privacy_sensitive_search_scope(tool_name: &str, input: &Value) -> 
         ) {
             return true;
         }
-        if arg.starts_with('-')
-            && !arg.starts_with("--")
-            && arg[1..].chars().any(|flag| matches!(flag, 'H' | 'L' | 'u'))
-        {
+        if crate::tool_policy::search_short_flag_present(tool_name, &arg, &['H', 'L', 'u']) {
             return true;
         }
+        skip_value = crate::tool_policy::search_tool_option_takes_value(tool_name, &arg);
     }
     false
 }
@@ -904,6 +920,28 @@ pub(crate) fn luhn_valid(digits: &str) -> bool {
     sum > 0 && sum.is_multiple_of(10)
 }
 
+pub(crate) fn privacy_sensitive_search_glob(glob: &str) -> bool {
+    if glob.starts_with('!') {
+        return false;
+    }
+    if privacy_sensitive_path(glob) {
+        return true;
+    }
+    let basename = glob
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(glob)
+        .to_ascii_lowercase();
+    let normalized = basename
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        .collect::<String>();
+    normalized.starts_with(".env")
+        || normalized.starts_with("id_")
+        || normalized.contains("credential")
+        || normalized.contains("private") && normalized.contains("key")
+}
+
 pub(crate) fn privacy_sensitive_path(path: &str) -> bool {
     let path = Path::new(path);
     let file_name = path
@@ -926,7 +964,8 @@ pub(crate) fn privacy_sensitive_path(path: &str) -> bool {
             | "id_ed25519"
             | "id_rsa"
             | "providers.json"
-    ) || file_name.ends_with(".pem")
+    ) || file_name.starts_with(".env.")
+        || file_name.ends_with(".pem")
         || file_name.ends_with(".key")
         || file_name.ends_with(".p12")
         || file_name.ends_with(".pfx")

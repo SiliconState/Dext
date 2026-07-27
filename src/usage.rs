@@ -33,12 +33,12 @@ impl Usage {
         let rhs_cost = o.cost_usd;
         let lhs_tokens = self.total_tokens();
         let rhs_tokens = o.total_tokens();
-        self.input += o.input;
-        self.output += o.output;
-        self.cache_create += o.cache_create;
-        self.cache_read += o.cache_read;
+        self.input = self.input.saturating_add(o.input);
+        self.output = self.output.saturating_add(o.output);
+        self.cache_create = self.cache_create.saturating_add(o.cache_create);
+        self.cache_read = self.cache_read.saturating_add(o.cache_read);
         self.cost_usd = match (lhs_cost, rhs_cost) {
-            (Some(a), Some(b)) => Some(a + b),
+            (Some(a), Some(b)) => Some(a + b).filter(|cost| cost.is_finite()),
             (Some(a), None) if rhs_tokens == 0 => Some(a),
             (None, Some(b)) if lhs_tokens == 0 => Some(b),
             (None, None) if lhs_tokens == 0 && rhs_tokens == 0 => None,
@@ -68,6 +68,11 @@ impl Usage {
 
     pub(crate) fn total_tokens(&self) -> u64 {
         self.billed_tokens()
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        self.cost_usd
+            .is_none_or(|cost| cost.is_finite() && cost >= 0.0)
     }
 
     pub(crate) fn estimated_cost_usd(&self) -> f64 {
@@ -441,6 +446,12 @@ pub(crate) struct BudgetCap {
 }
 
 impl BudgetCap {
+    pub(crate) fn is_valid(&self) -> bool {
+        (self.usd.is_some() || self.tokens.is_some())
+            && self.usd.is_none_or(|usd| usd.is_finite() && usd > 0.0)
+            && self.tokens.is_none_or(|tokens| tokens > 0)
+    }
+
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim();
         if raw.eq_ignore_ascii_case("off")
@@ -450,20 +461,27 @@ impl BudgetCap {
         {
             return None;
         }
-        let parts: Vec<&str> = raw
-            .split([',', '+'])
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .collect();
+        let parts: Vec<&str> = raw.split([',', '+']).map(str::trim).collect();
         if parts.len() > 1 {
+            if parts.iter().any(|part| part.is_empty()) {
+                return None;
+            }
             let mut cap = Self {
                 usd: None,
                 tokens: None,
             };
             for part in parts {
                 let parsed = Self::parse_one(part)?;
-                cap.usd = cap.usd.or(parsed.usd);
-                cap.tokens = cap.tokens.or(parsed.tokens);
+                if let Some(usd) = parsed.usd
+                    && cap.usd.replace(usd).is_some()
+                {
+                    return None;
+                }
+                if let Some(tokens) = parsed.tokens
+                    && cap.tokens.replace(tokens).is_some()
+                {
+                    return None;
+                }
             }
             return (cap.usd.is_some() || cap.tokens.is_some()).then_some(cap);
         }
@@ -496,6 +514,7 @@ impl BudgetCap {
             .strip_suffix("tok")
             .or_else(|| lower.strip_suffix("tokens"))
             .or_else(|| lower.strip_suffix("token"))
+            .or_else(|| lower.strip_suffix('t'))
         {
             return parse_token_count(rest.trim()).map(|tokens| Self {
                 usd: None,
@@ -508,10 +527,25 @@ impl BudgetCap {
         })
     }
 
-    pub(crate) fn from_env() -> Option<Self> {
-        std::env::var("DEXT_BUDGET_CAP")
-            .ok()
-            .and_then(|v| Self::parse(&v))
+    pub(crate) fn from_env() -> Result<Option<Self>, String> {
+        let raw = match std::env::var("DEXT_BUDGET_CAP") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("DEXT_BUDGET_CAP must be valid UTF-8".to_string());
+            }
+        };
+        if raw.trim().eq_ignore_ascii_case("off")
+            || raw.trim().eq_ignore_ascii_case("none")
+            || raw.trim().eq_ignore_ascii_case("disabled")
+            || raw.trim() == "0"
+        {
+            return Ok(None);
+        }
+        Self::parse(&raw).map(Some).ok_or_else(|| {
+            "invalid DEXT_BUDGET_CAP (expected positive dollars or tokens, optionally one of each)"
+                .to_string()
+        })
     }
 
     pub(crate) fn exceeded(&self, usage: Usage) -> Option<String> {
@@ -559,5 +593,5 @@ pub(crate) fn parse_token_count(raw: &str) -> Option<u64> {
     };
     let value = parse_positive_f64(number)?;
     let tokens = (value * mult).round();
-    (tokens.is_finite() && tokens >= 1.0 && tokens <= u64::MAX as f64).then_some(tokens as u64)
+    (tokens.is_finite() && tokens >= 1.0 && tokens < u64::MAX as f64).then_some(tokens as u64)
 }

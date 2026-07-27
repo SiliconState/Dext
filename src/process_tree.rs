@@ -113,6 +113,8 @@ fn resume_windows_process(pid: u32) -> io::Result<()> {
 pub(crate) struct ChildProcessTree {
     #[cfg(unix)]
     pid: u32,
+    #[cfg(unix)]
+    armed: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     job: usize,
 }
@@ -121,7 +123,10 @@ impl ChildProcessTree {
     pub(crate) fn for_std(child: &std::process::Child) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            Ok(Self { pid: child.id() })
+            Ok(Self {
+                pid: child.id(),
+                armed: std::sync::atomic::AtomicBool::new(true),
+            })
         }
         #[cfg(windows)]
         {
@@ -140,7 +145,10 @@ impl ChildProcessTree {
         {
             child
                 .id()
-                .map(|pid| Self { pid })
+                .map(|pid| Self {
+                    pid,
+                    armed: std::sync::atomic::AtomicBool::new(true),
+                })
                 .ok_or_else(|| io::Error::other("child exited before process-tree setup"))
         }
         #[cfg(windows)]
@@ -221,6 +229,9 @@ impl ChildProcessTree {
         unsafe {
             windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
         }
+        #[cfg(unix)]
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn terminate_std_child(&self, child: &mut std::process::Child) {
@@ -236,6 +247,9 @@ impl ChildProcessTree {
         }
         let _ = child.kill();
         let _ = child.wait();
+        #[cfg(unix)]
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) async fn terminate_tokio_child(&self, child: &mut tokio::process::Child) {
@@ -251,11 +265,19 @@ impl ChildProcessTree {
         }
         let _ = child.kill().await;
         let _ = child.wait().await;
+        #[cfg(unix)]
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
 impl Drop for ChildProcessTree {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.armed.load(std::sync::atomic::Ordering::Acquire) {
+            signal_process_group(self.pid, libc::SIGTERM);
+            signal_process_group(self.pid, libc::SIGKILL);
+        }
         #[cfg(windows)]
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.job as _);

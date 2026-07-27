@@ -170,18 +170,45 @@
 
 - Interrupting a parallel built-in tool round now actually cancels it. Queued
   calls previously acquired their concurrency permit and began executing after
-  Ctrl-C, `read_file`/`rg`/`fd` had no cancellation path at all, and the round
-  waiter noticed an interrupt only after some task completed. The waiter now
-  polls cancellation independently of task completion, in-flight tasks are
-  aborted, a call that wins its permit after the interrupt refuses to start,
-  and every abandoned `tool_use` id is reported as interrupted rather than as
-  an unknown outcome.
+  Ctrl-C, `read_file`/`read_symbol`/`todo_read`/`rg`/`fd` had incomplete
+  cancellation paths, and the round waiter noticed an interrupt only after some
+  task completed. The waiter now polls cancellation independently of task
+  completion, in-flight tasks are aborted, a call that wins its permit after the
+  interrupt refuses to start, and every abandoned `tool_use` id is reported as
+  interrupted rather than as an unknown outcome. Native file loading checks
+  cancellation between bounded chunks; `read_file` stops once it detects data
+  beyond an explicit limit and advances past a single over-cap line,
+  `read_symbol` rejects source inputs above 8 MiB, and todo state is capped at
+  256 KiB across tool/prompt/TUI loading. Each ancestor `DEXT.md`/`recall.md`
+  input is a regular non-symlink file capped at 1 MiB for both prompt loading and
+  session provenance hashing. Zero, mistyped,
+  overflowing, or out-of-range native read selectors now fail instead of being
+  clamped or silently defaulted.
+- Privacy-strict search scope now recognizes compact ripgrep globs such as
+  `-g.env`/`-ig .env`, wildcard-prefixed sensitive globs such as `*.env`,
+  `.env.*` variants, and attached operand-changing `-ePATTERN`/`-fFILE` forms,
+  while respecting where an attached short-option value begins, closing
+  spelling-dependent bypasses without treating letters inside values as flags.
+- Combined budget caps now accept the documented compact `t` token suffix and
+  reject duplicate dimensions, empty components, and unrepresentable token
+  counts instead of silently retaining or saturating a value. Invalid
+  `DEXT_BUDGET_CAP` configuration now fails startup instead of disabling the
+  guard. Resumed session
+  headers reject invalid persisted usage costs and empty/non-positive caps.
+- JSON and stream-JSON sinks now record each structural crash breadcrumb exactly
+  once; text-mode delegation no longer double-records the same event.
+- Child process-tree guards now terminate unfinished Unix process groups when
+  dropped during cancellation or unwinding, closing the lifecycle gap between
+  explicit exit/timeout/interrupt cleanup paths.
 - Recovery checkpoint loading no longer blocks write-risk tools on a recognized
-  retired manifest row: preview omits untracked snapshot entries with unsafe
+  retired manifest row: recognition validates the complete retired field grammar
+  as well as the header, preview omits untracked snapshot entries with unsafe
   host-native targets, malformed rows fail closed, and runtime manifest reads
-  are capped at 16 MiB. Matched retired refs are removed when retention compacts
-  their rows. (The pre-JSON row support this entry originally described was
-  retired before release; see Removed.)
+  are capped at 16 MiB. Retention durably compacts the manifest before deleting
+  expired or retired refs, so a later cleanup failure cannot leave `/undo`
+  naming an already-deleted ref. Matched retired refs are removed when retention
+  compacts their rows. (The pre-JSON row support this entry originally described
+  was retired before release; see Removed.)
 - Official OpenAI GPT-5.6 Responses requests use flat function tools with
   `strict:false`, explicitly request opaque encrypted reasoning state for
   stateless tool continuation, preserve valid returned state only across the
