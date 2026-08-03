@@ -17348,7 +17348,7 @@ fn local_llama_timings_parse_cached_prefix_and_delta_prompt() {
 
 #[test]
 fn usage_pricing_for_local_provider_is_zero_cost() {
-    let pricing = usage_pricing_for(
+    let pricing = usage_pricing_default_for(
         "local",
         ApiProvider::OpenAi,
         "http://127.0.0.1:8080",
@@ -17367,17 +17367,6 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
 
 #[test]
 fn gpt_5_6_pricing_applies_documented_long_context_tier() {
-    let _guard = env_lock();
-    for name in [
-        "DEXT_INPUT_USD_PER_MTOK",
-        "DEXT_OUTPUT_USD_PER_MTOK",
-        "DEXT_CACHE_READ_USD_PER_MTOK",
-        "DEXT_CACHE_CREATE_USD_PER_MTOK",
-    ] {
-        unsafe {
-            std::env::remove_var(name);
-        }
-    }
     let usage = Usage {
         input: 300_000,
         output: 100_000,
@@ -17390,49 +17379,62 @@ fn gpt_5_6_pricing_applies_documented_long_context_tier() {
         ("gpt-5.6-terra", 3.75),
         ("gpt-5.6-luna", 1.5),
     ] {
-        let priced = usage_with_current_pricing(
-            usage,
+        let pricing = usage_pricing_default_for(
             "openai",
             ApiProvider::OpenAi,
             "https://api.openai.com",
             model,
-            None,
         );
-        assert_eq!(priced.cost_usd, Some(expected), "{model}");
+        let pricing = gpt_5_6_long_context_pricing_with_override_state(
+            "openai", model, usage, pricing, false,
+        );
+        assert_eq!(pricing.estimate(usage), expected, "{model}");
     }
-    let unknown_suffix = usage_with_current_pricing(
-        usage,
+    let unknown_model = "gpt-5.6-preview";
+    let unknown_pricing = usage_pricing_default_for(
         "openai",
         ApiProvider::OpenAi,
         "https://api.openai.com",
-        "gpt-5.6-preview",
-        None,
+        unknown_model,
     );
-    assert_eq!(unknown_suffix.cost_usd, Some(1.375));
+    let unknown_pricing = gpt_5_6_long_context_pricing_with_override_state(
+        "openai",
+        unknown_model,
+        usage,
+        unknown_pricing,
+        false,
+    );
+    assert_eq!(unknown_pricing.estimate(usage), 1.375);
 
     let threshold_usage = Usage {
         input: 272_000,
         output: 100_000,
         ..Usage::default()
     };
-    let threshold = usage_with_current_pricing(
-        threshold_usage,
+    let threshold_model = "gpt-5.6-terra";
+    let threshold_pricing = usage_pricing_default_for(
         "openai",
         ApiProvider::OpenAi,
         "https://api.openai.com",
-        "gpt-5.6-terra",
-        None,
+        threshold_model,
+    );
+    let threshold_pricing = gpt_5_6_long_context_pricing_with_override_state(
+        "openai",
+        threshold_model,
+        threshold_usage,
+        threshold_pricing,
+        false,
     );
     assert!(
-        (threshold.cost_usd.expect("threshold price") - 2.18).abs() < 1e-12,
-        "{:?}",
-        threshold.cost_usd
+        (threshold_pricing.estimate(threshold_usage) - 2.18).abs() < 1e-12,
+        "{}",
+        threshold_pricing.estimate(threshold_usage)
     );
 }
 
 #[test]
 fn anthropic_fable_pricing_matches_console_session_cost() {
-    let pricing = usage_pricing_for(
+    let pricing = usage_pricing_default_for(
         "anthropic",
         ApiProvider::Anthropic,
         "https://api.anthropic.com",
@@ -17506,13 +17508,13 @@ fn glm_wire_cost_is_preserved_when_provider_reports_it() {
 
 #[test]
 fn anthropic_api_provider_uses_anthropic_model_pricing_for_custom_profiles() {
-    let direct = usage_pricing_for(
+    let direct = usage_pricing_default_for(
         "anthropic",
         ApiProvider::Anthropic,
         "https://api.anthropic.com",
         "claude-fable-5",
     );
-    let custom = usage_pricing_for(
+    let custom = usage_pricing_default_for(
         "custom-claude",
         ApiProvider::Anthropic,
         "https://api.anthropic.com",
@@ -17530,19 +17532,13 @@ fn anthropic_api_provider_uses_anthropic_model_pricing_for_custom_profiles() {
 }
 
 #[test]
-fn usage_pricing_env_override_controls_budget_estimate() {
-    let _guard = env_lock();
-    unsafe {
-        std::env::set_var("DEXT_INPUT_USD_PER_MTOK", "2");
-        std::env::set_var("DEXT_OUTPUT_USD_PER_MTOK", "4");
-        std::env::set_var("DEXT_CACHE_READ_USD_PER_MTOK", "0.5");
-        std::env::set_var("DEXT_CACHE_CREATE_USD_PER_MTOK", "1");
-    }
-    let pricing = usage_pricing_for(
-        "openai",
-        ApiProvider::OpenAi,
-        "https://api.openai.com",
-        "unknown",
+fn usage_pricing_overrides_control_budget_estimate_without_mutating_process_env() {
+    let pricing = usage_pricing_with_overrides(
+        UsagePricing::default(),
+        Some(2.0),
+        Some(4.0),
+        Some(0.5),
+        Some(1.0),
     );
     let usage = Usage {
         input: 1_000_000,
@@ -17552,13 +17548,6 @@ fn usage_pricing_env_override_controls_budget_estimate() {
         cost_usd: None,
     };
     assert_eq!(pricing.estimate(usage), 15.0);
-
-    unsafe {
-        std::env::remove_var("DEXT_INPUT_USD_PER_MTOK");
-        std::env::remove_var("DEXT_OUTPUT_USD_PER_MTOK");
-        std::env::remove_var("DEXT_CACHE_READ_USD_PER_MTOK");
-        std::env::remove_var("DEXT_CACHE_CREATE_USD_PER_MTOK");
-    }
 }
 
 #[test]
