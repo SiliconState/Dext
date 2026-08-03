@@ -700,7 +700,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Atomic Writes</h3>
 <p>Sensitive state writes use a temp-file-and-replace helper. On Windows the replacement uses <code>MoveFileExW</code>; on Unix it uses <code>fs::rename</code>. Session logs normally use private append writes while they remain below the cap.</p>
 <h3>Session State Lock</h3>
-<p>Each active session directory has a <code>session.lock.json</code> record containing PID, token, project, sandbox, and session identity. Session open, stale reclamation, cleanup, and prune operations are serialized by the owner-private <code>session-locks.operation.lock</code> file under <code>DEXT_HOME</code>. Stale removal revalidates the token and PID while holding that lock, so a replaced live lock is preserved. Matching locks are released through a cleanup registry.</p>
+<p>Each active session directory has a <code>session.lock.json</code> record containing PID, token, project, sandbox, and session identity. Session open, stale reclamation, cleanup, and prune operations are serialized by the owner-private <code>session-locks.operation.lock</code> file under <code>DEXT_HOME</code>. Stale removal revalidates the token and PID while holding that lock, so a replaced live lock is preserved. Matching locks are released through a cleanup registry. <code>dext session prune</code> runs as a dry run unless <code>--apply</code> is supplied; it preserves every project directory containing session or other project state and removes only stale locks plus stale lock-only directory trees.</p>
 <h3>Log Rotation</h3>
 <p>Each session's <code>latest.log</code> is capped at 64,000 bytes. <code>DEXT_LOG_ARCHIVES</code> may retain up to 16 rotated archives; the default is zero.</p>
 </div>

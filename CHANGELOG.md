@@ -56,6 +56,12 @@
 
 ### Removed
 
+- Retired the unused work-map/session-navigation experiment: `/map`, `/packet`,
+  `/focus`, `/tracks`, `/track`, `/branches`, their CLI/session aliases,
+  waypoint metadata, event surface, and TUI drawer. Existing session JSONL still
+  loads; retired `track_origin` metadata is ignored and omitted when rewritten.
+  Read-only session inspection remains available through list, brief, analyze,
+  grep, failures, verification, decisions, and export.
 - Retired the pre-JSON 8- and 9-field checkpoint manifest encodings and the
   9-field JSON form; only the 11- and 12-field rows this build writes are
   accepted. This deletes the second, weaker path-validation rule those rows
@@ -168,6 +174,13 @@
 
 ### Fixed
 
+- Session pruning now preserves every project directory containing session or
+  other project state and removes only stale locks plus stale lock-only directory
+  trees. Session open, stale reclamation, cleanup, and prune share an
+  owner-private cross-process operation lock; stale deletion revalidates token
+  and PID identity under that lock so a replacement live lock cannot be removed.
+  Session briefs now carry an explicit privacy reminder because distilled ledger,
+  path, failure, and verification data may still be sensitive.
 - Interrupting a parallel built-in tool round now actually cancels it. Queued
   calls previously acquired their concurrency permit and began executing after
   Ctrl-C, `read_file`/`read_symbol`/`todo_read`/`rg`/`fd` had incomplete

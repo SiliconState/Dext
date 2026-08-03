@@ -9,7 +9,7 @@ dext                  interactive TUI/REPL
 dext --resume         resume the project-scoped latest session
 dext --fork           resume latest into an isolated unsaved branch
 dext sessions         list project latest + named sessions
-dext session ...      export/analyze/grep/failures/verify-log/decisions
+dext session ...      brief/export/analyze/grep/failures/verify-log/decisions/prune
 dext auth ...         provider/model/auth management
 dext undo ...         list, preview, or restore Dext Git checkpoints
 dext --eval [NAME]    run eval harness
