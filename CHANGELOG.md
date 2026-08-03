@@ -4,6 +4,36 @@
 
 ### Changed
 
+- The pack and shelf registry summaries moved from the volatile environment tail
+  into the cached system block, so they are no longer re-billed at full input
+  rate on every tool round. The shared prompt-scan cache is rebuilt each user
+  turn and invalidated after mutation-capable tools or approved hooks, keeping
+  tool-created or edited packs visible on the next provider request; shelf
+  summary generation is also cached instead of recomputed per request.
+- Objective checkpoints now avoid treating the descriptive word `verifiable` as
+  a verification request, recognize explicit non-code verification reports such
+  as “checks pass,” and refresh the work ledger immediately after each tool
+  round. This prevents a completed custom verification from remaining
+  `[unresolved]` in the next model request.
+- Hardened and accelerated the built-in `http` client without changing provider,
+  OAuth, or local-context transport: HTTP/2 and gzip/Brotli decoding are enabled
+  only for the tool; connect/read inactivity, resolver work, total request time,
+  response source, and declared body sizes are bounded; `--extract-text` reads a
+  128 KB head instead of draining oversized pages; and raw output retains its
+  smaller head/tail context cap. One bounded 60-second DNS cache retains at
+  most 32 addresses only after validating each complete DNS answer and limits
+  lingering libc lookups. IPv4 current-network/broadcast, IP multicast, and
+  IPv6 unspecified destinations remain blocked under every trusted-network
+  override. Duplicate,
+  transport/framing, and method-override headers plus URL credentials are
+  rejected while ordinary headers can override defaults. Headerless/bodyless
+  GET and HEAD requests may follow validated cross-origin redirects without an
+  automatic `Referer`; HTTPS downgrades are blocked, while requests with custom
+  headers, bodies, or other methods remain same-origin so arbitrary credentials
+  and 307/308 bodies cannot be replayed across origins. URL details are removed
+  from transport errors, body-bearing nominal read methods require Danger
+  approval, and HTTPie-style delimiters are resolved by their earliest operator
+  so padded auth headers and typed/query values are not misclassified.
 - Upgraded the terminal stack to exact Ratatui 0.30.2, ratatui-core 0.1.2,
   tui-markdown 0.3.8, Crossterm 0.29.0, and unicode-width 0.2.2 versions.
   Dext carries a narrow exact-source ratatui-core compatibility patch for its
@@ -26,6 +56,26 @@
 
 ### Removed
 
+- Retired the unused work-map/session-navigation experiment: `/map`, `/packet`,
+  `/focus`, `/tracks`, `/track`, `/branches`, their CLI/session aliases,
+  waypoint metadata, event surface, and TUI drawer. Existing session JSONL still
+  loads; retired `track_origin` metadata is ignored and omitted when rewritten.
+  Read-only session inspection remains available through list, brief, analyze,
+  grep, failures, verification, decisions, and export.
+- Retired the pre-JSON 8- and 9-field checkpoint manifest encodings and the
+  9-field JSON form; only the 11- and 12-field rows this build writes are
+  accepted. This deletes the second, weaker path-validation rule those rows
+  selected — a manifest can no longer choose how strictly its own paths are
+  checked — along with the ambiguous relative-hint resolution they required.
+  A recognized retired row is skipped with a warning instead of failing the
+  whole listing, so one stale row can no longer take out `/undo` and block every
+  write-risk tool. Recognition requires an intact checkpoint header; the
+  recorded OID must match any live ref, and normal retention removes the matched
+  retired ref with its manifest row. Genuine corruption or tampering still
+  fails closed. The `legacy_sidecar_paths`
+  field is renamed `direct_sidecar_paths`: despite the old name it is the
+  current encoding's exact sidecar-membership index and is load-bearing for
+  fail-closed restore.
 - Removed the subagent feature completely: `/subagent` slash command,
   `subagent-runtime` CLI subcommand, detached/inline runners, steering,
   quality gates, TUI state, session artifacts dir, and all associated
@@ -80,8 +130,14 @@
   successfully completed terminal response; incomplete, failed, truncated, or
   bare-`[DONE]` call streams cannot reach execution.
 - Added GPT-5.6 Sol, Terra, and Luna to the ChatGPT and OpenAI catalogs with
-  model-specific context/output limits, aliases, native `none` through `xhigh`
-  reasoning, long-context pricing, and OpenAI `max_completion_tokens` shaping.
+  model-specific context/output limits, aliases, long-context pricing, and
+  provider-isolated reasoning controls. Official OpenAI API-key GPT-5.6 requests
+  now use `/v1/responses`: `--effort max` sends native `reasoning.effort=max`,
+  while independent `--reasoning-mode standard|pro` / `/reasoning-mode` control
+  `reasoning.mode`; summaries use the same contract. ChatGPT OAuth retains its
+  Codex Responses contract, `none` through `xhigh` effort (`max` maps to
+  `xhigh`), and receives no Platform-only mode field. Other models, custom
+  endpoints, and built-in providers retain their prior request shapes.
 - Added versioned durable-state compatibility fixtures for sessions, provider
   catalog, auth store, tool journal, todo/settings, and checkpoint manifests.
 - Extended `dext doctor` with structured policy/source, sandbox enforcement,
@@ -118,6 +174,79 @@
 
 ### Fixed
 
+- Windows checkpoint cache tests now compare normalized path identities instead of
+  treating Git's forward-slash path and the filesystem's verbatim `\\?\` path as
+  different repositories.
+- Cross-platform CI now avoids compiling Unix-only executable restoration metadata
+  as an unused Windows value, retains the session operation-lock file handle on
+  every platform without dead-code warnings, and runs the invalid-UTF-8 filename
+  fixture only on Unix filesystems that permit creating that fixture; macOS APFS
+  rejects the filename before Dext can inspect it.
+- Session pruning now preserves every project directory containing session or
+  other project state and removes only stale locks plus stale lock-only directory
+  trees. Session open, stale reclamation, cleanup, and prune share an
+  owner-private cross-process operation lock; stale deletion revalidates token
+  and PID identity under that lock so a replacement live lock cannot be removed.
+  Session briefs now carry an explicit privacy reminder because distilled ledger,
+  path, failure, and verification data may still be sensitive.
+- Interrupting a parallel built-in tool round now actually cancels it. Queued
+  calls previously acquired their concurrency permit and began executing after
+  Ctrl-C, `read_file`/`read_symbol`/`todo_read`/`rg`/`fd` had incomplete
+  cancellation paths, and the round waiter noticed an interrupt only after some
+  task completed. The waiter now polls cancellation independently of task
+  completion, in-flight tasks are aborted, a call that wins its permit after the
+  interrupt refuses to start, and every abandoned `tool_use` id is reported as
+  interrupted rather than as an unknown outcome. Native file loading checks
+  cancellation between bounded chunks; `read_file` stops once it detects data
+  beyond an explicit limit and advances past a single over-cap line,
+  `read_symbol` rejects source inputs above 8 MiB, and todo state is capped at
+  256 KiB across tool/prompt/TUI loading. Each ancestor `DEXT.md`/`recall.md`
+  input is a regular non-symlink file capped at 1 MiB for both prompt loading and
+  session provenance hashing. Zero, mistyped,
+  overflowing, or out-of-range native read selectors now fail instead of being
+  clamped or silently defaulted.
+- Privacy-strict search scope now recognizes compact ripgrep globs such as
+  `-g.env`/`-ig .env`, wildcard-prefixed sensitive globs such as `*.env`,
+  `.env.*` variants, and attached operand-changing `-ePATTERN`/`-fFILE` forms,
+  while respecting where an attached short-option value begins, closing
+  spelling-dependent bypasses without treating letters inside values as flags.
+- Combined budget caps now accept the documented compact `t` token suffix and
+  reject duplicate dimensions, empty components, and unrepresentable token
+  counts instead of silently retaining or saturating a value. Invalid
+  `DEXT_BUDGET_CAP` configuration now fails startup instead of disabling the
+  guard. Resumed session
+  headers reject invalid persisted usage costs and empty/non-positive caps.
+- JSON and stream-JSON sinks now record each structural crash breadcrumb exactly
+  once; text-mode delegation no longer double-records the same event.
+- Child process-tree guards now terminate unfinished Unix process groups when
+  dropped during cancellation or unwinding, closing the lifecycle gap between
+  explicit exit/timeout/interrupt cleanup paths.
+- Recovery checkpoint loading no longer blocks write-risk tools on a recognized
+  retired manifest row: recognition validates the complete retired field grammar
+  as well as the header, preview omits untracked snapshot entries with unsafe
+  host-native targets, malformed rows fail closed, and runtime manifest reads
+  are capped at 16 MiB. Retention durably compacts the manifest before deleting
+  expired or retired refs, so a later cleanup failure cannot leave `/undo`
+  naming an already-deleted ref. Matched retired refs are removed when retention
+  compacts their rows. (The pre-JSON row support this entry originally described
+  was retired before release; see Removed.)
+- Official OpenAI GPT-5.6 Responses requests use flat function tools with
+  `strict:false`, explicitly request opaque encrypted reasoning state for
+  stateless tool continuation, preserve valid returned state only across the
+  current tool turn, and reject or recover incomplete/content-filter terminal
+  states without executing unfinished calls. Content-filter terminals discard
+  visible output, tool calls, and opaque reasoning state. GPT-5.6 compaction now
+  preserves the selected Standard/Pro mode, and Responses main requests and
+  summaries resolve effort through the selected model's advertised levels before
+  nearest-level fallback; `off` sends `none` only when the model advertises it.
+  This avoids unsupported raw effort values and avoids promoting Low/Medium to
+  High when exact levels exist. OpenAI-local `gpt56*` aliases now resolve consistently;
+  only the four supported GPT-5.6 ids auto-select the official Responses route
+  or supported-variant effort mapping. `DEXT_COMPACT_MODEL` aliases are
+  normalized before routing, reasoning-capable Responses summaries retain the
+  larger summary allowance even when main effort is Off, explicitly
+  non-reasoning Responses models omit the reasoning object, and summary usage is
+  priced against the resolved summary model instead of the main model.
 - ChatGPT/Codex `response.failed` events now retain a bounded provider message so
   generic request-ID failures that explicitly say the request can be retried use
   Dext's existing capped pre-output stream retry instead of being misclassified

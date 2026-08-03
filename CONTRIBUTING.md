@@ -20,7 +20,7 @@ cargo install --path . --force --locked
 
 - Locate the relevant code with `rg`, `read_symbol`, or focused file reads.
 - Keep edits surgical.
-- Prefer existing modules over new files unless a boundary is clearly stable.
+- Prefer existing modules for small changes; when an existing file mixes several stable domains, extract one focused module instead of extending a monolith.
 - Avoid adding overlapping tools or prompt/schema bloat.
 - Do not commit runtime clutter, generated logs, session exports, screenshots, credentials, or local auth stores.
 - Treat `docs/index.html` as the canonical main technical documentation. Update it in the same change as user-visible/runtime/architecture/security/provider/tool/test/CI/release behavior, plus any focused Markdown guide for that subject.

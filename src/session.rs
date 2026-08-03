@@ -7,7 +7,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::{
     DEFAULT_SYSTEM, LATEST_LOG_ARCHIVE_MAX, LATEST_LOG_CAP, LATEST_SESSION_NAME, LOG_DETAIL_CAP,
-    SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort,
+    ReasoningMode, SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort,
     byte_prefix_at_char_boundary, byte_suffix_at_char_boundary, cap_bytes_with_hint,
 };
 
@@ -337,7 +337,7 @@ fn temp_swap_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
@@ -371,7 +371,7 @@ fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
@@ -600,6 +600,116 @@ pub(crate) fn new_session_id() -> String {
     format!("{}-{}-{random}", unix_timestamp_secs(), current_pid())
 }
 
+const SESSION_LOCK_OPERATION_FILE: &str = "session-locks.operation.lock";
+const SESSION_LOCK_OPERATION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn session_lock_process_guard() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub(crate) struct SessionLockOperationGuard {
+    _process_guard: std::sync::MutexGuard<'static, ()>,
+    _file: std::fs::File,
+}
+
+impl SessionLockOperationGuard {
+    pub(crate) fn acquire() -> Result<Self> {
+        let process_guard = session_lock_process_guard()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session lock operation mutex poisoned"))?;
+        let state_dir = dext_state_dir();
+        std::fs::create_dir_all(&state_dir)?;
+        let path = state_dir.join(SESSION_LOCK_OPERATION_FILE);
+        let deadline = std::time::Instant::now() + SESSION_LOCK_OPERATION_WAIT;
+        let file = loop {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                options.share_mode(0).custom_flags(0x0020_0000);
+            }
+            match options.open(&path) {
+                Ok(file) => break file,
+                Err(error)
+                    if cfg!(windows)
+                        && std::time::Instant::now() < deadline
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+                        ) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("opening session lock operation file {}", path.display())
+                    });
+                }
+            }
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "session lock operation path is not a regular file: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+                anyhow::bail!(
+                    "session lock operation file is not owner-private: {}",
+                    path.display()
+                );
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            loop {
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if std::time::Instant::now() >= deadline
+                    || error.kind() != io::ErrorKind::WouldBlock
+                {
+                    return Err(error)
+                        .with_context(|| format!("locking session operations {}", path.display()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        Ok(Self {
+            _process_guard: process_guard,
+            _file: file,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionLockOperationGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        unsafe {
+            let _ = libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for SessionLockOperationGuard {
+    fn drop(&mut self) {}
+}
+
 #[derive(Serialize, Deserialize)]
 struct SessionStateLockRecord {
     token: String,
@@ -643,23 +753,32 @@ pub(crate) fn restore_terminal_if_tui() {
     }
 }
 
-fn remove_lock_file_and_empty_parent(path: &Path) {
-    let _ = std::fs::remove_file(path);
+fn remove_lock_file_and_empty_parent(path: &Path) -> bool {
+    if std::fs::remove_file(path).is_err() {
+        return false;
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::remove_dir(parent);
     }
+    true
 }
 
 pub(crate) fn release_registered_locks() {
-    let Ok(mut entries) = lock_cleanup_registry().lock() else {
+    let Ok(_operation_guard) = SessionLockOperationGuard::acquire() else {
         return;
     };
-    for (path, token) in entries.drain(..) {
+    let entries = {
+        let Ok(mut entries) = lock_cleanup_registry().lock() else {
+            return;
+        };
+        entries.drain(..).collect::<Vec<_>>()
+    };
+    for (path, token) in entries {
         let Ok(existing) = SessionStateLock::read_record(&path) else {
             continue;
         };
         if existing.token == token && existing.pid == current_pid() {
-            remove_lock_file_and_empty_parent(&path);
+            let _ = remove_lock_file_and_empty_parent(&path);
         }
     }
 }
@@ -676,15 +795,46 @@ fn unregister_lock_cleanup(path: &Path, token: &str) {
     }
 }
 
-pub(crate) fn remove_stale_session_state_lock(path: &Path) -> bool {
+fn remove_stale_session_state_lock_if_matches_under_guard(
+    path: &Path,
+    expected_token: &str,
+    expected_pid: u32,
+) -> bool {
+    let Ok(current) = SessionStateLock::read_record(path) else {
+        return false;
+    };
+    if current.token != expected_token
+        || current.pid != expected_pid
+        || process_is_running(current.pid)
+    {
+        return false;
+    }
+    remove_lock_file_and_empty_parent(path)
+}
+
+pub(crate) fn remove_stale_session_state_lock_under_guard(
+    _operation_guard: &SessionLockOperationGuard,
+    path: &Path,
+) -> bool {
     let Ok(existing) = SessionStateLock::read_record(path) else {
         return false;
     };
     if process_is_running(existing.pid) {
         return false;
     }
-    remove_lock_file_and_empty_parent(path);
-    true
+    remove_stale_session_state_lock_if_matches_under_guard(path, &existing.token, existing.pid)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_stale_session_state_lock_if_matches(
+    path: &Path,
+    expected_token: &str,
+    expected_pid: u32,
+) -> bool {
+    let Ok(_operation_guard) = SessionLockOperationGuard::acquire() else {
+        return false;
+    };
+    remove_stale_session_state_lock_if_matches_under_guard(path, expected_token, expected_pid)
 }
 
 pub(crate) fn session_state_lock_is_live(path: &Path) -> bool {
@@ -722,6 +872,7 @@ impl SessionStateLock {
     }
 
     pub(crate) fn acquire(root: &Path, session_id: &str) -> Result<Self> {
+        let _operation_guard = SessionLockOperationGuard::acquire()?;
         let path = session_state_lock_path(root, session_id);
         let record = SessionStateLockRecord {
             token: format!("{}-{:x}", current_pid(), unix_timestamp_nanos()),
@@ -749,7 +900,16 @@ impl SessionStateLock {
                 }
                 match Self::read_record(&path) {
                     Ok(existing) if !process_is_running(existing.pid) => {
-                        remove_lock_file_and_empty_parent(&path);
+                        if !remove_stale_session_state_lock_if_matches_under_guard(
+                            &path,
+                            &existing.token,
+                            existing.pid,
+                        ) {
+                            anyhow::bail!(
+                                "session state lock changed while reclaiming: {}",
+                                path.display()
+                            );
+                        }
                         Self::write_record(&path, &record)?;
                         register_lock_cleanup(&path, &record.token);
                         Ok(Self {
@@ -777,11 +937,14 @@ impl SessionStateLock {
 impl Drop for SessionStateLock {
     fn drop(&mut self) {
         unregister_lock_cleanup(&self.path, &self.token);
+        let Ok(_operation_guard) = SessionLockOperationGuard::acquire() else {
+            return;
+        };
         let Ok(existing) = Self::read_record(&self.path) else {
             return;
         };
         if existing.token == self.token && existing.pid == current_pid() {
-            remove_lock_file_and_empty_parent(&self.path);
+            let _ = remove_lock_file_and_empty_parent(&self.path);
         }
     }
 }
@@ -893,6 +1056,16 @@ pub(crate) fn render_limited_lines(
     out
 }
 
+fn validate_session_header_accounting(header: &SessionHeader) -> Result<()> {
+    if !header.usage.is_valid() {
+        anyhow::bail!("session usage contains an invalid cost");
+    }
+    if header.budget_cap.is_some_and(|cap| !cap.is_valid()) {
+        anyhow::bail!("session budget cap is invalid");
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
     let meta: serde_json::Value = serde_json::from_str(line).context("bad session header")?;
     let object = meta
@@ -919,6 +1092,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
                 header.context_mode_explicit = true;
             }
             header.version = SESSION_FORMAT_VERSION;
+            validate_session_header_accounting(&header)?;
             return Ok(header);
         }
         Err(error) if source_version == SESSION_FORMAT_VERSION => {
@@ -927,7 +1101,20 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         Err(_) => {}
     }
 
-    Ok(SessionHeader {
+    let legacy_usage = if meta["usage"].is_null() {
+        crate::Usage::default()
+    } else {
+        serde_json::from_value(meta["usage"].clone()).context("invalid legacy session usage")?
+    };
+    let legacy_budget_cap = if meta["budget_cap"].is_null() {
+        None
+    } else {
+        Some(
+            serde_json::from_value(meta["budget_cap"].clone())
+                .context("invalid legacy session budget cap")?,
+        )
+    };
+    let header = SessionHeader {
         version: SESSION_FORMAT_VERSION,
         model: meta["model"].as_str().unwrap_or("glm-5.2[1m]").to_string(),
         system: meta["system"]
@@ -968,10 +1155,14 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             })
             .unwrap_or_default(),
         sandbox: meta["sandbox"].as_str().map(String::from),
-        usage: serde_json::from_value(meta["usage"].clone()).unwrap_or_default(),
+        usage: legacy_usage,
         thinking_effort: meta["thinking_effort"]
             .as_str()
             .and_then(ThinkingEffort::parse)
+            .unwrap_or_default(),
+        reasoning_mode: meta["reasoning_mode"]
+            .as_str()
+            .and_then(ReasoningMode::parse)
             .unwrap_or_default(),
         compact_threshold_chars: meta["compact_threshold_chars"]
             .as_u64()
@@ -989,11 +1180,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .as_str()
             .and_then(crate::SandboxProfile::parse)
             .unwrap_or_default(),
-        budget_cap: if meta["budget_cap"].is_null() {
-            None
-        } else {
-            serde_json::from_value(meta["budget_cap"].clone()).ok()
-        },
+        budget_cap: legacy_budget_cap,
         context_mode: meta["context_mode"]
             .as_str()
             .and_then(crate::ContextMode::parse)
@@ -1016,9 +1203,8 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         work_ledger: serde_json::from_value(meta["work_ledger"].clone()).unwrap_or_default(),
         provider_health: serde_json::from_value(meta["provider_health"].clone())
             .unwrap_or_default(),
-        track_origin: serde_json::from_value(meta["track_origin"].clone())
-            .ok()
-            .flatten(),
         privacy: serde_json::from_value(meta["privacy"].clone()).unwrap_or_default(),
-    })
+    };
+    validate_session_header_accounting(&header)?;
+    Ok(header)
 }

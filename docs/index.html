@@ -227,6 +227,11 @@ pre code{background:none;border:none;padding:0;color:inherit;font-size:inherit;w
 .diagram-svg .line{stroke:var(--dim);stroke-width:1.5;fill:none;marker-end:url(#arrow)}
 .diagram-svg .line-accent{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#arrowAccent)}
 .diagram-svg .lane{stroke:var(--border);stroke-dasharray:4 4;stroke-width:1}
+/* each diagram carries its own marker defs so no SVG depends on another */
+#tool-execution-sequence .line{marker-end:url(#arrow2)}
+#checkpoint-sequence .line{marker-end:url(#arrow3)}
+#turn-loop-flowchart .line{marker-end:url(#arrow4)}
+#checkpoint-flowchart .line{marker-end:url(#arrow5)}
 .diagram-notes{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:.9rem}
 .diagram-note{border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:.42rem .85rem;font-size:.78rem;color:var(--dim)}
 .diagram-note strong{color:var(--text);font-weight:600}
@@ -488,6 +493,12 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>src/packs.rs</code></td><td>Pack discovery, invocation, conversational pack inference</td></tr>
 <tr><td><code>src/shelves.rs</code></td><td>Typed shelf registry with ability metadata, signals, and effects</td></tr>
 <tr><td><code>src/tool_policy.rs</code></td><td>Command risk classification, input validation, bash guardrails</td></tr>
+<tr><td><code>src/privacy.rs</code></td><td>Privacy policy, sensitive-path/search-scope denial, secret/PII redaction</td></tr>
+<tr><td><code>src/usage.rs</code></td><td>Token usage normalization, per-model pricing, budget caps</td></tr>
+<tr><td><code>src/events.rs</code></td><td><code>AgentEvent</code> stream and the <code>EventSink</code> front-end trait</td></tr>
+<tr><td><code>src/crash.rs</code></td><td>Panic hook, redacted owner-only crash snapshots, event breadcrumbs</td></tr>
+<tr><td><code>src/process_tree.rs</code></td><td>Child session detachment and whole-tree teardown</td></tr>
+<tr><td><code>src/secret_redactor.rs</code></td><td>Streaming credential scrubbing for child-process output</td></tr>
 <tr><td><code>deny.toml</code></td><td>Dependency-license allowlist enforced by security and release workflows</td></tr>
 <tr><td><code>benches/dext_bench.rs</code></td><td>Criterion performance harness</td></tr>
 <tr><td><code>tests/tui_smoke.rs</code></td><td>PTY-backed launch, multiline input, streaming, and resize regression tests</td></tr>
@@ -525,62 +536,70 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <rect class="box box-accent" x="365" y="22" width="170" height="42"/><text x="450" y="48" text-anchor="middle">Provider Builder</text>
 <rect class="box box-accent" x="560" y="22" width="140" height="42"/><text x="630" y="48" text-anchor="middle">Provider SSE</text>
 <rect class="box box-accent" x="735" y="22" width="130" height="42"/><text x="800" y="48" text-anchor="middle">State/Session</text>
-<path class="line-accent" d="M90 95 H250"/><text class="muted" x="170" y="88" text-anchor="middle">prompt or steering</text>
+<path class="line-accent" d="M90 95 H260"/><text class="muted" x="175" y="88" text-anchor="middle">prompt or steering</text>
 <path class="line" d="M260 120 H450"/><text class="muted" x="355" y="113" text-anchor="middle">system + DEXT.md + optional recall + tools</text>
 <path class="line" d="M450 145 H630"/><text class="muted" x="540" y="138" text-anchor="middle">HTTP request</text>
-<path class="line-accent" d="M630 175 H270"/><text class="muted" x="450" y="168" text-anchor="middle">stream blocks: text / thinking / tool_use</text>
+<path class="line-accent" d="M630 175 H260"/><text class="muted" x="445" y="168" text-anchor="middle">stream blocks: text / thinking / tool_use</text>
 <rect class="box box-green" x="185" y="205" width="150" height="54"/><text x="260" y="227" text-anchor="middle">Parse blocks</text><text class="muted" x="260" y="246" text-anchor="middle">append text/thinking</text>
 <path class="line" d="M335 232 H505"/><rect class="box box-warn" x="505" y="205" width="160" height="54"/><text x="585" y="227" text-anchor="middle">Tool path</text><text class="muted" x="585" y="246" text-anchor="middle">validate + approve</text>
-<path class="line" d="M665 232 H790"/><rect class="box" x="715" y="280" width="170" height="58"/><text x="800" y="303" text-anchor="middle">Persist JSONL/log</text><text class="muted" x="800" y="322" text-anchor="middle">usage, ledger, health</text>
-<path class="line" d="M800 338 C800 375 260 375 260 292"/><text class="muted" x="505" y="392" text-anchor="middle">next provider call after tool_result, or final response</text>
+<path class="line" d="M665 232 H800 V280"/><rect class="box" x="715" y="280" width="170" height="58"/><text x="800" y="303" text-anchor="middle">Persist JSONL/log</text><text class="muted" x="800" y="322" text-anchor="middle">usage, ledger, health</text>
+<path class="line" d="M800 338 C800 392 260 392 260 259"/><text class="muted" x="505" y="400" text-anchor="middle">next provider call after tool_result, or final response</text>
 </svg>
 <div class="diagram-notes"><div class="diagram-note"><strong>Safe boundary:</strong> steering is injected between stream/tool cycles, not mid-mutation.</div><div class="diagram-note"><strong>Compaction:</strong> history compacts after safe checkpoints when context pressure is high.</div><div class="diagram-note"><strong>Evidence:</strong> session headers persist provider/tool/runtime provenance.</div></div>
 </div>
 
 <div class="diagram-panel" id="tool-execution-sequence">
-<h4>Tool Execution Sequence — validation, policy, checkpoint, result</h4>
-<svg class="diagram-svg" viewBox="0 0 900 360" role="img" aria-label="Tool execution sequence diagram">
+<h4>Tool Execution Sequence — validation, preview, approval, checkpoint, result</h4>
+<svg class="diagram-svg" viewBox="0 0 900 330" role="img" aria-label="Tool execution sequence diagram">
 <defs><marker id="arrow2" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="var(--dim)"/></marker></defs>
-<g class="diagram-svg"><path class="line" style="marker-end:url(#arrow2)" d="M80 68 H220"/><path class="line" style="marker-end:url(#arrow2)" d="M330 68 H470"/><path class="line" style="marker-end:url(#arrow2)" d="M580 68 H720"/>
-<rect class="box box-accent" x="20" y="42" width="120" height="52"/><text x="80" y="64" text-anchor="middle">tool_use</text><text class="muted" x="80" y="82" text-anchor="middle">name + JSON</text>
-<rect class="box" x="220" y="42" width="110" height="52"/><text x="275" y="64" text-anchor="middle">Validate</text><text class="muted" x="275" y="82" text-anchor="middle">required fields</text>
-<rect class="box box-warn" x="470" y="42" width="110" height="52"/><text x="525" y="64" text-anchor="middle">Classify</text><text class="muted" x="525" y="82" text-anchor="middle">Read/Write/Danger</text>
-<rect class="box box-danger" x="720" y="42" width="140" height="52"/><text x="790" y="64" text-anchor="middle">Permission</text><text class="muted" x="790" y="82" text-anchor="middle">profile + sandbox</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M790 94 V150 H700"/><rect class="box box-green" x="540" y="124" width="160" height="52"/><text x="620" y="146" text-anchor="middle">Checkpoint?</text><text class="muted" x="620" y="164" text-anchor="middle">non-read risk in Git repo</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M540 150 H395"/><rect class="box" x="245" y="124" width="150" height="52"/><text x="320" y="146" text-anchor="middle">Preview?</text><text class="muted" x="320" y="164" text-anchor="middle">direct file tools</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M320 176 V235 H455"/><rect class="box box-accent" x="455" y="210" width="150" height="52"/><text x="530" y="232" text-anchor="middle">Execute</text><text class="muted" x="530" y="250" text-anchor="middle">native or subprocess</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M605 236 H735"/><rect class="box box-green" x="735" y="210" width="135" height="52"/><text x="802" y="232" text-anchor="middle">tool_result</text><text class="muted" x="802" y="250" text-anchor="middle">capped output</text>
-<path class="line" style="marker-end:url(#arrow2)" d="M790 94 C790 300 135 300 135 95"/><text class="muted" x="420" y="318" text-anchor="middle">denied/invalid branches return immediate error tool_result</text></g>
+<path class="line" d="M165 68 H225"/><path class="line" d="M355 68 H415"/><path class="line" d="M590 68 H650"/>
+<rect class="box box-accent" x="25" y="40" width="140" height="56"/><text x="95" y="66" text-anchor="middle">tool_use</text><text class="muted" x="95" y="84" text-anchor="middle">name + JSON args</text>
+<rect class="box" x="225" y="40" width="130" height="56"/><text x="290" y="66" text-anchor="middle">Validate</text><text class="muted" x="290" y="84" text-anchor="middle">required fields</text>
+<rect class="box box-warn" x="415" y="40" width="175" height="56"/><text x="502" y="66" text-anchor="middle">Classify</text><text class="muted" x="502" y="84" text-anchor="middle">Read / Write / Danger</text>
+<rect class="box" x="650" y="40" width="175" height="56"/><text x="737" y="66" text-anchor="middle">Preview</text><text class="muted" x="737" y="84" text-anchor="middle">direct file mutations</text>
+<path class="line" d="M737 96 V158"/>
+<path class="line" d="M655 186 H600"/><path class="line" d="M400 186 H345"/>
+<rect class="box box-danger" x="655" y="158" width="165" height="56"/><text x="737" y="184" text-anchor="middle">Permission</text><text class="muted" x="737" y="202" text-anchor="middle">profile + sandbox</text>
+<rect class="box box-green" x="400" y="158" width="200" height="56"/><text x="500" y="184" text-anchor="middle">Checkpoint</text><text class="muted" x="500" y="202" text-anchor="middle">write-risk call in a Git repo</text>
+<rect class="box box-accent" x="175" y="158" width="170" height="56"/><text x="260" y="184" text-anchor="middle">Execute</text><text class="muted" x="260" y="202" text-anchor="middle">native or subprocess</text>
+<path class="line" d="M260 214 V250"/>
+<rect class="box box-green" x="175" y="250" width="170" height="56"/><text x="260" y="276" text-anchor="middle">tool_result</text><text class="muted" x="260" y="294" text-anchor="middle">capped output</text>
+<path class="line" d="M737 214 V278 H345"/><text class="muted" x="545" y="270" text-anchor="middle">denied, invalid, or interrupted → error tool_result</text>
 </svg>
-<div class="diagram-notes"><div class="diagram-note"><strong>Parallelism:</strong> only all-read batches (<code>read_file</code>, <code>rg</code>, <code>git_diff</code>, etc.) parallelize.</div><div class="diagram-note"><strong>HTTP:</strong> GET/HEAD/OPTIONS are read; POST/PUT/PATCH/DELETE are danger.</div><div class="diagram-note"><strong>Auth guard:</strong> outputs are scanned for 401/403/invalid-key markers.</div></div>
+<div class="diagram-notes"><div class="diagram-note"><strong>Preview first:</strong> <code>write_file</code>, <code>edit_file</code>, and <code>multi_edit</code> render their diff before the approval prompt, and the approved executor reuses that same prepared mutation.</div><div class="diagram-note"><strong>Parallelism:</strong> only all-read batches (<code>read_file</code>, <code>rg</code>, <code>git_diff</code>, etc.) parallelize; checkpoints stay on the sequential dispatch boundary.</div><div class="diagram-note"><strong>HTTP:</strong> GET/HEAD/OPTIONS are read, POST/PUT/PATCH/DELETE are danger, and a nominal read carrying a body is danger too.</div><div class="diagram-note"><strong>Auth guard:</strong> outputs are scanned for 401/403/invalid-key markers.</div></div>
 </div>
 
 <div class="diagram-panel" id="checkpoint-sequence">
 <h4>Checkpoint Lifecycle — Git recovery before mutation</h4>
-<svg class="diagram-svg" viewBox="0 0 900 300" role="img" aria-label="Checkpoint lifecycle diagram">
+<svg class="diagram-svg" viewBox="0 0 900 240" role="img" aria-label="Checkpoint lifecycle diagram">
 <defs><marker id="arrow3" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="var(--dim)"/></marker></defs>
-<path class="line" style="marker-end:url(#arrow3)" d="M120 72 H260"/><path class="line" style="marker-end:url(#arrow3)" d="M380 72 H520"/><path class="line" style="marker-end:url(#arrow3)" d="M650 72 H775"/>
-<rect class="box box-warn" x="30" y="44" width="150" height="56"/><text x="105" y="66" text-anchor="middle">Approved mutation</text><text class="muted" x="105" y="84" text-anchor="middle">write/danger risk</text>
-<rect class="box" x="250" y="44" width="140" height="56"/><text x="320" y="66" text-anchor="middle">Resolve Git root</text><text class="muted" x="320" y="84" text-anchor="middle">cached per session</text>
-<rect class="box box-green" x="515" y="44" width="150" height="56"/><text x="590" y="66" text-anchor="middle">Create ref</text><text class="muted" x="590" y="84" text-anchor="middle">refs/dext/checkpoints</text>
-<rect class="box" x="745" y="44" width="130" height="56"/><text x="810" y="66" text-anchor="middle">Manifest</text><text class="muted" x="810" y="84" text-anchor="middle">64-entry cap</text>
-<path class="line" style="marker-end:url(#arrow3)" d="M590 100 V155 H410"/><rect class="box" x="265" y="128" width="170" height="56"/><text x="350" y="150" text-anchor="middle">Dirty snapshot</text><text class="muted" x="350" y="168" text-anchor="middle">git stash create</text>
-<path class="line" style="marker-end:url(#arrow3)" d="M435 156 H570"/><rect class="box" x="570" y="128" width="180" height="56"/><text x="660" y="150" text-anchor="middle">Untracked sidecars</text><text class="muted" x="660" y="168" text-anchor="middle">direct file tools only</text>
-<path class="line" style="marker-end:url(#arrow3)" d="M660 184 V230 H455"/><rect class="box box-accent" x="320" y="204" width="160" height="56"/><text x="400" y="226" text-anchor="middle">Run mutation</text><text class="muted" x="400" y="244" text-anchor="middle">ref preserved</text>
+<path class="line" d="M185 68 H245"/><path class="line" d="M395 68 H455"/><path class="line" d="M605 68 H665"/>
+<rect class="box box-warn" x="25" y="40" width="160" height="56"/><text x="105" y="66" text-anchor="middle">Approved mutation</text><text class="muted" x="105" y="84" text-anchor="middle">write or danger risk</text>
+<rect class="box" x="245" y="40" width="150" height="56"/><text x="320" y="66" text-anchor="middle">Resolve Git root</text><text class="muted" x="320" y="84" text-anchor="middle">cached per session</text>
+<rect class="box" x="455" y="40" width="150" height="56"/><text x="530" y="66" text-anchor="middle">Dirty snapshot</text><text class="muted" x="530" y="84" text-anchor="middle">git stash create</text>
+<rect class="box box-green" x="665" y="40" width="185" height="56"/><text x="757" y="66" text-anchor="middle">Create ref</text><text class="muted" x="757" y="84" text-anchor="middle">refs/dext/checkpoints</text>
+<path class="line" d="M757 96 V158"/>
+<path class="line" d="M620 186 H550"/><path class="line" d="M380 186 H300"/>
+<rect class="box" x="620" y="158" width="200" height="56"/><text x="720" y="184" text-anchor="middle">Untracked sidecars</text><text class="muted" x="720" y="202" text-anchor="middle">SHA-256 blobs, bounded</text>
+<rect class="box" x="380" y="158" width="170" height="56"/><text x="465" y="184" text-anchor="middle">Manifest</text><text class="muted" x="465" y="202" text-anchor="middle">append, then retention</text>
+<rect class="box box-accent" x="140" y="158" width="160" height="56"/><text x="220" y="184" text-anchor="middle">Run mutation</text><text class="muted" x="220" y="202" text-anchor="middle">ref preserved</text>
 </svg>
+<div class="diagram-notes"><div class="diagram-note"><strong>Retention:</strong> 20 checkpoints for seven days; runtime manifest reads are capped at 16 MiB.</div><div class="diagram-note"><strong>Capture bounds:</strong> arbitrary-command checkpoints inventory at most 500 untracked paths within 8 MiB per file and 32 MiB per checkpoint.</div><div class="diagram-note"><strong>Ordering:</strong> each call is checkpointed at its own sequential dispatch boundary, so later calls in a round include earlier mutations.</div></div>
 </div>
 
 <div class="diagram-panel" id="turn-loop-flowchart">
 <h4>Turn Loop Flowchart — branch points</h4>
-<svg class="diagram-svg" viewBox="0 0 860 360" role="img" aria-label="Turn loop flowchart">
+<svg class="diagram-svg" viewBox="0 0 860 390" role="img" aria-label="Turn loop flowchart">
 <defs><marker id="arrow4" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="var(--dim)"/></marker></defs>
 <rect class="box box-accent" x="335" y="20" width="190" height="44"/><text x="430" y="47" text-anchor="middle">Start turn</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M430 64 V95"/><rect class="box" x="315" y="95" width="230" height="50"/><text x="430" y="116" text-anchor="middle">Build runtime context</text><text class="muted" x="430" y="133" text-anchor="middle">prompt, tools, ledger, provider</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M430 145 V175"/><polygon points="430,175 545,225 430,275 315,225" fill="var(--warn-bg)" stroke="var(--orange)" stroke-width="1.4"/><text x="430" y="221" text-anchor="middle">Provider block?</text><text class="muted" x="430" y="240" text-anchor="middle">text or tool_use</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M315 225 H165"/><rect class="box box-green" x="45" y="200" width="120" height="50"/><text x="105" y="222" text-anchor="middle">Text</text><text class="muted" x="105" y="240" text-anchor="middle">append stream</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M545 225 H695"/><rect class="box box-warn" x="695" y="200" width="130" height="50"/><text x="760" y="222" text-anchor="middle">Tool</text><text class="muted" x="760" y="240" text-anchor="middle">policy + result</text>
-<path class="line" style="marker-end:url(#arrow4)" d="M105 250 C105 320 360 320 390 286"/><path class="line" style="marker-end:url(#arrow4)" d="M760 250 C760 320 500 320 470 286"/><rect class="box" x="335" y="292" width="190" height="44"/><text x="430" y="319" text-anchor="middle">Persist / compact / idle</text>
+<path class="line" d="M430 64 V95"/><rect class="box" x="315" y="95" width="230" height="50"/><text x="430" y="116" text-anchor="middle">Build runtime context</text><text class="muted" x="430" y="133" text-anchor="middle">prompt, tools, ledger, provider</text>
+<path class="line" d="M430 145 V175"/><polygon points="430,175 545,225 430,275 315,225" fill="var(--warn-bg)" stroke="var(--orange)" stroke-width="1.4"/><text x="430" y="221" text-anchor="middle">Provider block?</text><text class="muted" x="430" y="240" text-anchor="middle">text or tool_use</text>
+<path class="line" d="M315 225 H165"/><rect class="box box-green" x="45" y="200" width="120" height="50"/><text x="105" y="222" text-anchor="middle">Text</text><text class="muted" x="105" y="240" text-anchor="middle">append stream</text>
+<path class="line" d="M545 225 H695"/><rect class="box box-warn" x="695" y="200" width="130" height="50"/><text x="760" y="222" text-anchor="middle">Tool</text><text class="muted" x="760" y="240" text-anchor="middle">policy + result</text>
+<path class="line" d="M105 250 V314 H335"/><path class="line" d="M760 250 V314 H525"/><rect class="box" x="335" y="292" width="190" height="44"/><text x="430" y="319" text-anchor="middle">Persist / compact / idle</text>
+<path class="line" d="M430 336 V370 H25 V42 H335"/><text class="muted" x="205" y="363" text-anchor="middle">loop until the final response</text>
 </svg>
+<div class="diagram-notes"><div class="diagram-note"><strong>Steering:</strong> queued input is injected between stream and tool cycles, never mid-mutation.</div><div class="diagram-note"><strong>Compaction:</strong> runs on the loop edge, after a safe checkpoint, when history approaches the model-aware budget.</div></div>
 </div>
 
 <div class="diagram-panel" id="checkpoint-flowchart">
@@ -588,29 +607,31 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <svg class="diagram-svg" viewBox="0 0 860 300" role="img" aria-label="Checkpoint restore flowchart">
 <defs><marker id="arrow5" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0,0 L10,4 L0,8 z" fill="var(--dim)"/></marker></defs>
 <rect class="box box-accent" x="35" y="55" width="150" height="54"/><text x="110" y="77" text-anchor="middle">/undo or CLI</text><text class="muted" x="110" y="95" text-anchor="middle">latest or id</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M185 82 H300"/><polygon points="360,45 450,82 360,119 270,82" fill="var(--warn-bg)" stroke="var(--orange)" stroke-width="1.4"/><text x="360" y="78" text-anchor="middle">mode?</text><text class="muted" x="360" y="96" text-anchor="middle">preview/apply/reset</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M360 119 V178 H225"/><rect class="box box-green" x="65" y="154" width="160" height="54"/><text x="145" y="176" text-anchor="middle">Preview</text><text class="muted" x="145" y="194" text-anchor="middle">stat + capped diff</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M450 82 H570"/><rect class="box box-warn" x="570" y="55" width="150" height="54"/><text x="645" y="77" text-anchor="middle">Worktree apply</text><text class="muted" x="645" y="95" text-anchor="middle">paths or whole tree</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M645 109 V160"/><rect class="box" x="565" y="160" width="160" height="54"/><text x="645" y="182" text-anchor="middle">Restore sidecars</text><text class="muted" x="645" y="200" text-anchor="middle">untracked copies</text>
-<path class="line" style="marker-end:url(#arrow5)" d="M450 82 C520 25 670 25 760 55"/><rect class="box box-danger" x="720" y="55" width="120" height="54"/><text x="780" y="77" text-anchor="middle">ResetHead</text><text class="muted" x="780" y="95" text-anchor="middle">git reset --hard</text>
+<path class="line" d="M185 82 H270"/><polygon points="360,45 450,82 360,119 270,82" fill="var(--warn-bg)" stroke="var(--orange)" stroke-width="1.4"/><text x="360" y="78" text-anchor="middle">mode?</text><text class="muted" x="360" y="96" text-anchor="middle">preview/apply/reset</text>
+<path class="line" d="M360 119 V178 H225"/><rect class="box box-green" x="65" y="154" width="160" height="54"/><text x="145" y="176" text-anchor="middle">Preview</text><text class="muted" x="145" y="194" text-anchor="middle">stat + capped diff</text>
+<path class="line" d="M450 82 H570"/><rect class="box box-warn" x="570" y="55" width="150" height="54"/><text x="645" y="77" text-anchor="middle">Worktree apply</text><text class="muted" x="645" y="95" text-anchor="middle">paths or whole tree</text>
+<path class="line" d="M645 109 V160"/><rect class="box" x="565" y="160" width="160" height="54"/><text x="645" y="182" text-anchor="middle">Restore sidecars</text><text class="muted" x="645" y="200" text-anchor="middle">untracked copies</text>
+<path class="line" d="M450 82 C520 25 690 25 792 55"/><rect class="box box-danger" x="735" y="55" width="115" height="54"/><text x="792" y="77" text-anchor="middle">ResetHead</text><text class="muted" x="792" y="95" text-anchor="middle">git reset --hard</text>
 </svg>
+<div class="diagram-notes"><div class="diagram-note"><strong>Default is safe:</strong> a normal restore updates worktree paths only; moving <code>HEAD</code> requires the explicit reset-head mode.</div><div class="diagram-note"><strong>Verified content:</strong> blobs are rehashed before and during restore, and the checkpoint ref is retained either way.</div></div>
 </div>
 
 <h3>Key Enums and Structs</h3>
 <table>
 <tr><th>Type</th><th>Defined In</th><th>Purpose</th></tr>
-<tr><td><code>ThinkingEffort</code></td><td>main.rs</td><td>Reasoning depth: Off, Low, Medium, High, XHigh, Max</td></tr>
+<tr><td><code>ThinkingEffort</code></td><td>main.rs</td><td>Reasoning depth: Off, Minimal, Low, Medium, High, XHigh, Max</td></tr>
+<tr><td><code>ReasoningMode</code></td><td>main.rs</td><td>Independent Standard or Pro execution mode; active only for official OpenAI GPT-5.6 Responses requests</td></tr>
 <tr><td><code>OutputMode</code></td><td>main.rs</td><td>Text, Json, StreamJson — output format for non-interactive mode</td></tr>
 <tr><td><code>ApprovalProfile</code></td><td>main.rs</td><td>Ask, AutoRead, AutoWrite, Never, Always — permission gating</td></tr>
 <tr><td><code>SandboxProfile</code></td><td>main.rs</td><td>ReadOnly, WorkspaceWrite, DangerFullAccess</td></tr>
 <tr><td><code>ContextMode</code></td><td>main.rs</td><td>Standard, Frugal, Tiny — context window management</td></tr>
 <tr><td><code>MutationPreviewMode</code></td><td>main.rs</td><td>Off, Simple, Git — diff preview before mutations</td></tr>
-<tr><td><code>Usage</code></td><td>main.rs</td><td>Token tracking: input, output, cache_create, cache_read</td></tr>
-<tr><td><code>BudgetCap</code></td><td>main.rs</td><td>Session budget limits in USD or tokens</td></tr>
+<tr><td><code>Usage</code></td><td>usage.rs</td><td>Token tracking: input, output, cache_create, cache_read</td></tr>
+<tr><td><code>BudgetCap</code></td><td>usage.rs</td><td>Session budget limits in USD or tokens</td></tr>
 <tr><td><code>WorkLedger</code></td><td>main.rs</td><td>Objective, phase, decisions, pending/done/blocked items</td></tr>
 <tr><td><code>SessionHeader</code></td><td>main.rs</td><td>Persisted session metadata with full provenance</td></tr>
 <tr><td><code>Message / Block</code></td><td>main.rs</td><td>Conversation history: Text, Thinking, ToolUse, ToolResult</td></tr>
-<tr><td><code>AgentEvent</code></td><td>main.rs</td><td>Event stream: TurnStart, TextDelta, ToolCallResult, etc.</td></tr>
+<tr><td><code>AgentEvent</code></td><td>events.rs</td><td>Event stream: TurnStart, TextDelta, ToolCallResult, etc.</td></tr>
 </table>
 
 <section class="collapsible-section">
@@ -620,10 +641,10 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Agent Loop</h3>
 <p>The central <code>Agent</code> struct drives a turn-based loop:</p>
 <ol>
-<li><strong>Prompt composition</strong> — Builds the system prompt from <code>DEXT.md</code>, project context, tool catalog, session header, work ledger, shelf abilities, and recall cache.</li>
+<li><strong>Prompt composition</strong> — Builds the system prompt from <code>DEXT.md</code>, project context, tool catalog, session header, work ledger, shelf abilities, and recall cache. Composition splits into a cached stable block and a volatile environment tail that rides after the cache breakpoint. Turn-stable sections — project guidance, recall, and the pack and shelf registry summaries — stay in the cached block; mutation-capable tool rounds and approved hooks invalidate pack discovery before the next request. Each ancestor <code>DEXT.md</code>/<code>recall.md</code> input is limited to a regular non-symlink file of at most 1 MiB for both prompt loading and provenance hashing. Todo state is limited to 256 KiB across tool, prompt-summary, and TUI loading paths. Only per-round state (work ledger, context state, provider health, todos, shelf context) is re-sent at full input rate. Per-mode caps for the tail come from one table, so <code>tiny</code>, <code>frugal</code>, and full modes differ only in caps and hint wording.</li>
 <li><strong>History management</strong> — Maintains a <code>Vec&lt;Message&gt;</code> with automatic compaction when context pressure exceeds configurable thresholds (default: 90% at end-turn, 80% after safe tool-result checkpoints).</li>
 <li><strong>Provider dispatch</strong> — Sends streaming requests to the active provider. Applies connect, first-byte, and between-chunk idle deadlines, then parses bounded SSE frames into <code>Block</code> variants.</li>
-<li><strong>Tool execution</strong> — Dispatches <code>tool_use</code> blocks to native Rust implementations. Supports parallel execution for read-only tools.</li>
+<li><strong>Tool execution</strong> — Dispatches <code>tool_use</code> blocks to native Rust implementations. Supports parallel execution for read-only tools. The round waiter observes interrupts independently of task completion, aborts in-flight tasks, and prevents a call that wins its concurrency permit after the interrupt from starting; every abandoned <code>tool_use</code> id still returns a matching interrupted result. Native file/todo reads check cancellation between bounded chunks; explicit <code>read_file</code> limits stop after detecting additional data, and <code>read_symbol</code> source input is capped at 8 MiB.</li>
 <li><strong>Permission gating</strong> — Routes tool calls through <code>EventSink::request_permission()</code> based on the active <code>ApprovalProfile</code> and tool risk classification.</li>
 <li><strong>Steering</strong> — Active-turn user input is routed to a steering channel, injected at safe boundaries.</li>
 </ol>
@@ -631,19 +652,21 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <table>
 <tr><th>Provider</th><th>API</th><th>Request Builder</th></tr>
 <tr><td>Anthropic / GLM / Kimi Code</td><td>Messages API (<code>/v1/messages</code>)</td><td><code>Request</code> struct with <code>AnthropicThinking</code></td></tr>
-<tr><td>OpenAI / DeepSeek / Local</td><td>Chat Completions (<code>/v1/chat/completions</code>)</td><td><code>OaiRequest</code> with <code>reasoning_effort</code></td></tr>
-<tr><td>ChatGPT / Codex</td><td>Responses API (<code>/codex/responses</code>)</td><td><code>build_chatgpt_request()</code></td></tr>
+<tr><td>Official OpenAI GPT-5.6 / explicit custom Responses profiles</td><td>Responses API (<code>/v1/responses</code>)</td><td><code>build_openai_responses_request()</code>; official GPT-5.6 adds independent <code>reasoning.effort</code> and <code>reasoning.mode</code></td></tr>
+<tr><td>Other OpenAI / DeepSeek / Local</td><td>Chat Completions (<code>/v1/chat/completions</code>)</td><td><code>OaiRequest</code> with provider-compatible <code>reasoning_effort</code></td></tr>
+<tr><td>ChatGPT / Codex</td><td>Codex Responses API (<code>/codex/responses</code>)</td><td><code>build_chatgpt_request()</code>; no Platform-only mode field</td></tr>
 </table>
 <h3>Transport Deadlines and Body Bounds</h3>
 <p>The shared provider client uses a 15-second connect timeout. Cloud requests allow 180 seconds to first response headers and 90 seconds between stream chunks; local llama.cpp requests default to 600 seconds and 300 seconds respectively. <code>DEXT_PROVIDER_CONNECT_TIMEOUT_SECS</code>, <code>DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS</code>, and <code>DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS</code> accept positive overrides. Initial requests and compaction retries use the same first-byte policy. Non-stream compaction responses use the stream-idle deadline while reading and reject JSON bodies above 4 MiB; provider error diagnostics stop at 4,000 bytes.</p>
 <p><code>src/sse.rs</code> limits its in-progress input buffer to one configured event plus at most four delimiter bytes before rejection. One large network read may still contain many valid small events; the decoder drains complete frames incrementally rather than rejecting by chunk size.</p>
-<p>ChatGPT Responses terminal events with <code>status=incomplete</code> are recoverable rather than fatal protocol errors. Dext executes only function calls that reached a streamed completion event and discards truncated calls, ignoring complete-looking terminal snapshots for those unfinished calls. Discarded live text/thinking preview state is reset; interactive warnings identify the recovery. If no executable call remains, Dext issues a bounded continuation request with a concise runtime hint; provider-reported content filtering halts immediately instead of retrying. Recovery lowers ChatGPT reasoning effort for that request only (for example, <code>xhigh</code> to <code>medium</code>) without changing the user-selected effort or consuming the normal tool-iteration budget. After three unsuccessful continuation requests, Dext halts the turn with guidance while keeping the session usable.</p>
+<p>Responses terminal events with <code>status=incomplete</code> are recoverable rather than fatal protocol errors. Dext executes only function calls that reached a streamed completion event and discards truncated calls, ignoring complete-looking terminal snapshots for those unfinished calls. Discarded live text/thinking preview state is reset; a content-filter terminal also discards function calls and opaque encrypted reasoning state. Interactive warnings identify the recovery. If no executable call remains, Dext issues a bounded continuation request with a concise runtime hint; provider-reported content filtering halts immediately instead of retrying. Recovery lowers reasoning effort for that request only (for example, <code>xhigh</code> to <code>medium</code>) without changing the user-selected effort or consuming the normal tool-iteration budget. After three unsuccessful continuation requests, Dext halts the turn with guidance while keeping the session usable.</p>
+<p>Official OpenAI GPT-5.6 uses stateless Responses requests with <code>store:false</code>. Tool-bearing requests explicitly include <code>reasoning.encrypted_content</code>; when the provider returns a valid opaque reasoning item, Dext retains it in session history and replays it only within the current user/tool turn. Older-turn reasoning and malformed or placeholder items are omitted. ChatGPT/Codex input continues to omit persisted reasoning items. OpenAI Responses tools use the flat function shape with <code>strict:false</code>; ChatGPT/Codex tools retain their existing flat <code>strict:null</code> shape.</p>
 <h3>Session Persistence</h3>
-<p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). This header is the replay anchor for deterministic restore behavior.</p>
+<p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). Persisted usage costs must be finite and non-negative, and restored budget caps must contain at least one positive dimension; invalid accounting metadata is rejected instead of affecting resumed enforcement. This header is the replay anchor for deterministic restore behavior. Session review remains available through list, brief, analyze, grep, failure, verification, and decision views. Briefs omit the raw transcript but can still expose sensitive ledger, path, failure, and verification data. Export writes an explicit HTML or JSONL copy. Prune removes stale locks and project directories containing no state other than stale locks while preserving session JSONL and all other project state. The unused work-map, packet, focus, and track surface has been removed.</p>
 <h3>Eval Harness</h3>
 <p>Outcome-oriented assertions on files and command output. The eval path validates objective completion semantically (not just command exit) and records verification artifacts for later audit. Run via <code>dext --eval</code>.</p>
 <h3>Crash Recovery</h3>
-<p>A panic hook writes an owner-private JSON snapshot under <code>~/.dext/crashes/</code> with a generated crash id, hashed source-location metadata, terminal dimensions, process id, current generated session id, recent event breadcrumbs, and whether backtraces were enabled. Free-form panic payloads, raw source paths, environment text, and backtrace content are omitted.</p>
+<p>A panic hook writes an owner-private JSON snapshot under <code>~/.dext/crashes/</code> with a generated crash id, hashed source-location metadata, terminal dimensions, process id, current generated session id, recent event breadcrumbs, and whether backtraces were enabled. Front-end sinks record each structural breadcrumb exactly once, including JSON and stream-JSON modes. Free-form panic payloads, raw source paths, environment text, and backtrace content are omitted.</p>
 </div>
 </section>
 <section class="collapsible-section">
@@ -656,6 +679,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 ├── auth.json                    # Stored credentials (0600 on Unix)
 ├── .env                         # Optional user-owned Dext dotenv settings
 ├── settings.json                 # user compaction threshold settings
+├── session-locks.operation.lock # owner-private cross-process session lock guard
 ├── crashes/                     # owner-private crash snapshots
 ├── shelves/                     # User-scoped shelves and packs
 └── projects/
@@ -676,7 +700,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Atomic Writes</h3>
 <p>Sensitive state writes use a temp-file-and-replace helper. On Windows the replacement uses <code>MoveFileExW</code>; on Unix it uses <code>fs::rename</code>. Session logs normally use private append writes while they remain below the cap.</p>
 <h3>Session State Lock</h3>
-<p>Each active session directory has a <code>session.lock.json</code> record containing PID, token, project, sandbox, and session identity. Matching locks are released through a cleanup registry; a lock is removed as stale only when its recorded process is no longer running.</p>
+<p>Each active session directory has a <code>session.lock.json</code> record containing PID, token, project, sandbox, and session identity. Session open, stale reclamation, cleanup, and prune operations are serialized by the owner-private <code>session-locks.operation.lock</code> file under <code>DEXT_HOME</code>. Stale removal revalidates the token and PID while holding that lock, so a replaced live lock is preserved. Matching locks are released through a cleanup registry. <code>dext session prune</code> runs as a dry run unless <code>--apply</code> is supplied; it preserves every project directory containing session or other project state and removes only stale locks plus stale lock-only directory trees.</p>
 <h3>Log Rotation</h3>
 <p>Each session's <code>latest.log</code> is capped at 64,000 bytes. <code>DEXT_LOG_ARCHIVES</code> may retain up to 16 rotated archives; the default is zero.</p>
 </div>
@@ -690,7 +714,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Three wire-format families:</p>
 <ul>
 <li><code>Anthropic</code> — Anthropic Messages API (also used by GLM via <code>api.z.ai/api/anthropic</code>)</li>
-<li><code>OpenAi</code> — OpenAI Chat Completions API (also used by DeepSeek, local llama.cpp)</li>
+<li><code>OpenAi</code> — OpenAI-compatible APIs. Ordinary models use Chat Completions; the built-in official <code>openai</code> profile routes GPT-5.6 at <code>api.openai.com</code> through the Platform Responses API.</li>
 <li><code>ChatGpt</code> — ChatGPT Responses API (OAuth-backed)</li>
 </ul>
 <h3>Built-in Providers</h3>
@@ -720,6 +744,10 @@ dext --frugal --effort off    # low-token mode</code></pre>
 </ol>
 <h3>ChatGPT Model Normalization</h3>
 <p>Compact aliases are canonicalized (for example <code>gpt5codex</code> → <code>gpt-5-codex</code> and ChatGPT <code>gpt-5.6</code> → <code>gpt-5.6-sol</code>). GLM models get an automatic <code>glm-</code> prefix when omitted, and model-name context hints such as <code>[1m]</code> are honored.</p>
+<h3>GPT-5.6 Responses Controls</h3>
+<p>The built-in OpenAI and ChatGPT catalogs include <code>gpt-5.6-sol</code>, <code>gpt-5.6-terra</code>, and <code>gpt-5.6-luna</code>; OpenAI also keeps the official unsuffixed <code>gpt-5.6</code> Sol id, while ChatGPT normalizes it to <code>gpt-5.6-sol</code>. Compact aliases are <code>gpt56</code>/<code>gpt56sol</code>, <code>gpt56terra</code>, and <code>gpt56luna</code>. All variants declare 1,050,000-token context and 128,000-token output metadata.</p>
+<p>For API-key OpenAI at the official endpoint, the four listed GPT-5.6 ids use <code>/v1/responses</code>; unknown <code>gpt-5.6-*</code> suffixes do not silently inherit that route. GPT-5.6 effort levels are <code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, and native <code>max</code>. Standard versus Pro is an independent model mode, defaults to Standard, and is carried inside the Responses <code>reasoning</code> object. Main turns and compaction summaries resolve effort through the selected model's advertised levels; unsupported selections clamp, and Off emits <code>none</code> only when advertised. Summaries preserve the selected Standard/Pro mode and receive Dext's reasoning-aware summary allowance whenever the summary model resolves a Responses reasoning effort, even when main-turn effort is Off. Tool-bearing stateless requests ask for opaque encrypted reasoning state so current-turn function-call continuation can replay it. <code>DEXT_COMPACT_MODEL</code> is normalized through the active provider; request contract, reasoning capability, effort levels, mode, and usage pricing come from the resolved summary model. This capability-scoped route does not change custom OpenAI-compatible endpoints or non-GPT-5.6 models.</p>
+<p>ChatGPT OAuth retains its Codex Responses contract and GPT-5.6 levels from <code>none</code> through <code>xhigh</code>; Dext <code>max</code> maps to <code>xhigh</code>. It receives neither <code>reasoning.mode</code> nor <code>max_output_tokens</code>. Other built-in providers retain their prior model-specific request shaping.</p>
 <h3>Authentication</h3>
 <p>Credentials stored in <code>~/.dext/auth.json</code>. Two types: <code>ApiKey</code> (plain key, supports env var refs and <code>!command</code> secret references) and <code>OAuth</code> (access token + refresh token + expiry, used by ChatGPT). Provider/profile resolution merges built-ins with user catalog overrides while pruning retired bundled providers.</p>
 </div>
@@ -727,7 +755,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="tools-rs" class="collapsible-header">Tools.rs — Tool Catalog <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p>Defines all provider-visible tools, their schemas, permission requirements, and parallel-safety classification.</p>
+<p>Defines all provider-visible tools and a shared <code>ToolSpec</code> registry for required fields, permission, side-effect/process, parallel-safety, and default/full-profile metadata. Wire schemas and lean descriptions stay next to the catalog; policy code consumes registry metadata instead of repeating lists.</p>
 <h3>Tool Profiles</h3>
 <table>
 <tr><th>Profile</th><th>Description</th><th>Schemas</th></tr>
@@ -746,7 +774,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <ul>
 <li><code>wire_tools()</code> — Anthropic format with <code>cache_control: ephemeral</code></li>
 <li><code>wire_tools_oai()</code> — OpenAI <code>function</code> type format</li>
-<li><code>wire_tools_chatgpt()</code> — ChatGPT flattened format with <code>strict: null</code></li>
+<li><code>wire_tools_chatgpt()</code> — ChatGPT flattened Responses format with <code>strict: null</code></li>
+<li><code>wire_tools_openai_responses()</code> — OpenAI Platform flattened Responses format with <code>strict: false</code></li>
 </ul>
 <p>Runtime-only pack and shelf commands are intentionally separate from provider-visible tools. Packs act as modular battery packs: Dext creates, discovers, inspects, maintains, and invokes shelf-contained workflows through the existing tool, approval, and sandbox surface. Dext ships no pack content and adds no pack-specific provider-visible tools.</p>
 </div>
@@ -759,21 +788,22 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Command Risk Levels</h3>
 <table>
 <tr><th>Risk</th><th>Description</th><th>Examples</th></tr>
-<tr><td><code>Read</code></td><td>Read-only operations</td><td><code>ls</code>, <code>cat</code>, <code>git status</code>, <code>http GET</code></td></tr>
+<tr><td><code>Read</code></td><td>Read-only operations</td><td><code>ls</code>, <code>cat</code>, native <code>git_diff</code>, <code>http GET</code></td></tr>
 <tr><td><code>Write</code></td><td>Modifies files or state</td><td><code>write_file</code>, <code>edit_file</code>, non-dangerous bash</td></tr>
-<tr><td><code>Danger</code></td><td>Destructive or sensitive operations</td><td><code>sudo</code>, <code>rm -rf</code>, <code>git push</code>, HTTP POST/DELETE</td></tr>
+<tr><td><code>Danger</code></td><td>Destructive or sensitive operations; never auto-approved by <code>auto-write</code></td><td><code>sudo</code>, <code>rm -rf</code>, shell Git outside the explicit <code>--no-pager</code> metadata allowlist, inline/stdin interpreters, <code>git push</code>, HTTP POST/DELETE</td></tr>
 </table>
 <h3>Bash Guardrails</h3>
 <ul>
 <li>Auto-injects <code>set -o pipefail</code> if missing</li>
 <li>Blocks <code>--break-system-packages</code> pip flag (overridable)</li>
-<li>Detects sudo commands needing password and routes to local auth prompt</li>
-<li>Bash calls are atomic: Unix roots run in detached sessions/process groups; Windows roots start suspended, enter kill-on-close Job Objects, then resume. Dext cleans the full child tree after completion, timeout, or interrupt.</li>
+<li>Detects sudo commands needing password and routes them to the local auth prompt</li>
+<li>Classifies destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands as Danger. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is also Danger unless it uses explicit <code>git --no-pager</code> and matches a narrow helper-free metadata-inspection allowlist; commands such as <code>grep</code>, <code>diff-tree</code>, <code>ls-files</code>, <code>check-ignore</code>, and <code>check-attr</code> remain gated because they can invoke fsmonitor. Use Dext’s hardened native Git tools for review operations. Inline or stdin interpreter execution—including shell input redirections and heredocs—and recognized dynamic or wrapper command paths are Danger because payload effects cannot be inferred safely. Dynamic command words include variable/command, glob, brace, tilde, and attached-redirection expansion forms. Actual shell <code>curl</code>/<code>wget</code>/HTTPie/XH requests are gated because startup configuration and request bodies are not safely inferable; use the native <code>http</code> tool for read requests. Attached/clustered flags and common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers are recognized. Python <code>-v</code> remains verbose and does not suppress stdin detection; Windows <code>.exe</code>/<code>.com</code> command and wrapper matching is case-insensitive.</li>
+<li>Bash calls are atomic: Unix roots run in detached sessions/process groups; Windows roots start suspended, enter kill-on-close Job Objects, then resume. Dext cleans the full child tree after completion, timeout, interrupt, or cancellation/unwinding that drops an in-flight process-tree guard.</li>
 <li>On Windows, shell-backed tools skip Windows/WSL app aliases and select a real <code>bash.exe</code> from <code>PATH</code> (for example Git for Windows); <code>DEXT_BASH_PATH</code> provides an explicit override.</li>
 <li>Advisories: prefer <code>rg</code> over <code>grep -r</code>, prefer <code>fd</code> over <code>find</code></li>
 </ul>
 <h3>Input Validation</h3>
-<p>Every tool call is validated for required fields before execution. Missing/empty required fields, type mismatches, and mutually exclusive params are caught early with descriptive errors.</p>
+<p>Every tool call is validated for required fields before execution. Missing/empty required fields, type mismatches, numeric range violations, and mutually exclusive params are caught early with descriptive errors. Search <code>extra_args</code> reject positional and operand-changing forms, including attached ripgrep <code>-ePATTERN</code>/<code>-fFILE</code>, so model-supplied pattern/path fields remain the only search operands.</p>
 <h3>Auth Failure Detection</h3>
 <p>Tool output is scanned for auth failure markers (<code>unauthorized</code>, <code>401</code>, <code>403</code>, <code>invalid api key</code>) to trigger circuit breakers and prevent repeated credential burn on failing hosts.</p>
 </div>
@@ -786,9 +816,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Layout</h3>
 <ul>
 <li><strong>Transcript area</strong> — Scrollable message history with user, assistant, tool, thinking, and steering lines</li>
-<li><strong>Live status bar</strong> — Provider, model, thinking effort, approval profile, context pressure, usage stats</li>
-<li><strong>Input panel</strong> — Multi-line text input with history (200 entries), completion for slash commands</li>
-<li><strong>Work map drawer</strong> — Collapsible work-ledger visualization</li>
+<li><strong>Live status bar</strong> — Provider, model, thinking effort and selected <code>/pro</code> mode when applicable, approval profile, context pressure, usage stats</li>
+<li><strong>Input panel</strong> — Multi-line text input with history (200 entries), completion for canonical handled slash commands, and argument hints</li>
 </ul>
 <h3>Startup Welcome</h3>
 <p>The startup welcome remains inline transcript content, so it scrolls away naturally with the conversation. One transcript-owned blank separator row keeps it visually distinct from CLI approval and sandbox diagnostics, including after inline viewport placement or replay. Its brand row shows Dext and the version, plus the working directory and cached Git branch/state at 80 columns or wider; narrower terminals drop that right segment. Exactly two facts, Model and Approval, sit between horizontal rules, followed by one rotating tip selected from verified commands and key bindings. Terminal-cell width controls alignment and path truncation. Git status uses one <code>git status --porcelain=v1 --branch</code> probe off the render loop, with only an 8 ms startup wait before path-only fallback. The empty composer reads <code>❯ Type a request… &nbsp; @ files · / commands</code>.</p>
@@ -815,7 +844,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Tool Result Rendering</h3>
 <p>Tool results are rendered as collapsible blocks with density grouping. Long outputs are compressed with head+tail preservation and JSON shape hints. Failed native <code>write_file</code>, <code>edit_file</code>, and <code>multi_edit</code> blocks explicitly state that no edits were applied, matching the atomic prepare-and-replace invariant. The alternate-screen backend viewer normalizes CRLF across arbitrary output chunks without introducing blank rows and visually matches the main TUI with a Dext header, agent-active clock, command summary, styled stdout/stderr lanes, output panel, command position, and compact controls. It continues to use the existing bounded ring buffer, selection, scrolling, event stream, and permission/auth priority.</p>
 <h3>Markdown Rendering</h3>
-<p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence.</p>
+<p>Assistant text blocks are rendered using <code>tui-markdown</code> with sanitization and terminal-safe formatting rules. Rendering preserves readability under narrow widths and avoids alternate-screen dependence. Thinking and steering blocks use a light or dark contrast palette. <code>DEXT_THEME=light|dark</code> is the explicit override; otherwise Dext converts the terminal's <code>COLORFGBG</code> 16/256-color background index to luminance when present and falls back to dark.</p>
 <h3 id="tui-dependencies">Dependency and resize contract</h3>
 <p>The exact stack is <code>ratatui 0.30.2</code>, <code>ratatui-core 0.1.2</code>, <code>tui-markdown 0.3.8</code>, <code>crossterm 0.29.0</code>, and <code>unicode-width 0.2.2</code>. Dext selects exact versions and patches exact vendored <code>ratatui-core</code> source to avoid synchronous cursor-position queries during inline replay and whole-display clears during horizontal shrink.</p>
 <p>The real-PTY regression suite verifies editable input during streaming, resize survival with populated history, zero whole-screen resize clears, bounded cursor queries, terminal-height-bounded replay chunks, and completed output after resize. Its final stream marker has a bounded 10-second wait so slower macOS CI hosts do not create false negatives. See <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a> and <a href="https://github.com/SiliconState/Dext/blob/main/vendor/ratatui-core/DEXT_PATCH.md"><code>vendor/ratatui-core/DEXT_PATCH.md</code></a> for the maintained contract and patch rationale.</p>
@@ -829,23 +858,22 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Git-native recovery checkpoints created before approved non-read-risk tool calls in Git workspaces.</p>
 <h3>Checkpoint Lifecycle</h3>
 <ol>
-<li><strong>Create</strong> — Before a tool executes, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;</code></li>
+<li><strong>Create</strong> — Immediately before each sequential tool dispatch, a checkpoint is created under <code>refs/dext/checkpoints/&lt;session&gt;/&lt;timestamp&gt;-&lt;ordinal&gt;-&lt;tool&gt;-&lt;random-nonce&gt;</code>; a later call in one round therefore captures state produced by earlier calls</li>
 <li><strong>Dirty state capture</strong> — If the worktree is dirty, <code>git stash create</code> captures a snapshot without touching the working tree or reflog</li>
-<li><strong>Untracked sidecar</strong> — For direct file tools, untracked files are saved to owner-private <code>.dext/checkpoints/&lt;id&gt;/</code> storage; symlinked storage paths are rejected on Unix</li>
-<li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude</li>
+<li><strong>Untracked sidecars</strong> — Direct file tools preserve an untracked target. Write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> checkpoints inventory up to 500 existing untracked paths, preserve regular files within 8 MiB/file and 32 MiB total bounds, and preserve bounded UTF-8 symlink targets without following them. Non-UTF-8 names, unsupported types, and path/type/size bounds are explicit partial-recovery gaps. Checkpoint storage containers must be real directories; on Unix they must be current-user-owned, <code>.dext</code> must not be group/world-writable, and managed checkpoint, sidecar, and blob directories are owner-private. Locked Unix mutations may repair modes only on current-user-owned managed directories; inspection does not repair them, restore rejects unsafe sidecar/blob containers, and pruning retains unsafe artifact directory trees with bounded warnings while unlinking only an orphan top-level sidecar symlink without following it. Regular-file content is stored in owner-private SHA-256-addressed blobs shared by retained checkpoints; unchanged source paths reuse the session cache only while source and blob metadata fingerprints remain stable, preview/restore rehash blobs before trusting them, and prune or failed checkpoint creation removes valid unreferenced/new blobs. Malformed or unsafe blob entries and sidecar directory trees remain untouched and produce bounded warnings without stopping other retention cleanup; an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked without following it. Owner execute state is descriptor metadata. Manifest rows carry 11 or 12 tab-separated fields; the retired pre-JSON 8/9-field encodings are no longer parsed, so every path in a current manifest is validated by one repo-relative rule with no weaker alternative a row can select. Current 12-field manifests record exact direct-sidecar membership; 11-field manifests without that field fail conservatively before mutation when a missing artifact is ambiguous rather than deleting current path content. A recognized retired row must match the complete retired field grammar and is skipped with a warning so one stale row cannot disable <code>/undo</code> or block write-risk tools. Its recorded OID must match any live checkpoint ref; retention publishes the compacted manifest before deleting expired or integrity-matched retired refs and artifacts, so cleanup failure leaves orphan state instead of a manifest naming a deleted recovery point. Mismatches and other corrupt or tampered rows fail the manifest closed. A recovery gap triggers separate repository/session-scoped approval: denial blocks the command, while approval preserves tracked/staged state and the bounded subset. Other checkpoint failures remain fail-closed. Repositories without an initial commit still block writes that would overwrite existing state. A workspace with no <code>.git</code> marker is non-Git unless ambient <code>GIT_DIR</code>/<code>GIT_WORK_TREE</code>/<code>GIT_COMMON_DIR</code> routing exists; routed-without-marker and malformed-marker cases fail loudly because Dext-owned Git commands scrub routing variables.</li>
+<li><strong>Manifest</strong> — Appended to owner-private <code>.dext/checkpoints/manifest.txt</code>; <code>/.dext/</code> is added to the repository-local Git exclude. Rows are tab-separated with 11 or 12 fields; a 12-field row adds the exact direct-sidecar membership index. Untracked preview entries with unsafe host-native targets are omitted, and a malformed field fails its row closed rather than degrading it. Runtime manifest reads are capped at 16 MiB. Retention writes the compacted manifest first, then removes expired/retired refs and orphan artifacts while holding the operation lock.</li>
 </ol>
 <h3>Restore Modes</h3>
 <table>
 <tr><th>Mode</th><th>Description</th></tr>
 <tr><td><code>Preview</code></td><td>Show diff vs current worktree without modifying anything</td></tr>
-<tr><td><code>Worktree</code></td><td>Checkout affected paths from checkpoint OID</td></tr>
-<tr><td><code>WorktreeAndIndex</code></td><td>Full worktree checkout from checkpoint OID</td></tr>
+<tr><td><code>Worktree</code></td><td>Restore affected paths from the checkpoint OID with literal Git pathspecs; revalidate and atomically replace captured sidecar files/symlinks on supported platforms</td></tr>
 <tr><td><code>ResetHead</code></td><td>Hard reset HEAD to checkpoint's original HEAD</td></tr>
 </table>
 <h3>Pruning</h3>
-<p>Default: keep the 20 newest checkpoints and remove entries older than 168 hours (7 days). Pruning rebuilds local manifests, removes orphaned <code>refs/dext/checkpoints/*</code>, and deletes associated sidecar directories for bounded disk growth. Never mirror-push <code>refs/dext/*</code>.</p>
+<p>Default: keep the 20 newest checkpoints and remove entries older than 168 hours (7 days). Pruning first publishes the reconciled local manifest, then removes orphaned <code>refs/dext/checkpoints/*</code>, legacy sidecar directories, and valid unreferenced content-addressed blobs for bounded disk growth. Malformed or unsafe blob entries and sidecar directory trees are retained for inspection and reported with bounded warnings without stopping other cleanup; an orphan top-level sidecar symlink with a valid checkpoint ID is unlinked without following it. Never mirror-push <code>refs/dext/*</code>.</p>
 <h3>Checkpoint Triggers</h3>
-<p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Other tools are checkpointed when <code>tool_policy::classify_command_risk()</code> returns Write or Danger (for example write-risk <code>bash</code>/<code>awk</code>/<code>csvkit</code> or non-GET <code>http</code>).</p>
+<p>Always checkpointed: <code>write_file</code>, <code>edit_file</code>, <code>multi_edit</code>, <code>todo_write</code>, <code>git_commit</code>. Other tools are checkpointed when <code>tool_policy::classify_command_risk()</code> returns Write or Danger. Required checkpoint creation is fail-closed before execution; HTTP and other non-filesystem side effects are not recoverable merely because a local Git checkpoint exists.</p>
 </div>
 </section>
 
@@ -857,7 +885,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <ol>
 <li>Read the current file content (or empty for new files)</li>
 <li>Compute the proposed content (apply edit/multi-edit transforms in memory)</li>
-<li>Generate a simple line-level diff with one context line around changed hunks</li>
+<li>Generate an alignment-aware Myers line diff with one context line around changed hunks; final-newline-only changes are explicit, and inputs above the line budget use a bounded conservative fallback</li>
+<li>Keep added/removed counts for the full proposed change even when rendered output is truncated</li>
 <li>Cap at 4,096 bytes with a truncation notice</li>
 <li>Show added/removed line counts and whether it's a new file</li>
 </ol>
@@ -889,7 +918,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li><strong>Feasibility guard</strong> — Requires single-item probes before bulk external collection</li>
 </ul>
 <h3>Objective Tracker</h3>
-<p>Parses user prompts to extract checkpoints (plan, analyze, implement, verify, document). Tracks satisfaction by examining tool usage patterns, bash commands, and assistant text.</p>
+<p>Parses user prompts to extract checkpoints (plan, analyze, implement, verify, document). Exact verification keywords avoid turning descriptive morphology such as <code>verifiable</code> into new work. Satisfaction is refreshed after every tool round and is derived from tool usage, bash commands, and explicit completion reports such as “checks pass,” so the next model request does not receive a stale <code>[unresolved]</code> checkpoint after custom checks pass.</p>
 <h3>Adaptive Caps</h3>
 <p>Tool UI content and result caps scale down dynamically based on context pressure: ≥90% → 25%, ≥75% → 50%, ≥60% → 75% of default. This preserves critical evidence near context limits while reducing prompt bloat.</p>
 </div>
@@ -898,7 +927,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="packs-rs" class="collapsible-header">Packs.rs — Pack System <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p><strong>Packs are shelf-contained workflow documents, not plugin binaries.</strong> Dext supplies the create, discover, inspect, maintain, and run lifecycle; users own the content. The runtime reads <code>PACK.md</code> and executes through the existing Dext tool surface, keeping packs provider-neutral and auditable without bloating the core binary.</p>
+<p><strong>Packs are shelf-contained workflow documents, not plugin binaries.</strong> Dext supplies the create, discover, inspect, maintain, and run lifecycle; users own the content. The runtime accepts <code>PACK.md</code> only as a regular non-symlink file no larger than 1 MiB, then applies the 32 KiB invocation-context cap and executes through the existing Dext tool surface, keeping packs provider-neutral and auditable without bloating the core binary.</p>
 
 <h3>Design Contract</h3>
 <ul>
@@ -925,7 +954,8 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>Explicit shelf roots: <code>DEXT_SHELVES_DIR</code></li>
 <li>User shelves: <code>~/.dext/shelves/*/packs</code></li>
 </ol>
-<p>Create reusable packs with <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>; add <code>--project</code> only for an explicitly project-local pack. The scaffold creates a minimal <code>PACK.md</code>, refuses overwrite, and is immediately available to normal inspection and invocation. Direct <code>packs/</code>, <code>.dext/packs</code>, <code>~/.dext/packs</code>, <code>DEXT_PACKS_DIR</code>, and per-pack override roots are not discovery inputs.</p>
+<p>Create reusable packs with <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>; add <code>--project</code> only for an explicitly project-local pack. The scaffold creates a minimal <code>PACK.md</code>, refuses overwrite, and is immediately available to normal inspection and explicit invocation. Direct <code>packs/</code>, <code>.dext/packs</code>, <code>~/.dext/packs</code>, <code>DEXT_PACKS_DIR</code>, and per-pack override roots are not discovery inputs.</p>
+<p>Project-local <code>PACK.md</code> content has a repository trust boundary. An explicit <code>/pack</code> or <code>dext pack</code> invocation confirms only that selected project workflow; it does not approve unrelated project shelf metadata. Conversational auto-invocation prompts once per active repository before loading project workflow text. Choosing <code>Always</code> stores a bounded owner-private, single-link project-scoped approval marker on Unix; unsafe or permissive markers are ignored, and <code>/project-extensions reset</code> refuses unsafe marker shapes while removing a safe marker or clearing a session denial. Denied project pack metadata stays out of the model prompt and cannot shadow a same-named user or run-shelf pack. Project-local credential declarations remain ignored.</p>
 <p>The resolver deduplicates by canonicalized path and normalized pack name. Name collisions are resolved by precedence order, not random filesystem order.</p>
 
 <h3>Pack Layout and Front Matter</h3>
@@ -956,10 +986,10 @@ credential-env: [SERVICE_TOKEN]
 <li>paths for workflow and optional hooks</li>
 <li>pack-scoped environment names (<code>DEXT_PACK_DIR</code>, <code>DEXT_PACK_&lt;NAME&gt;_DIR</code>), which the runtime supplies to active-pack <code>bash</code> calls and hook processes</li>
 <li>declared credential names only, never their values</li>
-<li>full <code>PACK.md</code> workflow body</li>
+<li>capped <code>PACK.md</code> workflow body</li>
 <li>explicit user task text</li>
 </ul>
-<p>This gives the model procedural guidance without changing core runtime policy. The selected pack remains active for the session: its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own native <code>bin/</code> helper, never hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state.</p>
+<p>This gives the model procedural guidance without changing core runtime policy. Workflow loading must succeed before the selected pack becomes active, so a missing, oversized, symlinked, or otherwise invalid <code>PACK.md</code> cannot install pack hooks or environment. Once active, its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own native <code>bin/</code> helper, never hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state.</p>
 
 <h3>Execution Paths</h3>
 <ul>
@@ -1004,7 +1034,7 @@ credential-env: [SERVICE_TOKEN]
 </table>
 
 <h3>Signal and Effect Types</h3>
-<p>The shelf module defines a typed signal/effect vocabulary for in-process shelf implementations. Filesystem <code>shelf.json</code> manifests are declarative metadata: a matching load/prompt hook declaration can opt declared context into bounded prompt injection, but manifests do not register executable tools or slash commands and do not supply arbitrary effect handlers.</p>
+<p>The shelf module defines a typed signal/effect vocabulary for in-process shelf implementations. Filesystem <code>shelf.json</code> manifests must be regular non-symlink files no larger than 1 MiB and are declarative metadata: a matching load/prompt hook declaration can opt declared context into bounded prompt injection, but manifests do not register executable tools or slash commands and do not supply arbitrary effect handlers.</p>
 <table>
 <tr><th>Signals</th><th>Typical Use</th></tr>
 <tr><td><code>load</code>, <code>prompt</code>, <code>tool(before|after)</code>, <code>turn(start|end)</code>, <code>compact</code>, <code>shutdown</code></td><td>Typed lifecycle vocabulary for in-process shelves</td></tr>
@@ -1017,12 +1047,12 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>rewrite_tool</code></td><td>Typed input-rewrite effect for an in-process shelf; not executed from a static manifest</td></tr>
 <tr><td><code>state</code></td><td>Typed state effect for an in-process shelf; static manifests do not persist it</td></tr>
 </table>
-<p><code>Block</code> effects terminate in-process signal flow early. Static manifest shelves only produce context/note data for opted-in load or prompt signals.</p>
+<p><code>Block</code> effects terminate in-process signal flow early. Static manifest shelves only produce context/note data for opted-in load or prompt signals. All project <code>shelf.json</code> metadata requires one first-use confirmation per active repository. Choosing <code>Always</code> persists a bounded owner-private, single-link project-scoped decision marker on Unix; unsafe or permissive markers are ignored, and <code>/project-extensions reset</code> refuses unsafe marker shapes while removing a safe marker or clearing a session denial. Before approval, project metadata is omitted from the model prompt, cannot shadow same-key trusted user/run metadata, and cannot contribute behavioral tool effects, while approved project context is explicitly labeled repository-controlled.</p>
 
 <h3>Discovery and Scope Precedence</h3>
 <table>
 <tr><th>Scope</th><th>Rank</th><th>Location</th><th>Intent</th></tr>
-<tr><td><code>Core</code></td><td>0</td><td>Bundled shelves</td><td>Base defaults</td></tr>
+<tr><td><code>Core</code></td><td>0</td><td>In-process registration</td><td>Base defaults; release binaries do not probe build-machine source paths</td></tr>
 <tr><td><code>User</code></td><td>1</td><td><code>~/.dext/shelves</code></td><td>User-level customization</td></tr>
 <tr><td><code>Project</code></td><td>2</td><td><code>.dext/shelves</code></td><td>Repo-specific policy/context</td></tr>
 <tr><td><code>Run</code></td><td>3</td><td><code>DEXT_SHELVES_DIR</code></td><td>Per-invocation highest-priority overrides</td></tr>
@@ -1060,7 +1090,7 @@ credential-env: [SERVICE_TOKEN]
 <li>Bash guardrails and sudo detection</li>
 <li>Checkpoint creation and restore logic</li>
 <li>Objective tracking and satisfaction assessment</li>
-<li>URL host extraction, proxy isolation, destination policy, and exact redirect limits; redirect fixtures use bounded blocking reads on accepted sockets for consistent Windows behavior</li>
+<li>URL parsing/error redaction, proxy isolation, shared bounded DNS reuse/lookups, destination policy, dangerous/duplicate header rejection, exact decoded-body caps, bodyless response semantics, safe cross-origin GET/HEAD redirects, sensitive redirect replay blocking, and automatic-<code>Referer</code> suppression; redirect fixtures use bounded blocking reads on accepted sockets for consistent Windows behavior</li>
 </ul>
 <p>Run with: <code>cargo test --release --locked</code></p>
 <h3>Real-PTY TUI Regression Suite (tests/tui_smoke.rs)</h3>
@@ -1072,7 +1102,7 @@ credential-env: [SERVICE_TOKEN]
 <li>Completed stream output and accepted input after resize, with no crash markers</li>
 </ul>
 <p>Run with: <code>cargo test --release --locked --test tui_smoke -- --nocapture</code></p>
-<p>The complete verification gate also runs formatting, Clippy with warnings denied across the Linux, macOS, and Windows CI matrix, vulnerability auditing, dependency-license policy checks, the vendored <code>ratatui-core</code> unit tests, and a locked release build. Release publication generates <code>dext.cdx.json</code>, includes it in <code>SHA256SUMS</code>, and attests and verifies it alongside the four platform archives. The first successful tag run remains tracked in <a href="https://github.com/SiliconState/Dext/blob/main/docs/RELEASING.md">docs/RELEASING.md</a> until the publication path has end-to-end evidence. On Windows CI and release builders, the scheduler-sensitive <code>fast_bash_command_returns_without_100ms_poll_tail</code> regression runs alone after the remaining release tests. Its original <code>&lt;90 ms</code> assertion remains unchanged; isolation prevents unrelated suite load from obscuring the process-wait regression it measures. The tool-call mock provider consumes its bounded <code>Content-Length</code> request body before responding so Windows does not reset the connection with unread request data. See <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a> for renderer-specific live-terminal checks.</p>
+<p>The complete verification gate also runs formatting, Clippy with warnings denied across the Linux, macOS, and Windows CI matrix, vulnerability auditing, dependency-license policy checks, the vendored <code>ratatui-core</code> unit tests, and a locked release build. Platform-specific fixtures follow host filesystem semantics: the invalid-UTF-8 checkpoint filename case runs only on Unix filesystems that permit creating it, because macOS APFS rejects that filename before Dext can inspect it. Release publication generates <code>dext.cdx.json</code>, includes it in <code>SHA256SUMS</code>, and attests and verifies it alongside the four platform archives. The first successful tag run remains tracked in <a href="https://github.com/SiliconState/Dext/blob/main/docs/RELEASING.md">docs/RELEASING.md</a> until the publication path has end-to-end evidence. On Windows CI and release builders, the scheduler-sensitive <code>fast_bash_command_returns_without_100ms_poll_tail</code> regression runs alone after the remaining release tests. Its original <code>&lt;90 ms</code> assertion remains unchanged; isolation prevents unrelated suite load from obscuring the process-wait regression it measures. The tool-call mock provider consumes its bounded <code>Content-Length</code> request body before responding so Windows does not reset the connection with unread request data. See <a href="https://github.com/SiliconState/Dext/blob/main/docs/TUI.md">docs/TUI.md</a> for renderer-specific live-terminal checks.</p>
 <h3 id="github-pages">GitHub Pages</h3>
 <p>The public site at <a href="https://siliconstate.github.io/Dext/">siliconstate.github.io/Dext</a> is deployed from the static <code>docs/</code> tree by <code>.github/workflows/pages.yml</code>. The workflow validates local links and anchors, uploads an immutable Pages artifact, and deploys with only <code>pages: write</code> and <code>id-token: write</code> in the deployment job. Third-party actions are pinned to full commit hashes and checkout credentials are not persisted.</p>
 <div class="warn"><strong>Confined self-test limitation:</strong> the complete suite is not expected to pass through a Dext <code>bash</code> tool under <code>workspace-write</code>. The sandbox's shared-temp denial can create many follow-on test failures after a common environment lock is poisoned; PTY denial prevents this smoke test from creating terminals; and Cargo-home protection blocks local installation metadata. These denials demonstrate confinement, but do not count as a successful release gate. Rerun from a trusted host terminal or CI.</div>
@@ -1105,7 +1135,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>dext -p</code></td><td>Read prompt from stdin</td></tr>
 <tr><td><code>dext --resume</code></td><td>Resume latest session</td></tr>
 <tr><td><code>dext --fork</code></td><td>Fork latest session into new session</td></tr>
-<tr><td><code>dext session ...</code></td><td>Brief/map/packet/focus/track/export/analyze/grep/failures/verification/decision operations</td></tr>
+<tr><td><code>dext session ...</code></td><td>Brief/export/analyze/grep/failures/verification/decision/prune operations</td></tr>
 <tr><td><code>dext doctor [...]</code></td><td>Inspect effective safety policy and bounded local state without repair or provider calls</td></tr>
 <tr><td><code>dext pack list|inspect|run ...</code></td><td>Discover or invoke source-first packs</td></tr>
 <tr><td><code>dext shelves</code></td><td>List typed shelf manifests and ability metadata</td></tr>
@@ -1120,11 +1150,12 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>dext --sandbox read-only|workspace-write|danger-full-access</code></td><td>Set sandbox profile</td></tr>
 <tr><td><code>dext --eval</code></td><td>Run eval harness</td></tr>
 <tr><td><code>dext --output json|stream-json</code></td><td>Machine-readable output</td></tr>
-<tr><td><code>dext --effort off|low|medium|high|xhigh|max</code></td><td>Thinking effort</td></tr>
+<tr><td><code>dext --effort off|minimal|low|medium|high|xhigh|max</code></td><td>Model reasoning effort; supported levels are clamped per model</td></tr>
+<tr><td><code>dext --reasoning-mode standard|pro</code></td><td>Select GPT-5.6 execution mode; sent only by official OpenAI Responses requests</td></tr>
 <tr><td><code>dext --approval ask|auto-read|auto-write|never|always</code></td><td>Approval profile</td></tr>
 <tr><td><code>dext --trust</code></td><td>Explicitly select approval <code>always</code></td></tr>
 <tr><td><code>dext --no-trust</code></td><td>Explicitly select the default <code>ask</code> approval profile</td></tr>
-<tr><td><code>dext --budget &lt;amount&gt;</code></td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
+<tr><td><code>dext --budget &lt;amount&gt;</code></td><td>Session budget cap: dollars, tokens, or one of each (e.g., $0.50, 100ktok, <code>$0.50 + 100kt</code>); duplicate dimensions are rejected</td></tr>
 </table>
 <h3>Auth Subcommands</h3>
 <table>
@@ -1164,10 +1195,12 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>/allowed</code></td><td>List auto-approved tools</td></tr>
 <tr><td><code>/trust [on|off|status]</code></td><td>Auto-approve all gated tools</td></tr>
 <tr><td><code>/approval [profile]</code></td><td>Set approval profile</td></tr>
+<tr><td><code>/preview [off|simple|git]</code></td><td>Set mutation preview mode</td></tr>
 <tr><td><code>/sandbox [path]</code></td><td>Show or change sandbox root</td></tr>
 <tr><td><code>/sandbox-profile [profile]</code></td><td>Set sandbox: read-only, workspace-write, danger-full-access</td></tr>
-<tr><td><code>/privacy [on|strict|off|status]</code></td><td>Control local redaction and optional strict native-read path blocking</td></tr>
-<tr><td><code>/effort [level]</code></td><td>Set thinking effort: off, low, medium, high, xhigh, max</td></tr>
+<tr><td><code>/privacy [on|strict|off|status]</code></td><td>Control local redaction and optional strict native-read path/search-scope blocking</td></tr>
+<tr><td><code>/effort [level]</code></td><td>Set thinking effort: off, minimal, low, medium, high, xhigh, max</td></tr>
+<tr><td><code>/reasoning-mode [standard|pro|next|prev|status]</code></td><td>Select or inspect GPT-5.6 execution mode; reports inactive outside official OpenAI Responses</td></tr>
 <tr><td><code>/model [name]</code></td><td>Show or change model</td></tr>
 <tr><td><code>/provider [id]</code></td><td>Show or change provider</td></tr>
 <tr><td><code>/models</code></td><td>List available models</td></tr>
@@ -1184,11 +1217,12 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>/save &lt;name&gt;</code></td><td>Save history/config to named JSONL session</td></tr>
 <tr><td><code>/export [html|jsonl] [path]</code></td><td>Export the current session</td></tr>
 <tr><td><code>/resume [name]</code></td><td>Resume latest or named session</td></tr>
-<tr><td><code>/sessions ...</code></td><td>List/analyze/map/grep/focus/export session history</td></tr>
+<tr><td><code>/sessions ...</code></td><td>List/analyze/brief/grep/failures/verification/decisions session history</td></tr>
 <tr><td><code>/plan &lt;task&gt;</code></td><td>Run read-only planning and seed the plan into history</td></tr>
-<tr><td><code>/budget [cap]</code></td><td>Set or show budget cap</td></tr>
+<tr><td><code>/budget [cap]</code></td><td>Set/show a dollar, token, or combined cap; <code>off</code> clears it</td></tr>
 <tr><td><code>/pack create|list|inspect|run</code></td><td>Create or use shelf-contained packs</td></tr>
 <tr><td><code>/shelves</code></td><td>Show shelf registry</td></tr>
+<tr><td><code>/project-extensions [status|reset]</code></td><td>Inspect or reset repository-scoped project extension approval</td></tr>
 <tr><td><code>/undo [--list|--apply|&lt;id&gt;]</code></td><td>Recovery checkpoint preview/apply management</td></tr>
 </table>
 </div>
@@ -1200,8 +1234,8 @@ credential-env: [SERVICE_TOKEN]
 <h3>File Operations</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
-<tr><td><code>read_file</code></td><td>Read</td><td>Read file with line numbers. Explicit offset+limit gets larger cap.</td></tr>
-<tr><td><code>read_symbol</code></td><td>Read</td><td>Locate a source symbol or block around a line number.</td></tr>
+<tr><td><code>read_file</code></td><td>Read</td><td>Read file with line numbers. Positive offset/limit windows get a larger cap, stop once additional data is detected, and can be cancelled between bounded chunks.</td></tr>
+<tr><td><code>read_symbol</code></td><td>Read</td><td>Locate a source symbol or block around a line number. Selector ranges are validated; loading is cancellable and capped at 8 MiB.</td></tr>
 <tr><td><code>write_file</code></td><td>Write</td><td>Write content to file, creating parent dirs. Overwrites existing.</td></tr>
 <tr><td><code>edit_file</code></td><td>Write</td><td>Replace exactly one occurrence of old_string with new_string.</td></tr>
 <tr><td><code>multi_edit</code></td><td>Write</td><td>Batch of exact-string edits applied atomically to one file.</td></tr>
@@ -1228,7 +1262,7 @@ credential-env: [SERVICE_TOKEN]
 <h3>HTTP</h3>
 <table>
 <tr><th>Tool</th><th>Permission</th><th>Description</th></tr>
-<tr><td><code>http</code></td><td>Varies</td><td>HTTPie-style client. Loopback, private/CGNAT, unique-local, link-local, and metadata destinations are blocked after DNS resolution and across redirects unless narrowly opted in.</td></tr>
+<tr><td><code>http</code></td><td>Varies</td><td>HTTPie-style client with HTTP/2 and gzip/Brotli decoding; provider, OAuth, and local-context clients retain HTTP/1/no-auto-decompression behavior. The entire DNS answer is validated before one shared 256-entry cache retains at most 32 addresses per host; connect, lookup, idle-read, 10-minute total-request, redirect, and exact decoded-response bounds apply. <code>--extract-text</code> reads at most 128 KB of source. Duplicate/framing/method-override headers and URL credentials are rejected; errors omit URLs; automatic <code>Referer</code> and HTTPS downgrades are disabled. Headerless/bodyless GET and HEAD requests may follow validated cross-origin redirects, while sensitive requests remain same-origin. GET, HEAD, and OPTIONS requests with raw bodies are Danger-class. IPv4 current-network/broadcast, IP multicast, and IPv6 unspecified destinations are always blocked. Loopback, private/CGNAT, unique-local, link-local, and metadata destinations are blocked unless narrowly opted in.</td></tr>
 </table>
 <h3>Git Operations</h3>
 <table>
@@ -1268,14 +1302,18 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>ANTHROPIC_BASE_URL</code></td><td>Profile default</td><td>Override Anthropic-family base URL</td></tr>
 <tr><td><code>OPENAI_BASE_URL</code></td><td>Profile default</td><td>Override OpenAI-family base URL</td></tr>
 <tr><td><code>DEXT_CONTEXT_MODE</code></td><td>standard</td><td>Context mode: standard, frugal, tiny</td></tr>
+<tr><td><code>DEXT_THINKING_EFFORT</code></td><td>medium</td><td>Model reasoning effort: off, minimal, low, medium, high, xhigh, max</td></tr>
+<tr><td><code>DEXT_REASONING_MODE</code></td><td>standard</td><td>Selected GPT-5.6 execution mode: standard or pro; sent only by the capability-scoped official OpenAI Responses route</td></tr>
+<tr><td><code>DEXT_COMPACT_MODEL</code></td><td>Active model</td><td>Optional same-provider summary model; normalized through the provider and used for summary request contract, reasoning capability, mode, and usage pricing</td></tr>
+<tr><td><code>DEXT_MAX_OUTPUT_TOKENS</code></td><td>Model/default cap</td><td>Positive streaming output-token override; ChatGPT/Codex deliberately omits the unsupported field</td></tr>
 <tr><td><code>DEXT_TOOLSET</code></td><td>default</td><td>Provider-visible tool count profile: default, full</td></tr>
 <tr><td><code>DEXT_TOOL_PROFILE</code></td><td>lean</td><td>Tool schema profile: full, lean</td></tr>
 <tr><td><code>DEXT_MUTATION_PREVIEW</code></td><td>simple</td><td>Mutation preview mode: off, simple, git</td></tr>
 <tr><td><code>DEXT_APPROVAL</code></td><td>ask</td><td>Approval profile: ask, auto-read, auto-write, never, always</td></tr>
 <tr><td><code>DEXT_SANDBOX_PROFILE</code></td><td>workspace-write</td><td>Sandbox profile: read-only, workspace-write, danger-full-access. On supported Linux/macOS hosts, confined profiles preserve reads available to the Dext process user; workspace-write permits writes only under the sandbox, scratch roots, and explicit toolchain cache/package roots. macOS Seatbelt profiles allow both canonical <code>/private/...</code> scratch paths and their <code>/var</code> or <code>/tmp</code> aliases so standard temp APIs remain confined but usable.</td></tr>
-<tr><td><code>DEXT_PRIVACY</code></td><td>true</td><td>Before model context and session logging, replace private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers while keeping user-readable files readable. Set to <code>strict</code> to also block sensitive-looking native read paths; disable only for intentionally raw output.</td></tr>
+<tr><td><code>DEXT_PRIVACY</code></td><td>true</td><td>Before model context and session logging, replace private-key blocks, real secret assignments, and explicitly labeled SSNs, payment-card numbers, and account identifiers while keeping user-readable files readable. Set to <code>strict</code> to also block sensitive-looking native paths plus hidden, ignored, symlink-following, and sensitive-glob search scopes, including compact/combined ripgrep forms such as <code>-g.env</code> and <code>-ig .env</code> plus wildcard-prefixed sensitive globs such as <code>*.env</code>; disable only for intentionally raw output.</td></tr>
 <tr><td><code>DEXT_INHERIT_TOOL_CREDENTIALS</code></td><td>false</td><td>High-trust opt-in to pass credential-shaped parent environment variables to model-invoked bash/external tools. Hooks and Dext-owned subprocesses remain scrubbed.</td></tr>
-<tr><td><code>DEXT_BUDGET_CAP</code></td><td>—</td><td>Session budget cap (e.g., $0.50, 100ktok)</td></tr>
+<tr><td><code>DEXT_BUDGET_CAP</code></td><td>—</td><td>Session cap in dollars, tokens (<code>t</code>/<code>tok</code>/<code>token(s)</code>), or one of each separated by <code>+</code>/<code>,</code>; duplicate, empty, or otherwise invalid components fail startup instead of disabling the guard</td></tr>
 <tr><td><code>DEXT_CONTEXT_WINDOW_TOKENS</code></td><td>Profile default</td><td>Override context window size</td></tr>
 <tr><td><code>DEXT_CONTEXT_WINDOW</code></td><td>Profile default</td><td>Alias override for context window size</td></tr>
 <tr><td><code>DEXT_BASH_TIMEOUT_SECS</code></td><td>60</td><td>Default bash command timeout</td></tr>
@@ -1284,10 +1322,11 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>DEXT_EXTERNAL_TIMEOUT_SECS</code></td><td>60</td><td>Default timeout for external tools</td></tr>
 <tr><td><code>DEXT_HOOK_TIMEOUT_SECS</code></td><td>60</td><td>Default timeout for hook commands</td></tr>
 <tr><td><code>DEXT_TRUST</code></td><td>false</td><td>Explicit alias for approval <code>always</code> when set to a true value; false values do not override the default <code>ask</code> profile.</td></tr>
-<tr><td><code>DEXT_HTTP_ALLOW_LOOPBACK</code></td><td>false</td><td>Built-in HTTP tool only: allow loopback and unspecified/local destinations.</td></tr>
+<tr><td><code>DEXT_HTTP_ALLOW_LOOPBACK</code></td><td>false</td><td>Built-in HTTP tool only: allow loopback destinations. Unspecified/current-network, multicast, and broadcast destinations remain blocked.</td></tr>
 <tr><td><code>DEXT_HTTP_ALLOW_PRIVATE</code></td><td>false</td><td>Built-in HTTP tool only: allow private, CGNAT, and IPv6 unique-local destinations.</td></tr>
 <tr><td><code>DEXT_HTTP_ALLOW_LINK_LOCAL</code></td><td>false</td><td>Built-in HTTP tool only: allow link-local and cloud-metadata destinations.</td></tr>
 <tr><td><code>DEXT_NO_TUI</code></td><td>false</td><td>Disable inline TUI even when a terminal is available</td></tr>
+<tr><td><code>DEXT_THEME</code></td><td>auto</td><td>TUI contrast palette: <code>light</code> or <code>dark</code>; auto converts a <code>COLORFGBG</code> 16/256-color background index to luminance and otherwise uses dark.</td></tr>
 <tr><td><code>DEXT_SYSTEM</code></td><td>Built-in prompt</td><td>Override the base system prompt</td></tr>
 <tr><td><code>DEXT_SANDBOX</code></td><td><code>.</code></td><td>Override sandbox root path</td></tr>
 <tr><td><code>DEXT_HOOKS_FILE</code></td><td><code>hooks.json</code></td><td>Override project hook configuration file</td></tr>
@@ -1317,12 +1356,12 @@ credential-env: [SERVICE_TOKEN]
 <ul>
 <li>Uses the OpenAI OAuth flow with a local callback server on port 1455</li>
 <li>Catalog models include GPT-5.6 Sol/Terra/Luna, gpt-5.4 and 5.4-mini, gpt-5.5, Codex variants, gpt-5/mini, gpt-4.1, gpt-4o/mini, o3/o3-mini, and o4-mini.</li>
-<li>GPT-5.6 variants declare 1.05M context and 128K output metadata; other models use the provider fallback or explicit model overrides. Auth: <code>dext auth login chatgpt</code> or <code>CHATGPT_ACCESS_TOKEN</code>.</li>
+<li>GPT-5.6 variants declare 1.05M context and 128K output metadata. This OAuth backend accepts reasoning effort through <code>xhigh</code>; Dext <code>max</code> maps to <code>xhigh</code>, and selected Standard/Pro mode is not sent. Auth: <code>dext auth login chatgpt</code> or <code>CHATGPT_ACCESS_TOKEN</code>.</li>
 </ul>
 <h3>OpenAI API</h3>
 <ul>
-<li>Standard OpenAI Platform API using API-key auth</li>
-<li>Catalog models include the official gpt-5.6 Sol alias plus Sol/Terra/Luna variants, gpt-5/mini, gpt-4.1/mini, gpt-4o/mini, o3/o3-mini, and o4-mini. Model-specific metadata overrides the 400K provider fallback.</li>
+<li>Standard OpenAI Platform API using API-key auth. The built-in official endpoint routes GPT-5.6 through <code>/v1/responses</code>; other models retain Chat Completions.</li>
+<li>Catalog models include the official <code>gpt-5.6</code> Sol id plus Sol/Terra/Luna variants, gpt-5/mini, gpt-4.1/mini, gpt-4o/mini, o3/o3-mini, and o4-mini. GPT-5.6 exposes native <code>minimal</code> through <code>max</code> effort plus independent Standard/Pro mode; model-specific metadata overrides the 400K provider fallback.</li>
 <li>Auth: API key via <code>OPENAI_API_KEY</code> or <code>dext auth login openai &lt;key&gt;</code></li>
 </ul>
 <h3>Anthropic</h3>
@@ -1353,18 +1392,18 @@ credential-env: [SERVICE_TOKEN]
 <p>Provider catalogs and auth stores are read through bounded non-symlink regular-file checks. On Unix, foreign ownership is rejected; group/world-writable provider catalogs are rejected; owner-owned auth files with loose mode are repaired to <code>0600</code> before parsing. <code>dext doctor</code> uses bounded, no-follow, inode-stable inspection and reports the same ownership/mode policy without repairing files.</p>
 <h3><code>providers.json</code> (~/.dext/providers.json)</h3>
 <p>Provider catalog with merged built-in + custom profiles. Editable via <code>/provider</code> and <code>/model</code> commands. Auto-normalized on load.</p>
-<p>Catalog v2 profiles may set <code>request_contract</code> to <code>anthropic-messages</code>, <code>openai-chat-completions</code>, or <code>chatgpt-responses</code>. Optional <code>model_aliases</code>, <code>model_defaults</code>, and <code>model_specs</code> provide canonical model ids, limits, effort levels, capabilities, and pricing. Explicit per-model metadata wins; context hints in model names such as <code>-128k</code> and <code>[1m]</code> win over provider-wide context defaults. Built-in metadata only fills omissions, and v1 profile fields remain accepted. <code>DEXT_PROMPT_CACHE=on|off</code> overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.</p>
+<p>Catalog v2 profiles may set <code>request_contract</code> to <code>anthropic-messages</code>, <code>openai-chat-completions</code>, <code>openai-responses</code>, or <code>chatgpt-responses</code>. Optional <code>model_aliases</code>, <code>model_defaults</code>, and <code>model_specs</code> provide canonical model ids, limits, effort levels, reasoning modes, capabilities, and pricing. Explicit per-model metadata wins; a selected effort uses an exact advertised level when available and otherwise clamps to the nearest supported level. Responses main turns and summaries both use this resolved effort metadata; Off sends <code>none</code> only when advertised, otherwise the reasoning object is omitted. Context hints in model names such as <code>-128k</code> and <code>[1m]</code> win over provider-wide context defaults. Built-in metadata only fills omissions, and v1 profile fields remain accepted. The built-in official OpenAI profile selects <code>openai-responses</code> automatically only for GPT-5.6 at <code>api.openai.com</code>; custom profiles may select it explicitly without inheriting GPT-5.6-only Standard/Pro behavior. <code>DEXT_PROMPT_CACHE=on|off</code> overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.</p>
 <h3><code>auth.json</code> (~/.dext/auth.json)</h3>
 <p>API-key entries may reference a parent environment variable by name or intentionally run a <code>!command</code> through <code>bash -lc</code>. Treat write access to this store as code-execution authority.</p>
 <p>Stored credentials per provider. Set to mode 0600 on Unix. Supports ApiKey and OAuth credential types. Credential-shaped parent environment variables are removed from agent-run subprocesses by default. <code>DEXT_INHERIT_TOOL_CREDENTIALS=1</code> opts in only trusted model-invoked bash/external tools; hooks and Dext-owned subprocesses remain scrubbed.</p>
 <h3><code>.env</code> (~/.dext/.env or $DEXT_HOME/.env)</h3>
 <p>Optional user-owned Dext settings. Project <code>.env</code> files and parent directories are never auto-loaded, so repository content cannot silently alter runtime policy.</p>
 <h3><code>DEXT.md</code> (sandbox ancestry)</h3>
-<p>Tracked machine-facing project guidance auto-injected into the system prompt. Dext scans the sandbox root and ancestors and does not modify the file automatically.</p>
+<p>Tracked machine-facing project guidance auto-injected into the system prompt. Dext scans the sandbox root and ancestors, labels it as project-controlled guidance, and does not modify the file automatically.</p>
 <h3><code>recall.md</code> (optional sandbox ancestry)</h3>
 <p>Optional ignored prompt cache. It is auto-injected only when present; Dext does not create or update it automatically.</p>
 <h3><code>hooks.json</code> (project root or <code>DEXT_HOOKS_FILE</code>)</h3>
-<p>Project-root hooks configuration loaded from <code>hooks.json</code> by default, or from <code>DEXT_HOOKS_FILE</code> when set. This is not the same as pack <code>phooks.json</code>.</p>
+<p>Project-root hooks configuration loaded from <code>hooks.json</code> by default, or from <code>DEXT_HOOKS_FILE</code> when set. This is not the same as pack <code>phooks.json</code>. Hook execution still requires its own approval. Approved <code>pre_tool</code> and <code>post_tool</code> hooks receive privacy-redacted <code>DEXT_TOOL_INPUT</code>; approved <code>post_tool</code> hooks also receive privacy-redacted <code>DEXT_TOOL_RESULT</code>, not raw input or output.</p>
 </div>
 </section>
 

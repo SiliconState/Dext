@@ -1,10 +1,15 @@
+mod crash;
+mod events;
 mod git_checkpoints;
 mod list_render;
 mod mutation_preview;
 mod orchestrator;
 mod packs;
+mod privacy;
+mod process_tree;
 mod provider;
 mod sandbox;
+mod secret_redactor;
 mod session;
 mod shelves;
 mod sse;
@@ -14,36 +19,48 @@ mod tool_policy;
 mod tool_round;
 mod tools;
 mod tui;
+mod usage;
 
 #[cfg(test)]
 mod main_tests;
 
+// Glob re-export so the extracted items keep their `crate::X` paths for every
+// sibling module, and the extraction stays a pure move.
+pub(crate) use crash::*;
+pub(crate) use events::*;
+pub(crate) use privacy::*;
+pub(crate) use process_tree::*;
+pub(crate) use secret_redactor::*;
+pub(crate) use usage::*;
+
 use anyhow::{Context, Result};
 use provider::{
-    ApiProvider, ModelPricing, ProviderProfile, RequestContract, ResolvedModelSpec,
+    ApiProvider, OpenAiResponsesReasoning, ProviderProfile, RequestContract, ResolvedModelSpec,
     ResolvedProviderConfig, apply_provider_headers, auth_store_path, build_chatgpt_request,
-    build_chatgpt_summary_request, built_in_provider_profiles, cancel_pending_oauth_login,
-    canonical_provider_id, extract_oauth_code_from_callback, find_provider_profile,
-    handle_auth_cli, is_official_kimi_profile, list_models_for_available_providers,
-    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
-    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
-    provider_auth_status, provider_catalog_path, provider_id_from_selector, provider_request_url,
-    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
-    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
-    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
+    build_chatgpt_summary_request, build_openai_responses_request, built_in_provider_profiles,
+    cancel_pending_oauth_login, canonical_provider_id, effective_request_contract,
+    extract_oauth_code_from_callback, find_provider_profile, handle_auth_cli, is_gpt_5_6_model,
+    is_official_kimi_profile, list_models_for_available_providers, list_models_for_provider,
+    load_auth_store, load_provider_catalog, login_provider, logout_provider,
+    looks_like_login_secret_input, normalize_provider_model_value,
+    official_openai_gpt_5_6_responses, provider_auth_status, provider_catalog_path,
+    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
+    render_provider_list, render_provider_picker, request_contract_for_profile,
+    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
+    resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 #[cfg(unix)]
 use session::session_sudo_dir;
 use session::{
-    SessionStateLock, append_log_event, atomic_write_bytes, atomic_write_secret,
-    canonicalize_read_tool_path, dext_state_dir, expand_user_path, latest_session_path,
-    list_session_records_for_root, named_session_path_for_root, named_sessions_dir_for_root,
-    new_session_id, parse_session_header, project_key, project_latest_session_path,
-    release_registered_locks, remove_stale_session_state_lock, render_limited_csv,
-    restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
-    session_latest_session_path, session_state_lock_is_live, session_state_lock_path,
-    session_todo_path, unix_timestamp_secs,
+    SessionLockOperationGuard, SessionStateLock, append_log_event, atomic_write_bytes,
+    atomic_write_secret, canonicalize_read_tool_path, dext_state_dir, expand_user_path,
+    latest_session_path, list_session_records_for_root, named_session_path_for_root,
+    named_sessions_dir_for_root, new_session_id, parse_session_header, project_key,
+    project_latest_session_path, project_state_dir, release_registered_locks,
+    remove_stale_session_state_lock_under_guard, render_limited_csv, restore_terminal_if_tui,
+    session_artifacts_dir, session_latest_log_path, session_latest_session_path,
+    session_state_lock_is_live, session_state_lock_path, session_todo_path, unix_timestamp_secs,
 };
 use tool_round::{ToolRoundContext, ToolRoundOutcome};
 use tools::{
@@ -67,6 +84,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 const TOOL_RESULT_CAP: usize = 12_000;
 const FRUGAL_TOOL_RESULT_CAP: usize = 6_000;
@@ -74,6 +92,9 @@ const TEXT_TOOL_CAPTURE_CAP: usize = 10_000;
 const FRUGAL_TEXT_TOOL_CAPTURE_CAP: usize = 6_000;
 const READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 16_000;
 const FRUGAL_READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 10_000;
+const READ_SYMBOL_INPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const PROMPT_CONTEXT_FILE_MAX_BYTES: usize = 1024 * 1024;
+pub(crate) const TODO_STATE_MAX_BYTES: usize = 256 * 1024;
 const PROCESS_STREAM_CAPTURE_CAP: usize = 6_000;
 const LIVE_OUTPUT_EVENT_QUEUE_CAP: usize = 256;
 const READ_SYMBOL_SUGGESTION_LIMIT: usize = 5;
@@ -84,7 +105,20 @@ const LSP_DIAGNOSTIC_FILE_BYTE_CAP: u64 = 1_048_576;
 const LSP_DIAGNOSTIC_TOTAL_BYTE_CAP: u64 = 8_388_608;
 const HTTP_EXTRACT_INPUT_CAP: usize = 128_000;
 const HTTP_EXTRACT_OUTPUT_CAP: usize = 24_000;
+const HTTP_REQUEST_INPUT_MAX: usize = 256_000;
+const HTTP_REQUEST_ARG_MAX: usize = 1_024;
+const HTTP_REQUEST_URL_MAX: usize = 256_000;
+const HTTP_REQUEST_HEADER_MAX_COUNT: usize = 128;
+const HTTP_REQUEST_HEADER_MAX_BYTES: usize = 64 * 1024;
+const HTTP_REQUEST_WIRE_BODY_MAX: usize = 256_000;
+const HTTP_RESPONSE_HTTP2_HEADER_MAX_BYTES: u32 = 16 * 1024;
+const HTTP_BODY_READ_CEILING: usize = 8 * 1024 * 1024;
 const HTTP_TOOL_REDIRECT_LIMIT: usize = 10;
+const HTTP_DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+const HTTP_DNS_CACHE_MAX_ENTRIES: usize = 256;
+const HTTP_DNS_ADDR_MAX: usize = 32;
+const HTTP_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_TOOL_TIMEOUT_MAX: Duration = Duration::from_secs(10 * 60);
 const HTTP_TOOL_ALLOW_LINK_LOCAL_ENV: &str = "DEXT_HTTP_ALLOW_LINK_LOCAL";
 const HTTP_TOOL_ALLOW_LOOPBACK_ENV: &str = "DEXT_HTTP_ALLOW_LOOPBACK";
 const HTTP_TOOL_ALLOW_PRIVATE_ENV: &str = "DEXT_HTTP_ALLOW_PRIVATE";
@@ -141,20 +175,24 @@ const PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
 const LOCAL_PROVIDER_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 // Consecutive 5xx responses from one provider before it is disabled for the turn.
 const MAX_CONSECUTIVE_SERVER_ERRORS: usize = 3;
-const DEFAULT_INPUT_USD_PER_MTOK: f64 = 1.0;
-const DEFAULT_OUTPUT_USD_PER_MTOK: f64 = 5.0;
-const DEFAULT_CACHE_READ_USD_PER_MTOK: f64 = 0.1;
-const DEFAULT_CACHE_CREATE_USD_PER_MTOK: f64 = 1.25;
 const SESSION_HTML_STYLE: &str = r#"body{font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:980px;margin:2rem auto;padding:0 1rem;background:#0f1115;color:#e6edf3}a{color:#8ab4ff}.meta{color:#9aa4b2;margin-bottom:1.5rem}.msg{border:1px solid #283241;border-radius:12px;margin:1rem 0;padding:1rem;background:#151922}.role{font-weight:700;text-transform:uppercase;font-size:.8rem;letter-spacing:.08em;margin-bottom:.6rem;color:#9aa4b2}.user{border-left:4px solid #7dd3fc}.assistant{border-left:4px solid #a78bfa}.tool{border-left:4px solid #f59e0b}.thinking{color:#9aa4b2}.block{white-space:pre-wrap;line-height:1.45}.tool-name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#fbbf24}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b0d12;border:1px solid #283241;border-radius:8px;padding:.8rem}code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.err{color:#fca5a5}.ok{color:#86efac}summary{cursor:pointer}.footer{margin:2rem 0;color:#687385;font-size:.85rem}"#;
 
 fn api_family_label(contract: RequestContract) -> &'static str {
     contract.as_str()
 }
 
+/// Serializes tests that mutate process-wide environment variables.
+///
+/// Poisoning is deliberately ignored. A panicking test can leave an env var it
+/// set behind, but honouring the poison would turn that one real failure into a
+/// cascade of unrelated ones across every module and bury the actual cause —
+/// and every test here restores what it sets on the non-panicking path.
 #[cfg(test)]
-pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn millis_u64(duration: std::time::Duration) -> u64 {
@@ -165,6 +203,7 @@ fn millis_u64(duration: std::time::Duration) -> u64 {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ThinkingEffort {
     Off,
+    Minimal,
     Low,
     #[default]
     Medium,
@@ -177,6 +216,7 @@ impl ThinkingEffort {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -190,6 +230,7 @@ impl ThinkingEffort {
             Self::Off => {
                 "Disable provider-side reasoning controls where supported; answer directly."
             }
+            Self::Minimal => "Use the least available reasoning beyond none.",
             Self::Low => "Keep reasoning concise and deliver a direct answer quickly.",
             Self::Medium => "Use balanced reasoning depth and concise explanations.",
             Self::High => "Reason carefully through edge cases before answering.",
@@ -205,6 +246,7 @@ impl ThinkingEffort {
     fn parse(v: &str) -> Option<Self> {
         match v.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "disable" | "disabled" | "0" => Some(Self::Off),
+            "minimal" | "min" => Some(Self::Minimal),
             "low" | "l" => Some(Self::Low),
             "medium" | "med" | "m" | "default" => Some(Self::Medium),
             "high" | "h" => Some(Self::High),
@@ -217,6 +259,7 @@ impl ThinkingEffort {
     fn cycle(self, step: i8) -> Self {
         let levels = [
             Self::Off,
+            Self::Minimal,
             Self::Low,
             Self::Medium,
             Self::High,
@@ -227,6 +270,38 @@ impl ThinkingEffort {
         let len = levels.len() as i32;
         let next = (idx + i32::from(step)).rem_euclid(len) as usize;
         levels[next]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReasoningMode {
+    #[default]
+    Standard,
+    Pro,
+}
+
+impl ReasoningMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Pro => "pro",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "standard" | "std" | "default" => Some(Self::Standard),
+            "pro" | "professional" => Some(Self::Pro),
+            _ => None,
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            Self::Standard => Self::Pro,
+            Self::Pro => Self::Standard,
+        }
     }
 }
 
@@ -259,7 +334,7 @@ fn stream_error_body(err: &anyhow::Error) -> String {
 }
 
 fn chatgpt_incomplete_reason(contract: RequestContract, stop_reason: Option<&str>) -> Option<&str> {
-    if contract != RequestContract::ChatGptResponses {
+    if !contract.is_responses() {
         return None;
     }
     match stop_reason? {
@@ -580,256 +655,6 @@ fn maybe_preserve_partial_stream(
     true
 }
 
-fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
-    payload
-        .downcast_ref::<&'static str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-}
-
-fn panic_message_is_broken_pipe(message: &str) -> bool {
-    (message.starts_with("failed printing to stdout: ")
-        || message.starts_with("failed printing to stderr: "))
-        && message.contains("Broken pipe")
-}
-
-fn panic_info_is_broken_pipe(info: &std::panic::PanicHookInfo<'_>) -> bool {
-    panic_payload_text(info.payload()).is_some_and(panic_message_is_broken_pipe)
-}
-
-#[derive(Default)]
-struct CrashRuntimeState {
-    current_session_id: Option<String>,
-    last_event_ids: Vec<String>,
-}
-
-fn crash_runtime_state() -> &'static Mutex<CrashRuntimeState> {
-    static STATE: OnceLock<Mutex<CrashRuntimeState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(CrashRuntimeState::default()))
-}
-
-fn generated_session_id_from_path(path: &Path) -> Option<String> {
-    if path.file_stem()?.to_str()? != LATEST_SESSION_NAME || path.extension()?.to_str()? != "jsonl"
-    {
-        return None;
-    }
-    let candidate = path.parent()?.file_name()?.to_str()?;
-    let mut parts = candidate.split('-');
-    let timestamp = parts.next()?;
-    let pid = parts.next()?;
-    let nonce = parts.next()?;
-    if parts.next().is_some()
-        || timestamp.parse::<u64>().is_err()
-        || pid.parse::<u32>().is_err()
-        || nonce.len() != 12
-        || !nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
-    Some(candidate.to_string())
-}
-
-fn record_crash_session_id(path: &Path) {
-    let session_id = generated_session_id_from_path(path);
-    if let Ok(mut state) = crash_runtime_state().lock() {
-        state.current_session_id = session_id;
-    }
-}
-
-fn crash_event_breadcrumb(event: &AgentEvent) -> Option<String> {
-    match event {
-        AgentEvent::TurnStart => Some("turn_start".to_string()),
-        AgentEvent::ToolCallPreview { .. } => Some("tool_preview".to_string()),
-        AgentEvent::ToolCallStart { .. } => Some("tool_start".to_string()),
-        AgentEvent::ToolCallResult { ok, .. } => Some(format!("tool_result:ok={ok}")),
-        AgentEvent::ToolOutputDelta { .. } => None,
-        AgentEvent::ToolBatchStart { call_ids, .. } => {
-            Some(format!("tool_batch_start:count={}", call_ids.len()))
-        }
-        AgentEvent::ToolBatchEnd {
-            call_ids, failed, ..
-        } => Some(format!(
-            "tool_batch_end:count={}:failed={failed}",
-            call_ids.len()
-        )),
-        AgentEvent::HttpRetry { attempt, .. } => Some(format!("http_retry:{attempt}")),
-        AgentEvent::CompactStart => Some("compact_start".to_string()),
-        AgentEvent::CompactEnd { before, after } => Some(format!("compact_end:{before}->{after}")),
-        AgentEvent::CompactFailed { .. } => Some("compact_failed".to_string()),
-        AgentEvent::Interrupted => Some("interrupted".to_string()),
-        AgentEvent::RuntimeControl(_) => Some("runtime_control".to_string()),
-        AgentEvent::RuntimeControlApplied {
-            commands,
-            model_changed,
-            effort_changed,
-            stream_aborted,
-        } => Some(format!(
-            "runtime_control_applied:{commands}:model={model_changed}:effort={effort_changed}:abort={stream_aborted}"
-        )),
-        AgentEvent::SteeringReceived { messages, .. } => {
-            Some(format!("steering:messages={messages}"))
-        }
-        AgentEvent::TurnEnd { failed, .. } => Some(if *failed {
-            "turn_end:failed".to_string()
-        } else {
-            "turn_end".to_string()
-        }),
-        _ => None,
-    }
-}
-
-pub(crate) fn record_crash_event(event: &AgentEvent) {
-    let Some(label) = crash_event_breadcrumb(event) else {
-        return;
-    };
-    if let Ok(mut state) = crash_runtime_state().lock() {
-        state.last_event_ids.push(label);
-        if state.last_event_ids.len() > 24 {
-            let excess = state.last_event_ids.len() - 24;
-            state.last_event_ids.drain(0..excess);
-        }
-    }
-}
-
-fn crash_snapshot_body(id: &str, location: Option<(&str, u32, u32)>) -> Value {
-    let runtime = crash_runtime_state().try_lock().ok().map(|state| {
-        json!({
-            "current_session_id": state.current_session_id,
-            "last_event_ids": state.last_event_ids,
-            "input_buffer_state": null,
-            "active_modal": null,
-        })
-    });
-    let parse_terminal_dimension = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-    };
-    let backtrace_enabled = std::env::var("RUST_BACKTRACE")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "full"));
-    let location = location.map(|(file, line, column)| {
-        json!({
-            "file_sha256": sha256_hex_str(file),
-            "line": line,
-            "column": column,
-        })
-    });
-    json!({
-        "id": id,
-        "panic": "panic captured; free-form payload omitted",
-        "location": location,
-        "terminal": {
-            "columns": parse_terminal_dimension("COLUMNS"),
-            "lines": parse_terminal_dimension("LINES"),
-        },
-        "pid": std::process::id(),
-        "runtime": runtime,
-        "backtrace_enabled": backtrace_enabled,
-    })
-}
-
-fn ensure_private_crash_dir(path: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "crash directory is not a real directory: {}",
-                    path.display()
-                ),
-            ));
-        }
-        #[cfg(unix)]
-        Ok(metadata)
-            if {
-                use std::os::unix::fs::MetadataExt as _;
-                metadata.uid() != unsafe { libc::geteuid() }
-            } =>
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "crash directory is not owned by the current user",
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(false);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
-            builder.create(path)?;
-        }
-        Err(error) => return Err(error),
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn write_private_crash_snapshot(path: &Path, body: &Value) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "crash path has no parent"))?;
-    ensure_private_crash_dir(parent)?;
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "crash snapshot path is not a regular file: {}",
-                    path.display()
-                ),
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let bytes = serde_json::to_vec_pretty(body).map_err(io::Error::other)?;
-    atomic_write_secret(path, &bytes)
-}
-
-fn new_crash_id() -> Option<String> {
-    let mut nonce = [0u8; 6];
-    getrandom::fill(&mut nonce).ok()?;
-    let nonce = nonce
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Some(format!(
-        "crash-{}-{}-{nonce}",
-        unix_timestamp_secs(),
-        std::process::id()
-    ))
-}
-
-fn crash_snapshot_notice(id: &str) -> String {
-    format!("[dext crash snapshot id: {id}]")
-}
-
-fn write_crash_snapshot(info: &std::panic::PanicHookInfo<'_>) -> Option<String> {
-    let id = new_crash_id()?;
-    let path = dext_state_dir().join("crashes").join(format!("{id}.json"));
-    let location = info
-        .location()
-        .map(|loc| (loc.file(), loc.line(), loc.column()));
-    let body = crash_snapshot_body(&id, location);
-    write_private_crash_snapshot(&path, &body).ok()?;
-    Some(id)
-}
-
 fn byte_prefix_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -878,14 +703,18 @@ impl LimitedTextCapture {
     }
 
     fn try_push_unit(&mut self, unit: &str) -> bool {
-        self.observed_bytes += unit.len();
-        if self.kept.len() + unit.len() <= self.cap {
-            self.kept.push_str(unit);
+        self.try_push_observed_unit(unit, unit.len())
+    }
+
+    fn try_push_observed_unit(&mut self, unit_prefix: &str, observed_len: usize) -> bool {
+        self.observed_bytes = self.observed_bytes.saturating_add(observed_len);
+        if observed_len == unit_prefix.len() && self.kept.len() + unit_prefix.len() <= self.cap {
+            self.kept.push_str(unit_prefix);
             return true;
         }
         if self.kept.is_empty() {
             self.kept
-                .push_str(byte_prefix_at_char_boundary(unit, self.cap));
+                .push_str(byte_prefix_at_char_boundary(unit_prefix, self.cap));
         }
         self.truncated = true;
         false
@@ -917,6 +746,7 @@ struct LimitedByteCapture {
     tail: Vec<u8>,
     observed_bytes: usize,
     truncated: bool,
+    stopped_early: bool,
 }
 
 impl LimitedByteCapture {
@@ -988,14 +818,37 @@ impl LimitedByteCapture {
         self.push_tail(rest);
     }
 
+    fn push_head(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.observed_bytes += chunk.len();
+        let remaining = self.cap.saturating_sub(self.head.len());
+        self.head
+            .extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+        if chunk.len() > remaining {
+            self.truncated = true;
+        }
+    }
+
+    fn mark_stopped_early(&mut self) {
+        self.truncated = true;
+        self.stopped_early = true;
+    }
+
     fn render(&self, label: &str) -> String {
         let mut out = String::from_utf8_lossy(&self.head).to_string();
         if self.truncated {
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }
+            let stopped = if self.stopped_early {
+                " read stopped at safety ceiling;"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "\n…[{label} capped after {} bytes observed; kept first {} and last {}]\n",
+                "\n…[{label} capped after {} bytes observed;{stopped} kept first {} and last {}]\n",
                 self.observed_bytes,
                 self.head.len(),
                 self.tail.len()
@@ -1224,7 +1077,16 @@ impl ReadFileCache {
                 return None;
             }
         }
-        Some(capture.finish(""))
+        let mut out = capture.finish("");
+        let next_line = offset.saturating_add(limit);
+        if cached.lines.contains_key(&next_line) {
+            out.push_str(&format!(
+                "\n…[more lines remain; pass offset={next_line} to continue]\n"
+            ));
+        } else if cached.eof_at.is_none_or(|last| next_line <= last) {
+            return None;
+        }
+        Some(out)
     }
 
     fn record_window(
@@ -1260,6 +1122,147 @@ fn regular_file_metadata(path: &Path) -> std::result::Result<std::fs::Metadata, 
         return Err(format!("{} is not a regular file", path.display()));
     }
     Ok(metadata)
+}
+
+pub(crate) fn read_utf8_file_with_limit(
+    path: &Path,
+    max_bytes: usize,
+    interrupt: Option<&AtomicBool>,
+    label: &str,
+) -> std::result::Result<String, String> {
+    let metadata = regular_file_metadata(path)?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(format!(
+            "{} exceeds the {label} {} byte input limit",
+            path.display(),
+            max_bytes
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|error| format!("{error}"))?;
+    let opened = file.metadata().map_err(|error| format!("{error}"))?;
+    if !opened.is_file() || opened.len() > max_bytes as u64 {
+        return Err(format!(
+            "{} changed or exceeds the {label} {} byte input limit",
+            path.display(),
+            max_bytes
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if interrupt.is_some_and(|interrupt| interrupt.load(Ordering::Relaxed)) {
+            return Err(format!("{label} interrupted by user"));
+        }
+        let read = file.read(&mut chunk).map_err(|error| format!("{error}"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > max_bytes {
+            return Err(format!(
+                "{} grew beyond the {label} {} byte input limit",
+                path.display(),
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8(bytes).map_err(|error| format!("{error}"))
+}
+
+pub(crate) fn read_utf8_regular_file_with_limit(
+    path: &Path,
+    max_bytes: usize,
+    interrupt: Option<&AtomicBool>,
+    label: &str,
+) -> std::result::Result<String, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| format!("{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{} is not a regular non-symlink file",
+            path.display()
+        ));
+    }
+    read_utf8_file_with_limit(path, max_bytes, interrupt, label)
+}
+
+fn read_bounded_utf8_line<R: BufRead>(
+    reader: &mut R,
+    retain_limit: usize,
+    interrupt: Option<&AtomicBool>,
+) -> std::result::Result<Option<(String, usize, bool)>, String> {
+    let mut retained = Vec::with_capacity(retain_limit.min(8 * 1024));
+    let mut utf8_tail = Vec::with_capacity(4);
+    let mut observed = 0usize;
+    let mut saw_bytes = false;
+    let mut ended_with_newline = false;
+
+    loop {
+        if interrupt.is_some_and(|interrupt| interrupt.load(Ordering::Relaxed)) {
+            return Err("read_file interrupted by user".to_string());
+        }
+        let available = reader.fill_buf().map_err(|error| format!("{error}"))?;
+        if available.is_empty() {
+            break;
+        }
+        saw_bytes = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let content = &available[..content_len];
+        let keep = retain_limit.saturating_sub(retained.len()).min(content_len);
+        retained.extend_from_slice(&content[..keep]);
+        observed = observed.saturating_add(content_len);
+
+        let mut validation = Vec::with_capacity(utf8_tail.len().saturating_add(content_len));
+        validation.extend_from_slice(&utf8_tail);
+        validation.extend_from_slice(content);
+        utf8_tail.clear();
+        if let Err(error) = std::str::from_utf8(&validation) {
+            if error.error_len().is_some() {
+                return Err(format!(
+                    "invalid utf-8 sequence at byte {}",
+                    error.valid_up_to()
+                ));
+            }
+            utf8_tail.extend_from_slice(&validation[error.valid_up_to()..]);
+        }
+
+        let consumed = newline.map_or(content_len, |position| position + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            ended_with_newline = true;
+            break;
+        }
+    }
+
+    if !saw_bytes {
+        return Ok(None);
+    }
+    if !utf8_tail.is_empty() {
+        return Err("incomplete utf-8 sequence at end of line".to_string());
+    }
+    let truncated = observed > retained.len();
+    if ended_with_newline && !truncated && retained.last() == Some(&b'\r') {
+        retained.pop();
+        observed = observed.saturating_sub(1);
+    }
+    let line = match String::from_utf8(retained) {
+        Ok(line) => line,
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).expect("validated UTF-8 prefix")
+        }
+        Err(error) => return Err(format!("{error}")),
+    };
+    Ok(Some((line, observed, truncated)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1485,6 +1488,7 @@ enum SlashUiUpdate {
     None,
     ModelProvider,
     ThinkingEffort,
+    ReasoningMode,
     ApprovalProfile,
 }
 
@@ -1556,380 +1560,6 @@ fn route_interactive_input_line(
         InteractiveInputRoute::Submitted
     } else {
         InteractiveInputRoute::Dropped
-    }
-}
-
-pub(crate) fn text_is_potential_local_secret(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if trimmed.contains("accessToken") || trimmed.contains("access_token") {
-        return true;
-    }
-    if slash_login_contains_secret(trimmed) {
-        return true;
-    }
-    if contains_secretish_assignment(trimmed) {
-        return true;
-    }
-    if let Some(token) = strip_bearer_token(trimmed) {
-        return token.chars().count() >= 8;
-    }
-    if contains_known_secret_token(trimmed) {
-        return true;
-    }
-    if trimmed.starts_with('/') || trimmed.starts_with('{') {
-        return false;
-    }
-    if looks_like_public_clipboard_reference(trimmed) {
-        return false;
-    }
-    false
-}
-
-fn contains_secretish_assignment(text: &str) -> bool {
-    text.split(|c: char| c.is_whitespace() || matches!(c, '&' | '?' | ';' | ','))
-        .chain(text.lines())
-        .any(secretish_assignment_has_value)
-}
-
-fn secretish_assignment_has_value(segment: &str) -> bool {
-    let trimmed = segment.trim_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '{' | '}' | '[' | ']' | '(' | ')')
-    });
-    let Some((key, value)) = trimmed.split_once('=').or_else(|| trimmed.split_once(':')) else {
-        return false;
-    };
-    let key = key
-        .trim()
-        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
-        .rsplit(['/', '.'])
-        .next()
-        .unwrap_or(key);
-    let value = value.trim().trim_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '{' | '}' | '[' | ']' | '(' | ')')
-    });
-    let value_len = value.chars().count();
-    (secretish_key_name(key) && value_len >= 6) || (secretish_code_key(key) && value_len >= 12)
-}
-
-fn compact_key_name(key: &str) -> String {
-    key.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn secretish_key_name(key: &str) -> bool {
-    let compact = compact_key_name(key);
-    compact == "auth"
-        || compact == "authorization"
-        || compact == "passwd"
-        || compact == "pwd"
-        || compact == "privatekey"
-        || compact.ends_with("apikey")
-        || compact.ends_with("token")
-        || compact.contains("password")
-        || compact.contains("secret")
-}
-
-fn secretish_code_key(key: &str) -> bool {
-    matches!(
-        compact_key_name(key).as_str(),
-        "code" | "oauthcode" | "authorizationcode"
-    )
-}
-
-fn strip_bearer_token(text: &str) -> Option<&str> {
-    let prefix_len = "bearer".len();
-    let prefix = text.get(..prefix_len)?;
-    let rest = text.get(prefix_len..)?;
-    if prefix.eq_ignore_ascii_case("bearer") && rest.chars().next().is_some_and(char::is_whitespace)
-    {
-        Some(rest.trim_start()).filter(|token| !token.is_empty())
-    } else {
-        None
-    }
-}
-
-fn contains_known_secret_token(text: &str) -> bool {
-    text.split(|c: char| {
-        c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '&' | '=' | ':' | ';' | ',' | '#')
-    })
-    .any(|raw| {
-        let token = raw.trim_matches(|c: char| {
-            c.is_whitespace()
-                || matches!(
-                    c,
-                    '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
-                )
-        });
-        let len = token.chars().count();
-        if len < 8 {
-            return false;
-        }
-        let lower = token.to_ascii_lowercase();
-        lower.starts_with("sk-")
-            || lower.starts_with("sk_")
-            || lower.starts_with("xoxb-")
-            || lower.starts_with("xoxp-")
-            || lower.starts_with("ghp_")
-            || lower.starts_with("github_pat_")
-            || lower.starts_with("glpat-")
-            || lower.starts_with("ya29.")
-            || (lower.starts_with("ac_") && len >= 16)
-            || (token.starts_with("AIza") && len >= 20)
-    })
-}
-
-fn looks_like_public_clipboard_reference(text: &str) -> bool {
-    let mut saw_reference = false;
-    for token in text.split_whitespace().map(|token| {
-        token.trim_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>'))
-    }) {
-        if token.is_empty() {
-            continue;
-        }
-        if !(looks_like_url_reference(token)
-            || looks_like_social_handle(token)
-            || looks_like_git_sha(token))
-        {
-            return false;
-        }
-        saw_reference = true;
-    }
-    saw_reference
-}
-
-fn looks_like_url_reference(token: &str) -> bool {
-    let lower = token.to_ascii_lowercase();
-    if lower.contains("://") {
-        return !url_authority_has_userinfo(token);
-    }
-    if lower.starts_with("www.") {
-        return true;
-    }
-    token.split_once('/').is_some_and(|(host, rest)| {
-        if host.contains('@') {
-            return false;
-        }
-        let host = host.split(':').next().unwrap_or(host);
-        !rest.is_empty() && looks_like_domain_name(host)
-    })
-}
-
-fn url_authority_has_userinfo(token: &str) -> bool {
-    let Some((_, rest)) = token.split_once("://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    authority.contains('@')
-}
-
-fn looks_like_domain_name(host: &str) -> bool {
-    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
-        return false;
-    }
-    let Some(tld) = host.rsplit('.').next() else {
-        return false;
-    };
-    (2..=24).contains(&tld.len())
-        && tld.chars().all(|c| c.is_ascii_alphabetic())
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
-}
-
-fn looks_like_social_handle(token: &str) -> bool {
-    let Some(handle) = token.strip_prefix('@') else {
-        return (3..=15).contains(&token.len())
-            && token.contains('_')
-            && token.chars().any(|c| c.is_ascii_digit())
-            && token.chars().any(|c| c.is_ascii_lowercase())
-            && token
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    };
-    !handle.is_empty()
-        && handle.len() <= 15
-        && handle
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn looks_like_git_sha(token: &str) -> bool {
-    let len = token.len();
-    matches!(len, 7..=12 | 40) && token.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn slash_login_contains_secret(trimmed: &str) -> bool {
-    let mut parts = trimmed.split_whitespace();
-    let Some(cmd) = parts.next() else {
-        return false;
-    };
-    if cmd != "/login" {
-        return false;
-    }
-    let args: Vec<&str> = parts.collect();
-    if args.len() < 2 {
-        return false;
-    }
-    let secret = args[1..].join(" ");
-    let lowered = secret.trim().to_ascii_lowercase();
-    if provider::login_arg_requests_web_flow(&lowered)
-        || provider::login_arg_requests_import(&lowered)
-    {
-        return false;
-    }
-    true
-}
-
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkMapEventKind {
-    Map,
-    Packet,
-    Focus,
-    Tracks,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(tag = "event", content = "data", rename_all = "snake_case")]
-enum AgentEvent {
-    TurnStart,
-    HistoryContextUpdated {
-        chars: usize,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tokens: Option<u64>,
-    },
-    TextDelta(String),
-    TextBlockComplete(String),
-    ThinkingDelta(String),
-    ThinkingBlockComplete(String),
-    ToolCallPreview {
-        call_id: String,
-        name: String,
-        summary: String,
-    },
-    ToolCallStart {
-        call_id: String,
-        name: String,
-        summary: String,
-    },
-    ToolCallResult {
-        call_id: String,
-        name: String,
-        ok: bool,
-        preview: String,
-        content: String,
-    },
-    ToolOutputDelta {
-        call_id: String,
-        name: String,
-        stream: String,
-        text: String,
-    },
-    LocalAuthPrompt {
-        tool: String,
-        message: String,
-    },
-    LoginInputMode {
-        provider: Option<String>,
-    },
-    ToolBatchStart {
-        batch_id: String,
-        call_ids: Vec<String>,
-        labels: Vec<String>,
-    },
-    ToolBatchEnd {
-        batch_id: String,
-        call_ids: Vec<String>,
-        labels: Vec<String>,
-        failed: usize,
-    },
-    UsageUpdate {
-        turn: Usage,
-        session: Usage,
-    },
-    HttpRetry {
-        attempt: u32,
-        wait_secs: u64,
-        reason: String,
-    },
-    ExternalTelemetry {
-        telemetry: orchestrator::ExternalTelemetry,
-    },
-    TurnDiagnostics {
-        provider: String,
-        api_family: String,
-        auth_source: String,
-        model: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context_window: Option<u64>,
-        last_retry_reason: Option<String>,
-        workaround_fired: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        turn_duration_ms: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        context_mode: Option<ContextMode>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tool_profile: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        compacted: Option<bool>,
-    },
-    ThinkingEffortChanged {
-        effort: ThinkingEffort,
-    },
-    ApprovalProfileChanged {
-        profile: ApprovalProfile,
-    },
-    RuntimeControl(String),
-    RuntimeControlApplied {
-        commands: usize,
-        model_changed: bool,
-        effort_changed: bool,
-        stream_aborted: bool,
-    },
-    Info(String),
-    Warn(String),
-    Error(String),
-    Slash(String),
-    WorkMap {
-        kind: WorkMapEventKind,
-        text: String,
-        waypoint_ids: Vec<String>,
-        selector: Option<String>,
-    },
-    TurnEnd {
-        usage: Usage,
-        failed: bool,
-    },
-    CompactStart,
-    CompactEnd {
-        before: usize,
-        after: usize,
-    },
-    CompactFailed {
-        message: String,
-    },
-    Interrupted,
-    SteeringReceived {
-        messages: usize,
-        preview: String,
-    },
-}
-
-trait EventSink: Send + Sync {
-    fn emit(&mut self, event: AgentEvent);
-    fn request_permission(&mut self, name: &str, input: &Value) -> Choice;
-    fn local_auth_prompt(&mut self, tool: &str, message: &str);
-    fn live_output_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
-        None
-    }
-    fn request_local_auth_secret(&mut self, tool: &str, message: &str) -> LocalAuthSecret {
-        self.local_auth_prompt(tool, message);
-        LocalAuthSecret::Unavailable
     }
 }
 
@@ -2029,6 +1659,7 @@ impl EventSink for ConsoleSink {
             AgentEvent::ExternalTelemetry { .. } => {}
             AgentEvent::TurnDiagnostics { .. } => {}
             AgentEvent::ThinkingEffortChanged { .. } => {}
+            AgentEvent::ReasoningModeChanged { .. } => {}
             AgentEvent::ApprovalProfileChanged { .. } => {}
             AgentEvent::RuntimeControl(s) => println!("{s}"),
             AgentEvent::RuntimeControlApplied { stream_aborted, .. } => {
@@ -2046,7 +1677,6 @@ impl EventSink for ConsoleSink {
             AgentEvent::Warn(s) => eprintln!("{s}"),
             AgentEvent::Error(s) => eprintln!("{s}"),
             AgentEvent::Slash(s) => println!("{s}"),
-            AgentEvent::WorkMap { text, .. } => println!("{text}"),
             AgentEvent::TurnEnd { usage, .. } => {
                 println!(
                     "{}",
@@ -2112,6 +1742,10 @@ impl JsonSink {
         }
     }
 
+    fn records_crash_events_directly(&self) -> bool {
+        self.mode != OutputMode::Text
+    }
+
     fn emit_json_line(value: &Value) {
         if let Ok(line) = serde_json::to_string(value) {
             println!("{line}");
@@ -2121,7 +1755,9 @@ impl JsonSink {
 
 impl EventSink for JsonSink {
     fn emit(&mut self, event: AgentEvent) {
-        record_crash_event(&event);
+        if self.records_crash_events_directly() {
+            record_crash_event(&event);
+        }
         match self.mode {
             OutputMode::Text => self.inner.emit(event),
             OutputMode::StreamJson => {
@@ -2142,12 +1778,6 @@ impl EventSink for JsonSink {
                 }
             }
             OutputMode::Json => match event {
-                AgentEvent::WorkMap { text, .. } => {
-                    Self::emit_json_line(&json!({
-                        "event": "work_map",
-                        "data": {"text": text}
-                    }));
-                }
                 AgentEvent::TextDelta(delta) => self.stream.text.push_str(&delta),
                 AgentEvent::TextBlockComplete(full) => self.stream.text = full,
                 AgentEvent::RuntimeControlApplied {
@@ -2231,21 +1861,6 @@ impl EventSink for ChannelSink {
 fn emit_external_telemetry(sink: &mut dyn EventSink, state: &orchestrator::TurnRuntimeState) {
     sink.emit(AgentEvent::ExternalTelemetry {
         telemetry: state.telemetry(),
-    });
-}
-
-fn emit_work_map_event(
-    sink: &mut dyn EventSink,
-    kind: WorkMapEventKind,
-    text: String,
-    waypoint_ids: Vec<String>,
-    selector: Option<String>,
-) {
-    sink.emit(AgentEvent::WorkMap {
-        kind,
-        text,
-        waypoint_ids,
-        selector,
     });
 }
 
@@ -2383,6 +1998,9 @@ enum Block {
     },
     RedactedThinking {
         data: String,
+    },
+    ResponsesReasoning {
+        item: Value,
     },
     ToolUse {
         id: String,
@@ -2622,6 +2240,7 @@ fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
             Block::Text { text } | Block::PartialStream { text } => text.len(),
             Block::Thinking { text, .. } => text.len(),
             Block::RedactedThinking { data } => data.len(),
+            Block::ResponsesReasoning { item } => json_byte_len(item),
             Block::ToolUse { input, .. } => json_byte_len(input),
             Block::ToolResult { content, .. } => content.len(),
         })
@@ -2635,807 +2254,6 @@ fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
 
 fn message_approx_tokens(message: &Message) -> u64 {
     blocks_approx_tokens(&message.content).max(1)
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-struct TrackOrigin {
-    source_session: String,
-    source_waypoint: String,
-    mode: String,
-    packet_hash: String,
-    created_at: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-struct WorkMapFocusState {
-    source_session: String,
-    selection: String,
-    mode: String,
-    packet_hash: String,
-    created_at: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkMapKind {
-    Intent,
-    Evidence,
-    Change,
-    Failure,
-    Verify,
-    Decision,
-    Compact,
-    Result,
-}
-
-impl WorkMapKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Intent => "intent",
-            Self::Evidence => "evidence",
-            Self::Change => "change",
-            Self::Failure => "failure",
-            Self::Verify => "verify",
-            Self::Decision => "decision",
-            Self::Compact => "compact",
-            Self::Result => "result",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkMapWaypoint {
-    id: String,
-    anchor: String,
-    kind: WorkMapKind,
-    message_start: usize,
-    message_end: usize,
-    summary: String,
-    files: Vec<String>,
-    commands: Vec<String>,
-    status: Option<String>,
-}
-
-impl WorkMapWaypoint {
-    fn display_range(&self) -> String {
-        match (self.message_start, self.message_end) {
-            (0, 0) => "ledger".to_string(),
-            (start, end) if start == end => format!("#{start}"),
-            (start, end) => format!("#{start}..#{end}"),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct WorkMap {
-    source: String,
-    header: SessionHeader,
-    messages: usize,
-    waypoints: Vec<WorkMapWaypoint>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkMapSelection {
-    start: usize,
-    end: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FocusMode {
-    Carry(Vec<String>),
-    Exact,
-}
-
-impl FocusMode {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Carry(_) => "carry",
-            Self::Exact => "exact",
-        }
-    }
-
-    fn carries(&self, item: &str) -> bool {
-        match self {
-            Self::Exact => false,
-            Self::Carry(items) => items.iter().any(|i| i.eq_ignore_ascii_case(item)),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(default)]
-struct PrivacyPolicy {
-    enabled: bool,
-    strict_paths: bool,
-    findings: PrivacyFindingCounts,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-#[serde(default)]
-struct PrivacyFindingCounts {
-    ssn: u64,
-    credit_card: u64,
-    api_key: u64,
-    private_key: u64,
-    account_number: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PrivacyRedaction {
-    text: String,
-    counts: PrivacyFindingCounts,
-}
-
-impl Default for PrivacyPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            strict_paths: false,
-            findings: PrivacyFindingCounts::default(),
-        }
-    }
-}
-
-impl PrivacyPolicy {
-    fn from_env() -> Self {
-        let mut policy = Self::default();
-        if let Ok(v) = std::env::var("DEXT_PRIVACY") {
-            let normalized = v.trim().to_ascii_lowercase();
-            policy.enabled = !matches!(normalized.as_str(), "0" | "false" | "no" | "off");
-            if normalized == "strict" {
-                policy.enabled = true;
-                policy.strict_paths = true;
-            }
-        }
-        policy
-    }
-
-    fn mode_label(&self) -> &'static str {
-        if !self.enabled {
-            "off"
-        } else if self.strict_paths {
-            "strict"
-        } else {
-            "redact"
-        }
-    }
-
-    fn prompt_status_line(&self) -> String {
-        if !self.enabled {
-            "privacy=off".to_string()
-        } else if self.strict_paths {
-            "privacy=strict (sensitive-looking native read paths are blocked; other tool output is redacted before model context/session logs)".to_string()
-        } else {
-            "privacy=redact (user-readable files remain readable; private keys, secret assignments, and labeled SSNs/cards/accounts are redacted before model context/session logs)".to_string()
-        }
-    }
-
-    fn status_text(&self) -> String {
-        let mut out = format!(
-            "privacy: {}\nstrict path guard: {}\nredacts: private keys, secret assignments, explicitly labeled SSNs/payment-card/account identifiers",
-            self.mode_label(),
-            if self.strict_paths { "on" } else { "off" }
-        );
-        if self.findings.total() > 0 {
-            out.push_str(&format!(
-                "\nredacted this session: {}",
-                self.findings.summary()
-            ));
-        }
-        out
-    }
-
-    fn redact_text(&self, text: &str) -> PrivacyRedaction {
-        if !self.enabled || text.is_empty() {
-            return PrivacyRedaction {
-                text: text.to_string(),
-                counts: PrivacyFindingCounts::default(),
-            };
-        }
-        redact_sensitive_text(text)
-    }
-
-    fn redact_log_detail(&self, text: &str) -> String {
-        if !self.enabled || text.is_empty() {
-            return text.to_string();
-        }
-        redact_sensitive_text(text).text
-    }
-
-    fn apply_tool_output(
-        &mut self,
-        _tool_name: &str,
-        _input: &Value,
-        content: String,
-    ) -> PrivacyRedaction {
-        let mut redacted = self.redact_text(&content);
-        if self.enabled && redacted.counts.total() > 0 {
-            let summary = redacted.counts.summary();
-            self.findings.add(&redacted.counts);
-            redacted.text.push_str(&format!(
-                "\n\n[privacy: redacted {summary}; raw values withheld]"
-            ));
-        }
-        redacted
-    }
-
-    fn path_denial(&mut self, tool_name: &str, input: &Value, root: &Path) -> Option<String> {
-        if !(self.enabled
-            && self.strict_paths
-            && matches!(
-                tool_name,
-                "read_file" | "read_symbol" | "fd" | "rg" | "jq" | "git_diff" | "git_log"
-            ))
-        {
-            return None;
-        }
-        let path = match tool_name {
-            "fd" | "rg" => input["path"].as_str().unwrap_or("."),
-            _ => input["path"].as_str()?,
-        };
-        let resolved_sensitive = canonicalize_read_tool_path(root, path)
-            .ok()
-            .is_some_and(|resolved| privacy_sensitive_path(&resolved.to_string_lossy()));
-        let sensitive_search_scope =
-            matches!(tool_name, "fd" | "rg") && privacy_sensitive_search_scope(tool_name, input);
-        if !privacy_sensitive_path(path) && !resolved_sensitive && !sensitive_search_scope {
-            return None;
-        }
-        self.findings.private_key = self.findings.private_key.saturating_add(1);
-        if sensitive_search_scope && !privacy_sensitive_path(path) && !resolved_sensitive {
-            Some(format!(
-                "[privacy] blocked {tool_name} because strict path mode does not allow hidden, ignored, symlink-following, or sensitive-glob search scope. Raw file content and sensitive paths withheld. Use `/privacy on` for redaction-only reads, or `/privacy off` for raw reads."
-            ))
-        } else {
-            Some(format!(
-                "[privacy] blocked {tool_name} for sensitive-looking path `{path}` because strict path mode is enabled. Raw file content withheld. Use `/privacy on` for redaction-only reads, or `/privacy off` for raw reads."
-            ))
-        }
-    }
-}
-
-fn privacy_sensitive_search_scope(tool_name: &str, input: &Value) -> bool {
-    if tool_name == "fd"
-        && input["pattern"]
-            .as_str()
-            .is_some_and(privacy_sensitive_path)
-    {
-        return true;
-    }
-    let args = str_array(&input["extra_args"]);
-    let mut expect_glob = false;
-    for arg in args {
-        if expect_glob {
-            if privacy_sensitive_path(&arg) {
-                return true;
-            }
-            expect_glob = false;
-            continue;
-        }
-        if matches!(arg.as_str(), "-g" | "--glob" | "--iglob") {
-            expect_glob = true;
-            continue;
-        }
-        if let Some(glob) = arg
-            .strip_prefix("--glob=")
-            .or_else(|| arg.strip_prefix("--iglob="))
-            && privacy_sensitive_path(glob)
-        {
-            return true;
-        }
-        if matches!(
-            arg.as_str(),
-            "-H" | "--hidden"
-                | "-L"
-                | "--follow"
-                | "-u"
-                | "-uu"
-                | "-uuu"
-                | "--no-ignore"
-                | "--no-ignore-vcs"
-                | "--no-ignore-global"
-                | "--no-ignore-parent"
-                | "--no-ignore-dot"
-                | "--no-ignore-exclude"
-                | "--no-ignore-files"
-        ) {
-            return true;
-        }
-        if arg.starts_with('-')
-            && !arg.starts_with("--")
-            && arg[1..].chars().any(|flag| matches!(flag, 'H' | 'L' | 'u'))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-impl PrivacyFindingCounts {
-    fn add(&mut self, other: &Self) {
-        self.ssn = self.ssn.saturating_add(other.ssn);
-        self.credit_card = self.credit_card.saturating_add(other.credit_card);
-        self.api_key = self.api_key.saturating_add(other.api_key);
-        self.private_key = self.private_key.saturating_add(other.private_key);
-        self.account_number = self.account_number.saturating_add(other.account_number);
-    }
-
-    fn total(&self) -> u64 {
-        self.ssn
-            .saturating_add(self.credit_card)
-            .saturating_add(self.api_key)
-            .saturating_add(self.private_key)
-            .saturating_add(self.account_number)
-    }
-
-    fn summary(&self) -> String {
-        let mut parts = Vec::new();
-        if self.ssn > 0 {
-            parts.push(format!("{} SSN", self.ssn));
-        }
-        if self.credit_card > 0 {
-            parts.push(format!("{} payment-card", self.credit_card));
-        }
-        if self.api_key > 0 {
-            parts.push(format!("{} API/token", self.api_key));
-        }
-        if self.private_key > 0 {
-            parts.push(format!("{} private-key/path", self.private_key));
-        }
-        if self.account_number > 0 {
-            parts.push(format!("{} account identifier", self.account_number));
-        }
-        if parts.is_empty() {
-            "0 items".to_string()
-        } else {
-            parts.join(", ")
-        }
-    }
-}
-
-fn redact_sensitive_text(text: &str) -> PrivacyRedaction {
-    let mut counts = PrivacyFindingCounts::default();
-    let mut out = redact_private_key_blocks(text, &mut counts);
-    out = redact_secret_assignments(&out, &mut counts);
-    out = redact_digit_sequences(&out, &mut counts);
-    PrivacyRedaction { text: out, counts }
-}
-
-fn redact_private_key_blocks(text: &str, counts: &mut PrivacyFindingCounts) -> String {
-    if !text.contains("PRIVATE KEY-----") {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut in_key = false;
-    for segment in text.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let line_ending = &segment[line.len()..];
-        let trimmed = line.trim();
-        if !in_key && trimmed.starts_with("-----BEGIN ") && trimmed.contains("PRIVATE KEY-----") {
-            counts.private_key = counts.private_key.saturating_add(1);
-            out.push_str("[REDACTED_PRIVATE_KEY]");
-            out.push_str(line_ending);
-            in_key = true;
-            continue;
-        }
-        if in_key {
-            if trimmed.starts_with("-----END ") && trimmed.contains("PRIVATE KEY-----") {
-                in_key = false;
-            }
-            continue;
-        }
-        out.push_str(segment);
-    }
-    out
-}
-
-fn redact_secret_assignments(text: &str, counts: &mut PrivacyFindingCounts) -> String {
-    let mut spans = Vec::new();
-    let mut line_start = 0usize;
-    for segment in text.split_inclusive('\n') {
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        for (start, end) in secret_assignment_value_spans(line) {
-            counts.api_key = counts.api_key.saturating_add(1);
-            spans.push((
-                line_start.saturating_add(start),
-                line_start.saturating_add(end),
-                "[REDACTED_SECRET]",
-            ));
-        }
-        line_start = line_start.saturating_add(segment.len());
-    }
-    redact_by_labeled_spans(text, spans)
-}
-
-fn secret_assignment_value_spans(line: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut scan_from = 0usize;
-    while scan_from < line.len() {
-        let Some((delimiter_offset, ch)) = line[scan_from..]
-            .char_indices()
-            .find(|(_, ch)| matches!(ch, '=' | ':'))
-        else {
-            break;
-        };
-        let delimiter = scan_from.saturating_add(delimiter_offset);
-        scan_from = delimiter.saturating_add(ch.len_utf8());
-        if ch == '=' && line[delimiter..].starts_with("==") {
-            continue;
-        }
-        let prefix = line[..delimiter].trim_end();
-        let key = prefix
-            .rsplit(|ch: char| ch.is_whitespace() || matches!(ch, '{' | '[' | '(' | ',' | ';'))
-            .next()
-            .unwrap_or(prefix)
-            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-');
-        if !redaction_secret_key_name(key) {
-            continue;
-        }
-        let Some((start, end)) = secret_assignment_candidate_span(line, scan_from) else {
-            continue;
-        };
-        scan_from = end.max(scan_from);
-        if secret_assignment_value_looks_real(&line[start..end]) {
-            spans.push((start, end));
-        }
-    }
-    spans
-}
-
-fn secret_assignment_candidate_span(line: &str, value_start: usize) -> Option<(usize, usize)> {
-    let value = line.get(value_start..)?;
-    let leading_ws = value.len().saturating_sub(value.trim_start().len());
-    let mut start = value_start.saturating_add(leading_ws);
-    let first = line.get(start..)?.chars().next()?;
-    if matches!(first, '"' | '\'' | '`') {
-        start = start.saturating_add(first.len_utf8());
-        let mut escaped = false;
-        for (offset, ch) in line.get(start..)?.char_indices() {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == first {
-                return (offset > 0).then_some((start, start.saturating_add(offset)));
-            }
-        }
-        return None;
-    }
-
-    if line
-        .get(start..start.saturating_add("bearer".len()))
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer"))
-        && line
-            .get(start.saturating_add("bearer".len())..)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(char::is_whitespace)
-    {
-        start = start.saturating_add("bearer".len());
-        let rest = line.get(start..)?;
-        start = start.saturating_add(rest.len().saturating_sub(rest.trim_start().len()));
-    }
-
-    let end = line
-        .get(start..)?
-        .char_indices()
-        .find_map(|(offset, ch)| {
-            (ch.is_whitespace() || matches!(ch, ',' | ';' | '&' | '}' | ']' | ')'))
-                .then_some(start.saturating_add(offset))
-        })
-        .unwrap_or(line.len());
-    (end > start).then_some((start, end))
-}
-
-fn redaction_secret_key_name(key: &str) -> bool {
-    let compact = compact_key_name(key);
-    matches!(
-        compact.as_str(),
-        "auth"
-            | "authorization"
-            | "passwd"
-            | "pwd"
-            | "password"
-            | "privatekey"
-            | "apikey"
-            | "accesstoken"
-            | "authtoken"
-            | "bearertoken"
-            | "clientsecret"
-            | "consumersecret"
-            | "secretkey"
-            | "awssecretaccesskey"
-    ) || compact.ends_with("apikey")
-        || compact.ends_with("accesstoken")
-        || compact.ends_with("authtoken")
-        || compact.ends_with("password")
-        || compact.ends_with("token")
-}
-
-fn secret_assignment_value_looks_real(value: &str) -> bool {
-    let value = value
-        .trim()
-        .trim_end_matches([',', ';'])
-        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
-    let bearer = strip_bearer_token(value);
-    let candidate = bearer.unwrap_or(value);
-    if candidate.len() < 6 || candidate.chars().any(char::is_whitespace) {
-        return false;
-    }
-    let lower = candidate.to_ascii_lowercase();
-    !matches!(
-        lower.as_str(),
-        "string"
-            | "str"
-            | "none"
-            | "null"
-            | "true"
-            | "false"
-            | "secret"
-            | "password"
-            | "token"
-            | "api-key"
-            | "apikey"
-            | "env_var_name"
-            | "!command"
-    ) && !lower.starts_with("[redacted")
-        && !lower.starts_with("<redacted")
-        && !lower.starts_with("example")
-        && !candidate.starts_with('$')
-        && !candidate.starts_with('<')
-        && !candidate.starts_with("env::")
-        && !candidate.starts_with("std::env")
-}
-
-fn redact_digit_sequences(text: &str, counts: &mut PrivacyFindingCounts) -> String {
-    let mut spans = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut digits = String::new();
-    let mut digit_count = 0usize;
-    for (idx, ch) in text.char_indices() {
-        if ch.is_ascii_digit() {
-            if start.is_none() {
-                start = Some(idx);
-                digits.clear();
-                digit_count = 0;
-            }
-            digits.push(ch);
-            digit_count += 1;
-        } else if start.is_some() && matches!(ch, ' ' | '-') {
-            digits.push(ch);
-        } else if let Some(s) = start.take() {
-            classify_digit_span(text, s, idx, &digits, digit_count, &mut spans, counts);
-            digits.clear();
-            digit_count = 0;
-        }
-    }
-    if let Some(s) = start {
-        classify_digit_span(
-            text,
-            s,
-            text.len(),
-            &digits,
-            digit_count,
-            &mut spans,
-            counts,
-        );
-    }
-    redact_by_labeled_spans(text, spans)
-}
-
-fn classify_digit_span(
-    text: &str,
-    start: usize,
-    _end: usize,
-    raw_digits: &str,
-    digit_count: usize,
-    spans: &mut Vec<(usize, usize, &'static str)>,
-    counts: &mut PrivacyFindingCounts,
-) {
-    let raw_digits = raw_digits.trim_end_matches([' ', '-']);
-    let end = start.saturating_add(raw_digits.len());
-    if digit_count < 9
-        || !byte_boundary_ok(text.as_bytes(), start, end)
-        || numeric_span_touches_decimal(text, start, end)
-    {
-        return;
-    }
-    let digits: String = raw_digits.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digit_count == 9 && looks_like_ssn_context(text, start) && valid_ssn_digits(&digits) {
-        counts.ssn = counts.ssn.saturating_add(1);
-        spans.push((start, end, "[REDACTED_SSN]"));
-    } else if (13..=19).contains(&digit_count)
-        && luhn_valid(&digits)
-        && looks_like_card_context(text, start)
-    {
-        counts.credit_card = counts.credit_card.saturating_add(1);
-        spans.push((start, end, "[REDACTED_CARD]"));
-    } else if (9..=34).contains(&digit_count) && looks_like_account_context(text, start) {
-        counts.account_number = counts.account_number.saturating_add(1);
-        spans.push((start, end, "[REDACTED_ACCOUNT]"));
-    }
-}
-
-fn byte_boundary_ok(bytes: &[u8], start: usize, end: usize) -> bool {
-    let before = start.checked_sub(1).and_then(|i| bytes.get(i)).copied();
-    let after = bytes.get(end).copied();
-    !before.is_some_and(|b| b.is_ascii_alphanumeric())
-        && !after.is_some_and(|b| b.is_ascii_alphanumeric())
-}
-
-fn redact_by_labeled_spans(text: &str, mut spans: Vec<(usize, usize, &'static str)>) -> String {
-    if spans.is_empty() {
-        return text.to_string();
-    }
-    spans.sort_by_key(|(s, _, _)| *s);
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0usize;
-    for (start, end, replacement) in spans {
-        if start < last {
-            continue;
-        }
-        out.push_str(&text[last..start]);
-        out.push_str(replacement);
-        last = end;
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
-fn normalized_numeric_label_before(text: &str, start: usize) -> String {
-    let line_prefix = text[..start]
-        .rsplit_once('\n')
-        .map_or(&text[..start], |(_, line)| line);
-    let suffix = byte_suffix_at_char_boundary(line_prefix, 64);
-    let normalized: String = suffix
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn numeric_label_matches(text: &str, start: usize, labels: &[&str]) -> bool {
-    let label = normalized_numeric_label_before(text, start);
-    labels.iter().any(|candidate| {
-        label == *candidate
-            || label
-                .strip_suffix(candidate)
-                .is_some_and(|prefix| prefix.ends_with(' '))
-    })
-}
-
-fn looks_like_ssn_context(text: &str, start: usize) -> bool {
-    numeric_label_matches(
-        text,
-        start,
-        &["ssn", "social security", "social security number"],
-    )
-}
-
-fn looks_like_card_context(text: &str, start: usize) -> bool {
-    numeric_label_matches(
-        text,
-        start,
-        &[
-            "card",
-            "card number",
-            "cardnumber",
-            "credit card",
-            "credit card number",
-            "creditcard",
-            "creditcardnumber",
-            "debit card",
-            "payment card",
-            "pan",
-        ],
-    )
-}
-
-fn looks_like_account_context(text: &str, start: usize) -> bool {
-    numeric_label_matches(
-        text,
-        start,
-        &[
-            "account",
-            "account number",
-            "accountnumber",
-            "acct",
-            "acct number",
-            "acctnumber",
-            "routing",
-            "routing number",
-            "routingnumber",
-            "iban",
-            "member id",
-            "memberid",
-            "customer id",
-            "customerid",
-        ],
-    )
-}
-
-fn numeric_span_touches_decimal(text: &str, start: usize, end: usize) -> bool {
-    text[..start]
-        .chars()
-        .next_back()
-        .is_some_and(|ch| matches!(ch, '.' | '_'))
-        || text[end..]
-            .chars()
-            .next()
-            .is_some_and(|ch| matches!(ch, '.' | '_'))
-}
-
-fn valid_ssn_digits(digits: &str) -> bool {
-    if digits.len() != 9 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
-    }
-    let area = digits[..3].parse::<u16>().unwrap_or(0);
-    let group = digits[3..5].parse::<u8>().unwrap_or(0);
-    let serial = digits[5..].parse::<u16>().unwrap_or(0);
-    (1..=899).contains(&area) && area != 666 && group != 0 && serial != 0
-}
-
-fn luhn_valid(digits: &str) -> bool {
-    let mut sum = 0u32;
-    let mut double = false;
-    for ch in digits.chars().rev() {
-        let Some(mut n) = ch.to_digit(10) else {
-            return false;
-        };
-        if double {
-            n *= 2;
-            if n > 9 {
-                n -= 9;
-            }
-        }
-        sum += n;
-        double = !double;
-    }
-    sum > 0 && sum.is_multiple_of(10)
-}
-
-fn privacy_sensitive_path(path: &str) -> bool {
-    let path = Path::new(path);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if matches!(
-        file_name.as_str(),
-        ".env"
-            | ".git-credentials"
-            | ".netrc"
-            | ".npmrc"
-            | ".pypirc"
-            | "auth.json"
-            | "credentials"
-            | "credentials.json"
-            | "id_dsa"
-            | "id_ecdsa"
-            | "id_ed25519"
-            | "id_rsa"
-            | "providers.json"
-    ) || file_name.ends_with(".pem")
-        || file_name.ends_with(".key")
-        || file_name.ends_with(".p12")
-        || file_name.ends_with(".pfx")
-    {
-        return true;
-    }
-    path.components().any(|component| match component {
-        Component::Normal(name) => matches!(
-            name.to_string_lossy().to_ascii_lowercase().as_str(),
-            ".aws" | ".gnupg" | ".ssh" | "secrets"
-        ),
-        _ => false,
-    })
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -3500,10 +2318,38 @@ pub(crate) struct WireTool {
     cache_control: Option<CacheControl>,
 }
 
+fn valid_openai_reasoning_item(item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    object.get("type").and_then(Value::as_str) == Some("reasoning")
+        && object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+        && object
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.is_empty())
+}
+
+fn openai_responses_reasoning_effort(effort: ThinkingEffort) -> &'static str {
+    match effort {
+        ThinkingEffort::Off => "none",
+        ThinkingEffort::Minimal => "minimal",
+        ThinkingEffort::Low => "low",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::XHigh => "xhigh",
+        ThinkingEffort::Max => "max",
+    }
+}
+
 fn openai_reasoning_effort(model: &str, effort: ThinkingEffort) -> Option<&'static str> {
-    if model.trim().to_ascii_lowercase().starts_with("gpt-5.6") {
+    if is_gpt_5_6_model(model) {
         return Some(match effort {
             ThinkingEffort::Off => "none",
+            ThinkingEffort::Minimal => "minimal",
             ThinkingEffort::Low => "low",
             ThinkingEffort::Medium => "medium",
             ThinkingEffort::High => "high",
@@ -3512,7 +2358,7 @@ fn openai_reasoning_effort(model: &str, effort: ThinkingEffort) -> Option<&'stat
     }
     match effort {
         ThinkingEffort::Off => None,
-        ThinkingEffort::Low => Some("low"),
+        ThinkingEffort::Minimal | ThinkingEffort::Low => Some("low"),
         ThinkingEffort::Medium => Some("medium"),
         ThinkingEffort::High | ThinkingEffort::XHigh | ThinkingEffort::Max => Some("high"),
     }
@@ -3573,7 +2419,7 @@ fn llama_tool_grammar_for(
 fn anthropic_thinking_budget_tokens(effort: ThinkingEffort) -> Option<u32> {
     match effort {
         ThinkingEffort::Off => None,
-        ThinkingEffort::Low => Some(1_024),
+        ThinkingEffort::Minimal | ThinkingEffort::Low => Some(1_024),
         ThinkingEffort::Medium => Some(2_048),
         ThinkingEffort::High => Some(4_096),
         ThinkingEffort::XHigh | ThinkingEffort::Max => Some(8_192),
@@ -3600,12 +2446,18 @@ fn map_effort_to_provider_levels(levels: &[String], effort: ThinkingEffort) -> O
     };
     match effort {
         ThinkingEffort::Off => None,
-        ThinkingEffort::Low | ThinkingEffort::Medium | ThinkingEffort::High => {
-            pick(&["high", effort.as_str(), "medium", "low"]).or_else(|| levels.first().cloned())
-        }
-        ThinkingEffort::XHigh | ThinkingEffort::Max => {
-            pick(&["max", "xhigh", "high"]).or_else(|| levels.last().cloned())
-        }
+        ThinkingEffort::Minimal => pick(&["minimal", "low", "medium", "high", "xhigh", "max"])
+            .or_else(|| levels.first().cloned()),
+        ThinkingEffort::Low => pick(&["low", "minimal", "medium", "high", "xhigh", "max"])
+            .or_else(|| levels.first().cloned()),
+        ThinkingEffort::Medium => pick(&["medium", "low", "high", "minimal", "xhigh", "max"])
+            .or_else(|| levels.first().cloned()),
+        ThinkingEffort::High => pick(&["high", "medium", "xhigh", "max", "low", "minimal"])
+            .or_else(|| levels.last().cloned()),
+        ThinkingEffort::XHigh => pick(&["xhigh", "high", "max", "medium", "low", "minimal"])
+            .or_else(|| levels.last().cloned()),
+        ThinkingEffort::Max => pick(&["max", "xhigh", "high", "medium", "low", "minimal"])
+            .or_else(|| levels.last().cloned()),
     }
 }
 
@@ -3621,7 +2473,7 @@ fn provider_model_output_config_effort(
 fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option<String> {
     let effort = match effort {
         ThinkingEffort::Off => return None,
-        ThinkingEffort::Low => "low",
+        ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
         ThinkingEffort::Medium => "medium",
         ThinkingEffort::High => "high",
         ThinkingEffort::XHigh => {
@@ -3860,556 +2712,6 @@ pub(crate) struct OaiFunctionDef {
     name: String,
     description: String,
     parameters: Value,
-}
-
-#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
-struct Usage {
-    // Provider usage is normalized into disjoint input buckets:
-    // - Anthropic: input_tokens plus cache_creation/read_input_tokens.
-    // - OpenAI/ChatGPT: prompt/input tokens minus cached_tokens, with cached_tokens as cache_read.
-    // - Z.ai/GLM: Anthropic-compatible fields when present; otherwise no cache buckets.
-    // - local llama.cpp: timings.prompt_n as new prompt input and timings.cache_n as cache_read.
-    input: u64,
-    output: u64,
-    cache_create: u64,
-    cache_read: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cost_usd: Option<f64>,
-}
-
-impl Usage {
-    fn add(&mut self, o: Usage) {
-        let lhs_cost = self.cost_usd;
-        let rhs_cost = o.cost_usd;
-        let lhs_tokens = self.total_tokens();
-        let rhs_tokens = o.total_tokens();
-        self.input += o.input;
-        self.output += o.output;
-        self.cache_create += o.cache_create;
-        self.cache_read += o.cache_read;
-        self.cost_usd = match (lhs_cost, rhs_cost) {
-            (Some(a), Some(b)) => Some(a + b),
-            (Some(a), None) if rhs_tokens == 0 => Some(a),
-            (None, Some(b)) if lhs_tokens == 0 => Some(b),
-            (None, None) if lhs_tokens == 0 && rhs_tokens == 0 => None,
-            _ => None,
-        };
-    }
-
-    fn actual_input_tokens(&self) -> u64 {
-        self.input
-    }
-
-    fn cached_input_tokens(&self) -> u64 {
-        self.cache_create.saturating_add(self.cache_read)
-    }
-
-    fn total_input_tokens(&self) -> u64 {
-        self.input.saturating_add(self.cached_input_tokens())
-    }
-
-    fn billed_tokens(&self) -> u64 {
-        self.total_input_tokens().saturating_add(self.output)
-    }
-
-    fn context_tokens(&self) -> u64 {
-        self.billed_tokens()
-    }
-
-    fn total_tokens(&self) -> u64 {
-        self.billed_tokens()
-    }
-
-    fn estimated_cost_usd(&self) -> f64 {
-        if let Some(cost) = self.cost_usd {
-            return cost;
-        }
-        let per_mtok = 1_000_000.0;
-        (self.input as f64 / per_mtok) * DEFAULT_INPUT_USD_PER_MTOK
-            + (self.output as f64 / per_mtok) * DEFAULT_OUTPUT_USD_PER_MTOK
-            + (self.cache_read as f64 / per_mtok) * DEFAULT_CACHE_READ_USD_PER_MTOK
-            + (self.cache_create as f64 / per_mtok) * DEFAULT_CACHE_CREATE_USD_PER_MTOK
-    }
-
-    fn parse(v: &Value) -> Self {
-        let cache_create = v["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-        let cache_read = v["cache_read_input_tokens"].as_u64().unwrap_or(0);
-        let input = if let Some(input) = v["input_tokens"].as_u64() {
-            input
-        } else {
-            v["prompt_tokens"]
-                .as_u64()
-                .unwrap_or(0)
-                .saturating_sub(cache_create)
-                .saturating_sub(cache_read)
-        };
-        let output = v["output_tokens"]
-            .as_u64()
-            .or_else(|| v["completion_tokens"].as_u64())
-            .unwrap_or(0);
-        Self {
-            input,
-            output,
-            cache_create,
-            cache_read,
-            cost_usd: parse_usage_cost(v),
-        }
-    }
-
-    fn parse_openai(v: &Value) -> Self {
-        let prompt_cache_hit = v["prompt_cache_hit_tokens"].as_u64().unwrap_or(0);
-        let prompt_cache_miss = v["prompt_cache_miss_tokens"].as_u64();
-        let total_input = v["prompt_tokens"]
-            .as_u64()
-            .or_else(|| v["input_tokens"].as_u64())
-            .or_else(|| prompt_cache_miss.map(|miss| miss.saturating_add(prompt_cache_hit)))
-            .unwrap_or(0);
-        let output = v["completion_tokens"]
-            .as_u64()
-            .or_else(|| v["output_tokens"].as_u64())
-            .or_else(|| v["completion_tokens_details"]["accepted_prediction_tokens"].as_u64())
-            .unwrap_or(0);
-        let cache_read = v
-            .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                v.get("input_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(Value::as_u64)
-            })
-            .or_else(|| v["cache_read_input_tokens"].as_u64())
-            .or_else(|| v["cached_tokens"].as_u64())
-            .or(Some(prompt_cache_hit).filter(|tokens| *tokens > 0))
-            .unwrap_or(0);
-        let cache_create = v["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-        let cost_usd = parse_usage_cost(v);
-        Self {
-            input: total_input
-                .saturating_sub(cache_read)
-                .saturating_sub(cache_create),
-            output,
-            cache_create,
-            cache_read,
-            cost_usd,
-        }
-    }
-
-    fn parse_openai_timings(v: &Value) -> Option<Self> {
-        let cache_read = v["cache_n"].as_u64().unwrap_or(0);
-        let input = v["prompt_n"].as_u64().unwrap_or(0);
-        let output = v["predicted_n"].as_u64().unwrap_or(0);
-        (cache_read > 0 || input > 0 || output > 0).then_some(Self {
-            input,
-            output,
-            cache_create: 0,
-            cache_read,
-            cost_usd: None,
-        })
-    }
-
-    fn line(&self) -> String {
-        let mut input = format!("input={}", self.total_input_tokens());
-        if self.cached_input_tokens() > 0 {
-            input.push_str(&format!(
-                " new_in={} cache_r={} cache_w={}",
-                self.actual_input_tokens(),
-                self.cache_read,
-                self.cache_create
-            ));
-        }
-        format!(
-            "{} out={} total={} est=${:.4}",
-            input,
-            self.output,
-            self.total_tokens(),
-            self.estimated_cost_usd()
-        )
-    }
-}
-
-fn parse_usage_cost(v: &Value) -> Option<f64> {
-    v["cost"]
-        .as_f64()
-        .or_else(|| v["cost_usd"].as_f64())
-        .or_else(|| v["total_cost"].as_f64())
-        .or_else(|| v["total_cost_usd"].as_f64())
-        .filter(|cost| cost.is_finite() && *cost >= 0.0)
-}
-
-#[derive(Clone, Copy)]
-struct UsagePricing {
-    input: f64,
-    output: f64,
-    cache_read: f64,
-    cache_create: f64,
-}
-
-impl UsagePricing {
-    const fn new(input: f64, output: f64, cache_read: f64, cache_create: f64) -> Self {
-        Self {
-            input,
-            output,
-            cache_read,
-            cache_create,
-        }
-    }
-
-    const fn zero() -> Self {
-        Self::new(0.0, 0.0, 0.0, 0.0)
-    }
-
-    fn scaled(self, input: f64, output: f64) -> Self {
-        Self::new(
-            self.input * input,
-            self.output * output,
-            self.cache_read * input,
-            self.cache_create * input,
-        )
-    }
-
-    fn estimate(self, usage: Usage) -> f64 {
-        let per_mtok = 1_000_000.0;
-        (usage.input as f64 / per_mtok) * self.input
-            + (usage.output as f64 / per_mtok) * self.output
-            + (usage.cache_read as f64 / per_mtok) * self.cache_read
-            + (usage.cache_create as f64 / per_mtok) * self.cache_create
-    }
-}
-
-impl From<&ModelPricing> for UsagePricing {
-    fn from(pricing: &ModelPricing) -> Self {
-        Self::new(
-            pricing.input_usd_per_mtok,
-            pricing.output_usd_per_mtok,
-            pricing.cache_read_usd_per_mtok,
-            pricing.cache_create_usd_per_mtok,
-        )
-    }
-}
-
-impl Default for UsagePricing {
-    fn default() -> Self {
-        Self::new(
-            DEFAULT_INPUT_USD_PER_MTOK,
-            DEFAULT_OUTPUT_USD_PER_MTOK,
-            DEFAULT_CACHE_READ_USD_PER_MTOK,
-            DEFAULT_CACHE_CREATE_USD_PER_MTOK,
-        )
-    }
-}
-
-fn provider_cost_estimate_overrides_wire_cost(
-    provider_id: &str,
-    api_provider: ApiProvider,
-    model: &str,
-) -> bool {
-    api_provider == ApiProvider::Anthropic && anthropic_prompt_cache_supported(provider_id, model)
-}
-
-fn usage_pricing_for(
-    provider_id: &str,
-    api_provider: ApiProvider,
-    base_url: &str,
-    model: &str,
-) -> UsagePricing {
-    let base = if provider::is_local_llama_provider(provider_id, api_provider, base_url) {
-        UsagePricing::zero()
-    } else {
-        let provider = canonical_provider_id(provider_id);
-        let model = normalize_price_model(model);
-        match provider.as_str() {
-            "openai" | "chatgpt" => openai_pricing(&model).unwrap_or_default(),
-            "anthropic" | "glm" => anthropic_pricing(&model).unwrap_or_default(),
-            "deepseek" => deepseek_pricing(&model).unwrap_or_default(),
-            _ if api_provider == ApiProvider::Anthropic => {
-                anthropic_pricing(&model).unwrap_or_default()
-            }
-            _ => UsagePricing::default(),
-        }
-    };
-    usage_pricing_from_env(base)
-}
-
-fn pricing_env_override_is_set() -> bool {
-    [
-        "DEXT_INPUT_USD_PER_MTOK",
-        "DEXT_OUTPUT_USD_PER_MTOK",
-        "DEXT_CACHE_READ_USD_PER_MTOK",
-        "DEXT_CACHE_CREATE_USD_PER_MTOK",
-    ]
-    .into_iter()
-    .any(|name| env_f64(name).is_some())
-}
-
-fn gpt_5_6_long_context_pricing(
-    provider_id: &str,
-    model: &str,
-    usage: Usage,
-    pricing: UsagePricing,
-) -> UsagePricing {
-    if matches!(
-        canonical_provider_id(provider_id).as_str(),
-        "openai" | "chatgpt"
-    ) && normalize_price_model(model).starts_with("gpt-5.6")
-        && usage.total_input_tokens() > 272_000
-        && !pricing_env_override_is_set()
-        && openai_pricing(&normalize_price_model(model)).is_some_and(|official| {
-            pricing.input == official.input
-                && pricing.output == official.output
-                && pricing.cache_read == official.cache_read
-                && pricing.cache_create == official.cache_create
-        })
-    {
-        pricing.scaled(2.0, 1.5)
-    } else {
-        pricing
-    }
-}
-
-fn usage_with_current_pricing(
-    mut usage: Usage,
-    provider_id: &str,
-    api_provider: ApiProvider,
-    base_url: &str,
-    model: &str,
-    model_pricing: Option<&ModelPricing>,
-) -> Usage {
-    if usage.total_tokens() > 0
-        && (provider_cost_estimate_overrides_wire_cost(provider_id, api_provider, model)
-            || usage.cost_usd.is_none())
-    {
-        let pricing = model_pricing.map_or_else(
-            || usage_pricing_for(provider_id, api_provider, base_url, model),
-            |pricing| usage_pricing_from_env(UsagePricing::from(pricing)),
-        );
-        let pricing = gpt_5_6_long_context_pricing(provider_id, model, usage, pricing);
-        usage.cost_usd = Some(pricing.estimate(usage));
-    }
-    usage
-}
-
-fn normalize_price_model(model: &str) -> String {
-    model.trim().to_ascii_lowercase()
-}
-
-fn openai_pricing(model: &str) -> Option<UsagePricing> {
-    if model == "gpt-5.6" || model.starts_with("gpt-5.6-sol") {
-        Some(UsagePricing::new(5.0, 30.0, 0.5, 6.25))
-    } else if model.starts_with("gpt-5.6-terra") {
-        Some(UsagePricing::new(2.5, 15.0, 0.25, 3.125))
-    } else if model.starts_with("gpt-5.6-luna") {
-        Some(UsagePricing::new(1.0, 6.0, 0.1, 1.25))
-    } else if model.starts_with("gpt-5.4-mini") {
-        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
-    } else if model.starts_with("gpt-5.4") {
-        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
-    } else if model.starts_with("gpt-5.3-codex-spark") {
-        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
-    } else if model.starts_with("gpt-5.3-codex") {
-        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
-    } else if model.starts_with("gpt-5-mini") {
-        Some(UsagePricing::new(0.25, 2.0, 0.025, 0.25))
-    } else if model.starts_with("gpt-5-nano") {
-        Some(UsagePricing::new(0.05, 0.4, 0.005, 0.05))
-    } else if model.starts_with("gpt-5") {
-        Some(UsagePricing::new(1.25, 10.0, 0.125, 1.25))
-    } else if model.starts_with("gpt-4.1-mini") {
-        Some(UsagePricing::new(0.4, 1.6, 0.1, 0.4))
-    } else if model.starts_with("gpt-4.1-nano") {
-        Some(UsagePricing::new(0.1, 0.4, 0.025, 0.1))
-    } else if model.starts_with("gpt-4.1") {
-        Some(UsagePricing::new(2.0, 8.0, 0.5, 2.0))
-    } else if model.starts_with("gpt-4o-mini") {
-        Some(UsagePricing::new(0.15, 0.6, 0.075, 0.15))
-    } else if model.starts_with("gpt-4o") {
-        Some(UsagePricing::new(2.5, 10.0, 1.25, 2.5))
-    } else if model.starts_with("o3-mini") || model.starts_with("o4-mini") {
-        Some(UsagePricing::new(1.1, 4.4, 0.55, 1.1))
-    } else if model.starts_with("o3") {
-        Some(UsagePricing::new(2.0, 8.0, 0.5, 2.0))
-    } else {
-        None
-    }
-}
-
-fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
-    if model.starts_with("glm-") {
-        return Some(UsagePricing::default());
-    }
-    if model.contains("fable") {
-        // Inferred from Anthropic Console billing for claude-fable-5 until public rates are listed.
-        Some(UsagePricing::new(
-            11.721718363700392,
-            58.60859181850196,
-            1.1721718363700393,
-            14.65214795462549,
-        ))
-    } else if model.contains("opus") {
-        Some(UsagePricing::new(15.0, 75.0, 1.5, 18.75))
-    } else if model.contains("sonnet") {
-        Some(UsagePricing::new(3.0, 15.0, 0.3, 3.75))
-    } else if model.contains("haiku-4-5") || model.contains("haiku-4.5") {
-        Some(UsagePricing::new(1.0, 5.0, 0.1, 1.25))
-    } else if model.contains("haiku") {
-        Some(UsagePricing::new(0.8, 4.0, 0.08, 1.0))
-    } else {
-        None
-    }
-}
-
-fn deepseek_pricing(model: &str) -> Option<UsagePricing> {
-    if model.contains("reasoner") {
-        Some(UsagePricing::new(0.55, 2.19, 0.14, 0.55))
-    } else if model.contains("chat") {
-        Some(UsagePricing::new(0.27, 1.1, 0.07, 0.27))
-    } else {
-        None
-    }
-}
-
-fn usage_pricing_from_env(default: UsagePricing) -> UsagePricing {
-    UsagePricing {
-        input: env_f64("DEXT_INPUT_USD_PER_MTOK").unwrap_or(default.input),
-        output: env_f64("DEXT_OUTPUT_USD_PER_MTOK").unwrap_or(default.output),
-        cache_read: env_f64("DEXT_CACHE_READ_USD_PER_MTOK").unwrap_or(default.cache_read),
-        cache_create: env_f64("DEXT_CACHE_CREATE_USD_PER_MTOK").unwrap_or(default.cache_create),
-    }
-}
-
-fn env_f64(name: &str) -> Option<f64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BudgetCap {
-    usd: Option<f64>,
-    tokens: Option<u64>,
-}
-
-impl BudgetCap {
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        let raw = raw.trim();
-        if raw.eq_ignore_ascii_case("off")
-            || raw.eq_ignore_ascii_case("none")
-            || raw.eq_ignore_ascii_case("disabled")
-            || raw == "0"
-        {
-            return None;
-        }
-        let parts: Vec<&str> = raw
-            .split([',', '+'])
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .collect();
-        if parts.len() > 1 {
-            let mut cap = Self {
-                usd: None,
-                tokens: None,
-            };
-            for part in parts {
-                let parsed = Self::parse_one(part)?;
-                cap.usd = cap.usd.or(parsed.usd);
-                cap.tokens = cap.tokens.or(parsed.tokens);
-            }
-            return (cap.usd.is_some() || cap.tokens.is_some()).then_some(cap);
-        }
-        Self::parse_one(raw)
-    }
-
-    fn parse_one(raw: &str) -> Option<Self> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("$") {
-            return parse_positive_f64(rest).map(|usd| Self {
-                usd: Some(usd),
-                tokens: None,
-            });
-        }
-        if let Some(rest) = lower
-            .strip_suffix("usd")
-            .or_else(|| lower.strip_suffix("dollars"))
-            .or_else(|| lower.strip_suffix("dollar"))
-        {
-            return parse_positive_f64(rest.trim()).map(|usd| Self {
-                usd: Some(usd),
-                tokens: None,
-            });
-        }
-        if let Some(rest) = lower
-            .strip_suffix("tok")
-            .or_else(|| lower.strip_suffix("tokens"))
-            .or_else(|| lower.strip_suffix("token"))
-        {
-            return parse_token_count(rest.trim()).map(|tokens| Self {
-                usd: None,
-                tokens: Some(tokens),
-            });
-        }
-        parse_positive_f64(&lower).map(|usd| Self {
-            usd: Some(usd),
-            tokens: None,
-        })
-    }
-
-    fn from_env() -> Option<Self> {
-        std::env::var("DEXT_BUDGET_CAP")
-            .ok()
-            .and_then(|v| Self::parse(&v))
-    }
-
-    fn exceeded(&self, usage: Usage) -> Option<String> {
-        if let Some(tokens) = self.tokens {
-            let used = usage.total_tokens();
-            if used >= tokens {
-                return Some(format!("token budget cap reached: {used}/{tokens} tokens"));
-            }
-        }
-        if let Some(usd) = self.usd {
-            let used = usage.estimated_cost_usd();
-            if used >= usd {
-                return Some(format!("budget cap reached: ${used:.4}/${usd:.4}"));
-            }
-        }
-        None
-    }
-
-    fn line(self) -> String {
-        match (self.usd, self.tokens) {
-            (Some(usd), Some(tokens)) => format!("${usd:.4} or {tokens} tokens"),
-            (Some(usd), None) => format!("${usd:.4}"),
-            (None, Some(tokens)) => format!("{tokens} tokens"),
-            (None, None) => "off".to_string(),
-        }
-    }
-}
-
-fn parse_positive_f64(raw: &str) -> Option<f64> {
-    let value = raw.trim().parse::<f64>().ok()?;
-    (value.is_finite() && value > 0.0).then_some(value)
-}
-
-fn parse_token_count(raw: &str) -> Option<u64> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let (number, mult) = if let Some(n) = trimmed.strip_suffix('k') {
-        (n, 1_000.0)
-    } else if let Some(n) = trimmed.strip_suffix('m') {
-        (n, 1_000_000.0)
-    } else {
-        (trimmed, 1.0)
-    };
-    let value = parse_positive_f64(number)?;
-    let tokens = (value * mult).round();
-    (tokens.is_finite() && tokens >= 1.0 && tokens <= u64::MAX as f64).then_some(tokens as u64)
 }
 
 pub(crate) fn normalize_reasoning_summary_text(text: &str) -> String {
@@ -4782,90 +3084,6 @@ where
     capture
 }
 
-const PACK_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED_PACK_CREDENTIAL]";
-
-struct SecretByteRedactor {
-    patterns: Vec<Vec<u8>>,
-    pending: Vec<u8>,
-    max_pattern_len: usize,
-}
-
-impl SecretByteRedactor {
-    fn new(patterns: Vec<Vec<u8>>) -> Self {
-        let patterns = patterns
-            .into_iter()
-            .filter(|pattern| !pattern.is_empty())
-            .collect::<Vec<_>>();
-        let max_pattern_len = patterns.iter().map(Vec::len).max().unwrap_or(0);
-        Self {
-            patterns,
-            pending: Vec::new(),
-            max_pattern_len,
-        }
-    }
-
-    fn push<F>(&mut self, bytes: &[u8], mut emit: F)
-    where
-        F: FnMut(&[u8]),
-    {
-        self.pending.extend_from_slice(bytes);
-        self.drain(false, &mut emit);
-    }
-
-    fn finish<F>(&mut self, mut emit: F)
-    where
-        F: FnMut(&[u8]),
-    {
-        self.drain(true, &mut emit);
-    }
-
-    fn drain<F>(&mut self, finish: bool, emit: &mut F)
-    where
-        F: FnMut(&[u8]),
-    {
-        loop {
-            let found = self
-                .patterns
-                .iter()
-                .filter_map(|pattern| {
-                    self.pending
-                        .windows(pattern.len())
-                        .position(|window| window == pattern)
-                        .map(|position| (position, pattern.len()))
-                })
-                .min_by_key(|(position, length)| (*position, std::cmp::Reverse(*length)));
-            if let Some((position, length)) = found {
-                let candidate = &self.pending[position..];
-                let could_extend = !finish
-                    && self.patterns.iter().any(|pattern| {
-                        pattern.len() > candidate.len() && pattern.starts_with(candidate)
-                    });
-                if could_extend {
-                    emit(&self.pending[..position]);
-                    self.pending.drain(..position);
-                    break;
-                }
-                emit(&self.pending[..position]);
-                emit(PACK_CREDENTIAL_REDACTION);
-                self.pending.drain(..position + length);
-                continue;
-            }
-
-            let keep = if finish {
-                0
-            } else {
-                self.max_pattern_len.saturating_sub(1)
-            };
-            let emit_len = self.pending.len().saturating_sub(keep);
-            if emit_len > 0 {
-                emit(&self.pending[..emit_len]);
-                self.pending.drain(..emit_len);
-            }
-            break;
-        }
-    }
-}
-
 async fn collect_async_limited_redacted<R>(
     mut reader: R,
     cap: usize,
@@ -4888,264 +3106,6 @@ where
     }
     redactor.finish(|bytes| capture.push(bytes));
     capture
-}
-
-// Children run in a new *session*, not merely a new process group: setsid()
-// also detaches them from Dext's controlling terminal, so nothing they spawn
-// can read from or paint over the TUI via /dev/tty (git credential prompts
-// did exactly that — the prompt text garbled the input box while git hung on
-// a terminal read that could never be answered). setsid() implies a fresh
-// process group with pgid == pid, so the pgid-based cleanup in
-// terminate_process_group_after_exit keeps working unchanged; setpgid is the
-// fallback if setsid is ever refused.
-#[cfg(unix)]
-fn detach_session_pre_exec() -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
-    || {
-        let setsid_result = unsafe { libc::setsid() };
-        if setsid_result != -1 {
-            return Ok(());
-        }
-        if unsafe { libc::setpgid(0, 0) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn configure_std_process_group(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-    unsafe {
-        cmd.pre_exec(detach_session_pre_exec());
-    }
-}
-
-#[cfg(windows)]
-fn configure_std_process_group(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_std_process_group(_cmd: &mut Command) {}
-
-#[cfg(unix)]
-fn configure_tokio_process_group(cmd: &mut tokio::process::Command) {
-    unsafe {
-        cmd.pre_exec(detach_session_pre_exec());
-    }
-}
-
-#[cfg(windows)]
-fn configure_tokio_process_group(cmd: &mut tokio::process::Command) {
-    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_tokio_process_group(_cmd: &mut tokio::process::Command) {}
-
-#[cfg(windows)]
-fn resume_windows_process(pid: u32) -> io::Result<()> {
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-        System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
-                Thread32Next,
-            },
-            Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
-        },
-    };
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    let mut present = unsafe { Thread32First(snapshot, &mut entry) } != 0;
-    while present {
-        if entry.th32OwnerProcessID == pid {
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if thread.is_null() {
-                let error = io::Error::last_os_error();
-                unsafe {
-                    CloseHandle(snapshot);
-                }
-                return Err(error);
-            }
-            let resumed = unsafe { ResumeThread(thread) };
-            let error = (resumed == u32::MAX).then(io::Error::last_os_error);
-            unsafe {
-                CloseHandle(thread);
-                CloseHandle(snapshot);
-            }
-            return error.map_or(Ok(()), Err);
-        }
-        present = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
-    }
-    unsafe {
-        CloseHandle(snapshot);
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "suspended child thread was not found",
-    ))
-}
-
-struct ChildProcessTree {
-    #[cfg(unix)]
-    pid: u32,
-    #[cfg(windows)]
-    job: usize,
-}
-
-impl ChildProcessTree {
-    fn for_std(child: &std::process::Child) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            Ok(Self { pid: child.id() })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle as _;
-            Self::for_windows_process(child.as_raw_handle() as _, child.id())
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = child;
-            Ok(Self {})
-        }
-    }
-
-    fn for_tokio(child: &tokio::process::Child) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            child
-                .id()
-                .map(|pid| Self { pid })
-                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))
-        }
-        #[cfg(windows)]
-        {
-            let process = child
-                .raw_handle()
-                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))?;
-            let pid = child
-                .id()
-                .ok_or_else(|| io::Error::other("child exited before process-tree setup"))?;
-            Self::for_windows_process(process as _, pid)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = child;
-            Ok(Self {})
-        }
-    }
-
-    #[cfg(windows)]
-    fn for_windows_process(
-        process: windows_sys::Win32::Foundation::HANDLE,
-        pid: u32,
-    ) -> io::Result<Self> {
-        use windows_sys::Win32::{
-            Foundation::CloseHandle,
-            System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
-            },
-        };
-
-        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if job.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&limits).cast(),
-                std::mem::size_of_val(&limits) as u32,
-            )
-        };
-        if configured == 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                CloseHandle(job);
-            }
-            return Err(error);
-        }
-        if unsafe { AssignProcessToJobObject(job, process) } == 0 {
-            let error = io::Error::last_os_error();
-            unsafe {
-                CloseHandle(job);
-            }
-            return Err(error);
-        }
-        if let Err(error) = resume_windows_process(pid) {
-            unsafe {
-                CloseHandle(job);
-            }
-            return Err(error);
-        }
-        Ok(Self { job: job as usize })
-    }
-
-    fn terminate_after_root_exit(&self) {
-        #[cfg(unix)]
-        {
-            signal_process_group(self.pid, libc::SIGTERM);
-            signal_process_group(self.pid, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
-        }
-    }
-
-    fn terminate_std_child(&self, child: &mut std::process::Child) {
-        #[cfg(unix)]
-        {
-            signal_process_group(self.pid, libc::SIGTERM);
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            signal_process_group(self.pid, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    async fn terminate_tokio_child(&self, child: &mut tokio::process::Child) {
-        #[cfg(unix)]
-        {
-            signal_process_group(self.pid, libc::SIGTERM);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            signal_process_group(self.pid, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job as _, 1);
-        }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
-}
-
-impl Drop for ChildProcessTree {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.job as _);
-        }
-    }
 }
 
 /// Forbid interactive credential prompting in tool children. They have no
@@ -5506,14 +3466,6 @@ pub(crate) fn harden_internal_command_env(cmd: &mut Command) {
     deny_interactive_prompt_env_std(cmd);
     scrub_credentials_from_std_command_unconditionally(cmd);
     scrub_startup_env_from_std_command(cmd);
-}
-
-#[cfg(unix)]
-fn signal_process_group(pid: u32, signal: libc::c_int) {
-    let pgid = -(pid as libc::pid_t);
-    unsafe {
-        let _ = libc::kill(pgid, signal);
-    }
 }
 
 fn run_sync_command_limited_with_scratch(
@@ -5976,6 +3928,9 @@ fn provider_stream_idle_timeout(local: bool) -> std::time::Duration {
 fn build_provider_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(provider_connect_timeout())
+        .no_gzip()
+        .no_brotli()
+        .http1_only()
         .build()
         .expect("build provider HTTP client")
 }
@@ -6773,46 +4728,149 @@ enum HttpOutputMode {
 struct PreparedHttpToolRequest {
     method: reqwest::Method,
     url: reqwest::Url,
-    headers: Vec<(String, String)>,
+    headers: reqwest::header::HeaderMap,
     body: Option<HttpToolBody>,
     timeout: std::time::Duration,
     output_mode: HttpOutputMode,
 }
 
-fn http_tool_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
+fn http_tool_redirect_crosses_origin(next: &reqwest::Url, previous: &[reqwest::Url]) -> bool {
+    previous.last().is_some_and(|previous| {
+        next.scheme() != previous.scheme()
+            || next.host_str() != previous.host_str()
+            || next.port_or_known_default() != previous.port_or_known_default()
+    })
+}
+
+fn http_tool_redirect_downgrades_https(next: &reqwest::Url, previous: &[reqwest::Url]) -> bool {
+    next.scheme() == "http"
+        && previous
+            .last()
+            .is_some_and(|previous| previous.scheme() == "https")
+}
+
+fn http_tool_url_origin(url: &reqwest::Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+fn http_tool_redirect_policy(allow_cross_origin: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > HTTP_TOOL_REDIRECT_LIMIT {
             return attempt.error("too many redirects");
         }
         if let Err(reason) = validate_http_tool_destination(attempt.url()) {
-            let url = attempt.url().to_string();
-            return attempt.error(format!("blocked http redirect to {url}: {reason}"));
+            let destination = http_tool_url_origin(attempt.url());
+            return attempt.error(format!("blocked http redirect to {destination}: {reason}"));
+        }
+        if !attempt.url().username().is_empty() || attempt.url().password().is_some() {
+            return attempt.error("blocked http redirect containing URL credentials");
+        }
+        if http_tool_redirect_downgrades_https(attempt.url(), attempt.previous()) {
+            return attempt.error("blocked HTTPS-to-HTTP redirect downgrade");
+        }
+        if http_tool_redirect_crosses_origin(attempt.url(), attempt.previous())
+            && !allow_cross_origin
+        {
+            let destination = http_tool_url_origin(attempt.url());
+            return attempt.error(format!(
+                "blocked cross-origin http redirect to {destination}"
+            ));
         }
         attempt.follow()
     })
 }
 
-fn build_http_tool_client() -> reqwest::Client {
+fn build_http_tool_client(allow_cross_origin: bool, resolver: HttpToolResolver) -> reqwest::Client {
     reqwest::Client::builder()
         // Proxy-side DNS would bypass the resolver checks below, so the
         // security-scoped built-in client must connect directly.
         .no_proxy()
-        .dns_resolver(Arc::new(HttpToolResolver))
-        .redirect(http_tool_redirect_policy())
+        .dns_resolver(Arc::new(resolver))
+        .redirect(http_tool_redirect_policy(allow_cross_origin))
+        .referer(false)
+        .http2_max_header_list_size(HTTP_RESPONSE_HTTP2_HEADER_MAX_BYTES)
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(4)
         .build()
         .expect("build http tool client")
 }
 
-fn http_tool_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(build_http_tool_client)
+struct HttpToolClients {
+    same_origin: reqwest::Client,
+    safe_cross_origin: reqwest::Client,
 }
 
-struct HttpToolResolver;
+fn http_tool_client(allow_cross_origin: bool) -> &'static reqwest::Client {
+    static CLIENTS: OnceLock<HttpToolClients> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| {
+        let resolver = HttpToolResolver::default();
+        HttpToolClients {
+            same_origin: build_http_tool_client(false, resolver.clone()),
+            safe_cross_origin: build_http_tool_client(true, resolver),
+        }
+    });
+    if allow_cross_origin {
+        &clients.safe_cross_origin
+    } else {
+        &clients.same_origin
+    }
+}
+
+#[derive(Clone)]
+struct HttpDnsCacheEntry {
+    addrs: Vec<SocketAddr>,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct HttpToolResolver {
+    cache: Arc<Mutex<HashMap<String, HttpDnsCacheEntry>>>,
+    lookup_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for HttpToolResolver {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            lookup_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        }
+    }
+}
+
+fn collect_validated_http_addrs(
+    host: &str,
+    addrs: impl Iterator<Item = SocketAddr>,
+) -> io::Result<Vec<SocketAddr>> {
+    let mut retained = Vec::with_capacity(HTTP_DNS_ADDR_MAX);
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        if let Some(reason) = http_tool_blocked_ip_reason(addr.ip()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("host '{host}' resolves to {} ({reason})", addr.ip()),
+            ));
+        }
+        if retained.len() < HTTP_DNS_ADDR_MAX {
+            retained.push(addr);
+        }
+    }
+    if !resolved_any {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("HTTP DNS lookup for {host} returned no addresses"),
+        ));
+    }
+    Ok(retained)
+}
 
 impl reqwest::dns::Resolve for HttpToolResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let cache = Arc::clone(&self.cache);
+        let lookup_slots = Arc::clone(&self.lookup_slots);
         Box::pin(async move {
             if !http_tool_allow_link_local() && http_tool_metadata_host(&host) {
                 return Err(io::Error::new(
@@ -6834,19 +4892,69 @@ impl reqwest::dns::Resolve for HttpToolResolver {
                 return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
             }
 
+            let cached = cache
+                .lock()
+                .map_err(|_| io::Error::other("HTTP DNS cache lock poisoned"))?
+                .get(&host)
+                .filter(|entry| entry.expires_at > Instant::now())
+                .map(|entry| entry.addrs.clone());
+            if let Some(addrs) = cached {
+                if let Some(reason) = http_tool_blocked_addrs_reason(&host, &addrs) {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason).into());
+                }
+                return Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs);
+            }
+
+            let lookup_deadline = tokio::time::Instant::now() + HTTP_DNS_LOOKUP_TIMEOUT;
+            let permit = tokio::time::timeout_at(lookup_deadline, lookup_slots.acquire_owned())
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "HTTP DNS lookup queue timed out")
+                })?
+                .map_err(|_| io::Error::other("HTTP DNS lookup limiter closed"))?;
             let host_for_lookup = host.clone();
-            let addrs = tokio::task::spawn_blocking(move || {
+            let lookup = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 (host_for_lookup.as_str(), 0)
                     .to_socket_addrs()
-                    .map(|iter| iter.collect::<Vec<SocketAddr>>())
-            })
-            .await
-            .map_err(|e| io::Error::other(format!("HTTP DNS resolver task failed: {e}")))?
-            .map_err(|e| io::Error::other(format!("HTTP DNS lookup for {host} failed: {e}")))?;
+                    .and_then(|iter| collect_validated_http_addrs(&host_for_lookup, iter))
+            });
+            let addrs = tokio::time::timeout_at(lookup_deadline, lookup)
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("HTTP DNS lookup for {host} timed out"),
+                    )
+                })?
+                .map_err(|e| io::Error::other(format!("HTTP DNS resolver task failed: {e}")))?
+                .map_err(|e| io::Error::other(format!("HTTP DNS lookup for {host} failed: {e}")))?;
 
             if let Some(reason) = http_tool_blocked_addrs_reason(&host, &addrs) {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason).into());
             }
+
+            let now = Instant::now();
+            let mut entries = cache
+                .lock()
+                .map_err(|_| io::Error::other("HTTP DNS cache lock poisoned"))?;
+            entries.retain(|_, entry| entry.expires_at > now);
+            if entries.len() >= HTTP_DNS_CACHE_MAX_ENTRIES
+                && !entries.contains_key(&host)
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .map(|(host, _)| host.clone())
+            {
+                entries.remove(&oldest);
+            }
+            entries.insert(
+                host,
+                HttpDnsCacheEntry {
+                    addrs: addrs.clone(),
+                    expires_at: now + HTTP_DNS_CACHE_TTL,
+                },
+            );
 
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
@@ -6911,8 +5019,8 @@ fn http_tool_blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => http_tool_blocked_ipv4_reason(v4),
         IpAddr::V6(v6) => {
-            if v6.is_unspecified() && !http_tool_allow_loopback() {
-                return Some("IPv6 unspecified/local address");
+            if v6.is_unspecified() {
+                return Some("IPv6 unspecified address");
             }
             if let Some(v4) = http_tool_ipv6_embedded_ipv4(v6)
                 && http_tool_blocked_ipv4_reason(v4).is_some()
@@ -6923,10 +5031,15 @@ fn http_tool_blocked_ip_reason(ip: IpAddr) -> Option<&'static str> {
             if v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
                 return (!http_tool_allow_link_local()).then_some("AWS IPv6 metadata address");
             }
+            if v6.is_multicast() {
+                return Some("IPv6 multicast address");
+            }
             if v6.is_loopback() && !http_tool_allow_loopback() {
                 Some("IPv6 loopback address")
             } else if first & 0xfe00 == 0xfc00 && !http_tool_allow_private() {
                 Some("IPv6 unique-local address")
+            } else if first & 0xffc0 == 0xfec0 && !http_tool_allow_private() {
+                Some("IPv6 deprecated site-local address")
             } else if first & 0xffc0 == 0xfe80 && !http_tool_allow_link_local() {
                 Some("IPv6 link-local address")
             } else {
@@ -6942,11 +5055,21 @@ fn http_tool_ipv4_is_shared(v4: Ipv4Addr) -> bool {
 }
 
 fn http_tool_blocked_ipv4_reason(v4: Ipv4Addr) -> Option<&'static str> {
+    let [first, _, _, _] = v4.octets();
+    if first == 0 {
+        return Some("IPv4 current-network address");
+    }
+    if v4 == Ipv4Addr::BROADCAST {
+        return Some("IPv4 limited broadcast address");
+    }
+    if v4.is_multicast() {
+        return Some("IPv4 multicast address");
+    }
     if v4 == Ipv4Addr::new(100, 100, 100, 200) {
         return (!http_tool_allow_link_local()).then_some("cloud metadata address");
     }
-    if v4.is_unspecified() && !http_tool_allow_loopback() {
-        Some("IPv4 unspecified/local address")
+    if v4.is_unspecified() {
+        Some("IPv4 unspecified address")
     } else if v4.is_loopback() && !http_tool_allow_loopback() {
         Some("IPv4 loopback address")
     } else if v4.is_link_local() && !http_tool_allow_link_local() {
@@ -6975,26 +5098,115 @@ fn http_tool_ipv6_embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
 
 fn parse_http_method_token(token: &str) -> Option<reqwest::Method> {
     let upper = token.trim().to_ascii_uppercase();
-    if upper.is_empty() || upper.contains("://") {
+    if upper.is_empty() || upper.starts_with('-') || upper.contains("://") {
         return None;
     }
     reqwest::Method::from_bytes(upper.as_bytes()).ok()
 }
 
+fn is_http_url_arg(token: &str) -> bool {
+    token
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || token
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpBodyMode {
+    Auto,
+    Json,
+    Form,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpItemKind {
+    Plain,
+    Query,
+    Json,
+}
+
+fn split_http_item(token: &str) -> Option<(HttpItemKind, &str, &str)> {
+    let (offset, _, kind, operator_len) = [
+        token
+            .find("==")
+            .map(|offset| (offset, 0, HttpItemKind::Query, 2)),
+        token
+            .find(":=")
+            .map(|offset| (offset, 0, HttpItemKind::Json, 2)),
+        token
+            .find('=')
+            .map(|offset| (offset, 1, HttpItemKind::Plain, 1)),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|(offset, priority, _, _)| (*offset, *priority))?;
+    Some((kind, &token[..offset], &token[offset + operator_len..]))
+}
+
 fn split_http_header_arg(token: &str) -> Option<(String, String)> {
-    if token.contains("://")
-        || token.starts_with(':')
-        || token.contains("==")
-        || token.contains(":=")
-    {
+    if is_http_url_arg(token) || token.starts_with(':') {
         return None;
     }
     let (name, value) = token.split_once(':')?;
+    let colon = name.len();
+    if split_http_item(token).is_some_and(|(_, key, _)| key.len() <= colon) {
+        return None;
+    }
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
     Some((name.to_string(), value.trim().to_string()))
+}
+
+fn http_tool_blocked_request_header(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "proxy-connection"
+            | "proxy-authorization"
+            | "keep-alive"
+            | "http2-settings"
+            | "x-http-method"
+            | "x-http-method-override"
+            | "x-method-override"
+            | "expect"
+    )
+}
+
+fn insert_http_tool_header(
+    headers: &mut reqwest::header::HeaderMap,
+    name: String,
+    value: String,
+) -> std::result::Result<(), String> {
+    let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| format!("invalid http header name '{name}'"))?;
+    if http_tool_blocked_request_header(&name) {
+        return Err(format!(
+            "http header '{}' is controlled by Dext's transport",
+            name.as_str()
+        ));
+    }
+    if headers.contains_key(&name) {
+        return Err(format!("duplicate http header '{}'", name.as_str()));
+    }
+    if headers.len() >= HTTP_REQUEST_HEADER_MAX_COUNT {
+        return Err(format!(
+            "http request exceeds the {HTTP_REQUEST_HEADER_MAX_COUNT}-header limit"
+        ));
+    }
+    let value = reqwest::header::HeaderValue::from_str(&value)
+        .map_err(|_| format!("invalid value for http header '{}'", name.as_str()))?;
+    headers.insert(name, value);
+    Ok(())
 }
 
 fn parse_http_timeout_value(raw: &str) -> std::result::Result<std::time::Duration, String> {
@@ -7005,14 +5217,52 @@ fn parse_http_timeout_value(raw: &str) -> std::result::Result<std::time::Duratio
     if !secs.is_finite() || secs <= 0.0 {
         return Err(format!("invalid http timeout '{raw}'"));
     }
-    Ok(std::time::Duration::from_secs_f64(secs))
+    let timeout = std::time::Duration::try_from_secs_f64(secs)
+        .map_err(|_| format!("invalid http timeout '{raw}'"))?;
+    if timeout.is_zero() || timeout > HTTP_TOOL_TIMEOUT_MAX {
+        return Err(format!("invalid http timeout '{raw}'"));
+    }
+    Ok(timeout)
 }
 
 fn prepare_http_tool_request(
     input: &Value,
     default_timeout: std::time::Duration,
 ) -> std::result::Result<PreparedHttpToolRequest, String> {
-    let args = str_array(&input["args"]);
+    let raw_args = input["args"]
+        .as_array()
+        .ok_or_else(|| "http args must be an array".to_string())?;
+    if raw_args.len() > HTTP_REQUEST_ARG_MAX {
+        return Err(format!(
+            "http input exceeds the {HTTP_REQUEST_ARG_MAX}-argument limit"
+        ));
+    }
+    let stdin_body = match input.get("stdin") {
+        Some(Value::String(stdin)) => {
+            if stdin.len() > HTTP_REQUEST_INPUT_MAX {
+                return Err(format!(
+                    "http input exceeds the {HTTP_REQUEST_INPUT_MAX}-byte limit"
+                ));
+            }
+            Some(stdin.clone())
+        }
+        Some(Value::Null) | None => None,
+        Some(_) => return Err("http stdin must be a string".to_string()),
+    };
+    let mut input_size = stdin_body.as_ref().map_or(0, String::len);
+    let mut args = Vec::with_capacity(raw_args.len());
+    for arg in raw_args {
+        let arg = arg
+            .as_str()
+            .ok_or_else(|| "http args must contain only strings".to_string())?;
+        input_size = input_size.saturating_add(arg.len());
+        if input_size > HTTP_REQUEST_INPUT_MAX {
+            return Err(format!(
+                "http input exceeds the {HTTP_REQUEST_INPUT_MAX}-byte limit"
+            ));
+        }
+        args.push(arg.to_string());
+    }
     if args.is_empty() {
         return Err("missing args".to_string());
     }
@@ -7026,34 +5276,41 @@ fn prepare_http_tool_request(
     };
 
     let mut url: Option<String> = None;
-    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut headers = reqwest::header::HeaderMap::new();
     let mut query_pairs: Vec<(String, String)> = Vec::new();
     let mut json_items: serde_json::Map<String, Value> = serde_json::Map::new();
     let mut form_fields: Vec<(String, String)> = Vec::new();
-    let mut raw_body = input["stdin"].as_str().map(String::from);
-    let mut form_mode = false;
-    let mut timeout = default_timeout;
+    let mut ignore_stdin = false;
+    let mut explicit_raw_body: Option<String> = None;
+    let mut body_mode = HttpBodyMode::Auto;
+    let mut timeout = default_timeout.min(HTTP_TOOL_TIMEOUT_MAX);
     let mut output_mode = HttpOutputMode::Raw;
 
     while idx < args.len() {
         let token = &args[idx];
         match token.as_str() {
             "--form" | "-f" => {
-                form_mode = true;
+                if body_mode == HttpBodyMode::Json || !json_items.is_empty() {
+                    return Err("cannot combine JSON and form request modes".to_string());
+                }
+                body_mode = HttpBodyMode::Form;
                 idx += 1;
                 continue;
             }
             "--json" | "-j" => {
-                form_mode = false;
+                if body_mode == HttpBodyMode::Form || !form_fields.is_empty() {
+                    return Err("cannot combine JSON and form request modes".to_string());
+                }
+                body_mode = HttpBodyMode::Json;
                 idx += 1;
                 continue;
             }
-            "--follow" | "-F" | "--headers" | "-h" | "--body" | "-b" | "--check-status" => {
+            "--follow" | "-F" | "--body" | "-b" | "--check-status" => {
                 idx += 1;
                 continue;
             }
             "--ignore-stdin" => {
-                raw_body = None;
+                ignore_stdin = true;
                 idx += 1;
                 continue;
             }
@@ -7074,10 +5331,10 @@ fn prepare_http_tool_request(
                 let Some(value) = args.get(idx + 1) else {
                     return Err(format!("missing value after {token}"));
                 };
-                if raw_body.is_some() {
+                if explicit_raw_body.is_some() {
                     return Err("http request body specified more than once".to_string());
                 }
-                raw_body = Some(value.clone());
+                explicit_raw_body = Some(value.clone());
                 idx += 2;
                 continue;
             }
@@ -7090,66 +5347,69 @@ fn prepare_http_tool_request(
             continue;
         }
         if let Some(value) = token.strip_prefix("--data=") {
-            if raw_body.is_some() {
+            if explicit_raw_body.is_some() {
                 return Err("http request body specified more than once".to_string());
             }
-            raw_body = Some(value.to_string());
+            explicit_raw_body = Some(value.to_string());
             idx += 1;
             continue;
         }
         if let Some(value) = token.strip_prefix("--raw=") {
-            if raw_body.is_some() {
+            if explicit_raw_body.is_some() {
                 return Err("http request body specified more than once".to_string());
             }
-            raw_body = Some(value.to_string());
+            explicit_raw_body = Some(value.to_string());
             idx += 1;
             continue;
         }
 
-        if url.is_none() && (token.starts_with("http://") || token.starts_with("https://")) {
+        if url.is_none() && is_http_url_arg(token) {
             url = Some(token.clone());
             idx += 1;
             continue;
         }
-        if let Some((key, value)) = token.split_once("==") {
-            let key = key.trim();
-            if key.is_empty() {
-                return Err(format!("invalid query arg: {token}"));
-            }
-            query_pairs.push((key.to_string(), value.to_string()));
-            idx += 1;
-            continue;
-        }
-        if let Some((key, value)) = token.split_once(":=") {
-            let key = key.trim();
-            if key.is_empty() {
-                return Err(format!("invalid JSON arg: {token}"));
-            }
-            let parsed = serde_json::from_str::<Value>(value)
-                .map_err(|e| format!("invalid JSON value for {key}: {e}"))?;
-            json_items.insert(key.to_string(), parsed);
-            idx += 1;
-            continue;
-        }
         if let Some((name, value)) = split_http_header_arg(token) {
-            headers.push((name, value));
+            insert_http_tool_header(&mut headers, name, value)?;
             idx += 1;
             continue;
         }
-        if let Some((key, value)) = token.split_once('=') {
+        if let Some((kind, key, value)) = split_http_item(token) {
             let key = key.trim();
             if key.is_empty() {
                 return Err(format!("invalid request item: {token}"));
             }
-            if matches!(
-                method,
-                reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
-            ) {
-                query_pairs.push((key.to_string(), value.to_string()));
-            } else if form_mode {
-                form_fields.push((key.to_string(), value.to_string()));
-            } else {
-                json_items.insert(key.to_string(), Value::String(value.to_string()));
+            match kind {
+                HttpItemKind::Query => {
+                    query_pairs.push((key.to_string(), value.to_string()));
+                }
+                HttpItemKind::Json => {
+                    if body_mode == HttpBodyMode::Form {
+                        return Err("cannot combine JSON and form request modes".to_string());
+                    }
+                    body_mode = HttpBodyMode::Json;
+                    let parsed = serde_json::from_str::<Value>(value)
+                        .map_err(|e| format!("invalid JSON value for {key}: {e}"))?;
+                    json_items.insert(key.to_string(), parsed);
+                }
+                HttpItemKind::Plain => match body_mode {
+                    HttpBodyMode::Form => {
+                        form_fields.push((key.to_string(), value.to_string()));
+                    }
+                    HttpBodyMode::Json => {
+                        json_items.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                    HttpBodyMode::Auto
+                        if matches!(
+                            method,
+                            reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+                        ) =>
+                    {
+                        query_pairs.push((key.to_string(), value.to_string()));
+                    }
+                    HttpBodyMode::Auto => {
+                        json_items.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                },
             }
             idx += 1;
             continue;
@@ -7161,17 +5421,39 @@ fn prepare_http_tool_request(
     }
 
     let raw_url = url.ok_or_else(|| "missing URL".to_string())?;
+    let stdin_body = (!ignore_stdin).then_some(stdin_body).flatten();
+    if explicit_raw_body.is_some() && stdin_body.is_some() {
+        return Err("http request body specified more than once".to_string());
+    }
+    let raw_body = explicit_raw_body.or(stdin_body);
+    if raw_body.is_some() && body_mode != HttpBodyMode::Auto {
+        return Err("cannot combine raw body/stdin with JSON or form mode".to_string());
+    }
     if raw_body.is_some() && (!json_items.is_empty() || !form_fields.is_empty()) {
         return Err("cannot combine raw body/stdin with key=value request items".to_string());
     }
+    if !json_items.is_empty() && !form_fields.is_empty() {
+        return Err("cannot combine JSON and form request modes".to_string());
+    }
 
-    let mut url =
-        reqwest::Url::parse(&raw_url).map_err(|e| format!("invalid URL '{raw_url}': {e}"))?;
+    let mut url = reqwest::Url::parse(&raw_url).map_err(|e| format!("invalid URL: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "URL-embedded credentials are not supported; use an explicit Authorization header"
+                .to_string(),
+        );
+    }
     if !query_pairs.is_empty() {
         let mut pairs = url.query_pairs_mut();
         for (key, value) in query_pairs {
             pairs.append_pair(&key, &value);
         }
+    }
+
+    if url.as_str().len() > HTTP_REQUEST_URL_MAX {
+        return Err(format!(
+            "http URL exceeds the {HTTP_REQUEST_URL_MAX}-byte limit"
+        ));
     }
 
     let body = if !form_fields.is_empty() {
@@ -7192,24 +5474,99 @@ fn prepare_http_tool_request(
     })
 }
 
+fn http_tool_header_is_read_only(name: &reqwest::header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept"
+            | "accept-encoding"
+            | "accept-language"
+            | "cache-control"
+            | "if-match"
+            | "if-modified-since"
+            | "if-none-match"
+            | "if-range"
+            | "if-unmodified-since"
+            | "range"
+            | "user-agent"
+    )
+}
+
+fn http_tool_request_is_read_only(input: &Value) -> bool {
+    prepare_http_tool_request(input, Duration::from_secs(1)).is_ok_and(|request| {
+        matches!(
+            request.method,
+            reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+        ) && request.body.is_none()
+            && request.headers.keys().all(http_tool_header_is_read_only)
+    })
+}
+
+fn http_response_has_body(method: &reqwest::Method, status: reqwest::StatusCode) -> bool {
+    method != reqwest::Method::HEAD
+        && !status.is_informational()
+        && !matches!(
+            status,
+            reqwest::StatusCode::NO_CONTENT
+                | reqwest::StatusCode::RESET_CONTENT
+                | reqwest::StatusCode::NOT_MODIFIED
+        )
+}
+
 async fn read_http_response_limited(
     resp: reqwest::Response,
     interrupt: Arc<AtomicBool>,
-) -> std::result::Result<String, String> {
+    output_mode: HttpOutputMode,
+    response_has_body: bool,
+) -> std::result::Result<(String, bool), String> {
+    if !response_has_body {
+        return Ok((String::new(), false));
+    }
+    let content_length = resp.content_length();
+    if content_length.is_some_and(|length| length > HTTP_BODY_READ_CEILING as u64) {
+        return Err(format!(
+            "HTTP response body exceeds the {HTTP_BODY_READ_CEILING}-byte safety ceiling"
+        ));
+    }
+
+    let read_ceiling = match output_mode {
+        HttpOutputMode::Raw => HTTP_BODY_READ_CEILING,
+        HttpOutputMode::Text => HTTP_EXTRACT_INPUT_CAP,
+    };
+    let capture_cap = match output_mode {
+        HttpOutputMode::Raw => PROCESS_STREAM_CAPTURE_CAP,
+        HttpOutputMode::Text => HTTP_EXTRACT_INPUT_CAP,
+    };
     let mut stream = resp.bytes_stream();
-    let mut capture = LimitedByteCapture::new(PROCESS_STREAM_CAPTURE_CAP);
+    let mut capture = LimitedByteCapture::new(capture_cap);
     loop {
         match read_stream_next_chunk(&mut stream, &interrupt, "killed by interrupt (^C)").await {
-            Ok(Some(chunk)) => capture.push(&chunk),
+            Ok(Some(chunk)) => {
+                let remaining = read_ceiling.saturating_sub(capture.observed_bytes);
+                let take = remaining.min(chunk.len());
+                match output_mode {
+                    HttpOutputMode::Raw => capture.push(&chunk[..take]),
+                    HttpOutputMode::Text => capture.push_head(&chunk[..take]),
+                }
+                if take < chunk.len() || capture.observed_bytes == read_ceiling {
+                    if take < chunk.len() || content_length != Some(capture.observed_bytes as u64) {
+                        capture.mark_stopped_early();
+                    }
+                    break;
+                }
+            }
             Ok(None) => break,
             Err(e) => return Err(e.to_string()),
         }
     }
-    Ok(capture.render("body"))
+    let stopped_early = capture.stopped_early;
+    let body = match output_mode {
+        HttpOutputMode::Raw => capture.render("body"),
+        HttpOutputMode::Text => String::from_utf8_lossy(&capture.head).into_owned(),
+    };
+    Ok((body, stopped_early))
 }
 
-fn html_entity_decode_minimal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn append_html_entity_decoded(out: &mut String, s: &str) {
     let mut i = 0usize;
     while let Some(ch) = s[i..].chars().next() {
         if ch != '&' {
@@ -7217,12 +5574,18 @@ fn html_entity_decode_minimal(s: &str) -> String {
             i += ch.len_utf8();
             continue;
         }
-        let Some(rel_end) = s[i..].find(';') else {
+        let entity_source = &s[i + 1..];
+        let Some(rel_end) = entity_source
+            .as_bytes()
+            .iter()
+            .take(32)
+            .position(|byte| *byte == b';')
+        else {
             out.push('&');
             i += 1;
             continue;
         };
-        let end = i + rel_end;
+        let end = i + 1 + rel_end;
         let entity = &s[i + 1..end];
         let decoded = match entity {
             "amp" => Some('&'),
@@ -7232,8 +5595,9 @@ fn html_entity_decode_minimal(s: &str) -> String {
             "apos" | "#39" => Some('\''),
             "nbsp" => Some(' '),
             _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-                let value = &entity[2..];
-                u32::from_str_radix(value, 16).ok().and_then(char::from_u32)
+                u32::from_str_radix(&entity[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
             }
             _ if entity.starts_with('#') => {
                 entity[1..].parse::<u32>().ok().and_then(char::from_u32)
@@ -7248,18 +5612,22 @@ fn html_entity_decode_minimal(s: &str) -> String {
             i += 1;
         }
     }
+}
+
+#[cfg(test)]
+fn html_entity_decode_minimal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    append_html_entity_decoded(&mut out, s);
     out
 }
 
 fn push_text_with_space(out: &mut String, text: &str) {
-    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if trimmed.is_empty() {
-        return;
+    for word in text.split_whitespace() {
+        if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        append_html_entity_decoded(out, word);
     }
-    if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
-        out.push(' ');
-    }
-    out.push_str(&html_entity_decode_minimal(&trimmed));
 }
 
 fn extract_html_text(html: &str) -> String {
@@ -7335,13 +5703,11 @@ fn extract_html_text(html: &str) -> String {
     }
 
     let mut compact = String::new();
-    let mut blank = false;
     for line in out.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if !compact.is_empty() && !blank {
+        if !compact.is_empty() {
             compact.push('\n');
         }
         compact.push_str(line);
-        blank = false;
     }
     cap_bytes_with_hint(
         compact,
@@ -7350,9 +5716,15 @@ fn extract_html_text(html: &str) -> String {
     )
 }
 
+fn ascii_prefix_contains_ignore_case(haystack: &str, needle: &[u8], prefix_cap: usize) -> bool {
+    haystack.as_bytes()[..haystack.len().min(prefix_cap)]
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn extract_response_text(body: String, content_type: Option<&str>) -> String {
     let ct = content_type.unwrap_or("").to_ascii_lowercase();
-    if ct.contains("text/html") || body.to_ascii_lowercase().contains("<html") {
+    if ct.contains("text/html") || ascii_prefix_contains_ignore_case(&body, b"<html", 4_096) {
         extract_html_text(&body)
     } else if ct.contains("application/json") || ct.contains("+json") {
         match serde_json::from_str::<Value>(&body) {
@@ -7387,6 +5759,7 @@ fn http_status_error(status: reqwest::StatusCode, text: &str) -> String {
 }
 
 fn format_http_request_error(err: reqwest::Error) -> String {
+    let err = err.without_url();
     let mut message = format!("HTTP request failed: {err}");
     let mut source = std::error::Error::source(&err);
     while let Some(err) = source {
@@ -7400,6 +5773,61 @@ fn format_http_request_error(err: reqwest::Error) -> String {
     message
 }
 
+fn validate_http_wire_request(request: &reqwest::Request) -> std::result::Result<(), String> {
+    if request.url().as_str().len() > HTTP_REQUEST_URL_MAX {
+        return Err(format!(
+            "http URL exceeds the {HTTP_REQUEST_URL_MAX}-byte limit"
+        ));
+    }
+    if request.headers().len() > HTTP_REQUEST_HEADER_MAX_COUNT {
+        return Err(format!(
+            "http request exceeds the {HTTP_REQUEST_HEADER_MAX_COUNT}-header limit"
+        ));
+    }
+    let header_bytes = request
+        .headers()
+        .iter()
+        .fold(0usize, |size, (name, value)| {
+            size.saturating_add(name.as_str().len())
+                .saturating_add(value.as_bytes().len())
+        });
+    if header_bytes > HTTP_REQUEST_HEADER_MAX_BYTES {
+        return Err(format!(
+            "http request headers exceed the {HTTP_REQUEST_HEADER_MAX_BYTES}-byte limit"
+        ));
+    }
+    if let Some(body) = request.body() {
+        let bytes = body
+            .as_bytes()
+            .ok_or_else(|| "http request body could not be bounded".to_string())?;
+        if bytes.len() > HTTP_REQUEST_WIRE_BODY_MAX {
+            return Err(format!(
+                "http request body exceeds the {HTTP_REQUEST_WIRE_BODY_MAX}-byte limit"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn send_http_request_interruptible(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    interrupt: &AtomicBool,
+) -> std::result::Result<reqwest::Response, String> {
+    let request = client.execute(request);
+    tokio::pin!(request);
+    let mut ticker = tokio::time::interval(Duration::from_millis(25));
+    loop {
+        if interrupt.load(Ordering::SeqCst) {
+            return Err("killed by interrupt (^C)".to_string());
+        }
+        tokio::select! {
+            response = &mut request => return response.map_err(format_http_request_error),
+            _ = ticker.tick() => {}
+        }
+    }
+}
+
 async fn execute_http_tool_async(
     input: &Value,
     interrupt: Arc<AtomicBool>,
@@ -7411,13 +5839,19 @@ async fn execute_http_tool_async(
         return Err("killed by interrupt (^C)".to_string());
     }
 
-    let mut req = http_tool_client()
-        .request(request.method, request.url)
+    let allow_cross_origin_redirects =
+        matches!(request.method, reqwest::Method::GET | reqwest::Method::HEAD)
+            && request.headers.is_empty()
+            && request.body.is_none();
+    let mut headers = request.headers;
+    headers
+        .entry(reqwest::header::USER_AGENT)
+        .or_insert(reqwest::header::HeaderValue::from_static("dext/http"));
+    let client = http_tool_client(allow_cross_origin_redirects);
+    let mut req = client
+        .request(request.method.clone(), request.url)
         .timeout(request.timeout)
-        .header(reqwest::header::USER_AGENT, "dext/http");
-    for (name, value) in request.headers {
-        req = req.header(name, value);
-    }
+        .headers(headers);
     match request.body {
         Some(HttpToolBody::Json(value)) => {
             req = req.json(&value);
@@ -7431,19 +5865,28 @@ async fn execute_http_tool_async(
         None => {}
     }
 
-    let resp = req.send().await.map_err(format_http_request_error)?;
+    let req = req.build().map_err(format_http_request_error)?;
+    validate_http_wire_request(&req)?;
+    let resp = send_http_request_interruptible(client, req, &interrupt).await?;
     let status = resp.status();
+    let response_has_body = http_response_has_body(&request.method, status);
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body = read_http_response_limited(resp, interrupt).await?;
-    let body = if request.output_mode == HttpOutputMode::Text {
+    let (body, stopped_early) =
+        read_http_response_limited(resp, interrupt, request.output_mode, response_has_body).await?;
+    let mut body = if request.output_mode == HttpOutputMode::Text {
         extract_response_text(body, content_type.as_deref())
     } else {
         body
     };
+    if stopped_early && request.output_mode == HttpOutputMode::Text {
+        body.push_str(&format!(
+            "\n\n…[source read stopped at the {HTTP_EXTRACT_INPUT_CAP}-byte extraction safety ceiling; narrow the source for later content.]"
+        ));
+    }
 
     if status.is_success() {
         if body.trim().is_empty() {
@@ -7865,7 +6308,7 @@ fn diagnostics_command(
     program: &Path,
     root: &Path,
 ) -> std::result::Result<sandbox::SandboxedStdCommand, String> {
-    let mut command = sandbox::std_command_offline(program, SandboxProfile::ReadOnly, root, &[])
+    let mut command = sandbox::std_command_offline(program, SandboxProfile::ReadOnly, root)
         .map_err(|error| format!("prepare offline diagnostics sandbox: {error}"))?;
     if let Some(scratch) = command.scratch_path().map(Path::to_path_buf) {
         command.env("CARGO_TARGET_DIR", scratch.join("cargo-target"));
@@ -9065,7 +7508,7 @@ fn tool_result_context_cap(
 #[cfg(test)]
 fn execute_tool(name: &str, input: &Value, root: &Path) -> std::result::Result<String, String> {
     let prepared_mutation = mutation_preview::prepare_tool_mutation(name, input, root)?;
-    execute_tool_with_cache(name, input, root, None, None, prepared_mutation)
+    execute_tool_with_cache(name, input, root, None, None, None, prepared_mutation)
 }
 
 fn todo_status_counts(items: &[Value]) -> (usize, usize, usize) {
@@ -9102,7 +7545,8 @@ fn render_todo_list(items: &[Value]) -> String {
 }
 
 fn read_todo_counts(path: &Path) -> Option<(usize, usize, usize)> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content =
+        read_utf8_regular_file_with_limit(path, TODO_STATE_MAX_BYTES, None, "todo state").ok()?;
     let todos = serde_json::from_str::<Value>(&content).ok()?;
     let items = todos.as_array()?;
     Some(todo_status_counts(items))
@@ -9140,6 +7584,7 @@ fn execute_tool_with_cache(
     name: &str,
     input: &Value,
     root: &Path,
+    interrupt: Option<&AtomicBool>,
     read_cache: Option<&Arc<Mutex<ReadFileCache>>>,
     session_id: Option<&str>,
     prepared_mutation: Option<mutation_preview::PreparedMutation>,
@@ -9148,8 +7593,24 @@ fn execute_tool_with_cache(
         "read_file" => {
             let path = input["path"].as_str().ok_or("missing path")?;
             let path = canonical_read_path(root, path)?;
-            let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
-            let limit = input["limit"].as_u64().map(|v| v as usize);
+            let offset = match input["offset"].as_u64() {
+                Some(value) => usize::try_from(value)
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or("offset must be a positive integer")?,
+                None if input["offset"].is_null() => 1,
+                None => return Err("offset must be a positive integer".to_string()),
+            };
+            let limit = match input["limit"].as_u64() {
+                Some(value) => Some(
+                    usize::try_from(value)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or("limit must be a positive integer")?,
+                ),
+                None if input["limit"].is_null() => None,
+                None => return Err("limit must be a positive integer".to_string()),
+            };
             let explicit_window = input["offset"].is_u64() && limit.is_some();
             let cap = if explicit_window {
                 effective_read_file_explicit_capture_cap()
@@ -9167,36 +7628,68 @@ fn execute_tool_with_cache(
             }
 
             let file = std::fs::File::open(&path).map_err(|e| format!("{e}"))?;
-            let reader = std::io::BufReader::new(file);
+            let mut reader = std::io::BufReader::new(file);
             let mut capture = LimitedTextCapture::new(cap);
             let mut emitted = 0usize;
-            let mut remaining = 0usize;
+            let mut more_lines = false;
             let mut next_offset = None;
+            let mut oversized_line = None;
             let mut cached_lines: Vec<(usize, String)> = Vec::new();
             let mut eof_at = None;
 
-            for (i, line) in reader.lines().enumerate() {
-                let line_no = i + 1;
-                let line = line.map_err(|e| format!("{e}"))?;
+            let mut line_no = 0usize;
+            loop {
+                if line_no >= offset.saturating_sub(1)
+                    && limit.is_some_and(|max_lines| emitted >= max_lines)
+                {
+                    if interrupt.is_some_and(|interrupt| interrupt.load(Ordering::Relaxed)) {
+                        return Err("read_file interrupted by user".to_string());
+                    }
+                    more_lines = !reader
+                        .fill_buf()
+                        .map_err(|error| format!("{error}"))?
+                        .is_empty();
+                    break;
+                }
+
+                let next_line_no = line_no.saturating_add(1);
+                let prefix = format!("{next_line_no}\t");
+                let retain_limit = if next_line_no < offset {
+                    0
+                } else {
+                    cap.saturating_sub(capture.kept.len())
+                        .saturating_sub(prefix.len())
+                        .saturating_sub(1)
+                };
+                let Some((line, observed_line_bytes, truncated)) =
+                    read_bounded_utf8_line(&mut reader, retain_limit, interrupt)?
+                else {
+                    break;
+                };
+                line_no = next_line_no;
                 if line_no < offset {
                     continue;
                 }
-                if let Some(max_lines) = limit
-                    && emitted >= max_lines
-                {
-                    remaining += 1;
-                    continue;
-                }
-                let rendered = format!("{line_no}\t{line}\n");
-                if !capture.try_push_unit(&rendered) {
-                    next_offset = Some(line_no.max(offset + emitted));
+                let rendered = format!("{prefix}{line}\n");
+                let observed_rendered_bytes = prefix
+                    .len()
+                    .saturating_add(observed_line_bytes)
+                    .saturating_add(1);
+                let captured = capture.try_push_observed_unit(&rendered, observed_rendered_bytes);
+                if truncated || !captured {
+                    if observed_rendered_bytes > cap {
+                        oversized_line = Some(line_no);
+                        next_offset = Some(line_no.saturating_add(1));
+                    } else {
+                        next_offset = Some(line_no.max(offset.saturating_add(emitted)));
+                    }
                     break;
                 }
                 cached_lines.push((line_no, line));
                 emitted += 1;
             }
-            if next_offset.is_none() && remaining == 0 {
-                eof_at = Some(offset.saturating_add(emitted).saturating_sub(1));
+            if next_offset.is_none() && !more_lines {
+                eof_at = Some(line_no);
             }
             if let Some(cache) = read_cache
                 && let Ok(mut cache) = cache.lock()
@@ -9205,14 +7698,20 @@ fn execute_tool_with_cache(
             }
 
             if let Some(next_offset) = next_offset {
-                Ok(capture.finish(&format!(
-                    "Pass offset={next_offset} and maybe a smaller limit to continue."
-                )))
+                let hint = oversized_line.map_or_else(
+                    || format!("Pass offset={next_offset} and maybe a smaller limit to continue."),
+                    |line_no| {
+                        format!(
+                            "Line {line_no} exceeds the per-call capture cap; pass offset={next_offset} to continue after it."
+                        )
+                    },
+                );
+                Ok(capture.finish(&hint))
             } else {
                 let mut out = capture.finish("");
-                if remaining > 0 {
+                if more_lines {
                     out.push_str(&format!(
-                        "\n…[{remaining} more lines remain; pass offset={} to continue]\n",
+                        "\n…[more lines remain; pass offset={} to continue]\n",
                         offset + emitted
                     ));
                 }
@@ -9225,18 +7724,40 @@ fn execute_tool_with_cache(
                 .as_str()
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let line_no = input["line"]
-                .as_u64()
-                .filter(|line| *line > 0)
-                .map(|v| v as usize);
+            let line_no = match input["line"].as_u64() {
+                Some(value) => Some(
+                    usize::try_from(value)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or("line must be a positive integer")?,
+                ),
+                None if input["line"].is_null() => None,
+                None => return Err("line must be a positive integer".to_string()),
+            };
             let selector_count = (symbol.is_some() as usize) + (line_no.is_some() as usize);
             if selector_count != 1 {
                 return Err("provide exactly one of symbol or line".to_string());
             }
-            let context = input["context"].as_u64().unwrap_or(5).min(50) as usize;
+            let context = match input["context"].as_u64() {
+                Some(value) if value <= 50 => value as usize,
+                Some(_) => return Err("context must be an integer from 0 through 50".to_string()),
+                None if input["context"].is_null() => 5,
+                None => return Err("context must be an integer from 0 through 50".to_string()),
+            };
             let path = canonical_read_path(root, path_str)?;
-            let _metadata = regular_file_metadata(&path)?;
-            let content = std::fs::read_to_string(&path).map_err(|e| format!("{e}"))?;
+            let content = read_utf8_file_with_limit(
+                &path,
+                READ_SYMBOL_INPUT_MAX_BYTES,
+                interrupt,
+                "read_symbol",
+            )
+            .map_err(|error| {
+                if error.contains("input limit") {
+                    format!("{error}; use rg and focused read_file windows instead")
+                } else {
+                    error
+                }
+            })?;
             let starts = source_line_starts(&content);
             if starts.is_empty() {
                 return Err(format!("{} is empty", path.display()));
@@ -9324,8 +7845,13 @@ fn execute_tool_with_cache(
             if !todo_path.exists() {
                 return Ok("(no todos — use todo_write to create a task list)".to_string());
             }
-            let content =
-                std::fs::read_to_string(todo_path).map_err(|e| format!("read todo: {e}"))?;
+            let content = read_utf8_regular_file_with_limit(
+                todo_path,
+                TODO_STATE_MAX_BYTES,
+                interrupt,
+                "todo_read",
+            )
+            .map_err(|e| format!("read todo: {e}"))?;
             let todos: Value =
                 serde_json::from_str(&content).map_err(|e| format!("parse todo: {e}"))?;
             let items = todos.as_array().ok_or("todo: expected array")?;
@@ -9355,6 +7881,11 @@ fn execute_tool_with_cache(
                 read_todo_counts(&todo_path).or_else(|| read_todo_counts(&project_todo_path));
             let content = serde_json::to_string_pretty(&json!(validated))
                 .map_err(|e| format!("serialize todo: {e}"))?;
+            if content.len() > TODO_STATE_MAX_BYTES {
+                return Err(format!(
+                    "todo state exceeds the {TODO_STATE_MAX_BYTES} byte limit"
+                ));
+            }
             atomic_write_bytes(&todo_path, content.as_bytes())
                 .map_err(|e| format!("write todo: {e}"))?;
 
@@ -10116,7 +8647,6 @@ fn start_git_credential_pipe_writer(path: PathBuf, payload: String) -> SudoPassw
 /// the FIFO, so it must outlive the tool call.
 struct GitCredentialHelperRuntime {
     env: Vec<(String, String)>,
-    sandbox_read_roots: Vec<PathBuf>,
     _pipe: SudoPasswordPipeRuntime,
 }
 
@@ -10168,11 +8698,7 @@ fn prepare_git_credential_helper(
         ),
         ("GIT_CONFIG_VALUE_4".to_string(), "always".to_string()),
     ];
-    Ok(GitCredentialHelperRuntime {
-        env,
-        sandbox_read_roots: vec![script, fifo],
-        _pipe: pipe,
-    })
+    Ok(GitCredentialHelperRuntime { env, _pipe: pipe })
 }
 
 #[cfg(not(unix))]
@@ -10257,7 +8783,6 @@ async fn execute_bash_async_with_timeout(
         sandbox_profile,
         None,
         &[],
-        &[],
     )
     .await
 }
@@ -10272,7 +8797,6 @@ async fn execute_bash_async_prepared(
     sandbox_profile: SandboxProfile,
     live_output: Option<LiveToolOutput>,
     extra_env: &[(String, String)],
-    extra_read_roots: &[PathBuf],
 ) -> std::result::Result<String, String> {
     let mut local_sudo_auth = local_sudo_auth;
     let pack_helper = if local_sudo_auth.is_none() {
@@ -10297,31 +8821,19 @@ async fn execute_bash_async_prepared(
     } else {
         sandbox_profile
     };
-    let mut sandbox_read_roots = extra_read_roots.to_vec();
-    if let Some(auth) = local_sudo_auth.as_ref() {
-        sandbox_read_roots.push(auth.sudo_shim_dir.clone());
-        if let Some(askpass) = auth.askpass.as_ref() {
-            sandbox_read_roots.push(askpass.clone());
-        }
-        if let Some(fifo) = auth.password_fifo.as_ref() {
-            sandbox_read_roots.push(fifo.clone());
-        }
-    }
     let mut command = if let Some(invocation) = pack_helper.as_ref() {
         let executable = invocation
             .executable
             .to_str()
             .ok_or_else(|| "pack helper path is not valid UTF-8".to_string())?;
-        let mut command =
-            sandbox::tokio_command(executable, effective_profile, root, &sandbox_read_roots)
-                .map_err(|error| format!("prepare sandbox for pack helper: {error}"))?;
+        let mut command = sandbox::tokio_command(executable, effective_profile, root)
+            .map_err(|error| format!("prepare sandbox for pack helper: {error}"))?;
         command.args(&invocation.args);
         command
     } else {
         let bash = bash_executable_path();
-        let mut command =
-            sandbox::tokio_command(&bash, effective_profile, root, &sandbox_read_roots)
-                .map_err(|error| format!("prepare bash sandbox: {error}"))?;
+        let mut command = sandbox::tokio_command(&bash, effective_profile, root)
+            .map_err(|error| format!("prepare bash sandbox: {error}"))?;
         command.arg("-c").arg(&bash_cmd);
         command
     };
@@ -10501,7 +9013,7 @@ async fn execute_external_async_status(
     } else {
         PathBuf::from(bin)
     };
-    let mut cmd = sandbox::tokio_command(&executable, policy.sandbox_profile, cwd, &[])
+    let mut cmd = sandbox::tokio_command(&executable, policy.sandbox_profile, cwd)
         .map_err(|error| format!("prepare sandbox for {bin}: {error}"))?;
     cmd.args(args)
         .current_dir(cwd)
@@ -10907,6 +9419,13 @@ async fn execute_builtin_call(
     live_output: Option<LiveToolOutput>,
     pack_env: Vec<(String, String)>,
 ) -> std::result::Result<String, String> {
+    // The blocking builtin path below cannot be cancelled once it starts, so
+    // this is the last point where an already-interrupted call can be stopped.
+    // It is also the gate for a parallel-round task that won its concurrency
+    // permit after the user hit Ctrl-C.
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(format!("{name} was not executed: interrupted by user"));
+    }
     if name == "bash" {
         let cmd = input["command"].as_str().unwrap_or("").to_string();
         let guarded = tool_policy::apply_bash_guardrails(&cmd)?;
@@ -10925,10 +9444,8 @@ async fn execute_builtin_call(
             _ => None,
         };
         let mut extra_env = pack_env;
-        let mut sandbox_read_roots = Vec::new();
         if let Some(runtime) = git_cred_runtime.as_ref() {
             extra_env.extend(runtime.env.clone());
-            sandbox_read_roots.extend(runtime.sandbox_read_roots.clone());
         }
         execute_bash_async_prepared(
             &guarded,
@@ -10939,7 +9456,6 @@ async fn execute_builtin_call(
             sandbox_profile,
             live_output,
             &extra_env,
-            &sandbox_read_roots,
         )
         .await
     } else if name == "http" {
@@ -10994,6 +9510,7 @@ async fn execute_builtin_call(
                 &name,
                 &input,
                 &root,
+                Some(interrupt.as_ref()),
                 read_cache.as_ref(),
                 session_id.as_deref(),
                 prepared_mutation,
@@ -11411,6 +9928,14 @@ fn persist_tool_journal_terminal(
         })
 }
 
+fn decimal_width(value: u64) -> usize {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
+}
+
 fn json_byte_len(v: &Value) -> usize {
     match v {
         Value::Null => 4,
@@ -11421,12 +9946,22 @@ fn json_byte_len(v: &Value) -> usize {
                 5
             }
         }
-        Value::Number(n) => n.to_string().len(),
+        // Integers are the overwhelming majority of numbers in tool payloads,
+        // and their decimal width is arithmetic — only floats need serde_json's
+        // formatter, and only they pay for an allocation.
+        Value::Number(n) => match (n.as_u64(), n.as_i64()) {
+            (Some(u), _) => decimal_width(u),
+            (_, Some(i)) => 1 + decimal_width(i.unsigned_abs()),
+            _ => n.to_string().len(),
+        },
         Value::String(s) => {
+            // Every escaped character here is ASCII, and a UTF-8 continuation
+            // byte can never collide with one, so counting bytes avoids
+            // decoding the string without changing the result.
             s.len()
                 + 2
-                + s.chars()
-                    .filter(|c| matches!(c, '"' | '\\' | '\n' | '\r' | '\t'))
+                + s.bytes()
+                    .filter(|b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t'))
                     .count()
         }
         Value::Array(a) => {
@@ -11490,6 +10025,12 @@ const TINY_SYSTEM: &str = "You are dext tiny, a terse CLI agent. Use exposed too
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
 
+fn prompt_context_file_hash(path: &Path) -> Option<String> {
+    read_utf8_regular_file_with_limit(path, PROMPT_CONTEXT_FILE_MAX_BYTES, None, "prompt context")
+        .ok()
+        .map(|content| sha256_hex_bytes(content.as_bytes()))
+}
+
 fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
     scan_prompt_context_files(root, filename).sections
 }
@@ -11506,8 +10047,8 @@ struct PromptContextScan {
 }
 
 fn prompt_file_signature(path: &Path) -> Option<(std::time::SystemTime, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
         return None;
     }
     Some((meta.modified().ok()?, meta.len()))
@@ -11520,9 +10061,12 @@ fn scan_prompt_context_files(root: &Path, filename: &str) -> PromptContextScan {
         let candidate = dir.join(filename);
         scan.signature
             .push((candidate.clone(), prompt_file_signature(&candidate)));
-        if candidate.exists()
-            && let Ok(content) = std::fs::read_to_string(&candidate)
-        {
+        if let Ok(content) = read_utf8_regular_file_with_limit(
+            &candidate,
+            PROMPT_CONTEXT_FILE_MAX_BYTES,
+            None,
+            "prompt context",
+        ) {
             let trimmed = content.trim();
             if !trimmed.is_empty() {
                 let display = dir.strip_prefix(root).unwrap_or(dir).display();
@@ -11557,9 +10101,11 @@ type PromptContextSections = Vec<(String, PathBuf, String)>;
 /// Refreshed when the epoch (user turn) changes or a stat signature drifts.
 struct PromptScanCache {
     epoch: u64,
+    include_project_extensions: bool,
     dext_md: PromptContextScan,
     recall: PromptContextScan,
     pack_summary: Option<String>,
+    shelf_summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -11567,6 +10113,76 @@ struct SystemParts {
     stable: String,
     env: String,
     prompt_sources: Vec<PathBuf>,
+}
+
+/// Per-mode caps for the volatile env block. `None` omits the section outright
+/// (and skips computing it); `suffix` completes the "<section> trimmed for
+/// {suffix}." hint every capped section shares.
+struct EnvCaps {
+    /// Byte cap paired with how many todo items to summarize.
+    todos: Option<(usize, usize)>,
+    ledger: usize,
+    context_state: usize,
+    health: Option<usize>,
+    budget_cap: bool,
+    packs: Option<usize>,
+    shelves: Option<usize>,
+    /// Byte cap paired with its own hint suffix: frugal says "frugal budget"
+    /// here while every other hint in that mode says "frugal context". Carried
+    /// so this refactor stays byte-identical; normalize it only as a deliberate
+    /// prompt change.
+    shelf_context: Option<(usize, &'static str)>,
+    suffix: &'static str,
+}
+
+impl EnvCaps {
+    const TINY: Self = Self {
+        todos: None,
+        ledger: 600,
+        context_state: 800,
+        health: None,
+        budget_cap: false,
+        packs: None,
+        shelves: None,
+        shelf_context: None,
+        suffix: "tiny context",
+    };
+
+    const FRUGAL: Self = Self {
+        todos: Some((600, 3)),
+        ledger: 1_200,
+        context_state: 1_200,
+        health: Some(600),
+        budget_cap: true,
+        packs: Some(600),
+        shelves: Some(700),
+        shelf_context: Some((600, "frugal budget")),
+        suffix: "frugal context",
+    };
+
+    const FULL: Self = Self {
+        todos: Some((900, 5)),
+        ledger: 2_000,
+        context_state: 1_800,
+        health: Some(800),
+        budget_cap: true,
+        packs: Some(600),
+        shelves: Some(700),
+        shelf_context: Some((1_200, "prompt budget")),
+        suffix: "prompt budget",
+    };
+}
+
+/// Appends `\n## {heading}\n{body}` with `body` capped and a trailing newline
+/// guaranteed — the shape every env section repeats.
+fn push_env_section(env: &mut String, heading: &str, body: String, cap: usize, hint: &str) {
+    env.push_str("\n## ");
+    env.push_str(heading);
+    env.push('\n');
+    env.push_str(&cap_bytes_with_hint(body, cap, hint));
+    if !env.ends_with('\n') {
+        env.push('\n');
+    }
 }
 
 const READ_ONLY_TOOLS: &[&str] = &[
@@ -11579,7 +10195,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 fn todo_summary_from_path(path: &Path, max_items: usize) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content =
+        read_utf8_regular_file_with_limit(path, TODO_STATE_MAX_BYTES, None, "todo summary").ok()?;
     let todos = serde_json::from_str::<Value>(&content).ok()?;
     let items = todos.as_array()?;
     if items.is_empty() {
@@ -11651,11 +10268,14 @@ Keep each section concise. Capture the user's overall goal, key decisions and wh
 const COMPACT_SUMMARY_MAX_TOKENS: u32 = 2_048;
 const COMPACT_SUMMARY_MAX_TOKENS_THINKING: u32 = 8_192;
 
-fn compact_summary_max_tokens(thinking_effort: ThinkingEffort) -> u32 {
-    if thinking_effort == ThinkingEffort::Off {
-        COMPACT_SUMMARY_MAX_TOKENS
-    } else {
+fn compact_summary_max_tokens(
+    thinking_effort: ThinkingEffort,
+    summary_reasoning_enabled: bool,
+) -> u32 {
+    if thinking_effort != ThinkingEffort::Off || summary_reasoning_enabled {
         COMPACT_SUMMARY_MAX_TOKENS_THINKING
+    } else {
+        COMPACT_SUMMARY_MAX_TOKENS
     }
 }
 
@@ -11677,6 +10297,9 @@ const COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 1_000;
 const FRUGAL_COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 360;
 
 const HOOKS_APPROVAL_NAME: &str = "hooks";
+const PROJECT_EXTENSIONS_APPROVAL_NAME: &str = "project_extensions";
+const PROJECT_EXTENSIONS_APPROVAL_FILE: &str = "project-extensions-approved";
+const CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME: &str = "checkpoint_recovery_gap";
 
 #[derive(Deserialize, Clone, Default)]
 struct Hook {
@@ -11752,7 +10375,7 @@ impl Hooks {
                 SandboxProfile::WorkspaceWrite
             };
             let bash = bash_executable_path();
-            let sandboxed = match sandbox::std_command(&bash, hook_profile, root, &[]) {
+            let sandboxed = match sandbox::std_command(&bash, hook_profile, root) {
                 Ok(command) => command,
                 Err(error) => {
                     out.push((format!("prepare hook sandbox: {error}"), -1));
@@ -11960,31 +10583,8 @@ impl ToolContextProfile {
     }
 }
 
-const DEFAULT_TOOL_NAMES: &[&str] = &[
-    "read_file",
-    "read_symbol",
-    "write_file",
-    "edit_file",
-    "multi_edit",
-    "bash",
-    "fd",
-    "rg",
-    "http",
-    "git_diff",
-    "git_commit",
-    "todo_read",
-    "todo_write",
-];
-
-const SPECIALIZED_TOOL_NAMES: &[&str] = &["jq", "fzf", "awk", "git_log", "csvkit"];
-
 fn tool_name_allowed_in_profile(name: &str, profile: ToolContextProfile) -> bool {
-    match profile {
-        ToolContextProfile::Full => true,
-        ToolContextProfile::Default | ToolContextProfile::Frugal => {
-            DEFAULT_TOOL_NAMES.contains(&name)
-        }
-    }
+    profile == ToolContextProfile::Full || tools::is_default_tool(name)
 }
 
 struct ToolsCommandResult {
@@ -12032,10 +10632,9 @@ fn render_tools_status(agent: &Agent) -> String {
         )
     );
 
-    let hidden_specialized: Vec<String> = SPECIALIZED_TOOL_NAMES
-        .iter()
-        .filter(|name| !agent.tools.iter().any(|tool| tool.name == **name))
-        .map(|name| (*name).to_string())
+    let hidden_specialized: Vec<String> = tools::specialized_tool_names()
+        .filter(|name| !agent.tools.iter().any(|tool| tool.name == *name))
+        .map(str::to_string)
         .collect();
     if !hidden_specialized.is_empty() {
         let _ = writeln!(
@@ -12090,7 +10689,6 @@ struct WorkLedger {
     verification: Vec<VerificationRecord>,
     diagnostics: Vec<WorkflowDiagnosticRecord>,
     next_actions: Vec<String>,
-    active_focus: Option<WorkMapFocusState>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -12151,6 +10749,8 @@ struct SessionProvenance {
     api_provider: ApiProvider,
     model: String,
     thinking_effort: ThinkingEffort,
+    #[serde(default)]
+    reasoning_mode: ReasoningMode,
     approval_profile: ApprovalProfile,
     #[serde(default)]
     approval_policy_source: ApprovalPolicySource,
@@ -12197,6 +10797,8 @@ struct SessionHeader {
     #[serde(default)]
     thinking_effort: ThinkingEffort,
     #[serde(default)]
+    reasoning_mode: ReasoningMode,
+    #[serde(default)]
     compact_threshold_chars: Option<usize>,
     #[serde(default)]
     compact_threshold_percent: Option<u8>,
@@ -12223,8 +10825,6 @@ struct SessionHeader {
     #[serde(default)]
     provider_health: ProviderHealthLedger,
     #[serde(default)]
-    track_origin: Option<TrackOrigin>,
-    #[serde(default)]
     privacy: PrivacyPolicy,
 }
 
@@ -12242,6 +10842,7 @@ impl Default for SessionHeader {
             sandbox: None,
             usage: Usage::default(),
             thinking_effort: ThinkingEffort::default(),
+            reasoning_mode: ReasoningMode::default(),
             compact_threshold_chars: None,
             compact_threshold_percent: None,
             approval_profile: ApprovalProfile::default(),
@@ -12255,7 +10856,6 @@ impl Default for SessionHeader {
             provenance: SessionProvenance::default(),
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
-            track_origin: None,
             privacy: PrivacyPolicy::default(),
         }
     }
@@ -12714,6 +11314,10 @@ fn render_context_state_prompt(history: &[Message], ledger: &WorkLedger) -> Stri
         }
     }
 
+    // Every strategy row is emitted even at zero use: an absent entry means
+    // either "never used" or "reset by a worktree mutation", and the explicit
+    // "0/N used · OK" is what tells the model a previously exhausted budget is
+    // available again. Dropping idle rows would erase that affordance.
     let budgets = context_strategy_budget_usage(&actions);
     out.push_str("Strategy budget:\n");
     for strategy in [
@@ -12880,7 +11484,10 @@ fn parse_runtime_control_command(text: &str) -> Option<(&str, &str)> {
 }
 
 fn runtime_control_command_accepts(cmd: &str) -> bool {
-    matches!(cmd, "model" | "effort" | "think" | "thinking")
+    matches!(
+        cmd,
+        "model" | "effort" | "think" | "thinking" | "reasoning-mode" | "reasoning_mode" | "rmode"
+    )
 }
 
 pub(crate) fn parse_active_runtime_control_sequence(text: &str) -> Option<Vec<String>> {
@@ -12913,6 +11520,8 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "packs"
             | "shelf"
             | "shelves"
+            | "project-extensions"
+            | "project_extensions"
             | "help"
             | "?"
             | "version"
@@ -12932,7 +11541,6 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "preview"
             | "sandbox-profile"
             | "budget"
-            | "browser-recipe"
             | "sandbox"
             | "model"
             | "providers"
@@ -12944,6 +11552,9 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "effort"
             | "think"
             | "thinking"
+            | "reasoning-mode"
+            | "reasoning_mode"
+            | "rmode"
             | "context"
             | "context-mode"
             | "tool-profile"
@@ -12956,12 +11567,6 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "diag"
             | "save"
             | "export"
-            | "map"
-            | "packet"
-            | "focus"
-            | "tracks"
-            | "branches"
-            | "track"
             | "resume"
             | "sessions"
             | "session"
@@ -13010,7 +11615,7 @@ fn unsupported_busy_slash_message(text: &str) -> String {
         .filter(|cmd| !cmd.is_empty())
         .unwrap_or("command");
     format!(
-        "queued slash command /{cmd} not run while agent is busy; only /model and /effort (/think) are active runtime controls"
+        "queued slash command /{cmd} not run while agent is busy; only /model, /effort (/think), and /reasoning-mode are active runtime controls"
     )
 }
 
@@ -13121,9 +11726,43 @@ fn apply_runtime_control_command(
                     }
                 }
                 None => emit(
-                    "usage: /effort [off|low|medium|high|xhigh|max|next|prev|status]".to_string(),
+                    "usage: /effort [off|minimal|low|medium|high|xhigh|max|next|prev|status]"
+                        .to_string(),
                 ),
             },
+        }
+        return true;
+    }
+
+    let mode_arg = matches!(cmd, "reasoning-mode" | "reasoning_mode" | "rmode").then_some(arg);
+    if let Some(arg) = mode_arg {
+        let selected = match arg.to_ascii_lowercase().as_str() {
+            "" | "status" => agent.reasoning_mode(),
+            "next" | "+" | "prev" | "previous" | "-" => agent.cycle_reasoning_mode(),
+            _ => match ReasoningMode::parse(arg) {
+                Some(mode) => {
+                    agent.set_reasoning_mode(mode);
+                    mode
+                }
+                None => {
+                    emit("usage: /reasoning-mode [standard|pro|next|prev|status]".to_string());
+                    return true;
+                }
+            },
+        };
+        let active = agent.effective_reasoning_mode();
+        if active == Some(selected.as_str()) {
+            emit(format!(
+                "reasoning mode: {} (active for the next official OpenAI GPT-5.6 Responses request)",
+                selected.as_str()
+            ));
+        } else {
+            emit(format!(
+                "reasoning mode: {} (selected, inactive for {}/{}; no mode field will be sent)",
+                selected.as_str(),
+                agent.provider_id,
+                agent.model
+            ));
         }
         return true;
     }
@@ -13136,6 +11775,8 @@ struct AppliedRuntimeControls {
     commands: usize,
     changed_model: bool,
     changed_effort: bool,
+    changed_mode: bool,
+    effective_mode_changed: bool,
     aborted_stream: bool,
 }
 
@@ -13148,6 +11789,8 @@ fn finish_active_runtime_controls(
     for message in messages {
         let before_model = (agent.provider_id.clone(), agent.model.clone());
         let before_effort = agent.thinking_effort();
+        let before_mode = agent.reasoning_mode();
+        let before_effective_mode = agent.effective_reasoning_mode();
         let mut notes = Vec::new();
         let handled = apply_runtime_control_command(agent, &message, |msg| notes.push(msg));
         for note in notes {
@@ -13163,6 +11806,12 @@ fn finish_active_runtime_controls(
             if agent.thinking_effort() != before_effort {
                 applied.changed_effort = true;
             }
+            if agent.reasoning_mode() != before_mode {
+                applied.changed_mode = true;
+            }
+            if agent.effective_reasoning_mode() != before_effective_mode {
+                applied.effective_mode_changed = true;
+            }
         } else {
             agent.sink.emit(AgentEvent::Warn(format!(
                 "unsupported active runtime control: {}",
@@ -13174,10 +11823,15 @@ fn finish_active_runtime_controls(
         agent.sink.emit(AgentEvent::ThinkingEffortChanged {
             effort: agent.thinking_effort(),
         });
+        agent.sink.emit(AgentEvent::ReasoningModeChanged {
+            mode: agent.reasoning_mode(),
+        });
         if applied.changed_model {
             agent.emit_runtime_provider_state();
         }
-        if abort_stream && (applied.changed_model || applied.changed_effort) {
+        if abort_stream
+            && (applied.changed_model || applied.changed_effort || applied.effective_mode_changed)
+        {
             applied.aborted_stream = true;
             agent.sink.emit(AgentEvent::Warn(
                 "[runtime control] current provider stream stopped; continuing immediately with updated runtime"
@@ -13186,16 +11840,24 @@ fn finish_active_runtime_controls(
             agent.append_latest_log(
                 "runtime_control_abort_stream",
                 &format!(
-                    "commands={} model_changed={} effort_changed={}",
-                    applied.commands, applied.changed_model, applied.changed_effort
+                    "commands={} model_changed={} effort_changed={} mode_changed={} effective_mode_changed={}",
+                    applied.commands,
+                    applied.changed_model,
+                    applied.changed_effort,
+                    applied.changed_mode,
+                    applied.effective_mode_changed
                 ),
             );
         } else {
             agent.append_latest_log(
                 "runtime_control_applied",
                 &format!(
-                    "commands={} model_changed={} effort_changed={}",
-                    applied.commands, applied.changed_model, applied.changed_effort
+                    "commands={} model_changed={} effort_changed={} mode_changed={} effective_mode_changed={}",
+                    applied.commands,
+                    applied.changed_model,
+                    applied.changed_effort,
+                    applied.changed_mode,
+                    applied.effective_mode_changed
                 ),
             );
         }
@@ -13203,6 +11865,7 @@ fn finish_active_runtime_controls(
             commands: applied.commands,
             model_changed: applied.changed_model,
             effort_changed: applied.changed_effort,
+            mode_changed: applied.changed_mode,
             stream_aborted: applied.aborted_stream,
         });
         agent.checkpoint_latest_session("after_runtime_control");
@@ -13243,6 +11906,39 @@ fn apply_runtime_control_for_stream(
 
 fn try_apply_runtime_controls_for_stream(agent: &mut Agent) -> AppliedRuntimeControls {
     apply_runtime_control_for_stream(agent, None)
+}
+
+fn build_responses_summary_body(
+    contract: RequestContract,
+    model: &str,
+    user_text: &str,
+    reasoning_effort: Option<&str>,
+    reasoning_mode: Option<&str>,
+    max_output_tokens: u32,
+) -> Value {
+    match contract {
+        RequestContract::ChatGptResponses => {
+            build_chatgpt_summary_request(model, COMPACT_SYSTEM, user_text, reasoning_effort)
+        }
+        RequestContract::OpenAiResponses => build_openai_responses_request(
+            model,
+            reasoning_effort.map(|effort| OpenAiResponsesReasoning {
+                effort,
+                mode: reasoning_mode,
+                include_encrypted_content: false,
+            }),
+            COMPACT_SYSTEM,
+            "dext-compact",
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": user_text }],
+            })],
+            Vec::new(),
+            max_output_tokens,
+        ),
+        _ => unreachable!("Responses summary requires a Responses contract"),
+    }
 }
 
 fn compaction_user_text_with_evidence(transcript: &str, evidence: &str) -> String {
@@ -13468,7 +12164,9 @@ fn render_transcript_for_summary(msgs: &[Message], context_mode: ContextMode) ->
                         out.push_str(&format!("[{}→partial_stream] {t}\n", m.role));
                     }
                 }
-                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
+                Block::Thinking { .. }
+                | Block::RedactedThinking { .. }
+                | Block::ResponsesReasoning { .. } => {}
                 Block::ToolUse { name, input, .. } => {
                     let s = input.to_string();
                     let truncated: String = s.chars().take(tool_use_cap).collect();
@@ -13919,6 +12617,7 @@ struct Agent {
     model: String,
     api_provider: ApiProvider,
     thinking_effort: ThinkingEffort,
+    reasoning_mode: ReasoningMode,
     system: String,
     history: Vec<Message>,
     tools: Vec<Tool>,
@@ -13940,6 +12639,7 @@ struct Agent {
     hooks: Hooks,
     pack_hook_env: Vec<(String, String)>,
     active_pack_hook_paths: HashSet<PathBuf>,
+    project_extensions_approved: Option<bool>,
     suppress_pack_activation: bool,
     state_lock: Option<Arc<SessionStateLock>>,
     session_enabled: bool,
@@ -13977,12 +12677,13 @@ struct Agent {
     read_cache: Arc<Mutex<ReadFileCache>>,
     work_ledger: WorkLedger,
     provider_health: ProviderHealthLedger,
-    track_origin: Option<TrackOrigin>,
     privacy: PrivacyPolicy,
     // Session-scoped git HTTPS credential from the masked local prompt.
     // Never serialized, logged, or shown to the model.
     git_credential: Option<LocalGitCredential>,
     checkpoint_cache: git_checkpoints::RepoRootCache,
+    checkpoint_blob_cache: git_checkpoints::UntrackedBlobCache,
+    checkpoint_partial_untracked_approved: bool,
     checkpoint_ordinal: usize,
     prompt_scan_cache: Mutex<Option<PromptScanCache>>,
     prompt_scan_epoch: u64,
@@ -14033,6 +12734,10 @@ impl Agent {
         let thinking_effort = std::env::var("DEXT_THINKING_EFFORT")
             .ok()
             .and_then(|v| ThinkingEffort::parse(&v))
+            .unwrap_or_default();
+        let reasoning_mode = std::env::var("DEXT_REASONING_MODE")
+            .ok()
+            .and_then(|v| ReasoningMode::parse(&v))
             .unwrap_or_default();
         let configured_context_mode = std::env::var("DEXT_CONTEXT_MODE")
             .ok()
@@ -14093,7 +12798,7 @@ impl Agent {
             git_summary(&sandbox_root)
         };
         let tool_profile = ToolProfile::from_env();
-        let budget_cap = BudgetCap::from_env();
+        let budget_cap = BudgetCap::from_env().map_err(anyhow::Error::msg)?;
         let tool_context_profile = ToolContextProfile::from_env().effective(context_mode);
         let tools: Vec<Tool> = provider_tool_definitions()
             .into_iter()
@@ -14111,6 +12816,7 @@ impl Agent {
             model,
             api_provider,
             thinking_effort,
+            reasoning_mode,
             system,
             history: Vec::new(),
             tools,
@@ -14120,6 +12826,7 @@ impl Agent {
             hooks: Hooks::load(&sandbox_root),
             pack_hook_env: Vec::new(),
             active_pack_hook_paths: HashSet::new(),
+            project_extensions_approved: None,
             suppress_pack_activation: false,
             sandbox_root,
             git_context,
@@ -14162,10 +12869,11 @@ impl Agent {
             read_cache: Arc::new(Mutex::new(ReadFileCache::default())),
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
-            track_origin: None,
             privacy: PrivacyPolicy::from_env(),
             git_credential: None,
             checkpoint_cache: git_checkpoints::RepoRootCache::new(),
+            checkpoint_blob_cache: git_checkpoints::UntrackedBlobCache::default(),
+            checkpoint_partial_untracked_approved: false,
             checkpoint_ordinal: 0,
             prompt_scan_cache: Mutex::new(None),
             prompt_scan_epoch: 0,
@@ -14358,11 +13066,15 @@ impl Agent {
         })
     }
 
+    fn request_contract_for_model(&self, model: &str) -> RequestContract {
+        self.provider_profile.as_ref().map_or_else(
+            || RequestContract::for_api_provider(self.api_provider),
+            |profile| effective_request_contract(profile, &self.base_url, model),
+        )
+    }
+
     fn request_contract(&self) -> RequestContract {
-        self.provider_profile
-            .as_ref()
-            .map(request_contract_for_profile)
-            .unwrap_or_else(|| RequestContract::for_api_provider(self.api_provider))
+        self.request_contract_for_model(&self.model)
     }
 
     fn route_api_provider(&self) -> ApiProvider {
@@ -14403,13 +13115,13 @@ impl Agent {
         }
         self.resolved_model_spec().map_or_else(
             || {
-                contract == RequestContract::ChatGptResponses
+                contract.is_responses()
                     || (contract == RequestContract::AnthropicMessages
                         && anthropic_prompt_cache_supported(&self.provider_id, &self.model))
             },
             |spec| {
                 if spec.source == "legacy" {
-                    contract == RequestContract::ChatGptResponses
+                    contract.is_responses()
                         || (contract == RequestContract::AnthropicMessages
                             && anthropic_prompt_cache_supported(&self.provider_id, &self.model))
                 } else {
@@ -14419,10 +13131,37 @@ impl Agent {
         )
     }
 
-    fn model_supports_reasoning(&self, model: &str) -> bool {
-        self.provider_profile
+    fn responses_reasoning_effort_for_model(
+        &self,
+        model: &str,
+        effort: ThinkingEffort,
+    ) -> Option<String> {
+        let spec = self
+            .provider_profile
             .as_ref()
-            .is_none_or(|profile| resolve_model_spec(profile, model).reasoning)
+            .map(|profile| resolve_model_spec(profile, model));
+        if spec.as_ref().is_some_and(|spec| !spec.reasoning) {
+            return None;
+        }
+        if let Some(spec) = spec.as_ref().filter(|spec| !spec.effort_levels.is_empty()) {
+            if effort == ThinkingEffort::Off {
+                return spec
+                    .effort_levels
+                    .iter()
+                    .any(|level| level == "none")
+                    .then(|| "none".to_string());
+            }
+            return map_effort_to_provider_levels(&spec.effort_levels, effort);
+        }
+        match self.request_contract_for_model(model) {
+            RequestContract::OpenAiResponses => {
+                Some(openai_responses_reasoning_effort(effort).to_string())
+            }
+            RequestContract::ChatGptResponses => {
+                provider::chatgpt_reasoning_effort(model, effort).map(str::to_string)
+            }
+            _ => None,
+        }
     }
 
     fn model_supports_image_input(&self) -> bool {
@@ -14456,16 +13195,23 @@ impl Agent {
         }
     }
 
-    fn finalize_usage_metrics(&self, usage: &mut Usage) {
-        let model_spec = self.resolved_model_spec();
+    fn finalize_usage_metrics_for_model(&self, usage: &mut Usage, model: &str) {
+        let model_spec = self
+            .provider_profile
+            .as_ref()
+            .map(|profile| resolve_model_spec(profile, model));
         *usage = usage_with_current_pricing(
             *usage,
             &self.provider_id,
-            self.route_api_provider(),
+            self.request_contract_for_model(model).api_provider(),
             &self.base_url,
-            &self.model,
+            model,
             model_spec.as_ref().and_then(|spec| spec.pricing.as_ref()),
         );
+    }
+
+    fn finalize_usage_metrics(&self, usage: &mut Usage) {
+        self.finalize_usage_metrics_for_model(usage, &self.model);
     }
 
     fn finalize_turn_usage_metrics(&self, usage: &mut Usage, blocks: &[Block]) {
@@ -14564,7 +13310,7 @@ impl Agent {
 
     fn provider_status_line(&self) -> String {
         format!(
-            "provider={} contract={} api={} model={} spec={} tools={} reasoning={} image_input={} prompt_cache={} auth={} base={}",
+            "provider={} contract={} api={} model={} spec={} tools={} reasoning={} effort={} reasoning_mode={} mode_active={} image_input={} prompt_cache={} auth={} base={}",
             self.provider_id,
             self.request_contract().as_str(),
             self.route_api_provider().as_str(),
@@ -14572,6 +13318,9 @@ impl Agent {
             self.model_spec_source(),
             self.model_supports_tools(),
             self.resolved_model_spec().is_none_or(|spec| spec.reasoning),
+            self.thinking_effort.as_str(),
+            self.reasoning_mode.as_str(),
+            self.reasoning_mode_is_active(),
             self.model_supports_image_input(),
             self.model_supports_prompt_cache(),
             self.key_source,
@@ -14720,7 +13469,7 @@ impl Agent {
         &self,
         current: ThinkingEffort,
     ) -> Option<(ThinkingEffort, String)> {
-        if self.request_contract() != RequestContract::ChatGptResponses {
+        if !self.request_contract().is_responses() {
             return None;
         }
         let reduced = match current {
@@ -14728,12 +13477,12 @@ impl Agent {
                 ThinkingEffort::Medium
             }
             ThinkingEffort::Medium => ThinkingEffort::Low,
-            ThinkingEffort::Low | ThinkingEffort::Off => return None,
+            ThinkingEffort::Minimal | ThinkingEffort::Low | ThinkingEffort::Off => return None,
         };
         Some((
             reduced,
             format!(
-                "provider recovery: ChatGPT ended a response without producing an executable function call; reduced reasoning effort from {} to {} for the retry",
+                "provider recovery: Responses API ended a response without producing an executable function call; reduced reasoning effort from {} to {} for the retry",
                 current.as_str(),
                 reduced.as_str()
             ),
@@ -14889,6 +13638,31 @@ impl Agent {
         self.thinking_effort
     }
 
+    pub(crate) fn reasoning_mode(&self) -> ReasoningMode {
+        self.reasoning_mode
+    }
+
+    fn reasoning_mode_for_model(&self, model: &str) -> Option<&'static str> {
+        let profile = self.provider_profile.as_ref()?;
+        let spec = resolve_model_spec(profile, model);
+        (self.request_contract_for_model(model) == RequestContract::OpenAiResponses
+            && official_openai_gpt_5_6_responses(profile, &self.base_url, model)
+            && spec.reasoning
+            && spec
+                .reasoning_modes
+                .iter()
+                .any(|mode| mode == self.reasoning_mode.as_str()))
+        .then(|| self.reasoning_mode.as_str())
+    }
+
+    fn reasoning_mode_is_active(&self) -> bool {
+        self.reasoning_mode_for_model(&self.model).is_some()
+    }
+
+    fn effective_reasoning_mode(&self) -> Option<&'static str> {
+        self.reasoning_mode_for_model(&self.model)
+    }
+
     fn compact_threshold_chars(&self) -> usize {
         history_char_budget_with_window(
             self.context_window_tokens(),
@@ -14937,6 +13711,19 @@ impl Agent {
         }
         self.thinking_effort = effort;
         true
+    }
+
+    fn set_reasoning_mode(&mut self, mode: ReasoningMode) -> bool {
+        if self.reasoning_mode == mode {
+            return false;
+        }
+        self.reasoning_mode = mode;
+        true
+    }
+
+    fn cycle_reasoning_mode(&mut self) -> ReasoningMode {
+        self.reasoning_mode = self.reasoning_mode.cycle();
+        self.reasoning_mode
     }
 
     fn cycle_thinking_effort(&mut self, step: i8) -> ThinkingEffort {
@@ -15036,6 +13823,12 @@ impl Agent {
         self.active_pack_hook_paths.clear();
         if root_changed {
             self.allowed.clear();
+            self.project_extensions_approved = None;
+            // The prompt scan cache is keyed on the epoch and on stat
+            // signatures for the *previous* root's ancestor chain, which stay
+            // current after a move. Without this bump a new root could be
+            // served the old root's DEXT.md, recall, pack, and shelf sections.
+            self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         }
         self.suppress_pack_activation = false;
         self.sandbox_root = root;
@@ -15043,6 +13836,8 @@ impl Agent {
         self.hooks = Hooks::load(&self.sandbox_root);
         self.git_context = git_summary(&self.sandbox_root);
         self.checkpoint_cache = git_checkpoints::RepoRootCache::new();
+        self.checkpoint_blob_cache = git_checkpoints::UntrackedBlobCache::default();
+        self.checkpoint_partial_untracked_approved = false;
         self.checkpoint_ordinal = 0;
         self.refresh_state_paths();
         record_crash_session_id(&self.latest_session_path);
@@ -15082,6 +13877,7 @@ impl Agent {
 
     async fn run_pack(&mut self, selector: &str, task: &str) -> Result<()> {
         let pack = packs::find_pack(&self.sandbox_root, selector)?;
+        let prompt = packs::pack_prompt(&pack, task)?;
         self.activate_pack_hooks(&pack);
         self.sink.emit(AgentEvent::Slash(format!(
             "▶ pack: {} · {}\nworkflow: {}",
@@ -15093,35 +13889,86 @@ impl Agent {
             },
             pack.pack_md_path.display()
         )));
-        let prompt = packs::pack_prompt(&pack, task)?;
-        self.chat(prompt).await
+        self.chat_with_pack_activation(prompt, true).await
     }
 
-    fn maybe_create_tool_checkpoint(&mut self, name: &str, input: &Value) {
+    fn maybe_create_tool_checkpoint(&mut self, name: &str, input: &Value) -> Result<(), String> {
         if !git_checkpoints::tool_needs_checkpoint(name, input) {
-            return;
+            return Ok(());
         }
-        let Some(git_root) = self.checkpoint_cache.get(&self.sandbox_root).ok().flatten() else {
-            return;
+        let Some(git_root) = self.checkpoint_cache.get(&self.sandbox_root)? else {
+            return Ok(());
         };
         let paths_hint: Vec<String> = input["path"]
             .as_str()
             .map(|p| vec![p.to_string()])
             .unwrap_or_default();
         self.checkpoint_ordinal += 1;
-        match git_checkpoints::create_checkpoint_in_repo(
-            &self.sandbox_root,
-            &git_root,
-            name,
-            &paths_hint,
-            self.checkpoint_ordinal,
-        ) {
-            Ok(Some(cp)) => self.append_latest_log("checkpoint", &format!("created {}", cp.id)),
-            Ok(None) => self.append_latest_log(
-                "checkpoint",
-                "skipped: no restorable repository state for this tool call",
-            ),
-            Err(e) => self.append_latest_log("checkpoint", &format!("warning: {e}")),
+        let create = |agent: &mut Self, allow_partial_untracked| {
+            git_checkpoints::create_checkpoint_in_repo(
+                &agent.sandbox_root,
+                &git_root,
+                name,
+                &paths_hint,
+                agent.checkpoint_ordinal,
+                allow_partial_untracked,
+                &mut agent.checkpoint_blob_cache,
+            )
+        };
+        let checkpoint = match create(self, self.checkpoint_partial_untracked_approved) {
+            Err(error)
+                if git_checkpoints::checkpoint_failure_blocks_tool(name)
+                    && git_checkpoints::is_partial_untracked_recovery_error(&error)
+                    && !self.checkpoint_partial_untracked_approved =>
+            {
+                if self.approval_profile == ApprovalProfile::Never {
+                    return Err(error);
+                }
+                let approval_input = json!({
+                    "operation": "run write-risk arbitrary commands with partial untracked-file recovery for this repository",
+                    "recovery_gap": error,
+                    "risk": "tracked and staged Git state remains checkpointed, but listed untracked paths outside bounded sidecar capture may not be recoverable"
+                });
+                match self
+                    .sink
+                    .request_permission(CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME, &approval_input)
+                {
+                    Choice::Deny => {
+                        return Err("partial checkpoint recovery was not approved".to_string());
+                    }
+                    Choice::Once | Choice::Always => {
+                        self.checkpoint_partial_untracked_approved = true;
+                        create(self, true)
+                    }
+                }
+            }
+            result => result,
+        };
+        match checkpoint {
+            Ok(Some(cp)) => {
+                self.append_latest_log("checkpoint", &format!("created {}", cp.id));
+                if let Some(warning) = cp.untracked_capture_warning {
+                    self.sink.emit(AgentEvent::Warn(format!(
+                        "[checkpoint recovery gap approved] {warning}"
+                    )));
+                }
+                Ok(())
+            }
+            Ok(None) => {
+                self.append_latest_log(
+                    "checkpoint",
+                    "skipped: no restorable repository state for this tool call",
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.append_latest_log("checkpoint", &format!("warning: {error}"));
+                if git_checkpoints::checkpoint_failure_blocks_tool(name) {
+                    Err(error)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -15165,15 +14012,23 @@ impl Agent {
     /// Prompt context contributed by the typed shelf signal→effect loop
     /// (Context abilities of shelves that opt in via a load-signal Hook).
     fn shelf_context_section(&self) -> Option<String> {
-        self.shelf_registry
-            .collect_context(&shelves::Signal::Load, &self.shelf_frame(), 1_200)
+        self.shelf_registry.collect_context(
+            &shelves::Signal::Load,
+            &self.shelf_frame(),
+            1_200,
+            self.project_extensions_approved == Some(true),
+        )
     }
 
     /// A shelf veto for a tool call, if any behavioral shelf opts into tool
     /// signals and returns a Block effect. No-op for manifest-only shelves.
     fn shelf_tool_denial(&self, name: &str, input: &Value) -> Option<String> {
-        self.shelf_registry
-            .tool_block_reason(&self.shelf_frame(), name, input)
+        self.shelf_registry.tool_block_reason(
+            &self.shelf_frame(),
+            name,
+            input,
+            self.project_extensions_approved == Some(true),
+        )
     }
 
     fn budget_cap_denial(&mut self) -> Option<String> {
@@ -15219,16 +14074,31 @@ impl Agent {
     /// and revalidated with cheap stats between tool rounds. compose runs once
     /// per provider request; without the cache it would repeat the ancestor
     /// walks and pack-directory reads on every round of a turn.
-    fn prompt_scans(&self) -> (PromptContextSections, PromptContextSections, Option<String>) {
+    fn prompt_scans(
+        &self,
+    ) -> (
+        PromptContextSections,
+        PromptContextSections,
+        Option<String>,
+        Option<String>,
+    ) {
         let Ok(mut guard) = self.prompt_scan_cache.lock() else {
             return (
                 prompt_context_files(&self.sandbox_root, "DEXT.md"),
                 prompt_context_files(&self.sandbox_root, "recall.md"),
-                packs::pack_summary_for_prompt(&self.sandbox_root),
+                packs::pack_summary_for_prompt(
+                    &self.sandbox_root,
+                    self.project_extensions_approved == Some(true),
+                ),
+                shelves::registry_summary_for_prompt(
+                    &self.shelf_registry,
+                    self.project_extensions_approved == Some(true),
+                ),
             );
         };
         if let Some(cache) = guard.as_ref()
             && cache.epoch == self.prompt_scan_epoch
+            && cache.include_project_extensions == (self.project_extensions_approved == Some(true))
             && prompt_context_scan_is_current(&cache.dext_md)
             && prompt_context_scan_is_current(&cache.recall)
         {
@@ -15236,26 +14106,45 @@ impl Agent {
                 cache.dext_md.sections.clone(),
                 cache.recall.sections.clone(),
                 cache.pack_summary.clone(),
+                cache.shelf_summary.clone(),
             );
         }
         let dext_md = scan_prompt_context_files(&self.sandbox_root, "DEXT.md");
         let recall = scan_prompt_context_files(&self.sandbox_root, "recall.md");
-        let pack_summary = packs::pack_summary_for_prompt(&self.sandbox_root);
+        let pack_summary = packs::pack_summary_for_prompt(
+            &self.sandbox_root,
+            self.project_extensions_approved == Some(true),
+        );
+        let shelf_summary = shelves::registry_summary_for_prompt(
+            &self.shelf_registry,
+            self.project_extensions_approved == Some(true),
+        );
         let result = (
             dext_md.sections.clone(),
             recall.sections.clone(),
             pack_summary.clone(),
+            shelf_summary.clone(),
         );
         *guard = Some(PromptScanCache {
             epoch: self.prompt_scan_epoch,
+            include_project_extensions: self.project_extensions_approved == Some(true),
             dext_md,
             recall,
             pack_summary,
+            shelf_summary,
         });
         result
     }
 
     fn compose_system_details(&self) -> SystemParts {
+        let tiny = self.context_mode.is_tiny();
+        let caps = if tiny {
+            EnvCaps::TINY
+        } else if self.context_mode.is_frugal() {
+            EnvCaps::FRUGAL
+        } else {
+            EnvCaps::FULL
+        };
         let mut stable = self.system.clone();
         if self.context_mode.is_frugal()
             && !self.context_mode.is_tiny()
@@ -15272,13 +14161,17 @@ impl Agent {
             PROJECT_CONTEXT_CAP
         };
         let mut prompt_sources = Vec::new();
-        let (dext_md_sections, recall_sections, cached_pack_summary) = self.prompt_scans();
+        let (dext_md_sections, recall_sections, cached_pack_summary, cached_shelf_summary) =
+            self.prompt_scans();
         for (label, path, content) in &dext_md_sections {
             if context_budget == 0 {
                 break;
             }
             prompt_sources.push(path.clone());
-            let section = format!("\n\n## Project context (DEXT.md from {label})\n{}", content);
+            let section = format!(
+                "\n\n## Project-controlled guidance (DEXT.md from {label})\n{}",
+                content
+            );
             if section.len() <= context_budget {
                 stable.push_str(&section);
                 context_budget -= section.len();
@@ -15289,7 +14182,7 @@ impl Agent {
                     "DEXT.md truncated; keep only the most important project guidance here.",
                 );
                 stable.push_str(&format!(
-                    "\n\n## Project context (DEXT.md from {label})\n{remaining}"
+                    "\n\n## Project-controlled guidance (DEXT.md from {label})\n{remaining}"
                 ));
                 context_budget = 0;
                 break;
@@ -15318,320 +14211,132 @@ impl Agent {
             }
         }
 
-        let mut env = String::from("## Environment\n");
-        if self.context_mode.is_tiny() {
-            if let Some(git) = &self.git_context {
-                env.push_str(&format!(
-                    "cwd={} os={} git={} provider={} model={} effort={} context={} schemas={} approval={} sandbox={}\n",
-                    self.sandbox_root.display(),
-                    std::env::consts::OS,
-                    git,
-                    self.provider_id,
-                    self.model,
-                    self.thinking_effort.as_str(),
-                    self.context_mode.as_str(),
-                    self.wire_tool_profile().as_str(),
-                    self.approval_profile.as_str(),
-                    self.sandbox_profile.as_str()
-                ));
-            } else {
-                env.push_str(&format!(
-                    "cwd={} os={} provider={} model={} effort={} context={} schemas={} approval={} sandbox={}\n",
-                    self.sandbox_root.display(),
-                    std::env::consts::OS,
-                    self.provider_id,
-                    self.model,
-                    self.thinking_effort.as_str(),
-                    self.context_mode.as_str(),
-                    self.wire_tool_profile().as_str(),
-                    self.approval_profile.as_str(),
-                    self.sandbox_profile.as_str()
-                ));
-            }
-            env.push_str(&format!(
-                "compact={} active={}\n",
-                self.compact_threshold_chars(),
-                self.active_compact_threshold_chars()
+        // Packs and shelves only change when prompt_scan_epoch bumps, so they
+        // belong in the cached system block instead of the tail that is
+        // re-billed at full input rate on every tool round.
+        if let Some(cap) = caps.packs
+            && let Some(pack_summary) = cached_pack_summary
+        {
+            stable.push_str("\n\n## Dext packs\n");
+            stable.push_str(&cap_bytes_with_hint(
+                pack_summary,
+                cap,
+                &format!("pack summary trimmed for {}.", caps.suffix),
             ));
-            let ledger = self.work_ledger_prompt();
-            if !ledger.trim().is_empty() {
-                env.push_str("\n## Work ledger\n");
-                env.push_str(&cap_bytes_with_hint(
-                    ledger,
-                    600,
-                    "work ledger trimmed for tiny context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            let context_state = self.context_state_prompt();
-            if !context_state.trim().is_empty() {
-                env.push_str("\n## Context State\n");
-                env.push_str(&cap_bytes_with_hint(
-                    context_state,
-                    800,
-                    "context state trimmed for tiny context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            env.push_str(&self.privacy.prompt_status_line());
-            env.push('\n');
-            return SystemParts {
-                stable,
-                env,
-                prompt_sources,
-            };
         }
-        if self.context_mode.is_frugal() {
-            if let Some(git) = &self.git_context {
-                env.push_str(&format!(
-                    "cwd={} os={} git={} provider={} model={} effort={} context={} toolset={} schemas={} approval={} sandbox={}\n",
-                    self.sandbox_root.display(),
-                    std::env::consts::OS,
-                    git,
-                    self.provider_id,
-                    self.model,
-                    self.thinking_effort.as_str(),
-                    self.context_mode.as_str(),
-                    self.tool_context_profile().as_str(),
-                    self.wire_tool_profile().as_str(),
-                    self.approval_profile.as_str(),
-                    self.sandbox_profile.as_str()
-                ));
-            } else {
-                env.push_str(&format!(
-                    "cwd={} os={} provider={} model={} effort={} context={} toolset={} schemas={} approval={} sandbox={}\n",
-                    self.sandbox_root.display(),
-                    std::env::consts::OS,
-                    self.provider_id,
-                    self.model,
-                    self.thinking_effort.as_str(),
-                    self.context_mode.as_str(),
-                    self.tool_context_profile().as_str(),
-                    self.wire_tool_profile().as_str(),
-                    self.approval_profile.as_str(),
-                    self.sandbox_profile.as_str()
-                ));
-            }
-            env.push_str(&format!(
-                "history_compact_threshold_chars={} active_history_compact_threshold_chars={}\n",
-                self.compact_threshold_chars(),
-                self.active_compact_threshold_chars()
+        if let Some(cap) = caps.shelves
+            && let Some(shelf_summary) = cached_shelf_summary
+        {
+            stable.push_str("\n\n## Dext shelves\n");
+            stable.push_str(&cap_bytes_with_hint(
+                shelf_summary,
+                cap,
+                &format!("shelf registry summary trimmed for {}.", caps.suffix),
             ));
-            if let Some(todo) = read_session_todo_summary(&self.sandbox_root, &self.session_id, 3) {
-                env.push_str("\n## Project todos\n");
-                env.push_str(&cap_bytes_with_hint(
-                    todo,
-                    600,
-                    "project todo summary trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            let ledger = self.work_ledger_prompt();
-            if !ledger.trim().is_empty() {
-                env.push_str("\n## Work ledger\n");
-                env.push_str(&cap_bytes_with_hint(
-                    ledger,
-                    1_200,
-                    "work ledger trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            let context_state = self.context_state_prompt();
-            if !context_state.trim().is_empty() {
-                env.push_str("\n## Context State\n");
-                env.push_str(&cap_bytes_with_hint(
-                    context_state,
-                    1_200,
-                    "context state trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            let health = self.provider_health_prompt();
-            if !health.trim().is_empty() {
-                env.push_str("\n## Provider health\n");
-                env.push_str(&cap_bytes_with_hint(
-                    health,
-                    600,
-                    "provider health trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            if let Some(cap) = self.budget_cap {
-                env.push_str(&format!("budget_cap={}\n", cap.line()));
-            }
-            if let Some(pack_summary) = cached_pack_summary.clone() {
-                env.push_str("\n## Dext packs\n");
-                env.push_str(&cap_bytes_with_hint(
-                    pack_summary,
-                    600,
-                    "pack summary trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            if let Some(shelf_summary) = shelves::registry_summary_for_prompt(&self.shelf_registry)
-            {
-                env.push_str("\n## Dext shelves\n");
-                env.push_str(&cap_bytes_with_hint(
-                    shelf_summary,
-                    700,
-                    "shelf registry summary trimmed for frugal context.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            if let Some(shelf_context) = self.shelf_context_section() {
-                env.push_str("\n## Shelf context\n");
-                env.push_str(&cap_bytes_with_hint(
-                    shelf_context,
-                    600,
-                    "shelf context trimmed for frugal budget.",
-                ));
-                if !env.ends_with('\n') {
-                    env.push('\n');
-                }
-            }
-            env.push_str(&self.privacy.prompt_status_line());
-            env.push('\n');
-            return SystemParts {
-                stable,
-                env,
-                prompt_sources,
-            };
         }
 
         let mut env = String::from("## Environment\n");
+        env.push_str(&format!(
+            "cwd={} os={}",
+            self.sandbox_root.display(),
+            std::env::consts::OS
+        ));
         if let Some(git) = &self.git_context {
+            env.push_str(&format!(" git={git}"));
+        }
+        env.push_str(&format!(
+            " provider={} model={} effort={} context={}",
+            self.provider_id,
+            self.model,
+            self.thinking_effort.as_str(),
+            self.context_mode.as_str()
+        ));
+        // Tiny drops the toolset profile and abbreviates the threshold keys.
+        if !tiny {
             env.push_str(&format!(
-                "cwd={} os={} git={} provider={} model={} effort={} context={} toolset={} schemas={} approval={} sandbox={}\n",
-                self.sandbox_root.display(),
-                std::env::consts::OS,
-                git,
-                self.provider_id,
-                self.model,
-                self.thinking_effort.as_str(),
-                self.context_mode.as_str(),
-                self.tool_context_profile().as_str(),
-                self.wire_tool_profile().as_str(),
-                self.approval_profile.as_str(),
-                self.sandbox_profile.as_str()
-            ));
-        } else {
-            env.push_str(&format!(
-                "cwd={} os={} provider={} model={} effort={} context={} toolset={} schemas={} approval={} sandbox={}\n",
-                self.sandbox_root.display(),
-                std::env::consts::OS,
-                self.provider_id,
-                self.model,
-                self.thinking_effort.as_str(),
-                self.context_mode.as_str(),
-                self.tool_context_profile().as_str(),
-                self.wire_tool_profile().as_str(),
-                self.approval_profile.as_str(),
-                self.sandbox_profile.as_str()
+                " toolset={}",
+                self.tool_context_profile().as_str()
             ));
         }
         env.push_str(&format!(
-            "history_compact_threshold_chars={} active_history_compact_threshold_chars={}\n",
+            " schemas={} approval={} sandbox={}\n",
+            self.wire_tool_profile().as_str(),
+            self.approval_profile.as_str(),
+            self.sandbox_profile.as_str()
+        ));
+        let (compact_key, active_key) = if tiny {
+            ("compact", "active")
+        } else {
+            (
+                "history_compact_threshold_chars",
+                "active_history_compact_threshold_chars",
+            )
+        };
+        env.push_str(&format!(
+            "{compact_key}={} {active_key}={}\n",
             self.compact_threshold_chars(),
             self.active_compact_threshold_chars()
         ));
-        if let Some(todo) = read_session_todo_summary(&self.sandbox_root, &self.session_id, 5) {
-            env.push_str("\n## Project todos\n");
-            env.push_str(&cap_bytes_with_hint(
+
+        if let Some((cap, items)) = caps.todos
+            && let Some(todo) =
+                read_session_todo_summary(&self.sandbox_root, &self.session_id, items)
+        {
+            push_env_section(
+                &mut env,
+                "Project todos",
                 todo,
-                900,
-                "project todo summary trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
+                cap,
+                &format!("project todo summary trimmed for {}.", caps.suffix),
+            );
         }
         let ledger = self.work_ledger_prompt();
         if !ledger.trim().is_empty() {
-            env.push_str("\n## Work ledger\n");
-            env.push_str(&cap_bytes_with_hint(
+            push_env_section(
+                &mut env,
+                "Work ledger",
                 ledger,
-                2_000,
-                "work ledger trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
+                caps.ledger,
+                &format!("work ledger trimmed for {}.", caps.suffix),
+            );
         }
         let context_state = self.context_state_prompt();
         if !context_state.trim().is_empty() {
-            env.push_str("\n## Context State\n");
-            env.push_str(&cap_bytes_with_hint(
+            push_env_section(
+                &mut env,
+                "Context State",
                 context_state,
-                1_800,
-                "context state trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
+                caps.context_state,
+                &format!("context state trimmed for {}.", caps.suffix),
+            );
+        }
+        if let Some(cap) = caps.health {
+            let health = self.provider_health_prompt();
+            if !health.trim().is_empty() {
+                push_env_section(
+                    &mut env,
+                    "Provider health",
+                    health,
+                    cap,
+                    &format!("provider health trimmed for {}.", caps.suffix),
+                );
             }
         }
-        let health = self.provider_health_prompt();
-        if !health.trim().is_empty() {
-            env.push_str("\n## Provider health\n");
-            env.push_str(&cap_bytes_with_hint(
-                health,
-                800,
-                "provider health trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
-        }
-        if let Some(cap) = self.budget_cap {
+        if caps.budget_cap
+            && let Some(cap) = self.budget_cap
+        {
             env.push_str(&format!("budget_cap={}\n", cap.line()));
         }
-        if let Some(pack_summary) = cached_pack_summary {
-            env.push_str("\n## Dext packs\n");
-            env.push_str(&cap_bytes_with_hint(
-                pack_summary,
-                600,
-                "pack summary trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
-        }
-        if let Some(shelf_summary) = shelves::registry_summary_for_prompt(&self.shelf_registry) {
-            env.push_str("\n## Dext shelves\n");
-            env.push_str(&cap_bytes_with_hint(
-                shelf_summary,
-                700,
-                "shelf registry summary trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
-        }
-        if let Some(shelf_context) = self.shelf_context_section() {
-            env.push_str("\n## Shelf context\n");
-            env.push_str(&cap_bytes_with_hint(
+        if let Some((cap, suffix)) = caps.shelf_context
+            && let Some(shelf_context) = self.shelf_context_section()
+        {
+            push_env_section(
+                &mut env,
+                "Shelf context",
                 shelf_context,
-                1_200,
-                "shelf context trimmed for prompt budget.",
-            ));
-            if !env.ends_with('\n') {
-                env.push('\n');
-            }
+                cap,
+                &format!("shelf context trimmed for {suffix}."),
+            );
         }
         env.push_str(&self.privacy.prompt_status_line());
         env.push('\n');
@@ -15947,26 +14652,8 @@ impl Agent {
         ids
     }
 
-    fn provider_context_history(&self) -> &[Message] {
-        if self.work_ledger.active_focus.is_none() {
-            return &self.history;
-        }
-        let Some(start) = self.history.iter().rposition(|m| {
-            m.role == "user"
-                && m.content.iter().any(|b| match b {
-                    Block::Text { text } | Block::PartialStream { text } => {
-                        text.starts_with("[dext focus packet loaded]")
-                    }
-                    _ => false,
-                })
-        }) else {
-            return &self.history;
-        };
-        &self.history[start..]
-    }
-
     fn history_to_oai_messages(&self, system_text: &str) -> Vec<OaiMessage> {
-        let history = self.provider_context_history();
+        let history = &self.history;
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let mut msgs = vec![OaiMessage {
             role: "system".to_string(),
@@ -16092,13 +14779,33 @@ impl Agent {
         tools::wire_tools_chatgpt(&self.tools, self.wire_tool_profile())
     }
 
+    fn wire_tools_openai_responses(&self) -> Vec<Value> {
+        let mut tools = self.wire_tools_chatgpt();
+        for tool in &mut tools {
+            tool["strict"] = json!(false);
+        }
+        tools
+    }
+
     fn history_to_chatgpt_input(&self) -> Vec<Value> {
-        let history = self.provider_context_history();
+        self.history_to_responses_input(false)
+    }
+
+    fn history_to_openai_responses_input(&self) -> Vec<Value> {
+        self.history_to_responses_input(true)
+    }
+
+    fn history_to_responses_input(&self, preserve_reasoning_items: bool) -> Vec<Value> {
+        let history = &self.history;
+        let current_turn_start = history
+            .iter()
+            .rposition(is_fresh_user_prompt_message)
+            .unwrap_or(0);
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let mut items = Vec::new();
         let mut msg_counter = 0usize;
 
-        for msg in history {
+        for (message_index, msg) in history.iter().enumerate() {
             for block in &msg.content {
                 match block {
                     Block::Text { text } if text.trim().is_empty() => continue,
@@ -16144,6 +14851,13 @@ impl Agent {
                             "call_id": tool_use_id,
                             "output": content,
                         }));
+                    }
+                    Block::ResponsesReasoning { item }
+                        if preserve_reasoning_items
+                            && message_index >= current_turn_start
+                            && valid_openai_reasoning_item(item) =>
+                    {
+                        items.push(item.clone());
                     }
                     Block::PartialStream { text } => {
                         items.push(json!({
@@ -16198,15 +14912,53 @@ impl Agent {
         let max_output_tokens = self.request_max_output_tokens();
         let url = provider_request_url(&self.base_url, contract);
         match contract {
+            RequestContract::OpenAiResponses => {
+                let mut input = self.history_to_openai_responses_input();
+                append_runtime_env_chatgpt_item(&mut input, sys_env);
+                let reasoning_mode = self.effective_reasoning_mode();
+                let tools = self.wire_tools_openai_responses();
+                let include_encrypted_content = !tools.is_empty()
+                    && self.provider_profile.as_ref().is_some_and(|profile| {
+                        official_openai_gpt_5_6_responses(profile, &self.base_url, &self.model)
+                    });
+                let reasoning_effort =
+                    self.responses_reasoning_effort_for_model(&self.model, effort);
+                let reasoning =
+                    reasoning_effort
+                        .as_deref()
+                        .map(|effort| OpenAiResponsesReasoning {
+                            effort,
+                            mode: reasoning_mode,
+                            include_encrypted_content,
+                        });
+                let mut body = build_openai_responses_request(
+                    &self.model,
+                    reasoning,
+                    sys_stable,
+                    chatgpt_session_id,
+                    input,
+                    tools,
+                    max_output_tokens,
+                );
+                if !self.model_supports_prompt_cache()
+                    && let Some(object) = body.as_object_mut()
+                {
+                    object.remove("prompt_cache_key");
+                }
+                let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
+                Ok((url, bytes))
+            }
             RequestContract::ChatGptResponses => {
                 // Instructions carry only the stable system text; volatile env
                 // state rides as a transient trailing input item so the prefix
                 // stays byte-stable for the Responses API's implicit caching.
                 let mut input = self.history_to_chatgpt_input();
                 append_runtime_env_chatgpt_item(&mut input, sys_env);
+                let reasoning_effort =
+                    self.responses_reasoning_effort_for_model(&self.model, effort);
                 let mut body = build_chatgpt_request(
                     &self.model,
-                    effort,
+                    reasoning_effort.as_deref(),
                     sys_stable,
                     chatgpt_session_id,
                     input,
@@ -16318,7 +15070,7 @@ impl Agent {
                         None,
                     )
                 };
-                let history = self.provider_context_history();
+                let history = &self.history;
                 let messages = sanitize_anthropic_messages(
                     history,
                     thinking.is_some(),
@@ -16351,16 +15103,15 @@ impl Agent {
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
         match self.request_contract() {
             RequestContract::OpenAiChatCompletions => self.read_stream_oai(resp).await,
-            RequestContract::ChatGptResponses => self.read_stream_chatgpt(resp).await,
+            RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
+                self.read_stream_responses(resp, self.request_contract())
+                    .await
+            }
             RequestContract::AnthropicMessages => self.read_stream(resp).await,
         }
     }
 
     fn session_header(&self) -> SessionHeader {
-        self.session_header_with_origin(self.track_origin.clone())
-    }
-
-    fn session_header_with_origin(&self, track_origin: Option<TrackOrigin>) -> SessionHeader {
         let system_details = self.compose_system_details();
         let composed_system = format!("{}\n\n{}", system_details.stable, system_details.env);
         let provenance = self.session_provenance_from(&system_details, &composed_system);
@@ -16402,6 +15153,7 @@ impl Agent {
             sandbox: Some(self.sandbox_root.display().to_string()),
             usage: self.priced_session_usage(),
             thinking_effort: self.thinking_effort,
+            reasoning_mode: self.reasoning_mode,
             compact_threshold_chars: self.compact_threshold_override(),
             compact_threshold_percent: self.compact_threshold_override_percent(),
             approval_profile: self.approval_profile,
@@ -16415,7 +15167,6 @@ impl Agent {
             provenance,
             work_ledger: self.cleaned_work_ledger(),
             provider_health: self.provider_health.clone(),
-            track_origin,
             privacy: self.privacy.clone(),
         }
     }
@@ -16433,7 +15184,7 @@ impl Agent {
         let mut prompt_sources = Vec::new();
         let dext_md_root = self.sandbox_root.join("DEXT.md");
         let recall_root = self.sandbox_root.join("recall.md");
-        let dext_md_hash = std::fs::read(&dext_md_root).ok().map(|bytes| {
+        let dext_md_hash = prompt_context_file_hash(&dext_md_root).inspect(|_| {
             if !details
                 .prompt_sources
                 .iter()
@@ -16441,9 +15192,8 @@ impl Agent {
             {
                 prompt_sources.push(dext_md_root.display().to_string());
             }
-            sha256_hex_bytes(&bytes)
         });
-        let recall_hash = std::fs::read(&recall_root).ok().map(|bytes| {
+        let recall_hash = prompt_context_file_hash(&recall_root).inspect(|_| {
             if !details
                 .prompt_sources
                 .iter()
@@ -16451,7 +15201,6 @@ impl Agent {
             {
                 prompt_sources.push(recall_root.display().to_string());
             }
-            sha256_hex_bytes(&bytes)
         });
         prompt_sources.extend(
             details
@@ -16466,6 +15215,7 @@ impl Agent {
             api_provider: self.route_api_provider(),
             model: self.model.clone(),
             thinking_effort: self.thinking_effort,
+            reasoning_mode: self.reasoning_mode,
             approval_profile: self.approval_profile,
             approval_policy_source: self.approval_policy_source,
             sandbox_profile: self.sandbox_profile,
@@ -16478,15 +15228,7 @@ impl Agent {
     }
 
     pub(crate) fn save_session_to_path(&self, path: &Path) -> Result<()> {
-        self.save_session_to_path_with_origin(path, self.track_origin.clone())
-    }
-
-    fn save_session_to_path_with_origin(
-        &self,
-        path: &Path,
-        track_origin: Option<TrackOrigin>,
-    ) -> Result<()> {
-        let header = self.session_header_with_origin(track_origin);
+        let header = self.session_header();
         let mut data = Vec::new();
         writeln!(&mut data, "{}", serde_json::to_string(&header)?)?;
         for m in &self.history {
@@ -16532,7 +15274,6 @@ impl Agent {
             "after_user_message" | "after_compact" | "outer_loop_autosave"
         );
         if !critical
-            && !matches!(reason, "after_focus" | "after_focus_clear")
             && let Some(last) = self.last_checkpoint_at
             && last.elapsed() < checkpoint_debounce()
         {
@@ -16581,6 +15322,7 @@ impl Agent {
             sandbox,
             usage,
             thinking_effort,
+            reasoning_mode,
             compact_threshold_chars,
             compact_threshold_percent,
             approval_profile,
@@ -16593,7 +15335,6 @@ impl Agent {
             tool_profile,
             work_ledger,
             mut provider_health,
-            track_origin,
             privacy,
             provenance,
             ..
@@ -16609,7 +15350,11 @@ impl Agent {
                     .with_context(|| format!("bad message on line {}", i + 2))?,
             );
         }
-        if provenance.api_provider == ApiProvider::ChatGpt {
+        if provenance.api_provider == ApiProvider::ChatGpt
+            || (provenance.api_provider == ApiProvider::OpenAi
+                && canonical_provider_id(&provenance.provider) == "openai"
+                && is_gpt_5_6_model(&model))
+        {
             normalize_restored_chatgpt_reasoning(&mut hist);
         }
         let source_journal = tool_journal::load_for_session_file(path)
@@ -16630,6 +15375,7 @@ impl Agent {
             .collect();
         self.session_usage = usage;
         self.thinking_effort = thinking_effort;
+        self.reasoning_mode = reasoning_mode;
         self.compact_threshold_percent =
             compact_threshold_percent.filter(|v| (1..=100).contains(v));
         self.compact_threshold_chars = self
@@ -16646,7 +15392,6 @@ impl Agent {
         self.work_ledger = work_ledger;
         normalize_provider_health_errors(&mut provider_health);
         self.provider_health = provider_health;
-        self.track_origin = track_origin;
         self.privacy = privacy;
         self.context_mode_explicit = context_mode_explicit;
         let restored_context_mode = if context_mode_explicit {
@@ -16730,10 +15475,7 @@ impl Agent {
     }
 
     fn estimated_context_tokens_from_history(&self) -> u64 {
-        self.provider_context_history()
-            .iter()
-            .map(message_approx_tokens)
-            .sum()
+        self.history.iter().map(message_approx_tokens).sum()
     }
 
     fn history_chars(&self) -> usize {
@@ -16749,6 +15491,7 @@ impl Agent {
                         // trigger — otherwise stored reasoning would force
                         // compaction of context that is never actually sent.
                         Block::Thinking { .. } | Block::RedactedThinking { .. } => 0,
+                        Block::ResponsesReasoning { item } => json_byte_len(item),
                         Block::ToolUse { input, .. } => json_byte_len(input),
                         Block::ToolResult { content, .. } => content.len(),
                     })
@@ -16847,6 +15590,7 @@ impl Agent {
                     Block::Text { text } | Block::PartialStream { text } => text.len(),
                     Block::Thinking { text, .. } => text.len(),
                     Block::RedactedThinking { data } => data.len(),
+                    Block::ResponsesReasoning { item } => json_byte_len(item),
                     Block::ToolUse { id, name, input } => {
                         id.len() + name.len() + json_byte_len(input)
                     }
@@ -16888,11 +15632,16 @@ impl Agent {
     /// points it at a cheaper slug on the same provider (e.g. claude-haiku-4-5,
     /// glm-4.6) so compaction doesn't pay flagship rates for a terse digest.
     fn compact_summary_model(&self) -> String {
-        std::env::var("DEXT_COMPACT_MODEL")
+        let model = std::env::var("DEXT_COMPACT_MODEL")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| self.model.clone())
+            .unwrap_or_else(|| self.model.clone());
+        self.provider_profile
+            .as_ref()
+            .map_or(model.clone(), |profile| {
+                normalize_provider_model_value(profile, &model)
+            })
     }
 
     fn split_compaction_inputs(&self, old: &[Message]) -> (Vec<Message>, Vec<Message>) {
@@ -16975,7 +15724,9 @@ impl Agent {
                         is_error: *is_error,
                         metadata: metadata.clone(),
                     }),
-                    Block::Thinking { .. } | Block::RedactedThinking { .. } => None,
+                    Block::Thinking { .. }
+                    | Block::RedactedThinking { .. }
+                    | Block::ResponsesReasoning { .. } => None,
                 })
                 .collect();
 
@@ -16998,26 +15749,36 @@ impl Agent {
         let transcript = render_transcript_for_summary(old, self.context_mode);
         let user_text = compaction_user_text_with_evidence(&transcript, evidence);
         let summary_model = self.compact_summary_model();
-        let summary_reasoning_supported = self.model_supports_reasoning(&summary_model);
-        let summary_max_tokens = compact_summary_max_tokens(self.thinking_effort);
 
         #[derive(PartialEq, Eq)]
         enum SummaryParse {
             Anthropic,
             OpenAi,
-            ChatGptSse,
+            Responses(RequestContract),
         }
 
-        let request_contract = self.request_contract();
-        let is_chatgpt_summary = request_contract == RequestContract::ChatGptResponses;
-        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if is_chatgpt_summary {
-            let body = build_chatgpt_summary_request(
+        let summary_contract = self.request_contract_for_model(&summary_model);
+        let is_responses_summary = summary_contract.is_responses();
+        let summary_reasoning_effort = is_responses_summary
+            .then(|| self.responses_reasoning_effort_for_model(&summary_model, ThinkingEffort::Low))
+            .flatten();
+        let summary_reasoning_enabled = summary_reasoning_effort.is_some();
+        let summary_max_tokens =
+            compact_summary_max_tokens(self.thinking_effort, summary_reasoning_enabled);
+        let summary_reasoning_mode = self.reasoning_mode_for_model(&summary_model);
+        let make_responses_summary_body = || {
+            build_responses_summary_body(
+                summary_contract,
                 &summary_model,
-                COMPACT_SYSTEM,
                 &user_text,
-                summary_reasoning_supported,
-            );
-            let url = provider_request_url(&self.base_url, self.request_contract());
+                summary_reasoning_effort.as_deref(),
+                summary_reasoning_mode,
+                summary_max_tokens,
+            )
+        };
+        let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if is_responses_summary {
+            let body = make_responses_summary_body();
+            let url = provider_request_url(&self.base_url, summary_contract);
             let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
             let req = apply_provider_headers(
                 self.http_client()
@@ -17025,7 +15786,7 @@ impl Agent {
                     .header("content-type", "application/json")
                     .header("accept", "text/event-stream")
                     .body(bytes),
-                self.request_contract(),
+                summary_contract,
                 &self.api_key,
                 self.provider_profile
                     .as_ref()
@@ -17034,9 +15795,9 @@ impl Agent {
             )?;
             (
                 send_provider_request(req, self.first_byte_timeout()).await?,
-                SummaryParse::ChatGptSse,
+                SummaryParse::Responses(summary_contract),
             )
-        } else if request_contract == RequestContract::OpenAiChatCompletions {
+        } else if summary_contract == RequestContract::OpenAiChatCompletions {
             let reasoning_effort = None;
             let messages = vec![
                 OaiMessage {
@@ -17072,10 +15833,7 @@ impl Agent {
             };
             let mut req = self
                 .http_client()
-                .post(provider_request_url(
-                    &self.base_url,
-                    self.request_contract(),
-                ))
+                .post(provider_request_url(&self.base_url, summary_contract))
                 .header("content-type", "application/json")
                 .json(&body);
             if !self.api_key.trim().is_empty() {
@@ -17107,13 +15865,10 @@ impl Agent {
             };
             let req = apply_provider_headers(
                 self.http_client()
-                    .post(provider_request_url(
-                        &self.base_url,
-                        self.request_contract(),
-                    ))
+                    .post(provider_request_url(&self.base_url, summary_contract))
                     .header("content-type", "application/json")
                     .json(&body),
-                self.request_contract(),
+                summary_contract,
                 &self.api_key,
                 self.provider_profile
                     .as_ref()
@@ -17134,16 +15889,20 @@ impl Agent {
             anyhow::bail!("summary {}", http_status_error(status, &text));
         }
 
-        if parse_mode == SummaryParse::ChatGptSse {
+        let responses_contract = match parse_mode {
+            SummaryParse::Responses(contract) => Some(contract),
+            _ => None,
+        };
+        if let Some(responses_contract) = responses_contract {
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
-                match self.read_stream_chatgpt(resp).await {
+                match self.read_stream_responses(resp, responses_contract).await {
                     Ok((blocks, _finish_reason, mut usage)) => {
                         let fallback_input =
                             ((user_text.len() as u64).saturating_add(3) / 4).max(1);
                         Self::fill_missing_usage_metrics(&mut usage, fallback_input, &blocks);
-                        self.finalize_usage_metrics(&mut usage);
+                        self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
                         let text = blocks
                             .into_iter()
                             .filter_map(|b| match b {
@@ -17175,13 +15934,8 @@ impl Agent {
                                 reason: format!("{} summary stream error", plan.label()),
                             });
                             let _ = self.interrupt_aware_sleep(wait).await;
-                            let body = build_chatgpt_summary_request(
-                                &summary_model,
-                                COMPACT_SYSTEM,
-                                &user_text,
-                                summary_reasoning_supported,
-                            );
-                            let url = provider_request_url(&self.base_url, self.request_contract());
+                            let body = make_responses_summary_body();
+                            let url = provider_request_url(&self.base_url, summary_contract);
                             let bytes =
                                 serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                             let req = apply_provider_headers(
@@ -17190,7 +15944,7 @@ impl Agent {
                                     .header("content-type", "application/json")
                                     .header("accept", "text/event-stream")
                                     .body(bytes),
-                                self.request_contract(),
+                                summary_contract,
                                 &self.api_key,
                                 self.provider_profile.as_ref().is_some_and(|profile| {
                                     is_official_kimi_profile(profile, &self.base_url)
@@ -17220,11 +15974,11 @@ impl Agent {
 
         let json = read_provider_json_body(resp, self.stream_idle_timeout()).await?;
         match parse_mode {
-            SummaryParse::ChatGptSse => unreachable!("handled above"),
+            SummaryParse::Responses(_) => unreachable!("handled above"),
             SummaryParse::OpenAi => {
                 let text = openai_summary_text_from_response(&json)?;
                 let mut usage = Usage::parse_openai(&json["usage"]);
-                self.finalize_usage_metrics(&mut usage);
+                self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
                 Ok((text, usage))
             }
             SummaryParse::Anthropic => {
@@ -17244,7 +15998,7 @@ impl Agent {
                     anyhow::bail!("summary response had no text: {json}");
                 }
                 let mut usage = Usage::parse(&json["usage"]);
-                self.finalize_usage_metrics(&mut usage);
+                self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
                 Ok((text, usage))
             }
         }
@@ -17474,11 +16228,21 @@ impl Agent {
     }
 
     async fn chat(&mut self, user_input: String) -> Result<()> {
+        self.chat_with_pack_activation(user_input, false).await
+    }
+
+    async fn chat_with_pack_activation(
+        &mut self,
+        user_input: String,
+        suppress_pack_activation_for_turn: bool,
+    ) -> Result<()> {
         self.interrupt.store(false, Ordering::SeqCst);
         self.begin_provider_turn();
         self.sink.emit(AgentEvent::TurnStart);
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
-        let result = self.chat_inner(user_input).await;
+        let result = self
+            .chat_inner(user_input, suppress_pack_activation_for_turn)
+            .await;
         if result.is_err() {
             let interrupted = self.interrupt.load(Ordering::SeqCst);
             if interrupted {
@@ -17492,28 +16256,57 @@ impl Agent {
         result
     }
 
-    async fn chat_inner(&mut self, mut user_input: String) -> Result<()> {
+    async fn chat_inner(
+        &mut self,
+        mut user_input: String,
+        suppress_pack_activation_for_turn: bool,
+    ) -> Result<()> {
         let mut compacted_this_turn = false;
         // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
         // walks, pack discovery) on the first request of the turn.
         self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         let turn_id = format!("turn-{}-{}", unix_timestamp_secs(), self.prompt_scan_epoch);
         self.git_context = git_summary(&self.sandbox_root);
-        if !self.suppress_pack_activation
-            && let Some(invocation) = packs::infer_pack_invocation(&self.sandbox_root, &user_input)
+        let suppress_pack_activation =
+            self.suppress_pack_activation || suppress_pack_activation_for_turn;
+        let project_pack_requested = !suppress_pack_activation
+            && packs::project_pack_invocation_requested(&self.sandbox_root, &user_input);
+        let project_context_requested =
+            !suppress_pack_activation && self.shelf_registry.has_project_extensions();
+        if (project_context_requested || project_pack_requested)
+            && self.project_extensions_approved.is_none()
         {
+            approve_project_extensions(self);
+        }
+        let inferred_pack = if suppress_pack_activation {
+            None
+        } else {
+            packs::infer_pack_invocation_with_project(
+                &self.sandbox_root,
+                &user_input,
+                self.project_extensions_approved == Some(true),
+            )
+        };
+        if project_pack_requested && self.project_extensions_approved != Some(true) {
+            self.sink.emit(AgentEvent::Info(
+                "project-controlled pack auto-invocation not approved; matching non-project packs remain eligible"
+                    .to_string(),
+            ));
+        }
+        if let Some(invocation) = inferred_pack {
             if pack_auto_invocation_disabled_by_env(&invocation.pack) {
                 self.sink.emit(AgentEvent::Info(format!(
                     "[pack:{}] auto-invocation disabled by DEXT_NO_PACK",
                     invocation.pack.name
                 )));
             } else {
+                let prompt = packs::pack_prompt(&invocation.pack, &invocation.task)?;
                 self.activate_pack_hooks(&invocation.pack);
                 self.sink.emit(AgentEvent::Info(format!(
                     "[pack:{}] inferred conversational invocation",
                     invocation.pack.name
                 )));
-                user_input = packs::pack_prompt(&invocation.pack, &invocation.task)?;
+                user_input = prompt;
             }
         }
         let mut hooks_approval_decided = !self.hooks.is_empty();
@@ -17641,7 +16434,10 @@ impl Agent {
             }
             iterations += 1;
             let runtime_controls = apply_queued_runtime_controls(self);
-            if runtime_controls.changed_model || runtime_controls.changed_effort {
+            if runtime_controls.changed_model
+                || runtime_controls.changed_effort
+                || runtime_controls.effective_mode_changed
+            {
                 incomplete_response_recoveries = 0;
                 request_effort_override = None;
             }
@@ -17649,14 +16445,13 @@ impl Agent {
                 continue;
             }
 
-            let chatgpt_session_id = (self.request_contract() == RequestContract::ChatGptResponses)
-                .then(|| {
-                    format!(
-                        "dext-{}-{}",
-                        self.provider_id,
-                        project_key(&self.sandbox_root)
-                    )
-                });
+            let chatgpt_session_id = self.request_contract().is_responses().then(|| {
+                format!(
+                    "dext-{}-{}",
+                    self.provider_id,
+                    project_key(&self.sandbox_root)
+                )
+            });
             self.partial_stream_text = None;
             let (sys_stable, sys_env) = self.compose_system_parts();
             // Only the stable text lives in the system prompt (with a cache
@@ -17951,7 +16746,7 @@ impl Agent {
                             }
                             continue 'stream_retry;
                         }
-                        if self.request_contract() == RequestContract::ChatGptResponses {
+                        if self.request_contract().is_responses() {
                             let partial_blocks = self.partial_chatgpt_stream_blocks();
                             if maybe_preserve_partial_stream(
                                 &partial_blocks,
@@ -18052,7 +16847,7 @@ impl Agent {
             {
                 last_retry_reason = Some(format!("incomplete response ({reason})"));
                 if reason == "content_filter" {
-                    let note = "[provider recovery halted] ChatGPT ended the response because of its content filter. No function call was executed; revise the request or switch models."
+                    let note = "[provider recovery halted] The Responses API ended the response because of its content filter. No function call was executed; revise the request or switch models."
                         .to_string();
                     self.sink.emit(AgentEvent::Warn(note.clone()));
                     self.append_latest_log("incomplete_response_content_filter", &note);
@@ -18066,7 +16861,7 @@ impl Agent {
                 incomplete_response_recoveries = incomplete_response_recoveries.saturating_add(1);
                 if incomplete_response_recoveries > MAX_INCOMPLETE_RESPONSE_RECOVERIES {
                     let note = format!(
-                        "[provider recovery halted] ChatGPT kept returning incomplete responses after {MAX_INCOMPLETE_RESPONSE_RECOVERIES} automatic recovery requests. The session remains usable; retry with `continue`, lower `/effort`, or switch models."
+                        "[provider recovery halted] The Responses API kept returning incomplete responses after {MAX_INCOMPLETE_RESPONSE_RECOVERIES} automatic recovery requests. The session remains usable; retry with `continue`, lower `/effort`, or switch models."
                     );
                     self.sink.emit(AgentEvent::Warn(note.clone()));
                     self.append_latest_log("incomplete_response_halt", &note);
@@ -18262,6 +17057,9 @@ impl Agent {
             denied_signatures = next_denied_signatures;
             hooks_approval_decided = next_hooks_approval_decided;
             hooks_approved = next_hooks_approved;
+
+            let coverage = objective.assess_history(&self.history);
+            self.sync_work_ledger_with_objective_coverage(&coverage);
 
             if let Some(halt) = turn_state.empty_tool_call_halt_message() {
                 self.sink.emit(AgentEvent::Warn(halt.clone()));
@@ -18518,9 +17316,7 @@ impl Agent {
         if contract != RequestContract::AnthropicMessages {
             for block in &parsed.blocks {
                 match block {
-                    Block::Thinking { text, .. }
-                        if contract == RequestContract::ChatGptResponses =>
-                    {
+                    Block::Thinking { text, .. } if contract.is_responses() => {
                         self.sink
                             .emit(AgentEvent::ThinkingBlockComplete(text.clone()));
                     }
@@ -18599,12 +17395,12 @@ impl Agent {
         blocks
     }
 
-    async fn read_stream_chatgpt(
+    async fn read_stream_responses(
         &mut self,
         resp: reqwest::Response,
+        contract: RequestContract,
     ) -> Result<(Vec<Block>, Option<String>, Usage)> {
-        self.read_provider_stream(resp, RequestContract::ChatGptResponses)
-            .await
+        self.read_provider_stream(resp, contract).await
     }
 }
 
@@ -18876,15 +17672,7 @@ fn render_session_listing(root: &Path) -> String {
         out,
         "{}",
         list_render::render_footer(
-            &[
-                "/resume [name]",
-                "/save <name>",
-                "/map",
-                "/focus @wNN",
-                "/focus @wNN --branch",
-                "/branches",
-                "/export html [path]",
-            ],
+            &["/resume [name]", "/save <name>", "/export html [path]"],
             &opts,
         )
     );
@@ -18941,6 +17729,7 @@ fn render_session_block_html(out: &mut String, block: &Block) {
                 html_escape(&summarize_inline(data, 160))
             );
         }
+        Block::ResponsesReasoning { .. } => {}
         Block::ToolUse { id, name, input } => {
             let input = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
             let _ = write!(
@@ -19130,7 +17919,9 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
                         analysis.failures.push(summarize_inline(content, 180));
                     }
                 }
-                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
+                Block::Thinking { .. }
+                | Block::RedactedThinking { .. }
+                | Block::ResponsesReasoning { .. } => {}
             }
         }
     }
@@ -19139,1183 +17930,6 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
     analysis.commands_run.truncate(50);
     analysis.failures.truncate(50);
     analysis
-}
-
-fn work_map_kind_rank(kind: WorkMapKind) -> u8 {
-    match kind {
-        WorkMapKind::Intent => 0,
-        WorkMapKind::Decision => 1,
-        WorkMapKind::Failure => 2,
-        WorkMapKind::Verify => 3,
-        WorkMapKind::Change => 4,
-        WorkMapKind::Evidence => 5,
-        WorkMapKind::Compact => 6,
-        WorkMapKind::Result => 7,
-    }
-}
-
-fn push_unique_limited(items: &mut Vec<String>, item: String, limit: usize) {
-    let item = summarize_inline(&item, 240);
-    if item.trim().is_empty() || items.iter().any(|existing| existing == &item) {
-        return;
-    }
-    items.push(item);
-    if items.len() > limit {
-        items.truncate(limit);
-    }
-}
-
-fn input_paths(input: &Value) -> Vec<String> {
-    let mut paths = Vec::new();
-    for key in ["path", "old_path", "new_path"] {
-        if let Some(path) = input[key].as_str() {
-            push_unique_limited(&mut paths, path.to_string(), 16);
-        }
-    }
-    if let Some(items) = input["paths"].as_array() {
-        for item in items {
-            if let Some(path) = item.as_str() {
-                push_unique_limited(&mut paths, path.to_string(), 16);
-            }
-        }
-    }
-    paths
-}
-
-fn tool_command(name: &str, input: &Value) -> Option<String> {
-    match name {
-        "bash" => input["command"]
-            .as_str()
-            .map(|cmd| summarize_bash_command(cmd, 220)),
-        "http" => Some(format!("http {}", summarize_args(&input["args"], 220))),
-        "csvkit" => Some(format!("csvkit {}", summarize_args(&input["args"], 220))),
-        _ => None,
-    }
-}
-
-fn tool_use_kind(name: &str, input: &Value) -> Option<WorkMapKind> {
-    match name {
-        "write_file" | "edit_file" | "multi_edit" | "git_commit" => Some(WorkMapKind::Change),
-        "read_file" | "read_symbol" | "fd" | "rg" | "grep" | "jq" | "fzf" | "http" | "git_diff"
-        | "git_log" | "todo_read" | "awk" | "csvkit" => Some(WorkMapKind::Evidence),
-        "bash" => input["command"].as_str().map(|command| {
-            if looks_like_verification_command(command) {
-                WorkMapKind::Verify
-            } else {
-                WorkMapKind::Evidence
-            }
-        }),
-        _ => None,
-    }
-}
-
-fn text_work_map_kind(role: &str, text: &str) -> Option<WorkMapKind> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("[prior conversation, summarized for resume]")
-        || lower.contains("[compaction]")
-        || lower.contains("compacted")
-    {
-        return Some(WorkMapKind::Compact);
-    }
-    if lower.contains("decision")
-        || lower.contains("decided")
-        || lower.contains("durable decision")
-        || lower.contains("user preference")
-    {
-        return Some(WorkMapKind::Decision);
-    }
-    if lower.contains("failed")
-        || lower.contains("failure")
-        || lower.contains("error")
-        || lower.contains("blocked")
-        || lower.contains("panic")
-    {
-        return Some(WorkMapKind::Failure);
-    }
-    if role == "user" && !text.trim().is_empty() {
-        return Some(WorkMapKind::Intent);
-    }
-    if role == "assistant" && !text.trim().is_empty() {
-        return Some(WorkMapKind::Result);
-    }
-    None
-}
-
-fn add_work_map_waypoint(
-    waypoints: &mut Vec<WorkMapWaypoint>,
-    kind: WorkMapKind,
-    message_range: std::ops::RangeInclusive<usize>,
-    summary: String,
-    files: Vec<String>,
-    commands: Vec<String>,
-    status: Option<String>,
-) {
-    let message_start = *message_range.start();
-    let message_end = *message_range.end();
-    let summary = summarize_inline(&summary, 180);
-    if summary == "?" {
-        return;
-    }
-    if let Some(existing) = waypoints
-        .iter_mut()
-        .find(|wp| wp.message_start == message_start && wp.summary == summary && wp.kind == kind)
-    {
-        existing.message_end = existing.message_end.max(message_end);
-        for file in files {
-            push_unique_limited(&mut existing.files, file, 8);
-        }
-        for command in commands {
-            push_unique_limited(&mut existing.commands, command, 8);
-        }
-        if existing.status.is_none() {
-            existing.status = status;
-        }
-        return;
-    }
-    let mut files_out = Vec::new();
-    for file in files {
-        push_unique_limited(&mut files_out, file, 8);
-    }
-    let mut commands_out = Vec::new();
-    for command in commands {
-        push_unique_limited(&mut commands_out, command, 8);
-    }
-    waypoints.push(WorkMapWaypoint {
-        id: String::new(),
-        anchor: String::new(),
-        kind,
-        message_start,
-        message_end,
-        summary,
-        files: files_out,
-        commands: commands_out,
-        status,
-    });
-}
-
-fn work_map_anchor_for(waypoint: &WorkMapWaypoint) -> String {
-    let raw = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        waypoint.kind.as_str(),
-        waypoint.message_start,
-        waypoint.message_end,
-        waypoint.summary,
-        waypoint.files.join("\u{1f}"),
-        waypoint.commands.join("\u{1f}"),
-        waypoint.status.as_deref().unwrap_or_default()
-    );
-    format!("@{}", &sha256_hex_str(&raw)[..8])
-}
-
-fn assign_work_map_ids(waypoints: &mut [WorkMapWaypoint]) {
-    waypoints.sort_by_key(|wp| {
-        (
-            wp.message_start,
-            wp.message_end,
-            work_map_kind_rank(wp.kind),
-            wp.summary.clone(),
-        )
-    });
-    for (idx, waypoint) in waypoints.iter_mut().enumerate() {
-        waypoint.id = format!("@w{:02}", idx + 1);
-        waypoint.anchor = work_map_anchor_for(waypoint);
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ToolUseInfo {
-    summary: String,
-    files: Vec<String>,
-    commands: Vec<String>,
-    kind: Option<WorkMapKind>,
-    message_index: usize,
-}
-
-fn build_session_work_map(source: &Path, header: &SessionHeader, history: &[Message]) -> WorkMap {
-    let mut tool_uses: HashMap<String, ToolUseInfo> = HashMap::new();
-    let mut waypoints = Vec::new();
-
-    // The objective and blocked fields are intentionally NOT turned into
-    // waypoints here: objective is synthesized verbatim from the latest user
-    // prompt (redundant with the Intent waypoint every real user message
-    // already produces via text_work_map_kind), and blocked only ever holds
-    // synthesized objective-warning reminders. Real decisions, file changes,
-    // verification results, and history-derived waypoints are sufficient.
-    for decision in &header.work_ledger.decisions {
-        add_work_map_waypoint(
-            &mut waypoints,
-            WorkMapKind::Decision,
-            0..=0,
-            decision.clone(),
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
-    }
-    for file in &header.work_ledger.files_changed {
-        add_work_map_waypoint(
-            &mut waypoints,
-            WorkMapKind::Change,
-            0..=0,
-            format!("changed file: {file}"),
-            vec![file.clone()],
-            Vec::new(),
-            None,
-        );
-    }
-    for record in &header.work_ledger.verification {
-        add_work_map_waypoint(
-            &mut waypoints,
-            WorkMapKind::Verify,
-            0..=0,
-            format!("{}: {}", record.name, record.status),
-            Vec::new(),
-            vec![record.command.clone()],
-            Some(record.status.clone()),
-        );
-    }
-
-    for (idx, message) in history.iter().enumerate() {
-        let message_index = idx + 1;
-        for block in &message.content {
-            match block {
-                Block::Text { text } | Block::PartialStream { text } => {
-                    if let Some(kind) = text_work_map_kind(&message.role, text) {
-                        add_work_map_waypoint(
-                            &mut waypoints,
-                            kind,
-                            message_index..=message_index,
-                            summarize_inline(text, 180),
-                            Vec::new(),
-                            Vec::new(),
-                            (kind == WorkMapKind::Failure).then(|| "noted".to_string()),
-                        );
-                    }
-                }
-                Block::ToolUse { id, name, input } => {
-                    let files = input_paths(input);
-                    let command = tool_command(name, input);
-                    let kind = tool_use_kind(name, input);
-                    let summary = summarize_call(name, input);
-                    tool_uses.insert(
-                        id.clone(),
-                        ToolUseInfo {
-                            summary: summary.clone(),
-                            files: files.clone(),
-                            commands: command.clone().into_iter().collect(),
-                            kind,
-                            message_index,
-                        },
-                    );
-                    if let Some(kind) = kind {
-                        add_work_map_waypoint(
-                            &mut waypoints,
-                            kind,
-                            message_index..=message_index,
-                            summary,
-                            files,
-                            command.into_iter().collect(),
-                            None,
-                        );
-                    }
-                }
-                Block::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    metadata,
-                } => {
-                    let info = tool_uses.get(tool_use_id);
-                    let ok = !is_error.unwrap_or(false)
-                        && metadata
-                            .status
-                            .as_deref()
-                            .is_none_or(|status| !matches!(status, "error" | "failed"));
-                    let kind = if !ok {
-                        WorkMapKind::Failure
-                    } else if metadata
-                        .status
-                        .as_deref()
-                        .is_some_and(|status| matches!(status, "passed" | "failed"))
-                    {
-                        WorkMapKind::Verify
-                    } else {
-                        info.and_then(|i| i.kind).unwrap_or(WorkMapKind::Evidence)
-                    };
-                    if matches!(kind, WorkMapKind::Evidence) && ok {
-                        continue;
-                    }
-                    let summary = if let Some(info) = info {
-                        format!("{} => {}", info.summary, summarize_inline(content, 120))
-                    } else {
-                        summarize_inline(content, 180)
-                    };
-                    add_work_map_waypoint(
-                        &mut waypoints,
-                        kind,
-                        info.map(|i| i.message_index).unwrap_or(message_index)..=message_index,
-                        summary,
-                        info.map(|i| i.files.clone()).unwrap_or_default(),
-                        info.map(|i| i.commands.clone()).unwrap_or_default(),
-                        metadata.status.clone().or_else(|| {
-                            if ok {
-                                Some("ok".to_string())
-                            } else {
-                                Some("error".to_string())
-                            }
-                        }),
-                    );
-                }
-                Block::Thinking { .. } | Block::RedactedThinking { .. } => {}
-            }
-        }
-    }
-
-    assign_work_map_ids(&mut waypoints);
-    WorkMap {
-        source: source.display().to_string(),
-        header: header.clone(),
-        messages: history.len(),
-        waypoints,
-    }
-}
-
-fn selected_waypoints<'a>(map: &'a WorkMap, selection: &WorkMapSelection) -> &'a [WorkMapWaypoint] {
-    let start = selection.start.min(map.waypoints.len());
-    let end = selection.end.min(map.waypoints.len().saturating_sub(1));
-    if start > end {
-        &map.waypoints[0..0]
-    } else {
-        &map.waypoints[start..=end]
-    }
-}
-
-fn parse_waypoint_number(raw: &str) -> Option<usize> {
-    let trimmed = raw.trim().trim_start_matches('@');
-    let number = trimmed.strip_prefix('w').unwrap_or(trimmed);
-    number.parse::<usize>().ok()?.checked_sub(1)
-}
-
-fn resolve_work_map_token(raw: &str, map: &WorkMap) -> Option<usize> {
-    if let Some(idx) = parse_waypoint_number(raw) {
-        return Some(idx);
-    }
-    let needle = raw.trim().trim_start_matches('@');
-    if needle.is_empty() {
-        return None;
-    }
-    map.waypoints.iter().position(|wp| {
-        wp.anchor.trim_start_matches('@') == needle
-            || wp.anchor == raw.trim()
-            || wp.id == raw.trim()
-    })
-}
-
-fn parse_work_map_selection(raw: &str, map: &WorkMap) -> Result<WorkMapSelection> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        anyhow::bail!("missing waypoint id (example: @w03, @a1b2c3d4, or @w03..@w08)");
-    }
-    let (start_raw, end_raw) = raw.split_once("..").unwrap_or((raw, raw));
-    let start = resolve_work_map_token(start_raw, map)
-        .ok_or_else(|| anyhow::anyhow!("invalid waypoint id '{start_raw}'"))?;
-    let end = resolve_work_map_token(end_raw, map)
-        .ok_or_else(|| anyhow::anyhow!("invalid waypoint id '{end_raw}'"))?;
-    if start >= map.waypoints.len() || end >= map.waypoints.len() {
-        anyhow::bail!(
-            "waypoint out of range; map has {} waypoint(s)",
-            map.waypoints.len()
-        );
-    }
-    Ok(WorkMapSelection {
-        start: start.min(end),
-        end: start.max(end),
-    })
-}
-
-fn work_map_waypoint_ids(map: &WorkMap) -> Vec<String> {
-    map.waypoints.iter().map(|wp| wp.id.clone()).collect()
-}
-
-fn work_map_waypoint_ids_for_view(map: &WorkMap, filters: &[WorkMapFilter]) -> Vec<String> {
-    map.waypoints
-        .iter()
-        .filter(|wp| work_map_filter_matches(map, wp, filters))
-        .map(|wp| wp.id.clone())
-        .collect()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum WorkMapFilter {
-    Kind(WorkMapKind),
-    File(String),
-    Query(String),
-}
-
-fn parse_work_map_filter_args_with_default(
-    args: &[String],
-    default_selector: &str,
-) -> Result<(String, Vec<WorkMapFilter>)> {
-    let mut selector: Option<String> = None;
-    let mut filters = Vec::new();
-    let mut idx = 0usize;
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-        match arg {
-            "current" | "this" | "memory" | "latest" if selector.is_none() => {
-                selector = Some(arg.to_string());
-                idx += 1;
-            }
-            "all" => {
-                idx += 1;
-            }
-            "intent" | "intents" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Intent));
-                idx += 1;
-            }
-            "evidence" | "read" | "reads" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Evidence));
-                idx += 1;
-            }
-            "change" | "changes" | "write" | "writes" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Change));
-                idx += 1;
-            }
-            "failure" | "failures" | "blocked" | "errors" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Failure));
-                idx += 1;
-            }
-            "verify" | "verification" | "tests" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Verify));
-                idx += 1;
-            }
-            "decision" | "decisions" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Decision));
-                idx += 1;
-            }
-            "compact" | "compactions" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Compact));
-                idx += 1;
-            }
-            "result" | "results" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Result));
-                idx += 1;
-            }
-            "file" => {
-                let Some(path) = args.get(idx + 1) else {
-                    anyhow::bail!("usage: /map file <path-fragment>");
-                };
-                filters.push(WorkMapFilter::File(path.clone()));
-                idx += 2;
-            }
-            "query" | "search" | "grep" => {
-                let rest = args[idx + 1..].join(" ");
-                if rest.trim().is_empty() {
-                    anyhow::bail!("usage: /map query <text>");
-                }
-                filters.push(WorkMapFilter::Query(rest));
-                break;
-            }
-            other if selector.is_none() => {
-                selector = Some(other.to_string());
-                idx += 1;
-            }
-            other => {
-                filters.push(WorkMapFilter::Query(other.to_string()));
-                idx += 1;
-            }
-        }
-    }
-    Ok((
-        selector.unwrap_or_else(|| default_selector.to_string()),
-        filters,
-    ))
-}
-
-fn parse_work_map_filter_args(args: &[String]) -> Result<(String, Vec<WorkMapFilter>)> {
-    parse_work_map_filter_args_with_default(args, "current")
-}
-
-fn work_map_filter_matches(
-    _map: &WorkMap,
-    waypoint: &WorkMapWaypoint,
-    filters: &[WorkMapFilter],
-) -> bool {
-    if filters.is_empty() {
-        return true;
-    }
-    let kind_filters = filters
-        .iter()
-        .filter_map(|filter| match filter {
-            WorkMapFilter::Kind(kind) => Some(*kind),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !kind_filters.is_empty() && !kind_filters.contains(&waypoint.kind) {
-        return false;
-    }
-    filters.iter().all(|filter| match filter {
-        WorkMapFilter::Kind(_) => true,
-        WorkMapFilter::File(needle) => {
-            let needle = needle.to_ascii_lowercase();
-            waypoint
-                .files
-                .iter()
-                .any(|file| file.to_ascii_lowercase().contains(&needle))
-                || waypoint.summary.to_ascii_lowercase().contains(&needle)
-        }
-        WorkMapFilter::Query(needle) => {
-            let needle = needle.to_ascii_lowercase();
-            waypoint.id.to_ascii_lowercase().contains(&needle)
-                || waypoint.anchor.to_ascii_lowercase().contains(&needle)
-                || waypoint.kind.as_str().contains(&needle)
-                || waypoint.summary.to_ascii_lowercase().contains(&needle)
-                || waypoint
-                    .files
-                    .iter()
-                    .any(|file| file.to_ascii_lowercase().contains(&needle))
-                || waypoint
-                    .commands
-                    .iter()
-                    .any(|cmd| cmd.to_ascii_lowercase().contains(&needle))
-        }
-    })
-}
-
-fn work_map_filter_label(filters: &[WorkMapFilter]) -> Option<String> {
-    if filters.is_empty() {
-        return None;
-    }
-    Some(
-        filters
-            .iter()
-            .map(|filter| match filter {
-                WorkMapFilter::Kind(kind) => kind.as_str().to_string(),
-                WorkMapFilter::File(path) => format!("file={path}"),
-                WorkMapFilter::Query(query) => format!("query={query}"),
-            })
-            .collect::<Vec<_>>()
-            .join(","),
-    )
-}
-
-fn render_work_map(map: &WorkMap, filters: &[WorkMapFilter]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let provider = if map.header.provenance.provider.is_empty() {
-        "unknown"
-    } else {
-        &map.header.provenance.provider
-    };
-    let _ = writeln!(out, "Session map — {}", map.source);
-    let _ = writeln!(
-        out,
-        "model {} · provider {} · messages {} · moments {}",
-        map.header.model,
-        provider,
-        map.messages,
-        map.waypoints.len()
-    );
-    if let Some(origin) = &map.header.track_origin {
-        let _ = writeln!(
-            out,
-            "branched from: {} moment {} ({})",
-            origin.source_session, origin.source_waypoint, origin.mode,
-        );
-    }
-    let visible = map
-        .waypoints
-        .iter()
-        .filter(|wp| work_map_filter_matches(map, wp, filters))
-        .collect::<Vec<_>>();
-    if let Some(label) = work_map_filter_label(filters) {
-        let _ = writeln!(
-            out,
-            "filter {label} · showing {}/{}",
-            visible.len(),
-            map.waypoints.len()
-        );
-    }
-    if let Some(focus) = &map.header.work_ledger.active_focus {
-        let _ = writeln!(
-            out,
-            "focus active: moment {} of {} ({})",
-            focus.selection, focus.source_session, focus.mode,
-        );
-    }
-    if map.waypoints.is_empty() {
-        let _ = writeln!(out, "(no waypoints found yet)");
-    } else if visible.is_empty() {
-        let _ = writeln!(out, "(no waypoints match filter)");
-    } else {
-        for wp in visible {
-            let status = wp
-                .status
-                .as_deref()
-                .map(|s| format!(" [{s}]"))
-                .unwrap_or_default();
-            let mut extra = Vec::new();
-            if let Some(file) = wp.files.first() {
-                extra.push(format!("file {file}"));
-            }
-            if let Some(command) = wp.commands.first() {
-                extra.push(format!("cmd {command}"));
-            }
-            extra.push(format!("anchor {}", wp.anchor));
-            let extra = format!(" · {}", extra.join(" · "));
-            let _ = writeln!(
-                out,
-                "{} {:8} {:>10}{}  {}{}",
-                wp.id,
-                wp.kind.as_str(),
-                wp.display_range(),
-                status,
-                wp.summary,
-                extra
-            );
-        }
-    }
-    let _ = write!(
-        out,
-        "commands: ↑/↓ or PgUp/PgDn navigate · Enter inspect · f edit · b branch · z filter (/map failures|changes|verify|file <path>|query <text>)"
-    );
-    out
-}
-
-fn collect_waypoint_items<'a, F>(waypoints: &'a [WorkMapWaypoint], mut f: F) -> Vec<String>
-where
-    F: FnMut(&'a WorkMapWaypoint) -> &'a [String],
-{
-    let mut out = Vec::new();
-    for wp in waypoints {
-        for item in f(wp) {
-            push_unique_limited(&mut out, item.clone(), 24);
-        }
-    }
-    out
-}
-
-fn work_map_selection_label(waypoints: &[WorkMapWaypoint]) -> String {
-    match (waypoints.first(), waypoints.last()) {
-        (Some(first), Some(last)) if first.id == last.id => first.id.clone(),
-        (Some(first), Some(last)) => format!("{}..{}", first.id, last.id),
-        _ => "(none)".to_string(),
-    }
-}
-
-fn render_bullets(out: &mut String, title: &str, items: &[String], limit: usize) {
-    use std::fmt::Write as _;
-    if items.is_empty() {
-        return;
-    }
-    let _ = writeln!(out, "{title}:");
-    for item in items.iter().take(limit) {
-        let _ = writeln!(out, "- {item}");
-    }
-    if items.len() > limit {
-        let _ = writeln!(out, "- … [{} more omitted]", items.len() - limit);
-    }
-}
-
-fn render_work_map_packet(map: &WorkMap, selection: &WorkMapSelection) -> String {
-    render_work_map_packet_with_mode(map, selection, None)
-}
-
-fn render_work_map_packet_with_mode(
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    mode: Option<&FocusMode>,
-) -> String {
-    use std::fmt::Write as _;
-    let waypoints = selected_waypoints(map, selection);
-    let mut out = String::new();
-    let _ = writeln!(out, "[dext packet {}]", work_map_selection_label(waypoints));
-    let _ = writeln!(out, "source: {}", map.source);
-    let ranges = waypoints
-        .iter()
-        .map(WorkMapWaypoint::display_range)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if !ranges.is_empty() {
-        let _ = writeln!(out, "messages: {ranges}");
-    }
-    if let Some(origin) = &map.header.track_origin {
-        let _ = writeln!(
-            out,
-            "origin: {} {} mode={}",
-            origin.source_session, origin.source_waypoint, origin.mode
-        );
-    }
-
-    let broad_packet = mode.is_none();
-    let include_decisions =
-        broad_packet || mode.is_some_and(|m| m.carries("decisions") || m.carries("decision"));
-    let include_files =
-        broad_packet || mode.is_some_and(|m| m.carries("files") || m.carries("file"));
-    let include_commands =
-        broad_packet || mode.is_some_and(|m| m.carries("commands") || m.carries("cmd"));
-    let include_verification = broad_packet
-        || mode.is_some_and(|m| {
-            m.carries("verify") || m.carries("verification") || m.carries("tests")
-        });
-    let include_constraints =
-        broad_packet || mode.is_some_and(|m| m.carries("constraints") || m.carries("constraint"));
-
-    // Intent is no longer synthesized from the objective field (which echoes
-    // raw user text); real user-message Intent waypoints appear below.
-    if !waypoints.is_empty() {
-        let _ = writeln!(out, "Selected waypoints:");
-        for wp in waypoints.iter().take(24) {
-            let status = wp
-                .status
-                .as_deref()
-                .map(|s| format!(" [{s}]"))
-                .unwrap_or_default();
-            let _ = writeln!(
-                out,
-                "- {} {} {}{} anchor={}: {}",
-                wp.id,
-                wp.kind.as_str(),
-                wp.display_range(),
-                status,
-                wp.anchor,
-                wp.summary
-            );
-        }
-    }
-
-    let mut files = collect_waypoint_items(waypoints, |wp| &wp.files);
-    if include_files {
-        for file in &map.header.work_ledger.files_changed {
-            push_unique_limited(&mut files, file.clone(), 24);
-        }
-    }
-    let mut commands = collect_waypoint_items(waypoints, |wp| &wp.commands);
-    if include_commands {
-        for record in &map.header.work_ledger.verification {
-            push_unique_limited(&mut commands, record.command.clone(), 24);
-        }
-    }
-    let decisions = if include_decisions {
-        map.header
-            .work_ledger
-            .decisions
-            .iter()
-            .map(|s| summarize_inline(s, 220))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let failures = waypoints
-        .iter()
-        .filter(|wp| wp.kind == WorkMapKind::Failure)
-        .map(|wp| wp.summary.clone())
-        .collect::<Vec<_>>();
-    let mut verification = waypoints
-        .iter()
-        .filter(|wp| wp.kind == WorkMapKind::Verify)
-        .map(|wp| {
-            let status = wp.status.as_deref().unwrap_or("unknown");
-            format!("{}: {status}", wp.summary)
-        })
-        .collect::<Vec<_>>();
-    if include_verification {
-        for v in &map.header.work_ledger.verification {
-            push_unique_limited(
-                &mut verification,
-                format!(
-                    "{}: {} exit={:?} artifact={}",
-                    v.name,
-                    v.status,
-                    v.exit_code,
-                    v.artifact.clone().unwrap_or_else(|| "(none)".to_string())
-                ),
-                24,
-            );
-        }
-    }
-    let evidence = waypoints
-        .iter()
-        .filter(|wp| wp.kind == WorkMapKind::Evidence)
-        .map(|wp| wp.summary.clone())
-        .collect::<Vec<_>>();
-    render_bullets(&mut out, "Evidence", &evidence, 12);
-    render_bullets(&mut out, "Files", &files, 16);
-    render_bullets(&mut out, "Commands", &commands, 16);
-    render_bullets(&mut out, "Verification", &verification, 12);
-    render_bullets(&mut out, "Decisions", &decisions, 12);
-    render_bullets(&mut out, "Failures/blockers", &failures, 12);
-    if include_constraints && !map.header.work_ledger.constraints.is_empty() {
-        render_bullets(
-            &mut out,
-            "Session constraints",
-            &map.header.work_ledger.constraints,
-            12,
-        );
-    }
-    let _ = writeln!(out, "Constraints:");
-    let _ = writeln!(
-        out,
-        "- Focus changes model context only; it does not rewind files, git state, or later logs."
-    );
-    if matches!(mode, Some(FocusMode::Exact)) {
-        let _ = writeln!(
-            out,
-            "- Exact focus withholds prior session history from model context after activation; only this packet and later messages are sent."
-        );
-    } else if matches!(mode, Some(FocusMode::Carry(_))) {
-        let _ = writeln!(
-            out,
-            "- Carry focus withholds prior raw history and carries only the requested ledger categories plus selected waypoints."
-        );
-    }
-    out
-}
-
-fn parse_focus_mode(args: &[String]) -> FocusMode {
-    let mut carry: Vec<String> = vec!["failures".into(), "decisions".into(), "files".into()];
-    for arg in args {
-        if arg == "--exact" || arg == "exact" || arg == "--isolate" || arg == "isolate" {
-            return FocusMode::Exact;
-        }
-        if let Some(raw) = arg
-            .strip_prefix("--carry=")
-            .or_else(|| arg.strip_prefix("--carry"))
-        {
-            let raw = raw.trim_start_matches('=');
-            if !raw.is_empty() {
-                carry = raw
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
-            }
-        }
-    }
-    FocusMode::Carry(carry)
-}
-
-fn render_work_map_focus(map: &WorkMap, selection: &WorkMapSelection, mode: &FocusMode) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let selected = selected_waypoints(map, selection);
-    let _ = writeln!(
-        out,
-        "[dext focus {} mode={}]",
-        work_map_selection_label(selected),
-        mode.label()
-    );
-    let _ = writeln!(
-        out,
-        "Note: this does not rewind files, git, or your current session."
-    );
-    match mode {
-        FocusMode::Exact => {
-            let _ = writeln!(
-                out,
-                "Exact: narrows the model's live context to this summary onward."
-            );
-        }
-        FocusMode::Carry(items) => {
-            let carry = if items.is_empty() {
-                "(none)".to_string()
-            } else {
-                items.join(",")
-            };
-            let _ = writeln!(
-                out,
-                "Carry: keeps only these facts in live context: {carry}"
-            );
-        }
-    }
-    out.push('\n');
-    out.push_str(&render_work_map_packet_with_mode(
-        map,
-        selection,
-        Some(mode),
-    ));
-    out
-}
-
-fn activate_work_map_focus(
-    agent: &mut Agent,
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    mode: &FocusMode,
-) -> String {
-    let text = render_work_map_focus(map, selection, mode);
-    let selected = selected_waypoints(map, selection);
-    let selection_label = work_map_selection_label(selected);
-    agent.work_ledger.active_focus = Some(WorkMapFocusState {
-        source_session: map.source.clone(),
-        selection: selection_label,
-        mode: mode.label().to_string(),
-        packet_hash: sha256_hex_str(&text),
-        created_at: unix_timestamp_secs(),
-    });
-    agent.history.push(Message {
-        role: "user".to_string(),
-        content: vec![Block::Text {
-            text: format!("[dext focus packet loaded]\n{text}"),
-        }],
-    });
-    agent.checkpoint_latest_session("after_focus");
-    text
-}
-
-fn parse_work_map_command_args(raw: &str) -> Vec<String> {
-    raw.split_whitespace().map(String::from).collect()
-}
-
-fn work_map_event_selector(selector: &str) -> Option<String> {
-    let selector = selector.trim();
-    if selector.is_empty() || matches!(selector, "current" | "memory" | "this") {
-        None
-    } else {
-        Some(selector.to_string())
-    }
-}
-
-fn load_work_map_for_selector(root: &Path, selector: &str) -> Result<(PathBuf, WorkMap)> {
-    let source = resolve_session_selector(root, selector)?;
-    let (header, history) = read_session_jsonl(&source)?;
-    let map = build_session_work_map(&source, &header, &history);
-    Ok((source, map))
-}
-
-fn current_work_map(agent: &Agent, label: &str) -> WorkMap {
-    let header = agent.session_header();
-    build_session_work_map(Path::new(label), &header, &agent.history)
-}
-
-fn looks_like_waypoint_token(raw: &str) -> bool {
-    parse_waypoint_number(raw).is_some()
-        || raw
-            .trim()
-            .strip_prefix('@')
-            .is_some_and(|rest| rest.len() >= 6 && rest.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-fn parse_work_map_operation_args<'a>(
-    args: &'a [String],
-    default_selector: &'a str,
-) -> Result<(&'a str, &'a str, Vec<String>)> {
-    let Some(id_pos) = args.iter().position(|arg| looks_like_waypoint_token(arg)) else {
-        anyhow::bail!("missing waypoint id (example: @w03)");
-    };
-    let id = args[id_pos].as_str();
-    let selector = args[..id_pos]
-        .first()
-        .map(String::as_str)
-        .unwrap_or(default_selector);
-    if args[..id_pos].len() > 1 {
-        anyhow::bail!("expected at most one session selector before waypoint id");
-    }
-    let mut selector = selector;
-    let selector_from_before = id_pos > 0;
-    let mut mode_args = Vec::new();
-    let mut prev_was_branch = false;
-    for arg in &args[id_pos + 1..] {
-        if arg.starts_with("--") || matches!(arg.as_str(), "exact" | "isolate") {
-            mode_args.push(arg.clone());
-            prev_was_branch = *arg == "--branch";
-        } else if prev_was_branch {
-            mode_args.push(arg.clone());
-            prev_was_branch = false;
-        } else if !selector_from_before && selector == default_selector {
-            selector = arg.as_str();
-        } else {
-            anyhow::bail!("unexpected argument after waypoint id: {arg}");
-        }
-    }
-    Ok((id, selector, mode_args))
-}
-
-fn parse_track_open_args<'a>(
-    args: &'a [String],
-    default_selector: &'a str,
-) -> Result<(&'a str, &'a str, Option<&'a str>, Vec<String>)> {
-    let Some(id_pos) = args.iter().position(|arg| looks_like_waypoint_token(arg)) else {
-        anyhow::bail!("missing waypoint id (example: @w03)");
-    };
-    let id = args[id_pos].as_str();
-    let selector = args[..id_pos]
-        .first()
-        .map(String::as_str)
-        .unwrap_or(default_selector);
-    if args[..id_pos].len() > 1 {
-        anyhow::bail!("expected at most one session selector before waypoint id");
-    }
-    let mut name: Option<&str> = None;
-    let mut mode_args = Vec::new();
-    for arg in &args[id_pos + 1..] {
-        if arg.starts_with("--") || matches!(arg.as_str(), "exact" | "isolate") {
-            mode_args.push(arg.clone());
-        } else if name.is_none() {
-            name = Some(arg.as_str());
-        } else {
-            mode_args.push(arg.clone());
-        }
-    }
-    Ok((id, selector, name, mode_args))
-}
-
-fn choose_work_map_source(
-    root: &Path,
-    selector: &str,
-    agent: Option<&Agent>,
-) -> Result<(PathBuf, WorkMap)> {
-    let selector = selector.trim();
-    if (selector.is_empty() || matches!(selector, "current" | "memory" | "this"))
-        && let Some(agent) = agent
-    {
-        return Ok((PathBuf::from("current"), current_work_map(agent, "current")));
-    }
-    let selector = if selector.is_empty() {
-        "latest"
-    } else {
-        selector
-    };
-    load_work_map_for_selector(root, selector)
-}
-
-fn render_tracks_listing(root: &Path) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(out, "Branches (sessions continued from past moments):");
-    match list_session_records_for_root(root) {
-        Ok(records) => {
-            let mut shown = 0usize;
-            for record in records {
-                let Ok((header, _)) = read_session_jsonl(&record.path) else {
-                    continue;
-                };
-                let Some(origin) = header.track_origin else {
-                    continue;
-                };
-                shown += 1;
-                let _ = writeln!(
-                    out,
-                    "  · {} — from moment {} ({})",
-                    record.name, origin.source_waypoint, origin.mode,
-                );
-                if shown >= SLASH_LIST_LIMIT {
-                    break;
-                }
-            }
-            if shown == 0 {
-                let _ = writeln!(out, "  (none yet; use /focus @wNN --branch [name])");
-            }
-        }
-        Err(e) => {
-            let _ = writeln!(out, "[err] {e:#}");
-        }
-    }
-    let _ = write!(out, "resume a branch with: /resume <name>");
-    let _ = root;
-    out
-}
-
-fn default_track_name(waypoint_id: &str) -> String {
-    let clean = waypoint_id
-        .trim_start_matches('@')
-        .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
-    format!("branch-{clean}-{}", unix_timestamp_secs())
-}
-
-fn create_track_from_work_map_with_header(
-    root: &Path,
-    mut header: SessionHeader,
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    name: Option<&str>,
-    mode: &FocusMode,
-) -> Result<PathBuf> {
-    let selected = selected_waypoints(map, selection);
-    let first = selected
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("empty waypoint selection"))?;
-    let track_name = name
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| default_track_name(&first.id));
-    session::validate_session_name(&track_name)?;
-    let packet = render_work_map_focus(map, selection, mode);
-    header.track_origin = Some(TrackOrigin {
-        source_session: map.source.clone(),
-        source_waypoint: work_map_selection_label(selected),
-        mode: mode.label().to_string(),
-        packet_hash: sha256_hex_str(&packet),
-        created_at: unix_timestamp_secs(),
-    });
-    header.work_ledger.objective = format!("branched from {}", work_map_selection_label(selected));
-    let path = named_session_path_for_root(root, &track_name)?;
-    let history = vec![
-        Message {
-            role: "user".to_string(),
-            content: vec![Block::Text {
-                text: format!(
-                    "Continued from moment {} in a previous session. Here is the summary of work so far:\n\n{}",
-                    work_map_selection_label(selected),
-                    packet
-                ),
-            }],
-        },
-        Message {
-            role: "assistant".to_string(),
-            content: vec![Block::Text {
-                text:
-                    "Branch ready. Your files and git state are unchanged — verify current repo state before editing."
-                        .to_string(),
-            }],
-        },
-    ];
-    let mut data = Vec::new();
-    writeln!(&mut data, "{}", serde_json::to_string(&header)?)?;
-    for message in history {
-        writeln!(&mut data, "{}", serde_json::to_string(&message)?)?;
-    }
-    crate::session::atomic_write_secret(&path, &data)?;
-    Ok(path)
-}
-
-fn create_branch_text(
-    agent: &Agent,
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    name: Option<&str>,
-) -> Result<String> {
-    let mode = FocusMode::Carry(vec!["failures".into(), "decisions".into(), "files".into()]);
-    let label = work_map_selection_label(selected_waypoints(map, selection));
-    let path = create_track_from_work_map(agent, map, selection, name, &mode)?;
-    let branch_name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("branch");
-    Ok(format!(
-        "Created branch \"{branch_name}\" — continues from moment {label}.\n\
-         Your current session is unchanged.\n\
-         Resume the branch later with: /resume {branch_name}",
-    ))
-}
-
-fn create_track_from_work_map(
-    agent: &Agent,
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    name: Option<&str>,
-    mode: &FocusMode,
-) -> Result<PathBuf> {
-    create_track_from_work_map_with_header(
-        &agent.sandbox_root,
-        agent.session_header(),
-        map,
-        selection,
-        name,
-        mode,
-    )
 }
 
 fn render_session_analysis(
@@ -20351,6 +17965,11 @@ fn render_session_analysis(
             out,
             "- thinking_effort: {}",
             header.provenance.thinking_effort.as_str()
+        );
+        let _ = writeln!(
+            out,
+            "- reasoning_mode: {}",
+            header.provenance.reasoning_mode.as_str()
         );
         let _ = writeln!(
             out,
@@ -20432,6 +18051,7 @@ fn grep_session_history(history: &[Message], needle: &str) -> Vec<String> {
                         ));
                     }
                 }
+                Block::ResponsesReasoning { .. } => {}
                 Block::ToolUse { name, input, .. } => {
                     let haystack = format!("{name} {input}");
                     if haystack.to_ascii_lowercase().contains(&needle_lower) {
@@ -21311,10 +18931,11 @@ fn doctor_report_with_overrides(
     render_doctor_findings(&findings)
 }
 
-/// A compact, safe continuation packet for handing work to another agent or a
-/// fresh session. Built from the curated work ledger (header) plus distilled
-/// analysis facts — deliberately not the raw prompts/tool output, which the
-/// full jsonl carries and which may contain sensitive content.
+/// A compact continuation packet for handing work to another agent or a fresh
+/// session. Built from the curated work ledger (header) plus distilled analysis
+/// facts rather than the full raw transcript. The distilled fields can still
+/// contain sensitive user or tool data and must be handled as private session
+/// output.
 fn render_session_brief(
     source: &Path,
     header: &SessionHeader,
@@ -21333,6 +18954,7 @@ fn render_session_brief(
         analysis.messages,
         analysis.usage.line()
     ));
+    out.push_str("privacy: distilled session data; review before sharing\n");
     if analysis.compactions > 0 {
         out.push_str(&format!("compactions: {}\n", analysis.compactions));
     }
@@ -21425,11 +19047,106 @@ fn collect_session_lock_paths(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Re
     Ok(())
 }
 
+fn prunable_project_dir_modified(dir: &Path) -> std::io::Result<Option<std::time::SystemTime>> {
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+    let Some(mut newest_modified) = metadata.modified().ok() else {
+        return Ok(None);
+    };
+
+    let mut inspected = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            inspected += 1;
+            if inspected > SESSION_PRUNE_ENTRY_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session prune traversal exceeds safety limit",
+                ));
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Ok(None);
+            }
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if !metadata.file_type().is_symlink() && metadata.file_type() == file_type =>
+                {
+                    metadata
+                }
+                _ => return Ok(None),
+            };
+            let Some(modified) = metadata.modified().ok() else {
+                return Ok(None);
+            };
+            newest_modified = newest_modified.max(modified);
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if !file_type.is_file()
+                || path.file_name().and_then(|name| name.to_str()) != Some(SESSION_STATE_LOCK_NAME)
+                || session_state_lock_is_live(&path)
+            {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(newest_modified))
+}
+
+fn remove_empty_directory_tree(dir: &Path) -> std::io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(false);
+    }
+
+    let mut inspected = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    let mut directories = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            inspected += 1;
+            if inspected > SESSION_PRUNE_ENTRY_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session prune traversal exceeds safety limit",
+                ));
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Ok(false);
+            }
+            let path = entry.path();
+            directories.push(path.clone());
+            stack.push(path);
+        }
+    }
+
+    for path in directories.into_iter().rev() {
+        match std::fs::remove_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
 fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<()> {
     let projects_dir = session::dext_state_dir().join("projects");
     let current_key = project_key(root);
     let now = std::time::SystemTime::now();
-    let max_age = std::time::Duration::from_secs(max_age_days * 86400);
+    let max_age = std::time::Duration::from_secs(max_age_days.saturating_mul(86_400));
 
     let entries = match std::fs::read_dir(&projects_dir) {
         Ok(e) => e,
@@ -21463,32 +19180,13 @@ fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<(
             kept += 1;
             continue;
         }
-        let sessions_dir = path.join("sessions");
-        let has_real_session = match walkdir_jsonl_count(&sessions_dir) {
-            Ok(count) => count > 0,
-            Err(_) => {
+        let modified = match prunable_project_dir_modified(&path) {
+            Ok(Some(modified)) => modified,
+            Ok(None) | Err(_) => {
                 kept += 1;
                 continue;
             }
         };
-        if has_real_session {
-            kept += 1;
-            continue;
-        }
-        let mut locks = Vec::new();
-        if collect_session_lock_paths(&path, &mut locks).is_err() {
-            kept += 1;
-            continue;
-        }
-        if locks.iter().any(|lock| session_state_lock_is_live(lock)) {
-            kept += 1;
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(now);
         let age = now.duration_since(modified).unwrap_or_default();
         if age <= max_age {
             kept += 1;
@@ -21525,57 +19223,24 @@ fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<(
     );
 
     if !dry_run {
+        let _operation_guard = SessionLockOperationGuard::acquire()?;
         for lock in &stale_locks {
-            let _ = remove_stale_session_state_lock(lock);
+            let _ = remove_stale_session_state_lock_under_guard(&_operation_guard, lock);
         }
         for (path, _, _) in &candidates {
-            let _ = std::fs::remove_dir_all(path);
+            match remove_empty_directory_tree(path) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "warning: preserved {} because it is no longer empty",
+                    path.display()
+                ),
+                Err(error) => {
+                    eprintln!("warning: could not remove {}: {error}", path.display())
+                }
+            }
         }
     }
     Ok(())
-}
-
-fn walkdir_jsonl_count(dir: &Path) -> std::io::Result<usize> {
-    let metadata = match std::fs::symlink_metadata(dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "session directory is not a regular directory",
-        ));
-    }
-
-    let mut count = 0;
-    let mut inspected = 0usize;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            inspected += 1;
-            if inspected > SESSION_PRUNE_ENTRY_LIMIT {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "session prune traversal exceeds safety limit",
-                ));
-            }
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
-                && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
-            {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
 }
 
 fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
@@ -21728,87 +19393,28 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                     Ok(Some(0))
                 }
                 "prune" => {
-                    let dry_run = !argv.iter().skip(2).any(|a| a == "--apply" || a == "apply");
-                    let max_age_days = argv
-                        .iter()
-                        .skip(2)
-                        .find_map(|a| {
-                            a.strip_prefix("--days=")
-                                .and_then(|v| v.parse::<u64>().ok())
-                        })
-                        .unwrap_or(7);
+                    let mut dry_run = true;
+                    let mut max_age_days = 7;
+                    for arg in argv.iter().skip(2) {
+                        if matches!(arg.as_str(), "--apply" | "apply") {
+                            dry_run = false;
+                        } else if let Some(value) = arg.strip_prefix("--days=") {
+                            let Ok(days) = value.parse::<u64>() else {
+                                eprintln!("usage: dext session prune [--days=N] [--apply]");
+                                return Ok(Some(2));
+                            };
+                            max_age_days = days;
+                        } else {
+                            eprintln!("usage: dext session prune [--days=N] [--apply]");
+                            return Ok(Some(2));
+                        }
+                    }
                     prune_project_dirs(&root, dry_run, max_age_days)?;
                     Ok(Some(0))
                 }
-                "map" => {
-                    let args = parse_work_map_command_args(&argv[2..].join(" "));
-                    let (selector, filters) =
-                        parse_work_map_filter_args_with_default(&args, "latest")?;
-                    let (_, map) = load_work_map_for_selector(&root, &selector)?;
-                    println!("{}", render_work_map(&map, &filters));
-                    Ok(Some(0))
-                }
-                "packet" => {
-                    let args = parse_work_map_command_args(&argv[2..].join(" "));
-                    let (id, selector, _) = parse_work_map_operation_args(&args, "latest")?;
-                    let (_, map) = load_work_map_for_selector(&root, selector)?;
-                    let selection = parse_work_map_selection(id, &map)?;
-                    println!("{}", render_work_map_packet(&map, &selection));
-                    Ok(Some(0))
-                }
-                "focus" => {
-                    let args = parse_work_map_command_args(&argv[2..].join(" "));
-                    let (id, selector, mode_args) = parse_work_map_operation_args(&args, "latest")?;
-                    let (_, map) = load_work_map_for_selector(&root, selector)?;
-                    let selection = parse_work_map_selection(id, &map)?;
-                    let mode = parse_focus_mode(&mode_args);
-                    println!("{}", render_work_map_focus(&map, &selection, &mode));
-                    Ok(Some(0))
-                }
-                "tracks" | "branches" => {
-                    println!("{}", render_tracks_listing(&root));
-                    Ok(Some(0))
-                }
-                "track" => {
-                    let sub = argv.get(2).map(|s| s.as_str());
-                    let args_str = if matches!(sub, Some("open")) {
-                        argv[3..].join(" ")
-                    } else {
-                        argv.get(2..).map(|s| s.join(" ")).unwrap_or_default()
-                    };
-                    let args = parse_work_map_command_args(&args_str);
-                    match parse_track_open_args(&args, "latest") {
-                        Ok((id, selector, name, _)) => {
-                            let (source, map) = load_work_map_for_selector(&root, selector)?;
-                            let selection = parse_work_map_selection(id, &map)?;
-                            let (header, _) = read_session_jsonl(&source)?;
-                            let mode = FocusMode::Carry(vec![
-                                "failures".into(),
-                                "decisions".into(),
-                                "files".into(),
-                            ]);
-                            let path = create_track_from_work_map_with_header(
-                                &root, header, &map, &selection, name, &mode,
-                            )?;
-                            let bn = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("branch");
-                            println!(
-                                "Created branch \"{}\" — resume with: dext --resume={}",
-                                bn, bn
-                            );
-                            Ok(Some(0))
-                        }
-                        Err(_) => {
-                            println!("{}", render_tracks_listing(&root));
-                            Ok(Some(0))
-                        }
-                    }
-                }
                 _ => {
                     eprintln!(
-                        "usage: dext session [list|map [session] [filter]|focus [session] @wNN [--exact]|packet [session] @wNN|tracks|track [open] @wNN [name]|export|analyze|brief|grep|failures|verify-log|decisions|prune]"
+                        "usage: dext session [list|export|analyze|brief|grep|failures|verify-log|decisions|prune]"
                     );
                     Ok(Some(2))
                 }
@@ -21819,6 +19425,112 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
 }
 
 const DIAGNOSTICS_APPROVAL_NAME: &str = "diagnostics";
+
+fn project_extensions_approval_path(root: &Path) -> PathBuf {
+    project_state_dir(root).join(PROJECT_EXTENSIONS_APPROVAL_FILE)
+}
+
+fn project_extensions_approval_metadata_is_private(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn project_extensions_always_approved(root: &Path) -> bool {
+    let path = project_extensions_approval_path(root);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !project_extensions_approval_metadata_is_private(&metadata) || metadata.len() > 16 {
+        return false;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(file) = options.open(&path) else {
+        return false;
+    };
+    let Ok(opened) = file.metadata() else {
+        return false;
+    };
+    if !project_extensions_approval_metadata_is_private(&opened) || opened.len() > 16 {
+        return false;
+    }
+    let mut text = String::new();
+    file.take(17).read_to_string(&mut text).is_ok() && text.len() <= 16 && text.trim() == "approved"
+}
+
+fn persist_project_extensions_approval(root: &Path) -> Result<()> {
+    atomic_write_secret(&project_extensions_approval_path(root), b"approved\n")?;
+    Ok(())
+}
+
+fn reset_project_extensions_approval(agent: &mut Agent) -> Result<()> {
+    let path = project_extensions_approval_path(&agent.sandbox_root);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !project_extensions_approval_metadata_is_private(&metadata) => {
+            anyhow::bail!("project extension approval marker is not a safe private file")
+        }
+        Ok(_) => std::fs::remove_file(&path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    agent.project_extensions_approved = None;
+    agent.prompt_scan_epoch = agent.prompt_scan_epoch.wrapping_add(1);
+    Ok(())
+}
+
+fn approve_project_extensions(agent: &mut Agent) -> bool {
+    if let Some(approved) = agent.project_extensions_approved {
+        return approved;
+    }
+    if project_extensions_always_approved(&agent.sandbox_root) {
+        agent.project_extensions_approved = Some(true);
+        return true;
+    }
+    if agent.approval_profile == ApprovalProfile::Never {
+        agent.project_extensions_approved = Some(false);
+        return false;
+    }
+    let input = json!({
+        "operation": "load project-controlled shelf context or PACK.md workflows for this repository",
+        "paths": [".dext/shelves/*/shelf.json", ".dext/shelves/*/packs/*/PACK.md"],
+        "risk": "repository-controlled text can steer the model; tool side effects still use normal approval and sandbox controls"
+    });
+    let approved = match agent
+        .sink
+        .request_permission(PROJECT_EXTENSIONS_APPROVAL_NAME, &input)
+    {
+        Choice::Once => true,
+        Choice::Always => match persist_project_extensions_approval(&agent.sandbox_root) {
+            Ok(()) => true,
+            Err(error) => {
+                agent.sink.emit(AgentEvent::Warn(format!(
+                    "could not persist project-extension approval: {error:#}"
+                )));
+                true
+            }
+        },
+        Choice::Deny => false,
+    };
+    agent.project_extensions_approved = Some(approved);
+    approved
+}
 
 fn hooks_approved(agent: &mut Agent) -> bool {
     if agent.hooks.is_empty() {
@@ -22066,6 +19778,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
+                "  /project-extensions [status|reset]  inspect or reset repository extension approval"
+            );
+            let _ = writeln!(
+                w,
                 "  /sandbox [path]           show or change the sandbox root"
             );
             let _ = writeln!(w);
@@ -22102,7 +19818,11 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "── Context & diagnostics ──");
             let _ = writeln!(
                 w,
-                "  /effort [level]           set model reasoning depth/tool persistence: off|low|medium|high|xhigh|max"
+                "  /effort [level]           set model reasoning depth/tool persistence: off|minimal|low|medium|high|xhigh|max"
+            );
+            let _ = writeln!(
+                w,
+                "  /reasoning-mode [mode]    select standard|pro (active only for official OpenAI GPT-5.6 Responses)"
             );
             let _ = writeln!(
                 w,
@@ -22133,7 +19853,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 "  /diagnostics              run rust-analyzer diagnostics (fallback: cargo check)"
             );
             let _ = writeln!(w);
-            let _ = writeln!(w, "── Sessions & work map ──");
+            let _ = writeln!(w, "── Sessions ──");
             let _ = writeln!(
                 w,
                 "  /save <name>              write history + config to sessions dir as JSONL"
@@ -22148,31 +19868,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /map [session] [filter]    show session as moments @wNN; filters: failures|changes|verify|file <path>|query <text>"
-            );
-            let _ = writeln!(
-                w,
-                "  /focus @wNN               inspect a past moment (read-only; your session is unchanged)"
-            );
-            let _ = writeln!(
-                w,
-                "  /focus @wNN --branch [n]  branch into a new session from that moment; resume with /resume <name>"
-            );
-            let _ = writeln!(
-                w,
-                "  /focus @wNN --exact       (advanced) narrow model context to this moment onward; /focus clear restores"
-            );
-            let _ = writeln!(
-                w,
-                "  /branches                 list branches (continuations from past moments)"
-            );
-            let _ = writeln!(
-                w,
-                "    Map drawer keys: ↑/↓/PgUp/PgDn/Home/End navigate · Enter inspect · f edit · b branch · z filter · Esc close"
-            );
-            let _ = writeln!(
-                w,
-                "  /sessions                 list latest + autosaved/named sessions; /sessions analyze|brief|grep|failures|verify-log|decisions|export|prune"
+                "  /sessions                 list latest + autosaved/named sessions; /sessions analyze|brief|grep|failures|verify-log|decisions"
             );
             let _ = writeln!(w, "  /session                  alias for /sessions");
             let _ = writeln!(
@@ -22198,7 +19894,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "reset" => {
             let n = agent.history.len();
             agent.history.clear();
-            agent.work_ledger.active_focus = None;
             agent.clear_pending_login();
             if agent.session_enabled {
                 let _ = std::fs::remove_file(&agent.latest_session_path);
@@ -22220,6 +19915,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         Block::Text { .. } => "text",
                         Block::Thinking { .. } => "thinking",
                         Block::RedactedThinking { .. } => "redacted_thinking",
+                        Block::ResponsesReasoning { .. } => "responses_reasoning",
                         Block::ToolUse { .. } => "tool_use",
                         Block::ToolResult { .. } => "tool_result",
                         Block::PartialStream { .. } => "partial_stream",
@@ -22321,6 +20017,40 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
             _ => {
                 let _ = writeln!(w, "usage: /trust [on|off|status]");
+            }
+        },
+        "project-extensions" | "project_extensions" => match arg {
+            "" | "status" => {
+                let state = if agent.project_extensions_approved == Some(true)
+                    || project_extensions_always_approved(&agent.sandbox_root)
+                {
+                    "approved"
+                } else if agent.project_extensions_approved == Some(false) {
+                    "denied for this session"
+                } else {
+                    "undecided"
+                };
+                let persistent = if project_extensions_always_approved(&agent.sandbox_root) {
+                    "yes"
+                } else {
+                    "no"
+                };
+                let _ = writeln!(w, "project extensions: {state}");
+                let _ = writeln!(w, "persistent approval: {persistent}");
+            }
+            "reset" | "ask" => match reset_project_extensions_approval(agent) {
+                Ok(()) => {
+                    let _ = writeln!(
+                        w,
+                        "project extension decision reset; the next matching use will ask again"
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(w, "could not reset project extension approval: {error:#}");
+                }
+            },
+            _ => {
+                let _ = writeln!(w, "usage: /project-extensions [status|reset]");
             }
         },
         "privacy" => match arg {
@@ -22628,7 +20358,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     None => {
                         let _ = writeln!(
                             w,
-                            "usage: /effort [off|low|medium|high|xhigh|max|next|prev|status]"
+                            "usage: /effort [off|minimal|low|medium|high|xhigh|max|next|prev|status]"
                         );
                         None
                     }
@@ -22644,6 +20374,38 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 if changed {
                     ui_update = SlashUiUpdate::ThinkingEffort;
                 }
+            }
+        }
+        "reasoning-mode" | "reasoning_mode" | "rmode" => {
+            let old = agent.reasoning_mode();
+            let next = match arg.to_ascii_lowercase().as_str() {
+                "" | "status" => Some(old),
+                "next" | "+" | "prev" | "previous" | "-" => Some(agent.cycle_reasoning_mode()),
+                _ => ReasoningMode::parse(arg),
+            };
+            if let Some(mode) = next {
+                let changed = mode != old;
+                agent.set_reasoning_mode(mode);
+                if agent.effective_reasoning_mode() == Some(mode.as_str()) {
+                    let _ = writeln!(
+                        w,
+                        "reasoning mode: {} (active for official OpenAI GPT-5.6 Responses)",
+                        mode.as_str()
+                    );
+                } else {
+                    let _ = writeln!(
+                        w,
+                        "reasoning mode: {} (selected, inactive for {}/{}; no mode field is sent)",
+                        mode.as_str(),
+                        agent.provider_id,
+                        agent.model
+                    );
+                }
+                if changed {
+                    ui_update = SlashUiUpdate::ReasoningMode;
+                }
+            } else {
+                let _ = writeln!(w, "usage: /reasoning-mode [standard|pro|next|prev|status]");
             }
         }
         "context" | "context-mode" => {
@@ -22877,159 +20639,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 }
             }
         }
-        "map" => {
-            let args = parse_work_map_command_args(arg);
-            match parse_work_map_filter_args(&args).and_then(|(selector, filters)| {
-                let (_, map) = choose_work_map_source(&agent.sandbox_root, &selector, Some(agent))?;
-                Ok((selector, filters, map))
-            }) {
-                Ok((selector, filters, map)) => emit_work_map_event(
-                    agent.sink.as_mut(),
-                    WorkMapEventKind::Map,
-                    render_work_map(&map, &filters),
-                    work_map_waypoint_ids_for_view(&map, &filters),
-                    work_map_event_selector(&selector),
-                ),
-                Err(e) => {
-                    let _ = writeln!(w, "[err] {e:#}");
-                }
-            }
-        }
-        "packet" => {
-            let args = parse_work_map_command_args(arg);
-            match parse_work_map_operation_args(&args, "current").and_then(|(id, selector, _)| {
-                let (_, map) = choose_work_map_source(&agent.sandbox_root, selector, Some(agent))?;
-                let selection = parse_work_map_selection(id, &map)?;
-                Ok((map, selection, selector))
-            }) {
-                Ok((map, selection, selector)) => emit_work_map_event(
-                    agent.sink.as_mut(),
-                    WorkMapEventKind::Packet,
-                    render_work_map_packet(&map, &selection),
-                    work_map_waypoint_ids(&map),
-                    work_map_event_selector(selector),
-                ),
-                Err(e) => {
-                    let _ = writeln!(w, "[err] {e:#}\nusage: /packet @wNN [session]");
-                }
-            }
-        }
-        "focus" => {
-            if matches!(arg.trim(), "clear" | "off" | "reset") {
-                agent.work_ledger.active_focus = None;
-                agent.checkpoint_latest_session("after_focus_clear");
-                let _ = writeln!(w, "focus cleared; full session history is active again");
-            } else {
-                let args = parse_work_map_command_args(arg);
-                match parse_work_map_operation_args(&args, "current").and_then(
-                    |(id, selector, mode_args)| {
-                        let (_, map) =
-                            choose_work_map_source(&agent.sandbox_root, selector, Some(agent))?;
-                        let selection = parse_work_map_selection(id, &map)?;
-                        Ok((map, selection, mode_args, selector))
-                    },
-                ) {
-                    Ok((map, selection, mode_args, selector)) => {
-                        let is_branch = mode_args.iter().any(|a| a == "--branch");
-                        if is_branch {
-                            let name = mode_args
-                                .iter()
-                                .position(|a| a == "--branch")
-                                .and_then(|pos| mode_args.get(pos + 1))
-                                .filter(|s| !s.starts_with("--"))
-                                .map(|s| s.as_str());
-                            match create_branch_text(agent, &map, &selection, name) {
-                                Ok(text) => emit_work_map_event(
-                                    agent.sink.as_mut(),
-                                    WorkMapEventKind::Focus,
-                                    text,
-                                    work_map_waypoint_ids(&map),
-                                    work_map_event_selector(selector),
-                                ),
-                                Err(e) => {
-                                    let _ = writeln!(w, "[err] {e:#}");
-                                }
-                            }
-                        } else if mode_args.is_empty() {
-                            emit_work_map_event(
-                                agent.sink.as_mut(),
-                                WorkMapEventKind::Focus,
-                                render_work_map_packet(&map, &selection),
-                                work_map_waypoint_ids(&map),
-                                work_map_event_selector(selector),
-                            );
-                        } else {
-                            let mode = parse_focus_mode(&mode_args);
-                            let text = activate_work_map_focus(agent, &map, &selection, &mode);
-                            emit_work_map_event(
-                                agent.sink.as_mut(),
-                                WorkMapEventKind::Focus,
-                                text,
-                                work_map_waypoint_ids(&map),
-                                work_map_event_selector(selector),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        let _ = writeln!(
-                            w,
-                            "[err] {e:#}\nusage: /focus @wNN [--branch name|--exact|--carry=...] or /focus clear"
-                        );
-                    }
-                }
-            }
-        }
-        "tracks" | "branches" => emit_work_map_event(
-            agent.sink.as_mut(),
-            WorkMapEventKind::Tracks,
-            render_tracks_listing(&agent.sandbox_root),
-            Vec::new(),
-            None,
-        ),
-        "track" => {
-            let args = parse_work_map_command_args(arg);
-            match args.first().map(|s| s.as_str()) {
-                Some("open") => {
-                    let rest = &args[1..];
-                    match parse_track_open_args(rest, "current").and_then(
-                        |(id, selector, name, _)| {
-                            let (_, map) =
-                                choose_work_map_source(&agent.sandbox_root, selector, Some(agent))?;
-                            let selection = parse_work_map_selection(id, &map)?;
-                            Ok((map, selection, name, selector))
-                        },
-                    ) {
-                        Ok((map, selection, name, selector)) => {
-                            match create_branch_text(agent, &map, &selection, name) {
-                                Ok(text) => emit_work_map_event(
-                                    agent.sink.as_mut(),
-                                    WorkMapEventKind::Focus,
-                                    text,
-                                    work_map_waypoint_ids(&map),
-                                    work_map_event_selector(selector),
-                                ),
-                                Err(e) => {
-                                    let _ = writeln!(
-                                        w,
-                                        "[err] {e:#}\nusage: /focus @wNN --branch [name]"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = writeln!(w, "[err] {e:#}\nusage: /focus @wNN --branch [name]");
-                        }
-                    }
-                }
-                _ => emit_work_map_event(
-                    agent.sink.as_mut(),
-                    WorkMapEventKind::Tracks,
-                    render_tracks_listing(&agent.sandbox_root),
-                    Vec::new(),
-                    None,
-                ),
-            }
-        }
         "resume" => {
             let loaded = if arg.is_empty() {
                 agent.load_latest_session()
@@ -23060,12 +20669,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             match sub {
                 "" | "list" => {
                     let _ = write!(w, "{}", render_session_listing(&agent.sandbox_root));
-                }
-                "map" | "packet" | "focus" | "tracks" | "track" | "branches" => {
-                    let _ = writeln!(
-                        w,
-                        "use the top-level command instead: /map · /focus · /branches"
-                    );
                 }
                 "analyze" | "analysis" => {
                     let selector = if rest.is_empty() { "latest" } else { rest };
@@ -23164,7 +20767,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 _ => {
                     let _ = writeln!(
                         w,
-                        "usage: /sessions [list|analyze|brief|map|packet|focus|tracks|grep|failures|verify-log|decisions]"
+                        "usage: /sessions [list|analyze|brief|grep|failures|verify-log|decisions]"
                     );
                 }
             }
@@ -23304,6 +20907,9 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         SlashUiUpdate::ThinkingEffort => agent.sink.emit(AgentEvent::ThinkingEffortChanged {
             effort: agent.thinking_effort(),
         }),
+        SlashUiUpdate::ReasoningMode => agent.sink.emit(AgentEvent::ReasoningModeChanged {
+            mode: agent.reasoning_mode(),
+        }),
         SlashUiUpdate::ApprovalProfile => agent.sink.emit(AgentEvent::ApprovalProfileChanged {
             profile: agent.approval_profile(),
         }),
@@ -23350,6 +20956,7 @@ fn approx_tokens_for_message(m: &Message) -> usize {
             Block::Text { text } | Block::PartialStream { text } => text.len(),
             Block::Thinking { text, .. } => text.len(),
             Block::RedactedThinking { data } => data.len(),
+            Block::ResponsesReasoning { item } => json_byte_len(item),
             Block::ToolUse { input, name, .. } => json_byte_len(input) + name.len(),
             Block::ToolResult { content, .. } => content.len(),
         })
@@ -23384,6 +20991,7 @@ fn render_tokens_report(history: &[Message]) -> String {
                 Block::Text { .. } => "text",
                 Block::Thinking { .. } => "thinking",
                 Block::RedactedThinking { .. } => "redacted_thinking",
+                Block::ResponsesReasoning { .. } => "responses_reasoning",
                 Block::ToolUse { .. } => "tool_use",
                 Block::ToolResult { .. } => "tool_result",
                 Block::PartialStream { .. } => "partial_stream",
@@ -23690,7 +21298,7 @@ fn run_eval_shell_command(
     command: &str,
 ) -> std::result::Result<(i32, String, String), String> {
     let bash = bash_executable_path();
-    let mut sandboxed = sandbox::std_command(&bash, SandboxProfile::ReadOnly, root, &[])
+    let mut sandboxed = sandbox::std_command(&bash, SandboxProfile::ReadOnly, root)
         .map_err(|error| format!("prepare eval sandbox: {error}"))?;
     sandboxed
         .arg("--noprofile")
@@ -24086,6 +21694,7 @@ pub(crate) struct CliOptions {
     pub(crate) budget_cap: Option<BudgetCap>,
     pub(crate) sandbox_profile: Option<SandboxProfile>,
     pub(crate) thinking_effort: Option<ThinkingEffort>,
+    pub(crate) reasoning_mode: Option<ReasoningMode>,
     pub(crate) context_mode: Option<ContextMode>,
     pub(crate) tool_context_profile: Option<ToolContextProfile>,
     pub(crate) tool_profile: Option<ToolProfile>,
@@ -24107,6 +21716,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut budget_cap: Option<BudgetCap> = None;
     let mut sandbox_profile: Option<SandboxProfile> = None;
     let mut thinking_effort: Option<ThinkingEffort> = None;
+    let mut reasoning_mode: Option<ReasoningMode> = None;
     let mut context_mode: Option<ContextMode> = None;
     let mut tool_context_profile: Option<ToolContextProfile> = None;
     let mut tool_profile: Option<ToolProfile> = None;
@@ -24245,12 +21855,21 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--effort" | "--thinking-effort" => {
                 i += 1;
                 let value = argv.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--effort requires off|low|medium|high|xhigh|max")
+                    anyhow::anyhow!("--effort requires off|minimal|low|medium|high|xhigh|max")
                 })?;
                 thinking_effort = Some(ThinkingEffort::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh|max)"
+                        "invalid thinking effort '{value}' (expected off|minimal|low|medium|high|xhigh|max)"
                     )
+                })?);
+            }
+            "--reasoning-mode" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--reasoning-mode requires standard|pro"))?;
+                reasoning_mode = Some(ReasoningMode::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("invalid reasoning mode '{value}' (expected standard|pro)")
                 })?);
             }
             "--output" => {
@@ -24292,8 +21911,14 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .unwrap_or_default();
                 thinking_effort = Some(ThinkingEffort::parse(value).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid thinking effort '{value}' (expected off|low|medium|high|xhigh|max)"
+                        "invalid thinking effort '{value}' (expected off|minimal|low|medium|high|xhigh|max)"
                     )
+                })?);
+            }
+            _ if arg.starts_with("--reasoning-mode=") => {
+                let value = arg.trim_start_matches("--reasoning-mode=");
+                reasoning_mode = Some(ReasoningMode::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("invalid reasoning mode '{value}' (expected standard|pro)")
                 })?);
             }
             _ if arg.starts_with("--context-mode=") => {
@@ -24404,6 +22029,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         budget_cap,
         sandbox_profile,
         thinking_effort,
+        reasoning_mode,
         context_mode,
         tool_context_profile,
         tool_profile,
@@ -24607,11 +22233,6 @@ async fn main() -> Result<()> {
         );
         println!("       dext sessions         list latest + autosaved/named sessions");
         println!("       dext session brief [latest|NAME|PATH]  distilled continuation packet");
-        println!("       dext session map [latest|NAME|PATH]");
-        println!("       dext session packet [latest|NAME|PATH] @wNN");
-        println!("       dext session focus [latest|NAME|PATH] @wNN [--exact]");
-        println!("       dext session tracks");
-        println!("       dext session track open [latest|NAME|PATH] @wNN [name]");
         println!("       dext session export [latest|NAME|PATH] [html|jsonl] [OUT]");
         println!("       dext doctor [--approval PROFILE] [--sandbox PROFILE] [--cd DIR]");
         println!("                           inspect effective safety policy and local state");
@@ -24623,6 +22244,9 @@ async fn main() -> Result<()> {
         );
         println!("       dext --pack NAME TASK  invoke a pack in one-shot mode");
         println!("       dext session analyze|grep|failures|verify-log|decisions [session]");
+        println!(
+            "       dext session prune [--days=N] [--apply]  prune stale locks/lock-only project dirs"
+        );
         println!(
             "       dext --no-session     disable session/log writes and side-effect crash recovery"
         );
@@ -24638,7 +22262,10 @@ async fn main() -> Result<()> {
         println!("       dext --preview off|simple|git  mutation preview mode");
         println!("       dext --sandbox read-only|workspace-write|danger-full-access");
         println!(
-            "       dext --effort off|low|medium|high|xhigh|max  set provider reasoning effort"
+            "       dext --effort off|minimal|low|medium|high|xhigh|max  set provider reasoning effort"
+        );
+        println!(
+            "       dext --reasoning-mode standard|pro  select GPT-5.6 Responses execution mode"
         );
         println!(
             "       dext --frugal        minimize prompt/tool/history context for lower token cost"
@@ -24659,7 +22286,7 @@ async fn main() -> Result<()> {
         println!("       dext undo --apply <id>   non-interactive apply");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|low|medium|high|xhigh|max, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
         );
         return Ok(());
     }
@@ -24717,6 +22344,9 @@ async fn main() -> Result<()> {
     if let Some(effort) = opts.thinking_effort {
         agent.set_thinking_effort(effort);
     }
+    if let Some(mode) = opts.reasoning_mode {
+        agent.set_reasoning_mode(mode);
+    }
     if let Some(mode) = opts.context_mode {
         agent.set_context_mode(mode);
     }
@@ -24748,6 +22378,22 @@ async fn main() -> Result<()> {
         };
         match loaded {
             Ok(path) => {
+                let configured_effort = opts.thinking_effort.or_else(|| {
+                    std::env::var("DEXT_THINKING_EFFORT")
+                        .ok()
+                        .and_then(|value| ThinkingEffort::parse(&value))
+                });
+                if let Some(effort) = configured_effort {
+                    agent.set_thinking_effort(effort);
+                }
+                let configured_reasoning_mode = opts.reasoning_mode.or_else(|| {
+                    std::env::var("DEXT_REASONING_MODE")
+                        .ok()
+                        .and_then(|value| ReasoningMode::parse(&value))
+                });
+                if let Some(mode) = configured_reasoning_mode {
+                    agent.set_reasoning_mode(mode);
+                }
                 let configured_context_mode = opts.context_mode.or_else(|| {
                     std::env::var("DEXT_CONTEXT_MODE")
                         .ok()

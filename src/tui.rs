@@ -17,8 +17,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tui_markdown::{
     Options as MarkdownOptions, StyleSheet as MarkdownStyleSheet, from_str_with_options,
@@ -27,7 +27,7 @@ use tui_markdown::{
 use crate::provider::{curated_provider_models, provider_has_available_credentials};
 use crate::{
     Agent, AgentEvent, ApprovalProfile, Choice, ContextMode, EventSink,
-    HISTORY_CHAR_BUDGET_END_TURN_PERCENT, LocalAuthSecret, ThinkingEffort, Usage, WorkMapEventKind,
+    HISTORY_CHAR_BUDGET_END_TURN_PERCENT, LocalAuthSecret, ReasoningMode, ThinkingEffort, Usage,
     canonical_provider_id, clear_secret_string, handle_slash, history_char_budget_with_window,
     load_auth_store, load_provider_catalog, model_context_window, orchestrator::ExternalTelemetry,
     packs, parse_active_runtime_control_sequence, parse_compact_slash, provider_auth_status,
@@ -47,12 +47,104 @@ const TRANSCRIPT_WRAP_GUARD_COLS: u16 = 1;
 const INPUT_MAX_PANEL_ROWS: u16 = 24;
 const PASTE_WORD_THRESHOLD: usize = 50;
 const CONTEXT_BAR_CELLS: usize = 10;
-const WORK_MAP_DRAWER_MAX_ROWS: usize = 20;
-const WORK_MAP_DRAWER_MAX_BODY_ROWS: usize = 18;
-const WORK_MAP_DRAWER_MIN_EDITOR_ROWS: usize = 1;
-const THINKING_BG: Color = Color::Indexed(235);
-const STEERING_BG: Color = Color::Indexed(236);
 const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
+
+#[derive(Clone, Copy)]
+struct TuiTheme {
+    thinking_bg: Color,
+    thinking_fg: Color,
+    thinking_marker: Color,
+    steering_bg: Color,
+    steering_fg: Color,
+    steering_gutter: Color,
+}
+
+const DARK_THEME: TuiTheme = TuiTheme {
+    thinking_bg: Color::Indexed(235),
+    thinking_fg: Color::Gray,
+    thinking_marker: Color::Indexed(244),
+    steering_bg: Color::Indexed(236),
+    steering_fg: Color::Indexed(215),
+    steering_gutter: Color::Indexed(214),
+};
+const LIGHT_THEME: TuiTheme = TuiTheme {
+    thinking_bg: Color::Indexed(255),
+    thinking_fg: Color::Indexed(238),
+    thinking_marker: Color::Indexed(244),
+    steering_bg: Color::Indexed(254),
+    steering_fg: Color::Indexed(94),
+    steering_gutter: Color::Indexed(130),
+};
+
+fn indexed_background_is_light(index: u8) -> bool {
+    let (red, green, blue) = match index {
+        0..=15 => [
+            (0, 0, 0),
+            (128, 0, 0),
+            (0, 128, 0),
+            (128, 128, 0),
+            (0, 0, 128),
+            (128, 0, 128),
+            (0, 128, 128),
+            (192, 192, 192),
+            (128, 128, 128),
+            (255, 0, 0),
+            (0, 255, 0),
+            (255, 255, 0),
+            (0, 0, 255),
+            (255, 0, 255),
+            (0, 255, 255),
+            (255, 255, 255),
+        ][index as usize],
+        16..=231 => {
+            let cube = index - 16;
+            let channel = |value: u8| match value {
+                0 => 0,
+                value => 55 + value * 40,
+            };
+            (
+                channel(cube / 36),
+                channel(cube % 36 / 6),
+                channel(cube % 6),
+            )
+        }
+        232..=255 => {
+            let gray = 8 + (index - 232) * 10;
+            (gray, gray, gray)
+        }
+    };
+    (u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1_000 >= 150
+}
+
+fn resolve_tui_theme(theme: Option<&str>, colorfgbg: Option<&str>) -> TuiTheme {
+    match theme.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("light") => LIGHT_THEME,
+        Some("dark") => DARK_THEME,
+        _ => colorfgbg
+            .and_then(|value| value.rsplit(';').next())
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .filter(|background| indexed_background_is_light(*background))
+            .map_or(DARK_THEME, |_| LIGHT_THEME),
+    }
+}
+
+fn tui_theme() -> &'static TuiTheme {
+    static THEME: OnceLock<TuiTheme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        resolve_tui_theme(
+            std::env::var("DEXT_THEME").ok().as_deref(),
+            std::env::var("COLORFGBG").ok().as_deref(),
+        )
+    })
+}
+
+fn thinking_bg() -> Color {
+    tui_theme().thinking_bg
+}
+
+fn steering_bg() -> Color {
+    tui_theme().steering_bg
+}
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const LIVE_BACKEND_RING_CAP: usize = 256_000;
 const LIVE_BACKEND_MAX_TOOLS: usize = 8;
@@ -131,22 +223,6 @@ struct PendingLocalAuth {
     responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
 }
 
-#[derive(Clone)]
-struct WorkMapDrawer {
-    text: String,
-    waypoint_ids: Vec<String>,
-    selector: Option<String>,
-    selected: usize,
-    scroll: usize,
-    filter_input: bool,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct ActiveFocusLabel {
-    selection: String,
-    mode: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct WelcomeGit {
     branch: String,
@@ -210,13 +286,6 @@ enum Line_ {
         preview: String,
     },
     Thinking(String),
-    WorkMap {
-        kind: WorkMapEventKind,
-        text: String,
-        waypoint_ids: Vec<String>,
-        selector: Option<String>,
-        selected: usize,
-    },
     Blank,
     TurnSep,
 }
@@ -390,9 +459,19 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "auto-approve all privileged tools",
     },
     SlashCmd {
+        name: "/privacy",
+        args: "[on|strict|off|status]",
+        help: "control output redaction/path guards",
+    },
+    SlashCmd {
         name: "/approval",
         args: "[profile]",
         help: "ask|auto-read|auto-write|never|always",
+    },
+    SlashCmd {
+        name: "/preview",
+        args: "[off|simple|git]",
+        help: "mutation preview mode",
     },
     SlashCmd {
         name: "/sandbox-profile",
@@ -442,12 +521,27 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/effort",
         args: "[level]",
-        help: "off|low|medium|high|xhigh|max",
+        help: "off|minimal|low|medium|high|xhigh|max",
+    },
+    SlashCmd {
+        name: "/reasoning-mode",
+        args: "[standard|pro|next|prev|status]",
+        help: "GPT-5.6 execution mode",
+    },
+    SlashCmd {
+        name: "/context",
+        args: "[standard|frugal|tiny|status]",
+        help: "context and cap mode",
+    },
+    SlashCmd {
+        name: "/tool-profile",
+        args: "[lean|full|status]",
+        help: "provider tool schema verbosity",
     },
     SlashCmd {
         name: "/compact",
-        args: "",
-        help: "summarize older history",
+        args: "[status|auto|N%]",
+        help: "summarize or set threshold",
     },
     SlashCmd {
         name: "/usage",
@@ -465,6 +559,11 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "tokens per message",
     },
     SlashCmd {
+        name: "/diagnostics",
+        args: "",
+        help: "run project diagnostics",
+    },
+    SlashCmd {
         name: "/save",
         args: "<name>",
         help: "save session as JSONL",
@@ -480,28 +579,13 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "load session",
     },
     SlashCmd {
-        name: "/map",
-        args: "[session]",
-        help: "open session map drawer",
-    },
-    SlashCmd {
-        name: "/focus",
-        args: "@wNN [--branch|--exact]",
-        help: "inspect or branch from a moment",
-    },
-    SlashCmd {
-        name: "/branches",
-        args: "",
-        help: "list branches",
-    },
-    SlashCmd {
         name: "/sessions",
-        args: "",
-        help: "list latest + autosaved/named",
+        args: "[list|analyze|brief|grep|failures|verify-log|decisions]",
+        help: "inspect saved session history",
     },
     SlashCmd {
         name: "/session",
-        args: "",
+        args: "[list|analyze|brief|grep|failures|verify-log|decisions]",
         help: "alias for /sessions",
     },
     SlashCmd {
@@ -515,9 +599,24 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "create/discover/invoke shelf packs",
     },
     SlashCmd {
+        name: "/shelves",
+        args: "",
+        help: "list shelf manifests and abilities",
+    },
+    SlashCmd {
+        name: "/project-extensions",
+        args: "[status|reset]",
+        help: "inspect/reset project extension approval",
+    },
+    SlashCmd {
         name: "/hooks",
         args: "[reload]",
         help: "show/reload hooks",
+    },
+    SlashCmd {
+        name: "/undo",
+        args: "[--list|--apply|--prune|id]",
+        help: "preview or restore a checkpoint",
     },
     SlashCmd {
         name: "/version",
@@ -528,8 +627,8 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
 
 static TRUST_ARGS: &[&str] = &["on", "off", "status"];
 static TOOLS_ARGS: &[&str] = &["default", "full", "status"];
-static EFFORT_ARGS: &[&str] = &["off", "low", "medium", "high", "xhigh", "max"];
-static WORK_MAP_SESSION_ARGS: &[&str] = &["current", "latest"];
+static EFFORT_ARGS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+static REASONING_MODE_ARGS: &[&str] = &["standard", "pro", "next", "prev", "status"];
 const SLASH_COMPLETION_MAX_VISIBLE: usize = 7;
 
 struct SlashCompletion {
@@ -724,7 +823,7 @@ fn slash_completions(input: &str) -> Vec<SlashCompletion> {
             "trust" => Some(TRUST_ARGS),
             "tools" => Some(TOOLS_ARGS),
             "effort" => Some(EFFORT_ARGS),
-            "map" | "focus" => Some(WORK_MAP_SESSION_ARGS),
+            "reasoning-mode" => Some(REASONING_MODE_ARGS),
             _ => None,
         };
         if let Some(args) = sub_args {
@@ -847,6 +946,7 @@ struct TuiState {
     frame_count: u64,
     approval_profile: ApprovalProfile,
     thinking_effort: ThinkingEffort,
+    reasoning_mode: ReasoningMode,
     last_expandable: Option<ExpandableBlock>,
     show_help: bool,
     show_todos: bool,
@@ -881,8 +981,6 @@ struct TuiState {
     turn_error_count: usize,
     turn_start_at: Option<Instant>,
     todo_progress: Option<TodoProgress>,
-    work_map: Option<WorkMapDrawer>,
-    active_focus: Option<ActiveFocusLabel>,
     debug_events: VecDeque<String>,
     backend_outputs: VecDeque<BackendOutput>,
     backend_viewer_open: bool,
@@ -973,6 +1071,7 @@ impl TuiState {
             frame_count: 0,
             approval_profile,
             thinking_effort,
+            reasoning_mode: ReasoningMode::default(),
             context_mode: ContextMode::Standard,
             last_expandable: None,
             show_help: false,
@@ -1007,8 +1106,6 @@ impl TuiState {
             turn_error_count: 0,
             turn_start_at: None,
             todo_progress: None,
-            work_map: None,
-            active_focus: None,
             debug_events: VecDeque::new(),
             backend_outputs: VecDeque::new(),
             backend_viewer_open: false,
@@ -1395,10 +1492,7 @@ impl TuiState {
             .or_else(|| self.transcript.last())
             .is_some_and(|line| {
                 Self::line_needs_history_spacing(line)
-                    || matches!(
-                        line,
-                        Line_::Warn(_) | Line_::WorkMap { .. } | Line_::SteeringDelivered { .. }
-                    )
+                    || matches!(line, Line_::Warn(_) | Line_::SteeringDelivered { .. })
                     || matches!(line, Line_::Info(text) if objective_status_text(text).is_some() || phase_status_text(text).is_some())
             })
     }
@@ -1630,63 +1724,6 @@ impl TuiState {
         });
         self.input_display_override =
             abstract_input_with_spans(&self.input, &self.input_preview_spans);
-    }
-
-    fn work_map_is_active(&self) -> bool {
-        self.work_map
-            .as_ref()
-            .is_some_and(|drawer| !drawer.waypoint_ids.is_empty())
-    }
-
-    fn set_work_map_selection(&mut self, selected: usize) {
-        if let Some(drawer) = self.work_map.as_mut() {
-            let max = drawer.waypoint_ids.len().saturating_sub(1);
-            drawer.selected = selected.min(max);
-            let visible_rows = drawer
-                .waypoint_ids
-                .len()
-                .clamp(1, WORK_MAP_DRAWER_MAX_BODY_ROWS);
-            sync_work_map_scroll(drawer, visible_rows);
-        }
-    }
-
-    fn move_work_map_selection(&mut self, delta: isize) -> bool {
-        self.move_work_map_selection_for_rows(delta, WORK_MAP_DRAWER_MAX_BODY_ROWS)
-    }
-
-    fn move_work_map_selection_for_rows(&mut self, delta: isize, visible_rows: usize) -> bool {
-        let Some(drawer) = self.work_map.as_mut() else {
-            return false;
-        };
-        if drawer.waypoint_ids.is_empty() {
-            return false;
-        }
-        let current = drawer
-            .selected
-            .min(drawer.waypoint_ids.len().saturating_sub(1));
-        let next = if delta < 0 {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            current
-                .saturating_add(delta as usize)
-                .min(drawer.waypoint_ids.len().saturating_sub(1))
-        };
-        if next == current {
-            return false;
-        }
-        drawer.selected = next;
-        sync_work_map_scroll(drawer, visible_rows);
-        true
-    }
-
-    fn selected_work_map_command_arg(&self) -> Option<String> {
-        let drawer = self.work_map.as_ref()?;
-        let id = drawer.waypoint_ids.get(drawer.selected)?;
-        if let Some(selector) = drawer.selector.as_deref().filter(|s| !s.trim().is_empty()) {
-            Some(format!("{} {id}", selector.trim()))
-        } else {
-            Some(id.clone())
-        }
     }
 
     fn managed_region_contains(&self, column: u16, row: u16) -> bool {
@@ -2105,6 +2142,10 @@ impl TuiState {
                 self.push_debug_event(format!("thinking effort changed · {}", effort.as_str()));
                 self.thinking_effort = effort;
             }
+            AgentEvent::ReasoningModeChanged { mode } => {
+                self.push_debug_event(format!("reasoning mode changed · {}", mode.as_str()));
+                self.reasoning_mode = mode;
+            }
             AgentEvent::ApprovalProfileChanged { profile } => {
                 self.push_debug_event(format!("approval profile changed · {}", profile.as_str()));
                 self.approval_profile = profile;
@@ -2160,58 +2201,8 @@ impl TuiState {
                 self.stream_chars = 0;
                 self.live_tools.clear();
                 self.set_agent_busy(false);
-                if s.starts_with("focus cleared;") || s.starts_with("cleared ") {
-                    self.active_focus = None;
-                }
                 self.status = phase_status_text(&s).unwrap_or_else(|| "ready".into());
                 self.queue(Line_::Info(s));
-            }
-            AgentEvent::WorkMap {
-                kind,
-                text,
-                waypoint_ids,
-                selector,
-            } => {
-                self.push_debug_event(format!(
-                    "work map · {kind:?} · {} waypoints",
-                    waypoint_ids.len()
-                ));
-                self.compacting = false;
-                self.compacting_resume_busy = false;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
-                self.stream_started_at = None;
-                self.stream_chars = 0;
-                self.live_tools.clear();
-                self.set_agent_busy(false);
-                if matches!(kind, WorkMapEventKind::Focus)
-                    && let Some(focus) = parse_work_map_focus_label(&text)
-                {
-                    self.active_focus = Some(focus);
-                }
-                let visible_ids = visible_work_map_ids(&text, &waypoint_ids);
-                if matches!(kind, WorkMapEventKind::Map) && !visible_ids.is_empty() {
-                    self.work_map = Some(WorkMapDrawer {
-                        text,
-                        waypoint_ids: visible_ids,
-                        selector,
-                        selected: 0,
-                        scroll: 0,
-                        filter_input: false,
-                    });
-                    self.status = "session map open: ↑/↓/PgUp/PgDn navigate · Enter inspect · f edit · b branch · z filter · Esc close"
-                        .into();
-                } else {
-                    self.work_map = None;
-                    self.status = "session map ready".into();
-                    self.queue(Line_::WorkMap {
-                        kind,
-                        text,
-                        waypoint_ids: visible_ids,
-                        selector,
-                        selected: 0,
-                    });
-                }
             }
             AgentEvent::TurnEnd { failed, .. } => {
                 self.push_debug_event(if failed {
@@ -2435,7 +2426,13 @@ fn todo_progress_from_content(content: &str) -> Option<TodoProgress> {
 }
 
 fn todo_items_from_path(path: &std::path::Path) -> Option<Vec<TodoItem>> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = crate::read_utf8_regular_file_with_limit(
+        path,
+        crate::TODO_STATE_MAX_BYTES,
+        None,
+        "todo view",
+    )
+    .ok()?;
     let items = serde_json::from_str::<Value>(&content).ok()?;
     let items = items.as_array()?;
     Some(
@@ -2626,11 +2623,14 @@ fn live_thinking_detail_line(
     max_cells: usize,
     context_mode: ContextMode,
 ) -> Line<'static> {
-    let style = Style::default().fg(Color::Gray).bg(THINKING_BG);
+    let theme = tui_theme();
+    let style = Style::default().fg(theme.thinking_fg).bg(theme.thinking_bg);
     Line::from(vec![
         Span::styled(
             "• ",
-            Style::default().fg(Color::Indexed(244)).bg(THINKING_BG),
+            Style::default()
+                .fg(theme.thinking_marker)
+                .bg(theme.thinking_bg),
         ),
         Span::styled(
             clamp_chars(
@@ -2837,6 +2837,12 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
         state.thinking_effort.as_str().to_string(),
         Style::default().fg(Color::Magenta),
     ));
+    if state.reasoning_mode == ReasoningMode::Pro {
+        spans.push(Span::styled(
+            "/pro",
+            Style::default().fg(Color::LightMagenta),
+        ));
+    }
 
     match state.approval_profile {
         ApprovalProfile::Ask | ApprovalProfile::Always => {}
@@ -2850,17 +2856,6 @@ fn status_spans(state: &TuiState) -> Vec<Span<'_>> {
                 Style::default().fg(Color::Yellow),
             ));
         }
-    }
-
-    if let Some(focus) = &state.active_focus {
-        spans.push(Span::styled(
-            " │ focus ",
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!("{} {}", clamp_chars(&focus.selection, 18), focus.mode),
-            Style::default().fg(Color::Yellow),
-        ));
     }
 
     if let Some((_, _, pct, color)) = context_usage(state) {
@@ -3254,27 +3249,6 @@ fn replace_last_permission_entry(items: &mut Vec<Line_>, replacement: Line_) -> 
     } else {
         false
     }
-}
-
-fn parse_work_map_focus_label(text: &str) -> Option<ActiveFocusLabel> {
-    let first = text.lines().next()?.trim();
-    let body = first.strip_prefix("[dext focus ")?.strip_suffix(']')?;
-    let (selection, mode) = body.split_once(" mode=")?;
-    Some(ActiveFocusLabel {
-        selection: selection.trim().to_string(),
-        mode: mode.trim().to_string(),
-    })
-}
-
-fn visible_work_map_ids(text: &str, waypoint_ids: &[String]) -> Vec<String> {
-    waypoint_ids
-        .iter()
-        .filter(|id| {
-            text.lines()
-                .any(|line| line.trim_start().starts_with(id.as_str()))
-        })
-        .cloned()
-        .collect()
 }
 
 fn extract_path_from_summary(summary: &str) -> Option<String> {
@@ -4132,30 +4106,8 @@ fn input_panel_height(state: &TuiState, area_height: u16, area_width: u16) -> u1
     let (wrapped, _, _) =
         wrap_input_visual(editor_text.as_ref(), input_display_cursor(state), cols);
     let text_rows = wrapped.len().max(1) as u16;
-    let drawer_rows = work_map_drawer_height(state, area_width) as u16;
-    let desired = text_rows.saturating_add(2).saturating_add(drawer_rows);
+    let desired = text_rows.saturating_add(2);
     desired.clamp(min_panel, max_panel)
-}
-
-fn work_map_drawer_body_rows(state: &TuiState) -> usize {
-    state
-        .work_map
-        .as_ref()
-        .map(|drawer| {
-            drawer
-                .waypoint_ids
-                .len()
-                .clamp(1, WORK_MAP_DRAWER_MAX_BODY_ROWS)
-        })
-        .unwrap_or(0)
-}
-
-fn work_map_drawer_height(state: &TuiState, area_width: u16) -> usize {
-    if !state.work_map_is_active() || area_width == 0 {
-        return 0;
-    }
-    let body_rows = work_map_drawer_body_rows(state);
-    (body_rows + 2).min(WORK_MAP_DRAWER_MAX_ROWS)
 }
 
 fn count_words(s: &str) -> usize {
@@ -5686,6 +5638,7 @@ fn welcome_session_index(root: &std::path::Path, session_id: &str, session_enabl
 fn welcome_effort_label(effort: ThinkingEffort) -> &'static str {
     match effort {
         ThinkingEffort::Off => "Off",
+        ThinkingEffort::Minimal => "Minimal",
         ThinkingEffort::Low => "Low",
         ThinkingEffort::Medium => "Medium",
         ThinkingEffort::High => "High",
@@ -6397,13 +6350,14 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
         }
         Line_::Steering(s) => {
             let sanitized = sanitize_display_text(s);
+            let theme = tui_theme();
             let body_style = Style::default()
-                .fg(Color::Indexed(215))
-                .bg(STEERING_BG)
+                .fg(theme.steering_fg)
+                .bg(theme.steering_bg)
                 .add_modifier(Modifier::ITALIC);
             let gutter_style = Style::default()
-                .fg(Color::Indexed(214))
-                .bg(STEERING_BG)
+                .fg(theme.steering_gutter)
+                .bg(theme.steering_bg)
                 .add_modifier(Modifier::BOLD);
             push_prefixed_wrapped_line(
                 &mut lines,
@@ -6435,11 +6389,14 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
         }
         Line_::Thinking(s) => {
             let sanitized = sanitize_display_text(s);
+            let theme = tui_theme();
             let thinking_style = Style::default()
-                .fg(Color::Gray)
-                .bg(THINKING_BG)
+                .fg(theme.thinking_fg)
+                .bg(theme.thinking_bg)
                 .add_modifier(Modifier::ITALIC);
-            let marker_style = Style::default().fg(Color::Indexed(244)).bg(THINKING_BG);
+            let marker_style = Style::default()
+                .fg(theme.thinking_marker)
+                .bg(theme.thinking_bg);
             push_thinking_body_lines(&mut lines, &sanitized, marker_style, thinking_style, width);
             let remaining = reasoning_paragraphs(&sanitized).len().saturating_sub(20);
             if remaining > 0 {
@@ -6455,114 +6412,9 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 );
             }
         }
-        Line_::WorkMap {
-            kind,
-            text,
-            waypoint_ids,
-            selected,
-            ..
-        } => push_work_map_lines(&mut lines, *kind, text, waypoint_ids, *selected, width),
         Line_::Blank => lines.push(Line::from("")),
     }
     Text::from(lines)
-}
-
-fn normalize_work_map_label(raw: &str) -> String {
-    let trimmed = raw.trim_start();
-    let indent = &raw[..raw.len() - trimmed.len()];
-    for (label, normalized) in [
-        ("objective:", "Objective:"),
-        ("checkpoints:", "Checkpoints:"),
-        ("probe:", "Probe:"),
-        ("final response:", "Final response:"),
-    ] {
-        if let Some(rest) = trimmed.strip_prefix(label) {
-            return format!("{indent}{normalized}{rest}");
-        }
-    }
-    raw.to_string()
-}
-
-fn work_map_line_style(raw: &str, is_selected: bool) -> Style {
-    let trimmed = raw.trim_start();
-    let mut style = if trimmed.starts_with("Session map")
-        || trimmed.starts_with("Work map")
-        || trimmed.starts_with("[dext")
-    {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if trimmed.starts_with("commands:") {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default()
-    };
-    if is_selected {
-        style = style
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-    }
-    style
-}
-
-fn push_work_map_lines(
-    lines: &mut Vec<Line<'static>>,
-    kind: WorkMapEventKind,
-    text: &str,
-    waypoint_ids: &[String],
-    selected: usize,
-    width: u16,
-) {
-    let title = match kind {
-        WorkMapEventKind::Map => "Session map",
-        WorkMapEventKind::Packet => "Packet",
-        WorkMapEventKind::Focus => "Focus",
-        WorkMapEventKind::Tracks => "Branches",
-    };
-    let selected_id = waypoint_ids.get(selected).map(String::as_str);
-    let border_style = Style::default().fg(Color::Cyan);
-    let title_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    lines.push(Line::from(vec![
-        Span::styled("▌ ", border_style),
-        Span::styled(title.to_string(), title_style),
-        Span::styled("  ".to_string(), Style::default()),
-        Span::styled(
-            if waypoint_ids.is_empty() {
-                "(static text)".to_string()
-            } else {
-                "↑/↓/PgUp/PgDn navigate · Enter inspect · f edit · b branch · z filter · Esc close"
-                    .to_string()
-            },
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-
-    let body_width = width.saturating_sub(2).max(1);
-    for raw in sanitize_display_text(text).lines() {
-        let raw = normalize_work_map_label(raw);
-        let trimmed = raw.trim_start();
-        let is_selected = selected_id.is_some_and(|id| trimmed.starts_with(id));
-        let body_style = work_map_line_style(&raw, is_selected);
-        let prefix_style = if is_selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-        let prefix = if is_selected { "▶ " } else { "│ " };
-        for (idx, wrapped) in wrap_plain_visual(&raw, body_width as usize)
-            .into_iter()
-            .enumerate()
-        {
-            let line_prefix = if idx == 0 { prefix } else { "  " };
-            lines.push(Line::from(vec![
-                Span::styled(line_prefix.to_string(), prefix_style),
-                Span::styled(wrapped, body_style),
-            ]));
-        }
-    }
 }
 
 fn rg_display_content(content: &str) -> String {
@@ -6984,8 +6836,8 @@ fn insert_transcript_items<B: Backend>(
     for item in items {
         let (text, height) = cached_transcript_render(state, item, width);
         let tint_bg = match item {
-            Line_::Thinking(_) => Some(THINKING_BG),
-            Line_::Steering(_) => Some(STEERING_BG),
+            Line_::Thinking(_) => Some(thinking_bg()),
+            Line_::Steering(_) => Some(steering_bg()),
             _ => next_transcript_tint(item, tool_tint_parity),
         };
         let text = Arc::new(text);
@@ -7215,16 +7067,6 @@ fn input_hint_text(state: &TuiState) -> &'static str {
         "login input masked · Enter submits locally · Esc clear/cancel"
     } else if state.pending_perm.is_some() {
         "y once · a always · n deny"
-    } else if state.work_map_is_active() {
-        if state
-            .work_map
-            .as_ref()
-            .is_some_and(|drawer| drawer.filter_input)
-        {
-            "type filter · Enter opens filtered map · Esc cancel"
-        } else {
-            "Enter inspect · f edit · b branch · z filter · Esc close"
-        }
     } else if state.input_display_override.is_some() {
         "paste preview · Enter sends full input"
     } else {
@@ -7641,122 +7483,6 @@ fn slash_popup_layout(
     })
 }
 
-fn work_map_drawer_rows(drawer: &WorkMapDrawer) -> Vec<String> {
-    let sanitized = sanitize_display_text(&drawer.text);
-    let text_lines = sanitized.lines().collect::<Vec<_>>();
-    drawer
-        .waypoint_ids
-        .iter()
-        .map(|id| {
-            text_lines
-                .iter()
-                .find(|line| line.trim_start().starts_with(id.as_str()))
-                .map(|line| line.trim_start().to_string())
-                .unwrap_or_else(|| id.clone())
-        })
-        .collect()
-}
-
-fn sync_work_map_scroll(drawer: &mut WorkMapDrawer, visible_rows: usize) {
-    if visible_rows == 0 || drawer.waypoint_ids.is_empty() {
-        drawer.scroll = 0;
-        return;
-    }
-    let max_selected = drawer.waypoint_ids.len().saturating_sub(1);
-    drawer.selected = drawer.selected.min(max_selected);
-    if drawer.selected < drawer.scroll {
-        drawer.scroll = drawer.selected;
-    } else if drawer.selected >= drawer.scroll.saturating_add(visible_rows) {
-        drawer.scroll = drawer
-            .selected
-            .saturating_add(1)
-            .saturating_sub(visible_rows);
-    }
-    let max_scroll = drawer.waypoint_ids.len().saturating_sub(visible_rows);
-    drawer.scroll = drawer.scroll.min(max_scroll);
-}
-
-fn work_map_drawer_lines(state: &mut TuiState, width: u16, height: usize) -> Vec<Line<'static>> {
-    if height < 3 || width == 0 {
-        return Vec::new();
-    }
-    let Some(drawer) = state.work_map.as_mut() else {
-        return Vec::new();
-    };
-    if drawer.waypoint_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let body_rows = height.saturating_sub(2).min(WORK_MAP_DRAWER_MAX_BODY_ROWS);
-    if body_rows == 0 {
-        return Vec::new();
-    }
-    sync_work_map_scroll(drawer, body_rows);
-
-    let rows = work_map_drawer_rows(drawer);
-    let total = drawer.waypoint_ids.len();
-    let selected = drawer.selected.min(total.saturating_sub(1));
-    let selected_id = drawer
-        .waypoint_ids
-        .get(selected)
-        .map(String::as_str)
-        .unwrap_or("?");
-    let inner_width = width.max(1) as usize;
-    let mut lines = Vec::with_capacity(height);
-    let title = format!("▌ Session map  {selected_id}  {}/{}", selected + 1, total);
-    lines.push(Line::from(vec![Span::styled(
-        clamp_chars(&title, inner_width),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )]));
-
-    for idx in drawer.scroll..drawer.scroll.saturating_add(body_rows).min(total) {
-        let raw = rows.get(idx).map(String::as_str).unwrap_or_else(|| {
-            drawer
-                .waypoint_ids
-                .get(idx)
-                .map(String::as_str)
-                .unwrap_or("?")
-        });
-        let is_selected = idx == selected;
-        let prefix = if is_selected { "▶ " } else { "  " };
-        let prefix_style = if is_selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let body_width = inner_width.saturating_sub(text_width(prefix)).max(1);
-        lines.push(Line::from(vec![
-            Span::styled(prefix.to_string(), prefix_style),
-            Span::styled(
-                clamp_chars(raw, body_width),
-                work_map_line_style(raw, is_selected),
-            ),
-        ]));
-    }
-
-    while lines.len() < height.saturating_sub(1) {
-        lines.push(Line::from(""));
-    }
-
-    let first_visible = drawer.scroll.saturating_add(1).min(total);
-    let last_visible = drawer.scroll.saturating_add(body_rows).min(total);
-    let scroll_hint = if total > body_rows {
-        format!("showing {first_visible}-{last_visible}/{total} · ")
-    } else {
-        String::new()
-    };
-    lines.push(Line::from(Span::styled(
-        clamp_chars(
-            &format!("  {scroll_hint}Enter inspect · f edit · b branch · z filter · Esc close"),
-            inner_width,
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines
-}
-
 fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
     let inner = width.saturating_sub(2).max(1) as usize;
     let mut lines = Vec::new();
@@ -7772,18 +7498,6 @@ fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
             Style::default().fg(Color::Cyan),
         ),
     ]));
-    if let Some(focus) = &state.active_focus {
-        lines.push(Line::from(vec![
-            Span::styled("Focus  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                clamp_chars(
-                    &format!("{} {}", focus.selection, focus.mode),
-                    inner.saturating_sub(7),
-                ),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    }
     if let Some((ctx_used, window, pct, color)) = context_usage(state) {
         lines.push(Line::from(vec![
             Span::styled("Context ", Style::default().fg(Color::DarkGray)),
@@ -8411,17 +8125,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     let (wrapped, cursor_row, cursor_col) =
         wrap_input_visual(editor_text.as_ref(), display_cursor, wrap_cols);
     let inner_rows = input_area.height.saturating_sub(2).max(1) as usize;
-    let drawer_height = work_map_drawer_height(state, input_area.width).min(inner_rows);
-    let hint_rows = 0usize;
-    let mut text_rows_visible = inner_rows
-        .saturating_sub(drawer_height)
-        .saturating_sub(hint_rows)
-        .max(WORK_MAP_DRAWER_MIN_EDITOR_ROWS);
-    let drawer_rows = drawer_height.min(inner_rows.saturating_sub(text_rows_visible + hint_rows));
-    text_rows_visible = inner_rows
-        .saturating_sub(drawer_rows)
-        .saturating_sub(hint_rows)
-        .max(WORK_MAP_DRAWER_MIN_EDITOR_ROWS);
+    let text_rows_visible = inner_rows;
 
     let mut start_row = 0usize;
     if wrapped.len() > text_rows_visible {
@@ -8438,10 +8142,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     while lines.len() < text_rows_visible {
         lines.push(Line::from(""));
     }
-    if drawer_rows > 0 {
-        lines.extend(work_map_drawer_lines(state, wrap_cols as u16, drawer_rows));
-    }
-
     let hint = input_hint_text(state);
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -8458,7 +8158,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         && state.pending_perm.is_none()
         && !state.show_help
         && !state.show_todos
-        && !state.work_map_is_active()
         && input_area.width > 0
         && input_area.height > 0
     {
@@ -8502,7 +8201,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         && !state.show_todos
         && state.pending_local_auth.is_none()
         && state.pending_perm.is_none()
-        && !state.work_map_is_active()
         && !state.show_inspector
         && (!state.agent_busy || state.input.starts_with('/'))
     {
@@ -8669,148 +8367,6 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
             state.scroll_transcript_by(-1);
         }
         _ => {}
-    }
-}
-
-fn insert_command_into_input(state: &mut TuiState, command: String) {
-    state.replace_input(command);
-    state.clear_slash_completion_selection();
-}
-
-fn work_map_command_prefix(drawer: &WorkMapDrawer) -> String {
-    if let Some(selector) = drawer.selector.as_deref().filter(|s| !s.trim().is_empty()) {
-        format!("/map {} ", selector.trim())
-    } else {
-        "/map ".to_string()
-    }
-}
-
-fn handle_work_map_key(
-    state: &mut TuiState,
-    key: KeyEvent,
-    agent_input: &tokio::sync::mpsc::UnboundedSender<FromTui>,
-) -> bool {
-    if !state.work_map_is_active() {
-        return false;
-    }
-    if state
-        .work_map
-        .as_ref()
-        .is_some_and(|drawer| drawer.filter_input)
-    {
-        match key.code {
-            KeyCode::Esc => {
-                if let Some(drawer) = state.work_map.as_mut() {
-                    drawer.filter_input = false;
-                }
-                state.status = "session map filter canceled".to_string();
-                true
-            }
-            KeyCode::Enter => {
-                let command = state.input.trim().to_string();
-                if command.is_empty() {
-                    return true;
-                }
-                state.work_map = None;
-                state.clear_slash_completion_selection();
-                state.status = "opening filtered session map".to_string();
-                let _ = agent_input.send(FromTui::Submit(command));
-                state.clear_input();
-                true
-            }
-            _ => false,
-        }
-    } else {
-        match key.code {
-            KeyCode::Esc => {
-                state.work_map = None;
-                state.status = "session map drawer closed".to_string();
-                true
-            }
-            KeyCode::Up => {
-                if state.move_work_map_selection(-1) {
-                    state.status = "session map selection moved".to_string();
-                }
-                true
-            }
-            KeyCode::Down => {
-                if state.move_work_map_selection(1) {
-                    state.status = "session map selection moved".to_string();
-                }
-                true
-            }
-            KeyCode::PageUp => {
-                let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
-                if state.move_work_map_selection_for_rows(-step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
-                    state.status = "session map selection moved".to_string();
-                }
-                true
-            }
-            KeyCode::PageDown => {
-                let step = work_map_drawer_body_rows(state).saturating_sub(1).max(1) as isize;
-                if state.move_work_map_selection_for_rows(step, WORK_MAP_DRAWER_MAX_BODY_ROWS) {
-                    state.status = "session map selection moved".to_string();
-                }
-                true
-            }
-            KeyCode::Home => {
-                state.set_work_map_selection(0);
-                state.status = "session map selection moved".to_string();
-                true
-            }
-            KeyCode::End => {
-                if let Some(last) = state
-                    .work_map
-                    .as_ref()
-                    .map(|drawer| drawer.waypoint_ids.len().saturating_sub(1))
-                {
-                    state.set_work_map_selection(last);
-                    state.status = "session map selection moved".to_string();
-                }
-                true
-            }
-            KeyCode::Enter => {
-                if let Some(arg) = state.selected_work_map_command_arg() {
-                    state.work_map = None;
-                    state.clear_slash_completion_selection();
-                    state.status = "inspecting moment".to_string();
-                    let _ = agent_input.send(FromTui::Submit(format!("/focus {arg}")));
-                }
-                true
-            }
-            KeyCode::Char('f') | KeyCode::Char('F') | KeyCode::Char('i') | KeyCode::Char('I') => {
-                if let Some(arg) = state.selected_work_map_command_arg() {
-                    insert_command_into_input(state, format!("/focus {arg}"));
-                    state.work_map = None;
-                    state.status = "inserted /focus command".to_string();
-                }
-                true
-            }
-            KeyCode::Char('b') | KeyCode::Char('B') => {
-                if let Some(arg) = state.selected_work_map_command_arg() {
-                    insert_command_into_input(state, format!("/focus {arg} --branch"));
-                    state.work_map = None;
-                    state.status = "inserted branch command".to_string();
-                }
-                true
-            }
-            KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('/') => {
-                let prefix = state
-                    .work_map
-                    .as_ref()
-                    .map(work_map_command_prefix)
-                    .unwrap_or_else(|| "/map ".to_string());
-                if let Some(drawer) = state.work_map.as_mut() {
-                    drawer.filter_input = true;
-                }
-                state.replace_input(prefix);
-                state.status =
-                    "session map filter: type failures|changes|verify|file <path>|query <text>"
-                        .to_string();
-                true
-            }
-            _ => false,
-        }
     }
 }
 
@@ -9107,9 +8663,6 @@ fn handle_key(
     if handle_login_input_key(state, key, agent_input) {
         return;
     }
-    if state.work_map_is_active() && handle_work_map_key(state, key, agent_input) {
-        return;
-    }
     if state.pending_perm.is_some() {
         let default_choice = state
             .pending_perm
@@ -9248,10 +8801,7 @@ fn handle_key(
             };
         }
         (KeyCode::Esc, _) => {
-            if state.work_map_is_active() {
-                state.work_map = None;
-                state.status = "session map drawer closed".to_string();
-            } else if state.show_help {
+            if state.show_help {
                 state.show_help = false;
             } else if state.show_inspector {
                 state.show_inspector = false;
@@ -9298,7 +8848,6 @@ fn handle_key(
             state.refresh_input_display_override();
         }
         (KeyCode::Enter, _) => {
-            state.work_map = None;
             let text = crate::normalize_user_input_path(&state.input);
             if text.trim().is_empty() {
                 return;
@@ -9720,6 +9269,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let sandbox = agent.sandbox_root.display().to_string();
     let approval_profile = agent.approval_profile();
     let thinking_effort = agent.thinking_effort();
+    let reasoning_mode = agent.reasoning_mode();
     let context_mode = agent.context_mode;
     let session_index = welcome_session_index(
         &agent.sandbox_root,
@@ -9794,6 +9344,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         thinking_effort,
     );
     state.context_mode = context_mode;
+    state.reasoning_mode = reasoning_mode;
     agent.git_context = git_context.clone();
     state.git_branch = git_context.clone();
     state.git_refresh_in_flight = git_probe_pending;
@@ -10157,7 +9708,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env_lock().lock().expect("env lock")
+        crate::test_env_lock()
     }
 
     fn tool_line(
@@ -10919,6 +10470,24 @@ mod tests {
     }
 
     #[test]
+    fn tui_theme_override_and_background_hint_select_contrasting_palettes() {
+        let dark = resolve_tui_theme(Some("dark"), Some("0;15"));
+        let light = resolve_tui_theme(Some("light"), Some("15;0"));
+        let detected_light = resolve_tui_theme(None, Some("0;15"));
+        let detected_dark = resolve_tui_theme(None, Some("15;0"));
+        let detected_dark_indexed = resolve_tui_theme(None, Some("15;235"));
+        let detected_light_indexed = resolve_tui_theme(None, Some("0;255"));
+
+        assert_eq!(dark.thinking_bg, DARK_THEME.thinking_bg);
+        assert_eq!(light.thinking_bg, LIGHT_THEME.thinking_bg);
+        assert_eq!(detected_light.steering_bg, LIGHT_THEME.steering_bg);
+        assert_eq!(detected_dark.steering_bg, DARK_THEME.steering_bg);
+        assert_eq!(detected_dark_indexed.thinking_bg, DARK_THEME.thinking_bg);
+        assert_eq!(detected_light_indexed.thinking_bg, LIGHT_THEME.thinking_bg);
+        assert_ne!(light.thinking_fg, dark.thinking_fg);
+    }
+
+    #[test]
     fn status_spans_do_not_render_trust_indicator() {
         let state = TuiState::new(
             "test-model".to_string(),
@@ -10994,6 +10563,30 @@ mod tests {
             line.find("Branch(Main (dirty))").unwrap() < line.find("GPT-5.5").unwrap(),
             "{line}"
         );
+    }
+
+    #[test]
+    fn status_bar_shows_selected_pro_mode_without_cluttering_standard() {
+        let mut state = TuiState::new(
+            "gpt-5.6-sol".to_string(),
+            model_context_window("gpt-5.6-sol"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Max,
+        );
+        let standard = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+        assert!(standard.contains("max"), "{standard}");
+        assert!(!standard.contains("/pro"), "{standard}");
+
+        state.reasoning_mode = ReasoningMode::Pro;
+        let pro = status_spans(&state)
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>();
+        assert!(pro.contains("max/pro"), "{pro}");
     }
 
     #[test]
@@ -12038,54 +11631,6 @@ mod tests {
     }
 
     #[test]
-    fn inserts_blank_between_work_map_and_next_transcript_block() {
-        let mut state = TuiState::new(
-            "test-model".to_string(),
-            model_context_window("test-model"),
-            ".".to_string(),
-            ApprovalProfile::Ask,
-            ThinkingEffort::Medium,
-        );
-        state.queue(Line_::WorkMap {
-            kind: WorkMapEventKind::Packet,
-            text: "Objective: finish cleanup\nprobe: validate one item\nFinal response: apply requested"
-                .to_string(),
-            waypoint_ids: Vec::new(),
-            selector: None,
-            selected: 0,
-        });
-        state.queue(Line_::Thinking(
-            "Reviewing git diff before commit".to_string(),
-        ));
-
-        assert!(matches!(
-            state.pending_insert.as_slice(),
-            [Line_::WorkMap { .. }, Line_::Blank, Line_::Thinking(_)]
-        ));
-
-        state.pending_insert.clear();
-        state.queue(Line_::WorkMap {
-            kind: WorkMapEventKind::Packet,
-            text: "Final response: apply requested".to_string(),
-            waypoint_ids: Vec::new(),
-            selector: None,
-            selected: 0,
-        });
-        state.queue(tool_line(
-            "call_1",
-            "rg",
-            "rg: spacing",
-            Some(true),
-            "match",
-        ));
-
-        assert!(matches!(
-            state.pending_insert.as_slice(),
-            [Line_::WorkMap { .. }, Line_::Blank, Line_::Tool { name, .. }] if name == "rg"
-        ));
-    }
-
-    #[test]
     fn tool_advisory_stays_with_tool_and_separates_next_block() {
         let next_blocks = [
             Line_::Thinking("Planning the next step".to_string()),
@@ -12240,158 +11785,6 @@ mod tests {
     }
 
     #[test]
-    fn work_map_packet_still_renders_in_transcript() {
-        let mut state = TuiState::new(
-            "test-model".to_string(),
-            model_context_window("test-model"),
-            ".".to_string(),
-            ApprovalProfile::Ask,
-            ThinkingEffort::Medium,
-        );
-        state.apply_event(AgentEvent::WorkMap {
-            kind: WorkMapEventKind::Packet,
-            text: "[dext packet @w01]\nsource: current".to_string(),
-            waypoint_ids: vec!["@w01".to_string()],
-            selector: None,
-        });
-
-        assert!(!state.work_map_is_active());
-        assert!(state.active_focus.is_none());
-        assert!(matches!(
-            state.pending_insert.last(),
-            Some(Line_::WorkMap { .. })
-        ));
-        let lines = flatten_lines(&line_to_text(state.pending_insert.last().unwrap(), 80));
-        assert!(
-            lines.iter().any(|line| line.contains("Packet")),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn work_map_event_opens_input_drawer_and_keyboard_inserts_commands() {
-        let mut state = TuiState::new(
-            "test-model".to_string(),
-            model_context_window("test-model"),
-            ".".to_string(),
-            ApprovalProfile::Ask,
-            ThinkingEffort::Medium,
-        );
-        state.apply_event(AgentEvent::WorkMap {
-            kind: WorkMapEventKind::Map,
-            text: "Session map — current\n@w01 intent #1  first\n@w02 change #2  second\ncommands: /focus @wNN".to_string(),
-            waypoint_ids: vec!["@w01".to_string(), "@w02".to_string(), "@w99".to_string()],
-            selector: None,
-        });
-
-        assert!(state.work_map_is_active());
-        assert!(state.pending_insert.is_empty());
-        let lines = flatten_lines(&Text::from(work_map_drawer_lines(&mut state, 80, 4)));
-        assert!(
-            lines.iter().any(|line| line.contains("Session map")),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|line| line.starts_with("▶ @w01")),
-            "{lines:?}"
-        );
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<FromTui>();
-        handle_work_map_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
-            &tx,
-        );
-        let lines = flatten_lines(&Text::from(work_map_drawer_lines(&mut state, 80, 4)));
-        assert!(
-            lines.iter().any(|line| line.starts_with("▶ @w02")),
-            "{lines:?}"
-        );
-        handle_work_map_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()),
-            &tx,
-        );
-
-        assert_eq!(state.input, "/focus @w02 --branch");
-        assert!(!state.work_map_is_active());
-
-        state.apply_event(AgentEvent::WorkMap {
-            kind: WorkMapEventKind::Focus,
-            text: "[dext focus @w02 mode=exact]\nSafety: focus changes model context only"
-                .to_string(),
-            waypoint_ids: vec!["@w02".to_string()],
-            selector: None,
-        });
-        assert_eq!(
-            state
-                .active_focus
-                .as_ref()
-                .map(|focus| (focus.selection.as_str(), focus.mode.as_str())),
-            Some(("@w02", "exact"))
-        );
-        let rendered = status_spans(&state)
-            .into_iter()
-            .map(|span| span.content)
-            .collect::<String>();
-        assert!(rendered.contains("focus @w02 exact"), "{rendered}");
-        state.apply_event(AgentEvent::Slash(
-            "focus cleared; full session history is active again".to_string(),
-        ));
-        assert!(state.active_focus.is_none());
-
-        state.input.clear();
-        state.cursor = 0;
-        state.apply_event(AgentEvent::WorkMap {
-            kind: WorkMapEventKind::Map,
-            text: "Session map — old-session\n@w01 intent #1  first".to_string(),
-            waypoint_ids: vec!["@w01".to_string()],
-            selector: Some("old-session".to_string()),
-        });
-        handle_work_map_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::empty()),
-            &tx,
-        );
-        assert_eq!(state.input, "/map old-session ");
-        assert!(
-            state
-                .work_map
-                .as_ref()
-                .is_some_and(|drawer| drawer.filter_input)
-        );
-        state.insert_input_str("failures");
-        handle_work_map_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        );
-        assert!(!state.work_map_is_active());
-        assert_eq!(state.input, "");
-        match rx.try_recv() {
-            Ok(FromTui::Submit(text)) => assert_eq!(text, "/map old-session failures"),
-            _ => panic!("expected filtered map submit"),
-        }
-
-        state.apply_event(AgentEvent::WorkMap {
-            kind: WorkMapEventKind::Map,
-            text: "Session map — old-session\n@w01 intent #1  first".to_string(),
-            waypoint_ids: vec!["@w01".to_string()],
-            selector: Some("old-session".to_string()),
-        });
-        handle_work_map_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-            &tx,
-        );
-        assert_eq!(state.input, "");
-        match rx.try_recv() {
-            Ok(FromTui::Submit(text)) => assert_eq!(text, "/focus old-session @w01"),
-            _ => panic!("expected focus submit"),
-        }
-    }
-
-    #[test]
     fn completed_thinking_can_be_hidden() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -12498,7 +11891,7 @@ mod tests {
             "live indicator should be allowed to fill/break at terminal border: {lines:?}"
         );
         let style = span_style_for(&text, "xxx").expect("streaming thinking detail");
-        assert_eq!(style.bg, Some(THINKING_BG));
+        assert_eq!(style.bg, Some(thinking_bg()));
         assert!(
             lines[1].starts_with("• "),
             "live thinking detail: {lines:?}"
@@ -12540,8 +11933,8 @@ mod tests {
         let body_style = span_style_for(&text, "checking").expect("thinking body");
         let lines = flatten_lines(&text);
 
-        assert_eq!(body_style.bg, Some(THINKING_BG));
-        assert_eq!(body_style.fg, Some(Color::Gray));
+        assert_eq!(body_style.bg, Some(thinking_bg()));
+        assert_eq!(body_style.fg, Some(tui_theme().thinking_fg));
         assert_eq!(
             lines.first().map(String::as_str),
             Some("• checking the next step")
@@ -12571,11 +11964,11 @@ mod tests {
             Some("┃ wolf = dext my bad. old names.")
         );
         assert!(lines.iter().all(|line| !line.contains(">>")));
-        assert_eq!(body_style.bg, Some(STEERING_BG));
-        assert_eq!(gutter_style.bg, Some(STEERING_BG));
-        assert_ne!(body_style.bg, Some(THINKING_BG));
-        assert_eq!(body_style.fg, Some(Color::Indexed(215)));
-        assert_eq!(gutter_style.fg, Some(Color::Indexed(214)));
+        assert_eq!(body_style.bg, Some(steering_bg()));
+        assert_eq!(gutter_style.bg, Some(steering_bg()));
+        assert_ne!(body_style.bg, Some(thinking_bg()));
+        assert_eq!(body_style.fg, Some(tui_theme().steering_fg));
+        assert_eq!(gutter_style.fg, Some(tui_theme().steering_gutter));
         assert!(gutter_style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -12641,6 +12034,7 @@ mod tests {
             commands: 1,
             model_changed: false,
             effort_changed: true,
+            mode_changed: false,
             stream_aborted: true,
         });
 
@@ -13822,6 +13216,56 @@ mod tests {
     #[cfg(not(unix))]
     fn keyboard_enhancement_is_off_for_non_unix() {
         assert!(!terminal_supports_keyboard_enhancement());
+    }
+
+    #[test]
+    fn slash_completion_exposes_reasoning_controls_and_all_effort_levels() {
+        let command_texts = slash_completions("/reason")
+            .into_iter()
+            .map(|completion| completion.text)
+            .collect::<Vec<_>>();
+        assert_eq!(command_texts, ["/reasoning-mode"]);
+
+        let mode_texts = slash_completions("/reasoning-mode ")
+            .into_iter()
+            .map(|completion| completion.text)
+            .collect::<Vec<_>>();
+        assert!(mode_texts.contains(&"/reasoning-mode pro".to_string()));
+        assert!(mode_texts.contains(&"/reasoning-mode status".to_string()));
+
+        let effort_texts = slash_completions("/effort min")
+            .into_iter()
+            .map(|completion| completion.text)
+            .collect::<Vec<_>>();
+        assert_eq!(effort_texts, ["/effort minimal"]);
+    }
+
+    #[test]
+    fn slash_completion_catalog_covers_canonical_handled_commands() {
+        for command in [
+            "/privacy",
+            "/preview",
+            "/context",
+            "/tool-profile",
+            "/diagnostics",
+            "/shelves",
+            "/project-extensions",
+            "/undo",
+        ] {
+            assert!(
+                SLASH_COMMANDS
+                    .iter()
+                    .any(|candidate| candidate.name == command),
+                "missing completion for {command}"
+            );
+        }
+        for command in SLASH_COMMANDS {
+            assert!(
+                crate::is_slash_command(command.name),
+                "completion has no slash handler: {}",
+                command.name
+            );
+        }
     }
 
     #[test]
@@ -15239,78 +14683,6 @@ mod tests {
     }
 
     #[test]
-    fn render_transcript_separates_live_planning_from_flushed_work_map_and_probe() {
-        use ratatui::backend::TestBackend;
-        use ratatui::{Terminal, TerminalOptions, Viewport};
-
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(6),
-            },
-        )
-        .expect("terminal");
-        let mut state = TuiState::new(
-            "test-model".to_string(),
-            model_context_window("test-model"),
-            ".".to_string(),
-            ApprovalProfile::Ask,
-            ThinkingEffort::Medium,
-        );
-        state.agent_busy = true;
-        state.verbose = true;
-        state.queue(Line_::WorkMap {
-            kind: WorkMapEventKind::Packet,
-            text: "Objective: inspect recent changes\nCheckpoints: verify outcome".to_string(),
-            waypoint_ids: Vec::new(),
-            selector: None,
-            selected: 0,
-        });
-        state.queue(Line_::Info(
-            "[phase:discover] validate one representative source item before scaling".to_string(),
-        ));
-        let width = current_transcript_pane_width(&mut terminal, &state).expect("pane width");
-        flush_pending_insert(&mut terminal, &mut state, width).expect("flush work map and probe");
-        assert!(matches!(
-            state.transcript.as_slice(),
-            [Line_::WorkMap { .. }, Line_::Info(_)]
-        ));
-
-        state.streaming_thinking = "**Planning git status and log inspection**".to_string();
-        let mut frame_area = None;
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                frame_area = Some(area);
-                render_transcript(frame, &mut state, area);
-            })
-            .expect("draw transcript");
-
-        let live = state.live_indicator_text.as_ref().expect("live indicator");
-        assert!(flatten_lines(live)[1].contains("Planning git status"));
-        assert_eq!(state.live_indicator_lines, 3);
-        assert_eq!(state.live_indicator_top_padding, 3);
-        assert_eq!(state.live_indicator_line_layout, Some((3, 6)));
-        let area = frame_area.expect("frame area");
-        assert!(area.y > 0, "work map flush should offset inline viewport");
-        let buffer = terminal.backend().buffer();
-        let row = |y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>();
-        let separator_y = area.y + 3;
-        let planning_y = area.y + 5;
-        assert!(
-            row(separator_y).trim().is_empty(),
-            "expected separator row: {:?}",
-            row(separator_y)
-        );
-        assert!(
-            row(planning_y).contains("Planning git status"),
-            "{}",
-            row(planning_y)
-        );
-    }
-
-    #[test]
     fn render_transcript_bottom_aligns_live_indicator() {
         use ratatui::backend::TestBackend;
         use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -15344,36 +14716,6 @@ mod tests {
         assert!(state.live_indicator_visible);
         assert_eq!(state.live_indicator_top_padding, 5);
         assert_eq!(state.live_indicator_line_layout, Some((5, 6)));
-    }
-
-    #[test]
-    fn work_map_drawer_expands_input_without_exceeding_half_viewport() {
-        let mut state = TuiState::new(
-            "glm-5.1".to_string(),
-            model_context_window("glm-5.1"),
-            ".".to_string(),
-            ApprovalProfile::Ask,
-            ThinkingEffort::Medium,
-        );
-        let area = ratatui::layout::Rect::new(0, 0, 80, 30);
-        let baseline = compute_layout(area, &state);
-        state.apply_event(AgentEvent::WorkMap {
-            kind: WorkMapEventKind::Map,
-            text: (1..=12)
-                .map(|n| format!("@w{n:02} change #{n}  waypoint {n}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            waypoint_ids: (1..=12).map(|n| format!("@w{n:02}")).collect(),
-            selector: None,
-        });
-        let with_drawer = compute_layout(area, &state);
-
-        assert!(with_drawer.input_area.height > baseline.input_area.height);
-        assert!(with_drawer.input_area.height <= area.height / 2);
-        assert_eq!(
-            with_drawer.status_area.y + with_drawer.status_area.height,
-            area.height
-        );
     }
 
     #[test]
@@ -15927,27 +15269,6 @@ mod tests {
                 "Checkpoints: branch visible".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn work_map_labels_use_consistent_sentence_case() {
-        let text = line_to_text(
-            &Line_::WorkMap {
-                kind: WorkMapEventKind::Packet,
-                text: "objective: clean up labels\ncheckpoints: verify flow\nprobe: inspect output\nfinal response: summarize changes".to_string(),
-                waypoint_ids: Vec::new(),
-                selector: None,
-                selected: 0,
-            },
-            100,
-        );
-        let joined = flatten_lines(&text).join("\n");
-        for label in ["Objective:", "Checkpoints:", "Probe:", "Final response:"] {
-            assert!(joined.contains(label), "missing {label} in {joined}");
-        }
-        for label in ["objective:", "checkpoints:", "probe:", "final response:"] {
-            assert!(!joined.contains(label), "unexpected {label} in {joined}");
-        }
     }
 
     #[test]

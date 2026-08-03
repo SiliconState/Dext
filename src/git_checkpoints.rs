@@ -4,6 +4,8 @@
 // recovery point under refs/dext/checkpoints/... Add /undo and CLI support
 // to preview and restore the latest checkpoint.
 
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +16,32 @@ const REF_SCAN_PREFIX: &str = "refs/dext/checkpoints/";
 const DEFAULT_PRUNE_KEEP: usize = 20;
 const DEFAULT_PRUNE_MAX_AGE_HOURS: u64 = 168; // 7 days
 const CHECKPOINT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const CHECKPOINT_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum UntrackedSidecar {
+    File {
+        path: String,
+        digest: String,
+        size: u64,
+        executable: bool,
+    },
+    Symlink {
+        path: String,
+        target: String,
+        #[serde(default)]
+        target_is_dir: bool,
+    },
+}
+
+impl UntrackedSidecar {
+    fn path(&self) -> &str {
+        match self {
+            Self::File { path, .. } | Self::Symlink { path, .. } => path,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Checkpoint {
@@ -26,13 +54,72 @@ pub(crate) struct Checkpoint {
     pub paths_hint: Vec<String>,
     pub includes_untracked_sidecar: bool,
     /// Untracked (not-ignored) repo paths present when the checkpoint was
-    /// taken. Lets undo/preview name untracked files a write-risk command
-    /// created or removed afterwards, even though `git stash create` does not
-    /// capture untracked content.
+    /// taken. Arbitrary-command checkpoints also preserve bounded regular-file
+    /// content for these paths in the checkpoint sidecar.
     pub untracked_snapshot: Vec<String>,
+    /// Exact membership index of the sidecars a direct file tool preserved for
+    /// this checkpoint. `None` marks a manifest row written before the field
+    /// existed, where a missing sidecar is ambiguous and restore must fail
+    /// conservatively rather than delete current path content.
+    pub direct_sidecar_paths: Option<Vec<String>>,
+    pub untracked_sidecars: Vec<UntrackedSidecar>,
+    pub untracked_capture_warning: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UntrackedSourceVersion {
+    modified_ns: u128,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_secs: i64,
+    #[cfg(unix)]
+    changed_ns: i64,
+}
+
+#[derive(Clone, Debug)]
+enum UntrackedCandidate {
+    File {
+        path: String,
+        size: u64,
+        source_version: UntrackedSourceVersion,
+        executable: bool,
+    },
+    Symlink {
+        path: String,
+        target: String,
+        target_is_dir: bool,
+    },
+}
+
+#[derive(Debug)]
+struct UntrackedCapturePlan {
+    snapshot: Vec<String>,
+    candidates: Vec<UntrackedCandidate>,
+    warning: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UntrackedBlobFingerprint {
+    size: u64,
+    source_version: UntrackedSourceVersion,
+    blob_version: UntrackedSourceVersion,
+    executable: bool,
+    digest: String,
+}
+
+#[derive(Default)]
+pub(crate) struct UntrackedBlobCache {
+    entries: BTreeMap<String, UntrackedBlobFingerprint>,
 }
 
 const UNTRACKED_SNAPSHOT_CAP: usize = 500;
+const BASH_UNTRACKED_SIDECAR_FILE_CAP: u64 = 8 * 1024 * 1024;
+const BASH_UNTRACKED_SIDECAR_TOTAL_CAP: u64 = 32 * 1024 * 1024;
+const SYMLINK_TARGET_CAP: usize = 16 * 1024;
+const BLOBS_DIR: &str = "blobs";
 
 fn random_checkpoint_nonce() -> Result<String, String> {
     let mut bytes = [0u8; 16];
@@ -44,39 +131,110 @@ fn git_command(cwd: &Path, args: &[&str]) -> Result<crate::InternalCommandOutput
     crate::run_internal_git_command(cwd, args)
 }
 
+struct UntrackedFiles {
+    paths: Vec<String>,
+    truncated: bool,
+    unsupported_paths: usize,
+}
+
 /// List untracked, not-ignored repo paths via porcelain status.
-fn untracked_files(git_root: &Path) -> Vec<String> {
-    let Ok(out) = run_git(
+fn untracked_files(git_root: &Path) -> Result<UntrackedFiles, String> {
+    let output = git_command(
         git_root,
-        &["status", "--porcelain", "--untracked-files=all"],
-    ) else {
-        return Vec::new();
-    };
-    out.lines()
-        .filter_map(|line| line.strip_prefix("?? "))
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .take(UNTRACKED_SNAPSHOT_CAP)
-        .collect()
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )?;
+    if !output.success() {
+        return Err(format!(
+            "git status --porcelain -z --untracked-files=all: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut paths = Vec::new();
+    let mut inventoried = 0usize;
+    let mut truncated = false;
+    let mut unsupported_paths = 0usize;
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let Some(raw_path) = record.strip_prefix(b"?? ") else {
+            continue;
+        };
+        let path = match git_path_from_bytes(raw_path) {
+            Ok(path) if path.starts_with(CHECKPOINTS_DIR) => continue,
+            Ok(path) => path,
+            Err(_) => {
+                inventoried = inventoried.saturating_add(1);
+                if inventoried > UNTRACKED_SNAPSHOT_CAP {
+                    truncated = true;
+                    break;
+                }
+                unsupported_paths = unsupported_paths.saturating_add(1);
+                continue;
+            }
+        };
+        inventoried = inventoried.saturating_add(1);
+        if inventoried > UNTRACKED_SNAPSHOT_CAP {
+            truncated = true;
+            break;
+        }
+        match path.into_os_string().into_string() {
+            Ok(path) => paths.push(path),
+            Err(_) => unsupported_paths = unsupported_paths.saturating_add(1),
+        }
+    }
+    Ok(UntrackedFiles {
+        paths,
+        truncated,
+        unsupported_paths,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestoreMode {
     Preview,
     Worktree,
-    WorktreeAndIndex,
     ResetHead,
 }
 
+fn git_marker_in_ancestry(root: &Path) -> Result<bool, String> {
+    let mut current = root;
+    loop {
+        match std::fs::symlink_metadata(current.join(".git")) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect Git marker under {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+        let Some(parent) = current.parent() else {
+            return Ok(false);
+        };
+        if parent == current {
+            return Ok(false);
+        }
+        current = parent;
+    }
+}
+
 pub(crate) fn repo_root(root: &Path) -> Result<Option<PathBuf>, String> {
+    if !git_marker_in_ancestry(root)? {
+        let routed = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"]
+            .into_iter()
+            .filter(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+            .collect::<Vec<_>>();
+        if !routed.is_empty() {
+            return Err(format!(
+                "no .git marker found, but ambient {} repository routing is set; Dext-owned Git commands intentionally ignore routing variables, so recovery checkpoints cannot safely identify this repository",
+                routed.join(", ")
+            ));
+        }
+        return Ok(None);
+    }
     let output = git_command(root, &["rev-parse", "--show-toplevel"])?;
     if output.success() {
         let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
         return Ok((!trimmed.is_empty()).then(|| PathBuf::from(trimmed)));
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    if stderr.contains("not a git repository") || stderr.contains("outside repository") {
-        return Ok(None);
     }
     Err(format!(
         "git rev-parse --show-toplevel: {}",
@@ -183,12 +341,54 @@ fn checkpoints_manifest_dir(git_root: &Path) -> PathBuf {
     git_root.join(CHECKPOINTS_DIR)
 }
 
+fn private_dir_owned_by_current_user(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return false;
+        }
+    }
+    true
+}
+
+fn safe_checkpoint_storage_parent_metadata(metadata: &std::fs::Metadata) -> bool {
+    if !private_dir_owned_by_current_user(metadata) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn safe_private_dir_metadata(metadata: &std::fs::Metadata) -> bool {
+    if !private_dir_owned_by_current_user(metadata) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if !private_dir_owned_by_current_user(&metadata) {
                 return Err(format!(
-                    "private directory path is not a real directory: {}",
+                    "private directory path is not a real directory owned by the current user: {}",
                     path.display()
                 ));
             }
@@ -218,15 +418,23 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("chmod private directory {}: {e}", path.display()))?;
     }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("private directory metadata {}: {error}", path.display()))?;
+    if !safe_private_dir_metadata(&metadata) {
+        return Err(format!(
+            "private directory path is not owner-private: {}",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
 fn ensure_checkpoint_storage(git_root: &Path) -> Result<(), String> {
     let dext_dir = git_root.join(".dext");
     match std::fs::symlink_metadata(&dext_dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        Ok(metadata) if !safe_checkpoint_storage_parent_metadata(&metadata) => {
             return Err(format!(
-                "checkpoint storage parent is not a real directory: {}",
+                "checkpoint storage parent is not a safe current-user-owned directory: {}",
                 dext_dir.display()
             ));
         }
@@ -253,11 +461,21 @@ fn ensure_checkpoint_storage(git_root: &Path) -> Result<(), String> {
 }
 
 fn checkpoint_storage_exists(git_root: &Path) -> Result<bool, String> {
-    for path in [git_root.join(".dext"), checkpoints_manifest_dir(git_root)] {
+    let paths = [
+        (git_root.join(".dext"), false),
+        (checkpoints_manifest_dir(git_root), true),
+    ];
+    for (path, must_be_private) in paths {
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Ok(metadata)
+                if if must_be_private {
+                    !safe_private_dir_metadata(&metadata)
+                } else {
+                    !safe_checkpoint_storage_parent_metadata(&metadata)
+                } =>
+            {
                 return Err(format!(
-                    "checkpoint storage path is not a real directory: {}",
+                    "checkpoint storage path is not owner-safe: {}",
                     path.display()
                 ));
             }
@@ -536,10 +754,6 @@ fn read_private_file_with_limit(path: &Path, max_bytes: Option<u64>) -> Result<S
     Ok(content)
 }
 
-fn read_private_file(path: &Path) -> Result<String, String> {
-    read_private_file_with_limit(path, None)
-}
-
 fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if !safe_private_file_metadata(&metadata) => {
@@ -697,14 +911,14 @@ fn head_oid(git_root: &Path) -> Result<Option<String>, String> {
     ))
 }
 
-/// Save untracked file content as a sidecar before direct file tools
-/// overwrite it. Returns the sidecar directory path on success.
-pub(crate) fn save_untracked_sidecar(
+/// Save untracked file content as a private checkpoint sidecar.
+fn save_untracked_sidecar(
     git_root: &Path,
     id: &str,
     abs_path: &Path,
     git_root_relative: &Path,
-) -> Result<(), String> {
+    max_bytes: Option<u64>,
+) -> Result<u64, String> {
     if !safe_checkpoint_id(id) || !safe_repo_relative_path(git_root_relative) {
         return Err("unsafe checkpoint sidecar path".to_string());
     }
@@ -731,21 +945,440 @@ pub(crate) fn save_untracked_sidecar(
         return Err("checkpoint sidecar source is not a regular file".to_string());
     }
     let mut destination = create_private_file(&dest).map_err(|e| format!("sidecar write: {e}"))?;
-    if let Err(error) = std::io::copy(&mut source, &mut destination) {
-        drop(destination);
-        let _ = std::fs::remove_file(&dest);
-        return Err(format!("sidecar copy: {error}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if source_metadata.permissions().mode() & 0o100 != 0 {
+            0o700
+        } else {
+            0o600
+        };
+        destination
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("sidecar permissions: {error}"))?;
     }
-    Ok(())
+    let copy_result = match max_bytes {
+        Some(limit) => std::io::copy(
+            &mut (&mut source).take(limit.saturating_add(1)),
+            &mut destination,
+        ),
+        None => std::io::copy(&mut source, &mut destination),
+    };
+    let copied = match copy_result {
+        Ok(copied) if max_bytes.is_some_and(|limit| copied > limit) => {
+            drop(destination);
+            let _ = std::fs::remove_file(&dest);
+            return Err(
+                "checkpoint sidecar source exceeded its byte limit while copying".to_string(),
+            );
+        }
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(destination);
+            let _ = std::fs::remove_file(&dest);
+            return Err(format!("sidecar copy: {error}"));
+        }
+    };
+    Ok(copied)
+}
+
+fn untracked_source_version(metadata: &std::fs::Metadata) -> UntrackedSourceVersion {
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        UntrackedSourceVersion {
+            modified_ns,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed_secs: metadata.ctime(),
+            changed_ns: metadata.ctime_nsec(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        UntrackedSourceVersion { modified_ns }
+    }
+}
+
+fn untracked_capture_warning(details: &[String]) -> Option<String> {
+    (!details.is_empty()).then(|| {
+        crate::cap_bytes_with_hint(
+            format!("untracked recovery is partial: {}", details.join("; ")),
+            4_096,
+            "additional recovery-gap details omitted.",
+        )
+    })
+}
+
+fn plan_untracked_capture(git_root: &Path) -> Result<UntrackedCapturePlan, String> {
+    let files = untracked_files(git_root)?;
+    let mut warnings = Vec::new();
+    if files.truncated {
+        warnings.push(format!(
+            "more than {UNTRACKED_SNAPSHOT_CAP} untracked paths exist; only the first {UNTRACKED_SNAPSHOT_CAP} can be inventoried"
+        ));
+    }
+    if files.unsupported_paths > 0 {
+        warnings.push(format!(
+            "{} untracked path(s) are not valid UTF-8 and cannot be inventoried or recovered",
+            files.unsupported_paths
+        ));
+    }
+    let mut total = 0u64;
+    let mut candidates = Vec::new();
+    for path in &files.paths {
+        let relative = Path::new(path);
+        if !safe_repo_relative_path(relative) {
+            return Err(format!("unsafe untracked checkpoint path: {path}"));
+        }
+        let absolute = git_root.join(relative);
+        let metadata = std::fs::symlink_metadata(&absolute)
+            .map_err(|error| format!("inspect untracked checkpoint path {path}: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&absolute)
+                .map_err(|error| format!("read untracked symlink {path}: {error}"))?;
+            let target = match target.into_os_string().into_string() {
+                Ok(target) if target.len() <= SYMLINK_TARGET_CAP => target,
+                Ok(_) => {
+                    if warnings.len() < 8 {
+                        warnings.push(format!(
+                            "symlink target exceeds {SYMLINK_TARGET_CAP} bytes: {path}"
+                        ));
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    if warnings.len() < 8 {
+                        warnings.push(format!("symlink target is not valid UTF-8: {path}"));
+                    }
+                    continue;
+                }
+            };
+            #[cfg(windows)]
+            let target_is_dir = {
+                use std::os::windows::fs::FileTypeExt as _;
+                metadata.file_type().is_symlink_dir()
+            };
+            #[cfg(not(windows))]
+            let target_is_dir = false;
+            candidates.push(UntrackedCandidate::Symlink {
+                path: path.clone(),
+                target,
+                target_is_dir,
+            });
+            continue;
+        }
+        if !metadata.is_file() {
+            if warnings.len() < 8 {
+                warnings.push(format!("unsupported non-regular untracked path: {path}"));
+            }
+            continue;
+        }
+        if metadata.len() > BASH_UNTRACKED_SIDECAR_FILE_CAP {
+            if warnings.len() < 8 {
+                warnings.push(format!(
+                    "file exceeds the {} MiB per-file limit: {path}",
+                    BASH_UNTRACKED_SIDECAR_FILE_CAP / 1024 / 1024
+                ));
+            }
+            continue;
+        }
+        if total.saturating_add(metadata.len()) > BASH_UNTRACKED_SIDECAR_TOTAL_CAP {
+            if warnings.len() < 8 {
+                warnings.push(format!(
+                    "captured regular-file content would exceed the {} MiB total limit at {path}",
+                    BASH_UNTRACKED_SIDECAR_TOTAL_CAP / 1024 / 1024
+                ));
+            }
+            continue;
+        }
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode() & 0o100 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
+        total = total.saturating_add(metadata.len());
+        candidates.push(UntrackedCandidate::File {
+            path: path.clone(),
+            size: metadata.len(),
+            source_version: untracked_source_version(&metadata),
+            executable,
+        });
+    }
+    Ok(UntrackedCapturePlan {
+        snapshot: files.paths,
+        candidates,
+        warning: untracked_capture_warning(&warnings),
+    })
+}
+
+fn checkpoint_blob_dir(git_root: &Path) -> PathBuf {
+    checkpoints_manifest_dir(git_root).join(BLOBS_DIR)
+}
+
+fn blob_path(git_root: &Path, digest: &str) -> PathBuf {
+    checkpoint_blob_dir(git_root).join(digest)
+}
+
+fn validate_private_blob_dir(git_root: &Path) -> Result<PathBuf, String> {
+    let dir = checkpoint_blob_dir(git_root);
+    let metadata = std::fs::symlink_metadata(&dir)
+        .map_err(|error| format!("checkpoint blob directory metadata: {error}"))?;
+    if !safe_private_dir_metadata(&metadata) {
+        return Err(format!(
+            "checkpoint blob directory is not owner-private: {}",
+            dir.display()
+        ));
+    }
+    Ok(dir)
+}
+
+fn private_blob_metadata_version(
+    git_root: &Path,
+    digest: &str,
+    expected_size: u64,
+) -> Option<UntrackedSourceVersion> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let dir = validate_private_blob_dir(git_root).ok()?;
+    let metadata = std::fs::symlink_metadata(dir.join(digest)).ok()?;
+    (safe_private_file_metadata(&metadata) && metadata.len() == expected_size)
+        .then(|| untracked_source_version(&metadata))
+}
+
+fn remove_new_checkpoint_blobs(git_root: &Path, digests: &[String]) {
+    for digest in digests {
+        let _ = std::fs::remove_file(blob_path(git_root, digest));
+    }
+}
+
+fn save_untracked_blob(
+    git_root: &Path,
+    relative: &str,
+    absolute: &Path,
+    expected_size: u64,
+    source_version: &UntrackedSourceVersion,
+    executable: bool,
+    cache: &mut UntrackedBlobCache,
+) -> Result<(String, bool), String> {
+    use std::io::{Seek as _, SeekFrom};
+
+    let blobs = checkpoint_blob_dir(git_root);
+    ensure_private_dir(&blobs)?;
+
+    #[cfg(unix)]
+    if let Some(cached) = cache.entries.get(relative)
+        && cached.size == expected_size
+        && cached.source_version == *source_version
+        && cached.executable == executable
+        && private_blob_metadata_version(git_root, &cached.digest, expected_size)
+            .is_some_and(|version| version == cached.blob_version)
+    {
+        return Ok((cached.digest.clone(), false));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut source = options
+        .open(absolute)
+        .map_err(|error| format!("open untracked checkpoint file: {error}"))?;
+    let metadata = source
+        .metadata()
+        .map_err(|error| format!("untracked checkpoint file metadata: {error}"))?;
+    if !metadata.is_file()
+        || metadata.len() != expected_size
+        || untracked_source_version(&metadata) != *source_version
+    {
+        return Err(format!(
+            "untracked checkpoint file changed while capturing: {}",
+            absolute.display()
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hashed = 0u64;
+    while hashed <= BASH_UNTRACKED_SIDECAR_FILE_CAP {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| format!("hash untracked checkpoint file: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        hashed = hashed.saturating_add(read as u64);
+    }
+    if hashed != expected_size || hashed > BASH_UNTRACKED_SIDECAR_FILE_CAP {
+        return Err(format!(
+            "untracked checkpoint file changed or exceeded its byte limit: {}",
+            absolute.display()
+        ));
+    }
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let destination = blob_path(git_root, &digest);
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata)
+            if safe_private_file_metadata(&metadata) && metadata.len() == expected_size =>
+        {
+            validate_private_blob(git_root, &digest, expected_size)?;
+            let blob_version = private_blob_metadata_version(git_root, &digest, expected_size)
+                .ok_or_else(|| format!("checkpoint blob is unsafe or corrupt: {digest}"))?;
+            cache.entries.insert(
+                relative.to_string(),
+                UntrackedBlobFingerprint {
+                    size: expected_size,
+                    source_version: source_version.clone(),
+                    blob_version,
+                    executable,
+                    digest: digest.clone(),
+                },
+            );
+            return Ok((digest, false));
+        }
+        Ok(_) => {
+            return Err(format!(
+                "checkpoint blob is unsafe or corrupt: {}",
+                destination.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("checkpoint blob metadata: {error}")),
+    }
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind untracked checkpoint file: {error}"))?;
+    let mut output = create_private_file(&destination)?;
+    let copied = match std::io::copy(&mut source, &mut output) {
+        Ok(copied) => copied,
+        Err(error) => {
+            drop(output);
+            let _ = std::fs::remove_file(&destination);
+            return Err(format!("write checkpoint blob: {error}"));
+        }
+    };
+    if copied != expected_size {
+        drop(output);
+        let _ = std::fs::remove_file(&destination);
+        return Err(format!(
+            "untracked checkpoint file changed while copying: {}",
+            absolute.display()
+        ));
+    }
+    if let Err(error) = output.sync_all() {
+        drop(output);
+        let _ = std::fs::remove_file(&destination);
+        return Err(format!("sync checkpoint blob: {error}"));
+    }
+    drop(output);
+    if let Err(error) = validate_private_blob(git_root, &digest, expected_size) {
+        let _ = std::fs::remove_file(&destination);
+        return Err(error);
+    }
+    let blob_version = private_blob_metadata_version(git_root, &digest, expected_size)
+        .ok_or_else(|| format!("checkpoint blob is unsafe or corrupt: {digest}"))?;
+    cache.entries.insert(
+        relative.to_string(),
+        UntrackedBlobFingerprint {
+            size: expected_size,
+            source_version: source_version.clone(),
+            blob_version,
+            executable,
+            digest: digest.clone(),
+        },
+    );
+    Ok((digest, true))
+}
+
+fn save_bash_untracked_sidecars(
+    git_root: &Path,
+    plan: &UntrackedCapturePlan,
+    cache: &mut UntrackedBlobCache,
+) -> Result<(Vec<UntrackedSidecar>, Vec<String>), String> {
+    let mut sidecars = Vec::with_capacity(plan.candidates.len());
+    let mut new_blobs = Vec::new();
+    for candidate in &plan.candidates {
+        match candidate {
+            UntrackedCandidate::File {
+                path,
+                size,
+                source_version,
+                executable,
+            } => {
+                let (digest, created) = match save_untracked_blob(
+                    git_root,
+                    path,
+                    &git_root.join(path),
+                    *size,
+                    source_version,
+                    *executable,
+                    cache,
+                ) {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        remove_new_checkpoint_blobs(git_root, &new_blobs);
+                        return Err(error);
+                    }
+                };
+                if created {
+                    new_blobs.push(digest.clone());
+                }
+                sidecars.push(UntrackedSidecar::File {
+                    path: path.clone(),
+                    digest,
+                    size: *size,
+                    executable: *executable,
+                });
+            }
+            UntrackedCandidate::Symlink {
+                path,
+                target,
+                target_is_dir,
+            } => {
+                sidecars.push(UntrackedSidecar::Symlink {
+                    path: path.clone(),
+                    target: target.clone(),
+                    target_is_dir: *target_is_dir,
+                });
+            }
+        }
+    }
+    Ok((sidecars, new_blobs))
+}
+
+fn literal_git_pathspec(relative: &str) -> String {
+    format!(":(literal){relative}")
 }
 
 /// Check if a path is tracked by Git.
-fn is_tracked(git_root: &Path, rel: &Path) -> bool {
-    run_git(
-        git_root,
-        &["ls-files", "--error-unmatch", rel.to_str().unwrap_or("")],
-    )
-    .is_ok()
+fn is_tracked(git_root: &Path, rel: &Path) -> Result<bool, String> {
+    let relative = rel
+        .to_str()
+        .ok_or_else(|| format!("Git path is not valid UTF-8: {}", rel.display()))?;
+    let pathspec = literal_git_pathspec(relative);
+    let output = git_command(git_root, &["ls-files", "-z", "--", &pathspec])?;
+    if !output.success() {
+        return Err(format!(
+            "git ls-files -z -- {relative}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 fn canonicalize_with_missing_ancestors(path: &Path) -> Option<PathBuf> {
@@ -775,6 +1408,7 @@ fn safe_repo_relative_path(path: &Path) -> bool {
         names.push(name);
     }
     if names.is_empty()
+        || path.to_string_lossy().contains('\0')
         || names
             .iter()
             .any(|name| name.to_string_lossy().eq_ignore_ascii_case(".git"))
@@ -790,8 +1424,9 @@ fn safe_repo_relative_path(path: &Path) -> bool {
 }
 
 fn resolve_user_repo_path(root: &Path, git_root: &Path, user_path: &str) -> Option<PathBuf> {
-    let candidate = if Path::new(user_path).is_absolute() {
-        PathBuf::from(user_path)
+    let user_path = Path::new(user_path);
+    let candidate = if user_path.is_absolute() {
+        user_path.to_path_buf()
     } else {
         root.join(user_path)
     };
@@ -808,6 +1443,22 @@ fn manifest_repo_relative_path(root: &Path, git_root: &Path, path: &str) -> Opti
         let relative = PathBuf::from(path);
         safe_repo_relative_path(&relative).then_some(relative)
     }
+}
+
+fn checkpoint_restore_paths(
+    root: &Path,
+    git_root: &Path,
+    cp: &Checkpoint,
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    cp.paths_hint
+        .iter()
+        .map(|path| {
+            let relative = manifest_repo_relative_path(root, git_root, path)
+                .ok_or_else(|| format!("unsafe checkpoint path: {path}"))?;
+            let target = safe_worktree_target(git_root, &relative)?;
+            Ok((relative, target))
+        })
+        .collect()
 }
 
 fn safe_worktree_target(git_root: &Path, relative: &Path) -> Result<PathBuf, String> {
@@ -845,8 +1496,16 @@ fn safe_worktree_target(git_root: &Path, relative: &Path) -> Result<PathBuf, Str
     Ok(canonical_root.join(relative))
 }
 
-fn tree_has_path(git_root: &Path, oid: &str, rel: &str) -> bool {
-    run_git(git_root, &["cat-file", "-e", &format!("{oid}:{rel}")]).is_ok()
+fn tree_has_path(git_root: &Path, oid: &str, rel: &str) -> Result<bool, String> {
+    let pathspec = literal_git_pathspec(rel);
+    let output = git_command(git_root, &["ls-tree", "-z", oid, "--", &pathspec])?;
+    if !output.success() {
+        return Err(format!(
+            "git ls-tree -z {oid} -- {rel}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 fn remove_worktree_path(path: &Path) -> Result<bool, String> {
@@ -883,9 +1542,20 @@ fn create_checkpoint_ref(git_root: &Path, ref_name: &str, oid: &str) -> Result<(
     run_git(git_root, &["update-ref", ref_name, oid, &zero_oid]).map(|_| ())
 }
 
+fn path_has_prior_state(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "inspect checkpoint target {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 /// Create a recovery checkpoint before a workspace mutation.
-/// Returns None if not in a Git repo or if HEAD is unborn. Returns error only on unexpected
-/// failures; checkpoint errors should warn but not block tool execution.
+/// Returns None if not in a Git repo or if there is no prior state to preserve.
+/// Unexpected failures are returned so callers can apply tool-specific policy.
 #[cfg(test)]
 pub(crate) fn create_checkpoint(
     root: &Path,
@@ -896,7 +1566,16 @@ pub(crate) fn create_checkpoint(
     let Some(git_root) = repo_root(root)? else {
         return Ok(None);
     };
-    create_checkpoint_in_repo(root, &git_root, tool, paths_hint, ordinal)
+    let mut blob_cache = UntrackedBlobCache::default();
+    create_checkpoint_in_repo(
+        root,
+        &git_root,
+        tool,
+        paths_hint,
+        ordinal,
+        false,
+        &mut blob_cache,
+    )
 }
 
 pub(crate) fn create_checkpoint_in_repo(
@@ -905,13 +1584,54 @@ pub(crate) fn create_checkpoint_in_repo(
     tool: &str,
     paths_hint: &[String],
     ordinal: usize,
+    allow_partial_untracked: bool,
+    blob_cache: &mut UntrackedBlobCache,
 ) -> Result<Option<Checkpoint>, String> {
-    let Some(_) = head_oid(git_root)? else {
+    if !valid_checkpoint_tool_name(tool) {
+        return Err("invalid checkpoint tool name".to_string());
+    }
+    if paths_hint.len() > UNTRACKED_SNAPSHOT_CAP {
+        return Err(format!(
+            "checkpoint path hints exceed the {UNTRACKED_SNAPSHOT_CAP}-path limit"
+        ));
+    }
+    let _operation_lock = CheckpointOperationLock::acquire(git_root)?;
+    let file_tools = ["write_file", "edit_file", "multi_edit"];
+    let arbitrary_command = matches!(tool, "bash" | "awk" | "csvkit");
+    let Some(head) = head_oid(git_root)? else {
+        ensure_checkpoint_git_exclude(git_root)?;
+        if arbitrary_command && is_dirty(git_root)? {
+            return Err(
+                "repository has no initial commit and contains worktree or index state; commit or remove it before running an arbitrary write-risk command"
+                    .to_string(),
+            );
+        }
+        if file_tools.contains(&tool) {
+            for path in paths_hint {
+                let Some(relative) = resolve_user_repo_path(root, git_root, path) else {
+                    continue;
+                };
+                if path_has_prior_state(&git_root.join(relative))? {
+                    return Err(
+                        "repository has no initial commit; commit the existing target before mutating it"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         return Ok(None);
     };
-    let _operation_lock = CheckpointOperationLock::acquire(git_root)?;
-    let Some(head) = head_oid(git_root)? else {
-        return Ok(None);
+
+    let untracked_plan = if arbitrary_command {
+        let plan = plan_untracked_capture(git_root)?;
+        if let Some(warning) = &plan.warning
+            && !allow_partial_untracked
+        {
+            return Err(warning.clone());
+        }
+        Some(plan)
+    } else {
+        None
     };
 
     let ts = now_ms();
@@ -960,15 +1680,21 @@ pub(crate) fn create_checkpoint_in_repo(
     // point even if a future entropy source or caller regresses.
     create_checkpoint_ref(git_root, &ref_name, &oid)?;
 
-    // Handle untracked sidecar for direct file tools. A checkpoint that cannot
-    // preserve an existing untracked target is not a usable recovery point.
     let mut includes_untracked_sidecar = false;
-    let file_tools = ["write_file", "edit_file", "multi_edit"];
+    let mut direct_sidecar_paths = Vec::new();
     if file_tools.contains(&tool) {
-        for rel in &normalized_paths {
+        for (rel, rel_string) in normalized_paths.iter().zip(&normalized_path_strings) {
             let abs = git_root.join(rel);
-            if abs.is_file() && !is_tracked(git_root, rel) {
-                if let Err(error) = save_untracked_sidecar(git_root, &id, &abs, rel) {
+            let tracked = match is_tracked(git_root, rel) {
+                Ok(tracked) => tracked,
+                Err(error) => {
+                    let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
+                    let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &id));
+                    return Err(error);
+                }
+            };
+            if abs.is_file() && !tracked {
+                if let Err(error) = save_untracked_sidecar(git_root, &id, &abs, rel, None) {
                     let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
                     let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &id));
                     return Err(format!(
@@ -977,17 +1703,31 @@ pub(crate) fn create_checkpoint_in_repo(
                     ));
                 }
                 includes_untracked_sidecar = true;
+                direct_sidecar_paths.push(rel_string.clone());
             }
         }
     }
 
-    // Direct file tools already capture their exact target via the sidecar
-    // above, so skip the broad (and per-call costly) untracked scan for them;
-    // it is the value-add for arbitrary commands like bash.
-    let untracked_snapshot = if file_tools.contains(&tool) {
-        Vec::new()
+    let mut untracked_sidecars = Vec::new();
+    let mut new_untracked_blobs = Vec::new();
+    let mut untracked_capture_warning = None;
+    let untracked_snapshot = if let Some(plan) = untracked_plan {
+        match save_bash_untracked_sidecars(git_root, &plan, blob_cache) {
+            Ok((saved, new_blobs)) => {
+                includes_untracked_sidecar = !saved.is_empty();
+                untracked_sidecars = saved;
+                new_untracked_blobs = new_blobs;
+                untracked_capture_warning = plan.warning;
+            }
+            Err(error) => {
+                let _ = run_git(git_root, &["update-ref", "-d", &ref_name]);
+                let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &id));
+                return Err(format!("preserve untracked checkpoint files: {error}"));
+            }
+        }
+        plan.snapshot
     } else {
-        untracked_files(git_root)
+        Vec::new()
     };
 
     let cp = Checkpoint {
@@ -1000,17 +1740,24 @@ pub(crate) fn create_checkpoint_in_repo(
         paths_hint: normalized_path_strings,
         includes_untracked_sidecar,
         untracked_snapshot,
+        direct_sidecar_paths: Some(direct_sidecar_paths),
+        untracked_sidecars,
+        untracked_capture_warning,
     };
 
     if let Err(error) = append_manifest(git_root, &cp) {
         let _ = run_git(git_root, &["update-ref", "-d", &cp.ref_name]);
         let _ = std::fs::remove_dir_all(sidecar_dir(git_root, &cp.id));
+        remove_new_checkpoint_blobs(git_root, &new_untracked_blobs);
         return Err(error);
     }
-    if let Err(error) =
-        prune_checkpoint_refs(git_root, DEFAULT_PRUNE_KEEP, DEFAULT_PRUNE_MAX_AGE_HOURS)
-    {
-        eprintln!("[checkpoint] retention warning: {error}");
+    match prune_checkpoint_refs(git_root, DEFAULT_PRUNE_KEEP, DEFAULT_PRUNE_MAX_AGE_HOURS) {
+        Ok(outcome) => {
+            for warning in outcome.warnings {
+                eprintln!("[checkpoint] retention warning: {warning}");
+            }
+        }
+        Err(error) => eprintln!("[checkpoint] retention warning: {error}"),
     }
 
     Ok(Some(cp))
@@ -1018,6 +1765,12 @@ pub(crate) fn create_checkpoint_in_repo(
 
 fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
     ensure_checkpoint_storage(git_root)?;
+    // Validate every existing row against the live ref namespace before adding a
+    // new recovery point. The caller has already created `cp.ref_name`, but an
+    // unmanifested ref is ignored here and removed by the caller if validation
+    // fails. This keeps an OID-tampered old row from degrading into a retention
+    // warning while a new write-risk tool is allowed to proceed.
+    let _ = list_checkpoints_in_repo(git_root, usize::MAX, false, None)?;
     let dir = checkpoints_manifest_dir(git_root);
     let manifest_path = dir.join("manifest.txt");
     let mut content = match std::fs::symlink_metadata(&manifest_path) {
@@ -1027,9 +1780,8 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
                 manifest_path.display()
             ));
         }
-        Ok(_) => {
-            read_private_file(&manifest_path).map_err(|error| format!("manifest read: {error}"))?
-        }
+        Ok(_) => read_private_file_with_limit(&manifest_path, Some(CHECKPOINT_MANIFEST_MAX_BYTES))
+            .map_err(|error| format!("manifest read: {error}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("checkpoint manifest metadata: {error}")),
     };
@@ -1042,13 +1794,23 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        let existing = parse_manifest_line(line.trim()).ok_or_else(|| {
-            format!(
-                "invalid checkpoint manifest entry at line {}",
-                line_index + 1
-            )
-        })?;
-        if !ids.insert(existing.id) || !refs.insert(existing.ref_name) {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // A row from a retired encoding is kept verbatim by this append, so it
+        // must not block a new checkpoint; its identity still participates in
+        // the uniqueness check.
+        let (id, ref_name) = match parse_manifest_line(line) {
+            Some(existing) => (existing.id, existing.ref_name),
+            None => {
+                let retired = retired_manifest_row(line).ok_or_else(|| {
+                    format!(
+                        "invalid checkpoint manifest entry at line {}",
+                        line_index + 1
+                    )
+                })?;
+                (retired.id.to_string(), retired.ref_name.to_string())
+            }
+        };
+        if !ids.insert(id) || !refs.insert(ref_name) {
             return Err(format!(
                 "duplicate checkpoint metadata in manifest at line {}",
                 line_index + 1
@@ -1060,6 +1822,11 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
     }
     content.push_str(&format_manifest_line(cp));
     content.push('\n');
+    if content.len() as u64 > CHECKPOINT_MANIFEST_MAX_BYTES {
+        return Err(format!(
+            "checkpoint manifest exceeds the {CHECKPOINT_MANIFEST_MAX_BYTES}-byte runtime bound"
+        ));
+    }
     write_private_file(&manifest_path, content.as_bytes())
         .map_err(|error| format!("manifest write: {error}"))
 }
@@ -1068,8 +1835,16 @@ fn format_manifest_line(cp: &Checkpoint) -> String {
     let paths = serde_json::to_string(&cp.paths_hint).unwrap_or_else(|_| "[]".to_string());
     let untracked =
         serde_json::to_string(&cp.untracked_snapshot).unwrap_or_else(|_| "[]".to_string());
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+    let sidecars =
+        serde_json::to_string(&cp.untracked_sidecars).unwrap_or_else(|_| "[]".to_string());
+    let warning =
+        serde_json::to_string(&cp.untracked_capture_warning).unwrap_or_else(|_| "null".to_string());
+    let direct_sidecars = cp
+        .direct_sidecar_paths
+        .as_ref()
+        .map(|paths| serde_json::to_string(paths).unwrap_or_else(|_| "[]".to_string()));
+    let mut line = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         cp.id,
         cp.ref_name,
         cp.oid,
@@ -1079,7 +1854,14 @@ fn format_manifest_line(cp: &Checkpoint) -> String {
         cp.includes_untracked_sidecar,
         paths,
         untracked,
-    )
+        sidecars,
+        warning,
+    );
+    if let Some(direct_sidecars) = direct_sidecars {
+        line.push('\t');
+        line.push_str(&direct_sidecars);
+    }
+    line
 }
 
 fn write_checkpoint_manifest(
@@ -1093,16 +1875,18 @@ fn write_checkpoint_manifest(
         .collect::<Vec<_>>()
         .join("\n");
     let manifest_path = checkpoints_manifest_dir(git_root).join("manifest.txt");
-    write_private_file(
-        &manifest_path,
-        if content.is_empty() {
-            String::new()
-        } else {
-            format!("{content}\n")
-        }
-        .as_bytes(),
-    )
-    .map_err(|error| format!("manifest write: {error}"))
+    let content = if content.is_empty() {
+        String::new()
+    } else {
+        format!("{content}\n")
+    };
+    if content.len() as u64 > CHECKPOINT_MANIFEST_MAX_BYTES {
+        return Err(format!(
+            "checkpoint manifest exceeds the {CHECKPOINT_MANIFEST_MAX_BYTES}-byte runtime bound"
+        ));
+    }
+    write_private_file(&manifest_path, content.as_bytes())
+        .map_err(|error| format!("manifest write: {error}"))
 }
 
 fn checkpoint_ref_valid(ref_name: &str, id: &str) -> bool {
@@ -1124,34 +1908,146 @@ fn valid_checkpoint_tool_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RetiredManifestRow<'a> {
+    id: &'a str,
+    ref_name: &'a str,
+    oid: &'a str,
+}
+
+fn retired_manifest_path_valid(path: &str, untracked: bool) -> bool {
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return false;
+    }
+    let mut has_name = false;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(name) => {
+                if name.to_string_lossy().eq_ignore_ascii_case(".git") {
+                    return false;
+                }
+                has_name = true;
+            }
+            _ if untracked => return false,
+            _ => {}
+        }
+    }
+    has_name
+}
+
+fn retired_manifest_fields_valid(parts: &[&str]) -> bool {
+    let paths_hint = (!parts[7].is_empty()).then_some(parts[7]);
+    let untracked_snapshot = parts
+        .get(8)
+        .into_iter()
+        .flat_map(|field| field.split('\u{1f}'))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let unique_snapshot = untracked_snapshot
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        == untracked_snapshot.len();
+    let direct_file_tool = matches!(parts[3], "write_file" | "edit_file" | "multi_edit");
+
+    paths_hint.is_none_or(|path| retired_manifest_path_valid(path, false))
+        && untracked_snapshot.len() <= UNTRACKED_SNAPSHOT_CAP
+        && unique_snapshot
+        && untracked_snapshot
+            .iter()
+            .all(|path| retired_manifest_path_valid(path, true))
+        && (!direct_file_tool || paths_hint.is_some())
+        && (parts[6] == "false" || paths_hint.is_some() || !untracked_snapshot.is_empty())
+}
+
+/// Header metadata of a row written by a retired Dext manifest encoding (the
+/// 8- and 9-field pre-JSON forms). Recognition requires an intact checkpoint
+/// header and valid retired field grammar, so genuine corruption or tampering
+/// still fails the manifest closed instead of being quietly skipped.
+fn retired_manifest_row(line: &str) -> Option<RetiredManifestRow<'_>> {
+    let parts: Vec<&str> = line.splitn(13, '\t').collect();
+    if !matches!(parts.len(), 8 | 9) {
+        return None;
+    }
+    // A current row truncated to 8 or 9 fields would still carry an intact
+    // header, but its path fields are JSON arrays and no pre-JSON writer
+    // emitted those. Rejecting either array-shaped field keeps truncation fatal
+    // rather than skippable even if the other field was damaged.
+    if parts[7].trim_start().starts_with('[')
+        || parts
+            .get(8)
+            .is_some_and(|field| field.trim_start().starts_with('['))
+    {
+        return None;
+    }
+    (safe_checkpoint_id(parts[0])
+        && checkpoint_ref_valid(parts[1], parts[0])
+        && valid_object_id(parts[2])
+        && valid_checkpoint_tool_name(parts[3])
+        && parts[4].parse::<u128>().is_ok()
+        && valid_object_id(parts[5])
+        && matches!(parts[6], "true" | "false")
+        && retired_manifest_fields_valid(&parts))
+    .then_some(RetiredManifestRow {
+        id: parts[0],
+        ref_name: parts[1],
+        oid: parts[2],
+    })
+}
+
 fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
-    let parts: Vec<&str> = line.splitn(9, '\t').collect();
-    if parts.len() != 9 {
+    let parts: Vec<&str> = line.splitn(13, '\t').collect();
+    if !matches!(parts.len(), 11 | 12) {
         return None;
     }
     let paths_hint = serde_json::from_str::<Vec<String>>(parts[7]).ok()?;
     let untracked_snapshot = serde_json::from_str::<Vec<String>>(parts[8]).ok()?;
+    let untracked_sidecars = serde_json::from_str::<Vec<UntrackedSidecar>>(parts[9]).ok()?;
+    let untracked_capture_warning = serde_json::from_str::<Option<String>>(parts[10]).ok()?;
+    // Field 12 is the exact direct-sidecar membership index. Rows written
+    // before it existed parse as None, which makes restore fail closed on an
+    // ambiguous missing sidecar instead of guessing.
+    let direct_sidecar_paths = if parts.len() == 12 {
+        Some(serde_json::from_str::<Vec<String>>(parts[11]).ok()?)
+    } else {
+        None
+    };
     let id = parts[0];
     let ref_name = parts[1];
     let oid = parts[2];
     let head = parts[5];
+    let safe_relative = |path: &String| safe_repo_relative_path(Path::new(path));
     if !safe_checkpoint_id(id)
         || !checkpoint_ref_valid(ref_name, id)
         || !valid_object_id(oid)
         || !valid_object_id(head)
         || !valid_checkpoint_tool_name(parts[3])
         || !matches!(parts[6], "true" | "false")
-        || !paths_hint
-            .iter()
-            .all(|path| safe_repo_relative_path(Path::new(path)))
-        || !untracked_snapshot
-            .iter()
-            .all(|path| safe_repo_relative_path(Path::new(path)))
-        || (parts[6] == "true" && paths_hint.is_empty())
+        || !paths_hint.iter().all(safe_relative)
+        || !untracked_snapshot.iter().all(safe_relative)
+        || !direct_sidecar_paths
+            .as_deref()
+            .is_none_or(|paths| paths.iter().all(safe_relative))
+        || !untracked_sidecars.iter().all(|sidecar| {
+            safe_repo_relative_path(Path::new(sidecar.path()))
+                && match sidecar {
+                    UntrackedSidecar::File { digest, size, .. } => {
+                        digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            && *size <= BASH_UNTRACKED_SIDECAR_FILE_CAP
+                    }
+                    UntrackedSidecar::Symlink { target, .. } => target.len() <= SYMLINK_TARGET_CAP,
+                }
+        })
+        || untracked_capture_warning
+            .as_ref()
+            .is_some_and(|warning| warning.len() > 4_096)
+        || (parts[6] == "true" && paths_hint.is_empty() && untracked_snapshot.is_empty())
     {
         return None;
     }
-    Some(Checkpoint {
+    let checkpoint = Checkpoint {
         id: id.to_string(),
         ref_name: ref_name.to_string(),
         oid: oid.to_string(),
@@ -1161,7 +2057,12 @@ fn parse_manifest_line(line: &str) -> Option<Checkpoint> {
         paths_hint,
         includes_untracked_sidecar: parts[6] == "true",
         untracked_snapshot,
-    })
+        direct_sidecar_paths,
+        untracked_sidecars,
+        untracked_capture_warning,
+    };
+    validate_checkpoint(&checkpoint).ok()?;
+    Some(checkpoint)
 }
 
 fn list_checkpoints_in_repo(
@@ -1169,7 +2070,7 @@ fn list_checkpoints_in_repo(
     limit: usize,
     tolerate_missing_refs: bool,
     manifest_max_bytes: Option<u64>,
-) -> Result<Vec<Checkpoint>, String> {
+) -> Result<(Vec<Checkpoint>, Vec<String>), String> {
     let manifest_path = checkpoints_manifest_dir(git_root).join("manifest.txt");
     let content = match std::fs::symlink_metadata(&manifest_path) {
         Ok(metadata) if !safe_private_file_metadata(&metadata) => {
@@ -1178,8 +2079,15 @@ fn list_checkpoints_in_repo(
                 manifest_path.display()
             ));
         }
-        Ok(_) => read_private_file_with_limit(&manifest_path, manifest_max_bytes)
-            .map_err(|error| format!("read checkpoint manifest: {error}"))?,
+        Ok(_) => read_private_file_with_limit(
+            &manifest_path,
+            Some(
+                manifest_max_bytes
+                    .unwrap_or(CHECKPOINT_MANIFEST_MAX_BYTES)
+                    .min(CHECKPOINT_MANIFEST_MAX_BYTES),
+            ),
+        )
+        .map_err(|error| format!("read checkpoint manifest: {error}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("checkpoint manifest metadata: {error}")),
     };
@@ -1211,16 +2119,52 @@ fn list_checkpoints_in_repo(
     let mut cps = Vec::new();
     let mut ids = std::collections::HashSet::new();
     let mut manifest_refs = std::collections::HashSet::new();
+    let mut unreadable: Vec<usize> = Vec::new();
+    let mut retired_refs = Vec::new();
     for (line_index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let checkpoint = parse_manifest_line(line.trim()).ok_or_else(|| {
-            format!(
-                "invalid checkpoint manifest entry at line {}",
-                line_index + 1
-            )
-        })?;
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let checkpoint = match parse_manifest_line(line) {
+            Some(checkpoint) => checkpoint,
+            // A row from a retired encoding is one this build also cannot
+            // restore from, so failing the whole listing would take out /undo
+            // and block every write-risk tool to protect a checkpoint that is
+            // already unusable. Skip it and say so. Anything else is corruption
+            // or tampering and still fails closed.
+            None => {
+                if let Some(retired) = retired_manifest_row(line) {
+                    if !ids.insert(retired.id.to_string()) {
+                        return Err(format!(
+                            "duplicate checkpoint id in manifest: {}",
+                            retired.id
+                        ));
+                    }
+                    if !manifest_refs.insert(retired.ref_name.to_string()) {
+                        return Err(format!(
+                            "duplicate checkpoint ref in manifest: {}",
+                            retired.ref_name
+                        ));
+                    }
+                    if let Some(ref_oid) = existing_refs.get(retired.ref_name) {
+                        if ref_oid != retired.oid {
+                            return Err(format!(
+                                "checkpoint ref no longer matches manifest OID: {}",
+                                retired.ref_name
+                            ));
+                        }
+                        retired_refs.push(retired.ref_name.to_string());
+                    }
+                    unreadable.push(line_index + 1);
+                    continue;
+                }
+                return Err(format!(
+                    "invalid checkpoint manifest entry at line {}",
+                    line_index + 1
+                ));
+            }
+        };
         if !ids.insert(checkpoint.id.clone()) {
             return Err(format!(
                 "duplicate checkpoint id in manifest: {}",
@@ -1248,6 +2192,30 @@ fn list_checkpoints_in_repo(
             ));
         }
     }
+    // Every write-risk tool call reaches this through automatic retention, and
+    // stderr is shared with the inline TUI, so the notice is emitted at most
+    // once per process instead of once per checkpoint.
+    static WARNED_UNREADABLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if !unreadable.is_empty() && !WARNED_UNREADABLE.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        let shown = unreadable
+            .iter()
+            .take(8)
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (entry_noun, line_noun) = if unreadable.len() == 1 {
+            ("entry", "line")
+        } else {
+            ("entries", "lines")
+        };
+        eprintln!(
+            "[checkpoint] skipped {} unreadable manifest {entry_noun} ({line_noun} {shown}{}); those recovery points cannot be restored by this build",
+            unreadable.len(),
+            if unreadable.len() > 8 { ", …" } else { "" },
+        );
+    }
     // Newest first. Manifest append order breaks ties when several checkpoints
     // share the same millisecond timestamp.
     cps.sort_by_key(|(line_index, checkpoint)| {
@@ -1258,7 +2226,7 @@ fn list_checkpoints_in_repo(
         .map(|(_, checkpoint)| checkpoint)
         .collect::<Vec<_>>();
     cps.truncate(limit);
-    Ok(cps)
+    Ok((cps, retired_refs))
 }
 
 pub(crate) fn inspect_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
@@ -1275,6 +2243,7 @@ pub(crate) fn inspect_checkpoints(root: &Path, limit: usize) -> Result<Vec<Check
         return Err("checkpoint manifest exceeds the doctor inspection bound".to_string());
     }
     list_checkpoints_in_repo(&git_root, limit, false, Some(256 * 1024))
+        .map(|(checkpoints, _)| checkpoints)
 }
 
 pub(crate) fn list_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
@@ -1285,7 +2254,7 @@ pub(crate) fn list_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoi
         return Ok(Vec::new());
     }
     let _operation_lock = CheckpointOperationLock::acquire(&git_root)?;
-    list_checkpoints_in_repo(&git_root, limit, false, None)
+    list_checkpoints_in_repo(&git_root, limit, false, None).map(|(checkpoints, _)| checkpoints)
 }
 
 fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
@@ -1297,21 +2266,113 @@ fn validate_checkpoint(cp: &Checkpoint) -> Result<(), String> {
     {
         return Err("checkpoint metadata failed validation".to_string());
     }
-    if let Some(path) = cp
-        .paths_hint
-        .iter()
-        .find(|path| !safe_repo_relative_path(Path::new(path)))
+    if cp.paths_hint.len() > UNTRACKED_SNAPSHOT_CAP
+        || cp.untracked_snapshot.len() > UNTRACKED_SNAPSHOT_CAP
+        || cp
+            .direct_sidecar_paths
+            .as_deref()
+            .is_some_and(|paths| paths.len() > UNTRACKED_SNAPSHOT_CAP)
+        || cp.untracked_sidecars.len() > UNTRACKED_SNAPSHOT_CAP
     {
+        return Err("checkpoint metadata exceeds its path-count limit".to_string());
+    }
+    let unique_paths = |paths: &[String]| {
+        paths.iter().collect::<std::collections::HashSet<_>>().len() == paths.len()
+    };
+    if !unique_paths(&cp.paths_hint)
+        || !unique_paths(&cp.untracked_snapshot)
+        || cp
+            .direct_sidecar_paths
+            .as_deref()
+            .is_some_and(|paths| !unique_paths(paths))
+    {
+        return Err("checkpoint metadata contains duplicate paths".to_string());
+    }
+    let direct_file_tool = matches!(
+        cp.tool_name.as_str(),
+        "write_file" | "edit_file" | "multi_edit"
+    );
+    if direct_file_tool && cp.paths_hint.is_empty() {
+        return Err(format!(
+            "checkpoint for direct file tool {} records no path hint",
+            cp.tool_name
+        ));
+    }
+    let unsafe_relative = |path: &&String| !safe_repo_relative_path(Path::new(path));
+    if let Some(path) = cp.paths_hint.iter().find(unsafe_relative) {
         return Err(format!("unsafe checkpoint path: {path}"));
     }
-    if let Some(path) = cp
-        .untracked_snapshot
-        .iter()
-        .find(|path| !safe_repo_relative_path(Path::new(path)))
-    {
+    if let Some(path) = cp.untracked_snapshot.iter().find(unsafe_relative) {
         return Err(format!("unsafe checkpoint untracked path: {path}"));
     }
-    if cp.includes_untracked_sidecar && cp.paths_hint.is_empty() {
+    if let Some(path) = cp.direct_sidecar_paths.as_deref().and_then(|paths| {
+        paths.iter().find(|path| {
+            !safe_repo_relative_path(Path::new(path))
+                || !cp.paths_hint.iter().any(|hint| hint == *path)
+        })
+    }) {
+        return Err(format!(
+            "unsafe or undeclared direct checkpoint sidecar path: {path}"
+        ));
+    }
+    let mut sidecar_paths = std::collections::HashSet::new();
+    let mut regular_file_bytes = 0u64;
+    for sidecar in &cp.untracked_sidecars {
+        let path = sidecar.path();
+        if !sidecar_paths.insert(path) {
+            return Err(format!("duplicate checkpoint sidecar path: {path}"));
+        }
+        if !safe_repo_relative_path(Path::new(path))
+            || !cp
+                .untracked_snapshot
+                .iter()
+                .any(|snapshot| snapshot == path)
+        {
+            return Err(format!(
+                "unsafe or undeclared checkpoint sidecar path: {path}"
+            ));
+        }
+        match sidecar {
+            UntrackedSidecar::File { digest, size, .. }
+                if digest.len() != 64
+                    || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || *size > BASH_UNTRACKED_SIDECAR_FILE_CAP =>
+            {
+                return Err(format!("invalid checkpoint blob digest for {path}"));
+            }
+            UntrackedSidecar::File { size, .. } => {
+                regular_file_bytes = regular_file_bytes.saturating_add(*size);
+                if regular_file_bytes > BASH_UNTRACKED_SIDECAR_TOTAL_CAP {
+                    return Err("checkpoint sidecars exceed their total byte limit".to_string());
+                }
+            }
+            UntrackedSidecar::Symlink { target, .. }
+                if target.len() > SYMLINK_TARGET_CAP || target.contains('\0') =>
+            {
+                return Err(format!("checkpoint symlink target is invalid: {path}"));
+            }
+            _ => {}
+        }
+    }
+    if !cp.includes_untracked_sidecar
+        && (cp
+            .direct_sidecar_paths
+            .as_deref()
+            .is_some_and(|paths| !paths.is_empty())
+            || !cp.untracked_sidecars.is_empty())
+    {
+        return Err("checkpoint declares sidecars without enabling restore".to_string());
+    }
+    if cp
+        .direct_sidecar_paths
+        .as_deref()
+        .is_some_and(|paths| !paths.is_empty())
+        && !cp.untracked_sidecars.is_empty()
+    {
+        return Err("checkpoint mixes direct and content-addressed sidecars".to_string());
+    }
+    if cp.includes_untracked_sidecar && cp.paths_hint.is_empty() && cp.untracked_snapshot.is_empty()
+    {
         return Err("checkpoint sidecar has no declared restore paths".to_string());
     }
     Ok(())
@@ -1336,8 +2397,27 @@ fn validate_checkpoint_ref(git_root: &Path, cp: &Checkpoint) -> Result<(), Strin
     Ok(())
 }
 
-fn preview_restore_locked(git_root: &Path, cp: &Checkpoint) -> Result<String, String> {
+fn preview_restore_locked(root: &Path, git_root: &Path, cp: &Checkpoint) -> Result<String, String> {
     validate_checkpoint_ref(git_root, cp)?;
+    let preview_restore_paths = checkpoint_restore_paths(root, git_root, cp)?;
+
+    let mut preview_untracked = Vec::new();
+    let mut skipped_untracked = 0usize;
+    for path in &cp.untracked_snapshot {
+        let Some(relative) = manifest_repo_relative_path(root, git_root, path) else {
+            skipped_untracked += 1;
+            continue;
+        };
+        let Ok(target) = safe_worktree_target(git_root, &relative) else {
+            skipped_untracked += 1;
+            continue;
+        };
+        let Some(relative_string) = relative.to_str().map(String::from) else {
+            skipped_untracked += 1;
+            continue;
+        };
+        preview_untracked.push((relative_string, target));
+    }
 
     let mut out = String::new();
     out.push_str(&format!("Checkpoint: {}\n", cp.id));
@@ -1345,11 +2425,21 @@ fn preview_restore_locked(git_root: &Path, cp: &Checkpoint) -> Result<String, St
     out.push_str(&format!("Ref: {}\n", cp.ref_name));
     out.push_str(&format!("OID: {}\n", cp.oid));
     out.push_str(&format!("HEAD at time: {}\n", cp.head));
-    if !cp.paths_hint.is_empty() {
-        out.push_str(&format!("Paths: {}\n", cp.paths_hint.join(", ")));
+    if !preview_restore_paths.is_empty() {
+        out.push_str(&format!(
+            "Paths: {}\n",
+            preview_restore_paths
+                .iter()
+                .map(|(relative, _)| relative.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if cp.includes_untracked_sidecar {
         out.push_str("Includes untracked file sidecar(s)\n");
+    }
+    if let Some(warning) = &cp.untracked_capture_warning {
+        out.push_str(&format!("WARNING: {warning}\n"));
     }
 
     // Show diff of checkpoint restore target vs current worktree.
@@ -1381,32 +2471,76 @@ fn preview_restore_locked(git_root: &Path, cp: &Checkpoint) -> Result<String, St
     }
 
     if cp.includes_untracked_sidecar {
-        let sdir = sidecar_dir(git_root, &cp.id);
-        if sdir.is_dir() {
-            out.push_str("\nUntracked sidecar files present; ");
-            out.push_str("restore will copy them back.\n");
+        if preflight_sidecar_restore(git_root, cp, &preview_restore_paths, false).is_ok() {
+            out.push_str("\nUntracked sidecar content present; restore will recreate it.\n");
         } else {
-            out.push_str("\nWARNING: expected untracked sidecar files are unavailable; apply will fail closed.\n");
+            out.push_str("\nWARNING: expected untracked sidecar content is unavailable; apply will fail closed.\n");
         }
     }
 
-    // Untracked-file delta since the checkpoint. `git stash create` does not
-    // capture untracked content, so name what changed instead of restoring it.
-    let before: std::collections::HashSet<&str> =
-        cp.untracked_snapshot.iter().map(String::as_str).collect();
-    let now = untracked_files(git_root);
-    let now_set: std::collections::HashSet<&str> = now.iter().map(String::as_str).collect();
+    // Untracked-file delta since the checkpoint. Older manifests may only
+    // identify removed paths; current arbitrary-command checkpoints preserve
+    // bounded regular-file content in sidecars.
+    let before: std::collections::HashSet<&str> = preview_untracked
+        .iter()
+        .map(|(relative, _)| relative.as_str())
+        .collect();
+    let now = untracked_files(git_root)?;
     let created: Vec<&str> = now
+        .paths
         .iter()
         .map(String::as_str)
         .filter(|p| !before.contains(p))
         .collect();
-    let removed: Vec<&str> = cp
-        .untracked_snapshot
+    let captured: std::collections::HashSet<&str> = cp
+        .untracked_sidecars
         .iter()
-        .map(String::as_str)
-        .filter(|p| !now_set.contains(p))
+        .map(UntrackedSidecar::path)
+        .chain(
+            cp.direct_sidecar_paths
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .map(String::as_str),
+        )
+        .chain(
+            preview_restore_paths
+                .iter()
+                .filter(|_| {
+                    cp.direct_sidecar_paths.is_none()
+                        && cp.includes_untracked_sidecar
+                        && cp.untracked_sidecars.is_empty()
+                })
+                .filter_map(|(relative, _)| relative.to_str()),
+        )
         .collect();
+    let removed: Vec<&str> = preview_untracked
+        .iter()
+        .filter(|(_, target)| {
+            std::fs::symlink_metadata(target)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+        .map(|(relative, _)| relative.as_str())
+        .collect();
+    let (removed_captured, removed_uncaptured): (Vec<_>, Vec<_>) = removed
+        .into_iter()
+        .partition(|path| captured.contains(path));
+    if skipped_untracked > 0 {
+        out.push_str(&format!(
+            "\nSkipped {skipped_untracked} checkpoint untracked path(s) outside safe repository targets.\n"
+        ));
+    }
+    if now.truncated {
+        out.push_str(&format!(
+            "\nCurrent untracked-file scan capped at {UNTRACKED_SNAPSHOT_CAP} paths; listed deltas may be incomplete.\n"
+        ));
+    }
+    if now.unsupported_paths > 0 {
+        out.push_str(&format!(
+            "\nCurrent untracked-file scan omitted {} non-UTF-8 path(s); listed deltas may be incomplete.\n",
+            now.unsupported_paths
+        ));
+    }
     if !created.is_empty() {
         out.push_str(
             "\nUntracked files created since checkpoint (restore will NOT remove them):\n",
@@ -1415,12 +2549,20 @@ fn preview_restore_locked(git_root: &Path, cp: &Checkpoint) -> Result<String, St
             out.push_str(&format!("  + {p}\n"));
         }
     }
-    if !removed.is_empty() {
+    if !removed_captured.is_empty() {
+        out.push_str(
+            "\nUntracked files present at checkpoint but gone now (sidecar content will be restored):\n",
+        );
+        for path in removed_captured.iter().take(50) {
+            out.push_str(&format!("  - {path}\n"));
+        }
+    }
+    if !removed_uncaptured.is_empty() {
         out.push_str(
             "\nUntracked files present at checkpoint but gone now (content not recoverable):\n",
         );
-        for p in removed.iter().take(50) {
-            out.push_str(&format!("  - {p}\n"));
+        for path in removed_uncaptured.iter().take(50) {
+            out.push_str(&format!("  - {path}\n"));
         }
     }
 
@@ -1433,7 +2575,7 @@ pub(crate) fn preview_restore(root: &Path, cp: &Checkpoint) -> Result<String, St
         return Err("not a git repository".to_string());
     };
     let _operation_lock = CheckpointOperationLock::acquire(&git_root)?;
-    preview_restore_locked(&git_root, cp)
+    preview_restore_locked(root, &git_root, cp)
 }
 
 fn cap_diff(diff: &str, max_bytes: usize) -> String {
@@ -1542,25 +2684,91 @@ fn preflight_restore_paths(
     cp: &Checkpoint,
     full_restore: bool,
 ) -> Result<Vec<(PathBuf, PathBuf)>, String> {
-    let restore_paths = cp
-        .paths_hint
-        .iter()
-        .map(|path| {
-            let relative = manifest_repo_relative_path(root, git_root, path)
-                .ok_or_else(|| format!("unsafe checkpoint path: {path}"))?;
-            let target = safe_worktree_target(git_root, &relative)?;
-            Ok((relative, target))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let restore_paths = checkpoint_restore_paths(root, git_root, cp)?;
     preflight_git_restore_destinations(git_root, &cp.oid, &restore_paths, full_restore)?;
     Ok(restore_paths)
 }
 
-fn preflight_sidecar_restore(
+#[derive(Clone, Debug)]
+enum PreparedSidecarRestore {
+    File {
+        source: PathBuf,
+        relative: PathBuf,
+        executable: Option<bool>,
+        digest: Option<String>,
+        size: Option<u64>,
+    },
+    Symlink {
+        relative: PathBuf,
+        target: String,
+        target_is_dir: bool,
+    },
+}
+
+impl PreparedSidecarRestore {
+    fn relative(&self) -> &Path {
+        match self {
+            Self::File { relative, .. } | Self::Symlink { relative, .. } => relative,
+        }
+    }
+}
+
+fn validate_private_blob(
+    git_root: &Path,
+    digest: &str,
+    expected_size: u64,
+) -> Result<PathBuf, String> {
+    let dir = validate_private_blob_dir(git_root)?;
+    let path = dir.join(digest);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("open checkpoint blob {digest}: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("checkpoint blob metadata: {error}"))?;
+    if !safe_private_file_metadata(&metadata) || metadata.len() != expected_size {
+        return Err(format!("checkpoint blob is unsafe or corrupt: {digest}"));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut read_total = 0u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read checkpoint blob: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        read_total = read_total.saturating_add(read as u64);
+        if read_total > BASH_UNTRACKED_SIDECAR_FILE_CAP {
+            return Err(format!("checkpoint blob exceeds its byte limit: {digest}"));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if read_total != expected_size || actual != digest {
+        return Err(format!("checkpoint blob digest mismatch: {digest}"));
+    }
+    Ok(path)
+}
+
+fn preflight_direct_sidecar_restore(
     git_root: &Path,
     cp: &Checkpoint,
     restore_paths: &[(PathBuf, PathBuf)],
-) -> Result<Vec<PathBuf>, String> {
+    validate_destinations: bool,
+) -> Result<Vec<PreparedSidecarRestore>, String> {
     let sdir = sidecar_dir(git_root, &cp.id);
     let metadata = match std::fs::symlink_metadata(&sdir) {
         Ok(metadata) => metadata,
@@ -1573,8 +2781,8 @@ fn preflight_sidecar_restore(
         }
         Err(error) => return Err(format!("checkpoint sidecar metadata: {error}")),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("checkpoint sidecar directory is unsafe".to_string());
+    if !safe_private_dir_metadata(&metadata) {
+        return Err("checkpoint sidecar directory is not owner-private".to_string());
     }
     let entries = walk_dir(&sdir)?;
     if entries.is_empty() {
@@ -1587,34 +2795,90 @@ fn preflight_sidecar_restore(
     if !cp.includes_untracked_sidecar {
         return Err("checkpoint has unexpected untracked sidecar files".to_string());
     }
-    let allowed = restore_paths
+    let selected = if restore_paths.is_empty() {
+        cp.untracked_snapshot
+            .iter()
+            .map(Path::new)
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        restore_paths
+            .iter()
+            .map(|(relative, _)| relative.as_path())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let allowed = if let Some(declared) = cp.direct_sidecar_paths.as_deref() {
+        declared
+            .iter()
+            .map(String::as_str)
+            .map(Path::new)
+            .filter(|path| selected.contains(path))
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        selected
+    };
+    let present = entries
         .iter()
-        .map(|(relative, _)| relative.as_path())
-        .collect::<std::collections::HashSet<_>>();
-    for entry in &entries {
+        .map(|entry| {
+            entry
+                .strip_prefix(&sdir)
+                .map_err(|_| "checkpoint sidecar escapes its storage directory".to_string())
+        })
+        .collect::<Result<std::collections::HashSet<_>, String>>()?;
+    if cp.direct_sidecar_paths.is_some() {
+        // Exact membership was recorded, so a missing sidecar is unambiguous.
+        if let Some(missing) = allowed.iter().find(|path| !present.contains(*path)) {
+            return Err(format!(
+                "required untracked checkpoint sidecar is missing: {}",
+                missing.display()
+            ));
+        }
+    } else {
+        // Without the membership index a missing sidecar is ambiguous: the path
+        // may have been tracked at checkpoint time (so no sidecar was ever
+        // written) rather than lost. Accept only that case, proven against the
+        // checkpoint tree, and fail closed otherwise.
+        for missing in allowed.difference(&present) {
+            let relative = missing.to_str().ok_or_else(|| {
+                format!("checkpoint path is not valid UTF-8: {}", missing.display())
+            })?;
+            if restore_paths.is_empty() || !tree_has_path(git_root, &cp.oid, relative)? {
+                return Err(format!(
+                    "required checkpoint sidecar is missing or was not recorded: {}",
+                    missing.display()
+                ));
+            }
+        }
+    }
+    let mut prepared = Vec::with_capacity(entries.len());
+    for entry in entries {
         let relative = entry
             .strip_prefix(&sdir)
-            .map_err(|_| "checkpoint sidecar escapes its storage directory".to_string())?;
-        if !safe_repo_relative_path(relative) || !allowed.contains(relative) {
+            .map_err(|_| "checkpoint sidecar escapes its storage directory".to_string())?
+            .to_path_buf();
+        if !safe_repo_relative_path(&relative) || !allowed.contains(relative.as_path()) {
             return Err(format!(
                 "checkpoint sidecar targets undeclared path: {}",
                 relative.display()
             ));
         }
-        let target = safe_worktree_target(git_root, relative)?;
-        match std::fs::symlink_metadata(&target) {
-            Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    || !safe_restore_destination_metadata(&metadata) =>
-            {
-                return Err(format!(
-                    "sidecar restore destination is unsafe or multiply linked: {}",
-                    target.display()
-                ));
+        if validate_destinations {
+            let target = safe_worktree_target(git_root, &relative)?;
+            match std::fs::symlink_metadata(&target) {
+                Ok(metadata)
+                    if metadata.file_type().is_symlink()
+                        || !safe_restore_destination_metadata(&metadata) =>
+                {
+                    return Err(format!(
+                        "sidecar restore destination is unsafe or multiply linked: {}",
+                        target.display()
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("sidecar restore destination metadata: {error}"));
+                }
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("sidecar restore destination metadata: {error}")),
         }
         let mut options = OpenOptions::new();
         options.read(true);
@@ -1624,7 +2888,7 @@ fn preflight_sidecar_restore(
             options.custom_flags(libc::O_NOFOLLOW);
         }
         let file = options
-            .open(entry)
+            .open(&entry)
             .map_err(|error| format!("open checkpoint sidecar {}: {error}", entry.display()))?;
         if !safe_private_file_metadata(
             &file
@@ -1636,8 +2900,114 @@ fn preflight_sidecar_restore(
                 entry.display()
             ));
         }
+        prepared.push(PreparedSidecarRestore::File {
+            source: entry,
+            relative,
+            executable: None,
+            digest: None,
+            size: None,
+        });
     }
-    Ok(entries)
+    Ok(prepared)
+}
+
+fn preflight_sidecar_destination(
+    destination: &Path,
+    restoring_symlink: bool,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() => Err(format!(
+            "refusing to replace directory during sidecar restore: {}",
+            destination.display()
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() && !restoring_symlink => Err(format!(
+            "refusing to replace symlink with checkpoint file: {}",
+            destination.display()
+        )),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(()),
+        Ok(metadata) if metadata.is_file() && !safe_restore_destination_metadata(&metadata) => {
+            Err(format!(
+                "sidecar restore destination is multiply linked: {}",
+                destination.display()
+            ))
+        }
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "sidecar restore destination is not a regular file or symlink: {}",
+            destination.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("sidecar restore destination metadata: {error}")),
+    }
+}
+
+fn preflight_sidecar_restore(
+    git_root: &Path,
+    cp: &Checkpoint,
+    restore_paths: &[(PathBuf, PathBuf)],
+    validate_destinations: bool,
+) -> Result<Vec<PreparedSidecarRestore>, String> {
+    if cp.untracked_sidecars.is_empty() {
+        return preflight_direct_sidecar_restore(
+            git_root,
+            cp,
+            restore_paths,
+            validate_destinations,
+        );
+    }
+    if !cp.includes_untracked_sidecar {
+        return Err("checkpoint declares sidecars without enabling restore".to_string());
+    }
+    let allowed = if restore_paths.is_empty() {
+        cp.untracked_snapshot
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        restore_paths
+            .iter()
+            .filter_map(|(relative, _)| relative.to_str())
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let mut prepared = Vec::with_capacity(cp.untracked_sidecars.len());
+    for sidecar in &cp.untracked_sidecars {
+        if !allowed.contains(sidecar.path()) {
+            return Err(format!(
+                "checkpoint sidecar targets undeclared path: {}",
+                sidecar.path()
+            ));
+        }
+        let relative = PathBuf::from(sidecar.path());
+        if validate_destinations {
+            let destination = safe_worktree_target(git_root, &relative)?;
+            let restoring_symlink = matches!(sidecar, UntrackedSidecar::Symlink { .. });
+            preflight_sidecar_destination(&destination, restoring_symlink)?;
+        }
+        match sidecar {
+            UntrackedSidecar::File {
+                digest,
+                size,
+                executable,
+                ..
+            } => prepared.push(PreparedSidecarRestore::File {
+                source: validate_private_blob(git_root, digest, *size)?,
+                relative,
+                executable: Some(*executable),
+                digest: Some(digest.clone()),
+                size: Some(*size),
+            }),
+            UntrackedSidecar::Symlink {
+                target,
+                target_is_dir,
+                ..
+            } => prepared.push(PreparedSidecarRestore::Symlink {
+                relative,
+                target: target.clone(),
+                target_is_dir: *target_is_dir,
+            }),
+        }
+    }
+    Ok(prepared)
 }
 
 pub(crate) fn restore_worktree(
@@ -1652,7 +3022,7 @@ pub(crate) fn restore_worktree(
     validate_checkpoint_ref(&git_root, cp)?;
 
     if mode == RestoreMode::Preview {
-        return preview_restore_locked(&git_root, cp);
+        return preview_restore_locked(root, &git_root, cp);
     }
 
     if mode == RestoreMode::ResetHead {
@@ -1660,13 +3030,24 @@ pub(crate) fn restore_worktree(
         return reset_head(&git_root, cp);
     }
 
-    let full_restore = mode == RestoreMode::WorktreeAndIndex || cp.paths_hint.is_empty();
+    let full_restore = cp.paths_hint.is_empty();
     let restore_paths = preflight_restore_paths(root, &git_root, cp, full_restore)?;
-    let sidecar_entries = preflight_sidecar_restore(&git_root, cp, &restore_paths)?;
-    let sdir = sidecar_dir(&git_root, &cp.id);
+    let sidecar_entries = preflight_sidecar_restore(&git_root, cp, &restore_paths, true)?;
+    let restore_path_tree_presence = restore_paths
+        .iter()
+        .map(|(relative, _)| {
+            let relative = relative.to_str().ok_or_else(|| {
+                format!(
+                    "checkpoint restore path is not valid UTF-8: {}",
+                    relative.display()
+                )
+            })?;
+            tree_has_path(&git_root, &cp.oid, relative)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let sidecar_paths = sidecar_entries
         .iter()
-        .filter_map(|entry| entry.strip_prefix(&sdir).ok())
+        .map(PreparedSidecarRestore::relative)
         .collect::<std::collections::HashSet<_>>();
 
     // Worktree restore: checkout paths from checkpoint OID
@@ -1674,12 +3055,20 @@ pub(crate) fn restore_worktree(
     let mut warnings: Vec<String> = Vec::new();
 
     if !restore_paths.is_empty() {
-        for (rel, target) in &restore_paths {
+        for ((rel, target), tree_has_path) in restore_paths.iter().zip(restore_path_tree_presence) {
             let rel_str = rel.to_string_lossy().to_string();
-            let result = if tree_has_path(&git_root, &cp.oid, &rel_str) {
+            let result = if tree_has_path {
+                let pathspec = literal_git_pathspec(&rel_str);
                 run_git(
                     &git_root,
-                    &["restore", "--source", &cp.oid, "--worktree", "--", &rel_str],
+                    &[
+                        "restore",
+                        "--source",
+                        &cp.oid,
+                        "--worktree",
+                        "--",
+                        &pathspec,
+                    ],
                 )
                 .map(|_| {
                     restored.push(rel_str.clone());
@@ -1699,28 +3088,46 @@ pub(crate) fn restore_worktree(
         }
     }
 
-    // If no specific paths, restore all worktree paths. WorktreeAndIndex is an
-    // internal explicit mode that also restores the index from the snapshot.
-    if mode == RestoreMode::WorktreeAndIndex || cp.paths_hint.is_empty() {
-        let mut args = vec!["restore", "--source", cp.oid.as_str()];
-        if mode == RestoreMode::WorktreeAndIndex {
-            args.push("--staged");
-        }
-        args.extend(["--worktree", "--", "."]);
+    // If no specific paths, restore all worktree paths.
+    if cp.paths_hint.is_empty() {
+        let args = vec![
+            "restore",
+            "--source",
+            cp.oid.as_str(),
+            "--worktree",
+            "--",
+            ".",
+        ];
         run_git(&git_root, &args)?;
         restored.push("(all worktree files)".to_string());
     }
 
     // Restore sidecar untracked files that were fully validated before any
     // worktree mutation above.
-    for entry in sidecar_entries {
-        let rel = entry
-            .strip_prefix(&sdir)
-            .expect("preflighted sidecar remains below checkpoint directory");
-        match safe_worktree_target(&git_root, rel)
-            .and_then(|_| copy_sidecar_file(&entry, &git_root, rel))
-        {
-            Ok(()) => restored.push(rel.display().to_string()),
+    for sidecar in sidecar_entries {
+        let relative = sidecar.relative().to_path_buf();
+        let result = match sidecar {
+            PreparedSidecarRestore::File {
+                source,
+                executable,
+                digest,
+                size,
+                ..
+            } => copy_sidecar_file(
+                &source,
+                &git_root,
+                &relative,
+                executable,
+                digest.as_deref().zip(size),
+            ),
+            PreparedSidecarRestore::Symlink {
+                target,
+                target_is_dir,
+                ..
+            } => restore_sidecar_symlink(&git_root, &relative, &target, target_is_dir),
+        };
+        match result {
+            Ok(()) => restored.push(relative.display().to_string()),
             Err(error) => warnings.push(format!("sidecar restore failed: {error}")),
         }
     }
@@ -1804,7 +3211,91 @@ fn ensure_worktree_parent_tree(git_root: &Path, relative: &Path) -> Result<PathB
     })?))
 }
 
-fn copy_sidecar_file(source: &Path, git_root: &Path, relative: &Path) -> Result<(), String> {
+fn create_platform_symlink(
+    link_target: &str,
+    destination: &Path,
+    target_is_dir: bool,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = target_is_dir;
+        std::os::unix::fs::symlink(link_target, destination)
+    }
+    #[cfg(windows)]
+    {
+        if target_is_dir {
+            std::os::windows::fs::symlink_dir(link_target, destination)
+        } else {
+            std::os::windows::fs::symlink_file(link_target, destination)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (link_target, target_is_dir, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink restore is unsupported on this platform",
+        ))
+    }
+}
+
+fn restore_sidecar_symlink(
+    git_root: &Path,
+    relative: &Path,
+    link_target: &str,
+    target_is_dir: bool,
+) -> Result<(), String> {
+    let destination = ensure_worktree_parent_tree(git_root, relative)?;
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "checkpoint symlink destination has no parent: {}",
+            destination.display()
+        )
+    })?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("restore");
+    let mut temp_path = None;
+    for _ in 0..16 {
+        let nonce = random_checkpoint_nonce()?;
+        let candidate = parent.join(format!(".{file_name}.dext-restore-{nonce}"));
+        match create_platform_symlink(link_target, &candidate, target_is_dir) {
+            Ok(()) => {
+                temp_path = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("restore checkpoint symlink: {error}")),
+        }
+    }
+    let temp_path = temp_path.ok_or_else(|| {
+        format!(
+            "could not allocate checkpoint symlink restore temp in {}",
+            parent.display()
+        )
+    })?;
+    if let Err(error) = preflight_sidecar_destination(&destination, true) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    let result = crate::session::replace_file_atomically(&temp_path, &destination)
+        .map_err(|error| format!("atomically replace checkpoint symlink: {error}"));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn copy_sidecar_file(
+    source: &Path,
+    git_root: &Path,
+    relative: &Path,
+    executable: Option<bool>,
+    expected_integrity: Option<(&str, u64)>,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = executable;
     let destination = ensure_worktree_parent_tree(git_root, relative)?;
     let metadata = std::fs::symlink_metadata(source)
         .map_err(|error| format!("sidecar metadata {}: {error}", source.display()))?;
@@ -1838,11 +3329,10 @@ fn copy_sidecar_file(source: &Path, git_root: &Path, relative: &Path) -> Result<
     let mut input = source_options
         .open(source)
         .map_err(|error| format!("open sidecar {}: {error}", source.display()))?;
-    if !safe_private_file_metadata(
-        &input
-            .metadata()
-            .map_err(|error| format!("sidecar metadata {}: {error}", source.display()))?,
-    ) {
+    let input_metadata = input
+        .metadata()
+        .map_err(|error| format!("sidecar metadata {}: {error}", source.display()))?;
+    if !safe_private_file_metadata(&input_metadata) {
         return Err(format!(
             "sidecar source is not a safe private file: {}",
             source.display()
@@ -1861,6 +3351,18 @@ fn copy_sidecar_file(source: &Path, git_root: &Path, relative: &Path) -> Result<
     })?;
     let mut temp_path = None;
     let mut output = None;
+    #[cfg(unix)]
+    let restore_mode = executable.map_or_else(
+        || {
+            use std::os::unix::fs::PermissionsExt as _;
+            if input_metadata.permissions().mode() & 0o100 != 0 {
+                0o700
+            } else {
+                0o600
+            }
+        },
+        |executable| if executable { 0o700 } else { 0o600 },
+    );
     for _ in 0..16 {
         let nonce = random_checkpoint_nonce()?;
         let candidate = parent.join(format!(".{file_name}.dext-restore-{nonce}"));
@@ -1869,7 +3371,7 @@ fn copy_sidecar_file(source: &Path, git_root: &Path, relative: &Path) -> Result<
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            options.mode(restore_mode).custom_flags(libc::O_NOFOLLOW);
         }
         match options.open(&candidate) {
             Ok(file) => {
@@ -1893,49 +3395,104 @@ fn copy_sidecar_file(source: &Path, git_root: &Path, relative: &Path) -> Result<
         )
     })?;
     let mut output = output.expect("temp path and file are created together");
-    let result = (|| -> Result<(), String> {
-        std::io::copy(&mut input, &mut output)
-            .map_err(|error| format!("copy sidecar to temp: {error}"))?;
+    let copy_result = (|| -> Result<(), String> {
+        let mut copied = 0u64;
+        let mut hasher = expected_integrity.map(|_| Sha256::new());
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = input
+                .read(&mut buffer)
+                .map_err(|error| format!("read sidecar for restore: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| format!("copy sidecar to temp: {error}"))?;
+            if let Some(hasher) = hasher.as_mut() {
+                hasher.update(&buffer[..read]);
+            }
+            copied = copied.saturating_add(read as u64);
+        }
+        if let Some((expected_digest, expected_size)) = expected_integrity {
+            let actual_digest = hasher
+                .expect("integrity request creates a hasher")
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if copied != expected_size || actual_digest != expected_digest {
+                return Err(format!(
+                    "checkpoint blob changed during restore: {expected_digest}"
+                ));
+            }
+        }
         output
             .sync_all()
             .map_err(|error| format!("sync sidecar restore temp: {error}"))?;
-        drop(output);
-        std::fs::rename(&temp_path, &destination).map_err(|error| {
+        Ok(())
+    })();
+    drop(output);
+    let result = copy_result.and_then(|()| {
+        preflight_sidecar_destination(&destination, false)?;
+        crate::session::replace_file_atomically(&temp_path, &destination).map_err(|error| {
             format!(
                 "replace restore destination {}: {error}",
                 destination.display()
             )
-        })?;
-        Ok(())
-    })();
+        })
+    });
     if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
     }
     result
 }
 
+const SIDECAR_TREE_ENTRY_CAP: usize = 65_536;
+
 fn walk_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let metadata =
-        std::fs::symlink_metadata(dir).map_err(|e| format!("directory metadata: {e}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!("unsafe sidecar directory: {}", dir.display()));
-    }
     let mut result = Vec::new();
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("dir_entry: {e}"))?;
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path).map_err(|e| format!("metadata: {e}"))?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!("unsafe sidecar symlink: {}", path.display()));
+    let mut pending = vec![dir.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(current) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| format!("directory metadata {}: {error}", current.display()))?;
+        if !safe_private_dir_metadata(&metadata) {
+            return Err(format!(
+                "unsafe non-private sidecar directory: {}",
+                current.display()
+            ));
         }
-        if metadata.is_dir() {
-            let mut sub = walk_dir(&path)?;
-            result.append(&mut sub);
-        } else if safe_private_file_metadata(&metadata) {
-            result.push(path);
-        } else {
-            return Err(format!("unsafe sidecar entry: {}", path.display()));
+        let entries = std::fs::read_dir(&current)
+            .map_err(|error| format!("read sidecar directory {}: {error}", current.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("read sidecar directory entry: {error}"))?;
+            visited = visited.saturating_add(1);
+            if visited > SIDECAR_TREE_ENTRY_CAP {
+                return Err(format!(
+                    "checkpoint sidecar tree exceeds the {SIDECAR_TREE_ENTRY_CAP}-entry limit: {}",
+                    dir.display()
+                ));
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("sidecar metadata {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!("unsafe sidecar symlink: {}", path.display()));
+            }
+            if metadata.is_dir() {
+                if !safe_private_dir_metadata(&metadata) {
+                    return Err(format!(
+                        "unsafe non-private sidecar directory: {}",
+                        path.display()
+                    ));
+                }
+                pending.push(path);
+            } else if safe_private_file_metadata(&metadata) {
+                result.push(path);
+            } else {
+                return Err(format!("unsafe sidecar entry: {}", path.display()));
+            }
         }
     }
     Ok(result)
@@ -1944,6 +3501,23 @@ fn walk_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
 struct PruneOutcome {
     checkpoints_removed: usize,
     orphan_sidecars_removed: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Default)]
+struct BlobPruneOutcome {
+    removed: usize,
+    warnings: Vec<String>,
+}
+
+const PRUNE_WARNING_CAP: usize = 8;
+
+fn record_prune_warning(warnings: &mut Vec<String>, warning: String) {
+    if warnings.len() < PRUNE_WARNING_CAP {
+        warnings.push(warning);
+    } else if warnings.len() == PRUNE_WARNING_CAP {
+        warnings.push("additional checkpoint prune warnings omitted".to_string());
+    }
 }
 
 fn prune_checkpoint_refs(
@@ -1954,67 +3528,277 @@ fn prune_checkpoint_refs(
     ensure_checkpoint_storage(git_root)?;
     let now = now_ms();
     let max_age_ms = (max_age_hours as u128) * 3_600_000;
-    let cps = list_checkpoints_in_repo(git_root, usize::MAX, true, None)?;
+    let (cps, retired_refs) = list_checkpoints_in_repo(git_root, usize::MAX, true, None)?;
     let mut remaining = Vec::with_capacity(cps.len());
     let mut expired = Vec::new();
     for (i, cp) in cps.into_iter().enumerate() {
         let age = now.saturating_sub(cp.created_at_ms);
-        if i >= keep || age > max_age_ms {
-            expired.push(cp);
-        } else {
+        if i < keep && age <= max_age_ms {
             remaining.push(cp);
+        } else {
+            expired.push(cp);
         }
     }
-    // Delete refs before compacting the manifest. If a ref deletion fails, the
-    // original manifest still names every live checkpoint ref. A later manifest
-    // write failure can leave stale entries for already-deleted refs, which list
-    // and the next prune safely ignore; it cannot leave an unmanifested live ref.
-    for cp in &expired {
-        run_git(git_root, &["update-ref", "-d", &cp.ref_name])?;
-    }
+    // Commit the compacted manifest before deleting any refs. If the manifest
+    // write fails, every live recovery ref remains named. If later ref cleanup
+    // fails, only an orphan ref is left; ordinary listing and /undo still see a
+    // self-consistent manifest instead of failing on a missing named ref.
+    //
+    // Recognized retired rows are safe to reclaim only after their full retired
+    // grammar was validated and their recorded OID matched the live ref during
+    // listing. Unrecognized parse failures never reach this rewrite, and a
+    // retired row/ref mismatch fails closed.
     write_checkpoint_manifest(git_root, &remaining)?;
-    let orphan_sidecars_removed = prune_orphan_sidecars(git_root, &remaining)?;
+    let mut checkpoints_removed = 0usize;
+    for checkpoint in expired {
+        run_git(git_root, &["update-ref", "-d", &checkpoint.ref_name])?;
+        checkpoints_removed = checkpoints_removed.saturating_add(1);
+    }
+    for ref_name in retired_refs {
+        run_git(git_root, &["update-ref", "-d", &ref_name])?;
+        checkpoints_removed = checkpoints_removed.saturating_add(1);
+    }
+    let sidecar_outcome = prune_orphan_sidecars(git_root, &remaining)?;
     Ok(PruneOutcome {
-        checkpoints_removed: expired.len(),
-        orphan_sidecars_removed,
+        checkpoints_removed,
+        orphan_sidecars_removed: sidecar_outcome.removed,
+        warnings: sidecar_outcome.warnings,
     })
 }
 
-fn prune_orphan_sidecars(git_root: &Path, remaining: &[Checkpoint]) -> Result<usize, String> {
+fn prune_orphan_blobs(
+    git_root: &Path,
+    remaining: &[Checkpoint],
+) -> Result<BlobPruneOutcome, String> {
+    let dir = checkpoint_blob_dir(git_root);
+    let metadata = match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BlobPruneOutcome::default());
+        }
+        Err(error) => return Err(format!("checkpoint blob directory metadata: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        let mut outcome = BlobPruneOutcome::default();
+        record_prune_warning(
+            &mut outcome.warnings,
+            format!("skip unsafe checkpoint blob path: {}", dir.display()),
+        );
+        return Ok(outcome);
+    }
+    if !safe_private_dir_metadata(&metadata) {
+        let mut outcome = BlobPruneOutcome::default();
+        record_prune_warning(
+            &mut outcome.warnings,
+            format!("skip unsafe checkpoint blob directory: {}", dir.display()),
+        );
+        return Ok(outcome);
+    }
+    let referenced = remaining
+        .iter()
+        .flat_map(|checkpoint| checkpoint.untracked_sidecars.iter())
+        .filter_map(|sidecar| match sidecar {
+            UntrackedSidecar::File { digest, .. } => Some(digest.as_str()),
+            UntrackedSidecar::Symlink { .. } => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut outcome = BlobPruneOutcome::default();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip unreadable checkpoint blob directory {}: {error}",
+                    dir.display()
+                ),
+            );
+            return Ok(outcome);
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!("skip unreadable checkpoint blob directory entry: {error}"),
+                );
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let path = entry.path();
+        let Some(digest) = name.to_str() else {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip checkpoint blob with non-UTF-8 name: {}",
+                    path.display()
+                ),
+            );
+            continue;
+        };
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "skip unreadable checkpoint blob {}: {error}",
+                        path.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        if digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !safe_private_file_metadata(&metadata)
+        {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!("skip unsafe checkpoint blob entry: {}", path.display()),
+            );
+            continue;
+        }
+        if !referenced.contains(digest) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => outcome.removed += 1,
+                Err(error) => record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "could not remove orphan checkpoint blob {}: {error}",
+                        path.display()
+                    ),
+                ),
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn prune_orphan_sidecars(
+    git_root: &Path,
+    remaining: &[Checkpoint],
+) -> Result<BlobPruneOutcome, String> {
     let dir = checkpoints_manifest_dir(git_root);
     let remaining_ids = remaining
         .iter()
         .map(|checkpoint| checkpoint.id.as_str())
         .collect::<std::collections::HashSet<_>>();
-    let mut removed = 0usize;
+    let mut outcome = prune_orphan_blobs(git_root, remaining)?;
     for entry in std::fs::read_dir(&dir).map_err(|error| format!("checkpoint dir read: {error}"))? {
-        let entry = entry.map_err(|error| format!("checkpoint dir entry: {error}"))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!("skip unreadable checkpoint sidecar directory entry: {error}"),
+                );
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(id) = name.to_str() else {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip checkpoint sidecar with non-UTF-8 name: {}",
+                    entry.path().display()
+                ),
+            );
             continue;
         };
-        if !safe_checkpoint_id(id) || remaining_ids.contains(id) {
+        if matches!(id, BLOBS_DIR | "manifest.txt" | "operation.lock") {
             continue;
         }
         let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("checkpoint sidecar metadata: {error}"))?;
-        if metadata.file_type().is_symlink() {
+        if !safe_checkpoint_id(id) {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip malformed checkpoint sidecar entry: {}",
+                    path.display()
+                ),
+            );
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "skip unreadable checkpoint sidecar {}: {error}",
+                        path.display()
+                    ),
+                );
+                continue;
+            }
+        };
+        if remaining_ids.contains(id) {
+            if !safe_private_dir_metadata(&metadata) {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "skip unsafe retained checkpoint sidecar: {}",
+                        path.display()
+                    ),
+                );
+            } else if let Err(error) = walk_dir(&path) {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "skip unsafe retained checkpoint sidecar {}: {error}",
+                        path.display()
+                    ),
+                );
+            }
+            continue;
+        }
+        let removal = if metadata.file_type().is_symlink() {
             std::fs::remove_file(&path)
-                .map_err(|error| format!("remove orphan checkpoint symlink: {error}"))?;
-            removed += 1;
-        } else if metadata.is_dir() {
+        } else if safe_private_dir_metadata(&metadata) {
+            if let Err(error) = walk_dir(&path) {
+                record_prune_warning(
+                    &mut outcome.warnings,
+                    format!(
+                        "skip unsafe orphan checkpoint sidecar {}: {error}",
+                        path.display()
+                    ),
+                );
+                continue;
+            }
             std::fs::remove_dir_all(&path)
-                .map_err(|error| format!("remove orphan checkpoint sidecar: {error}"))?;
-            removed += 1;
+        } else if metadata.is_dir() {
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!("skip unsafe orphan checkpoint sidecar: {}", path.display()),
+            );
+            continue;
         } else {
-            return Err(format!(
-                "unexpected checkpoint sidecar entry: {}",
-                path.display()
-            ));
+            record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "skip unexpected checkpoint sidecar entry: {}",
+                    path.display()
+                ),
+            );
+            continue;
+        };
+        match removal {
+            Ok(()) => outcome.removed += 1,
+            Err(error) => record_prune_warning(
+                &mut outcome.warnings,
+                format!(
+                    "could not remove orphan checkpoint sidecar {}: {error}",
+                    path.display()
+                ),
+            ),
         }
     }
-    Ok(removed)
+    Ok(outcome)
 }
 
 pub(crate) fn prune(
@@ -2030,10 +3814,12 @@ pub(crate) fn prune(
     ensure_checkpoint_git_exclude(&git_root)?;
     let keep = keep.unwrap_or(DEFAULT_PRUNE_KEEP);
     let max_age = max_age_hours.unwrap_or(DEFAULT_PRUNE_MAX_AGE_HOURS);
-    let outcome = prune_checkpoint_refs(&git_root, keep, max_age)?;
-    let mut removed = outcome.checkpoints_removed;
-    let mut orphan_sidecars_removed = outcome.orphan_sidecars_removed;
-    let cps = list_checkpoints_in_repo(&git_root, usize::MAX, true, None)?;
+    let PruneOutcome {
+        checkpoints_removed: mut removed,
+        mut orphan_sidecars_removed,
+        mut warnings,
+    } = prune_checkpoint_refs(&git_root, keep, max_age)?;
+    let (cps, _) = list_checkpoints_in_repo(&git_root, usize::MAX, true, None)?;
 
     // Reconcile refs created outside the private manifest, then rewrite the
     // manifest after all namespace cleanup while the repository lock is held.
@@ -2041,6 +3827,9 @@ pub(crate) fn prune(
         .into_iter()
         .filter(|cp| run_git(&git_root, &["rev-parse", "--verify", &cp.ref_name]).is_ok())
         .collect();
+    // Publish the reconciled manifest before deleting refs or artifacts. Any
+    // later cleanup failure then leaves only recoverable orphan state.
+    write_checkpoint_manifest(&git_root, &remaining)?;
     let remaining_refs: std::collections::HashSet<&str> =
         remaining.iter().map(|cp| cp.ref_name.as_str()).collect();
     let refs = run_git(
@@ -2054,11 +3843,15 @@ pub(crate) fn prune(
         }
     }
 
-    orphan_sidecars_removed += prune_orphan_sidecars(&git_root, &remaining)?;
+    let sidecar_outcome = prune_orphan_sidecars(&git_root, &remaining)?;
+    orphan_sidecars_removed += sidecar_outcome.removed;
+    for warning in sidecar_outcome.warnings {
+        if !warnings.contains(&warning) {
+            record_prune_warning(&mut warnings, warning);
+        }
+    }
 
-    write_checkpoint_manifest(&git_root, &remaining)?;
-
-    Ok(format!(
+    let mut result = format!(
         "pruned {removed} checkpoint(s) and {orphan_sidecars_removed} orphan sidecar entr{}, {} remaining",
         if orphan_sidecars_removed == 1 {
             "y"
@@ -2066,7 +3859,15 @@ pub(crate) fn prune(
             "ies"
         },
         remaining.len()
-    ))
+    );
+    if !warnings.is_empty() {
+        result.push_str("\nwarnings:");
+        for warning in warnings {
+            result.push_str("\n  ");
+            result.push_str(&warning);
+        }
+    }
+    Ok(result)
 }
 
 pub(crate) fn find_checkpoint(root: &Path, id_or_ref: &str) -> Result<Option<Checkpoint>, String> {
@@ -2098,6 +3899,24 @@ pub(crate) fn latest_checkpoint(root: &Path) -> Result<Option<Checkpoint>, Strin
     Ok(cps.into_iter().next())
 }
 
+pub(crate) fn is_partial_untracked_recovery_error(error: &str) -> bool {
+    error.starts_with("untracked recovery is partial:")
+}
+
+pub(crate) fn checkpoint_failure_blocks_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "awk"
+            | "csvkit"
+            | "write_file"
+            | "edit_file"
+            | "multi_edit"
+            | "todo_write"
+            | "git_commit"
+    )
+}
+
 /// Determine if a tool needs a checkpoint based on command risk.
 pub(crate) fn tool_needs_checkpoint(name: &str, input: &serde_json::Value) -> bool {
     let always = [
@@ -2110,7 +3929,9 @@ pub(crate) fn tool_needs_checkpoint(name: &str, input: &serde_json::Value) -> bo
     if always.contains(&name) {
         return true;
     }
-    // For bash/awk/csvkit, checkpoint only if write-risk
+    // Arbitrary command tools need a checkpoint when they can write. Other
+    // non-read tools keep the existing checkpoint policy without broad
+    // untracked-content capture.
     let risk = crate::tool_policy::classify_command_risk(name, input);
     risk != crate::tool_policy::CommandRisk::Read
 }
@@ -2126,10 +3947,14 @@ impl RepoRootCache {
     }
 
     pub(crate) fn get(&mut self, root: &Path) -> Result<Option<PathBuf>, String> {
-        if self.cached.is_none() {
-            self.cached = Some(repo_root(root)?);
+        if let Some(Some(cached)) = &self.cached {
+            return Ok(Some(cached.clone()));
         }
-        Ok(self.cached.as_ref().unwrap().clone())
+        let discovered = repo_root(root)?;
+        if discovered.is_some() {
+            self.cached = Some(discovered.clone());
+        }
+        Ok(discovered)
     }
 }
 
@@ -2148,9 +3973,10 @@ mod tests {
             .enumerate()
             .filter(|(_, line)| !line.trim().is_empty())
             .map(|(index, line)| {
-                let checkpoint = parse_manifest_line(line.trim()).ok_or_else(|| {
-                    format!("invalid checkpoint manifest entry at line {}", index + 1)
-                })?;
+                let checkpoint = parse_manifest_line(line.strip_suffix('\r').unwrap_or(line))
+                    .ok_or_else(|| {
+                        format!("invalid checkpoint manifest entry at line {}", index + 1)
+                    })?;
                 if !ids.insert(checkpoint.id.clone()) {
                     return Err(format!(
                         "duplicate checkpoint id in manifest: {}",
@@ -2212,6 +4038,135 @@ mod tests {
         assert_eq!(
             missing_ref[0].ref_name,
             "refs/dext/checkpoints/session/fixture-missing"
+        );
+    }
+
+    #[test]
+    fn manifest_schema_distinguishes_absent_and_exact_sidecar_membership() {
+        let oid = "a".repeat(40);
+        let digest = "b".repeat(64);
+        let eleven_without_membership = format!(
+            "fixture-eleven\trefs/dext/checkpoints/session/fixture-eleven\t{oid}\tbash\t2\t{oid}\ttrue\t[]\t[\"note.txt\"]\t[{{\"kind\":\"file\",\"path\":\"note.txt\",\"digest\":\"{digest}\",\"size\":0,\"executable\":false}}]\tnull"
+        );
+        let current_direct = format!(
+            "fixture-direct\trefs/dext/checkpoints/session/fixture-direct\t{oid}\twrite_file\t3\t{oid}\ttrue\t[\"note.txt\"]\t[]\t[]\tnull\t[\"note.txt\"]"
+        );
+        let current_without_direct_sidecars = format!(
+            "fixture-current\trefs/dext/checkpoints/session/fixture-current\t{oid}\twrite_file\t4\t{oid}\tfalse\t[\"tracked.txt\"]\t[]\t[]\tnull\t[]"
+        );
+
+        // An 11-field row predates the membership index, so it round-trips
+        // without one and restore must treat a missing sidecar as ambiguous.
+        let eleven = parse_manifest_line(&eleven_without_membership)
+            .expect("parse 11-field manifest without membership");
+        assert_eq!(eleven.direct_sidecar_paths, None);
+        assert_eq!(eleven.untracked_sidecars.len(), 1);
+        assert_eq!(format_manifest_line(&eleven).split('\t').count(), 11);
+
+        let current_direct =
+            parse_manifest_line(&current_direct).expect("parse 12-field direct-sidecar manifest");
+        assert_eq!(
+            current_direct.direct_sidecar_paths.as_deref(),
+            Some(["note.txt".to_string()].as_slice())
+        );
+        assert_eq!(
+            format_manifest_line(&current_direct).split('\t').count(),
+            12
+        );
+
+        // Empty-but-present membership is distinct from absent membership: it
+        // proves no sidecar was written, so restore need not fail conservatively.
+        let current_without_direct_sidecars = parse_manifest_line(&current_without_direct_sidecars)
+            .expect("parse 12-field manifest with exact empty membership");
+        assert_eq!(
+            current_without_direct_sidecars
+                .direct_sidecar_paths
+                .as_deref(),
+            Some([].as_slice())
+        );
+        assert_eq!(
+            format_manifest_line(&current_without_direct_sidecars)
+                .split('\t')
+                .count(),
+            12
+        );
+
+        // The retired pre-JSON encodings are no longer accepted at all.
+        let pre_json_eight = format!(
+            "fixture-eight\trefs/dext/checkpoints/session/fixture-eight\t{oid}\twrite_file\t0\t{oid}\tfalse\t/home/legacy/outside.txt"
+        );
+        let pre_json_nine = format!(
+            "fixture-pre-json\trefs/dext/checkpoints/session/fixture-pre-json\t{oid}\tbash\t1\t{oid}\tfalse\t\t.dext/checkpoints/manifest.txt\u{1f}notes.txt"
+        );
+        let json_nine = format!(
+            "fixture-nine\trefs/dext/checkpoints/session/fixture-nine\t{oid}\twrite_file\t1\t{oid}\ttrue\t[\"note.txt\"]\t[]"
+        );
+        let json_nine_snapshot = format!(
+            "fixture-nine-snapshot\trefs/dext/checkpoints/session/fixture-nine-snapshot\t{oid}\twrite_file\t1\t{oid}\ttrue\tdamaged\t[]"
+        );
+        for retired in [
+            &pre_json_eight,
+            &pre_json_nine,
+            &json_nine,
+            &json_nine_snapshot,
+        ] {
+            assert!(
+                parse_manifest_line(retired).is_none(),
+                "retired manifest encoding must not parse: {retired}"
+            );
+        }
+
+        // Skipping is reserved for rows a retired Dext writer actually emitted.
+        // The 8- and 9-field pre-JSON rows qualify; the 9-field JSON row does
+        // not, because its bracketed path field marks it as a truncated current
+        // row, which must stay fatal rather than become silently skippable.
+        assert_eq!(
+            retired_manifest_row(&pre_json_eight),
+            Some(RetiredManifestRow {
+                id: "fixture-eight",
+                ref_name: "refs/dext/checkpoints/session/fixture-eight",
+                oid: &oid,
+            })
+        );
+        assert!(retired_manifest_row(&pre_json_nine).is_some());
+        assert!(
+            retired_manifest_row(&json_nine).is_none(),
+            "a JSON path field means a truncated current row, not a retired one"
+        );
+        assert!(
+            retired_manifest_row(&json_nine_snapshot).is_none(),
+            "a JSON snapshot field means a damaged truncated current row, not a retired one"
+        );
+        for not_retired in [
+            "corrupt manifest line",
+            "",
+            &format!("../escape\trefs/dext/checkpoints/session/x\t{oid}\tbash\t1\t{oid}\tfalse\t"),
+            &format!(
+                "fixture-eight\trefs/dext/checkpoints/session/fixture-eight\t{oid}\tbash\tNOTANUMBER\t{oid}\tfalse\t"
+            ),
+            &format!(
+                "fixture-eight\trefs/dext/checkpoints/session/fixture-eight\t{oid}\tbash\t1\t{oid}\tmaybe\t"
+            ),
+        ] {
+            assert!(
+                retired_manifest_row(not_retired).is_none(),
+                "a damaged header must not be mistaken for a retired row: {not_retired}"
+            );
+        }
+
+        let malformed_current = format!(
+            "fixture-malformed\trefs/dext/checkpoints/session/fixture-malformed\t{oid}\tbash\t5\t{oid}\tfalse\t[\"note.txt\"\t[]\t[]\tnull"
+        );
+        assert!(
+            parse_manifest_line(&malformed_current).is_none(),
+            "a malformed JSON field fails the row rather than degrading it"
+        );
+        let empty_direct_current = format!(
+            "fixture-empty-direct\trefs/dext/checkpoints/session/fixture-empty-direct\t{oid}\twrite_file\t9\t{oid}\tfalse\t[]\t[]\t[]\tnull"
+        );
+        assert!(
+            parse_manifest_line(&empty_direct_current).is_none(),
+            "Dext never writes a direct-file checkpoint without one path hint"
         );
     }
 }

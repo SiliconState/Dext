@@ -125,9 +125,9 @@ Interactive equivalents:
 /pack run refactor-helper refactor the parser
 ```
 
-A clear conversational request can also invoke a known pack, for example: `run refactor-helper on the parser`.
+A clear conversational request can also invoke a known pack, for example: `run refactor-helper on the parser`. Conversational project-pack activation and project `shelf.json` metadata require one repository-scoped first-use confirmation. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Choosing `Always` stores a bounded owner-private, single-link project-scoped approval marker on Unix; unsafe/permissive markers are ignored, and `/project-extensions reset` refuses unsafe marker shapes while removing a safe marker or clearing a session denial. Until approval, project metadata cannot shadow a same-named user or run-shelf pack.
 
-When selected, Dext reads `PACK.md` as bounded invocation context and keeps the pack active for the session. It exports `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` calls and pack hook processes. Changing the sandbox root clears active pack state.
+When selected, Dext reads `PACK.md` only when it is a regular non-symlink file no larger than 1 MiB, then caps invocation context to 32 KiB and keeps the pack active for the session. `shelf.json` manifests use the same 1 MiB regular-file/no-follow load boundary. Pack hooks and environment are activated only after the workflow read succeeds. Dext exports `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` calls and pack hook processes. Changing the sandbox root clears active pack state.
 
 ## Maintain
 
