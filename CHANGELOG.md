@@ -174,6 +174,9 @@
 
 ### Fixed
 
+- Pricing override tests now exercise pure override/default composition without
+  mutating process-global pricing environment variables, preventing parallel
+  local-provider and cloud-pricing tests from observing transient prices.
 - Windows checkpoint cache tests now compare normalized path identities instead of
   treating Git's forward-slash path and the filesystem's verbatim `\\?\` path as
   different repositories.

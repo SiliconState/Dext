@@ -268,7 +268,21 @@ pub(crate) fn usage_pricing_for(
     base_url: &str,
     model: &str,
 ) -> UsagePricing {
-    let base = if crate::provider::is_local_llama_provider(provider_id, api_provider, base_url) {
+    usage_pricing_from_env(usage_pricing_default_for(
+        provider_id,
+        api_provider,
+        base_url,
+        model,
+    ))
+}
+
+pub(crate) fn usage_pricing_default_for(
+    provider_id: &str,
+    api_provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> UsagePricing {
+    if crate::provider::is_local_llama_provider(provider_id, api_provider, base_url) {
         UsagePricing::zero()
     } else {
         let provider = canonical_provider_id(provider_id);
@@ -282,8 +296,7 @@ pub(crate) fn usage_pricing_for(
             }
             _ => UsagePricing::default(),
         }
-    };
-    usage_pricing_from_env(base)
+    }
 }
 
 pub(crate) fn pricing_env_override_is_set() -> bool {
@@ -303,12 +316,28 @@ pub(crate) fn gpt_5_6_long_context_pricing(
     usage: Usage,
     pricing: UsagePricing,
 ) -> UsagePricing {
+    gpt_5_6_long_context_pricing_with_override_state(
+        provider_id,
+        model,
+        usage,
+        pricing,
+        pricing_env_override_is_set(),
+    )
+}
+
+pub(crate) fn gpt_5_6_long_context_pricing_with_override_state(
+    provider_id: &str,
+    model: &str,
+    usage: Usage,
+    pricing: UsagePricing,
+    pricing_override_is_set: bool,
+) -> UsagePricing {
     if matches!(
         canonical_provider_id(provider_id).as_str(),
         "openai" | "chatgpt"
     ) && is_gpt_5_6_model(model)
         && usage.total_input_tokens() > 272_000
-        && !pricing_env_override_is_set()
+        && !pricing_override_is_set
         && openai_pricing(&normalize_price_model(model)).is_some_and(|official| {
             pricing.input == official.input
                 && pricing.output == official.output
@@ -424,11 +453,27 @@ pub(crate) fn deepseek_pricing(model: &str) -> Option<UsagePricing> {
 }
 
 pub(crate) fn usage_pricing_from_env(default: UsagePricing) -> UsagePricing {
+    usage_pricing_with_overrides(
+        default,
+        env_f64("DEXT_INPUT_USD_PER_MTOK"),
+        env_f64("DEXT_OUTPUT_USD_PER_MTOK"),
+        env_f64("DEXT_CACHE_READ_USD_PER_MTOK"),
+        env_f64("DEXT_CACHE_CREATE_USD_PER_MTOK"),
+    )
+}
+
+pub(crate) fn usage_pricing_with_overrides(
+    default: UsagePricing,
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_create: Option<f64>,
+) -> UsagePricing {
     UsagePricing {
-        input: env_f64("DEXT_INPUT_USD_PER_MTOK").unwrap_or(default.input),
-        output: env_f64("DEXT_OUTPUT_USD_PER_MTOK").unwrap_or(default.output),
-        cache_read: env_f64("DEXT_CACHE_READ_USD_PER_MTOK").unwrap_or(default.cache_read),
-        cache_create: env_f64("DEXT_CACHE_CREATE_USD_PER_MTOK").unwrap_or(default.cache_create),
+        input: input.unwrap_or(default.input),
+        output: output.unwrap_or(default.output),
+        cache_read: cache_read.unwrap_or(default.cache_read),
+        cache_create: cache_create.unwrap_or(default.cache_create),
     }
 }
 

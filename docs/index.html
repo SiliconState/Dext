@@ -1081,7 +1081,7 @@ credential-env: [SERVICE_TOKEN]
 <h2 id="testing" class="collapsible-header">Testing</h2>
 <div class="collapsible-content">
 <h3>Unit Tests (main_tests.rs)</h3>
-<p>The test suite covers provider catalogs and request shaping, auth and state formats, stream/tool-call assembly, tool policy, sandboxing, side-effect journals, recovery checkpoints, TUI rendering, and runtime orchestration. Git fixture subprocesses explicitly clear ambient repository-routing variables such as <code>GIT_DIR</code> and <code>GIT_WORK_TREE</code>, so parallel environment-isolation tests cannot redirect unrelated temporary repositories.</p>
+<p>The test suite covers provider catalogs and request shaping, auth and state formats, stream/tool-call assembly, tool policy, sandboxing, side-effect journals, recovery checkpoints, TUI rendering, and runtime orchestration. Git fixture subprocesses explicitly clear ambient repository-routing variables such as <code>GIT_DIR</code> and <code>GIT_WORK_TREE</code>, so parallel environment-isolation tests cannot redirect unrelated temporary repositories. Pricing override coverage uses pure default/override composition rather than mutating process-global pricing variables, so parallel local-provider and cloud-pricing tests cannot observe transient test values.</p>
 <ul>
 <li>Provider catalog loading, normalization, and model resolution</li>
 <li>Auth store operations (save, load, normalize)</li>
