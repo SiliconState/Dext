@@ -120,8 +120,10 @@ CLI:
 dext --resume
 dext --fork
 dext sessions
+dext session brief latest
 dext session export latest html dext-session.html
 dext session analyze latest
+dext session prune --days=7
 dext doctor
 dext doctor --approval auto-write --sandbox read-only --cd /path/to/project
 dext undo --list
@@ -155,7 +157,7 @@ Interactive slash commands:
 /pack run my-pack task description
 /save name
 /export html path
-/sessions analyze|grep|failures|verify-log|decisions
+/sessions analyze|brief|grep|failures|verify-log|decisions
 ```
 
 

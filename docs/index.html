@@ -662,7 +662,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Responses terminal events with <code>status=incomplete</code> are recoverable rather than fatal protocol errors. Dext executes only function calls that reached a streamed completion event and discards truncated calls, ignoring complete-looking terminal snapshots for those unfinished calls. Discarded live text/thinking preview state is reset; a content-filter terminal also discards function calls and opaque encrypted reasoning state. Interactive warnings identify the recovery. If no executable call remains, Dext issues a bounded continuation request with a concise runtime hint; provider-reported content filtering halts immediately instead of retrying. Recovery lowers reasoning effort for that request only (for example, <code>xhigh</code> to <code>medium</code>) without changing the user-selected effort or consuming the normal tool-iteration budget. After three unsuccessful continuation requests, Dext halts the turn with guidance while keeping the session usable.</p>
 <p>Official OpenAI GPT-5.6 uses stateless Responses requests with <code>store:false</code>. Tool-bearing requests explicitly include <code>reasoning.encrypted_content</code>; when the provider returns a valid opaque reasoning item, Dext retains it in session history and replays it only within the current user/tool turn. Older-turn reasoning and malformed or placeholder items are omitted. ChatGPT/Codex input continues to omit persisted reasoning items. OpenAI Responses tools use the flat function shape with <code>strict:false</code>; ChatGPT/Codex tools retain their existing flat <code>strict:null</code> shape.</p>
 <h3>Session Persistence</h3>
-<p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). Persisted usage costs must be finite and non-negative, and restored budget caps must contain at least one positive dimension; invalid accounting metadata is rejected instead of affecting resumed enforcement. This header is the replay anchor for deterministic restore behavior.</p>
+<p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). Persisted usage costs must be finite and non-negative, and restored budget caps must contain at least one positive dimension; invalid accounting metadata is rejected instead of affecting resumed enforcement. This header is the replay anchor for deterministic restore behavior. Session review remains available through list, brief, analyze, grep, failure, verification, and decision views. Briefs omit the raw transcript but can still expose sensitive ledger, path, failure, and verification data. Export writes an explicit HTML or JSONL copy. Prune removes stale locks and project directories containing no state other than stale locks while preserving session JSONL and all other project state. The unused work-map, packet, focus, and track surface has been removed.</p>
 <h3>Eval Harness</h3>
 <p>Outcome-oriented assertions on files and command output. The eval path validates objective completion semantically (not just command exit) and records verification artifacts for later audit. Run via <code>dext --eval</code>.</p>
 <h3>Crash Recovery</h3>
@@ -679,6 +679,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 ├── auth.json                    # Stored credentials (0600 on Unix)
 ├── .env                         # Optional user-owned Dext dotenv settings
 ├── settings.json                 # user compaction threshold settings
+├── session-locks.operation.lock # owner-private cross-process session lock guard
 ├── crashes/                     # owner-private crash snapshots
 ├── shelves/                     # User-scoped shelves and packs
 └── projects/
@@ -699,7 +700,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Atomic Writes</h3>
 <p>Sensitive state writes use a temp-file-and-replace helper. On Windows the replacement uses <code>MoveFileExW</code>; on Unix it uses <code>fs::rename</code>. Session logs normally use private append writes while they remain below the cap.</p>
 <h3>Session State Lock</h3>
-<p>Each active session directory has a <code>session.lock.json</code> record containing PID, token, project, sandbox, and session identity. Matching locks are released through a cleanup registry; a lock is removed as stale only when its recorded process is no longer running.</p>
+<p>Each active session directory has a <code>session.lock.json</code> record containing PID, token, project, sandbox, and session identity. Session open, stale reclamation, cleanup, and prune operations are serialized by the owner-private <code>session-locks.operation.lock</code> file under <code>DEXT_HOME</code>. Stale removal revalidates the token and PID while holding that lock, so a replaced live lock is preserved. Matching locks are released through a cleanup registry.</p>
 <h3>Log Rotation</h3>
 <p>Each session's <code>latest.log</code> is capped at 64,000 bytes. <code>DEXT_LOG_ARCHIVES</code> may retain up to 16 rotated archives; the default is zero.</p>
 </div>
@@ -816,8 +817,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <ul>
 <li><strong>Transcript area</strong> — Scrollable message history with user, assistant, tool, thinking, and steering lines</li>
 <li><strong>Live status bar</strong> — Provider, model, thinking effort and selected <code>/pro</code> mode when applicable, approval profile, context pressure, usage stats</li>
-<li><strong>Input panel</strong> — Multi-line text input with history (200 entries), completion for slash commands</li>
-<li><strong>Work map drawer</strong> — Collapsible work-ledger visualization</li>
+<li><strong>Input panel</strong> — Multi-line text input with history (200 entries), completion for canonical handled slash commands, and argument hints</li>
 </ul>
 <h3>Startup Welcome</h3>
 <p>The startup welcome remains inline transcript content, so it scrolls away naturally with the conversation. One transcript-owned blank separator row keeps it visually distinct from CLI approval and sandbox diagnostics, including after inline viewport placement or replay. Its brand row shows Dext and the version, plus the working directory and cached Git branch/state at 80 columns or wider; narrower terminals drop that right segment. Exactly two facts, Model and Approval, sit between horizontal rules, followed by one rotating tip selected from verified commands and key bindings. Terminal-cell width controls alignment and path truncation. Git status uses one <code>git status --porcelain=v1 --branch</code> probe off the render loop, with only an 8 ms startup wait before path-only fallback. The empty composer reads <code>❯ Type a request… &nbsp; @ files · / commands</code>.</p>
@@ -1135,7 +1135,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>dext -p</code></td><td>Read prompt from stdin</td></tr>
 <tr><td><code>dext --resume</code></td><td>Resume latest session</td></tr>
 <tr><td><code>dext --fork</code></td><td>Fork latest session into new session</td></tr>
-<tr><td><code>dext session ...</code></td><td>Brief/map/packet/focus/track/export/analyze/grep/failures/verification/decision operations</td></tr>
+<tr><td><code>dext session ...</code></td><td>Brief/export/analyze/grep/failures/verification/decision/prune operations</td></tr>
 <tr><td><code>dext doctor [...]</code></td><td>Inspect effective safety policy and bounded local state without repair or provider calls</td></tr>
 <tr><td><code>dext pack list|inspect|run ...</code></td><td>Discover or invoke source-first packs</td></tr>
 <tr><td><code>dext shelves</code></td><td>List typed shelf manifests and ability metadata</td></tr>
@@ -1195,6 +1195,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>/allowed</code></td><td>List auto-approved tools</td></tr>
 <tr><td><code>/trust [on|off|status]</code></td><td>Auto-approve all gated tools</td></tr>
 <tr><td><code>/approval [profile]</code></td><td>Set approval profile</td></tr>
+<tr><td><code>/preview [off|simple|git]</code></td><td>Set mutation preview mode</td></tr>
 <tr><td><code>/sandbox [path]</code></td><td>Show or change sandbox root</td></tr>
 <tr><td><code>/sandbox-profile [profile]</code></td><td>Set sandbox: read-only, workspace-write, danger-full-access</td></tr>
 <tr><td><code>/privacy [on|strict|off|status]</code></td><td>Control local redaction and optional strict native-read path/search-scope blocking</td></tr>
@@ -1216,7 +1217,7 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>/save &lt;name&gt;</code></td><td>Save history/config to named JSONL session</td></tr>
 <tr><td><code>/export [html|jsonl] [path]</code></td><td>Export the current session</td></tr>
 <tr><td><code>/resume [name]</code></td><td>Resume latest or named session</td></tr>
-<tr><td><code>/sessions ...</code></td><td>List/analyze/map/grep/focus/export session history</td></tr>
+<tr><td><code>/sessions ...</code></td><td>List/analyze/brief/grep/failures/verification/decisions session history</td></tr>
 <tr><td><code>/plan &lt;task&gt;</code></td><td>Run read-only planning and seed the plan into history</td></tr>
 <tr><td><code>/budget [cap]</code></td><td>Set/show a dollar, token, or combined cap; <code>off</code> clears it</td></tr>
 <tr><td><code>/pack create|list|inspect|run</code></td><td>Create or use shelf-contained packs</td></tr>

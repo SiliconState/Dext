@@ -8,7 +8,8 @@ use crate::provider::{
 };
 use crate::session::{
     append_log_line, canonicalize_mutation_path, canonicalize_read_tool_path,
-    cap_latest_log_buffer, latest_log_path, render_limited_lines, validate_session_name,
+    cap_latest_log_buffer, latest_log_path, remove_stale_session_state_lock_if_matches,
+    render_limited_lines, validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
@@ -137,7 +138,6 @@ fn test_agent(root: &Path) -> Agent {
         read_cache: Arc::new(Mutex::new(ReadFileCache::default())),
         work_ledger: WorkLedger::default(),
         provider_health: ProviderHealthLedger::default(),
-        track_origin: None,
         privacy: PrivacyPolicy::default(),
         git_credential: None,
         checkpoint_cache: git_checkpoints::RepoRootCache::new(),
@@ -5603,6 +5603,17 @@ fn slash_routing_distinguishes_commands_from_absolute_and_wsl_paths() {
     ] {
         assert!(is_slash_command(command), "{command}");
     }
+    for retired in [
+        "/map",
+        "/packet",
+        "/focus",
+        "/tracks",
+        "/track",
+        "/branches",
+        "/browser-recipe",
+    ] {
+        assert!(!is_slash_command(retired), "{retired}");
+    }
     for path in [
         "/home/fixture-user/.dext/shelves/finance/packs/stock_deepdive/PACK.md",
         "/mnt/c/Users/fixture-user/report.md",
@@ -6401,286 +6412,6 @@ fn looks_like_login_secret_input_accepts_multiline_json() {
     assert!(looks_like_login_secret_input(raw));
 }
 
-fn build_test_work_map() -> WorkMap {
-    let header = SessionHeader {
-        model: "test-model".to_string(),
-        provenance: SessionProvenance {
-            provider: "test".to_string(),
-            ..Default::default()
-        },
-        work_ledger: WorkLedger {
-            objective: "fix failing tests".to_string(),
-            decisions: vec!["keep map non-tree".to_string()],
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let history = vec![
-        Message {
-            role: "user".to_string(),
-            content: vec![Block::Text {
-                text: "Fix failing tests".to_string(),
-            }],
-        },
-        Message {
-            role: "assistant".to_string(),
-            content: vec![Block::ToolUse {
-                id: "call_write".to_string(),
-                name: "write_file".to_string(),
-                input: json!({"path":"src/lib.rs","content":"x"}),
-            }],
-        },
-        Message {
-            role: "user".to_string(),
-            content: vec![Block::ToolResult {
-                tool_use_id: "call_write".to_string(),
-                content: "wrote file".to_string(),
-                is_error: None,
-                metadata: ToolResultMetadata::default(),
-            }],
-        },
-        Message {
-            role: "assistant".to_string(),
-            content: vec![Block::ToolUse {
-                id: "call_test".to_string(),
-                name: "bash".to_string(),
-                input: json!({"command":"cargo test --release"}),
-            }],
-        },
-        Message {
-            role: "user".to_string(),
-            content: vec![Block::ToolResult {
-                tool_use_id: "call_test".to_string(),
-                content: "exit: 1\nfailed".to_string(),
-                is_error: Some(true),
-                metadata: ToolResultMetadata {
-                    status: Some("failed".to_string()),
-                    exit_code: Some(1),
-                    duration_ms: Some(10),
-                    artifact: Some("artifact.json".to_string()),
-                },
-            }],
-        },
-    ];
-    build_session_work_map(Path::new("test-session.jsonl"), &header, &history)
-}
-
-#[test]
-fn work_map_derives_waypoints_and_packets() {
-    let map = build_test_work_map();
-    let rendered = render_work_map(&map, &[]);
-    assert!(rendered.contains("Session map"), "{rendered}");
-    assert!(rendered.contains("@w"), "{rendered}");
-    assert!(
-        map.waypoints
-            .iter()
-            .any(|wp| wp.kind == WorkMapKind::Change)
-    );
-    assert!(
-        map.waypoints
-            .iter()
-            .any(|wp| wp.kind == WorkMapKind::Failure)
-    );
-    let failure = map
-        .waypoints
-        .iter()
-        .find(|wp| wp.kind == WorkMapKind::Failure)
-        .expect("failure waypoint");
-    let selection = parse_work_map_selection(&failure.id, &map).expect("select waypoint");
-    let packet = render_work_map_packet(&map, &selection);
-    assert!(packet.contains("[dext packet"), "{packet}");
-    assert!(packet.contains("Failures/blockers"), "{packet}");
-    assert!(packet.contains("does not rewind files"), "{packet}");
-}
-
-#[test]
-fn work_map_focus_includes_safety_and_exact_mode() {
-    let map = build_test_work_map();
-    let selection = parse_work_map_selection("@w01", &map).expect("select waypoint");
-    let focus = render_work_map_focus(&map, &selection, &FocusMode::Exact);
-    assert!(focus.contains("mode=exact"), "{focus}");
-    assert!(focus.contains("does not rewind files"), "{focus}");
-}
-
-#[test]
-fn work_map_args_accept_waypoint_before_or_after_selector() -> Result<()> {
-    let args = parse_work_map_command_args("@w02 latest --exact");
-    let (id, selector, mode_args) = parse_work_map_operation_args(&args, "current")?;
-    assert_eq!(id, "@w02");
-    assert_eq!(selector, "latest");
-    assert_eq!(mode_args, vec!["--exact".to_string()]);
-
-    let args = parse_work_map_command_args("@w02 --carry=failures,files latest");
-    let (id, selector, mode_args) = parse_work_map_operation_args(&args, "current")?;
-    assert_eq!(id, "@w02");
-    assert_eq!(selector, "latest");
-    assert_eq!(mode_args, vec!["--carry=failures,files".to_string()]);
-
-    let args = parse_work_map_command_args("latest @w03 exact");
-    let (id, selector, mode_args) = parse_work_map_operation_args(&args, "current")?;
-    assert_eq!(id, "@w03");
-    assert_eq!(selector, "latest");
-    assert_eq!(mode_args, vec!["exact".to_string()]);
-
-    let args = parse_work_map_command_args("latest @w04 track-name --exact");
-    let (id, selector, name, mode_args) = parse_track_open_args(&args, "current")?;
-    assert_eq!(id, "@w04");
-    assert_eq!(selector, "latest");
-    assert_eq!(name, Some("track-name"));
-    assert_eq!(mode_args, vec!["--exact".to_string()]);
-    Ok(())
-}
-
-#[test]
-fn work_map_filters_multiple_kinds_as_union_and_narrow_by_query() -> Result<()> {
-    let map = build_test_work_map();
-    let args = parse_work_map_command_args("changes failures");
-    let (selector, filters) = parse_work_map_filter_args(&args)?;
-    assert_eq!(selector, "current");
-
-    let visible = map
-        .waypoints
-        .iter()
-        .filter(|wp| work_map_filter_matches(&map, wp, &filters))
-        .collect::<Vec<_>>();
-    assert!(
-        visible.iter().any(|wp| wp.kind == WorkMapKind::Change),
-        "{visible:?}"
-    );
-    assert!(
-        visible.iter().any(|wp| wp.kind == WorkMapKind::Failure),
-        "{visible:?}"
-    );
-    assert!(
-        visible
-            .iter()
-            .all(|wp| matches!(wp.kind, WorkMapKind::Change | WorkMapKind::Failure)),
-        "{visible:?}"
-    );
-    let rendered = render_work_map(&map, &filters);
-    assert!(rendered.contains("filter change,failure"), "{rendered}");
-
-    let args = parse_work_map_command_args("failures query cargo");
-    let (_, filters) = parse_work_map_filter_args(&args)?;
-    let visible = map
-        .waypoints
-        .iter()
-        .filter(|wp| work_map_filter_matches(&map, wp, &filters))
-        .collect::<Vec<_>>();
-    assert!(!visible.is_empty(), "expected cargo failure waypoint");
-    assert!(
-        visible.iter().all(|wp| wp.kind == WorkMapKind::Failure),
-        "{visible:?}"
-    );
-    Ok(())
-}
-
-#[test]
-fn work_map_query_does_not_match_hidden_objective_text() -> Result<()> {
-    let header = SessionHeader {
-        work_ledger: WorkLedger {
-            objective: "unique hidden objective text".to_string(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let history = vec![Message {
-        role: "user".to_string(),
-        content: vec![Block::Text {
-            text: "visible unrelated request".to_string(),
-        }],
-    }];
-    let map = build_session_work_map(Path::new("test-session.jsonl"), &header, &history);
-    let args = parse_work_map_command_args("query unique hidden objective");
-    let (_, filters) = parse_work_map_filter_args(&args)?;
-    let visible = map
-        .waypoints
-        .iter()
-        .filter(|wp| work_map_filter_matches(&map, wp, &filters))
-        .collect::<Vec<_>>();
-    assert!(visible.is_empty(), "{visible:?}");
-    Ok(())
-}
-
-#[test]
-fn work_map_active_focus_limits_future_provider_context() -> Result<()> {
-    let root = temp_test_dir("work-map-active-focus");
-    let mut agent = test_agent(&root);
-    agent.suppress_checkpoints = true;
-    agent.history.push(Message {
-        role: "user".to_string(),
-        content: vec![Block::Text {
-            text: "older request outside focus".to_string(),
-        }],
-    });
-    agent.history.push(Message {
-        role: "assistant".to_string(),
-        content: vec![Block::Text {
-            text: "older answer outside focus".to_string(),
-        }],
-    });
-
-    let map = build_test_work_map();
-    let selection = parse_work_map_selection("@w01", &map)?;
-    let focus = activate_work_map_focus(&mut agent, &map, &selection, &FocusMode::Exact);
-    assert!(focus.contains("mode=exact"), "{focus}");
-    assert!(agent.work_ledger.active_focus.is_some());
-    agent.history.push(Message {
-        role: "user".to_string(),
-        content: vec![Block::Text {
-            text: "new request inside focus".to_string(),
-        }],
-    });
-
-    let context = agent.provider_context_history();
-    assert_eq!(context.len(), 2);
-    let first = match &context[0].content[0] {
-        Block::Text { text } => text,
-        other => panic!("unexpected focus context block: {other:?}"),
-    };
-    assert!(first.starts_with("[dext focus packet loaded]"), "{first}");
-    let rendered = agent
-        .history_to_chatgpt_input()
-        .into_iter()
-        .map(|item| item.to_string())
-        .collect::<String>();
-    assert!(
-        !rendered.contains("older request outside focus"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("new request inside focus"), "{rendered}");
-    Ok(())
-}
-
-#[test]
-fn track_origin_serializes_in_session_header() -> Result<()> {
-    let root = temp_test_dir("work-map-track-origin");
-    let _guard = env_lock();
-    let sessions_dir = root.join("sessions");
-    std::fs::create_dir_all(&sessions_dir)?;
-    unsafe { std::env::set_var("DEXT_SESSIONS_DIR", &sessions_dir) };
-    let result = (|| -> Result<()> {
-        let agent = test_agent(&root);
-        let map = build_test_work_map();
-        let selection = parse_work_map_selection("@w01", &map)?;
-        let path = create_track_from_work_map(
-            &agent,
-            &map,
-            &selection,
-            Some("work-map-track"),
-            &FocusMode::Exact,
-        )?;
-        let (header, history) = read_session_jsonl(&path)?;
-        let origin = header.track_origin.expect("track origin");
-        assert_eq!(origin.source_waypoint, "@w01");
-        assert_eq!(origin.mode, "exact");
-        assert_eq!(history.len(), 2);
-        Ok(())
-    })();
-    unsafe { std::env::remove_var("DEXT_SESSIONS_DIR") };
-    result
-}
-
 #[test]
 fn session_replay_fixture_circuit_breaker_stops_retrying_blocked_host() -> Result<()> {
     let replay = SessionReplayFixture::load("circuit_breaker")?;
@@ -7413,6 +7144,62 @@ fn stale_session_lock_is_reaped_on_acquire() -> Result<()> {
 }
 
 #[test]
+fn stale_lock_identity_check_preserves_replacement() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("stale-lock-replacement");
+    let home = root.join("home");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+
+    let result = (|| -> Result<()> {
+        let project = std::fs::canonicalize(&root)?;
+        let lock_path = session_state_lock_path(&project, "same");
+        std::fs::create_dir_all(lock_path.parent().unwrap())?;
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&json!({
+                "token": "replacement",
+                "pid": std::process::id(),
+                "acquired_at": 2,
+                "project_key": project_key(&project),
+                "sandbox_root": project.display().to_string(),
+                "session_id": "same"
+            }))?,
+        )?;
+
+        assert!(!remove_stale_session_state_lock_if_matches(
+            &lock_path, "stale", 0
+        ));
+        let record = std::fs::read_to_string(&lock_path)?;
+        assert!(record.contains("replacement"), "{record}");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn session_prune_cli_rejects_unknown_and_invalid_flags() -> Result<()> {
+    for args in [
+        ["session", "prune", "--days=not-a-number"],
+        ["session", "prune", "--unknown"],
+    ] {
+        let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+        assert_eq!(handle_session_cli(&args)?, Some(2), "{args:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn session_prune_removes_stale_locks_but_preserves_sessions() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("prune-stale-locks");
@@ -7454,6 +7241,101 @@ fn session_prune_removes_stale_locks_but_preserves_sessions() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&root);
     result
+}
+
+#[test]
+fn session_prune_preserves_non_session_project_state() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("prune-preserves-project-state");
+    let home = root.join("home");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+
+    let result = (|| -> Result<()> {
+        let project = std::fs::canonicalize(&root)?;
+        let other_project = home.join("projects/other-project");
+        std::fs::create_dir_all(&other_project)?;
+        let approval = other_project.join(PROJECT_EXTENSIONS_APPROVAL_FILE);
+        std::fs::write(&approval, b"1\n")?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        prune_project_dirs(&project, false, 0)?;
+        assert_eq!(std::fs::read(&approval)?, b"1\n");
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn session_prune_removes_stale_lock_only_project_dirs() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("prune-lock-only-project");
+    let home = root.join("home");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+
+    let result = (|| -> Result<()> {
+        let project = std::fs::canonicalize(&root)?;
+        let other_project = home.join("projects/other-project");
+        let lock_path = other_project.join("sessions/old-session/session.lock.json");
+        std::fs::create_dir_all(lock_path.parent().unwrap())?;
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&json!({
+                "token": "stale",
+                "pid": 0,
+                "acquired_at": 1,
+                "project_key": "other-project",
+                "sandbox_root": "/missing",
+                "session_id": "old-session"
+            }))?,
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        prune_project_dirs(&project, false, 0)?;
+        assert!(
+            !other_project.exists(),
+            "stale lock-only state should be pruned"
+        );
+        Ok(())
+    })();
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_SESSIONS_DIR");
+        std::env::remove_var("DEXT_LOGS_DIR");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn session_prune_empty_tree_removal_preserves_concurrent_state() -> Result<()> {
+    let root = temp_test_dir("prune-concurrent-state");
+    let candidate = root.join("candidate");
+    std::fs::create_dir_all(candidate.join("sessions/old-session"))?;
+    assert!(prunable_project_dir_modified(&candidate)?.is_some());
+
+    let state = candidate.join("sessions/old-session/state.json");
+    std::fs::write(&state, b"keep")?;
+    assert!(!remove_empty_directory_tree(&candidate)?);
+    assert_eq!(std::fs::read(&state)?, b"keep");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 #[test]
@@ -15483,7 +15365,7 @@ fn project_extension_approval_never_profile_fails_without_prompt() {
 }
 
 #[test]
-fn session_brief_renders_safe_continuation_packet() {
+fn session_brief_renders_distilled_continuation_packet() {
     let mut header = SessionHeader {
         model: "glm-4.6".to_string(),
         ..SessionHeader::default()
@@ -15522,6 +15404,10 @@ fn session_brief_renders_safe_continuation_packet() {
     assert!(brief.contains("# Dext session brief"), "{brief}");
     assert!(brief.contains("src/parser.rs"), "{brief}");
     assert!(brief.contains("cargo test parser: passed"), "{brief}");
+    assert!(
+        brief.contains("privacy: distilled session data; review before sharing"),
+        "{brief}"
+    );
     assert!(brief.contains("## Continue"), "{brief}");
     // The brief surfaces real state only; synthesized objective/checkpoint
     // placeholders are not echoed from the user prompt.
@@ -15811,12 +15697,15 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
     assert_eq!(v2.reasoning_mode, ReasoningMode::Standard);
 
     let current = parse_session_header(
-        r#"{"version":3,"model":"v3","system":"system","context_mode":"Tiny"}"#,
+        r#"{"version":3,"model":"v3","system":"system","context_mode":"Tiny","track_origin":{"source_waypoint":"@w01"}}"#,
     )
     .expect("parse v3 session header");
     assert_eq!(current.version, SESSION_FORMAT_VERSION);
     assert_eq!(current.context_mode, ContextMode::Tiny);
     assert!(current.context_mode_explicit);
+    let serialized_current =
+        serde_json::to_string(&current).expect("serialize migrated current header");
+    assert!(!serialized_current.contains("track_origin"));
 
     let error = parse_session_header(r#"{"version":4,"model":"future","system":"system"}"#)
         .err()

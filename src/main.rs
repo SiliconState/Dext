@@ -53,14 +53,14 @@ use provider::{
 #[cfg(unix)]
 use session::session_sudo_dir;
 use session::{
-    SessionStateLock, append_log_event, atomic_write_bytes, atomic_write_secret,
-    canonicalize_read_tool_path, dext_state_dir, expand_user_path, latest_session_path,
-    list_session_records_for_root, named_session_path_for_root, named_sessions_dir_for_root,
-    new_session_id, parse_session_header, project_key, project_latest_session_path,
-    project_state_dir, release_registered_locks, remove_stale_session_state_lock,
-    render_limited_csv, restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
-    session_latest_session_path, session_state_lock_is_live, session_state_lock_path,
-    session_todo_path, unix_timestamp_secs,
+    SessionLockOperationGuard, SessionStateLock, append_log_event, atomic_write_bytes,
+    atomic_write_secret, canonicalize_read_tool_path, dext_state_dir, expand_user_path,
+    latest_session_path, list_session_records_for_root, named_session_path_for_root,
+    named_sessions_dir_for_root, new_session_id, parse_session_header, project_key,
+    project_latest_session_path, project_state_dir, release_registered_locks,
+    remove_stale_session_state_lock_under_guard, render_limited_csv, restore_terminal_if_tui,
+    session_artifacts_dir, session_latest_log_path, session_latest_session_path,
+    session_state_lock_is_live, session_state_lock_path, session_todo_path, unix_timestamp_secs,
 };
 use tool_round::{ToolRoundContext, ToolRoundOutcome};
 use tools::{
@@ -1677,7 +1677,6 @@ impl EventSink for ConsoleSink {
             AgentEvent::Warn(s) => eprintln!("{s}"),
             AgentEvent::Error(s) => eprintln!("{s}"),
             AgentEvent::Slash(s) => println!("{s}"),
-            AgentEvent::WorkMap { text, .. } => println!("{text}"),
             AgentEvent::TurnEnd { usage, .. } => {
                 println!(
                     "{}",
@@ -1779,12 +1778,6 @@ impl EventSink for JsonSink {
                 }
             }
             OutputMode::Json => match event {
-                AgentEvent::WorkMap { text, .. } => {
-                    Self::emit_json_line(&json!({
-                        "event": "work_map",
-                        "data": {"text": text}
-                    }));
-                }
                 AgentEvent::TextDelta(delta) => self.stream.text.push_str(&delta),
                 AgentEvent::TextBlockComplete(full) => self.stream.text = full,
                 AgentEvent::RuntimeControlApplied {
@@ -1868,21 +1861,6 @@ impl EventSink for ChannelSink {
 fn emit_external_telemetry(sink: &mut dyn EventSink, state: &orchestrator::TurnRuntimeState) {
     sink.emit(AgentEvent::ExternalTelemetry {
         telemetry: state.telemetry(),
-    });
-}
-
-fn emit_work_map_event(
-    sink: &mut dyn EventSink,
-    kind: WorkMapEventKind,
-    text: String,
-    waypoint_ids: Vec<String>,
-    selector: Option<String>,
-) {
-    sink.emit(AgentEvent::WorkMap {
-        kind,
-        text,
-        waypoint_ids,
-        selector,
     });
 }
 
@@ -2276,110 +2254,6 @@ fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
 
 fn message_approx_tokens(message: &Message) -> u64 {
     blocks_approx_tokens(&message.content).max(1)
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-struct TrackOrigin {
-    source_session: String,
-    source_waypoint: String,
-    mode: String,
-    packet_hash: String,
-    created_at: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
-struct WorkMapFocusState {
-    source_session: String,
-    selection: String,
-    mode: String,
-    packet_hash: String,
-    created_at: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkMapKind {
-    Intent,
-    Evidence,
-    Change,
-    Failure,
-    Verify,
-    Decision,
-    Compact,
-    Result,
-}
-
-impl WorkMapKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Intent => "intent",
-            Self::Evidence => "evidence",
-            Self::Change => "change",
-            Self::Failure => "failure",
-            Self::Verify => "verify",
-            Self::Decision => "decision",
-            Self::Compact => "compact",
-            Self::Result => "result",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkMapWaypoint {
-    id: String,
-    anchor: String,
-    kind: WorkMapKind,
-    message_start: usize,
-    message_end: usize,
-    summary: String,
-    files: Vec<String>,
-    commands: Vec<String>,
-    status: Option<String>,
-}
-
-impl WorkMapWaypoint {
-    fn display_range(&self) -> String {
-        match (self.message_start, self.message_end) {
-            (0, 0) => "ledger".to_string(),
-            (start, end) if start == end => format!("#{start}"),
-            (start, end) => format!("#{start}..#{end}"),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct WorkMap {
-    source: String,
-    header: SessionHeader,
-    messages: usize,
-    waypoints: Vec<WorkMapWaypoint>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkMapSelection {
-    start: usize,
-    end: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FocusMode {
-    Carry(Vec<String>),
-    Exact,
-}
-
-impl FocusMode {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Carry(_) => "carry",
-            Self::Exact => "exact",
-        }
-    }
-
-    fn carries(&self, item: &str) -> bool {
-        match self {
-            Self::Exact => false,
-            Self::Carry(items) => items.iter().any(|i| i.eq_ignore_ascii_case(item)),
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -10815,7 +10689,6 @@ struct WorkLedger {
     verification: Vec<VerificationRecord>,
     diagnostics: Vec<WorkflowDiagnosticRecord>,
     next_actions: Vec<String>,
-    active_focus: Option<WorkMapFocusState>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -10952,8 +10825,6 @@ struct SessionHeader {
     #[serde(default)]
     provider_health: ProviderHealthLedger,
     #[serde(default)]
-    track_origin: Option<TrackOrigin>,
-    #[serde(default)]
     privacy: PrivacyPolicy,
 }
 
@@ -10985,7 +10856,6 @@ impl Default for SessionHeader {
             provenance: SessionProvenance::default(),
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
-            track_origin: None,
             privacy: PrivacyPolicy::default(),
         }
     }
@@ -11671,7 +11541,6 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "preview"
             | "sandbox-profile"
             | "budget"
-            | "browser-recipe"
             | "sandbox"
             | "model"
             | "providers"
@@ -11698,12 +11567,6 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "diag"
             | "save"
             | "export"
-            | "map"
-            | "packet"
-            | "focus"
-            | "tracks"
-            | "branches"
-            | "track"
             | "resume"
             | "sessions"
             | "session"
@@ -12814,7 +12677,6 @@ struct Agent {
     read_cache: Arc<Mutex<ReadFileCache>>,
     work_ledger: WorkLedger,
     provider_health: ProviderHealthLedger,
-    track_origin: Option<TrackOrigin>,
     privacy: PrivacyPolicy,
     // Session-scoped git HTTPS credential from the masked local prompt.
     // Never serialized, logged, or shown to the model.
@@ -13007,7 +12869,6 @@ impl Agent {
             read_cache: Arc::new(Mutex::new(ReadFileCache::default())),
             work_ledger: WorkLedger::default(),
             provider_health: ProviderHealthLedger::default(),
-            track_origin: None,
             privacy: PrivacyPolicy::from_env(),
             git_credential: None,
             checkpoint_cache: git_checkpoints::RepoRootCache::new(),
@@ -14791,26 +14652,8 @@ impl Agent {
         ids
     }
 
-    fn provider_context_history(&self) -> &[Message] {
-        if self.work_ledger.active_focus.is_none() {
-            return &self.history;
-        }
-        let Some(start) = self.history.iter().rposition(|m| {
-            m.role == "user"
-                && m.content.iter().any(|b| match b {
-                    Block::Text { text } | Block::PartialStream { text } => {
-                        text.starts_with("[dext focus packet loaded]")
-                    }
-                    _ => false,
-                })
-        }) else {
-            return &self.history;
-        };
-        &self.history[start..]
-    }
-
     fn history_to_oai_messages(&self, system_text: &str) -> Vec<OaiMessage> {
-        let history = self.provider_context_history();
+        let history = &self.history;
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let mut msgs = vec![OaiMessage {
             role: "system".to_string(),
@@ -14953,7 +14796,7 @@ impl Agent {
     }
 
     fn history_to_responses_input(&self, preserve_reasoning_items: bool) -> Vec<Value> {
-        let history = self.provider_context_history();
+        let history = &self.history;
         let current_turn_start = history
             .iter()
             .rposition(is_fresh_user_prompt_message)
@@ -15227,7 +15070,7 @@ impl Agent {
                         None,
                     )
                 };
-                let history = self.provider_context_history();
+                let history = &self.history;
                 let messages = sanitize_anthropic_messages(
                     history,
                     thinking.is_some(),
@@ -15269,10 +15112,6 @@ impl Agent {
     }
 
     fn session_header(&self) -> SessionHeader {
-        self.session_header_with_origin(self.track_origin.clone())
-    }
-
-    fn session_header_with_origin(&self, track_origin: Option<TrackOrigin>) -> SessionHeader {
         let system_details = self.compose_system_details();
         let composed_system = format!("{}\n\n{}", system_details.stable, system_details.env);
         let provenance = self.session_provenance_from(&system_details, &composed_system);
@@ -15328,7 +15167,6 @@ impl Agent {
             provenance,
             work_ledger: self.cleaned_work_ledger(),
             provider_health: self.provider_health.clone(),
-            track_origin,
             privacy: self.privacy.clone(),
         }
     }
@@ -15390,15 +15228,7 @@ impl Agent {
     }
 
     pub(crate) fn save_session_to_path(&self, path: &Path) -> Result<()> {
-        self.save_session_to_path_with_origin(path, self.track_origin.clone())
-    }
-
-    fn save_session_to_path_with_origin(
-        &self,
-        path: &Path,
-        track_origin: Option<TrackOrigin>,
-    ) -> Result<()> {
-        let header = self.session_header_with_origin(track_origin);
+        let header = self.session_header();
         let mut data = Vec::new();
         writeln!(&mut data, "{}", serde_json::to_string(&header)?)?;
         for m in &self.history {
@@ -15444,7 +15274,6 @@ impl Agent {
             "after_user_message" | "after_compact" | "outer_loop_autosave"
         );
         if !critical
-            && !matches!(reason, "after_focus" | "after_focus_clear")
             && let Some(last) = self.last_checkpoint_at
             && last.elapsed() < checkpoint_debounce()
         {
@@ -15506,7 +15335,6 @@ impl Agent {
             tool_profile,
             work_ledger,
             mut provider_health,
-            track_origin,
             privacy,
             provenance,
             ..
@@ -15564,7 +15392,6 @@ impl Agent {
         self.work_ledger = work_ledger;
         normalize_provider_health_errors(&mut provider_health);
         self.provider_health = provider_health;
-        self.track_origin = track_origin;
         self.privacy = privacy;
         self.context_mode_explicit = context_mode_explicit;
         let restored_context_mode = if context_mode_explicit {
@@ -15648,10 +15475,7 @@ impl Agent {
     }
 
     fn estimated_context_tokens_from_history(&self) -> u64 {
-        self.provider_context_history()
-            .iter()
-            .map(message_approx_tokens)
-            .sum()
+        self.history.iter().map(message_approx_tokens).sum()
     }
 
     fn history_chars(&self) -> usize {
@@ -17848,15 +17672,7 @@ fn render_session_listing(root: &Path) -> String {
         out,
         "{}",
         list_render::render_footer(
-            &[
-                "/resume [name]",
-                "/save <name>",
-                "/map",
-                "/focus @wNN",
-                "/focus @wNN --branch",
-                "/branches",
-                "/export html [path]",
-            ],
+            &["/resume [name]", "/save <name>", "/export html [path]"],
             &opts,
         )
     );
@@ -18114,1185 +17930,6 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
     analysis.commands_run.truncate(50);
     analysis.failures.truncate(50);
     analysis
-}
-
-fn work_map_kind_rank(kind: WorkMapKind) -> u8 {
-    match kind {
-        WorkMapKind::Intent => 0,
-        WorkMapKind::Decision => 1,
-        WorkMapKind::Failure => 2,
-        WorkMapKind::Verify => 3,
-        WorkMapKind::Change => 4,
-        WorkMapKind::Evidence => 5,
-        WorkMapKind::Compact => 6,
-        WorkMapKind::Result => 7,
-    }
-}
-
-fn push_unique_limited(items: &mut Vec<String>, item: String, limit: usize) {
-    let item = summarize_inline(&item, 240);
-    if item.trim().is_empty() || items.iter().any(|existing| existing == &item) {
-        return;
-    }
-    items.push(item);
-    if items.len() > limit {
-        items.truncate(limit);
-    }
-}
-
-fn input_paths(input: &Value) -> Vec<String> {
-    let mut paths = Vec::new();
-    for key in ["path", "old_path", "new_path"] {
-        if let Some(path) = input[key].as_str() {
-            push_unique_limited(&mut paths, path.to_string(), 16);
-        }
-    }
-    if let Some(items) = input["paths"].as_array() {
-        for item in items {
-            if let Some(path) = item.as_str() {
-                push_unique_limited(&mut paths, path.to_string(), 16);
-            }
-        }
-    }
-    paths
-}
-
-fn tool_command(name: &str, input: &Value) -> Option<String> {
-    match name {
-        "bash" => input["command"]
-            .as_str()
-            .map(|cmd| summarize_bash_command(cmd, 220)),
-        "http" => Some(format!("http {}", summarize_args(&input["args"], 220))),
-        "csvkit" => Some(format!("csvkit {}", summarize_args(&input["args"], 220))),
-        _ => None,
-    }
-}
-
-fn tool_use_kind(name: &str, input: &Value) -> Option<WorkMapKind> {
-    match name {
-        "write_file" | "edit_file" | "multi_edit" | "git_commit" => Some(WorkMapKind::Change),
-        "read_file" | "read_symbol" | "fd" | "rg" | "grep" | "jq" | "fzf" | "http" | "git_diff"
-        | "git_log" | "todo_read" | "awk" | "csvkit" => Some(WorkMapKind::Evidence),
-        "bash" => input["command"].as_str().map(|command| {
-            if looks_like_verification_command(command) {
-                WorkMapKind::Verify
-            } else {
-                WorkMapKind::Evidence
-            }
-        }),
-        _ => None,
-    }
-}
-
-fn text_work_map_kind(role: &str, text: &str) -> Option<WorkMapKind> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("[prior conversation, summarized for resume]")
-        || lower.contains("[compaction]")
-        || lower.contains("compacted")
-    {
-        return Some(WorkMapKind::Compact);
-    }
-    if lower.contains("decision")
-        || lower.contains("decided")
-        || lower.contains("durable decision")
-        || lower.contains("user preference")
-    {
-        return Some(WorkMapKind::Decision);
-    }
-    if lower.contains("failed")
-        || lower.contains("failure")
-        || lower.contains("error")
-        || lower.contains("blocked")
-        || lower.contains("panic")
-    {
-        return Some(WorkMapKind::Failure);
-    }
-    if role == "user" && !text.trim().is_empty() {
-        return Some(WorkMapKind::Intent);
-    }
-    if role == "assistant" && !text.trim().is_empty() {
-        return Some(WorkMapKind::Result);
-    }
-    None
-}
-
-fn add_work_map_waypoint(
-    waypoints: &mut Vec<WorkMapWaypoint>,
-    kind: WorkMapKind,
-    message_range: std::ops::RangeInclusive<usize>,
-    summary: String,
-    files: Vec<String>,
-    commands: Vec<String>,
-    status: Option<String>,
-) {
-    let message_start = *message_range.start();
-    let message_end = *message_range.end();
-    let summary = summarize_inline(&summary, 180);
-    if summary == "?" {
-        return;
-    }
-    if let Some(existing) = waypoints
-        .iter_mut()
-        .find(|wp| wp.message_start == message_start && wp.summary == summary && wp.kind == kind)
-    {
-        existing.message_end = existing.message_end.max(message_end);
-        for file in files {
-            push_unique_limited(&mut existing.files, file, 8);
-        }
-        for command in commands {
-            push_unique_limited(&mut existing.commands, command, 8);
-        }
-        if existing.status.is_none() {
-            existing.status = status;
-        }
-        return;
-    }
-    let mut files_out = Vec::new();
-    for file in files {
-        push_unique_limited(&mut files_out, file, 8);
-    }
-    let mut commands_out = Vec::new();
-    for command in commands {
-        push_unique_limited(&mut commands_out, command, 8);
-    }
-    waypoints.push(WorkMapWaypoint {
-        id: String::new(),
-        anchor: String::new(),
-        kind,
-        message_start,
-        message_end,
-        summary,
-        files: files_out,
-        commands: commands_out,
-        status,
-    });
-}
-
-fn work_map_anchor_for(waypoint: &WorkMapWaypoint) -> String {
-    let raw = format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        waypoint.kind.as_str(),
-        waypoint.message_start,
-        waypoint.message_end,
-        waypoint.summary,
-        waypoint.files.join("\u{1f}"),
-        waypoint.commands.join("\u{1f}"),
-        waypoint.status.as_deref().unwrap_or_default()
-    );
-    format!("@{}", &sha256_hex_str(&raw)[..8])
-}
-
-fn assign_work_map_ids(waypoints: &mut [WorkMapWaypoint]) {
-    waypoints.sort_by_key(|wp| {
-        (
-            wp.message_start,
-            wp.message_end,
-            work_map_kind_rank(wp.kind),
-            wp.summary.clone(),
-        )
-    });
-    for (idx, waypoint) in waypoints.iter_mut().enumerate() {
-        waypoint.id = format!("@w{:02}", idx + 1);
-        waypoint.anchor = work_map_anchor_for(waypoint);
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ToolUseInfo {
-    summary: String,
-    files: Vec<String>,
-    commands: Vec<String>,
-    kind: Option<WorkMapKind>,
-    message_index: usize,
-}
-
-fn build_session_work_map(source: &Path, header: &SessionHeader, history: &[Message]) -> WorkMap {
-    let mut tool_uses: HashMap<String, ToolUseInfo> = HashMap::new();
-    let mut waypoints = Vec::new();
-
-    // The objective and blocked fields are intentionally NOT turned into
-    // waypoints here: objective is synthesized verbatim from the latest user
-    // prompt (redundant with the Intent waypoint every real user message
-    // already produces via text_work_map_kind), and blocked only ever holds
-    // synthesized objective-warning reminders. Real decisions, file changes,
-    // verification results, and history-derived waypoints are sufficient.
-    for decision in &header.work_ledger.decisions {
-        add_work_map_waypoint(
-            &mut waypoints,
-            WorkMapKind::Decision,
-            0..=0,
-            decision.clone(),
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
-    }
-    for file in &header.work_ledger.files_changed {
-        add_work_map_waypoint(
-            &mut waypoints,
-            WorkMapKind::Change,
-            0..=0,
-            format!("changed file: {file}"),
-            vec![file.clone()],
-            Vec::new(),
-            None,
-        );
-    }
-    for record in &header.work_ledger.verification {
-        add_work_map_waypoint(
-            &mut waypoints,
-            WorkMapKind::Verify,
-            0..=0,
-            format!("{}: {}", record.name, record.status),
-            Vec::new(),
-            vec![record.command.clone()],
-            Some(record.status.clone()),
-        );
-    }
-
-    for (idx, message) in history.iter().enumerate() {
-        let message_index = idx + 1;
-        for block in &message.content {
-            match block {
-                Block::Text { text } | Block::PartialStream { text } => {
-                    if let Some(kind) = text_work_map_kind(&message.role, text) {
-                        add_work_map_waypoint(
-                            &mut waypoints,
-                            kind,
-                            message_index..=message_index,
-                            summarize_inline(text, 180),
-                            Vec::new(),
-                            Vec::new(),
-                            (kind == WorkMapKind::Failure).then(|| "noted".to_string()),
-                        );
-                    }
-                }
-                Block::ToolUse { id, name, input } => {
-                    let files = input_paths(input);
-                    let command = tool_command(name, input);
-                    let kind = tool_use_kind(name, input);
-                    let summary = summarize_call(name, input);
-                    tool_uses.insert(
-                        id.clone(),
-                        ToolUseInfo {
-                            summary: summary.clone(),
-                            files: files.clone(),
-                            commands: command.clone().into_iter().collect(),
-                            kind,
-                            message_index,
-                        },
-                    );
-                    if let Some(kind) = kind {
-                        add_work_map_waypoint(
-                            &mut waypoints,
-                            kind,
-                            message_index..=message_index,
-                            summary,
-                            files,
-                            command.into_iter().collect(),
-                            None,
-                        );
-                    }
-                }
-                Block::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    metadata,
-                } => {
-                    let info = tool_uses.get(tool_use_id);
-                    let ok = !is_error.unwrap_or(false)
-                        && metadata
-                            .status
-                            .as_deref()
-                            .is_none_or(|status| !matches!(status, "error" | "failed"));
-                    let kind = if !ok {
-                        WorkMapKind::Failure
-                    } else if metadata
-                        .status
-                        .as_deref()
-                        .is_some_and(|status| matches!(status, "passed" | "failed"))
-                    {
-                        WorkMapKind::Verify
-                    } else {
-                        info.and_then(|i| i.kind).unwrap_or(WorkMapKind::Evidence)
-                    };
-                    if matches!(kind, WorkMapKind::Evidence) && ok {
-                        continue;
-                    }
-                    let summary = if let Some(info) = info {
-                        format!("{} => {}", info.summary, summarize_inline(content, 120))
-                    } else {
-                        summarize_inline(content, 180)
-                    };
-                    add_work_map_waypoint(
-                        &mut waypoints,
-                        kind,
-                        info.map(|i| i.message_index).unwrap_or(message_index)..=message_index,
-                        summary,
-                        info.map(|i| i.files.clone()).unwrap_or_default(),
-                        info.map(|i| i.commands.clone()).unwrap_or_default(),
-                        metadata.status.clone().or_else(|| {
-                            if ok {
-                                Some("ok".to_string())
-                            } else {
-                                Some("error".to_string())
-                            }
-                        }),
-                    );
-                }
-                Block::Thinking { .. }
-                | Block::RedactedThinking { .. }
-                | Block::ResponsesReasoning { .. } => {}
-            }
-        }
-    }
-
-    assign_work_map_ids(&mut waypoints);
-    WorkMap {
-        source: source.display().to_string(),
-        header: header.clone(),
-        messages: history.len(),
-        waypoints,
-    }
-}
-
-fn selected_waypoints<'a>(map: &'a WorkMap, selection: &WorkMapSelection) -> &'a [WorkMapWaypoint] {
-    let start = selection.start.min(map.waypoints.len());
-    let end = selection.end.min(map.waypoints.len().saturating_sub(1));
-    if start > end {
-        &map.waypoints[0..0]
-    } else {
-        &map.waypoints[start..=end]
-    }
-}
-
-fn parse_waypoint_number(raw: &str) -> Option<usize> {
-    let trimmed = raw.trim().trim_start_matches('@');
-    let number = trimmed.strip_prefix('w').unwrap_or(trimmed);
-    number.parse::<usize>().ok()?.checked_sub(1)
-}
-
-fn resolve_work_map_token(raw: &str, map: &WorkMap) -> Option<usize> {
-    if let Some(idx) = parse_waypoint_number(raw) {
-        return Some(idx);
-    }
-    let needle = raw.trim().trim_start_matches('@');
-    if needle.is_empty() {
-        return None;
-    }
-    map.waypoints.iter().position(|wp| {
-        wp.anchor.trim_start_matches('@') == needle
-            || wp.anchor == raw.trim()
-            || wp.id == raw.trim()
-    })
-}
-
-fn parse_work_map_selection(raw: &str, map: &WorkMap) -> Result<WorkMapSelection> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        anyhow::bail!("missing waypoint id (example: @w03, @a1b2c3d4, or @w03..@w08)");
-    }
-    let (start_raw, end_raw) = raw.split_once("..").unwrap_or((raw, raw));
-    let start = resolve_work_map_token(start_raw, map)
-        .ok_or_else(|| anyhow::anyhow!("invalid waypoint id '{start_raw}'"))?;
-    let end = resolve_work_map_token(end_raw, map)
-        .ok_or_else(|| anyhow::anyhow!("invalid waypoint id '{end_raw}'"))?;
-    if start >= map.waypoints.len() || end >= map.waypoints.len() {
-        anyhow::bail!(
-            "waypoint out of range; map has {} waypoint(s)",
-            map.waypoints.len()
-        );
-    }
-    Ok(WorkMapSelection {
-        start: start.min(end),
-        end: start.max(end),
-    })
-}
-
-fn work_map_waypoint_ids(map: &WorkMap) -> Vec<String> {
-    map.waypoints.iter().map(|wp| wp.id.clone()).collect()
-}
-
-fn work_map_waypoint_ids_for_view(map: &WorkMap, filters: &[WorkMapFilter]) -> Vec<String> {
-    map.waypoints
-        .iter()
-        .filter(|wp| work_map_filter_matches(map, wp, filters))
-        .map(|wp| wp.id.clone())
-        .collect()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum WorkMapFilter {
-    Kind(WorkMapKind),
-    File(String),
-    Query(String),
-}
-
-fn parse_work_map_filter_args_with_default(
-    args: &[String],
-    default_selector: &str,
-) -> Result<(String, Vec<WorkMapFilter>)> {
-    let mut selector: Option<String> = None;
-    let mut filters = Vec::new();
-    let mut idx = 0usize;
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-        match arg {
-            "current" | "this" | "memory" | "latest" if selector.is_none() => {
-                selector = Some(arg.to_string());
-                idx += 1;
-            }
-            "all" => {
-                idx += 1;
-            }
-            "intent" | "intents" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Intent));
-                idx += 1;
-            }
-            "evidence" | "read" | "reads" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Evidence));
-                idx += 1;
-            }
-            "change" | "changes" | "write" | "writes" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Change));
-                idx += 1;
-            }
-            "failure" | "failures" | "blocked" | "errors" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Failure));
-                idx += 1;
-            }
-            "verify" | "verification" | "tests" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Verify));
-                idx += 1;
-            }
-            "decision" | "decisions" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Decision));
-                idx += 1;
-            }
-            "compact" | "compactions" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Compact));
-                idx += 1;
-            }
-            "result" | "results" => {
-                filters.push(WorkMapFilter::Kind(WorkMapKind::Result));
-                idx += 1;
-            }
-            "file" => {
-                let Some(path) = args.get(idx + 1) else {
-                    anyhow::bail!("usage: /map file <path-fragment>");
-                };
-                filters.push(WorkMapFilter::File(path.clone()));
-                idx += 2;
-            }
-            "query" | "search" | "grep" => {
-                let rest = args[idx + 1..].join(" ");
-                if rest.trim().is_empty() {
-                    anyhow::bail!("usage: /map query <text>");
-                }
-                filters.push(WorkMapFilter::Query(rest));
-                break;
-            }
-            other if selector.is_none() => {
-                selector = Some(other.to_string());
-                idx += 1;
-            }
-            other => {
-                filters.push(WorkMapFilter::Query(other.to_string()));
-                idx += 1;
-            }
-        }
-    }
-    Ok((
-        selector.unwrap_or_else(|| default_selector.to_string()),
-        filters,
-    ))
-}
-
-fn parse_work_map_filter_args(args: &[String]) -> Result<(String, Vec<WorkMapFilter>)> {
-    parse_work_map_filter_args_with_default(args, "current")
-}
-
-fn work_map_filter_matches(
-    _map: &WorkMap,
-    waypoint: &WorkMapWaypoint,
-    filters: &[WorkMapFilter],
-) -> bool {
-    if filters.is_empty() {
-        return true;
-    }
-    let kind_filters = filters
-        .iter()
-        .filter_map(|filter| match filter {
-            WorkMapFilter::Kind(kind) => Some(*kind),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !kind_filters.is_empty() && !kind_filters.contains(&waypoint.kind) {
-        return false;
-    }
-    filters.iter().all(|filter| match filter {
-        WorkMapFilter::Kind(_) => true,
-        WorkMapFilter::File(needle) => {
-            let needle = needle.to_ascii_lowercase();
-            waypoint
-                .files
-                .iter()
-                .any(|file| file.to_ascii_lowercase().contains(&needle))
-                || waypoint.summary.to_ascii_lowercase().contains(&needle)
-        }
-        WorkMapFilter::Query(needle) => {
-            let needle = needle.to_ascii_lowercase();
-            waypoint.id.to_ascii_lowercase().contains(&needle)
-                || waypoint.anchor.to_ascii_lowercase().contains(&needle)
-                || waypoint.kind.as_str().contains(&needle)
-                || waypoint.summary.to_ascii_lowercase().contains(&needle)
-                || waypoint
-                    .files
-                    .iter()
-                    .any(|file| file.to_ascii_lowercase().contains(&needle))
-                || waypoint
-                    .commands
-                    .iter()
-                    .any(|cmd| cmd.to_ascii_lowercase().contains(&needle))
-        }
-    })
-}
-
-fn work_map_filter_label(filters: &[WorkMapFilter]) -> Option<String> {
-    if filters.is_empty() {
-        return None;
-    }
-    Some(
-        filters
-            .iter()
-            .map(|filter| match filter {
-                WorkMapFilter::Kind(kind) => kind.as_str().to_string(),
-                WorkMapFilter::File(path) => format!("file={path}"),
-                WorkMapFilter::Query(query) => format!("query={query}"),
-            })
-            .collect::<Vec<_>>()
-            .join(","),
-    )
-}
-
-fn render_work_map(map: &WorkMap, filters: &[WorkMapFilter]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let provider = if map.header.provenance.provider.is_empty() {
-        "unknown"
-    } else {
-        &map.header.provenance.provider
-    };
-    let _ = writeln!(out, "Session map — {}", map.source);
-    let _ = writeln!(
-        out,
-        "model {} · provider {} · messages {} · moments {}",
-        map.header.model,
-        provider,
-        map.messages,
-        map.waypoints.len()
-    );
-    if let Some(origin) = &map.header.track_origin {
-        let _ = writeln!(
-            out,
-            "branched from: {} moment {} ({})",
-            origin.source_session, origin.source_waypoint, origin.mode,
-        );
-    }
-    let visible = map
-        .waypoints
-        .iter()
-        .filter(|wp| work_map_filter_matches(map, wp, filters))
-        .collect::<Vec<_>>();
-    if let Some(label) = work_map_filter_label(filters) {
-        let _ = writeln!(
-            out,
-            "filter {label} · showing {}/{}",
-            visible.len(),
-            map.waypoints.len()
-        );
-    }
-    if let Some(focus) = &map.header.work_ledger.active_focus {
-        let _ = writeln!(
-            out,
-            "focus active: moment {} of {} ({})",
-            focus.selection, focus.source_session, focus.mode,
-        );
-    }
-    if map.waypoints.is_empty() {
-        let _ = writeln!(out, "(no waypoints found yet)");
-    } else if visible.is_empty() {
-        let _ = writeln!(out, "(no waypoints match filter)");
-    } else {
-        for wp in visible {
-            let status = wp
-                .status
-                .as_deref()
-                .map(|s| format!(" [{s}]"))
-                .unwrap_or_default();
-            let mut extra = Vec::new();
-            if let Some(file) = wp.files.first() {
-                extra.push(format!("file {file}"));
-            }
-            if let Some(command) = wp.commands.first() {
-                extra.push(format!("cmd {command}"));
-            }
-            extra.push(format!("anchor {}", wp.anchor));
-            let extra = format!(" · {}", extra.join(" · "));
-            let _ = writeln!(
-                out,
-                "{} {:8} {:>10}{}  {}{}",
-                wp.id,
-                wp.kind.as_str(),
-                wp.display_range(),
-                status,
-                wp.summary,
-                extra
-            );
-        }
-    }
-    let _ = write!(
-        out,
-        "commands: ↑/↓ or PgUp/PgDn navigate · Enter inspect · f edit · b branch · z filter (/map failures|changes|verify|file <path>|query <text>)"
-    );
-    out
-}
-
-fn collect_waypoint_items<'a, F>(waypoints: &'a [WorkMapWaypoint], mut f: F) -> Vec<String>
-where
-    F: FnMut(&'a WorkMapWaypoint) -> &'a [String],
-{
-    let mut out = Vec::new();
-    for wp in waypoints {
-        for item in f(wp) {
-            push_unique_limited(&mut out, item.clone(), 24);
-        }
-    }
-    out
-}
-
-fn work_map_selection_label(waypoints: &[WorkMapWaypoint]) -> String {
-    match (waypoints.first(), waypoints.last()) {
-        (Some(first), Some(last)) if first.id == last.id => first.id.clone(),
-        (Some(first), Some(last)) => format!("{}..{}", first.id, last.id),
-        _ => "(none)".to_string(),
-    }
-}
-
-fn render_bullets(out: &mut String, title: &str, items: &[String], limit: usize) {
-    use std::fmt::Write as _;
-    if items.is_empty() {
-        return;
-    }
-    let _ = writeln!(out, "{title}:");
-    for item in items.iter().take(limit) {
-        let _ = writeln!(out, "- {item}");
-    }
-    if items.len() > limit {
-        let _ = writeln!(out, "- … [{} more omitted]", items.len() - limit);
-    }
-}
-
-fn render_work_map_packet(map: &WorkMap, selection: &WorkMapSelection) -> String {
-    render_work_map_packet_with_mode(map, selection, None)
-}
-
-fn render_work_map_packet_with_mode(
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    mode: Option<&FocusMode>,
-) -> String {
-    use std::fmt::Write as _;
-    let waypoints = selected_waypoints(map, selection);
-    let mut out = String::new();
-    let _ = writeln!(out, "[dext packet {}]", work_map_selection_label(waypoints));
-    let _ = writeln!(out, "source: {}", map.source);
-    let ranges = waypoints
-        .iter()
-        .map(WorkMapWaypoint::display_range)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if !ranges.is_empty() {
-        let _ = writeln!(out, "messages: {ranges}");
-    }
-    if let Some(origin) = &map.header.track_origin {
-        let _ = writeln!(
-            out,
-            "origin: {} {} mode={}",
-            origin.source_session, origin.source_waypoint, origin.mode
-        );
-    }
-
-    let broad_packet = mode.is_none();
-    let include_decisions =
-        broad_packet || mode.is_some_and(|m| m.carries("decisions") || m.carries("decision"));
-    let include_files =
-        broad_packet || mode.is_some_and(|m| m.carries("files") || m.carries("file"));
-    let include_commands =
-        broad_packet || mode.is_some_and(|m| m.carries("commands") || m.carries("cmd"));
-    let include_verification = broad_packet
-        || mode.is_some_and(|m| {
-            m.carries("verify") || m.carries("verification") || m.carries("tests")
-        });
-    let include_constraints =
-        broad_packet || mode.is_some_and(|m| m.carries("constraints") || m.carries("constraint"));
-
-    // Intent is no longer synthesized from the objective field (which echoes
-    // raw user text); real user-message Intent waypoints appear below.
-    if !waypoints.is_empty() {
-        let _ = writeln!(out, "Selected waypoints:");
-        for wp in waypoints.iter().take(24) {
-            let status = wp
-                .status
-                .as_deref()
-                .map(|s| format!(" [{s}]"))
-                .unwrap_or_default();
-            let _ = writeln!(
-                out,
-                "- {} {} {}{} anchor={}: {}",
-                wp.id,
-                wp.kind.as_str(),
-                wp.display_range(),
-                status,
-                wp.anchor,
-                wp.summary
-            );
-        }
-    }
-
-    let mut files = collect_waypoint_items(waypoints, |wp| &wp.files);
-    if include_files {
-        for file in &map.header.work_ledger.files_changed {
-            push_unique_limited(&mut files, file.clone(), 24);
-        }
-    }
-    let mut commands = collect_waypoint_items(waypoints, |wp| &wp.commands);
-    if include_commands {
-        for record in &map.header.work_ledger.verification {
-            push_unique_limited(&mut commands, record.command.clone(), 24);
-        }
-    }
-    let decisions = if include_decisions {
-        map.header
-            .work_ledger
-            .decisions
-            .iter()
-            .map(|s| summarize_inline(s, 220))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let failures = waypoints
-        .iter()
-        .filter(|wp| wp.kind == WorkMapKind::Failure)
-        .map(|wp| wp.summary.clone())
-        .collect::<Vec<_>>();
-    let mut verification = waypoints
-        .iter()
-        .filter(|wp| wp.kind == WorkMapKind::Verify)
-        .map(|wp| {
-            let status = wp.status.as_deref().unwrap_or("unknown");
-            format!("{}: {status}", wp.summary)
-        })
-        .collect::<Vec<_>>();
-    if include_verification {
-        for v in &map.header.work_ledger.verification {
-            push_unique_limited(
-                &mut verification,
-                format!(
-                    "{}: {} exit={:?} artifact={}",
-                    v.name,
-                    v.status,
-                    v.exit_code,
-                    v.artifact.clone().unwrap_or_else(|| "(none)".to_string())
-                ),
-                24,
-            );
-        }
-    }
-    let evidence = waypoints
-        .iter()
-        .filter(|wp| wp.kind == WorkMapKind::Evidence)
-        .map(|wp| wp.summary.clone())
-        .collect::<Vec<_>>();
-    render_bullets(&mut out, "Evidence", &evidence, 12);
-    render_bullets(&mut out, "Files", &files, 16);
-    render_bullets(&mut out, "Commands", &commands, 16);
-    render_bullets(&mut out, "Verification", &verification, 12);
-    render_bullets(&mut out, "Decisions", &decisions, 12);
-    render_bullets(&mut out, "Failures/blockers", &failures, 12);
-    if include_constraints && !map.header.work_ledger.constraints.is_empty() {
-        render_bullets(
-            &mut out,
-            "Session constraints",
-            &map.header.work_ledger.constraints,
-            12,
-        );
-    }
-    let _ = writeln!(out, "Constraints:");
-    let _ = writeln!(
-        out,
-        "- Focus changes model context only; it does not rewind files, git state, or later logs."
-    );
-    if matches!(mode, Some(FocusMode::Exact)) {
-        let _ = writeln!(
-            out,
-            "- Exact focus withholds prior session history from model context after activation; only this packet and later messages are sent."
-        );
-    } else if matches!(mode, Some(FocusMode::Carry(_))) {
-        let _ = writeln!(
-            out,
-            "- Carry focus withholds prior raw history and carries only the requested ledger categories plus selected waypoints."
-        );
-    }
-    out
-}
-
-fn parse_focus_mode(args: &[String]) -> FocusMode {
-    let mut carry: Vec<String> = vec!["failures".into(), "decisions".into(), "files".into()];
-    for arg in args {
-        if arg == "--exact" || arg == "exact" || arg == "--isolate" || arg == "isolate" {
-            return FocusMode::Exact;
-        }
-        if let Some(raw) = arg
-            .strip_prefix("--carry=")
-            .or_else(|| arg.strip_prefix("--carry"))
-        {
-            let raw = raw.trim_start_matches('=');
-            if !raw.is_empty() {
-                carry = raw
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect();
-            }
-        }
-    }
-    FocusMode::Carry(carry)
-}
-
-fn render_work_map_focus(map: &WorkMap, selection: &WorkMapSelection, mode: &FocusMode) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let selected = selected_waypoints(map, selection);
-    let _ = writeln!(
-        out,
-        "[dext focus {} mode={}]",
-        work_map_selection_label(selected),
-        mode.label()
-    );
-    let _ = writeln!(
-        out,
-        "Note: this does not rewind files, git, or your current session."
-    );
-    match mode {
-        FocusMode::Exact => {
-            let _ = writeln!(
-                out,
-                "Exact: narrows the model's live context to this summary onward."
-            );
-        }
-        FocusMode::Carry(items) => {
-            let carry = if items.is_empty() {
-                "(none)".to_string()
-            } else {
-                items.join(",")
-            };
-            let _ = writeln!(
-                out,
-                "Carry: keeps only these facts in live context: {carry}"
-            );
-        }
-    }
-    out.push('\n');
-    out.push_str(&render_work_map_packet_with_mode(
-        map,
-        selection,
-        Some(mode),
-    ));
-    out
-}
-
-fn activate_work_map_focus(
-    agent: &mut Agent,
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    mode: &FocusMode,
-) -> String {
-    let text = render_work_map_focus(map, selection, mode);
-    let selected = selected_waypoints(map, selection);
-    let selection_label = work_map_selection_label(selected);
-    agent.work_ledger.active_focus = Some(WorkMapFocusState {
-        source_session: map.source.clone(),
-        selection: selection_label,
-        mode: mode.label().to_string(),
-        packet_hash: sha256_hex_str(&text),
-        created_at: unix_timestamp_secs(),
-    });
-    agent.history.push(Message {
-        role: "user".to_string(),
-        content: vec![Block::Text {
-            text: format!("[dext focus packet loaded]\n{text}"),
-        }],
-    });
-    agent.checkpoint_latest_session("after_focus");
-    text
-}
-
-fn parse_work_map_command_args(raw: &str) -> Vec<String> {
-    raw.split_whitespace().map(String::from).collect()
-}
-
-fn work_map_event_selector(selector: &str) -> Option<String> {
-    let selector = selector.trim();
-    if selector.is_empty() || matches!(selector, "current" | "memory" | "this") {
-        None
-    } else {
-        Some(selector.to_string())
-    }
-}
-
-fn load_work_map_for_selector(root: &Path, selector: &str) -> Result<(PathBuf, WorkMap)> {
-    let source = resolve_session_selector(root, selector)?;
-    let (header, history) = read_session_jsonl(&source)?;
-    let map = build_session_work_map(&source, &header, &history);
-    Ok((source, map))
-}
-
-fn current_work_map(agent: &Agent, label: &str) -> WorkMap {
-    let header = agent.session_header();
-    build_session_work_map(Path::new(label), &header, &agent.history)
-}
-
-fn looks_like_waypoint_token(raw: &str) -> bool {
-    parse_waypoint_number(raw).is_some()
-        || raw
-            .trim()
-            .strip_prefix('@')
-            .is_some_and(|rest| rest.len() >= 6 && rest.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-fn parse_work_map_operation_args<'a>(
-    args: &'a [String],
-    default_selector: &'a str,
-) -> Result<(&'a str, &'a str, Vec<String>)> {
-    let Some(id_pos) = args.iter().position(|arg| looks_like_waypoint_token(arg)) else {
-        anyhow::bail!("missing waypoint id (example: @w03)");
-    };
-    let id = args[id_pos].as_str();
-    let selector = args[..id_pos]
-        .first()
-        .map(String::as_str)
-        .unwrap_or(default_selector);
-    if args[..id_pos].len() > 1 {
-        anyhow::bail!("expected at most one session selector before waypoint id");
-    }
-    let mut selector = selector;
-    let selector_from_before = id_pos > 0;
-    let mut mode_args = Vec::new();
-    let mut prev_was_branch = false;
-    for arg in &args[id_pos + 1..] {
-        if arg.starts_with("--") || matches!(arg.as_str(), "exact" | "isolate") {
-            mode_args.push(arg.clone());
-            prev_was_branch = *arg == "--branch";
-        } else if prev_was_branch {
-            mode_args.push(arg.clone());
-            prev_was_branch = false;
-        } else if !selector_from_before && selector == default_selector {
-            selector = arg.as_str();
-        } else {
-            anyhow::bail!("unexpected argument after waypoint id: {arg}");
-        }
-    }
-    Ok((id, selector, mode_args))
-}
-
-fn parse_track_open_args<'a>(
-    args: &'a [String],
-    default_selector: &'a str,
-) -> Result<(&'a str, &'a str, Option<&'a str>, Vec<String>)> {
-    let Some(id_pos) = args.iter().position(|arg| looks_like_waypoint_token(arg)) else {
-        anyhow::bail!("missing waypoint id (example: @w03)");
-    };
-    let id = args[id_pos].as_str();
-    let selector = args[..id_pos]
-        .first()
-        .map(String::as_str)
-        .unwrap_or(default_selector);
-    if args[..id_pos].len() > 1 {
-        anyhow::bail!("expected at most one session selector before waypoint id");
-    }
-    let mut name: Option<&str> = None;
-    let mut mode_args = Vec::new();
-    for arg in &args[id_pos + 1..] {
-        if arg.starts_with("--") || matches!(arg.as_str(), "exact" | "isolate") {
-            mode_args.push(arg.clone());
-        } else if name.is_none() {
-            name = Some(arg.as_str());
-        } else {
-            mode_args.push(arg.clone());
-        }
-    }
-    Ok((id, selector, name, mode_args))
-}
-
-fn choose_work_map_source(
-    root: &Path,
-    selector: &str,
-    agent: Option<&Agent>,
-) -> Result<(PathBuf, WorkMap)> {
-    let selector = selector.trim();
-    if (selector.is_empty() || matches!(selector, "current" | "memory" | "this"))
-        && let Some(agent) = agent
-    {
-        return Ok((PathBuf::from("current"), current_work_map(agent, "current")));
-    }
-    let selector = if selector.is_empty() {
-        "latest"
-    } else {
-        selector
-    };
-    load_work_map_for_selector(root, selector)
-}
-
-fn render_tracks_listing(root: &Path) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(out, "Branches (sessions continued from past moments):");
-    match list_session_records_for_root(root) {
-        Ok(records) => {
-            let mut shown = 0usize;
-            for record in records {
-                let Ok((header, _)) = read_session_jsonl(&record.path) else {
-                    continue;
-                };
-                let Some(origin) = header.track_origin else {
-                    continue;
-                };
-                shown += 1;
-                let _ = writeln!(
-                    out,
-                    "  · {} — from moment {} ({})",
-                    record.name, origin.source_waypoint, origin.mode,
-                );
-                if shown >= SLASH_LIST_LIMIT {
-                    break;
-                }
-            }
-            if shown == 0 {
-                let _ = writeln!(out, "  (none yet; use /focus @wNN --branch [name])");
-            }
-        }
-        Err(e) => {
-            let _ = writeln!(out, "[err] {e:#}");
-        }
-    }
-    let _ = write!(out, "resume a branch with: /resume <name>");
-    let _ = root;
-    out
-}
-
-fn default_track_name(waypoint_id: &str) -> String {
-    let clean = waypoint_id
-        .trim_start_matches('@')
-        .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
-    format!("branch-{clean}-{}", unix_timestamp_secs())
-}
-
-fn create_track_from_work_map_with_header(
-    root: &Path,
-    mut header: SessionHeader,
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    name: Option<&str>,
-    mode: &FocusMode,
-) -> Result<PathBuf> {
-    let selected = selected_waypoints(map, selection);
-    let first = selected
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("empty waypoint selection"))?;
-    let track_name = name
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| default_track_name(&first.id));
-    session::validate_session_name(&track_name)?;
-    let packet = render_work_map_focus(map, selection, mode);
-    header.track_origin = Some(TrackOrigin {
-        source_session: map.source.clone(),
-        source_waypoint: work_map_selection_label(selected),
-        mode: mode.label().to_string(),
-        packet_hash: sha256_hex_str(&packet),
-        created_at: unix_timestamp_secs(),
-    });
-    header.work_ledger.objective = format!("branched from {}", work_map_selection_label(selected));
-    let path = named_session_path_for_root(root, &track_name)?;
-    let history = vec![
-        Message {
-            role: "user".to_string(),
-            content: vec![Block::Text {
-                text: format!(
-                    "Continued from moment {} in a previous session. Here is the summary of work so far:\n\n{}",
-                    work_map_selection_label(selected),
-                    packet
-                ),
-            }],
-        },
-        Message {
-            role: "assistant".to_string(),
-            content: vec![Block::Text {
-                text:
-                    "Branch ready. Your files and git state are unchanged — verify current repo state before editing."
-                        .to_string(),
-            }],
-        },
-    ];
-    let mut data = Vec::new();
-    writeln!(&mut data, "{}", serde_json::to_string(&header)?)?;
-    for message in history {
-        writeln!(&mut data, "{}", serde_json::to_string(&message)?)?;
-    }
-    crate::session::atomic_write_secret(&path, &data)?;
-    Ok(path)
-}
-
-fn create_branch_text(
-    agent: &Agent,
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    name: Option<&str>,
-) -> Result<String> {
-    let mode = FocusMode::Carry(vec!["failures".into(), "decisions".into(), "files".into()]);
-    let label = work_map_selection_label(selected_waypoints(map, selection));
-    let path = create_track_from_work_map(agent, map, selection, name, &mode)?;
-    let branch_name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("branch");
-    Ok(format!(
-        "Created branch \"{branch_name}\" — continues from moment {label}.\n\
-         Your current session is unchanged.\n\
-         Resume the branch later with: /resume {branch_name}",
-    ))
-}
-
-fn create_track_from_work_map(
-    agent: &Agent,
-    map: &WorkMap,
-    selection: &WorkMapSelection,
-    name: Option<&str>,
-    mode: &FocusMode,
-) -> Result<PathBuf> {
-    create_track_from_work_map_with_header(
-        &agent.sandbox_root,
-        agent.session_header(),
-        map,
-        selection,
-        name,
-        mode,
-    )
 }
 
 fn render_session_analysis(
@@ -20294,10 +18931,11 @@ fn doctor_report_with_overrides(
     render_doctor_findings(&findings)
 }
 
-/// A compact, safe continuation packet for handing work to another agent or a
-/// fresh session. Built from the curated work ledger (header) plus distilled
-/// analysis facts — deliberately not the raw prompts/tool output, which the
-/// full jsonl carries and which may contain sensitive content.
+/// A compact continuation packet for handing work to another agent or a fresh
+/// session. Built from the curated work ledger (header) plus distilled analysis
+/// facts rather than the full raw transcript. The distilled fields can still
+/// contain sensitive user or tool data and must be handled as private session
+/// output.
 fn render_session_brief(
     source: &Path,
     header: &SessionHeader,
@@ -20316,6 +18954,7 @@ fn render_session_brief(
         analysis.messages,
         analysis.usage.line()
     ));
+    out.push_str("privacy: distilled session data; review before sharing\n");
     if analysis.compactions > 0 {
         out.push_str(&format!("compactions: {}\n", analysis.compactions));
     }
@@ -20408,11 +19047,106 @@ fn collect_session_lock_paths(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Re
     Ok(())
 }
 
+fn prunable_project_dir_modified(dir: &Path) -> std::io::Result<Option<std::time::SystemTime>> {
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+    let Some(mut newest_modified) = metadata.modified().ok() else {
+        return Ok(None);
+    };
+
+    let mut inspected = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            inspected += 1;
+            if inspected > SESSION_PRUNE_ENTRY_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session prune traversal exceeds safety limit",
+                ));
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Ok(None);
+            }
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if !metadata.file_type().is_symlink() && metadata.file_type() == file_type =>
+                {
+                    metadata
+                }
+                _ => return Ok(None),
+            };
+            let Some(modified) = metadata.modified().ok() else {
+                return Ok(None);
+            };
+            newest_modified = newest_modified.max(modified);
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if !file_type.is_file()
+                || path.file_name().and_then(|name| name.to_str()) != Some(SESSION_STATE_LOCK_NAME)
+                || session_state_lock_is_live(&path)
+            {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(newest_modified))
+}
+
+fn remove_empty_directory_tree(dir: &Path) -> std::io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(false);
+    }
+
+    let mut inspected = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    let mut directories = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            inspected += 1;
+            if inspected > SESSION_PRUNE_ENTRY_LIMIT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "session prune traversal exceeds safety limit",
+                ));
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Ok(false);
+            }
+            let path = entry.path();
+            directories.push(path.clone());
+            stack.push(path);
+        }
+    }
+
+    for path in directories.into_iter().rev() {
+        match std::fs::remove_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
 fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<()> {
     let projects_dir = session::dext_state_dir().join("projects");
     let current_key = project_key(root);
     let now = std::time::SystemTime::now();
-    let max_age = std::time::Duration::from_secs(max_age_days * 86400);
+    let max_age = std::time::Duration::from_secs(max_age_days.saturating_mul(86_400));
 
     let entries = match std::fs::read_dir(&projects_dir) {
         Ok(e) => e,
@@ -20446,32 +19180,13 @@ fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<(
             kept += 1;
             continue;
         }
-        let sessions_dir = path.join("sessions");
-        let has_real_session = match walkdir_jsonl_count(&sessions_dir) {
-            Ok(count) => count > 0,
-            Err(_) => {
+        let modified = match prunable_project_dir_modified(&path) {
+            Ok(Some(modified)) => modified,
+            Ok(None) | Err(_) => {
                 kept += 1;
                 continue;
             }
         };
-        if has_real_session {
-            kept += 1;
-            continue;
-        }
-        let mut locks = Vec::new();
-        if collect_session_lock_paths(&path, &mut locks).is_err() {
-            kept += 1;
-            continue;
-        }
-        if locks.iter().any(|lock| session_state_lock_is_live(lock)) {
-            kept += 1;
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(now);
         let age = now.duration_since(modified).unwrap_or_default();
         if age <= max_age {
             kept += 1;
@@ -20508,57 +19223,24 @@ fn prune_project_dirs(root: &Path, dry_run: bool, max_age_days: u64) -> Result<(
     );
 
     if !dry_run {
+        let _operation_guard = SessionLockOperationGuard::acquire()?;
         for lock in &stale_locks {
-            let _ = remove_stale_session_state_lock(lock);
+            let _ = remove_stale_session_state_lock_under_guard(&_operation_guard, lock);
         }
         for (path, _, _) in &candidates {
-            let _ = std::fs::remove_dir_all(path);
+            match remove_empty_directory_tree(path) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "warning: preserved {} because it is no longer empty",
+                    path.display()
+                ),
+                Err(error) => {
+                    eprintln!("warning: could not remove {}: {error}", path.display())
+                }
+            }
         }
     }
     Ok(())
-}
-
-fn walkdir_jsonl_count(dir: &Path) -> std::io::Result<usize> {
-    let metadata = match std::fs::symlink_metadata(dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "session directory is not a regular directory",
-        ));
-    }
-
-    let mut count = 0;
-    let mut inspected = 0usize;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            inspected += 1;
-            if inspected > SESSION_PRUNE_ENTRY_LIMIT {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "session prune traversal exceeds safety limit",
-                ));
-            }
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
-                && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
-            {
-                count += 1;
-            }
-        }
-    }
-    Ok(count)
 }
 
 fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
@@ -20711,87 +19393,28 @@ fn handle_session_cli(argv: &[String]) -> Result<Option<i32>> {
                     Ok(Some(0))
                 }
                 "prune" => {
-                    let dry_run = !argv.iter().skip(2).any(|a| a == "--apply" || a == "apply");
-                    let max_age_days = argv
-                        .iter()
-                        .skip(2)
-                        .find_map(|a| {
-                            a.strip_prefix("--days=")
-                                .and_then(|v| v.parse::<u64>().ok())
-                        })
-                        .unwrap_or(7);
+                    let mut dry_run = true;
+                    let mut max_age_days = 7;
+                    for arg in argv.iter().skip(2) {
+                        if matches!(arg.as_str(), "--apply" | "apply") {
+                            dry_run = false;
+                        } else if let Some(value) = arg.strip_prefix("--days=") {
+                            let Ok(days) = value.parse::<u64>() else {
+                                eprintln!("usage: dext session prune [--days=N] [--apply]");
+                                return Ok(Some(2));
+                            };
+                            max_age_days = days;
+                        } else {
+                            eprintln!("usage: dext session prune [--days=N] [--apply]");
+                            return Ok(Some(2));
+                        }
+                    }
                     prune_project_dirs(&root, dry_run, max_age_days)?;
                     Ok(Some(0))
                 }
-                "map" => {
-                    let args = parse_work_map_command_args(&argv[2..].join(" "));
-                    let (selector, filters) =
-                        parse_work_map_filter_args_with_default(&args, "latest")?;
-                    let (_, map) = load_work_map_for_selector(&root, &selector)?;
-                    println!("{}", render_work_map(&map, &filters));
-                    Ok(Some(0))
-                }
-                "packet" => {
-                    let args = parse_work_map_command_args(&argv[2..].join(" "));
-                    let (id, selector, _) = parse_work_map_operation_args(&args, "latest")?;
-                    let (_, map) = load_work_map_for_selector(&root, selector)?;
-                    let selection = parse_work_map_selection(id, &map)?;
-                    println!("{}", render_work_map_packet(&map, &selection));
-                    Ok(Some(0))
-                }
-                "focus" => {
-                    let args = parse_work_map_command_args(&argv[2..].join(" "));
-                    let (id, selector, mode_args) = parse_work_map_operation_args(&args, "latest")?;
-                    let (_, map) = load_work_map_for_selector(&root, selector)?;
-                    let selection = parse_work_map_selection(id, &map)?;
-                    let mode = parse_focus_mode(&mode_args);
-                    println!("{}", render_work_map_focus(&map, &selection, &mode));
-                    Ok(Some(0))
-                }
-                "tracks" | "branches" => {
-                    println!("{}", render_tracks_listing(&root));
-                    Ok(Some(0))
-                }
-                "track" => {
-                    let sub = argv.get(2).map(|s| s.as_str());
-                    let args_str = if matches!(sub, Some("open")) {
-                        argv[3..].join(" ")
-                    } else {
-                        argv.get(2..).map(|s| s.join(" ")).unwrap_or_default()
-                    };
-                    let args = parse_work_map_command_args(&args_str);
-                    match parse_track_open_args(&args, "latest") {
-                        Ok((id, selector, name, _)) => {
-                            let (source, map) = load_work_map_for_selector(&root, selector)?;
-                            let selection = parse_work_map_selection(id, &map)?;
-                            let (header, _) = read_session_jsonl(&source)?;
-                            let mode = FocusMode::Carry(vec![
-                                "failures".into(),
-                                "decisions".into(),
-                                "files".into(),
-                            ]);
-                            let path = create_track_from_work_map_with_header(
-                                &root, header, &map, &selection, name, &mode,
-                            )?;
-                            let bn = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("branch");
-                            println!(
-                                "Created branch \"{}\" — resume with: dext --resume={}",
-                                bn, bn
-                            );
-                            Ok(Some(0))
-                        }
-                        Err(_) => {
-                            println!("{}", render_tracks_listing(&root));
-                            Ok(Some(0))
-                        }
-                    }
-                }
                 _ => {
                     eprintln!(
-                        "usage: dext session [list|map [session] [filter]|focus [session] @wNN [--exact]|packet [session] @wNN|tracks|track [open] @wNN [name]|export|analyze|brief|grep|failures|verify-log|decisions|prune]"
+                        "usage: dext session [list|export|analyze|brief|grep|failures|verify-log|decisions|prune]"
                     );
                     Ok(Some(2))
                 }
@@ -21230,7 +19853,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 "  /diagnostics              run rust-analyzer diagnostics (fallback: cargo check)"
             );
             let _ = writeln!(w);
-            let _ = writeln!(w, "── Sessions & work map ──");
+            let _ = writeln!(w, "── Sessions ──");
             let _ = writeln!(
                 w,
                 "  /save <name>              write history + config to sessions dir as JSONL"
@@ -21245,31 +19868,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /map [session] [filter]    show session as moments @wNN; filters: failures|changes|verify|file <path>|query <text>"
-            );
-            let _ = writeln!(
-                w,
-                "  /focus @wNN               inspect a past moment (read-only; your session is unchanged)"
-            );
-            let _ = writeln!(
-                w,
-                "  /focus @wNN --branch [n]  branch into a new session from that moment; resume with /resume <name>"
-            );
-            let _ = writeln!(
-                w,
-                "  /focus @wNN --exact       (advanced) narrow model context to this moment onward; /focus clear restores"
-            );
-            let _ = writeln!(
-                w,
-                "  /branches                 list branches (continuations from past moments)"
-            );
-            let _ = writeln!(
-                w,
-                "    Map drawer keys: ↑/↓/PgUp/PgDn/Home/End navigate · Enter inspect · f edit · b branch · z filter · Esc close"
-            );
-            let _ = writeln!(
-                w,
-                "  /sessions                 list latest + autosaved/named sessions; /sessions analyze|brief|grep|failures|verify-log|decisions|export|prune"
+                "  /sessions                 list latest + autosaved/named sessions; /sessions analyze|brief|grep|failures|verify-log|decisions"
             );
             let _ = writeln!(w, "  /session                  alias for /sessions");
             let _ = writeln!(
@@ -21295,7 +19894,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "reset" => {
             let n = agent.history.len();
             agent.history.clear();
-            agent.work_ledger.active_focus = None;
             agent.clear_pending_login();
             if agent.session_enabled {
                 let _ = std::fs::remove_file(&agent.latest_session_path);
@@ -22041,159 +20639,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 }
             }
         }
-        "map" => {
-            let args = parse_work_map_command_args(arg);
-            match parse_work_map_filter_args(&args).and_then(|(selector, filters)| {
-                let (_, map) = choose_work_map_source(&agent.sandbox_root, &selector, Some(agent))?;
-                Ok((selector, filters, map))
-            }) {
-                Ok((selector, filters, map)) => emit_work_map_event(
-                    agent.sink.as_mut(),
-                    WorkMapEventKind::Map,
-                    render_work_map(&map, &filters),
-                    work_map_waypoint_ids_for_view(&map, &filters),
-                    work_map_event_selector(&selector),
-                ),
-                Err(e) => {
-                    let _ = writeln!(w, "[err] {e:#}");
-                }
-            }
-        }
-        "packet" => {
-            let args = parse_work_map_command_args(arg);
-            match parse_work_map_operation_args(&args, "current").and_then(|(id, selector, _)| {
-                let (_, map) = choose_work_map_source(&agent.sandbox_root, selector, Some(agent))?;
-                let selection = parse_work_map_selection(id, &map)?;
-                Ok((map, selection, selector))
-            }) {
-                Ok((map, selection, selector)) => emit_work_map_event(
-                    agent.sink.as_mut(),
-                    WorkMapEventKind::Packet,
-                    render_work_map_packet(&map, &selection),
-                    work_map_waypoint_ids(&map),
-                    work_map_event_selector(selector),
-                ),
-                Err(e) => {
-                    let _ = writeln!(w, "[err] {e:#}\nusage: /packet @wNN [session]");
-                }
-            }
-        }
-        "focus" => {
-            if matches!(arg.trim(), "clear" | "off" | "reset") {
-                agent.work_ledger.active_focus = None;
-                agent.checkpoint_latest_session("after_focus_clear");
-                let _ = writeln!(w, "focus cleared; full session history is active again");
-            } else {
-                let args = parse_work_map_command_args(arg);
-                match parse_work_map_operation_args(&args, "current").and_then(
-                    |(id, selector, mode_args)| {
-                        let (_, map) =
-                            choose_work_map_source(&agent.sandbox_root, selector, Some(agent))?;
-                        let selection = parse_work_map_selection(id, &map)?;
-                        Ok((map, selection, mode_args, selector))
-                    },
-                ) {
-                    Ok((map, selection, mode_args, selector)) => {
-                        let is_branch = mode_args.iter().any(|a| a == "--branch");
-                        if is_branch {
-                            let name = mode_args
-                                .iter()
-                                .position(|a| a == "--branch")
-                                .and_then(|pos| mode_args.get(pos + 1))
-                                .filter(|s| !s.starts_with("--"))
-                                .map(|s| s.as_str());
-                            match create_branch_text(agent, &map, &selection, name) {
-                                Ok(text) => emit_work_map_event(
-                                    agent.sink.as_mut(),
-                                    WorkMapEventKind::Focus,
-                                    text,
-                                    work_map_waypoint_ids(&map),
-                                    work_map_event_selector(selector),
-                                ),
-                                Err(e) => {
-                                    let _ = writeln!(w, "[err] {e:#}");
-                                }
-                            }
-                        } else if mode_args.is_empty() {
-                            emit_work_map_event(
-                                agent.sink.as_mut(),
-                                WorkMapEventKind::Focus,
-                                render_work_map_packet(&map, &selection),
-                                work_map_waypoint_ids(&map),
-                                work_map_event_selector(selector),
-                            );
-                        } else {
-                            let mode = parse_focus_mode(&mode_args);
-                            let text = activate_work_map_focus(agent, &map, &selection, &mode);
-                            emit_work_map_event(
-                                agent.sink.as_mut(),
-                                WorkMapEventKind::Focus,
-                                text,
-                                work_map_waypoint_ids(&map),
-                                work_map_event_selector(selector),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        let _ = writeln!(
-                            w,
-                            "[err] {e:#}\nusage: /focus @wNN [--branch name|--exact|--carry=...] or /focus clear"
-                        );
-                    }
-                }
-            }
-        }
-        "tracks" | "branches" => emit_work_map_event(
-            agent.sink.as_mut(),
-            WorkMapEventKind::Tracks,
-            render_tracks_listing(&agent.sandbox_root),
-            Vec::new(),
-            None,
-        ),
-        "track" => {
-            let args = parse_work_map_command_args(arg);
-            match args.first().map(|s| s.as_str()) {
-                Some("open") => {
-                    let rest = &args[1..];
-                    match parse_track_open_args(rest, "current").and_then(
-                        |(id, selector, name, _)| {
-                            let (_, map) =
-                                choose_work_map_source(&agent.sandbox_root, selector, Some(agent))?;
-                            let selection = parse_work_map_selection(id, &map)?;
-                            Ok((map, selection, name, selector))
-                        },
-                    ) {
-                        Ok((map, selection, name, selector)) => {
-                            match create_branch_text(agent, &map, &selection, name) {
-                                Ok(text) => emit_work_map_event(
-                                    agent.sink.as_mut(),
-                                    WorkMapEventKind::Focus,
-                                    text,
-                                    work_map_waypoint_ids(&map),
-                                    work_map_event_selector(selector),
-                                ),
-                                Err(e) => {
-                                    let _ = writeln!(
-                                        w,
-                                        "[err] {e:#}\nusage: /focus @wNN --branch [name]"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = writeln!(w, "[err] {e:#}\nusage: /focus @wNN --branch [name]");
-                        }
-                    }
-                }
-                _ => emit_work_map_event(
-                    agent.sink.as_mut(),
-                    WorkMapEventKind::Tracks,
-                    render_tracks_listing(&agent.sandbox_root),
-                    Vec::new(),
-                    None,
-                ),
-            }
-        }
         "resume" => {
             let loaded = if arg.is_empty() {
                 agent.load_latest_session()
@@ -22224,12 +20669,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             match sub {
                 "" | "list" => {
                     let _ = write!(w, "{}", render_session_listing(&agent.sandbox_root));
-                }
-                "map" | "packet" | "focus" | "tracks" | "track" | "branches" => {
-                    let _ = writeln!(
-                        w,
-                        "use the top-level command instead: /map · /focus · /branches"
-                    );
                 }
                 "analyze" | "analysis" => {
                     let selector = if rest.is_empty() { "latest" } else { rest };
@@ -22328,7 +20767,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 _ => {
                     let _ = writeln!(
                         w,
-                        "usage: /sessions [list|analyze|brief|map|packet|focus|tracks|grep|failures|verify-log|decisions]"
+                        "usage: /sessions [list|analyze|brief|grep|failures|verify-log|decisions]"
                     );
                 }
             }
@@ -23794,11 +22233,6 @@ async fn main() -> Result<()> {
         );
         println!("       dext sessions         list latest + autosaved/named sessions");
         println!("       dext session brief [latest|NAME|PATH]  distilled continuation packet");
-        println!("       dext session map [latest|NAME|PATH]");
-        println!("       dext session packet [latest|NAME|PATH] @wNN");
-        println!("       dext session focus [latest|NAME|PATH] @wNN [--exact]");
-        println!("       dext session tracks");
-        println!("       dext session track open [latest|NAME|PATH] @wNN [name]");
         println!("       dext session export [latest|NAME|PATH] [html|jsonl] [OUT]");
         println!("       dext doctor [--approval PROFILE] [--sandbox PROFILE] [--cd DIR]");
         println!("                           inspect effective safety policy and local state");
@@ -23810,6 +22244,9 @@ async fn main() -> Result<()> {
         );
         println!("       dext --pack NAME TASK  invoke a pack in one-shot mode");
         println!("       dext session analyze|grep|failures|verify-log|decisions [session]");
+        println!(
+            "       dext session prune [--days=N] [--apply]  prune stale locks/lock-only project dirs"
+        );
         println!(
             "       dext --no-session     disable session/log writes and side-effect crash recovery"
         );

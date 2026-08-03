@@ -143,6 +143,7 @@ Useful slash commands:
 /save name                    save a named session
 /export html session.html     export transcript
 /sessions analyze             inspect latest session
+/sessions brief               render a distilled continuation packet
 /pack list                    list discovered packs
 /pack run my-pack <task>      invoke a shelf pack in-session
 /quit                         exit
@@ -371,6 +372,7 @@ Doctor does not repair or rewrite state, resolve environment or `!command` crede
 
 ```bash
 dext sessions
+dext session brief latest
 dext session export latest jsonl latest.jsonl
 dext session export latest html latest.html
 dext session analyze latest
@@ -378,9 +380,11 @@ dext session grep "error" latest
 dext session failures latest
 dext session verify-log latest
 dext session decisions latest
+dext session prune --days=7          # dry run
+dext session prune --days=7 --apply  # remove stale locks and stale lock-only project dirs; all other state is preserved
 ```
 
-Session exports can include prompts, tool output, credentials accidentally pasted by a user, and local paths. Treat them as private unless reviewed.
+Session commands can surface prompts, tool output, work-ledger entries, failure details, local paths, and credentials accidentally pasted by a user. Briefs omit the raw transcript but can still contain sensitive distilled data. Treat all session command output and exports as private unless reviewed.
 
 ## Environment variables
 

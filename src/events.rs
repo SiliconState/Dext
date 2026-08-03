@@ -9,15 +9,6 @@ use crate::{
     orchestrator,
 };
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkMapEventKind {
-    Map,
-    Packet,
-    Focus,
-    Tracks,
-}
-
 #[derive(Serialize, Clone)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub(crate) enum AgentEvent {
@@ -123,12 +114,6 @@ pub(crate) enum AgentEvent {
     Warn(String),
     Error(String),
     Slash(String),
-    WorkMap {
-        kind: WorkMapEventKind,
-        text: String,
-        waypoint_ids: Vec<String>,
-        selector: Option<String>,
-    },
     TurnEnd {
         usage: Usage,
         failed: bool,
