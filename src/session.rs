@@ -610,7 +610,7 @@ fn session_lock_process_guard() -> &'static Mutex<()> {
 
 pub(crate) struct SessionLockOperationGuard {
     _process_guard: std::sync::MutexGuard<'static, ()>,
-    file: std::fs::File,
+    _file: std::fs::File,
 }
 
 impl SessionLockOperationGuard {
@@ -690,7 +690,7 @@ impl SessionLockOperationGuard {
         }
         Ok(Self {
             _process_guard: process_guard,
-            file,
+            _file: file,
         })
     }
 }
@@ -700,7 +700,7 @@ impl Drop for SessionLockOperationGuard {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd as _;
         unsafe {
-            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            let _ = libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }

@@ -682,7 +682,7 @@ fn arbitrary_checkpoint_cache_rejects_same_size_blob_corruption() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn arbitrary_checkpoint_reports_non_utf8_untracked_recovery_gap() {
     use std::os::unix::ffi::OsStringExt as _;

@@ -174,6 +174,11 @@
 
 ### Fixed
 
+- Cross-platform CI now avoids compiling Unix-only executable restoration metadata
+  as an unused Windows value, retains the session operation-lock file handle on
+  every platform without dead-code warnings, and runs the invalid-UTF-8 filename
+  fixture only on Unix filesystems that permit creating that fixture; macOS APFS
+  rejects the filename before Dext can inspect it.
 - Session pruning now preserves every project directory containing session or
   other project state and removes only stale locks plus stale lock-only directory
   trees. Session open, stale reclamation, cleanup, and prune share an

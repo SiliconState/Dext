@@ -3294,6 +3294,8 @@ fn copy_sidecar_file(
     executable: Option<bool>,
     expected_integrity: Option<(&str, u64)>,
 ) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = executable;
     let destination = ensure_worktree_parent_tree(git_root, relative)?;
     let metadata = std::fs::symlink_metadata(source)
         .map_err(|error| format!("sidecar metadata {}: {error}", source.display()))?;
