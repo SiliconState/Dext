@@ -174,6 +174,9 @@
 
 ### Fixed
 
+- Windows checkpoint cache tests now compare normalized path identities instead of
+  treating Git's forward-slash path and the filesystem's verbatim `\\?\` path as
+  different repositories.
 - Cross-platform CI now avoids compiling Unix-only executable restoration metadata
   as an unused Windows value, retains the session operation-lock file handle on
   every platform without dead-code warnings, and runs the invalid-UTF-8 filename

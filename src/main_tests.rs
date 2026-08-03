@@ -727,10 +727,11 @@ fn checkpoint_repo_cache_rechecks_after_git_init() {
     assert!(cache.get(&root).expect("probe non-repository").is_none());
 
     git_ok(&root, &["init", "-q"]);
-    assert_eq!(
-        cache.get(&root).expect("recheck after git init"),
-        Some(root.clone())
-    );
+    let resolved = cache
+        .get(&root)
+        .expect("recheck after git init")
+        .expect("repository after git init");
+    assert_eq!(normalized_path_text(&resolved), normalized_path_text(&root));
 
     let _ = std::fs::remove_dir_all(root);
 }
