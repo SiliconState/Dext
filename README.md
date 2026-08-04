@@ -255,11 +255,7 @@ update either file automatically.
 
 ## Packs
 
-Packs are Dext's modular “battery packs”: source-first workflows that add
-specialized behavior without adding provider-visible tools or bloating the core
-binary. Dext owns the create, discover, inspect, maintain, and run lifecycle but
-ships no pack content. Every pack lives inside a shelf at
-`<shelf>/packs/<name>`.
+Packs are Dext's modular “battery packs”: source-first workflows that add specialized behavior without bloating the core binary. A reviewed pack may optionally add a bounded executable `runtime.json` helper that exposes dynamic tools only while the pack is active. Dext owns the create, discover, inspect, maintain, and run lifecycle but ships no pack content. Every pack lives inside a shelf at `<shelf>/packs/<name>`.
 
 Create a reusable user pack, then edit and exercise it:
 
@@ -275,11 +271,7 @@ pack under `.dext/shelves/`. Dext discovers project shelves,
 `~/.dext/packs`, and `DEXT_PACKS_DIR` roots are not supported. Shelf repositories
 remain separate from Dext and should be reviewed and maintained on their own.
 
-Inside a session, use `/pack create`, `/pack list`, `/pack inspect`, and
-`/pack run`. Selected packs continue to use normal Dext tools, approvals,
-sandboxing, hooks, and helper environment variables. See
-[`docs/PACKS.md`](docs/PACKS.md) for the complete authoring and maintenance
-contract.
+Inside a session, use `/pack create`, `/pack list`, `/pack inspect`, and `/pack run`. Selected packs continue to use normal Dext tools, approvals, sandboxing, hooks, and helper environment variables. Optional executable runtimes are one-shot, credential-scrubbed, size/version bounded, separately approved, and keep per-tool read/write/danger policy plus session-bound state/effects. See [`docs/PACKS.md`](docs/PACKS.md) for the complete authoring, runtime protocol, and maintenance contract.
 
 ## Configuration and state
 

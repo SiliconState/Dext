@@ -277,6 +277,11 @@ enum Line_ {
         message: String,
     },
     Info(String),
+    RuntimeView {
+        pack: String,
+        title: String,
+        markdown: String,
+    },
     Warn(String),
     Error(String),
     Retry(String),
@@ -2027,6 +2032,18 @@ impl TuiState {
                     expanded: false,
                 });
                 self.status = "thinking".into();
+            }
+            AgentEvent::RuntimeView {
+                pack,
+                title,
+                markdown,
+            } => {
+                self.push_debug_event(format!("runtime view · {pack} · {title}"));
+                self.queue(Line_::RuntimeView {
+                    pack,
+                    title,
+                    markdown,
+                });
             }
             AgentEvent::ToolOutputDelta {
                 call_id,
@@ -5877,6 +5894,20 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                     Color::Blue
                 },
                 text,
+                Style::default(),
+                width,
+            );
+        }
+        Line_::RuntimeView {
+            pack,
+            title,
+            markdown,
+        } => {
+            push_swim_markdown_card(
+                &mut lines,
+                &format!("{pack} · {title}"),
+                Color::Cyan,
+                markdown,
                 Style::default(),
                 width,
             );

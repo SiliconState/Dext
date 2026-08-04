@@ -4,6 +4,7 @@ mod git_checkpoints;
 mod list_render;
 mod mutation_preview;
 mod orchestrator;
+mod pack_runtime;
 mod packs;
 mod privacy;
 mod process_tree;
@@ -34,7 +35,7 @@ pub(crate) use process_tree::*;
 pub(crate) use secret_redactor::*;
 pub(crate) use usage::*;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use provider::{
     ApiProvider, OpenAiResponsesReasoning, ProviderProfile, RequestContract, ResolvedModelSpec,
     ResolvedProviderConfig, apply_provider_headers, auth_store_path, build_chatgpt_request,
@@ -333,6 +334,13 @@ fn stream_error_body(err: &anyhow::Error) -> String {
     } else {
         body
     }
+}
+
+fn malformed_responses_tool_arguments_error(contract: RequestContract, body: &str) -> bool {
+    contract == RequestContract::ChatGptResponses
+        && body.contains("stream protocol error [chatgpt-responses/finalize]")
+        && body.contains("function item")
+        && body.contains("has malformed arguments")
 }
 
 fn chatgpt_incomplete_reason(contract: RequestContract, stop_reason: Option<&str>) -> Option<&str> {
@@ -1645,6 +1653,11 @@ impl EventSink for ConsoleSink {
             }
             AgentEvent::ToolCallStart { .. } => {}
             AgentEvent::ToolCallResult { .. } => {}
+            AgentEvent::RuntimeView {
+                pack,
+                title,
+                markdown,
+            } => println!("[{pack}: {title}]\n{markdown}"),
             AgentEvent::ToolOutputDelta { .. } => {}
             AgentEvent::LocalAuthPrompt { .. } => {}
             AgentEvent::LoginInputMode { .. } => {}
@@ -10344,6 +10357,7 @@ const COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 1_000;
 const FRUGAL_COMPACT_SUMMARY_TOOL_RESULT_CAP: usize = 360;
 
 const HOOKS_APPROVAL_NAME: &str = "hooks";
+const PACK_RUNTIME_APPROVAL_NAME: &str = "pack_runtime";
 const PROJECT_EXTENSIONS_APPROVAL_NAME: &str = "project_extensions";
 const PROJECT_EXTENSIONS_APPROVAL_FILE: &str = "project-extensions-approved";
 const CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME: &str = "checkpoint_recovery_gap";
@@ -10880,6 +10894,8 @@ struct SessionHeader {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seat: Option<SeatRef>,
     #[serde(default)]
+    active_pack_runtimes: Vec<pack_runtime::RuntimeSnapshot>,
+    #[serde(default)]
     provider_health: ProviderHealthLedger,
     #[serde(default)]
     privacy: PrivacyPolicy,
@@ -10913,6 +10929,7 @@ impl Default for SessionHeader {
             provenance: SessionProvenance::default(),
             work_ledger: WorkLedger::default(),
             seat: None,
+            active_pack_runtimes: Vec::new(),
             provider_health: ProviderHealthLedger::default(),
             privacy: PrivacyPolicy::default(),
         }
@@ -12697,6 +12714,8 @@ struct Agent {
     hooks: Hooks,
     pack_hook_env: Vec<(String, String)>,
     active_pack_hook_paths: HashSet<PathBuf>,
+    active_pack_runtime: Option<pack_runtime::ActiveRuntime>,
+    pending_pack_runtime_prompts: Vec<(String, u64)>,
     project_extensions_approved: Option<bool>,
     suppress_pack_activation: bool,
     state_lock: Option<Arc<SessionStateLock>>,
@@ -12886,6 +12905,8 @@ impl Agent {
             hooks: Hooks::load(&sandbox_root),
             pack_hook_env: Vec::new(),
             active_pack_hook_paths: HashSet::new(),
+            active_pack_runtime: None,
+            pending_pack_runtime_prompts: Vec::new(),
             project_extensions_approved: None,
             suppress_pack_activation: false,
             sandbox_root,
@@ -13884,6 +13905,8 @@ impl Agent {
         let project_changed = project_key(&self.sandbox_root) != project_key(&root);
         self.pack_hook_env.clear();
         self.active_pack_hook_paths.clear();
+        self.active_pack_runtime = None;
+        self.pending_pack_runtime_prompts.clear();
         if root_changed {
             self.allowed.clear();
             self.project_extensions_approved = None;
@@ -13942,10 +13965,285 @@ impl Agent {
         }
     }
 
+    fn deactivate_pack_runtime(&mut self) {
+        if let Some(previous) = self.active_pack_runtime.take() {
+            for tool in previous.tools {
+                self.allowed.remove(&tool.name);
+                self.deny_tools.remove(&tool.name);
+            }
+        }
+        self.pending_pack_runtime_prompts.clear();
+    }
+
+    fn pack_runtime_execution_approved(
+        &mut self,
+        pack: &packs::PackInfo,
+        runtime: &pack_runtime::ActiveRuntime,
+    ) -> bool {
+        if self.approval_profile == ApprovalProfile::Never {
+            return false;
+        }
+        if self.allowed.contains(PACK_RUNTIME_APPROVAL_NAME)
+            || self.approval_profile == ApprovalProfile::Always
+        {
+            return true;
+        }
+        let approval_input = json!({
+            "operation": format!("activate executable pack runtime '{}'", pack.name),
+            "runtime": pack.runtime_path.as_ref().map(|path| path.display().to_string()),
+            "tools": runtime.tools.iter().map(|tool| format!("{}:{:?}", tool.name, tool.risk).to_ascii_lowercase()).collect::<Vec<_>>(),
+            "risk": "executes a pack-owned native helper with credentials removed; activation and idle are read-only-confined, while declared write/danger tools retain normal per-call approval and Git checkpoint controls"
+        });
+        match self
+            .sink
+            .request_permission(PACK_RUNTIME_APPROVAL_NAME, &approval_input)
+        {
+            Choice::Once => true,
+            Choice::Always => {
+                self.allowed.insert(PACK_RUNTIME_APPROVAL_NAME.to_string());
+                true
+            }
+            Choice::Deny => false,
+        }
+    }
+
+    async fn activate_pack_runtime(&mut self, pack: &packs::PackInfo) -> Result<String> {
+        self.deactivate_pack_runtime();
+        let occupied_names = tools::registered_tool_names()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let Some(runtime) = pack_runtime::load(pack, &occupied_names)? else {
+            self.active_pack_runtime = None;
+            return Ok(String::new());
+        };
+        if !self.pack_runtime_execution_approved(pack, &runtime) {
+            bail!("pack runtime execution was not approved");
+        }
+        let invocation = pack_runtime::invoke(
+            &runtime,
+            pack_runtime::RuntimeEvent::Activate,
+            &self.sandbox_root,
+            &self.session_id,
+            pack_runtime::RuntimeContext {
+                turn_id: "activation",
+                iteration: 0,
+                history_messages: self.history.len(),
+                compacted: false,
+            },
+            self.interrupt.clone(),
+            SandboxProfile::ReadOnly,
+        )
+        .await
+        .with_context(|| format!("activating pack runtime for {}", pack.name))?;
+        self.active_pack_runtime = Some(runtime);
+        let content = match self.apply_pack_runtime_invocation(invocation) {
+            Ok(content) => content,
+            Err(error) => {
+                self.deactivate_pack_runtime();
+                return Err(error);
+            }
+        };
+        self.checkpoint_latest_session("after_pack_runtime_activation");
+        Ok(content)
+    }
+
+    fn apply_pack_runtime_invocation(
+        &mut self,
+        invocation: pack_runtime::RuntimeInvocation,
+    ) -> Result<String> {
+        let mut content = self.privacy.redact_text(&invocation.content).text;
+        if invocation.is_error {
+            bail!(
+                "pack runtime reported an error{}",
+                if content.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", content.trim())
+                }
+            );
+        }
+        if let Some(state) = invocation.state
+            && let Some(runtime) = self.active_pack_runtime.as_mut()
+        {
+            runtime.state = state;
+        }
+        let pack_name = self
+            .active_pack_runtime
+            .as_ref()
+            .map(|runtime| runtime.pack_name.clone())
+            .unwrap_or_else(|| "pack".to_string());
+        for effect in invocation.effects {
+            match effect {
+                pack_runtime::RuntimeEffect::Steer { text } => {
+                    let text = self.privacy.redact_text(&text).text;
+                    if !content.is_empty() {
+                        content.push_str("\n\n");
+                    }
+                    content.push_str("[pack-runtime steer]\n");
+                    content.push_str(&text);
+                }
+                pack_runtime::RuntimeEffect::Continue { prompt, delay_ms } => {
+                    let prompt = self.privacy.redact_text(&prompt).text;
+                    let runtime = self
+                        .active_pack_runtime
+                        .as_mut()
+                        .context("pack runtime continuation has no active runtime")?;
+                    if runtime.continuations_used >= runtime.max_continuations {
+                        bail!(
+                            "pack runtime continuation limit reached ({})",
+                            runtime.max_continuations
+                        );
+                    }
+                    runtime.continuations_used = runtime.continuations_used.saturating_add(1);
+                    self.pending_pack_runtime_prompts.push((prompt, delay_ms));
+                }
+                pack_runtime::RuntimeEffect::View { title, markdown } => {
+                    let title = self.privacy.redact_text(&title).text;
+                    let markdown = self.privacy.redact_text(&markdown).text;
+                    self.sink.emit(AgentEvent::RuntimeView {
+                        pack: pack_name.clone(),
+                        title,
+                        markdown,
+                    });
+                }
+            }
+        }
+        Ok(content)
+    }
+
+    async fn execute_pack_runtime_tool(
+        &mut self,
+        name: &str,
+        input: &Value,
+        turn_id: &str,
+        iteration: u32,
+    ) -> std::result::Result<String, String> {
+        let runtime = self
+            .active_pack_runtime
+            .clone()
+            .ok_or_else(|| format!("pack runtime tool {name} has no active runtime"))?;
+        let sandbox_profile = if runtime
+            .tool(name)
+            .is_some_and(|tool| tool.risk == pack_runtime::RuntimeRisk::Read)
+        {
+            SandboxProfile::ReadOnly
+        } else {
+            self.sandbox_profile
+        };
+        let invocation = pack_runtime::invoke(
+            &runtime,
+            pack_runtime::RuntimeEvent::Tool { name, input },
+            &self.sandbox_root,
+            &self.session_id,
+            pack_runtime::RuntimeContext {
+                turn_id,
+                iteration,
+                history_messages: self.history.len(),
+                compacted: false,
+            },
+            self.interrupt.clone(),
+            sandbox_profile,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+        self.apply_pack_runtime_invocation(invocation)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    async fn invoke_pack_runtime_idle(
+        &mut self,
+        turn_id: &str,
+        iteration: u32,
+        compacted: bool,
+    ) -> Result<bool> {
+        let Some(runtime) = self.active_pack_runtime.clone() else {
+            return Ok(false);
+        };
+        let invocation = pack_runtime::invoke(
+            &runtime,
+            pack_runtime::RuntimeEvent::Idle,
+            &self.sandbox_root,
+            &self.session_id,
+            pack_runtime::RuntimeContext {
+                turn_id,
+                iteration,
+                history_messages: self.history.len(),
+                compacted,
+            },
+            self.interrupt.clone(),
+            self.sandbox_profile,
+        )
+        .await?;
+        let content = self.apply_pack_runtime_invocation(invocation)?;
+        let had_pending_continuation = !self.pending_pack_runtime_prompts.is_empty();
+        if !content.trim().is_empty() {
+            if !had_pending_continuation {
+                let runtime = self
+                    .active_pack_runtime
+                    .as_mut()
+                    .context("pack runtime idle response has no active runtime")?;
+                if runtime.continuations_used >= runtime.max_continuations {
+                    bail!(
+                        "pack runtime continuation limit reached ({})",
+                        runtime.max_continuations
+                    );
+                }
+                runtime.continuations_used = runtime.continuations_used.saturating_add(1);
+            }
+            self.history.push(Message {
+                role: "user".to_string(),
+                content: vec![Block::Text {
+                    text: format!("[runtime-note] [pack-runtime idle]\n{content}"),
+                }],
+            });
+        }
+        Ok(!self.pending_pack_runtime_prompts.is_empty() || !content.trim().is_empty())
+    }
+
+    async fn inject_pending_pack_runtime_prompt(&mut self) -> bool {
+        if self.pending_pack_runtime_prompts.is_empty() {
+            return false;
+        }
+        let pending = std::mem::take(&mut self.pending_pack_runtime_prompts);
+        let delay_ms = pending.iter().map(|(_, delay)| *delay).max().unwrap_or(0);
+        if delay_ms > 0 {
+            let sleep = tokio::time::sleep(std::time::Duration::from_millis(delay_ms));
+            tokio::pin!(sleep);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+            loop {
+                if self.interrupt.load(Ordering::SeqCst) {
+                    return false;
+                }
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    _ = ticker.tick() => {}
+                }
+            }
+        }
+        let prompts = pending
+            .into_iter()
+            .map(|(prompt, _)| prompt)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: format!("[runtime-note] [pack-runtime continue]\n{prompts}"),
+            }],
+        });
+        self.checkpoint_latest_session("after_pack_runtime_continue");
+        true
+    }
+
     async fn run_pack(&mut self, selector: &str, task: &str) -> Result<()> {
         let pack = packs::find_pack(&self.sandbox_root, selector)?;
-        let prompt = packs::pack_prompt(&pack, task)?;
+        let mut prompt = packs::pack_prompt(&pack, task)?;
+        let runtime_context = self.activate_pack_runtime(&pack).await?;
         self.activate_pack_hooks(&pack);
+        if !runtime_context.trim().is_empty() {
+            prompt.push_str("\n\n[pack runtime activation]\n");
+            prompt.push_str(&runtime_context);
+        }
         self.sink.emit(AgentEvent::Slash(format!(
             "▶ pack: {} · {}\nworkflow: {}",
             pack.name,
@@ -13960,6 +14258,12 @@ impl Agent {
     }
 
     fn maybe_create_tool_checkpoint(&mut self, name: &str, input: &Value) -> Result<(), String> {
+        if self
+            .active_runtime_tool(name)
+            .is_some_and(|tool| tool.risk == pack_runtime::RuntimeRisk::Read)
+        {
+            return Ok(());
+        }
         if !git_checkpoints::tool_needs_checkpoint(name, input) {
             return Ok(());
         }
@@ -13982,9 +14286,13 @@ impl Agent {
                 &mut agent.checkpoint_blob_cache,
             )
         };
+        let checkpoint_failure_blocks = git_checkpoints::checkpoint_failure_blocks_tool(name)
+            || self
+                .active_runtime_tool(name)
+                .is_some_and(|tool| tool.risk != pack_runtime::RuntimeRisk::Read);
         let checkpoint = match create(self, self.checkpoint_partial_untracked_approved) {
             Err(error)
-                if git_checkpoints::checkpoint_failure_blocks_tool(name)
+                if checkpoint_failure_blocks
                     && git_checkpoints::is_partial_untracked_recovery_error(&error)
                     && !self.checkpoint_partial_untracked_approved =>
             {
@@ -14030,12 +14338,45 @@ impl Agent {
             }
             Err(error) => {
                 self.append_latest_log("checkpoint", &format!("warning: {error}"));
-                if git_checkpoints::checkpoint_failure_blocks_tool(name) {
+                if checkpoint_failure_blocks {
                     Err(error)
                 } else {
                     Ok(())
                 }
             }
+        }
+    }
+
+    fn active_runtime_tool(&self, name: &str) -> Option<&pack_runtime::RuntimeTool> {
+        self.active_pack_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.tool(name))
+    }
+
+    fn tool_risk(&self, name: &str, input: &Value) -> tool_policy::CommandRisk {
+        match self.active_runtime_tool(name).map(|tool| tool.risk) {
+            Some(pack_runtime::RuntimeRisk::Read) => tool_policy::CommandRisk::Read,
+            Some(pack_runtime::RuntimeRisk::Write) => tool_policy::CommandRisk::Write,
+            Some(pack_runtime::RuntimeRisk::Danger) => tool_policy::CommandRisk::Danger,
+            None => tool_policy::classify_command_risk(name, input),
+        }
+    }
+
+    fn tool_needs_permission(&self, name: &str) -> bool {
+        self.active_runtime_tool(name)
+            .is_some_and(|tool| tool.risk != pack_runtime::RuntimeRisk::Read)
+            || needs_permission(name)
+    }
+
+    fn tool_is_side_effect_capable(&self, name: &str) -> bool {
+        self.tool_needs_permission(name) || is_side_effect_capable_tool(name)
+    }
+
+    fn validate_active_tool_input(&self, name: &str, input: &Value) -> Result<(), String> {
+        if let Some(tool) = self.active_runtime_tool(name) {
+            pack_runtime::validate_tool_input(tool, input).map_err(|error| format!("{error:#}"))
+        } else {
+            tool_policy::validate_tool_input(name, input)
         }
     }
 
@@ -14046,17 +14387,17 @@ impl Agent {
         match self.approval_profile {
             ApprovalProfile::Always => true,
             ApprovalProfile::AutoRead => {
-                tool_policy::classify_command_risk(name, input) == tool_policy::CommandRisk::Read
+                self.tool_risk(name, input) == tool_policy::CommandRisk::Read
             }
             ApprovalProfile::AutoWrite => {
-                tool_policy::classify_command_risk(name, input) != tool_policy::CommandRisk::Danger
+                self.tool_risk(name, input) != tool_policy::CommandRisk::Danger
             }
             ApprovalProfile::Ask | ApprovalProfile::Never => false,
         }
     }
 
     fn sandbox_policy_denial(&self, name: &str, input: &Value) -> Option<String> {
-        let risk = tool_policy::classify_command_risk(name, input);
+        let risk = self.tool_risk(name, input);
         match self.sandbox_profile {
             SandboxProfile::DangerFullAccess | SandboxProfile::WorkspaceWrite => None,
             SandboxProfile::ReadOnly => {
@@ -14757,7 +15098,10 @@ impl Agent {
             .into_iter()
             .filter(|t| tool_name_allowed_in_profile(t.name, profile))
             .collect();
-        let exposed: HashSet<&str> = self.tools.iter().map(|t| t.name).collect();
+        let mut exposed: HashSet<&str> = self.tools.iter().map(|t| t.name).collect();
+        if let Some(runtime) = &self.active_pack_runtime {
+            exposed.extend(runtime.tools.iter().map(|tool| tool.name.as_str()));
+        }
         self.allowed.retain(|name| exposed.contains(name.as_str()));
         self.deny_tools
             .retain(|name| exposed.contains(name.as_str()));
@@ -14771,14 +15115,40 @@ impl Agent {
         if !self.model_supports_tools() {
             return Vec::new();
         }
-        tools::wire_tools(&self.tools, self.wire_tool_profile())
+        let mut wire = tools::wire_tools(&self.tools, self.wire_tool_profile());
+        if let Some(runtime) = &self.active_pack_runtime {
+            wire.extend(runtime.tools.iter().map(|tool| WireTool {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: tool.input_schema.clone(),
+                cache_control: None,
+            }));
+        }
+        for tool in &mut wire {
+            tool.cache_control = None;
+        }
+        if let Some(last) = wire.last_mut() {
+            last.cache_control = Some(CacheControl::for_prompt());
+        }
+        wire
     }
 
     fn wire_tools_oai(&self) -> Vec<OaiTool> {
         if !self.model_supports_tools() {
             return Vec::new();
         }
-        tools::wire_tools_oai(&self.tools, self.wire_tool_profile())
+        let mut wire = tools::wire_tools_oai(&self.tools, self.wire_tool_profile());
+        if let Some(runtime) = &self.active_pack_runtime {
+            wire.extend(runtime.tools.iter().map(|tool| OaiTool {
+                r#type: "function".to_string(),
+                function: OaiFunctionDef {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.input_schema.clone(),
+                },
+            }));
+        }
+        wire
     }
 
     fn tool_use_ids_in_messages(messages: &[Message]) -> HashSet<String> {
@@ -14917,7 +15287,19 @@ impl Agent {
         if !self.model_supports_tools() {
             return Vec::new();
         }
-        tools::wire_tools_chatgpt(&self.tools, self.wire_tool_profile())
+        let mut wire = tools::wire_tools_chatgpt(&self.tools, self.wire_tool_profile());
+        if let Some(runtime) = &self.active_pack_runtime {
+            wire.extend(runtime.tools.iter().map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                    "strict": Value::Null,
+                })
+            }));
+        }
+        wire
     }
 
     fn wire_tools_openai_responses(&self) -> Vec<Value> {
@@ -15259,25 +15641,33 @@ impl Agent {
         let mut allowed: Vec<String> = self
             .allowed
             .iter()
-            .filter(|name| name.as_str() != HOOKS_APPROVAL_NAME)
+            .filter(|name| {
+                !matches!(
+                    name.as_str(),
+                    HOOKS_APPROVAL_NAME | PACK_RUNTIME_APPROVAL_NAME
+                )
+            })
             .cloned()
             .collect();
         allowed.sort();
         let mut exposed_tools: Vec<String> =
             self.tools.iter().map(|t| t.name.to_string()).collect();
+        if let Some(runtime) = &self.active_pack_runtime {
+            exposed_tools.extend(runtime.tools.iter().map(|tool| tool.name.clone()));
+        }
         exposed_tools.sort();
-        let mut approval_required_tools: Vec<String> = self
-            .tools
+        exposed_tools.dedup();
+        let mut approval_required_tools: Vec<String> = exposed_tools
             .iter()
-            .filter(|t| needs_permission(t.name))
-            .map(|t| t.name.to_string())
+            .filter(|name| self.tool_needs_permission(name))
+            .cloned()
             .collect();
         approval_required_tools.sort();
         let mut auto_approved_tools: Vec<String> = exposed_tools
             .iter()
             .filter(|name| {
                 let input = Value::Null;
-                !needs_permission(name.as_str()) || self.tool_auto_approved(name, &input)
+                !self.tool_needs_permission(name) || self.tool_auto_approved(name, &input)
             })
             .cloned()
             .collect();
@@ -15312,6 +15702,11 @@ impl Agent {
             provenance,
             work_ledger: self.cleaned_work_ledger(),
             seat: self.seat.clone(),
+            active_pack_runtimes: self
+                .active_pack_runtime
+                .as_ref()
+                .map(|runtime| vec![runtime.snapshot()])
+                .unwrap_or_default(),
             provider_health: self.provider_health.clone(),
             privacy: self.privacy.clone(),
         }
@@ -15497,6 +15892,7 @@ impl Agent {
             tool_profile,
             work_ledger,
             seat,
+            active_pack_runtimes,
             mut provider_health,
             privacy,
             provenance,
@@ -15565,7 +15961,12 @@ impl Agent {
         self.system = system;
         self.allowed = allowed
             .into_iter()
-            .filter(|name| name != HOOKS_APPROVAL_NAME)
+            .filter(|name| {
+                !matches!(
+                    name.as_str(),
+                    HOOKS_APPROVAL_NAME | PACK_RUNTIME_APPROVAL_NAME
+                )
+            })
             .collect();
         self.session_usage = usage;
         self.thinking_effort = thinking_effort;
@@ -15602,6 +16003,38 @@ impl Agent {
         self.tool_context_profile = tool_context_profile.effective(restored_context_mode);
         self.tool_profile = tool_profile;
         self.refresh_tools_for_context();
+        self.active_pack_runtime = None;
+        if active_pack_runtimes.len() > 1 {
+            anyhow::bail!("session declares more than one active pack runtime");
+        }
+        if let Some(snapshot) = active_pack_runtimes.first() {
+            let project_runtime = snapshot.pack_source.starts_with("project:");
+            if !project_runtime || approve_project_extensions(self) {
+                let pack = packs::find_pack(&self.sandbox_root, &snapshot.pack_name)
+                    .with_context(|| format!("restoring pack runtime {}", snapshot.pack_name))?;
+                let occupied_names = self
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.to_string())
+                    .collect::<HashSet<_>>();
+                let mut runtime = pack_runtime::load(&pack, &occupied_names)?
+                    .context("saved pack no longer declares a runtime")?;
+                runtime.restore_state(snapshot)?;
+                if self.pack_runtime_execution_approved(&pack, &runtime) {
+                    self.active_pack_runtime = Some(runtime);
+                } else {
+                    self.sink.emit(AgentEvent::Warn(format!(
+                        "pack runtime '{}' was not restored because executable runtime access was not approved",
+                        snapshot.pack_name
+                    )));
+                }
+            } else {
+                self.sink.emit(AgentEvent::Warn(format!(
+                    "project pack runtime '{}' was not restored because project extensions were not approved",
+                    snapshot.pack_name
+                )));
+            }
+        }
         self.history = hist;
         self.clear_pending_login();
         if recovery.total() > 0 {
@@ -16368,6 +16801,9 @@ impl Agent {
         let saved_hooks = self.hooks.clone();
         let saved_pack_hook_env = self.pack_hook_env.clone();
         let saved_active_pack_hook_paths = self.active_pack_hook_paths.clone();
+        let saved_active_pack_runtime = self.active_pack_runtime.take();
+        let saved_pending_pack_runtime_prompts =
+            std::mem::take(&mut self.pending_pack_runtime_prompts);
         let saved_suppress_pack_activation = self.suppress_pack_activation;
         let saved_work_ledger = self.work_ledger.clone();
         let saved_budget_exhausted = self.budget_exhausted;
@@ -16418,6 +16854,8 @@ impl Agent {
         self.hooks = saved_hooks;
         self.pack_hook_env = saved_pack_hook_env;
         self.active_pack_hook_paths = saved_active_pack_hook_paths;
+        self.active_pack_runtime = saved_active_pack_runtime;
+        self.pending_pack_runtime_prompts = saved_pending_pack_runtime_prompts;
         self.suppress_pack_activation = saved_suppress_pack_activation;
         self.work_ledger = saved_work_ledger;
         self.budget_exhausted = saved_budget_exhausted;
@@ -16501,12 +16939,17 @@ impl Agent {
                 )));
             } else {
                 let prompt = packs::pack_prompt(&invocation.pack, &invocation.task)?;
+                let runtime_context = self.activate_pack_runtime(&invocation.pack).await?;
                 self.activate_pack_hooks(&invocation.pack);
                 self.sink.emit(AgentEvent::Info(format!(
                     "[pack:{}] inferred conversational invocation",
                     invocation.pack.name
                 )));
-                user_input = prompt;
+                user_input = if runtime_context.trim().is_empty() {
+                    prompt
+                } else {
+                    format!("{prompt}\n\n[pack runtime activation]\n{runtime_context}")
+                };
             }
         }
         let mut hooks_approval_decided = !self.hooks.is_empty();
@@ -16615,6 +17058,9 @@ impl Agent {
         let mut incomplete_response_recoveries = 0u32;
         let mut request_effort_override = None;
         loop {
+            if self.inject_pending_pack_runtime_prompt().await {
+                self.append_latest_log("pack_runtime_continue", "injected queued continuation");
+            }
             if let Some(msg) = self.budget_cap_denial() {
                 self.sink.emit(AgentEvent::Warn(msg.clone()));
                 self.append_latest_log("budget_cap_stop", &msg);
@@ -16665,9 +17111,10 @@ impl Agent {
             }];
             let mut stream_attempt: u32 = 0;
             let mut provider_workaround_used = false;
-            // One compaction attempt per request round: if the provider still
-            // reports overflow after compacting, surface the error normally.
+            // One context-overflow compaction and one malformed-call recovery
+            // are allowed per request round. Neither invalid call is executed.
             let mut context_overflow_compact_attempted = false;
+            let mut malformed_tool_call_recovery_attempted = false;
             let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
                 let (url, req_body) = self.build_streaming_request_with_effort(
@@ -16916,6 +17363,39 @@ impl Agent {
                                 continue 'stream_retry;
                             }
                         }
+                        if !malformed_tool_call_recovery_attempted
+                            && !visible_text_streamed
+                            && malformed_responses_tool_arguments_error(
+                                self.request_contract(),
+                                &body,
+                            )
+                        {
+                            malformed_tool_call_recovery_attempted = true;
+                            let before_chars = self.history_chars();
+                            let compacted = if self.find_compact_split().is_some() {
+                                self.compact().await.is_ok() && self.history_chars() < before_chars
+                            } else {
+                                false
+                            };
+                            compacted_this_turn |= compacted;
+                            self.append_latest_log(
+                                "malformed_tool_call_recovery",
+                                &format!(
+                                    "compacted={compacted} history_chars={before_chars}->{} body={}",
+                                    self.history_chars(),
+                                    summarize_inline(&body, 240)
+                                ),
+                            );
+                            self.sink.emit(AgentEvent::Warn(if compacted {
+                                "[provider recovery] ChatGPT returned malformed function arguments; compacted history and retrying once"
+                                    .to_string()
+                            } else {
+                                "[provider recovery] ChatGPT returned malformed function arguments; retrying once without executing the invalid call"
+                                    .to_string()
+                            }));
+                            self.partial_stream_text = None;
+                            continue 'stream_retry;
+                        }
                         if plan.retry
                             && !visible_text_streamed
                             && stream_attempt < MAX_STREAM_ATTEMPTS
@@ -17107,6 +17587,13 @@ impl Agent {
             let empty_tool_call_loop_note = turn_state.empty_tool_call_loop_note();
 
             if tool_calls.is_empty() {
+                if self
+                    .invoke_pack_runtime_idle(&turn_id, iterations, compacted_this_turn)
+                    .await?
+                {
+                    self.checkpoint_latest_session("after_pack_runtime_idle");
+                    continue;
+                }
                 let coverage = objective.assess_history(&self.history);
                 self.sync_work_ledger_with_objective_coverage(&coverage);
                 if objective.apply_fixes_allowed()
@@ -17531,7 +18018,7 @@ impl Agent {
             let Block::ToolUse { id, name, input } = block else {
                 continue;
             };
-            let privileged = needs_permission(name) && !self.allowed.contains(name);
+            let privileged = self.tool_needs_permission(name) && !self.allowed.contains(name);
             if contract == RequestContract::AnthropicMessages && privileged {
                 continue;
             }

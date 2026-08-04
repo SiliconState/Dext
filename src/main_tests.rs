@@ -104,6 +104,8 @@ fn test_agent(root: &Path) -> Agent {
         hooks: Hooks::default(),
         pack_hook_env: Vec::new(),
         active_pack_hook_paths: HashSet::new(),
+        active_pack_runtime: None,
+        pending_pack_runtime_prompts: Vec::new(),
         project_extensions_approved: None,
         suppress_pack_activation: false,
         state_lock: None,
@@ -8277,6 +8279,7 @@ fn hook_execution_requires_explicit_non_persistent_approval() {
     }));
     assert!(hooks_approved(&mut agent));
     assert!(agent.allowed.contains(HOOKS_APPROVAL_NAME));
+    agent.allowed.insert(PACK_RUNTIME_APPROVAL_NAME.to_string());
     assert!(hooks_approved(&mut agent));
     assert_eq!(always_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(
@@ -8284,7 +8287,14 @@ fn hook_execution_requires_explicit_non_persistent_approval() {
             .session_header()
             .allowed
             .contains(&HOOKS_APPROVAL_NAME.to_string()),
-        "hook trust must not be serialized into sessions"
+        "hook and pack runtime trust must not be serialized into sessions"
+    );
+    assert!(
+        !agent
+            .session_header()
+            .allowed
+            .contains(&PACK_RUNTIME_APPROVAL_NAME.to_string()),
+        "pack runtime trust must not be serialized into sessions"
     );
     agent.set_sandbox_profile(SandboxProfile::ReadOnly);
     assert!(
@@ -14333,6 +14343,27 @@ fn stream_error_classification_retries_chunked_eof() {
         "error decoding response body: error reading a body from connection: unexpected EOF during chunk size line",
     );
     assert!(plan.retry);
+}
+
+#[test]
+fn malformed_responses_tool_arguments_recovery_is_exact_and_contract_scoped() {
+    let error = "stream protocol error [chatgpt-responses/finalize]: tool call function item 0 has malformed arguments";
+    assert!(malformed_responses_tool_arguments_error(
+        RequestContract::ChatGptResponses,
+        error
+    ));
+    assert!(!malformed_responses_tool_arguments_error(
+        RequestContract::OpenAiResponses,
+        error
+    ));
+    assert!(!malformed_responses_tool_arguments_error(
+        RequestContract::ChatGptResponses,
+        "stream protocol error [chatgpt-responses/finalize]: function item 0 has incomplete identity"
+    ));
+    assert!(!malformed_responses_tool_arguments_error(
+        RequestContract::ChatGptResponses,
+        "stream protocol error [chatgpt-responses/event]: function item 0 has malformed arguments"
+    ));
 }
 
 #[test]
@@ -24521,6 +24552,7 @@ fn pack_auto_invocation_disabled_by_env_globs_and_specific_names() {
         path: PathBuf::from("/tmp/crew"),
         pack_md_path: PathBuf::from("/tmp/crew/PACK.md"),
         phooks_path: None,
+        runtime_path: None,
         credential_env: Vec::new(),
         credential_env_ignored: false,
         source: "test".to_string(),

@@ -21,6 +21,7 @@ pub(crate) struct PackInfo {
     pub(crate) path: PathBuf,
     pub(crate) pack_md_path: PathBuf,
     pub(crate) phooks_path: Option<PathBuf>,
+    pub(crate) runtime_path: Option<PathBuf>,
     pub(crate) credential_env: Vec<String>,
     pub(crate) credential_env_ignored: bool,
     pub(crate) source: String,
@@ -210,12 +211,14 @@ fn load_pack_from_dir(dir: &Path, source: &str, shelf: Option<&str>) -> Result<O
     };
     let path = dir.to_path_buf();
     let phooks = path.join("phooks.json");
+    let runtime = path.join(crate::pack_runtime::RUNTIME_MANIFEST_NAME);
     Ok(Some(PackInfo {
         name,
         description,
         path,
         pack_md_path,
         phooks_path: phooks.is_file().then_some(phooks),
+        runtime_path: runtime.is_file().then_some(runtime),
         credential_env,
         credential_env_ignored,
         source: source.to_string(),
@@ -501,6 +504,11 @@ pub(crate) fn render_pack_inspect(root: &Path, selector: &str) -> Result<String>
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(none)".to_string());
+    let runtime = pack
+        .runtime_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(none)".to_string());
     let credentials = if pack.credential_env_ignored {
         "(ignored: project-local packs cannot inherit parent credentials)".to_string()
     } else if pack.credential_env.is_empty() {
@@ -509,7 +517,7 @@ pub(crate) fn render_pack_inspect(root: &Path, selector: &str) -> Result<String>
         pack.credential_env.join(", ")
     };
     Ok(format!(
-        "pack: {}\ndescription: {}\nshelf: {}\nsource: {}\npath: {}\nworkflow: {}\nhooks: {}\nenv: {}={}\ncredential env: {}",
+        "pack: {}\ndescription: {}\nshelf: {}\nsource: {}\npath: {}\nworkflow: {}\nhooks: {}\nruntime: {}\nenv: {}={}\ncredential env: {}",
         pack.name,
         if pack.description.is_empty() {
             "(none)"
@@ -521,6 +529,7 @@ pub(crate) fn render_pack_inspect(root: &Path, selector: &str) -> Result<String>
         pack.path.display(),
         pack.pack_md_path.display(),
         hooks,
+        runtime,
         pack.env_var_name(),
         pack.path.display(),
         credentials

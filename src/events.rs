@@ -39,6 +39,11 @@ pub(crate) enum AgentEvent {
         preview: String,
         content: String,
     },
+    RuntimeView {
+        pack: String,
+        title: String,
+        markdown: String,
+    },
     ToolOutputDelta {
         call_id: String,
         name: String,

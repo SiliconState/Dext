@@ -406,7 +406,6 @@ pub(crate) fn is_default_tool(name: &str) -> bool {
     tool_spec(name).is_some_and(|spec| spec.flags & DEFAULT_PROFILE != 0)
 }
 
-#[cfg(test)]
 pub(crate) fn registered_tool_names() -> impl Iterator<Item = &'static str> {
     TOOL_SPECS.iter().map(|spec| spec.name)
 }

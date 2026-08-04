@@ -6,6 +6,7 @@ pub(crate) enum Plan {
         is_error: Option<bool>,
     },
     Builtin,
+    Runtime,
 }
 
 pub(crate) struct PlannedCall {
@@ -63,7 +64,7 @@ impl Agent {
         if self.session_enabled
             && tool_calls
                 .iter()
-                .any(|(_, name, _)| is_side_effect_capable_tool(name))
+                .any(|(_, name, _)| self.tool_is_side_effect_capable(name))
         {
             self.save_latest_session()
                 .context("persisting assistant tool calls before side-effect-capable execution")?;
@@ -118,7 +119,7 @@ impl Agent {
             let mut prepared_mutation: Option<mutation_preview::PreparedMutation> = None;
             let journal_record_id: Option<String> = None;
 
-            if let Err(msg) = tool_policy::validate_tool_input(&name, &input) {
+            if let Err(msg) = self.validate_active_tool_input(&name, &input) {
                 if let Some(budget_msg) = turn_state.tool_retry_guard(&name, &msg) {
                     emit_external_telemetry(self.sink.as_mut(), turn_state);
                     plan = Some(Plan::Immediate {
@@ -217,10 +218,13 @@ impl Agent {
             if plan.is_none() {
                 let approved = if self.deny_tools.contains(&name)
                     || denied_signatures.contains(&call_sig)
-                    || (needs_permission(&name) && self.approval_profile == ApprovalProfile::Never)
+                    || (self.tool_needs_permission(&name)
+                        && self.approval_profile == ApprovalProfile::Never)
                 {
                     false
-                } else if needs_permission(&name) && !self.tool_auto_approved(&name, &input) {
+                } else if self.tool_needs_permission(&name)
+                    && !self.tool_auto_approved(&name, &input)
+                {
                     // The preview and executor share the same prepared mutation.
                     if self.preview_mode != MutationPreviewMode::Off
                         && let Some(prepared) = prepared_mutation.as_ref()
@@ -286,7 +290,11 @@ impl Agent {
                                 && tool_policy::command_invokes_sudo(
                                     input["command"].as_str().unwrap_or(""),
                                 );
-                            Plan::Builtin
+                            if self.active_runtime_tool(&name).is_some() {
+                                Plan::Runtime
+                            } else {
+                                Plan::Builtin
+                            }
                         }
                     });
                 }
@@ -305,8 +313,8 @@ impl Agent {
                     turn_state.phase().label()
                 )));
             }
-            if matches!(plan, Plan::Builtin)
-                && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
+            if matches!(plan, Plan::Builtin | Plan::Runtime)
+                && self.tool_is_side_effect_capable(&name)
                 && let Some((_, msg)) = turn_state.advance_phase(if objective_apply_fixes_allowed {
                     orchestrator::PhaseTrigger::Fix
                 } else {
@@ -341,13 +349,13 @@ impl Agent {
         let durable_side_effect_round = self.session_enabled
             && plans
                 .iter()
-                .any(|plan| is_side_effect_capable_tool(&plan.name));
+                .any(|plan| self.tool_is_side_effect_capable(&plan.name));
 
         let runnable_indices: Vec<usize> = plans
             .iter()
             .enumerate()
             .filter_map(|(idx, p)| {
-                if matches!(p.plan, Plan::Builtin) {
+                if matches!(p.plan, Plan::Builtin | Plan::Runtime) {
                     Some(idx)
                 } else {
                     None
@@ -375,7 +383,7 @@ impl Agent {
             .iter()
             .enumerate()
             .filter_map(|(idx, p)| {
-                if matches!(p.plan, Plan::Builtin) {
+                if matches!(p.plan, Plan::Builtin | Plan::Runtime) {
                     Some(idx)
                 } else {
                     None
@@ -390,12 +398,15 @@ impl Agent {
             .iter()
             .map(|idx| plans[*idx].name.as_str())
             .collect();
-        let parallel_builtin_round = should_parallelize_builtin_tools(&builtin_names);
+        let parallel_builtin_round = builtin_indices
+            .iter()
+            .all(|idx| matches!(plans[*idx].plan, Plan::Builtin))
+            && should_parallelize_builtin_tools(&builtin_names);
         debug_assert!(
             !parallel_builtin_round
                 || builtin_indices
                     .iter()
-                    .all(|idx| !is_side_effect_capable_tool(&plans[*idx].name))
+                    .all(|idx| !self.tool_is_side_effect_capable(&plans[*idx].name))
         );
 
         let mut builtin_outputs: HashMap<usize, std::result::Result<String, String>> =
@@ -542,7 +553,9 @@ impl Agent {
                 }
                 // Sequential dispatch is the mutation boundary: a later call in
                 // the same round must checkpoint state produced by earlier calls.
-                if let Err(error) = self.maybe_create_tool_checkpoint(&n, &inp) {
+                if self.tool_is_side_effect_capable(&n)
+                    && let Err(error) = self.maybe_create_tool_checkpoint(&n, &inp)
+                {
                     builtin_outputs.insert(
                         idx,
                         Err(format!(
@@ -551,7 +564,7 @@ impl Agent {
                     );
                     continue;
                 }
-                if self.session_enabled && is_side_effect_capable_tool(&n) {
+                if self.session_enabled && self.tool_is_side_effect_capable(&n) {
                     match tool_journal::start(
                         &root,
                         &session_id,
@@ -660,22 +673,27 @@ impl Agent {
                     builtin_git_cred_used.insert(idx);
                 }
                 let prepared_mutation = plans[idx].prepared_mutation.take();
-                let r = execute_builtin_call(
-                    n.clone(),
-                    inp,
-                    root.clone(),
-                    self.interrupt.clone(),
-                    Some(read_cache.clone()),
-                    Some(session_id.clone()),
-                    local_sudo_auth,
-                    git_credential_for_call,
-                    prepared_mutation,
-                    self.sandbox_profile,
-                    hooks_approved,
-                    live_output,
-                    self.pack_hook_env.clone(),
-                )
-                .await;
+                let r = if matches!(plans[idx].plan, Plan::Runtime) {
+                    self.execute_pack_runtime_tool(&n, &inp, &turn_id, iterations)
+                        .await
+                } else {
+                    execute_builtin_call(
+                        n.clone(),
+                        inp,
+                        root.clone(),
+                        self.interrupt.clone(),
+                        Some(read_cache.clone()),
+                        Some(session_id.clone()),
+                        local_sudo_auth,
+                        git_credential_for_call,
+                        prepared_mutation,
+                        self.sandbox_profile,
+                        hooks_approved,
+                        live_output,
+                        self.pack_hook_env.clone(),
+                    )
+                    .await
+                };
                 if let Some(error) = persist_tool_journal_terminal(
                     &root,
                     &session_id,
@@ -715,7 +733,8 @@ impl Agent {
             } = p;
 
             let started_at = builtin_started_at.remove(&idx);
-            let ran_builtin = matches!(plan, Plan::Builtin);
+            let ran_tool = matches!(plan, Plan::Builtin | Plan::Runtime);
+            let ran_runtime = matches!(plan, Plan::Runtime);
             let ui_summary = summary.clone();
             let mut followup_warnings: Vec<String> = Vec::new();
             let mut provider_runtime_notes: Vec<String> = Vec::new();
@@ -726,7 +745,7 @@ impl Agent {
 
             let (mut content, is_error) = match plan {
                 Plan::Immediate { content, is_error } => (content, is_error),
-                Plan::Builtin => match builtin_outputs.remove(&idx).unwrap_or_else(|| {
+                Plan::Builtin | Plan::Runtime => match builtin_outputs.remove(&idx).unwrap_or_else(|| {
                     Err(format!(
                         "internal tool runner omitted the result for {name}; the tool outcome is unknown"
                     ))
@@ -775,31 +794,31 @@ impl Agent {
             }
 
             let ok = !is_error.unwrap_or(false);
-            if ran_builtin
-                && matches!(
-                    name.as_str(),
-                    "write_file"
-                        | "edit_file"
-                        | "multi_edit"
-                        | "bash"
-                        | "awk"
-                        | "csvkit"
-                        | "git_commit"
-                )
+            if ran_tool
+                && (ran_runtime && self.tool_is_side_effect_capable(&name)
+                    || matches!(
+                        name.as_str(),
+                        "write_file"
+                            | "edit_file"
+                            | "multi_edit"
+                            | "bash"
+                            | "awk"
+                            | "csvkit"
+                            | "git_commit"
+                    ))
             {
                 // Even a failed process may have changed extension files before
                 // reporting its error.
                 extension_state_may_have_changed = true;
             }
-            if ok
-                && ran_builtin
-                && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
+            if ok && ran_tool && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
             {
                 self.work_ledger_note_file_change(&input);
             }
             if ok
-                && ran_builtin
-                && (ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
+                && ran_tool
+                && (ran_runtime && self.tool_is_side_effect_capable(&name)
+                    || ACTION_CONTRACT_MUTATING_TOOL_NAMES.contains(&name.as_str())
                     || name == "bash"
                         && input["command"]
                             .as_str()
@@ -854,7 +873,7 @@ impl Agent {
                 if ok { "tool_ok" } else { "tool_error" },
                 &format!("{} :: {}", ui_summary, content),
             );
-            let verification_command = if ran_builtin && matches!(name.as_str(), "bash" | "csvkit")
+            let verification_command = if !ran_runtime && matches!(name.as_str(), "bash" | "csvkit")
             {
                 if name == "bash" {
                     serde_json::from_str::<Value>(&input_str)

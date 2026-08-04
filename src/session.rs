@@ -1249,6 +1249,8 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         provenance: serde_json::from_value(meta["provenance"].clone()).unwrap_or_default(),
         work_ledger: serde_json::from_value(meta["work_ledger"].clone()).unwrap_or_default(),
         seat,
+        active_pack_runtimes: serde_json::from_value(meta["active_pack_runtimes"].clone())
+            .unwrap_or_default(),
         provider_health: serde_json::from_value(meta["provider_health"].clone())
             .unwrap_or_default(),
         privacy: serde_json::from_value(meta["privacy"].clone()).unwrap_or_default(),

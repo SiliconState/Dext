@@ -127,7 +127,80 @@ Interactive equivalents:
 
 A clear conversational request can also invoke a known pack, for example: `run refactor-helper on the parser`. Conversational project-pack activation and project `shelf.json` metadata require one repository-scoped first-use confirmation. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Choosing `Always` stores a bounded owner-private, single-link project-scoped approval marker on Unix; unsafe/permissive markers are ignored, and `/project-extensions reset` refuses unsafe marker shapes while removing a safe marker or clearing a session denial. Until approval, project metadata cannot shadow a same-named user or run-shelf pack.
 
-When selected, Dext reads `PACK.md` only when it is a regular non-symlink file no larger than 1 MiB, then caps invocation context to 32 KiB and keeps the pack active for the session. `shelf.json` manifests use the same 1 MiB regular-file/no-follow load boundary. Pack hooks and environment are activated only after the workflow read succeeds. Dext exports `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` calls and pack hook processes. Changing the sandbox root clears active pack state.
+When selected, Dext reads `PACK.md` only when it is a regular non-symlink file no larger than 1 MiB, then caps invocation context to 32 KiB and keeps the pack active for the session. `shelf.json` manifests use the same 1 MiB regular-file/no-follow load boundary. Pack hooks and environment are activated only after workflow and optional runtime activation succeed. Dext exports `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` calls and pack hook processes. Changing the sandbox root clears active pack state.
+
+## Optional executable runtime protocol
+
+A reviewed pack may add `runtime.json` to expose a small dynamic tool set and lifecycle effects without adding pack-specific code to Dext. This is optional; `PACK.md`-only packs continue to use the native Dext tools.
+
+```json
+{
+  "version": 1,
+  "command": "bin/my-pack-runtime",
+  "args": [],
+  "max_continuations": 100,
+  "tools": [
+    {
+      "name": "measure_target",
+      "description": "Measure the configured optimization target.",
+      "risk": "write",
+      "input_schema": {
+        "type": "object",
+        "properties": {"note": {"type": "string"}},
+        "additionalProperties": false
+      }
+    }
+  ]
+}
+```
+
+The v1 boundary is fail-closed:
+
+- `runtime.json` is a regular non-symlink file capped at 256 KiB. Unknown manifest fields, unsupported versions, built-in/dynamic name collisions, invalid provider tool names, oversized descriptions/schemas/arguments, and non-object tool schemas are rejected.
+- `command` is a relative path to a regular executable inside the canonical pack root. Symlinked, non-executable, absolute, or escaping commands are rejected.
+- Runtime activation is executable-code approval, separate from selecting `PACK.md`. Approval profile `never` disables it. Activation and idle events run with read-only confinement even when the session allows writes.
+- Every declared tool has `read`, `write`, or `danger` risk (`write` by default). Read tools run read-only and need no mutation checkpoint. Write/danger tools use normal Dext approval/sandbox policy, durable side-effect fencing, and a fail-closed Git checkpoint before execution when a repository is present.
+- Runtime subprocesses inherit no credential-shaped environment values, including pack helper credential declarations and `DEXT_INHERIT_TOOL_CREDENTIALS`. They are one-shot process-group-contained calls, not daemons; timeout defaults to 120 seconds. A manifest may set `timeout_seconds` from 1–604800 for long-running helpers, and `DEXT_PACK_RUNTIME_TIMEOUT_SECS` overrides it within the same bound.
+
+Dext sends one JSON object on stdin for each `activate`, `tool`, or `idle` event:
+
+```json
+{
+  "version": 1,
+  "event": "tool",
+  "pack": "my-pack",
+  "session_id": "...",
+  "cwd": "/active/project",
+  "state": {},
+  "context": {
+    "turn_id": "turn-...",
+    "iteration": 2,
+    "history_messages": 8,
+    "compacted": false
+  },
+  "tool": "measure_target",
+  "input": {"note": "baseline"}
+}
+```
+
+The helper writes exactly one JSON response object to stdout:
+
+```json
+{
+  "version": 1,
+  "content": "measurement complete",
+  "is_error": false,
+  "state": {"runs": 1},
+  "effects": [
+    {"type": "steer", "text": "Compare against the baseline."},
+    {"type": "continue", "prompt": "Run the next bounded experiment.", "delay_ms": 100},
+    {"type": "view", "title": "Experiments", "markdown": "# Results"}
+  ]
+}
+```
+
+Requests/responses are capped at 256 KiB, content and steering/continuation text at 128 KiB, state at 64 KiB, markdown views at 128 KiB, effects at 16 per call, and continuation delays at 30 seconds. State and continuation counts persist in the owner-private session header. Resume re-resolves the pack, rechecks executable-runtime approval, and accepts state only when pack name/source and the SHA-256 of `runtime.json` still match; changed or missing runtimes fail closed. Runtime content/effects pass through privacy redaction before model, log, or TUI exposure. A pack can request at most its declared `max_continuations` (hard cap 1,000) across the saved runtime state.
+
 
 ## Maintain
 
@@ -145,7 +218,7 @@ Dext does not auto-update packs or fetch shelf repositories. Versioning, review,
 
 ## Helpers and hooks
 
-Optional helpers live under the pack's `bin/` directory and run through normal Dext execution policy. Prefer small transparent helpers over new provider-visible tools.
+Optional ordinary helpers live under the pack's `bin/` directory and run through normal Dext execution policy. A reviewed native helper declared by `runtime.json` instead participates in the bounded one-shot runtime protocol above and may expose dynamic provider tools only while that pack runtime is active.
 
 `phooks.json` contains pack hook templates and is distinct from a project's `hooks.json`. Dext adds these hooks for the active session; the pack should remain understandable and useful without them.
 

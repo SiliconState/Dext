@@ -658,7 +658,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td>ChatGPT / Codex</td><td>Codex Responses API (<code>/codex/responses</code>)</td><td><code>build_chatgpt_request()</code>; no Platform-only mode field</td></tr>
 </table>
 <h3>Transport Deadlines and Body Bounds</h3>
-<p>The shared provider client uses a 15-second connect timeout. Cloud requests allow 180 seconds to first response headers and 90 seconds between stream chunks; local llama.cpp requests default to 600 seconds and 300 seconds respectively. <code>DEXT_PROVIDER_CONNECT_TIMEOUT_SECS</code>, <code>DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS</code>, and <code>DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS</code> accept positive overrides. Initial requests and compaction retries use the same first-byte policy. Non-stream compaction responses use the stream-idle deadline while reading and reject JSON bodies above 4 MiB; provider error diagnostics stop at 4,000 bytes.</p>
+<p>The shared provider client uses a 15-second connect timeout. Cloud requests allow 180 seconds to first response headers and 90 seconds between stream chunks; local llama.cpp requests default to 600 seconds and 300 seconds respectively. <code>DEXT_PROVIDER_CONNECT_TIMEOUT_SECS</code>, <code>DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS</code>, and <code>DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS</code> accept positive overrides. Initial requests and compaction retries use the same first-byte policy. Non-stream compaction responses use the stream-idle deadline while reading and reject JSON bodies above 4 MiB; provider error diagnostics stop at 4,000 bytes. A ChatGPT Responses finalize error caused by malformed function arguments is never executed; if no visible text was streamed, Dext compacts once when a safe split exists and retries exactly once, then surfaces the protocol error if it persists.</p>
 <p><code>src/sse.rs</code> limits its in-progress input buffer to one configured event plus at most four delimiter bytes before rejection. One large network read may still contain many valid small events; the decoder drains complete frames incrementally rather than rejecting by chunk size.</p>
 <p>Responses terminal events with <code>status=incomplete</code> are recoverable rather than fatal protocol errors. Dext executes only function calls that reached a streamed completion event and discards truncated calls, ignoring complete-looking terminal snapshots for those unfinished calls. Discarded live text/thinking preview state is reset; a content-filter terminal also discards function calls and opaque encrypted reasoning state. Interactive warnings identify the recovery. If no executable call remains, Dext issues a bounded continuation request with a concise runtime hint; provider-reported content filtering halts immediately instead of retrying. Recovery lowers reasoning effort for that request only (for example, <code>xhigh</code> to <code>medium</code>) without changing the user-selected effort or consuming the normal tool-iteration budget. After three unsuccessful continuation requests, Dext halts the turn with guidance while keeping the session usable.</p>
 <p>Official OpenAI GPT-5.6 uses stateless Responses requests with <code>store:false</code>. Tool-bearing requests explicitly include <code>reasoning.encrypted_content</code>; when the provider returns a valid opaque reasoning item, Dext retains it in session history and replays it only within the current user/tool turn. Older-turn reasoning and malformed or placeholder items are omitted. ChatGPT/Codex input continues to omit persisted reasoning items. OpenAI Responses tools use the flat function shape with <code>strict:false</code>; ChatGPT/Codex tools retain their existing flat <code>strict:null</code> shape.</p>
@@ -932,14 +932,14 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="packs-rs" class="collapsible-header">Packs.rs — Pack System <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p><strong>Packs are shelf-contained workflow documents, not plugin binaries.</strong> Dext supplies the create, discover, inspect, maintain, and run lifecycle; users own the content. The runtime accepts <code>PACK.md</code> only as a regular non-symlink file no larger than 1 MiB, then applies the 32 KiB invocation-context cap and executes through the existing Dext tool surface, keeping packs provider-neutral and auditable without bloating the core binary.</p>
+<p><strong>Packs are shelf-contained, source-first workflows with an optional bounded executable runtime.</strong> Dext supplies the create, discover, inspect, maintain, and run lifecycle; users own the content. <code>PACK.md</code>-only packs orchestrate the native tool surface. A reviewed pack may additionally declare <code>runtime.json</code> protocol v1 to expose dynamic tools only while active, without adding pack-specific code to the Dext binary.</p>
 
 <h3>Design Contract</h3>
 <ul>
-<li>No provider-visible tool expansion: packs orchestrate existing tools (<code>bash</code>, <code>read_file</code>, <code>rg</code>, etc.).</li>
+<li><code>PACK.md</code>-only packs add no provider tools; optional reviewed runtimes may add a bounded active-pack tool set.</li>
 <li>Source-first reviewability: every pack is plain files in a directory.</li>
 <li>Deterministic discovery and precedence: first resolved name wins after ordered search roots.</li>
-<li>Optional hooks via <code>phooks.json</code>, isolated from project <code>hooks.json</code>.</li>
+<li>Optional hooks via <code>phooks.json</code> and optional one-shot native runtime via <code>runtime.json</code>; both remain separate from project <code>hooks.json</code>.</li>
 </ul>
 
 <div class="tip"><strong>Battery-pack model:</strong> Dext ships no packs. Every pack lives under <code>&lt;shelf&gt;/packs/&lt;name&gt;</code> in a user, project, or explicitly configured shelf root.</div>
@@ -948,7 +948,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p><code>packs.rs</code> normalizes each discovered pack into <code>PackInfo</code> with:</p>
 <ul>
 <li><code>name</code>, <code>description</code>, declared <code>credential_env</code> names (from front matter or directory defaults)</li>
-<li><code>path</code>, <code>pack_md_path</code>, optional <code>phooks_path</code></li>
+<li><code>path</code>, <code>pack_md_path</code>, optional <code>phooks_path</code>, optional <code>runtime_path</code></li>
 <li><code>source</code> label (project/env/user) and shelf ownership</li>
 </ul>
 <p>Invocation wraps this as <code>PackInvocation { pack, task }</code> so the task is explicit and auditable.</p>
@@ -966,8 +966,9 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Pack Layout and Front Matter</h3>
 <pre><code>my-pack/
 ├── PACK.md          # required; markdown workflow with YAML front matter
+├── runtime.json     # optional bounded executable protocol v1 manifest
 ├── phooks.json      # optional hook template for this pack
-├── bin/             # optional helper scripts
+├── bin/             # optional ordinary or runtime helpers
 └── README.md        # optional human docs</code></pre>
 <pre><code>---
 name: my-pack
@@ -994,7 +995,11 @@ credential-env: [SERVICE_TOKEN]
 <li>capped <code>PACK.md</code> workflow body</li>
 <li>explicit user task text</li>
 </ul>
-<p>This gives the model procedural guidance without changing core runtime policy. Workflow loading must succeed before the selected pack becomes active, so a missing, oversized, symlinked, or otherwise invalid <code>PACK.md</code> cannot install pack hooks or environment. Once active, its <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own native <code>bin/</code> helper, never hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state.</p>
+<p>This gives the model procedural guidance without changing core runtime policy unless the selected pack declares an approved runtime. Workflow loading and optional runtime activation must succeed before pack hooks or environment are activated. Once active, <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own ordinary native <code>bin/</code> helper, never runtime helpers, hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state.</p>
+<h3>Pack Runtime Protocol v1</h3>
+<p><code>src/pack_runtime.rs</code> loads <code>runtime.json</code> only as a regular non-symlink file capped at 256 KiB. The manifest declares version 1, a relative regular executable inside the canonical pack root, optional bounded arguments, a 1–604800-second timeout, a continuation budget, and at most 32 dynamic tools. Tool names must be provider-safe and collision-free across the full native catalog; descriptions and object schemas are bounded. Every tool declares <code>read</code>, <code>write</code>, or <code>danger</code> risk, defaulting to write.</p>
+<p>Activation is executable-code approval separate from selecting <code>PACK.md</code>; approval profile <code>never</code> disables it. Activation approval is never persisted through the session’s generic allowed-tool list. Activation, idle events, and read tools run under read-only confinement. Write/danger tools retain normal per-call approval, sandbox, durable side-effect journaling, and fail-closed Git checkpoint controls. Runtime helpers are one-shot process-group-contained calls, receive no inherited credentials, and exchange exactly one JSON request/response through stdin/stdout. The default timeout is 120 seconds; manifest <code>timeout_seconds</code> configures it and <code>DEXT_PACK_RUNTIME_TIMEOUT_SECS</code> overrides it within the same 1–604800 bound.</p>
+<p>Requests identify <code>activate</code>, <code>tool</code>, or <code>idle</code>, plus pack/session/project context, bounded state, turn/iteration/compaction context, and optional tool input. Responses may contain content, an error bit, replacement state, and at most 16 effects: <code>steer</code>, delayed <code>continue</code> (maximum 30 seconds), or a Markdown <code>view</code>. Request/response size is 256 KiB, state 64 KiB, content/effect text and views 128 KiB. Runtime outputs are privacy-redacted. State and continuation counters persist inside the existing owner-private 256 KiB session-header ceiling; resume re-resolves the pack, rechecks executable approval, and requires exact pack source plus <code>runtime.json</code> SHA-256 identity.</p>
 
 <h3>Execution Paths</h3>
 <ul>
