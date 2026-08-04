@@ -7,6 +7,9 @@ dext [TASK...]        run one-shot with TASK
 dext -p               read task from stdin
 dext                  interactive TUI/REPL
 dext --resume         resume the project-scoped latest session
+dext --seat NAME      start a new session with a durable project identity
+dext --seat NAME --resume  resume that seat's latest session
+dext seat list|show NAME  inspect project seats
 dext --fork           resume latest into an isolated unsaved branch
 dext sessions         list project latest + named sessions
 dext session ...      brief/export/analyze/grep/failures/verify-log/decisions/prune
@@ -16,6 +19,14 @@ dext --eval [NAME]    run eval harness
 ```
 
 Run `dext --help` for the exact options supported by the installed binary.
+
+## Seats
+
+A Seat is a durable project-scoped agent identity, while a session is one disposable incarnation of that identity. Start a new seated session with `dext --seat planner`; resume that identity's latest durable session with `dext --seat planner --resume`; inspect records with `dext seat list` or `dext seat show planner`; maintain context with `dext seat set planner --label "Planning role"` and `dext seat set planner --summary-file ./planner-context.txt`. Clear fields with `--clear-label` or `--clear-summary`; `--summary-file -` reads bounded UTF-8 from stdin.
+
+Seat records contain bounded identity metadata and the latest session id under `~/.dext/projects/<project-key>/seats/<seat-id>/seat.json`. Seat ids are portable lowercase 1–128 byte components; trailing dots and Windows device names are rejected. Selection alone is contextual and does not persist an empty record: the first successful durable session save or explicit `seat set` creates it. Unseated writes remain format v3 for compatibility; seated writes use v4 so pre-Seat binaries fail safely. Valid transitional v3 Seat headers remain loadable and fully validated, then upgrade on the next seated save; Seat metadata is rejected in v1–v2. Headers are bounded at 256 KiB on save, review, and restore. A session attached to one Seat cannot be resumed under another id or a same-named Seat from another project; malformed metadata and seated headers without project sandbox provenance also fail before state mutation. Explicitly resuming an unseated legacy session while a Seat is selected attaches identity on the next durable save. `--no-session --seat NAME` neither creates a record nor advances a pointer. Prompt-visible labels and summaries are privacy-redacted single-line JSON marked as user-authored non-instruction data. Switching projects clears active identity. `/reset` serializes pointer update and transcript removal; failed removal preserves history and attempts pointer rollback.
+
+Crew maps directly portable role names to `crew.<agent>` and passes them to child Dext processes with `--no-session`. Existing valid custom role names outside the portable Seat grammar receive deterministic `crew.agent-<hash>` ids rather than becoming invalid. The child receives identity context but cannot update durable Seat state; crew's trusted parent remains authoritative. Project-scoped roles may read an existing summary; isolated roles intentionally use a private temporary project's context. Captured, detached-systemd, and tmux-pane workers use one effective absolute Dext state root even when supervisor home variables are stale.
 
 ## Authentication
 
@@ -369,6 +380,15 @@ Doctor reports `ok`, `info`, and `warn` findings for the effective approval prof
 Doctor does not repair or rewrite state, resolve environment or `!command` credential references, invoke provider/local-model APIs, or print credential-bearing JSON. Use the explicit flags to inspect the posture that those startup choices would produce.
 
 ## Session commands
+
+Seats select identity; sessions remain transcript and crash-recovery units:
+
+```bash
+dext --seat planner
+dext --seat planner --resume
+dext seat list
+dext seat show planner
+```
 
 ```bash
 dext sessions

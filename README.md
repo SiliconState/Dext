@@ -118,6 +118,12 @@ CLI:
 
 ```bash
 dext --resume
+dext --seat planner
+dext --seat planner --resume
+dext seat list
+dext seat show planner
+dext seat set planner --label "Planning role"
+dext seat set planner --summary-file ./planner-context.txt
 dext --fork
 dext sessions
 dext session brief latest
@@ -132,6 +138,10 @@ dext pack inspect my-pack
 dext pack run my-pack "task description"
 dext --eval
 ```
+
+A **Seat** is a durable project-scoped agent identity; a session is one disposable incarnation. `--seat NAME` starts a new session associated with the Seat, while `--seat NAME --resume` resumes its latest durable session. Seat ids are portable lowercase 1–128 byte path components using ASCII letters, digits, `-`, `_`, and `.`; trailing dots and Windows device names are rejected. Selecting a new Seat does not create an empty record: persistence begins with the first successful durable session save or explicit `dext seat set`. Use `dext seat set NAME --label TEXT`, `--summary-file PATH|-`, `--clear-label`, and `--clear-summary` to maintain bounded context without placing summaries directly in process arguments. Unseated writes remain format v3 for backward compatibility; seated writes use v4 so older binaries reject rather than silently ignore identity. Valid transitional v3 Seat headers remain loadable and validated, then upgrade on the next seated save. Explicit resume rejects a different Seat id, the same Seat name from another project, malformed or unprovenanced metadata, and headers over 256 KiB before applying saved state. `--no-session --seat NAME` supplies identity context without creating or updating durable state. Prompt-visible label/summary context is privacy-redacted and encoded as one JSON data line with an explicit non-authority note. Changing projects clears the active Seat. `/reset` updates the matching pointer and removes the transcript under one state-operation guard; on deletion failure it preserves history and attempts to restore the pointer.
+
+Crew maps directly portable role names to read-only contextual Seats such as `crew.reviewer`. Existing valid custom role names that cannot fit the portable Seat grammar receive a deterministic `crew.agent-<hash>` identity, preserving crew's prior role-name compatibility. Children retain `--no-session`, so the trusted parent remains authoritative and child runs do not advance durable pointers. Project-scoped roles can load an existing summary; isolated roles intentionally use their private temporary project's context. Captured, detached-systemd, and tmux-pane workers pin the same effective absolute Dext state root, preventing stale supervisor environments from selecting a different Seat store.
 
 Interactive slash commands:
 
@@ -360,6 +370,7 @@ Run the final full suite and install directly in a trusted host terminal. Dext's
 - `src/provider.rs` — provider catalog, auth, OAuth/API-key handling, request shaping, transport deadlines/body bounds, and side-effect-free bounded state/auth-permission inspection.
 - `src/sandbox.rs` — OS confinement, profile-specific write roots, private scratch, and offline diagnostic isolation.
 - `src/session.rs` — session persistence, project state paths, logs, lock cleanup, terminal restore.
+- `src/seats.rs` — project-scoped durable agent identity records and seat-specific session lookup.
 - `src/tools.rs` — tool catalog and provider-facing tool schemas.
 - `src/tool_policy.rs` — validation and command/external-source guardrails.
 - `src/sse.rs` — bounded SSE framing shared by runtime and Criterion benchmarks.

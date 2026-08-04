@@ -87,6 +87,7 @@
 
 ### Added
 
+- Added project-scoped Seats as durable agent identities across disposable sessions. `--seat NAME` starts a seated session, `--seat NAME --resume` resumes its latest incarnation, `dext seat list|show` inspects records, and `dext seat set` maintains bounded labels/summaries. Portable ids, owner-safe/private state paths, atomic metadata updates, deferred record creation, 256 KiB session-header bounds, transactional reset pointer handling, and cross-Seat/cross-project/provenance checks fail closed. Unseated writes retain v3 compatibility; seated writes use v4, with transitional v3 Seat headers still validated and loadable. No-session/forked runs do not advance state. Crew supplies direct or deterministic fallback role identities while pinning one absolute Dext state root across captured, detached, and pane workers.
 - Added the public GitHub Pages documentation site at
   `https://siliconstate.github.io/Dext/`, deployed from `docs/` by a
   least-privilege workflow with commit-pinned actions and offline validation of

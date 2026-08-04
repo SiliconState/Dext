@@ -485,6 +485,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>src/tool_round.rs</code></td><td>Tool planning, approval, checkpoint/journal boundaries, dispatch, result normalization</td></tr>
 <tr><td><code>src/tool_journal.rs</code></td><td>Owner-private side-effect start/terminal records and resume reconciliation</td></tr>
 <tr><td><code>src/session.rs</code></td><td>Session/log persistence, project state locks, atomic I/O</td></tr>
+<tr><td><code>src/seats.rs</code></td><td>Project-scoped durable agent identities and seat-specific latest-session lookup</td></tr>
 <tr><td><code>src/sandbox.rs</code></td><td>OS confinement, profile write roots, private scratch, offline diagnostics isolation</td></tr>
 <tr><td><code>src/tools.rs</code></td><td>Tool definitions, permission metadata, parallel-safe classification</td></tr>
 <tr><td><code>src/orchestrator.rs</code></td><td>Work phases, similarity guards, objective tracking, adaptive caps</td></tr>
@@ -662,7 +663,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Responses terminal events with <code>status=incomplete</code> are recoverable rather than fatal protocol errors. Dext executes only function calls that reached a streamed completion event and discards truncated calls, ignoring complete-looking terminal snapshots for those unfinished calls. Discarded live text/thinking preview state is reset; a content-filter terminal also discards function calls and opaque encrypted reasoning state. Interactive warnings identify the recovery. If no executable call remains, Dext issues a bounded continuation request with a concise runtime hint; provider-reported content filtering halts immediately instead of retrying. Recovery lowers reasoning effort for that request only (for example, <code>xhigh</code> to <code>medium</code>) without changing the user-selected effort or consuming the normal tool-iteration budget. After three unsuccessful continuation requests, Dext halts the turn with guidance while keeping the session usable.</p>
 <p>Official OpenAI GPT-5.6 uses stateless Responses requests with <code>store:false</code>. Tool-bearing requests explicitly include <code>reasoning.encrypted_content</code>; when the provider returns a valid opaque reasoning item, Dext retains it in session history and replays it only within the current user/tool turn. Older-turn reasoning and malformed or placeholder items are omitted. ChatGPT/Codex input continues to omit persisted reasoning items. OpenAI Responses tools use the flat function shape with <code>strict:false</code>; ChatGPT/Codex tools retain their existing flat <code>strict:null</code> shape.</p>
 <h3>Session Persistence</h3>
-<p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance (model/provider, tool policy surface, approval/sandbox profiles, context mode, usage ledger, work ledger, provider health, and runtime diagnostics). Persisted usage costs must be finite and non-negative, and restored budget caps must contain at least one positive dimension; invalid accounting metadata is rejected instead of affecting resumed enforcement. This header is the replay anchor for deterministic restore behavior. Session review remains available through list, brief, analyze, grep, failure, verification, and decision views. Briefs omit the raw transcript but can still expose sensitive ledger, path, failure, and verification data. Export writes an explicit HTML or JSONL copy. Prune removes stale locks and project directories containing no state other than stale locks while preserving session JSONL and all other project state. The unused work-map, packet, focus, and track surface has been removed.</p>
+<p>Sessions are stored as JSONL files under <code>~/.dext/projects/&lt;project-key&gt;/sessions/</code>. The first line is a <code>SessionHeader</code> with full provenance. Unseated writes retain format v3 for backward compatibility; seated writes use v4 so older binaries reject rather than ignore identity. Valid transitional v3 Seat headers remain loadable and validated, then upgrade on the next seated save; v1–v2 cannot carry Seat metadata. Header serialization and reads are bounded at 256 KiB. Invalid persisted accounting metadata is rejected instead of affecting resumed enforcement. Session review remains available through list, brief, analyze, grep, failure, verification, and decision views. Export writes an explicit HTML or JSONL copy. Prune removes stale locks and lock-only project trees while preserving session JSONL, Seats, and other project state.</p>
 <h3>Eval Harness</h3>
 <p>Outcome-oriented assertions on files and command output. The eval path validates objective completion semantically (not just command exit) and records verification artifacts for later audit. Run via <code>dext --eval</code>.</p>
 <h3>Crash Recovery</h3>
@@ -684,6 +685,9 @@ dext --frugal --effort off    # low-token mode</code></pre>
 ├── shelves/                     # User-scoped shelves and packs
 └── projects/
     └── &lt;project-key&gt;/
+        ├── seats/
+        │   └── &lt;seat-id&gt;/
+        │       └── seat.json        # Bounded durable identity + latest session id
         └── sessions/
             ├── &lt;name&gt;.jsonl     # Named session export
             └── &lt;session-id&gt;/
@@ -697,6 +701,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
                 └── sudo/</code></pre>
 <h3>Project Key</h3>
 <p>Each project gets a stable key derived from its canonical path: <code>&lt;slug&gt;-&lt;FNV-1a-hash&gt;</code>. This ensures isolated state per project even with identical directory names.</p>
+<p>Each project may contain bounded Seat records under <code>seats/&lt;seat-id&gt;/seat.json</code>. A Seat is a durable agent identity; a session is one transcript/crash-recovery incarnation. Portable lowercase ids are validated before path construction; trailing dots and Windows device names are rejected. Unix ancestors must be owner-safe, managed directories owner-private, and record files regular, private, single-link, and no-follow. Selecting <code>--seat NAME</code> does not create an empty record; the first successful durable save or explicit <code>dext seat set</code> persists it. Use <code>dext seat set NAME --label TEXT</code>, <code>--summary-file PATH|-</code>, <code>--clear-label</code>, or <code>--clear-summary</code> to maintain bounded context. <code>--seat NAME --resume</code> follows that Seat's latest-session pointer. Cross-Seat, same-name cross-project, malformed, oversized, and unprovenanced restoration fails before saved state mutation. <code>--no-session --seat NAME</code> is contextual only. Prompt-visible context is privacy-redacted bounded JSON marked as user-authored data, not instructions. Project changes clear active identity. <code>/reset</code> serializes pointer update and transcript removal and attempts pointer rollback on deletion failure. Crew directly maps portable role names to <code>crew.&lt;agent&gt;</code> and assigns deterministic <code>crew.agent-&lt;hash&gt;</code> ids to other valid custom names; captured, detached, and pane workers pin one absolute Dext state root. Path-based Seat operations retain a hostile same-user ancestor-replacement race tracked as R-012.</p>
 <h3>Atomic Writes</h3>
 <p>Sensitive state writes use a temp-file-and-replace helper. On Windows the replacement uses <code>MoveFileExW</code>; on Unix it uses <code>fs::rename</code>. Session logs normally use private append writes while they remain below the cap.</p>
 <h3>Session State Lock</h3>
@@ -1134,6 +1139,10 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>dext "prompt"</code></td><td>One-shot task</td></tr>
 <tr><td><code>dext -p</code></td><td>Read prompt from stdin</td></tr>
 <tr><td><code>dext --resume</code></td><td>Resume latest session</td></tr>
+<tr><td><code>dext --seat &lt;name&gt;</code></td><td>Start a new session with a durable project identity</td></tr>
+<tr><td><code>dext --seat &lt;name&gt; --resume</code></td><td>Resume that Seat's latest durable session</td></tr>
+<tr><td><code>dext seat list|show &lt;name&gt;</code></td><td>Inspect project Seat records</td></tr>
+<tr><td><code>dext seat set &lt;name&gt; ...</code></td><td>Set or clear a bounded Seat label/summary</td></tr>
 <tr><td><code>dext --fork</code></td><td>Fork latest session into new session</td></tr>
 <tr><td><code>dext session ...</code></td><td>Brief/export/analyze/grep/failures/verification/decision/prune operations</td></tr>
 <tr><td><code>dext doctor [...]</code></td><td>Inspect effective safety policy and bounded local state without repair or provider calls</td></tr>

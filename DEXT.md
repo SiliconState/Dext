@@ -12,6 +12,7 @@ The `bash` tool is deliberately atomic. Dext launches bash in a separate process
 ## Architecture
 - `src/main.rs` — agent loop, provider HTTP, permissions/sandboxing, slash
   commands, CLI entry, eval, and remaining orchestration.
+- `src/seats.rs` — project-scoped durable agent identity records and Seat-specific session lookup.
 - `src/session.rs` — session/log persistence, project state locks, state paths,
   and TUI terminal restore helpers.
 - `src/tools.rs` — tool catalog, permission/parallel metadata, and lean/full
