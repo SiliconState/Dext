@@ -439,19 +439,23 @@ pub(crate) fn should_parallelize_builtin_tools(names: &[&str]) -> bool {
 
 fn lean_description(name: &str, fallback: &str) -> String {
     match name {
-        "read_file" => "Read capped file lines; absolute read-only.",
-        "read_symbol" => "Read source symbol/block; absolute read-only.",
-        "write_file" => "Write file.",
+        "read_file" => "Read capped line-numbered file window; absolute paths read-only.",
+        "read_symbol" => {
+            "Read symbol/enclosing line block; selectors exclusive; absolute paths read-only."
+        }
+        "write_file" => "Create/overwrite file.",
         "edit_file" => "Replace one unique exact string.",
         "multi_edit" => "Apply atomic exact replacements in one file.",
-        "bash" => "Atomic shell fallback for build/test/install/gaps; no persistence.",
-        "fd" => "Find files by regex; absolute read-only.",
-        "rg" => "Search text by regex; absolute read-only.",
+        "bash" => {
+            "Atomic shell fallback for build/test/install/gaps; timeout in seconds; pipefail; capped; no persistence; prefer arrays/heredocs for quoting."
+        }
+        "fd" => "Find files by regex; absolute paths read-only.",
+        "rg" => "Search text by regex; absolute paths read-only.",
         "jq" => "Run jq on JSON text or file.",
         "fzf" => "Rank provided lines by fuzzy query.",
-        "http" => "Bounded HTTP request.",
+        "http" => "HTTPie-style request; response capped.",
         "awk" => "Run awk with optional stdin.",
-        "git_diff" => "Read capped Git diff/stat.",
+        "git_diff" => "Read capped Git diff/stat; use stat first when broad.",
         "git_log" => "Show recent git log.",
         "git_commit" => "Stage and commit files.",
         "todo_read" => "Read project todos.",
@@ -493,47 +497,73 @@ fn tool_schema(tool: &Tool, profile: ToolProfile) -> Value {
     }
 }
 
-pub(crate) fn wire_tools(tools: &[Tool], profile: ToolProfile) -> Vec<WireTool> {
-    let mut wt: Vec<WireTool> = tools
-        .iter()
-        .map(|t| WireTool {
-            name: t.name.to_string(),
-            description: tool_description(t, profile),
-            input_schema: tool_schema(t, profile),
-            cache_control: None,
-        })
-        .collect();
-    if let Some(last) = wt.last_mut() {
-        last.cache_control = Some(CacheControl::for_prompt());
-    }
-    wt
+#[derive(Clone, Serialize)]
+pub(crate) struct ProviderNeutralTool {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) schema: Value,
 }
 
-pub(crate) fn wire_tools_oai(tools: &[Tool], profile: ToolProfile) -> Vec<OaiTool> {
+pub(crate) fn provider_neutral_tools(
+    tools: &[Tool],
+    profile: ToolProfile,
+) -> Vec<ProviderNeutralTool> {
     tools
         .iter()
-        .map(|t| OaiTool {
+        .map(|tool| ProviderNeutralTool {
+            name: tool.name.to_string(),
+            description: tool_description(tool, profile),
+            schema: tool_schema(tool, profile),
+        })
+        .collect()
+}
+
+pub(crate) fn wire_tools_from_neutral(tools: Vec<ProviderNeutralTool>) -> Vec<WireTool> {
+    let mut wire = tools
+        .into_iter()
+        .map(|tool| WireTool {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.schema,
+            cache_control: None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(last) = wire.last_mut() {
+        last.cache_control = Some(CacheControl::for_prompt());
+    }
+    wire
+}
+
+pub(crate) fn wire_oai_tools_from_neutral(tools: Vec<ProviderNeutralTool>) -> Vec<OaiTool> {
+    tools
+        .into_iter()
+        .map(|tool| OaiTool {
             r#type: "function".to_string(),
             function: OaiFunctionDef {
-                name: t.name.to_string(),
-                description: tool_description(t, profile),
-                parameters: tool_schema(t, profile),
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.schema,
             },
         })
         .collect()
 }
 
-pub(crate) fn wire_tools_chatgpt(tools: &[Tool], profile: ToolProfile) -> Vec<Value> {
+pub(crate) fn wire_responses_tools_from_neutral(tools: Vec<ProviderNeutralTool>) -> Vec<Value> {
     tools
-        .iter()
-        .map(|t| {
+        .into_iter()
+        .map(|tool| {
             json!({
                 "type": "function",
-                "name": t.name,
-                "description": tool_description(t, profile),
-                "parameters": tool_schema(t, profile),
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.schema,
                 "strict": Value::Null,
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn wire_tools(tools: &[Tool], profile: ToolProfile) -> Vec<WireTool> {
+    wire_tools_from_neutral(provider_neutral_tools(tools, profile))
 }

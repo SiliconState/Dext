@@ -110,7 +110,7 @@ dext --context-mode tiny --effort off
 /effort off
 ```
 
-The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/tools full` only when you need the complete catalog.
+The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/tools full` only when you need the complete catalog. Static tools and active pack-runtime tools share one provider-neutral `{name, description, schema}` layer before Anthropic, OpenAI Chat Completions, OpenAI Responses, or ChatGPT Responses wrapping.
 
 ## Common commands
 
@@ -331,7 +331,7 @@ DEXT_CACHE_READ_USD_PER_MTOK=0.1
 DEXT_CACHE_CREATE_USD_PER_MTOK=1.25
 ```
 
-Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored.
+Runtime state and credentials live outside version control. Project-local runtime artifacts such as `.dext/`, `.auto/log.jsonl`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored; reproducible autoresearch workflow files under `.auto/` may remain tracked.
 
 Usage metrics are recorded in session headers and `/usage` after provider turns. Cloud providers use returned usage objects when available; OpenAI-compatible streaming requests ask for usage chunks, while local llama.cpp derives exact prompt/cache/output counts from streamed `timings` and records zero dollar cost unless pricing env overrides are set.
 

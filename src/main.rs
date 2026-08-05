@@ -9682,14 +9682,86 @@ fn cap_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn prompt_line_break(ch: char) -> bool {
+    ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')
+}
+
 fn summarize_inline(s: &str, max_chars: usize) -> String {
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sanitized = s
+        .chars()
+        .map(|ch| if prompt_line_break(ch) { ' ' } else { ch })
+        .collect::<String>();
+    let collapsed = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
     let baseline = if collapsed.is_empty() {
         "?".to_string()
     } else {
         collapsed
     };
     cap_chars(&baseline, max_chars)
+}
+
+fn prompt_safe_json_text(encoded: String) -> String {
+    use std::fmt::Write as _;
+
+    let mut safe = String::with_capacity(encoded.len());
+    for ch in encoded.chars() {
+        if prompt_line_break(ch) {
+            let _ = write!(safe, "\\u{:04x}", ch as u32);
+        } else {
+            safe.push(ch);
+        }
+    }
+    safe
+}
+
+fn json_prompt_string(value: &str) -> String {
+    prompt_safe_json_text(serde_json::to_string(value).unwrap_or_else(|_| "\"?\"".to_string()))
+}
+
+fn json_prompt_value(value: &Value) -> String {
+    prompt_safe_json_text(serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()))
+}
+
+fn prompt_env_value(raw: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    let value = if raw.is_empty() { "?" } else { raw };
+    let plain = value
+        .chars()
+        .all(|ch| ch.is_ascii_graphic() && !matches!(ch, '"' | '\\'));
+    if plain {
+        if value.len() <= max_bytes {
+            return value.to_string();
+        }
+        if max_bytes <= 3 {
+            return ".".repeat(max_bytes);
+        }
+        return format!("{}...", byte_prefix_at_char_boundary(value, max_bytes - 3));
+    }
+
+    let encoded = json_prompt_string(value);
+    if encoded.len() <= max_bytes {
+        return encoded;
+    }
+    if max_bytes < 5 {
+        return ".".repeat(max_bytes);
+    }
+
+    let mut keep = value.len().min(max_bytes);
+    loop {
+        let prefix = byte_prefix_at_char_boundary(value, keep);
+        let candidate = format!("{prefix}...");
+        let encoded = json_prompt_string(&candidate);
+        if encoded.len() <= max_bytes {
+            return encoded;
+        }
+        if prefix.is_empty() {
+            return "\"...\"".to_string();
+        }
+        let overflow = encoded.len().saturating_sub(max_bytes).max(1);
+        keep = prefix.len().saturating_sub(overflow);
+    }
 }
 
 fn summarize_args(args: &Value, max_chars: usize) -> String {
@@ -10135,11 +10207,11 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 
 - Use only exposed tools via real provider calls; never print call JSON/syntax or bash envelopes. Obey approval and sandbox policy; if denied, ask. Use unsafe pip only if requested; avoid external state-store mutations.
 - Before each call, honor runtime notes and Context State. At PIVOT REQUIRED or a pattern, stop repeating and pivot or ask.
-- `[queued-user-update]` is literal active user input. Never dismiss path-only or context-looking updates; inspect an exact path first with read_file or fd/rg, not guessed paths or bash/sudo discovery, and address it in the response.
-- For nontrivial work use todo. Treat DEXT.md/recall.md as project guidance; modify neither unless asked.
+- `[queued-user-update]` is literal active user input. Never dismiss path-only or context-looking updates; inspect an exact path first—read_file for a file, fd/rg for a directory—not guessed paths or bash/sudo discovery, and address it in the response.
+- For nontrivial work use todo. Treat DEXT.md/recall.md as guidance; modify neither unless asked.
 - Prefer native tools: fd for files, rg for text/symbols, then focused read_file/read_symbol; use git_diff, edits, and http for their domains. Parallelize independent reads. Bash is only for orchestration, build/test/install, or gaps. Absolute reads are allowed; writes stay confined.
-- Read before editing. Inspect tracked diffs first, checkpoint large edits, and use native git_commit. Keep calls and results focused; reuse reads instead of repeating them.
-- Bash calls are atomic: backgrounding/nohup/disown/setsid cannot persist. Use an OS supervisor with a dext- unit for requested persistent services. Inspect stderr, validate external sources before scaling, and ask on auth failure.
+- Read before editing. Inspect tracked diffs first and use native git_commit. Keep calls and results focused; reuse reads instead of repeating them.
+- Bash calls are atomic: backgrounding/nohup/disown cannot persist; setsid is unsupported. Use an OS supervisor with a dext- unit for requested persistent services. Inspect stderr, validate external sources before scaling, and ask on auth failure.
 - Verify narrowly after changes. Final answers are terse: changes, tests, gaps.
 - Tables: one grouped table for related data; one physical line per row; plain cells without emoji, bold, unescaped `|`, or line breaks.
 - Invoke requested packs directly. Reusable packs are user-global unless explicitly project-local.";
@@ -10301,13 +10373,12 @@ fn render_seat_context(seat: &SeatRef, summary: Option<&str>, cap: usize) -> Str
     let json_budget = cap.saturating_sub("seat_context_json=\n".len() + NOTE.len());
     let summary = summary.filter(|value| !value.trim().is_empty());
     let encode = |label: Option<&str>, summary: Option<&str>, truncated: bool| {
-        serde_json::to_string(&json!({
+        json_prompt_value(&json!({
             "id": seat.id,
             "label": label,
             "summary": summary,
             "summary_truncated": truncated,
         }))
-        .unwrap_or_else(|_| format!(r#"{{"id":"{}"}}"#, seat.id))
     };
 
     let mut label = seat.label.as_deref();
@@ -11065,7 +11136,10 @@ impl Default for SessionHeader {
 fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
     let mut out = String::new();
     if !ledger.current_phase.trim().is_empty() {
-        out.push_str(&format!("current_phase: {}\n", ledger.current_phase.trim()));
+        out.push_str(&format!(
+            "current_phase: {}\n",
+            summarize_inline(&ledger.current_phase, 80)
+        ));
     }
     // Only real, observable state is surfaced here. The objective/done/pending/
     // in_progress/blocked/next_actions fields are excluded from the runtime
@@ -11083,7 +11157,7 @@ fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
         if !items.is_empty() {
             out.push_str(&format!("{label}:\n"));
             for item in items.iter().take(8) {
-                out.push_str(&format!("- {}\n", item.trim()));
+                out.push_str(&format!("- {}\n", summarize_inline(item, 240)));
             }
         }
     }
@@ -11092,13 +11166,13 @@ fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
         for record in ledger.verification.iter().rev().take(6).rev() {
             out.push_str(&format!(
                 "- {}: {} ({}ms){}\n",
-                record.name,
-                record.status,
+                summarize_inline(&record.name, 160),
+                summarize_inline(&record.status, 40),
                 record.duration_ms,
                 record
                     .artifact
                     .as_ref()
-                    .map(|a| format!(" artifact={a}"))
+                    .map(|a| format!(" artifact={}", summarize_inline(a, 240)))
                     .unwrap_or_default()
             ));
         }
@@ -11108,12 +11182,12 @@ fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
         for record in ledger.diagnostics.iter().rev().take(4).rev() {
             out.push_str(&format!(
                 "- {}: {} errors={} warnings={} ({}ms) {}\n",
-                record.source,
-                record.status,
+                summarize_inline(&record.source, 120),
+                summarize_inline(&record.status, 40),
                 record.errors,
                 record.warnings,
                 record.duration_ms,
-                record.summary.trim()
+                summarize_inline(&record.summary, 240)
             ));
         }
     }
@@ -11154,15 +11228,19 @@ fn render_provider_health_prompt(health: &ProviderHealthLedger) -> String {
             continue;
         }
         out.push_str(&format!(
-            "{provider}: auth={} ",
-            if state.auth.is_empty() {
-                "unknown"
-            } else {
-                &state.auth
-            }
+            "{}: auth={} ",
+            prompt_env_value(provider, 128),
+            prompt_env_value(
+                if state.auth.is_empty() {
+                    "unknown"
+                } else {
+                    &state.auth
+                },
+                80
+            )
         ));
         if let Some(mode) = &state.mode {
-            out.push_str(&format!("mode={mode} "));
+            out.push_str(&format!("mode={} ", prompt_env_value(mode, 80)));
         }
         if let Some(retry_after) = state.retry_after {
             out.push_str(&format!("retry_after={retry_after}s "));
@@ -11173,7 +11251,10 @@ fn render_provider_health_prompt(health: &ProviderHealthLedger) -> String {
         if let Some(err) = &state.last_error {
             out.push_str(&format!(
                 "last_error={} ",
-                summarize_inline(&normalize_http_status_noise(err), 160)
+                prompt_env_value(
+                    &summarize_inline(&normalize_http_status_noise(err), 160),
+                    160
+                )
             ));
         }
         out.push('\n');
@@ -11516,6 +11597,8 @@ fn render_context_state_prompt(history: &[Message], ledger: &WorkLedger) -> Stri
     }
 
     if !actions.is_empty() {
+        // Before the first result every counter is necessarily zero. Once any
+        // action exists, emit every row so mutation-driven resets remain visible.
         let budgets = context_strategy_budget_usage(&actions);
         out.push_str("Strategy budget:\n");
         for strategy in [
@@ -14820,6 +14903,7 @@ impl Agent {
                 break;
             }
             prompt_sources.push(path.clone());
+            let label = prompt_env_value(label, 512);
             let section = format!(
                 "\n\n## Project-controlled guidance (DEXT.md from {label})\n{}",
                 content
@@ -14846,6 +14930,7 @@ impl Agent {
                 break;
             }
             prompt_sources.push(path.clone());
+            let label = prompt_env_value(label, 512);
             let section = format!("\n\n## Recall (recall.md from {label})\n{}", content);
             if section.len() <= context_budget {
                 stable.push_str(&section);
@@ -14890,16 +14975,16 @@ impl Agent {
         let mut env = String::from("## Environment\n");
         env.push_str(&format!(
             "cwd={} os={}",
-            self.sandbox_root.display(),
+            prompt_env_value(&self.sandbox_root.display().to_string(), 2_048),
             std::env::consts::OS
         ));
         if let Some(git) = &self.git_context {
-            env.push_str(&format!(" git={git}"));
+            env.push_str(&format!(" git={}", prompt_env_value(git, 256)));
         }
         env.push_str(&format!(
             " provider={} model={} effort={} context={} approval={} sandbox={}\n",
-            self.provider_id,
-            self.model,
+            prompt_env_value(&self.provider_id, 128),
+            prompt_env_value(&self.model, 256),
             self.thinking_effort.as_str(),
             self.context_mode.as_str(),
             self.approval_profile.as_str(),
@@ -15277,44 +15362,27 @@ impl Agent {
         self.tool_profile
     }
 
-    fn wire_tools(&self) -> Vec<WireTool> {
+    fn provider_neutral_tools(&self) -> Vec<tools::ProviderNeutralTool> {
         if !self.model_supports_tools() {
             return Vec::new();
         }
-        let mut wire = tools::wire_tools(&self.tools, self.wire_tool_profile());
+        let mut neutral = tools::provider_neutral_tools(&self.tools, self.wire_tool_profile());
         if let Some(runtime) = &self.active_pack_runtime {
-            wire.extend(runtime.tools.iter().map(|tool| WireTool {
+            neutral.extend(runtime.tools.iter().map(|tool| tools::ProviderNeutralTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                input_schema: tool.input_schema.clone(),
-                cache_control: None,
+                schema: tool.input_schema.clone(),
             }));
         }
-        for tool in &mut wire {
-            tool.cache_control = None;
-        }
-        if let Some(last) = wire.last_mut() {
-            last.cache_control = Some(CacheControl::for_prompt());
-        }
-        wire
+        neutral
+    }
+
+    fn wire_tools(&self) -> Vec<WireTool> {
+        tools::wire_tools_from_neutral(self.provider_neutral_tools())
     }
 
     fn wire_tools_oai(&self) -> Vec<OaiTool> {
-        if !self.model_supports_tools() {
-            return Vec::new();
-        }
-        let mut wire = tools::wire_tools_oai(&self.tools, self.wire_tool_profile());
-        if let Some(runtime) = &self.active_pack_runtime {
-            wire.extend(runtime.tools.iter().map(|tool| OaiTool {
-                r#type: "function".to_string(),
-                function: OaiFunctionDef {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
-                    parameters: tool.input_schema.clone(),
-                },
-            }));
-        }
-        wire
+        tools::wire_oai_tools_from_neutral(self.provider_neutral_tools())
     }
 
     fn tool_use_ids_in_messages(messages: &[Message]) -> HashSet<String> {
@@ -15450,22 +15518,7 @@ impl Agent {
     }
 
     fn wire_tools_chatgpt(&self) -> Vec<Value> {
-        if !self.model_supports_tools() {
-            return Vec::new();
-        }
-        let mut wire = tools::wire_tools_chatgpt(&self.tools, self.wire_tool_profile());
-        if let Some(runtime) = &self.active_pack_runtime {
-            wire.extend(runtime.tools.iter().map(|tool| {
-                json!({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
-                    "strict": Value::Null,
-                })
-            }));
-        }
-        wire
+        tools::wire_responses_tools_from_neutral(self.provider_neutral_tools())
     }
 
     fn wire_tools_openai_responses(&self) -> Vec<Value> {
