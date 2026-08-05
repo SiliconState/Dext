@@ -446,7 +446,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/allow",
         args: "<tool>",
-        help: "auto-approve tool",
+        help: "auto-approve native/runtime tool",
     },
     SlashCmd {
         name: "/revoke",
@@ -456,7 +456,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd {
         name: "/allowed",
         args: "",
-        help: "list auto-approved tools",
+        help: "list native/runtime grants",
     },
     SlashCmd {
         name: "/trust",

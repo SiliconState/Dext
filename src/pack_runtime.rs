@@ -530,7 +530,7 @@ pub(crate) fn load(
     let timeout = runtime_timeout(manifest.timeout_seconds)?;
     Ok(Some(ActiveRuntime {
         pack_name: pack.name.clone(),
-        pack_source: pack.source.clone(),
+        pack_source: pack.source_identity(),
         executable,
         executable_sha256,
         args: manifest.args,
@@ -690,6 +690,7 @@ pub(crate) fn validate_pending_continuations(prompts: &[(String, u64)]) -> Resul
             if prompt.trim().is_empty()
                 || prompt.len() > RUNTIME_CONTENT_CAP
                 || *delay_ms > RUNTIME_MAX_DELAY_MS
+                || contains_unsafe_runtime_control(prompt, true)
             {
                 bail!("pack runtime pending continuation exceeds its size or delay limit");
             }
@@ -703,6 +704,11 @@ pub(crate) fn validate_pending_continuations(prompts: &[(String, u64)]) -> Resul
     Ok(())
 }
 
+fn contains_unsafe_runtime_control(text: &str, multiline: bool) -> bool {
+    text.chars()
+        .any(|ch| ch.is_control() && !(multiline && matches!(ch, '\n' | '\t')))
+}
+
 fn validate_response(response: &RuntimeResponse) -> Result<()> {
     if response.version != RUNTIME_PROTOCOL_VERSION {
         bail!(
@@ -714,6 +720,9 @@ fn validate_response(response: &RuntimeResponse) -> Result<()> {
     if response.content.len() > RUNTIME_CONTENT_CAP {
         bail!("pack runtime content exceeds {RUNTIME_CONTENT_CAP} bytes");
     }
+    if contains_unsafe_runtime_control(&response.content, true) {
+        bail!("pack runtime content contains unsafe terminal control characters");
+    }
     if response.effects.len() > RUNTIME_EFFECT_LIMIT {
         bail!("pack runtime returned more than {RUNTIME_EFFECT_LIMIT} effects");
     }
@@ -723,21 +732,26 @@ fn validate_response(response: &RuntimeResponse) -> Result<()> {
     for effect in &response.effects {
         match effect {
             RuntimeEffect::Steer { text }
-                if text.trim().is_empty() || text.len() > RUNTIME_CONTENT_CAP =>
+                if text.trim().is_empty()
+                    || text.len() > RUNTIME_CONTENT_CAP
+                    || contains_unsafe_runtime_control(text, true) =>
             {
                 bail!("pack runtime steer effect exceeds its size limit");
             }
             RuntimeEffect::Continue { prompt, delay_ms }
                 if prompt.trim().is_empty()
                     || prompt.len() > RUNTIME_CONTENT_CAP
-                    || *delay_ms > RUNTIME_MAX_DELAY_MS =>
+                    || *delay_ms > RUNTIME_MAX_DELAY_MS
+                    || contains_unsafe_runtime_control(prompt, true) =>
             {
                 bail!("pack runtime continue effect exceeds its size or delay limit");
             }
             RuntimeEffect::View { title, markdown }
                 if title.trim().is_empty()
                     || title.len() > 256
-                    || markdown.len() > RUNTIME_VIEW_CAP =>
+                    || markdown.len() > RUNTIME_VIEW_CAP
+                    || contains_unsafe_runtime_control(title, false)
+                    || contains_unsafe_runtime_control(markdown, true) =>
             {
                 bail!("pack runtime view effect exceeds its size limit");
             }
@@ -751,11 +765,15 @@ fn runtime_timeout(configured: Option<u64>) -> Result<Duration> {
     if configured.is_some_and(|seconds| !(1..=RUNTIME_MAX_TIMEOUT_SECS).contains(&seconds)) {
         bail!("pack runtime timeout_seconds must be between 1 and {RUNTIME_MAX_TIMEOUT_SECS}");
     }
-    let seconds = std::env::var("DEXT_PACK_RUNTIME_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .or(configured)
-        .unwrap_or(RUNTIME_DEFAULT_TIMEOUT_SECS);
+    let seconds = match std::env::var("DEXT_PACK_RUNTIME_TIMEOUT_SECS") {
+        Ok(value) => value.parse::<u64>().with_context(
+            || "DEXT_PACK_RUNTIME_TIMEOUT_SECS must be an integer between 1 and 604800",
+        )?,
+        Err(std::env::VarError::NotPresent) => configured.unwrap_or(RUNTIME_DEFAULT_TIMEOUT_SECS),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("DEXT_PACK_RUNTIME_TIMEOUT_SECS must be valid Unicode")
+        }
+    };
     if !(1..=RUNTIME_MAX_TIMEOUT_SECS).contains(&seconds) {
         bail!("pack runtime timeout_seconds must be between 1 and {RUNTIME_MAX_TIMEOUT_SECS}");
     }
@@ -900,13 +918,34 @@ mod tests {
     }
 
     #[test]
-    fn runtime_timeout_manifest_bound_is_fail_closed() {
+    fn runtime_timeout_manifest_and_override_bounds_are_fail_closed() {
+        let _guard = crate::test_env_lock();
+        let old = std::env::var_os("DEXT_PACK_RUNTIME_TIMEOUT_SECS");
+        unsafe {
+            std::env::remove_var("DEXT_PACK_RUNTIME_TIMEOUT_SECS");
+        }
         assert!(runtime_timeout(Some(0)).is_err());
         assert!(runtime_timeout(Some(RUNTIME_MAX_TIMEOUT_SECS + 1)).is_err());
+        unsafe {
+            std::env::set_var("DEXT_PACK_RUNTIME_TIMEOUT_SECS", "not-a-number");
+        }
+        let error = runtime_timeout(Some(10)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("DEXT_PACK_RUNTIME_TIMEOUT_SECS must be an integer"),
+            "{error:#}"
+        );
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var("DEXT_PACK_RUNTIME_TIMEOUT_SECS", value),
+                None => std::env::remove_var("DEXT_PACK_RUNTIME_TIMEOUT_SECS"),
+            }
+        }
     }
 
     #[test]
-    fn runtime_response_effects_are_bounded() {
+    fn runtime_response_effects_are_bounded_and_terminal_safe() {
         let response = RuntimeResponse {
             version: 1,
             content: String::new(),
@@ -918,6 +957,37 @@ mod tests {
             }],
         };
         assert!(validate_response(&response).is_ok());
+
+        for response in [
+            RuntimeResponse {
+                version: 1,
+                content: "unsafe\u{1b}[2J".to_string(),
+                is_error: false,
+                state: None,
+                effects: Vec::new(),
+            },
+            RuntimeResponse {
+                version: 1,
+                content: String::new(),
+                is_error: false,
+                state: None,
+                effects: vec![RuntimeEffect::Steer {
+                    text: "unsafe\u{7}".to_string(),
+                }],
+            },
+            RuntimeResponse {
+                version: 1,
+                content: String::new(),
+                is_error: false,
+                state: None,
+                effects: vec![RuntimeEffect::View {
+                    title: "unsafe\nview".to_string(),
+                    markdown: "safe markdown".to_string(),
+                }],
+            },
+        ] {
+            assert!(validate_response(&response).is_err(), "{response:?}");
+        }
     }
 
     #[cfg(unix)]

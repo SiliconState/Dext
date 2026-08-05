@@ -10476,6 +10476,24 @@ const PROJECT_EXTENSIONS_APPROVAL_NAME: &str = "project_extensions";
 const PROJECT_EXTENSIONS_APPROVAL_FILE: &str = "project-extensions-approved";
 const CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME: &str = "checkpoint_recovery_gap";
 
+fn pack_runtime_occupied_names() -> HashSet<String> {
+    let mut names = tools::registered_tool_names()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    names.extend(
+        [
+            HOOKS_APPROVAL_NAME,
+            PACK_RUNTIME_APPROVAL_NAME,
+            PROJECT_EXTENSIONS_APPROVAL_NAME,
+            CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME,
+            DIAGNOSTICS_APPROVAL_NAME,
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    names
+}
+
 #[derive(Deserialize, Clone, Default)]
 struct Hook {
     #[serde(rename = "match")]
@@ -13626,6 +13644,7 @@ impl Agent {
         }
         if profile_changed {
             self.approved_pack_runtime = None;
+            changed += self.deactivate_pack_runtime();
         }
         if profile_changed && self.allowed.remove(HOOKS_APPROVAL_NAME) {
             changed += 1;
@@ -13637,6 +13656,7 @@ impl Agent {
         if self.sandbox_profile != profile {
             self.allowed.remove(HOOKS_APPROVAL_NAME);
             self.approved_pack_runtime = None;
+            self.deactivate_pack_runtime();
         }
         self.sandbox_profile = profile;
     }
@@ -14025,8 +14045,7 @@ impl Agent {
         let project_changed = project_key(&self.sandbox_root) != project_key(&root);
         self.pack_hook_env.clear();
         self.active_pack_hook_paths.clear();
-        self.active_pack_runtime = None;
-        self.pending_pack_runtime_prompts.clear();
+        self.deactivate_pack_runtime();
         if root_changed {
             self.approved_pack_runtime = None;
             self.allowed.clear();
@@ -14086,29 +14105,33 @@ impl Agent {
         }
     }
 
-    fn deactivate_pack_runtime(&mut self) {
+    fn deactivate_pack_runtime(&mut self) -> usize {
+        let mut removed_grants = 0usize;
         if let Some(previous) = self.active_pack_runtime.take() {
             for tool in previous.tools {
-                self.allowed.remove(&tool.name);
+                removed_grants += usize::from(self.allowed.remove(&tool.name));
                 self.deny_tools.remove(&tool.name);
             }
         }
         self.pending_pack_runtime_prompts.clear();
+        removed_grants
     }
 
-    fn pack_runtime_execution_approved(
+    fn pack_runtime_execution_decision(
         &mut self,
         pack: &packs::PackInfo,
         runtime: &pack_runtime::ActiveRuntime,
-    ) -> bool {
+        reuse_cached_approval: bool,
+    ) -> (bool, Option<pack_runtime::RuntimeApprovalIdentity>) {
         if self.approval_profile == ApprovalProfile::Never {
-            return false;
+            return (false, None);
         }
         let identity = runtime.approval_identity();
-        if self.approval_profile == ApprovalProfile::Always
-            || self.approved_pack_runtime.as_ref() == Some(&identity)
-        {
-            return true;
+        if self.approval_profile == ApprovalProfile::Always {
+            return (true, None);
+        }
+        if reuse_cached_approval && self.approved_pack_runtime.as_ref() == Some(&identity) {
+            return (true, Some(identity));
         }
         let approval_input = json!({
             "operation": format!("activate executable pack runtime '{}'", pack.name),
@@ -14121,20 +14144,28 @@ impl Agent {
             .sink
             .request_permission(PACK_RUNTIME_APPROVAL_NAME, &approval_input)
         {
-            Choice::Once => true,
-            Choice::Always => {
-                self.approved_pack_runtime = Some(identity);
-                true
-            }
-            Choice::Deny => false,
+            Choice::Once => (true, None),
+            Choice::Always => (true, Some(identity)),
+            Choice::Deny => (false, None),
         }
+    }
+
+    fn pack_runtime_execution_approved(
+        &mut self,
+        pack: &packs::PackInfo,
+        runtime: &pack_runtime::ActiveRuntime,
+    ) -> bool {
+        let (approved, persistent_identity) =
+            self.pack_runtime_execution_decision(pack, runtime, true);
+        if let Some(identity) = persistent_identity {
+            self.approved_pack_runtime = Some(identity);
+        }
+        approved
     }
 
     async fn activate_pack_runtime(&mut self, pack: &packs::PackInfo) -> Result<String> {
         self.deactivate_pack_runtime();
-        let occupied_names = tools::registered_tool_names()
-            .map(str::to_string)
-            .collect::<HashSet<_>>();
+        let occupied_names = pack_runtime_occupied_names();
         let Some(runtime) = pack_runtime::load(pack, &occupied_names)? else {
             self.active_pack_runtime = None;
             return Ok(String::new());
@@ -16074,6 +16105,9 @@ impl Agent {
             provenance,
             ..
         } = parse_session_header(header.trim_end())?;
+        if active_pack_runtimes.len() > 1 {
+            anyhow::bail!("session declares more than one active pack runtime");
+        }
         if let Some(expected) = expected_seat
             && let Some(actual) = seat.as_ref().map(|seat| seat.id.as_str())
             && actual != expected
@@ -16128,6 +16162,66 @@ impl Agent {
         let source_journal = tool_journal::load_for_session_file(path)
             .context("loading source session tool journal")?;
         let recovery = reconcile_pending_tool_calls(&mut hist, source_journal.as_deref())?;
+
+        let runtime_root = restored_sandbox
+            .as_ref()
+            .unwrap_or(&self.sandbox_root)
+            .clone();
+        let mut prepared_runtime = None;
+        let mut prepared_pending_prompts = Vec::new();
+        let mut prepared_runtime_approval = None;
+        let mut prepared_project_extensions_approval = None;
+        let mut runtime_restore_warning = None;
+        if let Some(snapshot) = active_pack_runtimes.first() {
+            let project_runtime = snapshot.pack_source.starts_with("project:");
+            let project_approved = if project_runtime {
+                let cached = (runtime_root == self.sandbox_root)
+                    .then_some(self.project_extensions_approved)
+                    .flatten();
+                let approved = project_extensions_approval_decision(self, &runtime_root, cached);
+                prepared_project_extensions_approval = Some(approved);
+                approved
+            } else {
+                true
+            };
+            if project_approved {
+                let pack = packs::find_pack_exact_source(
+                    &runtime_root,
+                    &snapshot.pack_name,
+                    &snapshot.pack_source,
+                )
+                .with_context(|| format!("restoring pack runtime {}", snapshot.pack_name))?;
+                if pack.name != snapshot.pack_name || pack.source_identity() != snapshot.pack_source
+                {
+                    anyhow::bail!(
+                        "pack runtime identity or source changed since the session was saved"
+                    );
+                }
+                let occupied_names = pack_runtime_occupied_names();
+                let mut runtime = pack_runtime::load(&pack, &occupied_names)?
+                    .context("saved pack no longer declares a runtime")?;
+                runtime.restore_state(snapshot)?;
+                let reuse_cached_approval = runtime_root == self.sandbox_root;
+                let (approved, persistent_identity) =
+                    self.pack_runtime_execution_decision(&pack, &runtime, reuse_cached_approval);
+                if approved {
+                    prepared_pending_prompts = snapshot.pending_continuations.clone();
+                    prepared_runtime = Some(runtime);
+                    prepared_runtime_approval = persistent_identity;
+                } else {
+                    runtime_restore_warning = Some(format!(
+                        "pack runtime '{}' was not restored because executable runtime access was not approved",
+                        snapshot.pack_name
+                    ));
+                }
+            } else {
+                runtime_restore_warning = Some(format!(
+                    "project pack runtime '{}' was not restored because project extensions were not approved",
+                    snapshot.pack_name
+                ));
+            }
+        }
+
         if let Some(restored) = restored_sandbox {
             self.set_sandbox_root(restored)?;
         }
@@ -16170,37 +16264,14 @@ impl Agent {
         self.set_context_mode_automatic(restored_context_mode);
         self.tool_context_profile = tool_context_profile.effective(restored_context_mode);
         self.tool_profile = tool_profile;
-        self.active_pack_runtime = None;
-        self.pending_pack_runtime_prompts.clear();
-        if active_pack_runtimes.len() > 1 {
-            anyhow::bail!("session declares more than one active pack runtime");
+        self.active_pack_runtime = prepared_runtime;
+        self.pending_pack_runtime_prompts = prepared_pending_prompts;
+        self.approved_pack_runtime = prepared_runtime_approval;
+        if prepared_project_extensions_approval.is_some() {
+            self.project_extensions_approved = prepared_project_extensions_approval;
         }
-        if let Some(snapshot) = active_pack_runtimes.first() {
-            let project_runtime = snapshot.pack_source.starts_with("project:");
-            if !project_runtime || approve_project_extensions(self) {
-                let pack = packs::find_pack(&self.sandbox_root, &snapshot.pack_name)
-                    .with_context(|| format!("restoring pack runtime {}", snapshot.pack_name))?;
-                let occupied_names = tools::registered_tool_names()
-                    .map(str::to_string)
-                    .collect::<HashSet<_>>();
-                let mut runtime = pack_runtime::load(&pack, &occupied_names)?
-                    .context("saved pack no longer declares a runtime")?;
-                runtime.restore_state(snapshot)?;
-                if self.pack_runtime_execution_approved(&pack, &runtime) {
-                    self.pending_pack_runtime_prompts = snapshot.pending_continuations.clone();
-                    self.active_pack_runtime = Some(runtime);
-                } else {
-                    self.sink.emit(AgentEvent::Warn(format!(
-                        "pack runtime '{}' was not restored because executable runtime access was not approved",
-                        snapshot.pack_name
-                    )));
-                }
-            } else {
-                self.sink.emit(AgentEvent::Warn(format!(
-                    "project pack runtime '{}' was not restored because project extensions were not approved",
-                    snapshot.pack_name
-                )));
-            }
+        if let Some(warning) = runtime_restore_warning {
+            self.sink.emit(AgentEvent::Warn(warning));
         }
         self.allowed.clear();
         self.refresh_tools_for_context();
@@ -20360,16 +20431,18 @@ fn reset_project_extensions_approval(agent: &mut Agent) -> Result<()> {
     Ok(())
 }
 
-fn approve_project_extensions(agent: &mut Agent) -> bool {
-    if let Some(approved) = agent.project_extensions_approved {
+fn project_extensions_approval_decision(
+    agent: &mut Agent,
+    root: &Path,
+    cached: Option<bool>,
+) -> bool {
+    if let Some(approved) = cached {
         return approved;
     }
-    if project_extensions_always_approved(&agent.sandbox_root) {
-        agent.project_extensions_approved = Some(true);
+    if project_extensions_always_approved(root) {
         return true;
     }
     if agent.approval_profile == ApprovalProfile::Never {
-        agent.project_extensions_approved = Some(false);
         return false;
     }
     let input = json!({
@@ -20377,12 +20450,12 @@ fn approve_project_extensions(agent: &mut Agent) -> bool {
         "paths": [".dext/shelves/*/shelf.json", ".dext/shelves/*/packs/*/PACK.md"],
         "risk": "repository-controlled text can steer the model; tool side effects still use normal approval and sandbox controls"
     });
-    let approved = match agent
+    match agent
         .sink
         .request_permission(PROJECT_EXTENSIONS_APPROVAL_NAME, &input)
     {
         Choice::Once => true,
-        Choice::Always => match persist_project_extensions_approval(&agent.sandbox_root) {
+        Choice::Always => match persist_project_extensions_approval(root) {
             Ok(()) => true,
             Err(error) => {
                 agent.sink.emit(AgentEvent::Warn(format!(
@@ -20392,7 +20465,13 @@ fn approve_project_extensions(agent: &mut Agent) -> bool {
             }
         },
         Choice::Deny => false,
-    };
+    }
+}
+
+fn approve_project_extensions(agent: &mut Agent) -> bool {
+    let root = agent.sandbox_root.clone();
+    let approved =
+        project_extensions_approval_decision(agent, &root, agent.project_extensions_approved);
     agent.project_extensions_approved = Some(approved);
     approved
 }
@@ -20603,10 +20682,13 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /allow <tool>             auto-approve this tool for the session"
+                "  /allow <tool>             auto-approve a native or active runtime tool"
             );
             let _ = writeln!(w, "  /revoke <tool>            remove auto-approval");
-            let _ = writeln!(w, "  /allowed                  list auto-approved tools");
+            let _ = writeln!(
+                w,
+                "  /allowed                  list native and active-runtime grants"
+            );
             let _ = writeln!(
                 w,
                 "  /trust [on|off|status]   auto-approve all privileged tools"
@@ -20826,7 +20908,9 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "allow" => {
             if arg.is_empty() {
                 let _ = writeln!(w, "usage: /allow <tool>");
-            } else if !agent.tools.iter().any(|t| t.name == arg) && arg != DIAGNOSTICS_APPROVAL_NAME
+            } else if !agent.tools.iter().any(|t| t.name == arg)
+                && agent.active_runtime_tool(arg).is_none()
+                && arg != DIAGNOSTICS_APPROVAL_NAME
             {
                 let _ = writeln!(w, "no such tool or operation: {arg}");
             } else {
@@ -20848,6 +20932,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 .filter(|name| {
                     name.as_str() == DIAGNOSTICS_APPROVAL_NAME
                         || agent.tools.iter().any(|tool| tool.name == name.as_str())
+                        || agent.active_runtime_tool(name).is_some()
                 })
                 .cloned()
                 .collect();

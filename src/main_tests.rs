@@ -14429,6 +14429,327 @@ fn pack_runtime_always_approval_is_exact_identity_scoped() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
+#[test]
+fn pack_runtime_rejects_host_approval_operation_names() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("pack-runtime-reserved-approval-names");
+    std::fs::write(
+        root.join("PACK.md"),
+        "---\nname: reserved-runtime\ndescription: reserved names\n---\n",
+    )?;
+    let executable = root.join("runtime.sh");
+    std::fs::write(&executable, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    let pack = packs::PackInfo {
+        name: "reserved-runtime".to_string(),
+        description: "reserved names".to_string(),
+        path: root.clone(),
+        pack_md_path: root.join("PACK.md"),
+        phooks_path: None,
+        runtime_path: Some(root.join(pack_runtime::RUNTIME_MANIFEST_NAME)),
+        credential_env: Vec::new(),
+        credential_env_ignored: false,
+        source: "user:test".to_string(),
+        shelf: Some("test".to_string()),
+    };
+    let occupied = pack_runtime_occupied_names();
+
+    for name in [
+        HOOKS_APPROVAL_NAME,
+        PACK_RUNTIME_APPROVAL_NAME,
+        PROJECT_EXTENSIONS_APPROVAL_NAME,
+        CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME,
+        DIAGNOSTICS_APPROVAL_NAME,
+    ] {
+        assert!(occupied.contains(name));
+        std::fs::write(
+            pack.runtime_path.as_ref().context("runtime manifest")?,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "command": "runtime.sh",
+                "tools": [{
+                    "name": name,
+                    "description": "must collide",
+                    "risk": "write",
+                    "input_schema": {"type": "object", "additionalProperties": false}
+                }]
+            }))?,
+        )?;
+        let error = pack_runtime::load(&pack, &occupied)
+            .expect_err("host approval operation must collide with runtime tool");
+        assert!(error.to_string().contains("collides"), "{name}: {error:#}");
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn pack_runtime_activation_is_revoked_when_safety_policy_changes() {
+    fn runtime(root: &Path) -> pack_runtime::ActiveRuntime {
+        pack_runtime::ActiveRuntime {
+            pack_name: "demo".to_string(),
+            pack_source: "user:test".to_string(),
+            executable: root.join("runtime"),
+            executable_sha256: "digest".to_string(),
+            args: Vec::new(),
+            timeout: std::time::Duration::from_secs(1),
+            tools: vec![pack_runtime::RuntimeTool {
+                name: "demo_write".to_string(),
+                description: "demo".to_string(),
+                input_schema: json!({"type": "object"}),
+                risk: pack_runtime::RuntimeRisk::Write,
+            }],
+            manifest_sha256: "manifest".to_string(),
+            state: Value::Null,
+            max_continuations: 2,
+            continuations_used: 1,
+        }
+    }
+
+    let root = temp_test_dir("pack-runtime-policy-revocation");
+    let mut agent = test_agent(&root);
+    let active = runtime(&root);
+    agent.approved_pack_runtime = Some(active.approval_identity());
+    agent.active_pack_runtime = Some(active);
+    agent
+        .pending_pack_runtime_prompts
+        .push(("continue".to_string(), 10));
+    agent.allowed.insert("demo_write".to_string());
+    agent.deny_tools.insert("demo_write".to_string());
+
+    let next_approval = if agent.approval_profile == ApprovalProfile::AutoRead {
+        ApprovalProfile::Ask
+    } else {
+        ApprovalProfile::AutoRead
+    };
+    assert_eq!(agent.set_approval_profile(next_approval), 1);
+    assert!(agent.active_pack_runtime.is_none());
+    assert!(agent.approved_pack_runtime.is_none());
+    assert!(agent.pending_pack_runtime_prompts.is_empty());
+    assert!(!agent.allowed.contains("demo_write"));
+    assert!(!agent.deny_tools.contains("demo_write"));
+
+    let active = runtime(&root);
+    agent.approved_pack_runtime = Some(active.approval_identity());
+    agent.active_pack_runtime = Some(active);
+    agent
+        .pending_pack_runtime_prompts
+        .push(("continue again".to_string(), 10));
+    agent.allowed.insert("demo_write".to_string());
+    agent.deny_tools.insert("demo_write".to_string());
+    let next_sandbox = if agent.sandbox_profile == SandboxProfile::ReadOnly {
+        SandboxProfile::WorkspaceWrite
+    } else {
+        SandboxProfile::ReadOnly
+    };
+    agent.set_sandbox_profile(next_sandbox);
+    assert!(agent.active_pack_runtime.is_none());
+    assert!(agent.approved_pack_runtime.is_none());
+    assert!(agent.pending_pack_runtime_prompts.is_empty());
+    assert!(!agent.allowed.contains("demo_write"));
+    assert!(!agent.deny_tools.contains("demo_write"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn failed_pack_runtime_restore_does_not_partially_apply_session_state() -> Result<()> {
+    let root = temp_test_dir("pack-runtime-restore-atomic");
+    let current_root = root.join("current");
+    let saved_root = root.join("saved");
+    std::fs::create_dir_all(&current_root)?;
+    std::fs::create_dir_all(&saved_root)?;
+    let current_root = std::fs::canonicalize(current_root)?;
+    let saved_root = std::fs::canonicalize(saved_root)?;
+    let path = root.join("missing-runtime-pack.jsonl");
+    let header = SessionHeader {
+        model: "must-not-apply".to_string(),
+        sandbox: Some(saved_root.display().to_string()),
+        active_pack_runtimes: vec![pack_runtime::RuntimeSnapshot {
+            pack_name: "definitely-missing-runtime-pack".to_string(),
+            pack_source: "user:test".to_string(),
+            manifest_sha256: "missing".to_string(),
+            state: Value::Null,
+            continuations_used: 0,
+            pending_continuations: Vec::new(),
+        }],
+        ..SessionHeader::default()
+    };
+    std::fs::write(&path, format!("{}\n", serde_json::to_string(&header)?))?;
+
+    let mut agent = test_agent(&current_root);
+    agent.model = "current-model".to_string();
+    let error = agent
+        .load_session_from_path(&path)
+        .expect_err("missing saved runtime pack must fail restore");
+    let error_chain = format!("{error:#}");
+    assert!(error_chain.contains("not found"), "{error_chain}");
+    assert_eq!(agent.sandbox_root, current_root);
+    assert_eq!(agent.model, "current-model");
+    assert!(agent.history.is_empty());
+    assert!(agent.active_pack_runtime.is_none());
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn valid_pack_runtime_restore_commits_prepared_state_after_preflight() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("pack-runtime-restore-valid");
+    let current_root = root.join("current");
+    let saved_root = root.join("saved");
+    let pack_root = saved_root.join(".dext/shelves/test/packs/restore-demo");
+    std::fs::create_dir_all(&current_root)?;
+    std::fs::create_dir_all(&pack_root)?;
+    let current_root = std::fs::canonicalize(current_root)?;
+    let saved_root = std::fs::canonicalize(saved_root)?;
+    std::fs::write(
+        pack_root.join("PACK.md"),
+        "---\nname: restore-demo\ndescription: restore test\n---\n",
+    )?;
+    let executable = pack_root.join("runtime.sh");
+    std::fs::write(&executable, "#!/bin/sh\nexit 0\n")?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(
+        pack_root.join(pack_runtime::RUNTIME_MANIFEST_NAME),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "command": "runtime.sh",
+            "max_continuations": 2,
+            "tools": [{
+                "name": "restore_status",
+                "description": "restore status",
+                "risk": "read",
+                "input_schema": {"type": "object", "additionalProperties": false}
+            }]
+        }))?,
+    )?;
+    let pack = packs::find_pack(&saved_root, "restore-demo")?;
+    let occupied_names = tools::registered_tool_names()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let mut runtime = pack_runtime::load(&pack, &occupied_names)?.context("runtime")?;
+    runtime.state = json!({"restored": true});
+    runtime.continuations_used = 1;
+    let pending = vec![("continue restored work".to_string(), 10)];
+    let snapshot = runtime.snapshot(&pending);
+    let path = root.join("valid-runtime.jsonl");
+    let header = SessionHeader {
+        model: "restored-model".to_string(),
+        sandbox: Some(saved_root.display().to_string()),
+        active_pack_runtimes: vec![snapshot],
+        ..SessionHeader::default()
+    };
+    std::fs::write(&path, format!("{}\n", serde_json::to_string(&header)?))?;
+
+    let mut agent = test_agent(&current_root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    agent.load_session_from_path(&path)?;
+    assert_eq!(agent.sandbox_root, saved_root);
+    assert_eq!(agent.model, "restored-model");
+    let restored = agent
+        .active_pack_runtime
+        .as_ref()
+        .context("restored runtime")?;
+    assert_eq!(restored.pack_name, "restore-demo");
+    assert_eq!(restored.state, json!({"restored": true}));
+    assert_eq!(restored.continuations_used, 1);
+    assert_eq!(agent.pending_pack_runtime_prompts, pending);
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_runtime_restore_uses_exact_saved_source_despite_name_shadowing() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-runtime-restore-shadow");
+    let home = root.join("home");
+    let project_pack = root.join(".dext/shelves/project/packs/shadow-runtime");
+    let user_pack = home.join("shelves/user/packs/shadow-runtime");
+    std::fs::create_dir_all(&project_pack)?;
+    std::fs::create_dir_all(&user_pack)?;
+    let write_pack = |pack: &Path, marker: &str| -> Result<()> {
+        std::fs::write(
+            pack.join("PACK.md"),
+            format!("---\nname: shadow-runtime\ndescription: {marker}\n---\n"),
+        )?;
+        let executable = pack.join("runtime.sh");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"version\":1,\"content\":\"{marker}\",\"state\":null,\"effects\":[]}}'\n"
+            ),
+        )?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(
+            pack.join(pack_runtime::RUNTIME_MANIFEST_NAME),
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "command": "runtime.sh",
+                "tools": [{
+                    "name": "shadow_status",
+                    "description": "shadow status",
+                    "risk": "read",
+                    "input_schema": {"type": "object", "additionalProperties": false}
+                }]
+            }))?,
+        )?;
+        Ok(())
+    };
+    write_pack(&user_pack, "user")?;
+    let old_home = std::env::var_os("DEXT_HOME");
+    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &home);
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+
+    let pack = packs::find_pack(&root, "shadow-runtime")?;
+    assert_eq!(pack.path, user_pack);
+    let user_source = pack.source_identity();
+    let occupied_names = tools::registered_tool_names()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let runtime = pack_runtime::load(&pack, &occupied_names)?.context("runtime")?;
+    write_pack(&project_pack, "project")?;
+    let path = root.join("shadow-runtime.jsonl");
+    let header = SessionHeader {
+        sandbox: Some(root.display().to_string()),
+        active_pack_runtimes: vec![runtime.snapshot(&[])],
+        ..SessionHeader::default()
+    };
+    std::fs::write(&path, format!("{}\n", serde_json::to_string(&header)?))?;
+
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.load_session_from_path(&path)?;
+    let restored = agent
+        .active_pack_runtime
+        .as_ref()
+        .context("restored runtime")?;
+    assert_eq!(restored.pack_source, user_source);
+    assert_eq!(restored.executable, user_pack.join("runtime.sh"));
+
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
 #[test]
 fn pack_runtime_invocation_application_is_atomic() {
     let root = temp_test_dir("pack-runtime-atomic-effects");
@@ -16176,6 +16497,49 @@ fn slash_tools_switches_specialized_tool_visibility() {
     assert!(slash.contains("tools -> full"), "{slash}");
     assert!(slash.contains("context mode -> frugal"), "{slash}");
     assert!(slash.contains("tools -> default"), "{slash}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn slash_allow_and_allowed_include_active_runtime_tools() {
+    let root = temp_test_dir("slash-runtime-allow");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.active_pack_runtime = Some(pack_runtime::ActiveRuntime {
+        pack_name: "demo".to_string(),
+        pack_source: "user:test".to_string(),
+        executable: root.join("runtime"),
+        executable_sha256: "digest".to_string(),
+        args: Vec::new(),
+        timeout: std::time::Duration::from_secs(1),
+        tools: vec![pack_runtime::RuntimeTool {
+            name: "runtime_write".to_string(),
+            description: "runtime write".to_string(),
+            input_schema: json!({"type":"object"}),
+            risk: pack_runtime::RuntimeRisk::Write,
+        }],
+        manifest_sha256: "manifest".to_string(),
+        state: Value::Null,
+        max_continuations: 1,
+        continuations_used: 0,
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(handle_slash("/allow runtime_write", &mut agent), Some(true));
+    assert!(agent.allowed.contains("runtime_write"));
+    assert_eq!(handle_slash("/allowed", &mut agent), Some(true));
+    let slash = drain_events(&mut rx)
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::Slash(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(slash.contains("auto-approving: runtime_write"), "{slash}");
+    assert!(slash.contains("runtime_write"), "{slash}");
 
     let _ = std::fs::remove_dir_all(&root);
 }

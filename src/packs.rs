@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Read as _;
@@ -44,6 +45,10 @@ struct PackFrontMatter {
 impl PackInfo {
     pub(crate) fn env_var_name(&self) -> String {
         pack_env_var_name(&self.name)
+    }
+
+    pub(crate) fn source_identity(&self) -> String {
+        pack_source_identity(&self.source, &self.path)
     }
 
     #[cfg(test)]
@@ -288,6 +293,23 @@ fn push_shelf_root(
     }
 }
 
+fn shelf_root_fingerprint(path: &Path) -> String {
+    let canonical = canonicalize_or_clone(path);
+    let identity = if cfg!(windows) {
+        canonical.to_string_lossy().to_lowercase()
+    } else {
+        canonical.to_string_lossy().to_string()
+    };
+    Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn pack_source_identity(source: &str, path: &Path) -> String {
+    format!("{source}#{}", shelf_root_fingerprint(path))
+}
+
 fn candidate_pack_dirs(root: &Path) -> Vec<PackDirCandidate> {
     let mut direct = Vec::new();
     push_shelf_root(
@@ -396,6 +418,25 @@ pub(crate) fn create_pack(root: &Path, selector: &str, project: bool) -> Result<
         return Err(error).with_context(|| format!("writing {}", pack_md.display()));
     }
     Ok(pack_path)
+}
+
+pub(crate) fn find_pack_exact_source(root: &Path, name: &str, source: &str) -> Result<PackInfo> {
+    let key = normalize_key(name);
+    let mut seen_paths = HashSet::new();
+    for (dir, candidate_source, shelf) in candidate_pack_dirs(root) {
+        if pack_source_identity(&candidate_source, &dir) != source
+            || !seen_paths.insert(canonicalize_or_clone(&dir))
+        {
+            continue;
+        }
+        let Some(pack) = load_pack_from_dir(&dir, &candidate_source, shelf.as_deref())? else {
+            continue;
+        };
+        if normalize_key(&pack.name) == key {
+            return Ok(pack);
+        }
+    }
+    anyhow::bail!("pack '{name}' from saved source '{source}' not found")
 }
 
 pub(crate) fn find_pack(root: &Path, selector: &str) -> Result<PackInfo> {
