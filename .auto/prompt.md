@@ -49,7 +49,8 @@ Each measured experiment runs formatting plus focused prompt, context-state, sch
 
 ## Prior findings
 
-- Pre-autoresearch audit estimated a clean standard/default/lean baseline around 8.8 KB (~2.2K tokens): ~4.25 KB system, ~3.85 KB tools, ~0.68 KB runtime tail.
-- Largest static duplication: native-tools-before-Bash and Bash lifecycle policy are repeated across system prose and the Bash lean description.
-- Context State deliberately duplicates recent history after tool rounds, but first optimize the stable baseline.
-- Under 1,000 tokens is structurally impossible with the current ~962-token tool payload plus any meaningful system/runtime context; reaching it likely requires on-demand/adaptive tool exposure, not unsafe prose deletion.
+- Measured baseline: 8,781 bytes (~2,196 tokens): 4,250 system, 3,846 tools, 683 runtime tail.
+- Compact invariant-driven system prompt kept at 6,290 total bytes (~1,573 tokens), reducing the system contribution to 1,759 bytes while preserving semantic guardrail tests.
+- Largest remaining static duplication is in lean descriptions whose argument details already exist in schemas and whose cross-tool policy now exists in the compact system prompt.
+- Context State deliberately duplicates recent history after tool rounds; optimize that only after the stable baseline reaches the primary target.
+- Under 1,000 tokens is structurally impossible with the current tool payload plus meaningful system/runtime context; reaching it likely requires on-demand/adaptive tool exposure, not unsafe prose deletion.

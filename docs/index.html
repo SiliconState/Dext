@@ -765,7 +765,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <table>
 <tr><th>Profile</th><th>Description</th><th>Schemas</th></tr>
 <tr><td><code>Full</code></td><td>Complete tool descriptions and full JSON schemas</td><td>Full</td></tr>
-<tr><td><code>Lean</code> (default)</td><td>Compact one-liner descriptions, schemas without field descriptions</td><td>Stripped</td></tr>
+<tr><td><code>Lean</code> (default)</td><td>Minimal action/safety descriptions, schemas without field descriptions</td><td>Stripped</td></tr>
 </table>
 <p>Controlled via <code>DEXT_TOOL_PROFILE</code>. Lean mode saves significant prompt tokens per turn. A separate toolset profile is selected by <code>--toolset</code> or <code>DEXT_TOOLSET</code>: <code>default</code> hides specialized tools and <code>full</code> exposes the complete catalog. Frugal/tiny reduce context and result budgets without overriding explicit toolset or schema selections.</p>
 <h3>Tool Classification</h3>

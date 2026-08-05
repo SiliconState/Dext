@@ -23685,10 +23685,8 @@ fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
         .find(|tool| tool.name == "read_file")
         .expect("read_file tool");
     let wired = tools::wire_tools(&[read_file], ToolProfile::Lean);
-    assert_eq!(
-        wired[0].description,
-        "Read capped line-numbered file window. Absolute paths ok read-only; prefer offset+limit."
-    );
+    assert!(wired[0].description.contains("capped"));
+    assert!(wired[0].description.contains("absolute read-only"));
     assert!(
         wired[0].input_schema.to_string().contains("\"offset\""),
         "{}",
@@ -23705,8 +23703,23 @@ fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
         .find(|tool| tool.name == "bash")
         .expect("bash tool");
     let wired = tools::wire_tools(&[bash], ToolProfile::Lean);
-    assert!(wired[0].description.contains("last-resort"));
-    assert!(wired[0].description.contains("native tool"));
+    assert!(wired[0].description.contains("fallback"));
+    assert!(wired[0].description.contains("no persistence"));
+
+    let default_tools = provider_tool_definitions()
+        .into_iter()
+        .filter(|tool| tools::is_default_tool(tool.name))
+        .collect::<Vec<_>>();
+    let serialized = serde_json::to_vec(&tools::wire_tools_chatgpt(
+        &default_tools,
+        ToolProfile::Lean,
+    ))
+    .expect("serialize default lean tools");
+    assert!(
+        serialized.len() < 3_600,
+        "default lean tool payload should remain compact: {} bytes",
+        serialized.len()
+    );
 }
 
 #[test]
