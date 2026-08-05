@@ -16870,34 +16870,37 @@ fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
 
 #[test]
 fn systems_preserve_tool_protocol_guardrails_and_table_guidance() {
+    for guardrail in [
+        "only exposed tools via real provider calls",
+        "approval and sandbox policy",
+        "PIVOT REQUIRED",
+        "literal active user input",
+        "inspect an exact path first",
+        "bash/sudo discovery",
+        "Read before editing",
+        "Bash calls are atomic",
+        "OS supervisor with a dext- unit",
+        "Verify narrowly",
+        "changes, tests, gaps",
+    ] {
+        assert!(
+            DEFAULT_SYSTEM.contains(guardrail),
+            "standard prompt missing {guardrail:?}: {DEFAULT_SYSTEM}"
+        );
+    }
     assert!(
-        !DEFAULT_SYSTEM.contains("Never print raw tool syntax"),
-        "standard prompt should not carry frugal-only tool syntax guardrails: {DEFAULT_SYSTEM}"
+        DEFAULT_SYSTEM.contains("one grouped table")
+            && DEFAULT_SYSTEM.contains("one physical line per row")
+            && DEFAULT_SYSTEM.contains("without emoji")
+            && DEFAULT_SYSTEM.contains("unescaped `|`"),
+        "standard prompt should preserve compact renderer-safe tables: {DEFAULT_SYSTEM}"
     );
     assert!(
-        DEFAULT_SYSTEM.contains("consolidate them into one grouped table"),
-        "standard prompt should steer related table groups: {DEFAULT_SYSTEM}"
-    );
-    assert!(
-        DEFAULT_SYSTEM.contains("one physical line per row"),
-        "standard prompt should avoid renderer-hostile row wrapping: {DEFAULT_SYSTEM}"
-    );
-    assert!(
-        DEFAULT_SYSTEM.contains("emoji verdict icons") && DEFAULT_SYSTEM.contains("unescaped `|`"),
-        "standard prompt should call out fragile table-cell content: {DEFAULT_SYSTEM}"
-    );
-    assert!(
-        DEFAULT_SYSTEM.contains("Avoid stacked heading+table blocks"),
-        "standard prompt should avoid renderer-hostile table stacks: {DEFAULT_SYSTEM}"
+        DEFAULT_SYSTEM.len() < 2_000,
+        "standard prompt should remain compact: {} bytes",
+        DEFAULT_SYSTEM.len()
     );
 
-    assert!(
-        DEFAULT_SYSTEM.contains("literal active user input")
-            && DEFAULT_SYSTEM.contains("Never dismiss terse, path-only")
-            && DEFAULT_SYSTEM.contains("inspect it first with native tools")
-            && DEFAULT_SYSTEM.contains("using bash/sudo discovery"),
-        "standard prompt should preserve path-only queued steering: {DEFAULT_SYSTEM}"
-    );
     assert!(
         TINY_SYSTEM.contains("literal active user input")
             && TINY_SYSTEM.contains("never dismiss path-only/context-looking updates")

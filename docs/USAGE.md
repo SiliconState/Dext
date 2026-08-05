@@ -345,7 +345,7 @@ dext --budget 200000t
 dext --budget '$2 + 200000t'  # stop at either dimension
 ```
 
-Frugal mode uses lean schemas by default, keeps the selected toolset, applies smaller caps, and compacts context more aggressively. Tiny mode uses a condensed prompt and caps history around 80% of the detected model window (bounded 8k–32k chars). Explicit `--toolset` and `--tool-profile` choices remain available in every context mode. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
+Frugal mode uses lean schemas by default, keeps the selected toolset, applies smaller caps, and compacts context more aggressively. Tiny mode uses a condensed prompt and caps history around 80% of the detected model window (bounded 8k–32k chars). Standard mode also uses a compact invariant-driven built-in prompt: universal workflow and safety rules remain there, while tool-specific syntax lives in the default lean schemas instead of being repeated. Explicit `--toolset` and `--tool-profile` choices remain available in every context mode. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
 
 Budget caps accept the documented compact `t` suffix as well as `tok`, reject duplicate dollar or token dimensions in combined caps instead of silently keeping one value, and reject empty combined components. An invalid `DEXT_BUDGET_CAP` fails startup instead of silently disabling the guard.
 
