@@ -103,14 +103,12 @@ Use low-token mode (local providers choose `frugal` automatically unless you exp
 
 ```bash
 dext --frugal --effort off
-# even smaller local mode:
-dext --context-mode tiny --effort off
 # or inside Dext:
-/context tiny
+/context frugal
 /effort off
 ```
 
-The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/tools full` only when you need the complete catalog. Static tools and active pack-runtime tools share one provider-neutral `{name, description, schema}` layer before Anthropic, OpenAI Chat Completions, OpenAI Responses, or ChatGPT Responses wrapping.
+The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/tools full` only when you need the complete catalog; non-JSON startup prints `[tools] toolset full` whenever the full catalog is selected, including in frugal mode. Static tools and active pack-runtime tools share one provider-neutral `{name, description, schema}` layer before Anthropic, OpenAI Chat Completions, OpenAI Responses, or ChatGPT Responses wrapping; the selected lean/full schema profile applies to both. Frugal mode preserves explicit toolset/schema selections while applying smaller context/result/read-capture budgets. `/context` changes those live caps for subsequent native reads and tool results; an explicit context choice remains pinned across provider switches and session restore, while automatic defaults follow the active local/cloud provider. A valid CLI context mode overrides `DEXT_CONTEXT_MODE`. The retired `tiny` mode and `--tiny` alias are rejected rather than silently mapped to frugal.
 
 ## Common commands
 
@@ -154,7 +152,7 @@ Interactive slash commands:
 /model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
 /approval ask|auto-read|auto-write|never|always
 /sandbox-profile read-only|workspace-write|danger-full-access
-/context standard|frugal|tiny
+/context standard|frugal
 /tools default|full
 /tool-profile lean|full     # default is lean
 /preview off|simple|git

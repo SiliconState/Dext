@@ -1161,12 +1161,13 @@ pub(crate) fn adaptive_tool_result_cap_for_window(
     window_tokens: u64,
     default_cap: usize,
 ) -> usize {
-    let min_cap = if crate::ContextMode::from_env().is_frugal() {
-        2_000
-    } else {
-        MIN_DYNAMIC_TOOL_RESULT_CAP
-    };
-    adaptive_tool_cap_for_pressure(session_usage, window_tokens, default_cap, min_cap, 3)
+    adaptive_tool_cap_for_pressure(
+        session_usage,
+        window_tokens,
+        default_cap,
+        MIN_DYNAMIC_TOOL_RESULT_CAP,
+        3,
+    )
 }
 
 pub(crate) fn adaptive_tool_result_cap(

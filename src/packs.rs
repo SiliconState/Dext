@@ -728,9 +728,14 @@ pub(crate) fn pack_summary_for_prompt(root: &Path, include_project: bool) -> Opt
         &packs
             .iter()
             .take(10)
-            .map(|pack| match pack.shelf.as_deref() {
-                Some(shelf) => format!("{}[{shelf}]", pack.name),
-                None => pack.name.clone(),
+            .map(|pack| {
+                let name = crate::summarize_inline(&pack.name, 96);
+                match pack.shelf.as_deref() {
+                    Some(shelf) => {
+                        format!("{name}[{}]", crate::summarize_inline(shelf, 64))
+                    }
+                    None => name,
+                }
             })
             .collect::<Vec<_>>()
             .join(", "),

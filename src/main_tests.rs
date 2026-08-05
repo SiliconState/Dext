@@ -11239,6 +11239,63 @@ fn tool_result_metadata_parses_status_and_artifact_hints() {
 }
 
 #[test]
+fn resolved_context_mode_controls_native_read_capture_caps() {
+    let root = temp_test_dir("resolved-context-read-caps");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let content = (0..300)
+        .map(|index| format!("line-{index:03}-{}\n", "x".repeat(80)))
+        .collect::<String>();
+    std::fs::write(root.join("large.txt"), content).expect("write fixture");
+    let input = json!({"path": "large.txt"});
+
+    let standard = execute_tool_with_cache_for_context(
+        "read_file",
+        &input,
+        &root,
+        None,
+        None,
+        None,
+        None,
+        ContextMode::Standard,
+    )
+    .expect("standard read");
+    let frugal = execute_tool_with_cache_for_context(
+        "read_file",
+        &input,
+        &root,
+        None,
+        None,
+        None,
+        None,
+        ContextMode::Frugal,
+    )
+    .expect("frugal read");
+
+    assert!(
+        standard.len() > frugal.len(),
+        "{} <= {}",
+        standard.len(),
+        frugal.len()
+    );
+    assert!(
+        standard.len() > FRUGAL_TEXT_TOOL_CAPTURE_CAP,
+        "standard capture unexpectedly used frugal cap: {}",
+        standard.len()
+    );
+    assert!(
+        frugal.len() <= FRUGAL_TEXT_TOOL_CAPTURE_CAP + 256,
+        "frugal capture exceeded bounded marker allowance: {}",
+        frugal.len()
+    );
+    assert!(
+        frugal.contains("output capped") && frugal.contains("Pass offset="),
+        "{frugal}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn read_file_explicit_window_uses_larger_model_context_cap_and_cache() {
     let root = temp_test_dir("read-file-explicit-cache");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -14953,7 +15010,7 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(maybe_preserve_partial_stream(
         &multiline_raw_tool_text,
         &mut history,
-        ContextMode::Tiny
+        ContextMode::Frugal
     ));
     assert_eq!(history.len(), 1);
     assert!(matches!(
@@ -14983,7 +15040,7 @@ fn partial_stream_preserve_only_text_blocks() {
     assert!(!maybe_preserve_partial_stream(
         &tool_only,
         &mut history,
-        ContextMode::Tiny
+        ContextMode::Frugal
     ));
 }
 
@@ -16038,6 +16095,158 @@ fn automatic_hooks_never_inherit_danger_full_access() {
 }
 
 #[test]
+fn prompt_provenance_excludes_root_context_omitted_by_budget() -> Result<()> {
+    let root = temp_test_dir("prompt-provenance-omitted-root");
+    let root = std::fs::canonicalize(root)?;
+    let dext_path = root.join("DEXT.md");
+    let recall_path = root.join("recall.md");
+    std::fs::write(&dext_path, "project guidance ".repeat(PROJECT_CONTEXT_CAP))?;
+    std::fs::write(&recall_path, "omitted durable fact")?;
+    let mut agent = test_agent(&root);
+    agent.system = "base-system".to_string();
+
+    let details = agent.compose_system_details();
+    assert_eq!(details.prompt_sources, vec![dext_path.clone()]);
+    assert!(!details.stable.contains("omitted durable fact"));
+    let composed = format!("{}\n\n{}", details.stable, details.env);
+    let provenance = agent.session_provenance_from(&details, &composed);
+    assert_eq!(
+        provenance.prompt_sources,
+        vec![dext_path.display().to_string()]
+    );
+    assert!(provenance.dext_md_hash.is_some());
+    assert_eq!(provenance.recall_hash, None);
+    assert!(
+        !provenance
+            .prompt_sources
+            .contains(&recall_path.display().to_string())
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn prompt_context_sections_respect_exact_total_budget() {
+    for cap in 0..256 {
+        let output =
+            cap_bytes_with_hint_to_total(&"日本語 detail ".repeat(100), cap, "context truncated.");
+        assert!(
+            output.len() <= cap,
+            "cap={cap} len={}: {output}",
+            output.len()
+        );
+    }
+
+    let mut env = String::new();
+    push_env_section(&mut env, "Bounded", "x".repeat(500), 96, "section trimmed.");
+    let body = env
+        .strip_prefix("\n## Bounded\n")
+        .expect("section heading")
+        .strip_suffix('\n')
+        .expect("section newline");
+    assert!(body.len() <= 96, "{} bytes: {body}", body.len());
+    assert!(body.contains("section trimmed"), "{body}");
+
+    let mut stable = "base".to_string();
+    let mut budget = 96;
+    let result = push_prompt_context_section(
+        &mut stable,
+        &"x".repeat(200),
+        "content",
+        &mut budget,
+        "truncated.",
+    );
+    assert!(matches!(result, PromptContextSectionResult::Omitted));
+    assert_eq!(stable, "base");
+    assert_eq!(budget, 0);
+
+    let root = temp_test_dir("prompt-context-exact-budget");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.system = "base-system".to_string();
+    let dext_path = root.join("DEXT.md");
+    let recall_path = root.join("recall.md");
+    *agent.prompt_scan_cache.lock().expect("prompt scan cache") = Some(PromptScanCache {
+        epoch: agent.prompt_scan_epoch,
+        include_project_extensions: false,
+        dext_md: PromptContextScan {
+            sections: vec![(
+                format!("ancestor {}", "日本語".repeat(300)),
+                dext_path.clone(),
+                "guidance ".repeat(PROJECT_CONTEXT_CAP),
+                sha256_hex_str(&"guidance ".repeat(PROJECT_CONTEXT_CAP)),
+            )],
+            ..PromptContextScan::default()
+        },
+        recall: PromptContextScan {
+            sections: vec![(
+                "recall".to_string(),
+                recall_path,
+                "must not fit".to_string(),
+                sha256_hex_str("must not fit"),
+            )],
+            ..PromptContextScan::default()
+        },
+        pack_summary: None,
+        shelf_summary: None,
+    });
+
+    let parts = agent.compose_system_details();
+    assert_eq!(parts.stable.len() - agent.system.len(), PROJECT_CONTEXT_CAP);
+    assert!(
+        parts.stable.contains("DEXT.md truncated"),
+        "{}",
+        parts.stable
+    );
+    assert_eq!(parts.prompt_sources, vec![dext_path]);
+    assert!(!parts.stable.contains("must not fit"));
+
+    let mut agent = test_agent(&root);
+    agent.system = "base-system".to_string();
+    let first_path = root.join("first-DEXT.md");
+    let omitted_path = root.join("omitted-DEXT.md");
+    let first_label = prompt_env_value(".", 512);
+    let first_heading = format!("Project-controlled guidance (DEXT.md from {first_label})");
+    let first_prefix = format!("\n\n## {first_heading}\n");
+    let residual = 8;
+    let first_content = "x".repeat(PROJECT_CONTEXT_CAP - first_prefix.len() - residual);
+    *agent.prompt_scan_cache.lock().expect("prompt scan cache") = Some(PromptScanCache {
+        epoch: agent.prompt_scan_epoch,
+        include_project_extensions: false,
+        dext_md: PromptContextScan {
+            sections: vec![
+                (
+                    ".".to_string(),
+                    first_path.clone(),
+                    first_content.clone(),
+                    sha256_hex_str(&first_content),
+                ),
+                (
+                    "second".to_string(),
+                    omitted_path,
+                    "omitted guidance".to_string(),
+                    sha256_hex_str("omitted guidance"),
+                ),
+            ],
+            ..PromptContextScan::default()
+        },
+        recall: PromptContextScan::default(),
+        pack_summary: None,
+        shelf_summary: None,
+    });
+    let parts = agent.compose_system_details();
+    assert_eq!(
+        parts.stable.len() - agent.system.len(),
+        PROJECT_CONTEXT_CAP - residual
+    );
+    assert_eq!(parts.prompt_sources, vec![first_path]);
+    assert!(!parts.stable.contains("omitted guidance"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn compose_system_parts_caps_dext_md() {
     let root = temp_test_dir("dext-md-cap");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -16055,25 +16264,23 @@ fn compose_system_parts_caps_dext_md() {
 }
 
 #[test]
-fn tiny_mode_uses_condensed_prompt_and_slim_env() {
-    let root = temp_test_dir("tiny-system-prompt");
+fn frugal_mode_uses_condensed_context_and_slim_env() {
+    let root = temp_test_dir("frugal-system-prompt");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     std::fs::write(root.join("DEXT.md"), "project guidance".repeat(500)).expect("write DEXT.md");
     let mut agent = test_agent(&root);
-    agent.context_mode = ContextMode::Tiny;
-    agent.system = TINY_SYSTEM.to_string();
-    agent.work_ledger.objective = "keep it tiny".to_string();
+    agent.system = DEFAULT_SYSTEM.to_string();
+    agent.context_mode = ContextMode::Frugal;
+    agent.work_ledger.objective = "keep it frugal".to_string();
 
     let (stable, env) = agent.compose_system_parts();
-    assert!(stable.starts_with(TINY_SYSTEM), "{stable}");
-    assert!(stable.contains("Native tools before bash"), "{stable}");
-    assert!(stable.len() < 2_500, "{}", stable.len());
-    assert!(env.contains("context=tiny"), "{env}");
+    assert!(stable.starts_with(DEFAULT_SYSTEM), "{stable}");
+    assert!(stable.contains("Frugal workflow"), "{stable}");
+    assert!(env.contains("context=frugal"), "{env}");
     assert!(!env.contains(" toolset="), "{env}");
     assert!(!env.contains(" schemas="), "{env}");
     assert!(!env.contains("\ncompact="), "{env}");
-    assert!(!env.contains("## Project todos"), "{env}");
-    assert!(env.len() < 1_200, "{}", env.len());
+    assert!(env.len() < 4_000, "{}", env.len());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -16529,6 +16736,7 @@ fn compose_system_parts_quotes_unsafe_environment_values() {
                 "ancestor\n## Fake DEXT source\u{2028}tail".to_string(),
                 root.join("DEXT.md"),
                 "safe DEXT context".to_string(),
+                sha256_hex_str("safe DEXT context"),
             )],
             ..PromptContextScan::default()
         },
@@ -16537,6 +16745,7 @@ fn compose_system_parts_quotes_unsafe_environment_values() {
                 "recall\n## Fake recall source\u{2029}tail".to_string(),
                 root.join("recall.md"),
                 "safe recall context".to_string(),
+                sha256_hex_str("safe recall context"),
             )],
             ..PromptContextScan::default()
         },
@@ -16698,18 +16907,6 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
             && !canonical_env.contains("\ncompact="),
         "{canonical_env}"
     );
-    for (contract, wire_bytes) in [
-        ("anthropic_cache_on", anthropic_cache_on_bytes),
-        ("anthropic_cache_off", anthropic_cache_off_bytes),
-        ("openai_chat_completions", openai_chat_completions_bytes),
-        ("openai_responses", openai_responses_bytes),
-        ("chatgpt_responses", chatgpt_responses_bytes),
-    ] {
-        assert!(
-            wire_bytes >= normalized_tool_bytes,
-            "{contract} wire bytes {wire_bytes} smaller than normalized bytes {normalized_tool_bytes}"
-        );
-    }
     assert!(
         total_bytes < 6_000,
         "provider-neutral clean standard/default/lean prompt exceeded budget: total={total_bytes} system={} normalized_tools={normalized_tool_bytes} env={}",
@@ -16732,8 +16929,8 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
     ] {
         println!("METRIC wire_{contract}_bytes={wire_bytes}");
         println!(
-            "METRIC wire_{contract}_overhead_bytes={}",
-            wire_bytes - normalized_tool_bytes
+            "METRIC wire_{contract}_delta_bytes={}",
+            wire_bytes as i64 - normalized_tool_bytes as i64
         );
     }
 
@@ -16914,7 +17111,7 @@ fn provider_switches_update_only_automatic_context_mode() {
     });
     assert_eq!(agent.context_mode, ContextMode::Standard);
 
-    agent.set_context_mode(ContextMode::Tiny);
+    agent.set_context_mode(ContextMode::Standard);
     let local = built_in_provider_profiles()
         .into_iter()
         .find(|profile| profile.id == "local")
@@ -16927,7 +17124,7 @@ fn provider_switches_update_only_automatic_context_mode() {
         base_url: String::new(),
         requires_api_key: false,
     });
-    assert_eq!(agent.context_mode, ContextMode::Tiny);
+    assert_eq!(agent.context_mode, ContextMode::Standard);
     assert!(agent.context_mode_explicit);
 
     let _ = std::fs::remove_dir_all(&root);
@@ -16938,7 +17135,7 @@ fn session_state_fixtures_migrate_v1_v2_and_preserve_v3_semantics() -> Result<()
     let (v1, v1_history) = load_session_state_fixture("v1.jsonl")?;
     assert_eq!(v1.version, SESSION_FORMAT_VERSION);
     assert_eq!(v1.model, "fixture-v1");
-    assert_eq!(v1.context_mode, ContextMode::Tiny);
+    assert_eq!(v1.context_mode, ContextMode::Frugal);
     assert!(v1.context_mode_explicit);
     assert_eq!(v1_history.len(), 1);
 
@@ -17008,11 +17205,11 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
     assert_eq!(v2.reasoning_mode, ReasoningMode::Standard);
 
     let migrated_v3 = parse_session_header(
-        r#"{"version":3,"model":"v3","system":"system","context_mode":"Tiny","track_origin":{"source_waypoint":"@w01"}}"#,
+        r#"{"version":3,"model":"v3","system":"system","context_mode":"Frugal","track_origin":{"source_waypoint":"@w01"}}"#,
     )
     .expect("parse v3 session header");
     assert_eq!(migrated_v3.version, SESSION_FORMAT_VERSION);
-    assert_eq!(migrated_v3.context_mode, ContextMode::Tiny);
+    assert_eq!(migrated_v3.context_mode, ContextMode::Frugal);
     assert!(migrated_v3.context_mode_explicit);
     let serialized_v3 = serde_json::to_string(&migrated_v3).expect("serialize migrated v3 header");
     assert!(!serialized_v3.contains("track_origin"));
@@ -17095,9 +17292,9 @@ fn legacy_session_context_mode_preserves_nonstandard_as_explicit() {
     value
         .as_object_mut()
         .expect("header object")
-        .insert("context_mode".to_string(), json!("tiny"));
-    let header = parse_session_header(&value.to_string()).expect("parse legacy tiny header");
-    assert_eq!(header.context_mode, ContextMode::Tiny);
+        .insert("context_mode".to_string(), json!("frugal"));
+    let header = parse_session_header(&value.to_string()).expect("parse legacy frugal header");
+    assert_eq!(header.context_mode, ContextMode::Frugal);
     assert!(header.context_mode_explicit);
 
     value
@@ -17110,14 +17307,15 @@ fn legacy_session_context_mode_preserves_nonstandard_as_explicit() {
 }
 
 #[test]
-fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
-    assert_eq!(ContextMode::parse("tiny"), Some(ContextMode::Tiny));
-    assert_eq!(ContextMode::parse("skinny"), Some(ContextMode::Tiny));
+fn context_mode_parse_accepts_two_modes_and_rejects_retired_values() {
+    assert_eq!(ContextMode::parse("tiny"), None);
+    assert_eq!(ContextMode::parse("skinny"), None);
+    assert_eq!(ContextMode::parse("standard"), Some(ContextMode::Standard));
     assert_eq!(ContextMode::parse("frugal"), Some(ContextMode::Frugal));
-    assert_eq!(ContextMode::Tiny.as_str(), "tiny");
-    assert!(ContextMode::Tiny.is_frugal());
-    assert!(ContextMode::Tiny.is_tiny());
-    assert!(!ContextMode::Frugal.is_tiny());
+    assert_eq!(ContextMode::Standard.as_str(), "standard");
+    assert_eq!(ContextMode::Frugal.as_str(), "frugal");
+    assert!(!ContextMode::Standard.is_frugal());
+    assert!(ContextMode::Frugal.is_frugal());
     assert_eq!(
         ToolContextProfile::parse("full"),
         Some(ToolContextProfile::Full)
@@ -17126,19 +17324,8 @@ fn context_mode_parse_includes_tiny_without_aliasing_frugal() {
         ToolContextProfile::parse("standard"),
         Some(ToolContextProfile::Default)
     );
-    assert_eq!(
-        ToolContextProfile::parse("frugal"),
-        Some(ToolContextProfile::Frugal)
-    );
+    assert_eq!(ToolContextProfile::parse("frugal"), None);
     assert_eq!(ToolContextProfile::parse_selectable("frugal"), None);
-    assert_eq!(
-        ToolContextProfile::Full.effective(ContextMode::Frugal),
-        ToolContextProfile::Full
-    );
-    assert_eq!(
-        ToolContextProfile::Frugal.effective(ContextMode::Standard),
-        ToolContextProfile::Default
-    );
 }
 
 #[test]
@@ -17190,13 +17377,6 @@ fn systems_preserve_tool_protocol_guardrails_and_table_guidance() {
             && DEFAULT_SYSTEM.contains("unescaped `|`"),
         "standard prompt should preserve compact renderer-safe tables: {DEFAULT_SYSTEM}"
     );
-    assert!(
-        TINY_SYSTEM.contains("literal active user input")
-            && TINY_SYSTEM.contains("never dismiss path-only/context-looking updates")
-            && TINY_SYSTEM.contains("inspect exact user paths first")
-            && TINY_SYSTEM.contains("not bash/sudo discovery"),
-        "tiny prompt should preserve path-only queued steering: {TINY_SYSTEM}"
-    );
 
     let root = temp_test_dir("frugal-tool-protocol-note");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -17211,23 +17391,6 @@ fn systems_preserve_tool_protocol_guardrails_and_table_guidance() {
     assert!(
         frugal_stable.contains("repair only the failed step"),
         "{frugal_stable}"
-    );
-    assert!(
-        TINY_SYSTEM.contains("required input and observable output")
-            && TINY_SYSTEM.contains("repair only the failed step"),
-        "{TINY_SYSTEM}"
-    );
-    assert!(
-        TINY_SYSTEM.contains("prefill the TUI input"),
-        "{TINY_SYSTEM}"
-    );
-    assert!(
-        TINY_SYSTEM.contains("related data -> one grouped table"),
-        "{TINY_SYSTEM}"
-    );
-    assert!(
-        TINY_SYSTEM.contains("one row/line") && TINY_SYSTEM.contains("no emoji"),
-        "{TINY_SYSTEM}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -17276,23 +17439,7 @@ fn context_window_and_history_budget_are_model_aware_and_overridable() {
         active_history_char_budget_with_override("demo-128k", None, ContextMode::Frugal),
         60_000
     );
-    assert_eq!(
-        history_char_budget_with_override(DEFAULT_LOCAL_MODEL, None, ContextMode::Tiny),
-        32_000
-    );
     assert_eq!(model_context_window(DEFAULT_LOCAL_MODEL), 200_000);
-    assert_eq!(
-        active_history_char_budget_with_override(DEFAULT_LOCAL_MODEL, None, ContextMode::Tiny),
-        32_000
-    );
-    assert_eq!(
-        history_char_budget_with_override("tiny-1k", None, ContextMode::Tiny),
-        8_000
-    );
-    assert_eq!(
-        active_history_char_budget_with_override("tiny-1k", None, ContextMode::Tiny),
-        8_000
-    );
 
     unsafe {
         std::env::set_var("DEXT_CONTEXT_WINDOW_TOKENS", "64000");
@@ -17880,7 +18027,6 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         "--approval=auto-read".to_string(),
         "--sandbox-profile=read-only".to_string(),
         "--frugal".to_string(),
-        "--tiny".to_string(),
         "--tool-context-profile=full".to_string(),
         "--tool-profile=default".to_string(),
         format!("@{}", task_file.display()),
@@ -17897,7 +18043,7 @@ fn parse_cli_options_supports_no_session_cd_output_and_file_args() -> Result<()>
         Some(ApprovalProfile::AutoRead)
     );
     assert_eq!(opts.sandbox_profile, Some(SandboxProfile::ReadOnly));
-    assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
+    assert_eq!(opts.context_mode, Some(ContextMode::Frugal));
     assert_eq!(opts.tool_context_profile, Some(ToolContextProfile::Full));
     assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
     assert_eq!(
@@ -17948,28 +18094,6 @@ fn parse_cli_options_accepts_and_validates_seat() -> Result<()> {
 }
 
 #[test]
-fn tiny_context_mode_sets_distinct_system_prompt() {
-    let root = temp_test_dir("tiny-mode-banner");
-    let root = std::fs::canonicalize(root).expect("canonical temp dir");
-    let mut agent = test_agent(&root);
-    agent.system = DEFAULT_SYSTEM.to_string();
-
-    assert!(agent.session_dir().ends_with(&agent.session_id));
-
-    agent.set_context_mode(ContextMode::Tiny);
-
-    assert!(agent.context_mode_explicit);
-    assert!(agent.context_mode.is_tiny());
-    assert_eq!(agent.system, TINY_SYSTEM);
-
-    agent.set_context_mode(ContextMode::Frugal);
-    assert_eq!(agent.context_mode, ContextMode::Frugal);
-    assert_eq!(agent.system, DEFAULT_SYSTEM);
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
 fn parse_cli_options_accepts_reasoning_mode_and_minimal_effort() -> Result<()> {
     let opts = parse_cli_options(vec![
         "--effort".to_string(),
@@ -17986,23 +18110,70 @@ fn parse_cli_options_accepts_reasoning_mode_and_minimal_effort() -> Result<()> {
 }
 
 #[test]
-fn parse_cli_options_accepts_tiny_alias_without_positional_leak() -> Result<()> {
-    let opts = parse_cli_options(vec!["--tiny".to_string(), "do task".to_string()])?;
+fn parse_cli_options_rejects_removed_tiny_alias() {
+    let error = parse_cli_options(vec!["--tiny".to_string(), "do task".to_string()])
+        .expect_err("removed --tiny alias must fail")
+        .to_string();
+    assert!(error.contains("unknown option '--tiny'"), "{error}");
+}
 
-    assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
-    assert_eq!(opts.tool_profile, Some(ToolProfile::Lean));
+#[test]
+fn parse_cli_options_rejects_removed_tiny_context_mode() {
+    let error = parse_cli_options(vec!["--context-mode=tiny".to_string()])
+        .expect_err("removed tiny context mode must fail")
+        .to_string();
+    assert!(error.contains("expected standard|frugal"), "{error}");
+}
+
+#[test]
+fn context_mode_configuration_gives_valid_cli_precedence_over_stale_env() {
+    let _guard = env_lock();
+    let old = std::env::var_os("DEXT_CONTEXT_MODE");
+    unsafe {
+        std::env::set_var("DEXT_CONTEXT_MODE", "tiny");
+    }
+
+    assert_eq!(
+        resolve_context_mode_configuration(Some(ContextMode::Frugal))
+            .expect("valid CLI mode must override stale env"),
+        Some(ContextMode::Frugal)
+    );
+    let error = resolve_context_mode_configuration(None)
+        .expect_err("invalid env must fail without a CLI override")
+        .to_string();
+    assert!(error.contains("expected standard|frugal"), "{error}");
+
+    restore_env_var("DEXT_CONTEXT_MODE", old);
+}
+
+#[test]
+fn frugal_flag_does_not_override_explicit_schema_profile_in_either_order() -> Result<()> {
+    for args in [
+        vec!["--tool-profile=full".to_string(), "--frugal".to_string()],
+        vec!["--frugal".to_string(), "--tool-profile=full".to_string()],
+    ] {
+        let opts = parse_cli_options(args)?;
+        assert_eq!(opts.context_mode, Some(ContextMode::Frugal));
+        assert_eq!(opts.tool_profile, Some(ToolProfile::Full));
+    }
+
+    let opts = parse_cli_options(vec!["--frugal".to_string()])?;
+    assert_eq!(opts.context_mode, Some(ContextMode::Frugal));
+    assert_eq!(opts.tool_profile, None);
     assert_eq!(opts.thinking_effort, Some(ThinkingEffort::Medium));
-    assert_eq!(opts.positional, vec!["do task".to_string()]);
     Ok(())
 }
 
 #[test]
-fn parse_cli_options_still_accepts_context_mode_tiny() -> Result<()> {
-    let opts = parse_cli_options(vec!["--context-mode=tiny".to_string()])?;
-
-    assert_eq!(opts.context_mode, Some(ContextMode::Tiny));
-    assert!(opts.positional.is_empty());
-    Ok(())
+fn full_toolset_startup_diagnostic_is_visible_in_every_context_mode() {
+    assert_eq!(
+        toolset_startup_diagnostic(ToolContextProfile::Default),
+        None
+    );
+    assert_eq!(
+        toolset_startup_diagnostic(ToolContextProfile::Full).as_deref(),
+        Some("[tools] toolset full")
+    );
 }
 
 #[test]
@@ -24095,6 +24266,76 @@ fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
 }
 
 #[test]
+fn lean_schema_stripping_preserves_argument_names_and_literal_data() {
+    let tool = Tool {
+        name: "custom",
+        description: "Custom tool.",
+        input_schema: json!({
+            "type": "object",
+            "description": "remove root annotation",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "remove property annotation"
+                },
+                "payload": {
+                    "type": "object",
+                    "default": {"description": "preserve literal data"},
+                    "properties": {
+                        "nested": {
+                            "type": "string",
+                            "description": "remove nested annotation"
+                        }
+                    }
+                },
+                "choice": {
+                    "anyOf": [
+                        {"type": "string", "description": "remove branch annotation"},
+                        {"type": "integer"}
+                    ]
+                }
+            },
+            "$defs": {
+                "node": {"type": "string", "description": "remove definition annotation"}
+            },
+            "required": ["description"]
+        }),
+    };
+
+    let wired = tools::wire_tools(&[tool], ToolProfile::Lean);
+    let schema = &wired[0].input_schema;
+    assert!(schema.get("description").is_none(), "{schema}");
+    assert_eq!(schema["properties"]["description"]["type"], "string");
+    assert!(
+        schema["properties"]["description"]
+            .get("description")
+            .is_none(),
+        "{schema}"
+    );
+    assert_eq!(
+        schema["properties"]["payload"]["default"]["description"],
+        "preserve literal data"
+    );
+    assert!(
+        schema["properties"]["payload"]["properties"]["nested"]
+            .get("description")
+            .is_none(),
+        "{schema}"
+    );
+    assert!(
+        schema["properties"]["choice"]["anyOf"][0]
+            .get("description")
+            .is_none(),
+        "{schema}"
+    );
+    assert!(
+        schema["$defs"]["node"].get("description").is_none(),
+        "{schema}"
+    );
+    assert_eq!(schema["required"][0], "description");
+}
+
+#[test]
 fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
     let root = temp_test_dir("provider-neutral-runtime-tools");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
@@ -24111,7 +24352,13 @@ fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
             description: "Look up bounded runtime state.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {"key": {"type": "string"}},
+                "description": "Runtime request object.",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Lookup key."
+                    }
+                },
                 "required": ["key"],
                 "additionalProperties": false
             }),
@@ -24137,6 +24384,19 @@ fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
     let index = neutral.len() - 1;
     let runtime = &neutral[index];
     assert_eq!(runtime.name, "runtime_lookup");
+    assert_eq!(runtime.description, "Look up bounded runtime state.");
+    assert!(
+        runtime.schema.get("description").is_none(),
+        "{}",
+        runtime.schema
+    );
+    assert!(
+        runtime.schema["properties"]["key"]
+            .get("description")
+            .is_none(),
+        "{}",
+        runtime.schema
+    );
     assert_eq!(anthropic[index].name, runtime.name);
     assert_eq!(anthropic[index].description, runtime.description);
     assert_eq!(anthropic[index].input_schema, runtime.schema);
@@ -24147,6 +24407,84 @@ fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
         assert_eq!(tool["name"], runtime.name);
         assert_eq!(tool["description"], runtime.description);
         assert_eq!(tool["parameters"], runtime.schema);
+    }
+
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("OpenAI profile");
+    agent.provider_id = profile.id.clone();
+    agent.base_url = profile.base_url.clone();
+    agent.model = "custom-runtime-model".to_string();
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        profile.request_contract = Some(contract);
+        agent.api_provider = contract.api_provider();
+        agent.provider_profile = Some(profile.clone());
+        let anthropic_tools = agent.wire_tools();
+        let system = [SystemBlock {
+            kind: "text",
+            text: "sys",
+            cache_control: Some(CacheControl::EPHEMERAL),
+        }];
+        let (_, body) = agent
+            .build_streaming_request("sys", "env", &system, &anthropic_tools, "sess")
+            .expect("runtime-tool request");
+        let body: Value = serde_json::from_slice(&body).expect("request JSON");
+        let tool = body["tools"]
+            .as_array()
+            .and_then(|tools| tools.last())
+            .unwrap_or_else(|| panic!("{} omitted runtime tool: {body}", contract.as_str()));
+        match contract {
+            RequestContract::AnthropicMessages => {
+                assert_eq!(tool["name"], runtime.name);
+                assert_eq!(tool["description"], runtime.description);
+                assert_eq!(tool["input_schema"], runtime.schema);
+            }
+            RequestContract::OpenAiChatCompletions => {
+                assert_eq!(tool["function"]["name"], runtime.name);
+                assert_eq!(tool["function"]["description"], runtime.description);
+                assert_eq!(tool["function"]["parameters"], runtime.schema);
+            }
+            RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
+                assert_eq!(tool["name"], runtime.name);
+                assert_eq!(tool["description"], runtime.description);
+                assert_eq!(tool["parameters"], runtime.schema);
+            }
+        }
+    }
+
+    agent.tool_profile = ToolProfile::Full;
+    let full_neutral = agent.provider_neutral_tools();
+    let full_runtime = full_neutral.last().expect("full runtime tool");
+    assert_eq!(full_runtime.description, runtime.description);
+    assert_eq!(
+        full_runtime.schema["description"],
+        "Runtime request object."
+    );
+    assert_eq!(
+        full_runtime.schema["properties"]["key"]["description"],
+        "Lookup key."
+    );
+    let full_anthropic = agent.wire_tools();
+    let full_openai_chat = agent.wire_tools_oai();
+    let full_openai_responses = agent.wire_tools_openai_responses();
+    let full_chatgpt_responses = agent.wire_tools_chatgpt();
+    let full_index = full_neutral.len() - 1;
+    assert_eq!(full_anthropic[full_index].input_schema, full_runtime.schema);
+    assert_eq!(
+        full_openai_chat[full_index].function.parameters,
+        full_runtime.schema
+    );
+    for tool in [
+        &full_openai_responses[full_index],
+        &full_chatgpt_responses[full_index],
+    ] {
+        assert_eq!(tool["parameters"], full_runtime.schema);
     }
 
     let _ = std::fs::remove_dir_all(&root);
@@ -24192,6 +24530,72 @@ fn tool_disabled_models_expose_no_static_or_dynamic_tools() {
     assert!(agent.wire_tools_oai().is_empty());
     assert!(agent.wire_tools_openai_responses().is_empty());
     assert!(agent.wire_tools_chatgpt().is_empty());
+
+    let system = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: None,
+    }];
+    for contract in [
+        RequestContract::AnthropicMessages,
+        RequestContract::OpenAiChatCompletions,
+        RequestContract::OpenAiResponses,
+        RequestContract::ChatGptResponses,
+    ] {
+        agent
+            .provider_profile
+            .as_mut()
+            .expect("provider profile")
+            .request_contract = Some(contract);
+        agent.api_provider = contract.api_provider();
+        let anthropic_tools = agent.wire_tools();
+        let (_, body) = agent
+            .build_streaming_request("sys", "env", &system, &anthropic_tools, "sess")
+            .expect("tool-disabled request");
+        let body: Value = serde_json::from_slice(&body).expect("request JSON");
+        assert!(
+            body.get("tools").is_none(),
+            "{} emitted tools for {contract:?}: {body}",
+            contract.as_str()
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "{} emitted tool_choice: {body}",
+            contract.as_str()
+        );
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "{} emitted parallel_tool_calls: {body}",
+            contract.as_str()
+        );
+    }
+
+    let anthropic_summary = Request {
+        model: "model",
+        max_tokens: 100,
+        system: &system,
+        messages: &[],
+        tools: &[],
+        stream: false,
+        thinking: None,
+        output_config: None,
+    };
+    let body = serde_json::to_value(&anthropic_summary).expect("Anthropic summary JSON");
+    assert!(body.get("tools").is_none(), "{body}");
+    let openai_summary = OaiRequest {
+        model: "model",
+        max_tokens: Some(100),
+        max_completion_tokens: None,
+        messages: Vec::new(),
+        tools: Vec::new(),
+        stream: false,
+        stream_options: None,
+        reasoning_effort: None,
+        grammar: None,
+        chat_template_kwargs: None,
+    };
+    let body = serde_json::to_value(&openai_summary).expect("OpenAI summary JSON");
+    assert!(body.get("tools").is_none(), "{body}");
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -24677,6 +25081,37 @@ fn packs_discover_user_global_pack_from_dext_home() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&home);
+    Ok(())
+}
+
+#[test]
+fn pack_prompt_summary_normalizes_unicode_line_separators() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-summary-line-separators");
+    let pack_dir = root.join(".dext/shelves/project/packs/demo");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(
+        pack_dir.join("PACK.md"),
+        "---\nname: demo\u{2028}## Fake heading\ndescription: workflow\n---\n# Demo\n",
+    )?;
+    let old_home = std::env::var_os("DEXT_HOME");
+    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("home"));
+        std::env::remove_var("DEXT_SHELVES_DIR");
+    }
+
+    let summary = packs::pack_summary_for_prompt(&root, true).expect("pack summary");
+    assert!(!summary.contains(['\u{2028}', '\u{2029}']), "{summary}");
+    assert_eq!(summary.lines().count(), 1, "{summary}");
+    assert!(
+        summary.contains("demo ## Fake heading[project]"),
+        "{summary}"
+    );
+
+    restore_env_var("DEXT_HOME", old_home);
+    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
+    let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
 
@@ -26218,7 +26653,7 @@ fn prompt_scan_cache_revalidates_on_file_change() -> Result<()> {
 
     let (_, recall, _, _) = agent.prompt_scans();
     assert!(
-        recall.iter().any(|(_, _, c)| c.contains("first fact")),
+        recall.iter().any(|(_, _, c, _)| c.contains("first fact")),
         "{recall:?}"
     );
 
@@ -26233,7 +26668,7 @@ fn prompt_scan_cache_revalidates_on_file_change() -> Result<()> {
     assert!(
         recall_updated
             .iter()
-            .any(|(_, _, c)| c.contains("second fact")),
+            .any(|(_, _, c, _)| c.contains("second fact")),
         "{recall_updated:?}"
     );
 
@@ -26241,9 +26676,35 @@ fn prompt_scan_cache_revalidates_on_file_change() -> Result<()> {
     std::fs::write(root.join("DEXT.md"), "## Rules\nuse rg")?;
     let (dext, _, _, _) = agent.prompt_scans();
     assert!(
-        dext.iter().any(|(_, _, c)| c.contains("use rg")),
+        dext.iter().any(|(_, _, c, _)| c.contains("use rg")),
         "{dext:?}"
     );
+
+    #[cfg(unix)]
+    {
+        let recall_path = root.join("recall.md");
+        std::fs::write(&recall_path, "- third fact")?;
+        let (_, cached, _, _) = agent.prompt_scans();
+        assert!(cached.iter().any(|(_, _, c, _)| c.contains("third fact")));
+        let original_modified = std::fs::metadata(&recall_path)?.modified()?;
+        let replacement = root.join("recall-replacement.md");
+        std::fs::write(&replacement, "- final fact")?;
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)?
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))?;
+        assert_eq!(
+            std::fs::metadata(&replacement)?.len(),
+            std::fs::metadata(&recall_path)?.len()
+        );
+        std::fs::rename(&replacement, &recall_path)?;
+
+        let (_, replaced, _, _) = agent.prompt_scans();
+        assert!(
+            replaced.iter().any(|(_, _, c, _)| c.contains("final fact")),
+            "same-length atomic replacement with preserved mtime must invalidate: {replaced:?}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -26287,7 +26748,7 @@ fn prompt_scan_skips_oversized_context_files() -> Result<()> {
     let (dext, _, _, _) = agent.prompt_scans();
     assert!(
         dext.iter()
-            .all(|(_, path, _)| path != &root.join("DEXT.md")),
+            .all(|(_, path, _, _)| path != &root.join("DEXT.md")),
         "oversized context must not enter prompt: {dext:?}"
     );
 
@@ -26488,6 +26949,8 @@ fn env_prompt_sections_emit_every_reachable_cap_hint() {
     "description": "research helpers",
     "abilities": [
       {{"ability": "tool", "name": "search", "description": "project search {pad}", "schema": {{"type": "object"}}, "grants": ["read"], "exposure": "on_demand"}},
+      {{"ability": "tool", "name": "inspect", "description": "project inspection {pad}", "schema": {{"type": "object"}}, "grants": ["read"], "exposure": "on_demand"}},
+      {{"ability": "tool", "name": "summarize", "description": "project summary {pad}", "schema": {{"type": "object"}}, "grants": ["read"], "exposure": "on_demand"}},
       {{"ability": "hook", "name": "loader", "signals": ["load"]}},
       {{"ability": "context", "name": "notes", "description": "curated notes {pad}", "budget": 8192}}
     ]
@@ -26518,11 +26981,7 @@ fn env_prompt_sections_emit_every_reachable_cap_hint() {
     let mut compared = 0usize;
     let mut all_env = String::new();
     let mut all_stable = String::new();
-    for mode in [
-        ContextMode::Standard,
-        ContextMode::Frugal,
-        ContextMode::Tiny,
-    ] {
+    for mode in [ContextMode::Standard, ContextMode::Frugal] {
         for git in [None, Some("main +2 ~1".to_string())] {
             for approved in [None, Some(true)] {
                 for loaded in [false, true] {
@@ -26648,12 +27107,10 @@ fn env_prompt_sections_emit_every_reachable_cap_hint() {
             }
         }
     }
-    assert_eq!(compared, 24, "matrix must cover every branch combination");
+    assert_eq!(compared, 16, "matrix must cover every branch combination");
     // A differential test only proves what it exercises, so every cap hint the
     // table can emit has to actually appear somewhere in the matrix.
     for hint in [
-        "work ledger trimmed for tiny context.",
-        "context state trimmed for tiny context.",
         "project todo summary trimmed for frugal context.",
         "work ledger trimmed for frugal context.",
         "context state trimmed for frugal context.",

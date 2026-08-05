@@ -570,6 +570,21 @@ fn wants_signal(manifest: &ShelfManifest, kind: SignalKind) -> bool {
     })
 }
 
+fn prompt_multiline_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\n' | '\t') {
+                ch
+            } else if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 pub(crate) struct StaticShelf {
     manifest: ShelfManifest,
 }
@@ -649,7 +664,9 @@ impl Shelf for StaticShelf {
                 for pack in &self.manifest.packs {
                     for ability in &pack.abilities {
                         if let Ability::Context(ctx) = ability {
-                            let text = format!("{}: {}", ctx.name, empty_label(&ctx.description));
+                            let name = crate::summarize_inline(&ctx.name, 96);
+                            let description = prompt_multiline_text(empty_label(&ctx.description));
+                            let text = format!("{name}: {description}");
                             // budget is a token hint; cap injected bytes to ~4x.
                             let cap = ctx.budget.saturating_mul(4).clamp(64, 8_192);
                             effects.push(Effect::Context {
@@ -855,12 +872,11 @@ pub(crate) fn registry_summary_for_prompt(
 
 fn compact_resolved_ability(resolved: &ResolvedAbility) -> String {
     let (kind, name) = resolved.ability.key();
-    format!(
-        "{kind}:{name} ({}/{}, {})",
-        resolved.shelf.as_str(),
-        resolved.pack.as_str(),
-        ability_short_description(&resolved.ability)
-    )
+    let name = crate::summarize_inline(name, 96);
+    let shelf = crate::summarize_inline(resolved.shelf.as_str(), 64);
+    let pack = crate::summarize_inline(resolved.pack.as_str(), 64);
+    let description = crate::summarize_inline(&ability_short_description(&resolved.ability), 160);
+    format!("{kind}:{name} ({shelf}/{pack}, {description})")
 }
 
 fn format_resolved_ability(resolved: &ResolvedAbility, indent: &str) -> String {
@@ -1104,6 +1120,28 @@ mod tests {
     }
 
     #[test]
+    fn registry_prompt_summary_normalizes_controls_and_line_separators() {
+        let mut registry = ShelfRegistry::new();
+        registry.register(search_shelf(
+            ShelfScope::Core,
+            "core",
+            "search",
+            "first\n## Fake heading\u{2028}tail\u{1b}[2J",
+        ));
+
+        let summary = registry_summary_for_prompt(&registry, true).expect("registry summary");
+        assert_eq!(summary.lines().count(), 1, "{summary}");
+        assert!(
+            !summary.contains(['\u{2028}', '\u{2029}', '\u{1b}']),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("first ## Fake heading tail [2J"),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn project_shelf_pack_overrides_core_pack_ability() {
         let mut registry = ShelfRegistry::new();
         registry.register(search_shelf(
@@ -1273,6 +1311,29 @@ mod tests {
             registry
                 .collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000, true)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn collect_context_normalizes_unsafe_controls_but_preserves_newlines() {
+        let mut shelf = context_shelf(true);
+        if let Ability::Context(context) = &mut shelf.manifest.packs[0].abilities[0] {
+            context.description =
+                "first line\nsecond\tcolumn\u{2028}third\u{2029}fourth\u{1b}[2J".to_string();
+        }
+        let mut registry = ShelfRegistry::new();
+        registry.register(shelf);
+
+        let block = registry
+            .collect_context(&Signal::Load, &ShelfFrame::new("."), 1_000, true)
+            .expect("context block");
+        assert!(
+            block.contains("first line\nsecond\tcolumn third fourth [2J"),
+            "{block}"
+        );
+        assert!(
+            !block.contains(['\u{2028}', '\u{2029}', '\u{1b}']),
+            "{block}"
         );
     }
 

@@ -2607,6 +2607,10 @@ fn clamp_thinking_budget_below_max(budget_tokens: u32, max_tokens: u32) -> Optio
     Some(budget_tokens.min(ceiling.max(1)).min(strict_max))
 }
 
+fn slice_is_empty<T>(value: &[T]) -> bool {
+    value.is_empty()
+}
+
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
@@ -2615,6 +2619,7 @@ struct Request<'a> {
     // Pre-serialized message JSON: cache breakpoints and the transient runtime
     // env block are injected at wire level so they never touch stored history.
     messages: &'a [Value],
+    #[serde(skip_serializing_if = "slice_is_empty")]
     tools: &'a [WireTool],
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2674,6 +2679,7 @@ struct OaiRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
     messages: Vec<OaiMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OaiTool>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7499,16 +7505,16 @@ fn render_line_window(
     capture.finish("")
 }
 
-fn effective_text_tool_capture_cap() -> usize {
-    if ContextMode::from_env().is_frugal() {
+fn text_tool_capture_cap(context_mode: ContextMode) -> usize {
+    if context_mode.is_frugal() {
         FRUGAL_TEXT_TOOL_CAPTURE_CAP
     } else {
         TEXT_TOOL_CAPTURE_CAP
     }
 }
 
-fn effective_read_file_explicit_capture_cap() -> usize {
-    if ContextMode::from_env().is_frugal() {
+fn read_file_explicit_capture_cap(context_mode: ContextMode) -> usize {
+    if context_mode.is_frugal() {
         FRUGAL_READ_FILE_EXPLICIT_CAPTURE_CAP
     } else {
         READ_FILE_EXPLICIT_CAPTURE_CAP
@@ -7633,6 +7639,7 @@ fn format_todo_delta(
     }
 }
 
+#[cfg(test)]
 fn execute_tool_with_cache(
     name: &str,
     input: &Value,
@@ -7641,6 +7648,29 @@ fn execute_tool_with_cache(
     read_cache: Option<&Arc<Mutex<ReadFileCache>>>,
     session_id: Option<&str>,
     prepared_mutation: Option<mutation_preview::PreparedMutation>,
+) -> std::result::Result<String, String> {
+    execute_tool_with_cache_for_context(
+        name,
+        input,
+        root,
+        interrupt,
+        read_cache,
+        session_id,
+        prepared_mutation,
+        ContextMode::Standard,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_tool_with_cache_for_context(
+    name: &str,
+    input: &Value,
+    root: &Path,
+    interrupt: Option<&AtomicBool>,
+    read_cache: Option<&Arc<Mutex<ReadFileCache>>>,
+    session_id: Option<&str>,
+    prepared_mutation: Option<mutation_preview::PreparedMutation>,
+    context_mode: ContextMode,
 ) -> std::result::Result<String, String> {
     match name {
         "read_file" => {
@@ -7666,9 +7696,9 @@ fn execute_tool_with_cache(
             };
             let explicit_window = input["offset"].is_u64() && limit.is_some();
             let cap = if explicit_window {
-                effective_read_file_explicit_capture_cap()
+                read_file_explicit_capture_cap(context_mode)
             } else {
-                effective_text_tool_capture_cap()
+                text_tool_capture_cap(context_mode)
             };
             let metadata = regular_file_metadata(&path)?;
             let signature = file_signature_from_metadata(&metadata);
@@ -9529,7 +9559,7 @@ fn live_output_for_tool(
 // Per-call execution context; args are distinct types passed straight through
 // from the agent loop, so a struct adds indirection without preventing misuse.
 #[allow(clippy::too_many_arguments)]
-async fn execute_builtin_call(
+async fn execute_builtin_call_for_context(
     name: String,
     input: Value,
     root: PathBuf,
@@ -9543,6 +9573,7 @@ async fn execute_builtin_call(
     git_hooks_approved: bool,
     live_output: Option<LiveToolOutput>,
     pack_env: Vec<(String, String)>,
+    context_mode: ContextMode,
 ) -> std::result::Result<String, String> {
     // The blocking builtin path below cannot be cancelled once it starts, so
     // this is the last point where an already-interrupted call can be stopped.
@@ -9635,7 +9666,7 @@ async fn execute_builtin_call(
         }
     } else {
         tokio::task::spawn_blocking(move || {
-            execute_tool_with_cache(
+            execute_tool_with_cache_for_context(
                 &name,
                 &input,
                 &root,
@@ -9643,11 +9674,48 @@ async fn execute_builtin_call(
                 read_cache.as_ref(),
                 session_id.as_deref(),
                 prepared_mutation,
+                context_mode,
             )
         })
         .await
         .map_err(|e| format!("task panic: {e}"))?
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn execute_builtin_call(
+    name: String,
+    input: Value,
+    root: PathBuf,
+    interrupt: Arc<AtomicBool>,
+    read_cache: Option<Arc<Mutex<ReadFileCache>>>,
+    session_id: Option<String>,
+    local_sudo_auth: Option<LocalSudoAuth>,
+    git_credential: Option<LocalGitCredential>,
+    prepared_mutation: Option<mutation_preview::PreparedMutation>,
+    sandbox_profile: SandboxProfile,
+    git_hooks_approved: bool,
+    live_output: Option<LiveToolOutput>,
+    pack_env: Vec<(String, String)>,
+) -> std::result::Result<String, String> {
+    execute_builtin_call_for_context(
+        name,
+        input,
+        root,
+        interrupt,
+        read_cache,
+        session_id,
+        local_sudo_auth,
+        git_credential,
+        prepared_mutation,
+        sandbox_profile,
+        git_hooks_approved,
+        live_output,
+        pack_env,
+        ContextMode::Standard,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -10216,17 +10284,16 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 - Tables: one grouped table for related data; one physical line per row; plain cells without emoji, bold, unescaped `|`, or line breaks.
 - Invoke requested packs directly. Reusable packs are user-global unless explicitly project-local.";
 
-const TINY_SYSTEM: &str = "You are dext tiny, a terse CLI agent. Use exposed tools via real calls; never print call JSON/bash envelopes or prefill the TUI input. Check Context State; pivot at PIVOT REQUIRED/pattern. Queued-user-update blocks are literal active user input: never dismiss path-only/context-looking updates; inspect exact user paths first with read_file or fd/rg, not bash/sudo discovery. For nontrivial work, define steps by required input and observable output; parallelize reads, reuse results, and repair only the failed step. Native tools before bash: prefer rg/fd/read_file/read_symbol/git_diff/edit/http. Absolute reads are allowed; writes stay confined; use bash only for orchestration/build/test/install/gaps. Inspect before editing. Use todo for nontrivial work. Bash is atomic; supervise requested persistent dext- services. Obey runtime notes. Reusable packs default user-global. Tables: related data -> one grouped table; one row/line; plain cells, no emoji/bold/unescaped `|`/linebreaks. Verify narrowly. Final: changes, tests, gaps.";
-
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
 
+#[cfg(test)]
 fn prompt_context_file_hash(path: &Path) -> Option<String> {
     read_utf8_regular_file_with_limit(path, PROMPT_CONTEXT_FILE_MAX_BYTES, None, "prompt context")
         .ok()
         .map(|content| sha256_hex_bytes(content.as_bytes()))
 }
 
-fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, String)> {
+fn prompt_context_files(root: &Path, filename: &str) -> PromptContextSections {
     scan_prompt_context_files(root, filename).sections
 }
 
@@ -10235,18 +10302,53 @@ fn prompt_context_files(root: &Path, filename: &str) -> Vec<(String, PathBuf, St
 /// revalidate the scan with a handful of stats instead of repeating the walk
 /// and re-reading the files, while still catching approved mid-turn edits and
 /// newly created files at any ancestor level.
-#[derive(Clone, Default)]
-struct PromptContextScan {
-    sections: Vec<(String, PathBuf, String)>,
-    signature: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptFileSignature {
+    modified: std::time::SystemTime,
+    created: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_secs: i64,
+    #[cfg(unix)]
+    changed_nanos: i64,
 }
 
-fn prompt_file_signature(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+#[derive(Clone, Default)]
+struct PromptContextScan {
+    sections: Vec<(String, PathBuf, String, String)>,
+    signature: Vec<(PathBuf, Option<PromptFileSignature>)>,
+}
+
+fn prompt_file_signature(path: &Path) -> Option<PromptFileSignature> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     if meta.file_type().is_symlink() || !meta.is_file() {
         return None;
     }
-    Some((meta.modified().ok()?, meta.len()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(PromptFileSignature {
+            modified: meta.modified().ok()?,
+            created: meta.created().ok(),
+            len: meta.len(),
+            device: meta.dev(),
+            inode: meta.ino(),
+            changed_secs: meta.ctime(),
+            changed_nanos: meta.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some(PromptFileSignature {
+            modified: meta.modified().ok()?,
+            created: meta.created().ok(),
+            len: meta.len(),
+        })
+    }
 }
 
 fn scan_prompt_context_files(root: &Path, filename: &str) -> PromptContextScan {
@@ -10262,6 +10364,7 @@ fn scan_prompt_context_files(root: &Path, filename: &str) -> PromptContextScan {
             None,
             "prompt context",
         ) {
+            let content_hash = sha256_hex_bytes(content.as_bytes());
             let trimmed = content.trim();
             if !trimmed.is_empty() {
                 let display = dir.strip_prefix(root).unwrap_or(dir).display();
@@ -10270,7 +10373,8 @@ fn scan_prompt_context_files(root: &Path, filename: &str) -> PromptContextScan {
                 } else {
                     format!("/{display}")
                 };
-                scan.sections.push((label, candidate, trimmed.to_string()));
+                scan.sections
+                    .push((label, candidate, trimmed.to_string(), content_hash));
             }
         }
         match dir.parent() {
@@ -10289,7 +10393,7 @@ fn prompt_context_scan_is_current(scan: &PromptContextScan) -> bool {
 }
 
 /// Labeled prompt context sections: (ancestor label, file path, content).
-type PromptContextSections = Vec<(String, PathBuf, String)>;
+type PromptContextSections = Vec<(String, PathBuf, String, String)>;
 
 /// Cached prompt filesystem scans (DEXT.md/recall.md ancestor walks and pack
 /// discovery), shared across the many provider requests of a single turn.
@@ -10308,6 +10412,7 @@ struct SystemParts {
     stable: String,
     env: String,
     prompt_sources: Vec<PathBuf>,
+    prompt_source_hashes: Vec<(PathBuf, String)>,
 }
 
 /// Per-mode caps for the volatile env block. `None` omits the section outright
@@ -10331,18 +10436,6 @@ struct EnvCaps {
 }
 
 impl EnvCaps {
-    const TINY: Self = Self {
-        todos: None,
-        ledger: 600,
-        context_state: 800,
-        health: None,
-        budget_cap: false,
-        packs: None,
-        shelves: None,
-        shelf_context: None,
-        suffix: "tiny context",
-    };
-
     const FRUGAL: Self = Self {
         todos: Some((600, 3)),
         ledger: 1_200,
@@ -10366,6 +10459,82 @@ impl EnvCaps {
         shelf_context: Some((1_200, "prompt budget")),
         suffix: "prompt budget",
     };
+}
+
+fn cap_bytes_with_hint_to_total(s: &str, total_cap: usize, hint: &str) -> String {
+    if s.len() <= total_cap {
+        return s.to_string();
+    }
+    if total_cap == 0 {
+        return String::new();
+    }
+
+    let suffix = if hint.is_empty() {
+        String::new()
+    } else {
+        format!(" {hint}")
+    };
+    let marker = |kept: usize| {
+        format!(
+            "\n\n…[truncated after {} bytes; kept first {kept}.{suffix}]",
+            s.len()
+        )
+    };
+    let empty_marker = marker(0);
+    if empty_marker.len() > total_cap {
+        return if total_cap >= '…'.len_utf8() {
+            "…".to_string()
+        } else {
+            ".".repeat(total_cap)
+        };
+    }
+
+    let mut keep = total_cap - empty_marker.len();
+    loop {
+        let prefix = byte_prefix_at_char_boundary(s, keep);
+        let marker = marker(prefix.len());
+        let used = prefix.len() + marker.len();
+        if used <= total_cap {
+            return format!("{prefix}{marker}");
+        }
+        keep = prefix.len().saturating_sub(used - total_cap);
+    }
+}
+
+enum PromptContextSectionResult {
+    Complete,
+    Truncated,
+    Omitted,
+}
+
+fn push_prompt_context_section(
+    stable: &mut String,
+    heading: &str,
+    content: &str,
+    context_budget: &mut usize,
+    truncation_hint: &str,
+) -> PromptContextSectionResult {
+    let prefix = format!("\n\n## {heading}\n");
+    if prefix.len() >= *context_budget {
+        *context_budget = 0;
+        return PromptContextSectionResult::Omitted;
+    }
+
+    let content_budget = *context_budget - prefix.len();
+    stable.push_str(&prefix);
+    if content.len() <= content_budget {
+        stable.push_str(content);
+        *context_budget -= prefix.len() + content.len();
+        PromptContextSectionResult::Complete
+    } else {
+        stable.push_str(&cap_bytes_with_hint_to_total(
+            content,
+            content_budget,
+            truncation_hint,
+        ));
+        *context_budget = 0;
+        PromptContextSectionResult::Truncated
+    }
 }
 
 fn render_seat_context(seat: &SeatRef, summary: Option<&str>, cap: usize) -> String {
@@ -10418,7 +10587,7 @@ fn push_env_section(env: &mut String, heading: &str, body: String, cap: usize, h
     env.push_str("\n## ");
     env.push_str(heading);
     env.push('\n');
-    env.push_str(&cap_bytes_with_hint(body, cap, hint));
+    env.push_str(&cap_bytes_with_hint_to_total(&body, cap, hint));
     if !env.ends_with('\n') {
         env.push('\n');
     }
@@ -10521,10 +10690,7 @@ fn compact_summary_max_tokens(
 const HISTORY_CHAR_BUDGET_MIN: usize = 24_000;
 pub(crate) const HISTORY_CHAR_BUDGET_END_TURN_PERCENT: u8 = 90;
 const HISTORY_CHAR_BUDGET_ACTIVE_PERCENT: u8 = 80;
-const FRUGAL_HISTORY_CHAR_BUDGET_PERCENT: u8 = 80;
-const FRUGAL_HISTORY_CHAR_BUDGET_MIN: usize = 8_000;
-const FRUGAL_HISTORY_CHAR_BUDGET_MAX: usize = 32_000;
-// Fixed history budget for frugal (non-tiny) context mode.
+// Fixed history budget for frugal context mode.
 const FRUGAL_HISTORY_CHAR_BUDGET: usize = 60_000;
 const COMPACT_KEEP_MESSAGES: usize = 6;
 const COMPACT_USER_BOUNDARY_BACKTRACK: usize = COMPACT_KEEP_MESSAGES * 4;
@@ -10746,6 +10912,26 @@ fn default_context_mode_for_provider(
     }
 }
 
+fn context_mode_from_env() -> Result<Option<ContextMode>> {
+    std::env::var("DEXT_CONTEXT_MODE")
+        .ok()
+        .map(|value| {
+            ContextMode::parse(&value).ok_or_else(|| {
+                anyhow::anyhow!("invalid DEXT_CONTEXT_MODE '{value}' (expected standard|frugal)")
+            })
+        })
+        .transpose()
+}
+
+fn resolve_context_mode_configuration(
+    cli_mode: Option<ContextMode>,
+) -> Result<Option<ContextMode>> {
+    match cli_mode {
+        Some(mode) => Ok(Some(mode)),
+        None => context_mode_from_env(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum ContextMode {
     #[default]
@@ -10753,8 +10939,6 @@ pub(crate) enum ContextMode {
     Standard,
     #[serde(alias = "frugal")]
     Frugal,
-    #[serde(alias = "tiny")]
-    Tiny,
 }
 
 impl ContextMode {
@@ -10762,32 +10946,19 @@ impl ContextMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "standard" | "default" | "full" | "normal" | "off" => Some(Self::Standard),
             "frugal" | "lean" | "slim" | "minimal" | "min" => Some(Self::Frugal),
-            "tiny" | "skinny" | "micro" | "lite" => Some(Self::Tiny),
             _ => None,
         }
-    }
-
-    fn from_env() -> Self {
-        std::env::var("DEXT_CONTEXT_MODE")
-            .ok()
-            .and_then(|v| Self::parse(&v))
-            .unwrap_or_default()
     }
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::Frugal => "frugal",
-            Self::Tiny => "tiny",
         }
     }
 
     fn is_frugal(self) -> bool {
-        matches!(self, Self::Frugal | Self::Tiny)
-    }
-
-    fn is_tiny(self) -> bool {
-        self == Self::Tiny
+        self == Self::Frugal
     }
 }
 
@@ -10796,7 +10967,6 @@ impl ContextMode {
 enum ToolContextProfile {
     #[default]
     Default,
-    Frugal,
     Full,
 }
 
@@ -10804,7 +10974,6 @@ impl ToolContextProfile {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "default" | "standard" | "core" => Some(Self::Default),
-            "frugal" | "slim" | "minimal" | "tiny" => Some(Self::Frugal),
             "full" | "all" => Some(Self::Full),
             _ => None,
         }
@@ -10825,18 +10994,9 @@ impl ToolContextProfile {
             .unwrap_or_default()
     }
 
-    fn effective(self, _context_mode: ContextMode) -> Self {
-        if self == Self::Frugal {
-            Self::Default
-        } else {
-            self
-        }
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Frugal => "frugal",
             Self::Full => "full",
         }
     }
@@ -10844,6 +11004,11 @@ impl ToolContextProfile {
 
 fn tool_name_allowed_in_profile(name: &str, profile: ToolContextProfile) -> bool {
     profile == ToolContextProfile::Full || tools::is_default_tool(name)
+}
+
+fn toolset_startup_diagnostic(profile: ToolContextProfile) -> Option<String> {
+    (profile != ToolContextProfile::Default)
+        .then(|| format!("[tools] toolset {}", profile.as_str()))
 }
 
 struct ToolsCommandResult {
@@ -10915,7 +11080,7 @@ fn handle_tools_command(agent: &mut Agent, arg: &str) -> ToolsCommandResult {
         "default" | "standard" | "core" | "full" | "all" => {
             let profile =
                 ToolContextProfile::parse_selectable(raw).unwrap_or(ToolContextProfile::Default);
-            agent.tool_context_profile = profile.effective(agent.context_mode);
+            agent.tool_context_profile = profile;
             agent.refresh_tools_for_context();
             ToolsCommandResult {
                 output: format!(
@@ -12715,18 +12880,6 @@ pub(crate) fn history_char_budget_with_window(
     {
         return v;
     }
-    if context_mode.is_tiny() {
-        let window_chars = usize::try_from(window_tokens)
-            .unwrap_or(usize::MAX / 4)
-            .saturating_mul(4);
-        return window_chars
-            .saturating_mul(FRUGAL_HISTORY_CHAR_BUDGET_PERCENT as usize)
-            .saturating_div(100)
-            .clamp(
-                FRUGAL_HISTORY_CHAR_BUDGET_MIN,
-                FRUGAL_HISTORY_CHAR_BUDGET_MAX,
-            );
-    }
     if context_mode.is_frugal() {
         return FRUGAL_HISTORY_CHAR_BUDGET;
     }
@@ -12981,13 +13134,14 @@ struct Agent {
 
 impl Agent {
     fn new() -> Result<Self> {
-        Self::new_with_sandbox(None, true, false)
+        Self::new_with_sandbox(None, true, false, context_mode_from_env()?)
     }
 
     pub(crate) fn new_with_sandbox(
         sandbox: Option<PathBuf>,
         session_enabled: bool,
         defer_git_context: bool,
+        configured_context_mode: Option<ContextMode>,
     ) -> Result<Self> {
         let resolved = resolve_runtime_provider(None, false)?;
         let provider_id = resolved.profile.id.clone();
@@ -13026,9 +13180,6 @@ impl Agent {
             .ok()
             .and_then(|v| ReasoningMode::parse(&v))
             .unwrap_or_default();
-        let configured_context_mode = std::env::var("DEXT_CONTEXT_MODE")
-            .ok()
-            .and_then(|value| ContextMode::parse(&value));
         let context_mode_explicit = configured_context_mode.is_some();
         let context_mode = configured_context_mode.unwrap_or_else(|| {
             default_context_mode_for_provider(&provider_id, api_provider, &base_url)
@@ -13043,13 +13194,7 @@ impl Agent {
                     Some(v)
                 }
             })
-            .unwrap_or_else(|| {
-                if context_mode.is_tiny() {
-                    TINY_SYSTEM.to_string()
-                } else {
-                    DEFAULT_SYSTEM.to_string()
-                }
-            });
+            .unwrap_or_else(|| DEFAULT_SYSTEM.to_string());
         let system = match std::env::var("DEXT_SYSTEM_APPEND")
             .ok()
             .and_then(|v| load_prompt_env_value(v).ok())
@@ -13086,7 +13231,7 @@ impl Agent {
         };
         let tool_profile = ToolProfile::from_env();
         let budget_cap = BudgetCap::from_env().map_err(anyhow::Error::msg)?;
-        let tool_context_profile = ToolContextProfile::from_env().effective(context_mode);
+        let tool_context_profile = ToolContextProfile::from_env();
         let tools: Vec<Tool> = provider_tool_definitions()
             .into_iter()
             .filter(|t| tool_name_allowed_in_profile(t.name, tool_context_profile))
@@ -14738,11 +14883,6 @@ impl Agent {
         ))
     }
 
-    #[cfg(test)]
-    fn session_dir(&self) -> PathBuf {
-        crate::session::session_state_dir(&self.sandbox_root, &self.session_id)
-    }
-
     fn append_latest_log(&self, event: &str, detail: &str) {
         if !self.session_enabled {
             return;
@@ -14872,79 +15012,72 @@ impl Agent {
     }
 
     fn compose_system_details(&self) -> SystemParts {
-        let tiny = self.context_mode.is_tiny();
-        let caps = if tiny {
-            EnvCaps::TINY
-        } else if self.context_mode.is_frugal() {
+        let caps = if self.context_mode.is_frugal() {
             EnvCaps::FRUGAL
         } else {
             EnvCaps::FULL
         };
         let mut stable = self.system.clone();
-        if self.context_mode.is_frugal()
-            && !self.context_mode.is_tiny()
-            && !stable.contains(FRUGAL_TOOL_PROTOCOL_NOTE)
-        {
+        if self.context_mode.is_frugal() && !stable.contains(FRUGAL_TOOL_PROTOCOL_NOTE) {
             stable.push('\n');
             stable.push_str(FRUGAL_TOOL_PROTOCOL_NOTE);
         }
-        let mut context_budget = if self.context_mode.is_tiny() {
-            1_300
-        } else if self.context_mode.is_frugal() {
+        let mut context_budget = if self.context_mode.is_frugal() {
             FRUGAL_PROJECT_CONTEXT_CAP
         } else {
             PROJECT_CONTEXT_CAP
         };
         let mut prompt_sources = Vec::new();
+        let mut prompt_source_hashes = Vec::new();
         let (dext_md_sections, recall_sections, cached_pack_summary, cached_shelf_summary) =
             self.prompt_scans();
-        for (label, path, content) in &dext_md_sections {
+        for (label, path, content, content_hash) in &dext_md_sections {
             if context_budget == 0 {
                 break;
             }
             prompt_sources.push(path.clone());
+            prompt_source_hashes.push((path.clone(), content_hash.clone()));
             let label = prompt_env_value(label, 512);
-            let section = format!(
-                "\n\n## Project-controlled guidance (DEXT.md from {label})\n{}",
-                content
-            );
-            if section.len() <= context_budget {
-                stable.push_str(&section);
-                context_budget -= section.len();
-            } else {
-                let remaining = cap_bytes_with_hint(
-                    content.clone(),
-                    context_budget.saturating_sub(60),
-                    "DEXT.md truncated; keep only the most important project guidance here.",
-                );
-                stable.push_str(&format!(
-                    "\n\n## Project-controlled guidance (DEXT.md from {label})\n{remaining}"
-                ));
-                context_budget = 0;
-                break;
+            let heading = format!("Project-controlled guidance (DEXT.md from {label})");
+            match push_prompt_context_section(
+                &mut stable,
+                &heading,
+                content,
+                &mut context_budget,
+                "DEXT.md truncated; keep only the most important project guidance here.",
+            ) {
+                PromptContextSectionResult::Complete => {}
+                PromptContextSectionResult::Truncated => break,
+                PromptContextSectionResult::Omitted => {
+                    prompt_sources.pop();
+                    prompt_source_hashes.pop();
+                    break;
+                }
             }
         }
 
-        for (label, path, content) in &recall_sections {
+        for (label, path, content, content_hash) in &recall_sections {
             if context_budget == 0 {
                 break;
             }
             prompt_sources.push(path.clone());
+            prompt_source_hashes.push((path.clone(), content_hash.clone()));
             let label = prompt_env_value(label, 512);
-            let section = format!("\n\n## Recall (recall.md from {label})\n{}", content);
-            if section.len() <= context_budget {
-                stable.push_str(&section);
-                context_budget -= section.len();
-            } else {
-                let remaining = cap_bytes_with_hint(
-                    content.clone(),
-                    context_budget.saturating_sub(60),
-                    "recall.md truncated; keep durable facts concise.",
-                );
-                stable.push_str(&format!(
-                    "\n\n## Recall (recall.md from {label})\n{remaining}"
-                ));
-                break;
+            let heading = format!("Recall (recall.md from {label})");
+            match push_prompt_context_section(
+                &mut stable,
+                &heading,
+                content,
+                &mut context_budget,
+                "recall.md truncated; keep durable facts concise.",
+            ) {
+                PromptContextSectionResult::Complete => {}
+                PromptContextSectionResult::Truncated => break,
+                PromptContextSectionResult::Omitted => {
+                    prompt_sources.pop();
+                    prompt_source_hashes.pop();
+                    break;
+                }
             }
         }
 
@@ -14955,8 +15088,8 @@ impl Agent {
             && let Some(pack_summary) = cached_pack_summary
         {
             stable.push_str("\n\n## Dext packs\n");
-            stable.push_str(&cap_bytes_with_hint(
-                pack_summary,
+            stable.push_str(&cap_bytes_with_hint_to_total(
+                &pack_summary,
                 cap,
                 &format!("pack summary trimmed for {}.", caps.suffix),
             ));
@@ -14965,8 +15098,8 @@ impl Agent {
             && let Some(shelf_summary) = cached_shelf_summary
         {
             stable.push_str("\n\n## Dext shelves\n");
-            stable.push_str(&cap_bytes_with_hint(
-                shelf_summary,
+            stable.push_str(&cap_bytes_with_hint_to_total(
+                &shelf_summary,
                 cap,
                 &format!("shelf registry summary trimmed for {}.", caps.suffix),
             ));
@@ -14992,7 +15125,7 @@ impl Agent {
         ));
 
         if let Some(seat) = &self.seat {
-            let cap = if tiny { 600 } else { 1_000 };
+            let cap = 1_000;
             let mut prompt_seat = seat.clone();
             prompt_seat.label = prompt_seat
                 .label
@@ -15077,6 +15210,7 @@ impl Agent {
             stable,
             env,
             prompt_sources,
+            prompt_source_hashes,
         }
     }
 
@@ -15327,20 +15461,11 @@ impl Agent {
     }
 
     fn set_context_mode_automatic(&mut self, mode: ContextMode) {
-        let switching_to_tiny = mode.is_tiny();
         self.context_mode = mode;
-        self.tool_context_profile = self.tool_context_profile.effective(mode);
-        if switching_to_tiny {
-            if self.system == DEFAULT_SYSTEM {
-                self.system = TINY_SYSTEM.to_string();
-            }
-        } else if self.system == TINY_SYSTEM {
-            self.system = DEFAULT_SYSTEM.to_string();
-        }
     }
 
     fn tool_context_profile(&self) -> ToolContextProfile {
-        self.tool_context_profile.effective(self.context_mode)
+        self.tool_context_profile
     }
 
     fn refresh_tools_for_context(&mut self) {
@@ -15368,10 +15493,11 @@ impl Agent {
         }
         let mut neutral = tools::provider_neutral_tools(&self.tools, self.wire_tool_profile());
         if let Some(runtime) = &self.active_pack_runtime {
+            let profile = self.wire_tool_profile();
             neutral.extend(runtime.tools.iter().map(|tool| tools::ProviderNeutralTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                schema: tool.input_schema.clone(),
+                schema: tools::schema_for_profile(&tool.input_schema, profile),
             }));
         }
         neutral
@@ -15941,33 +16067,23 @@ impl Agent {
         details: &SystemParts,
         system_prompt: &str,
     ) -> SessionProvenance {
-        let mut prompt_sources = Vec::new();
+        let prompt_sources = details
+            .prompt_sources
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
         let dext_md_root = self.sandbox_root.join("DEXT.md");
         let recall_root = self.sandbox_root.join("recall.md");
-        let dext_md_hash = prompt_context_file_hash(&dext_md_root).inspect(|_| {
-            if !details
-                .prompt_sources
-                .iter()
-                .any(|path| path == &dext_md_root)
-            {
-                prompt_sources.push(dext_md_root.display().to_string());
-            }
-        });
-        let recall_hash = prompt_context_file_hash(&recall_root).inspect(|_| {
-            if !details
-                .prompt_sources
-                .iter()
-                .any(|path| path == &recall_root)
-            {
-                prompt_sources.push(recall_root.display().to_string());
-            }
-        });
-        prompt_sources.extend(
-            details
-                .prompt_sources
-                .iter()
-                .map(|path| path.display().to_string()),
-        );
+        let dext_md_hash = details
+            .prompt_source_hashes
+            .iter()
+            .find(|(path, _)| path == &dext_md_root)
+            .map(|(_, hash)| hash.clone());
+        let recall_hash = details
+            .prompt_source_hashes
+            .iter()
+            .find(|(path, _)| path == &recall_root)
+            .map(|(_, hash)| hash.clone());
         SessionProvenance {
             dext_version: env!("CARGO_PKG_VERSION").to_string(),
             git: self.git_context.clone(),
@@ -16283,7 +16399,7 @@ impl Agent {
             )
         };
         self.set_context_mode_automatic(restored_context_mode);
-        self.tool_context_profile = tool_context_profile.effective(restored_context_mode);
+        self.tool_context_profile = tool_context_profile;
         self.tool_profile = tool_profile;
         self.active_pack_runtime = prepared_runtime;
         self.pending_pack_runtime_prompts = prepared_pending_prompts;
@@ -20794,7 +20910,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
             let _ = writeln!(
                 w,
-                "  /context [standard|frugal|tiny] context/cap mode; tiny is skinny local mode"
+                "  /context [standard|frugal]  context/cap mode; local providers default to frugal"
             );
             let _ = writeln!(
                 w,
@@ -21410,7 +21526,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     agent.tool_context_profile().as_str()
                 );
             } else {
-                let _ = writeln!(w, "usage: /context [standard|frugal|tiny|status]");
+                let _ = writeln!(w, "usage: /context [standard|frugal|status]");
             }
         }
         "tool-profile" | "tools-profile" => {
@@ -22742,27 +22858,18 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--fork" => fork = true,
             "--frugal" => {
                 context_mode = Some(ContextMode::Frugal);
-                tool_profile = Some(ToolProfile::Lean);
                 if thinking_effort.is_none() {
                     thinking_effort = Some(ThinkingEffort::Medium);
                 }
             }
-            "--tiny" => {
-                context_mode = Some(ContextMode::Tiny);
-                tool_profile = Some(ToolProfile::Lean);
-                if thinking_effort.is_none() {
-                    thinking_effort = Some(ThinkingEffort::Medium);
-                }
-            }
+            "--tiny" => anyhow::bail!("unknown option '--tiny'; use --frugal"),
             "--context-mode" => {
                 i += 1;
-                let value = argv.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--context-mode requires standard|frugal|tiny")
-                })?;
+                let value = argv
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--context-mode requires standard|frugal"))?;
                 context_mode = Some(ContextMode::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid --context-mode '{value}' (expected standard|frugal|tiny)"
-                    )
+                    anyhow::anyhow!("invalid --context-mode '{value}' (expected standard|frugal)")
                 })?);
             }
             "--toolset" | "--tool-context-profile" => {
@@ -22940,9 +23047,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             _ if arg.starts_with("--context-mode=") => {
                 let value = arg.trim_start_matches("--context-mode=");
                 context_mode = Some(ContextMode::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid context mode '{value}' (expected standard|frugal|tiny)"
-                    )
+                    anyhow::anyhow!("invalid context mode '{value}' (expected standard|frugal)")
                 })?);
             }
             _ if arg.starts_with("--pack=") => {
@@ -23436,8 +23541,7 @@ async fn main() -> Result<()> {
         println!(
             "       dext --frugal        minimize prompt/tool/history context for lower token cost"
         );
-        println!("       dext --tiny          extra-light context mode with condensed prompt");
-        println!("       dext --context-mode standard|frugal|tiny");
+        println!("       dext --context-mode standard|frugal");
         println!("       dext --toolset default|full  choose provider-visible tool count profile");
         println!("       dext --tool-context-profile default|full  alias for --toolset");
         println!(
@@ -23452,7 +23556,7 @@ async fn main() -> Result<()> {
         println!("       dext undo --apply <id>   non-interactive apply");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal|tiny, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
         );
         return Ok(());
     }
@@ -23463,6 +23567,7 @@ async fn main() -> Result<()> {
         std::process::exit(if ok { 0 } else { 1 });
     }
     let opts = parse_cli_options(argv.clone())?;
+    let configured_context_mode = resolve_context_mode_configuration(opts.context_mode)?;
     let approval_policy = resolve_approval_policy_from_env(opts.approval_policy_override);
     for warning in &approval_policy.warnings {
         eprintln!("[approval warning] {warning}");
@@ -23493,6 +23598,7 @@ async fn main() -> Result<()> {
         opts.cd.clone(),
         !opts.no_session && !opts.fork,
         will_use_tui,
+        configured_context_mode,
     )?;
     agent.set_resolved_approval_profile(approval_policy.profile, approval_policy.source);
     agent.prewarm_connection();
@@ -23518,7 +23624,7 @@ async fn main() -> Result<()> {
         agent.set_context_mode(mode);
     }
     if let Some(profile) = opts.tool_context_profile {
-        agent.tool_context_profile = profile.effective(agent.context_mode);
+        agent.tool_context_profile = profile;
     }
     if let Some(profile) = opts.tool_profile {
         agent.tool_profile = profile;
@@ -23578,16 +23684,11 @@ async fn main() -> Result<()> {
                 if let Some(mode) = configured_reasoning_mode {
                     agent.set_reasoning_mode(mode);
                 }
-                let configured_context_mode = opts.context_mode.or_else(|| {
-                    std::env::var("DEXT_CONTEXT_MODE")
-                        .ok()
-                        .and_then(|value| ContextMode::parse(&value))
-                });
                 if let Some(mode) = configured_context_mode {
                     agent.set_context_mode(mode);
                 }
                 if let Some(profile) = opts.tool_context_profile {
-                    agent.tool_context_profile = profile.effective(agent.context_mode);
+                    agent.tool_context_profile = profile;
                 }
                 if let Some(profile) = opts.tool_profile {
                     agent.tool_profile = profile;
@@ -23640,10 +23741,8 @@ async fn main() -> Result<()> {
         if agent.sandbox_profile() != SandboxProfile::DangerFullAccess && !sandbox::is_enforced() {
             eprintln!("[sandbox warning] {}", sandbox::describe());
         }
-        if agent.tool_context_profile() != ToolContextProfile::Default
-            && !agent.context_mode.is_frugal()
-        {
-            eprintln!("[tools] toolset {}", agent.tool_context_profile().as_str());
+        if let Some(message) = toolset_startup_diagnostic(agent.tool_context_profile()) {
+            eprintln!("{message}");
         }
     }
 

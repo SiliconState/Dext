@@ -535,7 +535,7 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
     },
     SlashCmd {
         name: "/context",
-        args: "[standard|frugal|tiny|status]",
+        args: "[standard|frugal|status]",
         help: "context and cap mode",
     },
     SlashCmd {
@@ -11026,7 +11026,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_text_block_redacts_multiline_raw_tool_protocol_payload_in_tiny() {
+    fn assistant_text_block_redacts_multiline_raw_tool_protocol_payload_in_frugal() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -11034,7 +11034,7 @@ mod tests {
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        state.context_mode = ContextMode::Tiny;
+        state.context_mode = ContextMode::Frugal;
 
         state.apply_event(AgentEvent::TextBlockComplete(
             "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}\nDone".to_string(),
@@ -11052,7 +11052,7 @@ mod tests {
     }
 
     #[test]
-    fn inspector_keeps_standard_legacy_payload_and_redacts_tiny_payload() {
+    fn inspector_keeps_standard_legacy_payload_and_redacts_frugal_payload() {
         let mut standard = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -11068,17 +11068,17 @@ mod tests {
         assert!(joined.contains("command"), "{joined}");
         assert!(joined.contains("cargo test"), "{joined}");
 
-        let mut tiny = TuiState::new(
+        let mut frugal = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
             ".".to_string(),
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        tiny.context_mode = ContextMode::Tiny;
-        tiny.streaming_thinking =
+        frugal.context_mode = ContextMode::Frugal;
+        frugal.streaming_thinking =
             "to=functions.bash\n{\n  \"command\": \"cargo test\"\n}".to_string();
-        let text = inspector_lines(&tiny, 100, 20);
+        let text = inspector_lines(&frugal, 100, 20);
         let joined = flatten_lines(&text).join("\n");
         assert!(joined.contains("tool call redacted"), "{joined}");
         assert!(!joined.contains("to=functions"), "{joined}");
@@ -11109,7 +11109,7 @@ mod tests {
     }
 
     #[test]
-    fn status_spans_hide_frugal_and_tiny_context_mode_labels() {
+    fn status_spans_hide_frugal_context_mode_label() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -11121,10 +11121,6 @@ mod tests {
         state.context_mode = ContextMode::Frugal;
         let joined = flatten_lines(&Text::from(Line::from(status_spans(&state)))).join("\n");
         assert!(!joined.contains("frugal"), "{joined}");
-
-        state.context_mode = ContextMode::Tiny;
-        let joined = flatten_lines(&Text::from(Line::from(status_spans(&state)))).join("\n");
-        assert!(!joined.contains("tiny"), "{joined}");
     }
 
     #[test]
@@ -13025,14 +13021,13 @@ mod tests {
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        state.context_mode = ContextMode::Tiny;
+        state.context_mode = ContextMode::Frugal;
 
         let rendered = status_spans(&state)
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
 
-        assert!(!rendered.contains("tiny"), "{rendered}");
         assert!(!rendered.contains("frugal"), "{rendered}");
     }
 
@@ -13055,17 +13050,16 @@ mod tests {
             last_retry_reason: None,
             workaround_fired: false,
             turn_duration_ms: None,
-            context_mode: Some(ContextMode::Tiny),
+            context_mode: Some(ContextMode::Frugal),
             tool_profile: None,
             compacted: None,
         });
 
-        assert_eq!(state.context_mode, ContextMode::Tiny);
+        assert_eq!(state.context_mode, ContextMode::Frugal);
         let rendered = status_spans(&state)
             .into_iter()
             .map(|span| span.content)
             .collect::<String>();
-        assert!(!rendered.contains("tiny"), "{rendered}");
         assert!(!rendered.contains("frugal"), "{rendered}");
     }
 

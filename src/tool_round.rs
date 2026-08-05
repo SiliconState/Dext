@@ -61,6 +61,7 @@ impl Agent {
             mut hooks_approved,
         } = context;
         let read_cache = self.read_cache.clone();
+        let context_mode = self.context_mode;
         if self.session_enabled
             && tool_calls.iter().any(|(_, name, _)| {
                 self.active_runtime_tool(name).is_some() || self.tool_is_side_effect_capable(name)
@@ -449,7 +450,7 @@ impl Agent {
                     // arrived; `execute_builtin_call` re-reads the flag before
                     // it does anything, so a queued call short-circuits here
                     // rather than starting work the user already cancelled.
-                    let outcome = execute_builtin_call(
+                    let outcome = execute_builtin_call_for_context(
                         n,
                         inp,
                         root,
@@ -463,6 +464,7 @@ impl Agent {
                         hooks_approved,
                         None,
                         pack_env,
+                        context_mode,
                     )
                     .await;
                     (idx, outcome)
@@ -677,7 +679,7 @@ impl Agent {
                     self.execute_pack_runtime_tool(&n, &inp, &turn_id, iterations)
                         .await
                 } else {
-                    execute_builtin_call(
+                    execute_builtin_call_for_context(
                         n.clone(),
                         inp,
                         root.clone(),
@@ -691,6 +693,7 @@ impl Agent {
                         hooks_approved,
                         live_output,
                         self.pack_hook_env.clone(),
+                        context_mode,
                     )
                     .await
                 };

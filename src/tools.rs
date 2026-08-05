@@ -467,20 +467,82 @@ fn lean_description(name: &str, fallback: &str) -> String {
 }
 
 fn slim_schema(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (key, child) in map {
-                if key == "description" {
-                    continue;
-                }
-                out.insert(key.clone(), slim_schema(child));
-            }
-            Value::Object(out)
+    let Value::Object(map) = value else {
+        return value.clone();
+    };
+
+    let mut out = serde_json::Map::new();
+    for (key, child) in map {
+        if key == "description" {
+            continue;
         }
-        Value::Array(items) => Value::Array(items.iter().map(slim_schema).collect()),
-        _ => value.clone(),
+        let child = match key.as_str() {
+            "properties" | "patternProperties" | "dependentSchemas" | "$defs" | "definitions" => {
+                slim_schema_map(child)
+            }
+            "dependencies" => slim_schema_dependencies(child),
+            "additionalItems"
+            | "additionalProperties"
+            | "contains"
+            | "contentSchema"
+            | "else"
+            | "if"
+            | "items"
+            | "not"
+            | "propertyNames"
+            | "then"
+            | "unevaluatedItems"
+            | "unevaluatedProperties" => slim_schema_or_array(child),
+            "allOf" | "anyOf" | "oneOf" | "prefixItems" => slim_schema_array(child),
+            _ => child.clone(),
+        };
+        out.insert(key.clone(), child);
     }
+    Value::Object(out)
+}
+
+fn slim_schema_map(value: &Value) -> Value {
+    let Value::Object(map) = value else {
+        return value.clone();
+    };
+    Value::Object(
+        map.iter()
+            .map(|(name, schema)| (name.clone(), slim_schema(schema)))
+            .collect(),
+    )
+}
+
+fn slim_schema_dependencies(value: &Value) -> Value {
+    let Value::Object(map) = value else {
+        return value.clone();
+    };
+    Value::Object(
+        map.iter()
+            .map(|(name, dependency)| {
+                let value = if dependency.is_object() {
+                    slim_schema(dependency)
+                } else {
+                    dependency.clone()
+                };
+                (name.clone(), value)
+            })
+            .collect(),
+    )
+}
+
+fn slim_schema_or_array(value: &Value) -> Value {
+    if value.is_array() {
+        slim_schema_array(value)
+    } else {
+        slim_schema(value)
+    }
+}
+
+fn slim_schema_array(value: &Value) -> Value {
+    let Value::Array(items) = value else {
+        return value.clone();
+    };
+    Value::Array(items.iter().map(slim_schema).collect())
 }
 
 fn tool_description(tool: &Tool, profile: ToolProfile) -> String {
@@ -490,11 +552,15 @@ fn tool_description(tool: &Tool, profile: ToolProfile) -> String {
     }
 }
 
-fn tool_schema(tool: &Tool, profile: ToolProfile) -> Value {
+pub(crate) fn schema_for_profile(schema: &Value, profile: ToolProfile) -> Value {
     match profile {
-        ToolProfile::Full => tool.input_schema.clone(),
-        ToolProfile::Lean => slim_schema(&tool.input_schema),
+        ToolProfile::Full => schema.clone(),
+        ToolProfile::Lean => slim_schema(schema),
     }
+}
+
+fn tool_schema(tool: &Tool, profile: ToolProfile) -> Value {
+    schema_for_profile(&tool.input_schema, profile)
 }
 
 #[derive(Clone, Serialize)]

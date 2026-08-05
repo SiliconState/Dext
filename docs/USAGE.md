@@ -103,7 +103,7 @@ The built-in Kimi Code catalog uses Anthropic Messages semantics at `https://api
 
 ## Local Qwen / llama.cpp
 
-Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Local providers use frugal context by default unless you explicitly select `standard` or `tiny`. On startup and provider/model switches, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) and uses the live runtime context window for whichever model alias the server exposes. You can select any local alias; no model-specific context value is built into the local provider. Start one server first, then select its alias:
+Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Local providers use frugal context by default unless you explicitly select `standard`. On startup and provider/model switches, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) and uses the live runtime context window for whichever model alias the server exposes. You can select any local alias; no model-specific context value is built into the local provider. Start one server first, then select its alias:
 
 ```bash
 dext auth provider local
@@ -124,7 +124,7 @@ cd /path/to/llama.cpp
   --host 127.0.0.1 --port 8080
 ```
 
-Use `--context-mode tiny --effort off` or `/context tiny` plus `/effort off` for the lowest local token/compute pressure.
+Use `--frugal --effort off` or `/context frugal` plus `/effort off` for the lowest local token/compute pressure.
 
 ## Interactive workflow
 
@@ -145,7 +145,7 @@ Useful slash commands:
 /allowed                       list native and active-runtime grants
 /approval ask                 ask before privileged tools
 /sandbox-profile read-only    prevent write operations
-/context tiny                 skinny local/token mode
+/context frugal               low-token context mode
 /effort max                  select maximum model effort
 /reasoning-mode pro          select GPT-5.6 Pro mode; active only on official OpenAI Responses
 /compact status               inspect compaction threshold/history size
@@ -335,7 +335,6 @@ Inside a session:
 
 ```bash
 dext --frugal
-dext --context-mode tiny
 dext --context-mode frugal
 dext --tool-profile lean    # default schema verbosity
 dext --toolset full
@@ -345,7 +344,7 @@ dext --budget 200000t
 dext --budget '$2 + 200000t'  # stop at either dimension
 ```
 
-Frugal mode uses lean schemas by default, keeps the selected toolset, applies smaller caps, and compacts context more aggressively. Tiny mode uses a condensed prompt and caps history around 80% of the detected model window (bounded 8k–32k chars). Standard mode also uses a compact invariant-driven built-in prompt: universal workflow and safety rules remain there, while tool-specific syntax lives in the default lean schemas instead of being repeated. Explicit `--toolset` and `--tool-profile` choices remain available in every context mode. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
+Frugal mode uses lean schemas by default, keeps explicit toolset/schema selections, applies smaller context/result/raw-capture caps, and compacts context more aggressively. `/context` applies the selected mode immediately to subsequent native reads and tool-result shaping in both sequential and parallel tool rounds. Frugal mode also uses the stricter pseudo-tool-protocol sanitizer for assistant text: serialized or multiline tool-call-like payloads are replaced with a redaction marker in partial-stream recovery, transcript rendering, and the inspector while surrounding prose is retained. An explicit context selection remains pinned across provider switches and is persisted on session save/restore; without one, local providers select frugal and cloud providers select standard automatically. The retired `tiny` mode and `--tiny` alias are rejected rather than silently mapped to frugal. Standard mode also uses a compact invariant-driven built-in prompt: universal workflow and safety rules remain there, while tool-specific syntax lives in the default lean schemas instead of being repeated. Explicit `--toolset` and `--tool-profile` choices remain available in both context modes and are order-independent; a valid CLI context mode overrides `DEXT_CONTEXT_MODE`, while an invalid environment value still fails when no CLI override is supplied. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them. Non-JSON startup prints `[tools] toolset full` whenever that opt-in catalog is selected, including in frugal mode.
 
 Budget caps accept the documented compact `t` suffix as well as `tok`, reject duplicate dollar or token dimensions in combined caps instead of silently keeping one value, and reject empty combined components. An invalid `DEXT_BUDGET_CAP` fails startup instead of silently disabling the guard.
 

@@ -7,8 +7,8 @@ Reduce the provider-visible input Dext supplies for the first request in a clean
 ## Primary metric
 
 - `total_bytes`, lower is better.
-- Deterministic canonical fixture: `DEFAULT_SYSTEM` UTF-8 bytes + a clean-repository standard-mode runtime tail with neutral cwd/OS/provider/model/Git values + canonical JSON for all 13 default lean `{name, description, schema}` descriptors.
-- The normalized descriptor payload is provider-independent comparison data, not an actual provider request, tokenizer count, or billing count. Actual tool-array bytes and wrapper overhead are reported separately for Anthropic cache-on/cache-off, OpenAI Chat Completions, OpenAI Responses, and ChatGPT Responses.
+- Deterministic normalized fixture: `DEFAULT_SYSTEM` UTF-8 bytes + a clean-repository standard-mode runtime tail with neutral cwd/OS/provider/model/Git values + deterministic JSON for all 13 default lean `{name, description, schema}` descriptors.
+- The normalized descriptor payload is provider-independent comparison data, not an actual provider request, formal canonical-JSON encoding, tokenizer count, or billing count. Actual tool-array bytes and signed size deltas are reported separately for Anthropic cache-on/cache-off, OpenAI Chat Completions, OpenAI Responses, and ChatGPT Responses.
 - `approx_tokens = ceil(total_bytes / 4)` is the target-facing secondary metric.
 - Goal: strictly below 6,000 bytes (~1,500 tokens). Stretch goal below 4,000 bytes (~1,000 tokens) only if behavior and capabilities remain intact.
 
@@ -20,7 +20,7 @@ Reduce the provider-visible input Dext supplies for the first request in a clean
 - `docs/index.html`, `docs/ARCHITECTURE.md`, `docs/USAGE.md`: same-change documentation.
 - `.auto/measure.sh`, `.auto/checks.sh`, `.auto/prompt.md`, `.auto/ideas.md`: benchmark evidence and evolving findings.
 
-Do not optimize repository-specific injected prompt files, full-schema mode, tiny mode, unrelated runtime behavior, or output caps.
+Do not optimize repository-specific injected prompt files, full-schema mode, frugal-mode behavior, unrelated runtime behavior, or output caps.
 
 ## Invariants
 
@@ -38,7 +38,7 @@ Do not optimize repository-specific injected prompt files, full-schema mode, tin
 bash .auto/measure.sh
 ```
 
-The Rust regression composes the real `DEFAULT_SYSTEM`, a clean-repository environment tail with neutral provider/model placeholders, default-tool membership, and canonical JSON for lean provider-neutral descriptors. `.auto/measure.sh` relays that fixture's primary metrics plus actual per-contract tool-array bytes and wrapper overhead. The normalized payload is a reproducible comparison fixture, not a provider request, tokenizer count, billing count, or maximum for arbitrary runtime strings.
+The Rust regression composes the real `DEFAULT_SYSTEM`, a clean-repository environment tail with neutral provider/model placeholders, default-tool membership, and deterministic normalized JSON for lean provider-neutral descriptors. `.auto/measure.sh` relays that fixture's primary metrics plus actual per-contract tool-array bytes and signed size deltas. The normalized payload is a reproducible comparison fixture, not a provider request, formal canonical-JSON encoding, tokenizer count, billing count, or maximum for arbitrary runtime strings.
 
 ## Correctness backpressure
 
