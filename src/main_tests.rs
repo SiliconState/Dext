@@ -16058,7 +16058,9 @@ fn tiny_mode_uses_condensed_prompt_and_slim_env() {
     assert!(stable.contains("Native tools before bash"), "{stable}");
     assert!(stable.len() < 2_500, "{}", stable.len());
     assert!(env.contains("context=tiny"), "{env}");
-    assert!(env.contains("compact="), "{env}");
+    assert!(!env.contains(" toolset="), "{env}");
+    assert!(!env.contains(" schemas="), "{env}");
+    assert!(!env.contains("\ncompact="), "{env}");
     assert!(!env.contains("## Project todos"), "{env}");
     assert!(env.len() < 1_200, "{}", env.len());
 
@@ -16094,10 +16096,9 @@ fn compose_system_parts_keeps_standard_env_compact_and_caps_ledger() {
 
     let (_stable, env) = agent.compose_system_parts();
     assert!(env.starts_with("## Environment\ncwd="), "{env}");
-    assert!(
-        env.contains("active_history_compact_threshold_chars="),
-        "{env}"
-    );
+    assert!(!env.contains("history_compact_threshold_chars="), "{env}");
+    assert!(!env.contains(" toolset="), "{env}");
+    assert!(!env.contains(" schemas="), "{env}");
     assert!(!env.contains("session_event_refs"), "{env}");
     assert!(!env.contains("auth_source"), "{env}");
     assert!(
@@ -26133,19 +26134,19 @@ fn env_prompt_sections_emit_every_reachable_cap_hint() {
                         "env must open with the kv line: {}",
                         parts.env
                     );
-                    // Tiny drops the toolset field and abbreviates the
-                    // threshold keys; the other modes carry both in full.
-                    if matches!(mode, ContextMode::Tiny) {
-                        assert!(!parts.env.contains(" toolset="), "{}", parts.env);
-                        assert!(parts.env.contains("\ncompact="), "{}", parts.env);
-                    } else {
-                        assert!(parts.env.contains(" toolset="), "{}", parts.env);
-                        assert!(
-                            parts.env.contains("\nhistory_compact_threshold_chars="),
-                            "{}",
-                            parts.env
-                        );
-                    }
+                    assert!(parts.env.contains(" provider="), "{}", parts.env);
+                    assert!(parts.env.contains(" model="), "{}", parts.env);
+                    assert!(parts.env.contains(" context="), "{}", parts.env);
+                    assert!(parts.env.contains(" approval="), "{}", parts.env);
+                    assert!(parts.env.contains(" sandbox="), "{}", parts.env);
+                    assert!(!parts.env.contains(" toolset="), "{}", parts.env);
+                    assert!(!parts.env.contains(" schemas="), "{}", parts.env);
+                    assert!(
+                        !parts.env.contains("history_compact_threshold_chars=")
+                            && !parts.env.contains("\ncompact="),
+                        "{}",
+                        parts.env
+                    );
                     all_env.push_str(&parts.env);
                     all_stable.push_str(&parts.stable);
                     // Packs and shelves moved into the cached block; they must

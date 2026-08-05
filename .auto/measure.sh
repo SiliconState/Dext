@@ -153,8 +153,7 @@ tool_json = json.dumps(wire_tools, separators=(",", ":"), ensure_ascii=False).en
 # Canonical clean-repository first request after ObjectiveTracker initialization.
 # It intentionally excludes optional DEXT.md/recall/todo/Seat/pack/shelf/history state.
 runtime_tail = """## Environment
-cwd=/work/new-repo os=linux git=main provider=chatgpt model=gpt-5.6-sol effort=xhigh context=standard toolset=default schemas=lean approval=ask sandbox=workspace-write
-history_compact_threshold_chars=3360000 active_history_compact_threshold_chars=3360000
+cwd=/work/new-repo os=linux git=main provider=chatgpt model=gpt-5.6-sol effort=xhigh context=standard approval=ask sandbox=workspace-write
 
 ## Work ledger
 current_phase: probe

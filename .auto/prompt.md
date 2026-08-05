@@ -51,5 +51,6 @@ Each measured experiment runs formatting plus focused prompt, context-state, sch
 
 - Measured baseline: 8,781 bytes (~2,196 tokens): 4,250 system, 3,846 tools, 683 runtime tail.
 - Compact invariant-driven system prompt plus minimal lean descriptions reached 5,999 bytes (~1,500 tokens) while retaining all 13 default tools, schema fields, and semantic guardrail tests.
-- The clean first-request runtime tail still emits three all-zero strategy budgets before any tool action; omitting only that state should preserve explicit reset/pivot budgets after actions.
+- Omitting all-zero pre-action strategy rows reached 5,891 bytes (~1,473 tokens) while preserving explicit post-action reset/pivot budgets.
+- The runtime tail still carries toolset/schema labels already evident in tool definitions and host-only compaction thresholds; remove only those, retaining actionable provider/model/effort/context and policy state.
 - Under 1,000 tokens is structurally impossible with the current tool payload plus meaningful system/runtime context; reaching it likely requires on-demand/adaptive tool exposure, not unsafe prose deletion.

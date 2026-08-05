@@ -20,7 +20,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Slash commands.
   - Built-in tool implementations, including bounded, cancellation-aware native file reads and an 8 MiB `read_symbol` source-input ceiling.
   - Eval harness.
-  - Prompt/context assembly and compaction; the standard built-in agent prompt is compact, invariant-driven, and regression-capped below 2,000 bytes, leaving tool-specific syntax in lean schemas rather than duplicating it in universal prose. Turn-stable guidance/pack/shelf prompt sections are cached separately from the volatile per-round environment tail; context strategy budgets omit all-zero rows before the first tool action, then remain explicit after actions to preserve reset/warning/pivot state. Each ancestor guidance/recall file is bounded at 1 MiB for both prompt loading and provenance hashing.
+  - Prompt/context assembly and compaction; the standard built-in agent prompt is compact, invariant-driven, and regression-capped below 2,000 bytes, leaving tool-specific syntax in lean schemas rather than duplicating it in universal prose. Turn-stable guidance/pack/shelf prompt sections are cached separately from the volatile per-round environment tail. That tail omits toolset/schema labels already represented by provider definitions and host-only compaction thresholds, while retaining actionable runtime policy/model state. Context strategy budgets omit all-zero rows before the first tool action, then remain explicit after actions to preserve reset/warning/pivot state. Each ancestor guidance/recall file is bounded at 1 MiB for both prompt loading and provenance hashing.
   - Event emission through the sinks it owns.
 
 - `src/git_checkpoints.rs`

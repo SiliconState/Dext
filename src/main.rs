@@ -14897,37 +14897,13 @@ impl Agent {
             env.push_str(&format!(" git={git}"));
         }
         env.push_str(&format!(
-            " provider={} model={} effort={} context={}",
+            " provider={} model={} effort={} context={} approval={} sandbox={}\n",
             self.provider_id,
             self.model,
             self.thinking_effort.as_str(),
-            self.context_mode.as_str()
-        ));
-        // Tiny drops the toolset profile and abbreviates the threshold keys.
-        if !tiny {
-            env.push_str(&format!(
-                " toolset={}",
-                self.tool_context_profile().as_str()
-            ));
-        }
-        env.push_str(&format!(
-            " schemas={} approval={} sandbox={}\n",
-            self.wire_tool_profile().as_str(),
+            self.context_mode.as_str(),
             self.approval_profile.as_str(),
             self.sandbox_profile.as_str()
-        ));
-        let (compact_key, active_key) = if tiny {
-            ("compact", "active")
-        } else {
-            (
-                "history_compact_threshold_chars",
-                "active_history_compact_threshold_chars",
-            )
-        };
-        env.push_str(&format!(
-            "{compact_key}={} {active_key}={}\n",
-            self.compact_threshold_chars(),
-            self.active_compact_threshold_chars()
         ));
 
         if let Some(seat) = &self.seat {
