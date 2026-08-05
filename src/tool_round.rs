@@ -62,12 +62,12 @@ impl Agent {
         } = context;
         let read_cache = self.read_cache.clone();
         if self.session_enabled
-            && tool_calls
-                .iter()
-                .any(|(_, name, _)| self.tool_is_side_effect_capable(name))
+            && tool_calls.iter().any(|(_, name, _)| {
+                self.active_runtime_tool(name).is_some() || self.tool_is_side_effect_capable(name)
+            })
         {
             self.save_latest_session()
-                .context("persisting assistant tool calls before side-effect-capable execution")?;
+                .context("persisting assistant tool calls before runtime/stateful or side-effect-capable execution")?;
             self.last_checkpoint_at = Some(std::time::Instant::now());
             self.last_checkpoint_signature = Some((self.history.len(), self.history_chars()));
         }
@@ -346,10 +346,10 @@ impl Agent {
             });
         }
 
-        let durable_side_effect_round = self.session_enabled
-            && plans
-                .iter()
-                .any(|plan| self.tool_is_side_effect_capable(&plan.name));
+        let durable_result_round = self.session_enabled
+            && plans.iter().any(|plan| {
+                matches!(plan.plan, Plan::Runtime) || self.tool_is_side_effect_capable(&plan.name)
+            });
 
         let runnable_indices: Vec<usize> = plans
             .iter()
@@ -991,10 +991,10 @@ impl Agent {
             role: "user".to_string(),
             content: squashed_results,
         });
-        if durable_side_effect_round {
+        if durable_result_round {
             let result_checkpoint = self
                 .save_latest_session()
-                .context("persisting tool results after side-effect-capable execution");
+                .context("persisting tool results and runtime state after execution");
             if let Err(error) = result_checkpoint {
                 journal_terminal_errors.push(format!("tool result checkpoint failed: {error:#}"));
             } else {
@@ -1013,10 +1013,10 @@ impl Agent {
             let detail = journal_terminal_errors.join("; ");
             self.append_latest_log("tool_journal_hard_error", &detail);
             self.sink.emit(AgentEvent::Warn(format!(
-                "[hard error] side-effect outcome recovery is unresolved: {detail}"
+                "[hard error] tool outcome/state recovery is unresolved: {detail}"
             )));
             anyhow::bail!(
-                "side-effect outcome recovery is unresolved; inspect the tool journal before retrying: {detail}"
+                "tool outcome/state recovery is unresolved; inspect the session and tool journal before retrying: {detail}"
             );
         }
 

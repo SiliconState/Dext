@@ -105,6 +105,7 @@ fn test_agent(root: &Path) -> Agent {
         pack_hook_env: Vec::new(),
         active_pack_hook_paths: HashSet::new(),
         active_pack_runtime: None,
+        approved_pack_runtime: None,
         pending_pack_runtime_prompts: Vec::new(),
         project_extensions_approved: None,
         suppress_pack_activation: false,
@@ -6696,8 +6697,8 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         assert_eq!(loaded.sandbox_root, sandbox);
         assert_eq!(loaded.session_usage.input, 11);
         assert_eq!(loaded.session_usage.output, 7);
-        assert!(loaded.allowed.contains("read_file"));
-        assert!(loaded.allowed.contains("write_file"));
+        assert!(!loaded.allowed.contains("read_file"));
+        assert!(!loaded.allowed.contains("write_file"));
         assert_eq!(loaded.work_ledger.objective, "preserve session metadata");
         assert_eq!(loaded.work_ledger.verification[0].status, "passed");
         assert!(
@@ -9972,11 +9973,40 @@ async fn external_runner_times_out() {
             timeout: std::time::Duration::from_millis(150),
             sandbox_profile: SandboxProfile::WorkspaceWrite,
             allow_tool_credentials: true,
+            stdout_cap: PROCESS_STREAM_CAPTURE_CAP,
+            stderr_cap: PROCESS_STREAM_CAPTURE_CAP,
         },
     )
     .await
     .expect_err("expected timeout");
     assert!(err.contains("timed out after"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn external_runner_bounds_stdin_backpressure() {
+    let root = temp_test_dir("external-stdin-timeout");
+    let args = vec!["-lc".to_string(), "sleep 5".to_string()];
+    let input = "x".repeat(2 * 1024 * 1024);
+    let started = std::time::Instant::now();
+    let err = execute_external_async(
+        "bash",
+        &args,
+        Some(&input),
+        &root,
+        Arc::new(AtomicBool::new(false)),
+        ExternalExecutionPolicy {
+            timeout: std::time::Duration::from_millis(150),
+            sandbox_profile: SandboxProfile::WorkspaceWrite,
+            allow_tool_credentials: true,
+            stdout_cap: PROCESS_STREAM_CAPTURE_CAP,
+            stderr_cap: PROCESS_STREAM_CAPTURE_CAP,
+        },
+    )
+    .await
+    .expect_err("expected stdin timeout");
+    assert!(err.contains("writing stdin"), "{err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -10001,6 +10031,8 @@ async fn external_runner_honors_interrupts() {
             timeout: std::time::Duration::from_secs(10),
             sandbox_profile: SandboxProfile::WorkspaceWrite,
             allow_tool_credentials: true,
+            stdout_cap: PROCESS_STREAM_CAPTURE_CAP,
+            stderr_cap: PROCESS_STREAM_CAPTURE_CAP,
         },
     )
     .await
@@ -14346,6 +14378,149 @@ fn stream_error_classification_retries_chunked_eof() {
 }
 
 #[test]
+fn pack_runtime_always_approval_is_exact_identity_scoped() {
+    let root = temp_test_dir("pack-runtime-approval-identity");
+    let mut agent = test_agent(&root);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Always,
+        requests: requests.clone(),
+    }));
+    let runtime = pack_runtime::ActiveRuntime {
+        pack_name: "demo".to_string(),
+        pack_source: "user:test".to_string(),
+        executable: root.join("runtime"),
+        executable_sha256: "digest-a".to_string(),
+        args: Vec::new(),
+        timeout: std::time::Duration::from_secs(1),
+        tools: Vec::new(),
+        manifest_sha256: "manifest".to_string(),
+        state: Value::Null,
+        max_continuations: 1,
+        continuations_used: 0,
+    };
+    let pack = packs::PackInfo {
+        name: "demo".to_string(),
+        description: "demo".to_string(),
+        path: root.clone(),
+        pack_md_path: root.join("PACK.md"),
+        phooks_path: None,
+        runtime_path: Some(root.join("runtime.json")),
+        credential_env: Vec::new(),
+        credential_env_ignored: false,
+        source: "user:test".to_string(),
+        shelf: Some("test".to_string()),
+    };
+
+    assert!(agent.pack_runtime_execution_approved(&pack, &runtime));
+    assert!(agent.pack_runtime_execution_approved(&pack, &runtime));
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let mut changed = runtime.clone();
+    changed.executable_sha256 = "digest-b".to_string();
+    assert!(agent.pack_runtime_execution_approved(&pack, &changed));
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        !agent
+            .session_header()
+            .allowed
+            .contains(&PACK_RUNTIME_APPROVAL_NAME.to_string())
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn pack_runtime_invocation_application_is_atomic() {
+    let root = temp_test_dir("pack-runtime-atomic-effects");
+    let mut agent = test_agent(&root);
+    agent.active_pack_runtime = Some(pack_runtime::ActiveRuntime {
+        pack_name: "demo".to_string(),
+        pack_source: "test".to_string(),
+        executable: root.join("runtime"),
+        executable_sha256: "digest".to_string(),
+        args: Vec::new(),
+        timeout: std::time::Duration::from_secs(1),
+        tools: Vec::new(),
+        manifest_sha256: "manifest".to_string(),
+        state: json!({"old": true}),
+        max_continuations: 1,
+        continuations_used: 0,
+    });
+
+    let error = agent
+        .apply_pack_runtime_invocation(
+            pack_runtime::RuntimeInvocation {
+                content: String::new(),
+                is_error: false,
+                state: Some(json!({"new": true})),
+                effects: vec![
+                    pack_runtime::RuntimeEffect::Continue {
+                        prompt: "one".to_string(),
+                        delay_ms: 0,
+                    },
+                    pack_runtime::RuntimeEffect::Continue {
+                        prompt: "two".to_string(),
+                        delay_ms: 0,
+                    },
+                ],
+            },
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("continuation limit"),
+        "{error:#}"
+    );
+    let runtime = agent.active_pack_runtime.as_ref().unwrap();
+    assert_eq!(runtime.state, json!({"old": true}));
+    assert_eq!(runtime.continuations_used, 0);
+    assert!(agent.pending_pack_runtime_prompts.is_empty());
+
+    let content = agent
+        .apply_pack_runtime_invocation(
+            pack_runtime::RuntimeInvocation {
+                content: "idle follow-up".to_string(),
+                is_error: false,
+                state: Some(json!({"new": true})),
+                effects: Vec::new(),
+            },
+            true,
+        )
+        .unwrap();
+    assert_eq!(content, "idle follow-up");
+    let runtime = agent.active_pack_runtime.as_ref().unwrap();
+    assert_eq!(runtime.state, json!({"new": true}));
+    assert_eq!(runtime.continuations_used, 1);
+
+    agent
+        .active_pack_runtime
+        .as_mut()
+        .unwrap()
+        .max_continuations = 2;
+    agent
+        .apply_pack_runtime_invocation(
+            pack_runtime::RuntimeInvocation {
+                content: String::new(),
+                is_error: false,
+                state: None,
+                effects: vec![pack_runtime::RuntimeEffect::Continue {
+                    prompt: "persist me".to_string(),
+                    delay_ms: 10,
+                }],
+            },
+            false,
+        )
+        .unwrap();
+    let snapshot = &agent.session_header().active_pack_runtimes[0];
+    assert_eq!(snapshot.continuations_used, 2);
+    assert_eq!(
+        snapshot.pending_continuations,
+        vec![("persist me".to_string(), 10)]
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn malformed_responses_tool_arguments_recovery_is_exact_and_contract_scoped() {
     let error = "stream protocol error [chatgpt-responses/finalize]: tool call function item 0 has malformed arguments";
     assert!(malformed_responses_tool_arguments_error(
@@ -17561,9 +17736,13 @@ fn applying_current_policy_after_resume_clears_saved_privileged_grants() -> Resu
     source.save_session_to_path(&path)?;
 
     let mut resumed = test_agent(&root);
+    resumed.set_resolved_approval_profile(ApprovalProfile::Never, ApprovalPolicySource::Cli);
+    resumed.set_sandbox_profile(SandboxProfile::ReadOnly);
     resumed.load_session_from_path(&path)?;
-    assert_eq!(resumed.approval_profile, ApprovalProfile::Always);
-    assert!(resumed.allowed.contains("write_file"));
+    assert_eq!(resumed.approval_profile, ApprovalProfile::Never);
+    assert_eq!(resumed.approval_policy_source, ApprovalPolicySource::Cli);
+    assert_eq!(resumed.sandbox_profile, SandboxProfile::ReadOnly);
+    assert!(!resumed.allowed.contains("write_file"));
 
     resumed.set_resolved_approval_profile(ApprovalProfile::Ask, ApprovalPolicySource::Default);
     assert_eq!(resumed.approval_profile, ApprovalProfile::Ask);

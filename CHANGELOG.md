@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Pack Runtime Protocol v1 now fails closed across the full lifecycle: recursive schemas accept only the implemented keyword subset; native-name collisions use the full catalog during activation and resume; executable bytes are hashed, displayed at approval, and rechecked before every call; prompt-level `Always` approval is scoped to that exact runtime identity; current-run approval/sandbox policy remains authoritative during resume and saved grants are discarded before restoration; activation/idle/read events enforce read-only confinement inside the executor; protocol-sized stdout is preserved; stdin delivery and root execution share the configured deadline, and output drain after process-tree cleanup has a separate one-second cap; state/effects/continuation accounting applies atomically; and pending continuations persist, cancel/refund on interrupt, and remain bounded. Runtime calls also persist state/results without read-tool debounce, while surfaced lifecycle errors are privacy-redacted.
+
+- Autoresearch now requires each run to be logged before another starts, caps parsed metric cardinality, treats measured metrics as authoritative, permits `keep` only for an actual improvement, validates status/result consistency, records unmeasured crashes without fabricating metrics, bounds post-exit pipe drain, and treats post-persistence hook failures as nonfatal steering.
+
 - ChatGPT Responses finalize errors for malformed function-call arguments now use one bounded fail-closed recovery when no visible text streamed: Dext compacts once if a safe split exists, retries exactly once without executing the invalid call, and surfaces a repeated protocol error instead of stopping immediately or looping.
 
 - The pack and shelf registry summaries moved from the volatile environment tail

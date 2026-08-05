@@ -24,6 +24,11 @@ const RUNTIME_VIEW_CAP: usize = 128 * 1024;
 const RUNTIME_EFFECT_LIMIT: usize = 16;
 const RUNTIME_TOOL_LIMIT: usize = 32;
 const RUNTIME_SCHEMA_CAP: usize = 32 * 1024;
+const RUNTIME_EXECUTABLE_CAP: u64 = 256 * 1024 * 1024;
+const RUNTIME_MAX_SCHEMA_DEPTH: usize = 16;
+const RUNTIME_MAX_SCHEMA_PROPERTIES: usize = 256;
+const RUNTIME_MAX_ENUM_VALUES: usize = 256;
+const RUNTIME_PENDING_CONTINUATION_LIMIT: usize = 32;
 const RUNTIME_MAX_DELAY_MS: u64 = 30_000;
 const RUNTIME_MAX_CONTINUATIONS: u32 = 1_000;
 const RUNTIME_DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -46,11 +51,20 @@ pub(crate) struct RuntimeTool {
     pub(crate) risk: RuntimeRisk,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeApprovalIdentity {
+    pack_name: String,
+    pack_source: String,
+    manifest_sha256: String,
+    executable_sha256: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveRuntime {
     pub(crate) pack_name: String,
     pub(crate) pack_source: String,
     pub(crate) executable: PathBuf,
+    pub(crate) executable_sha256: String,
     pub(crate) args: Vec<String>,
     pub(crate) timeout: Duration,
     pub(crate) tools: Vec<RuntimeTool>,
@@ -69,6 +83,8 @@ pub(crate) struct RuntimeSnapshot {
     pub(crate) state: Value,
     #[serde(default)]
     pub(crate) continuations_used: u32,
+    #[serde(default)]
+    pub(crate) pending_continuations: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +233,60 @@ fn read_regular_bounded(path: &Path, cap: u64, label: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn sha256_regular_bounded(path: &Path, cap: u64, label: &str) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "{label} is not a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > cap {
+        bail!("{label} exceeds the {cap} byte limit: {}", path.display());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("opening {label} {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspecting open {label} {}", path.display()))?;
+    if !opened.is_file() || opened.len() > cap {
+        bail!(
+            "{label} changed or exceeds its byte limit: {}",
+            path.display()
+        );
+    }
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {label} {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > cap {
+            bail!("{label} exceeds the {cap} byte limit: {}", path.display());
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn valid_tool_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     (1..=64).contains(&bytes.len())
@@ -272,27 +342,122 @@ fn resolve_executable(pack: &PackInfo, command: &str) -> Result<PathBuf> {
 }
 
 fn validate_schema(schema: &Value) -> Result<()> {
-    let object = schema
-        .as_object()
-        .context("pack runtime tool input_schema must be a JSON object")?;
-    if object.get("type").and_then(Value::as_str) != Some("object") {
-        bail!("pack runtime tool input_schema must declare type=object");
-    }
     if serde_json::to_vec(schema)?.len() > RUNTIME_SCHEMA_CAP {
         bail!("pack runtime tool input_schema exceeds {RUNTIME_SCHEMA_CAP} bytes");
+    }
+    validate_schema_node(schema, "$", 0)?;
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        bail!("pack runtime tool input_schema must declare type=object");
+    }
+    Ok(())
+}
+
+fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<()> {
+    if depth > RUNTIME_MAX_SCHEMA_DEPTH {
+        bail!("{path} schema exceeds the nesting limit");
+    }
+    let object = schema
+        .as_object()
+        .with_context(|| format!("{path} schema must be an object"))?;
+    const SUPPORTED: &[&str] = &[
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "description",
+    ];
+    if let Some(keyword) = object.keys().find(|key| !SUPPORTED.contains(&key.as_str())) {
+        bail!("{path} schema uses unsupported keyword {keyword}");
+    }
+    let kind = match object.get("type") {
+        Some(Value::String(kind))
+            if matches!(
+                kind.as_str(),
+                "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+            ) =>
+        {
+            kind.as_str()
+        }
+        Some(Value::String(kind)) => bail!("{path} schema has unsupported type {kind}"),
+        Some(_) => bail!("{path} schema type must be a string"),
+        None => bail!("{path} schema must declare a supported type"),
+    };
+    if let Some(description) = object.get("description") {
+        let description = description
+            .as_str()
+            .with_context(|| format!("{path} schema description must be a string"))?;
+        if description.len() > 2_000 {
+            bail!("{path} schema description exceeds 2000 bytes");
+        }
+    }
+    if let Some(values) = object.get("enum") {
+        let values = values
+            .as_array()
+            .with_context(|| format!("{path} schema enum must be an array"))?;
+        if values.is_empty() || values.len() > RUNTIME_MAX_ENUM_VALUES {
+            bail!("{path} schema enum must contain 1-{RUNTIME_MAX_ENUM_VALUES} values");
+        }
+        if let Some(value) = values.iter().find(|value| !value_matches_type(value, kind)) {
+            bail!("{path} schema enum value {value} does not match type {kind}");
+        }
+    }
+    let properties = match object.get("properties") {
+        None => None,
+        Some(Value::Object(properties)) => Some(properties),
+        Some(_) => bail!("{path} schema properties must be an object"),
+    };
+    if (properties.is_some()
+        || object.contains_key("required")
+        || object.contains_key("additionalProperties"))
+        && kind != "object"
+    {
+        bail!("{path} schema object keywords require type=object");
+    }
+    if let Some(properties) = properties {
+        if properties.len() > RUNTIME_MAX_SCHEMA_PROPERTIES {
+            bail!("{path} schema declares more than {RUNTIME_MAX_SCHEMA_PROPERTIES} properties");
+        }
+        for (name, child) in properties {
+            if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+                bail!("{path} schema contains an invalid property name");
+            }
+            validate_schema_node(child, &format!("{path}.{name}"), depth + 1)?;
+        }
     }
     if let Some(required) = object.get("required") {
         let required = required
             .as_array()
-            .context("pack runtime tool schema required must be an array")?;
-        if !required.iter().all(Value::is_string) {
-            bail!("pack runtime tool schema required entries must be strings");
+            .with_context(|| format!("{path} schema required must be an array"))?;
+        if required.len() > RUNTIME_MAX_SCHEMA_PROPERTIES {
+            bail!("{path} schema required list is too large");
+        }
+        let mut names = HashSet::new();
+        for name in required {
+            let name = name
+                .as_str()
+                .with_context(|| format!("{path} schema required entries must be strings"))?;
+            if !names.insert(name) {
+                bail!("{path} schema required contains duplicate {name}");
+            }
+            if properties.is_none_or(|properties| !properties.contains_key(name)) {
+                bail!("{path} schema required entry {name} has no property schema");
+            }
         }
     }
-    if let Some(properties) = object.get("properties")
-        && !properties.is_object()
+    if let Some(additional) = object.get("additionalProperties")
+        && !additional.is_boolean()
     {
-        bail!("pack runtime tool schema properties must be an object");
+        bail!("{path} schema additionalProperties must be a boolean");
+    }
+    if let Some(items) = object.get("items") {
+        if kind != "array" {
+            bail!("{path} schema items requires type=array");
+        }
+        validate_schema_node(items, &format!("{path}[]"), depth + 1)?;
+    } else if kind == "array" {
+        bail!("{path} array schema must declare items");
     }
     Ok(())
 }
@@ -357,11 +522,17 @@ pub(crate) fn load(
         .with_context(|| format!("parsing pack runtime manifest {}", path.display()))?;
     validate_manifest(&manifest, occupied_names)?;
     let executable = resolve_executable(pack, &manifest.command)?;
+    let executable_sha256 = sha256_regular_bounded(
+        &executable,
+        RUNTIME_EXECUTABLE_CAP,
+        "pack runtime executable",
+    )?;
     let timeout = runtime_timeout(manifest.timeout_seconds)?;
     Ok(Some(ActiveRuntime {
         pack_name: pack.name.clone(),
         pack_source: pack.source.clone(),
         executable,
+        executable_sha256,
         args: manifest.args,
         timeout,
         tools: manifest
@@ -382,13 +553,23 @@ pub(crate) fn load(
 }
 
 impl ActiveRuntime {
-    pub(crate) fn snapshot(&self) -> RuntimeSnapshot {
+    pub(crate) fn approval_identity(&self) -> RuntimeApprovalIdentity {
+        RuntimeApprovalIdentity {
+            pack_name: self.pack_name.clone(),
+            pack_source: self.pack_source.clone(),
+            manifest_sha256: self.manifest_sha256.clone(),
+            executable_sha256: self.executable_sha256.clone(),
+        }
+    }
+
+    pub(crate) fn snapshot(&self, pending_continuations: &[(String, u64)]) -> RuntimeSnapshot {
         RuntimeSnapshot {
             pack_name: self.pack_name.clone(),
             pack_source: self.pack_source.clone(),
             manifest_sha256: self.manifest_sha256.clone(),
             state: self.state.clone(),
             continuations_used: self.continuations_used,
+            pending_continuations: pending_continuations.to_vec(),
         }
     }
 
@@ -403,9 +584,15 @@ impl ActiveRuntime {
         {
             bail!("pack runtime identity or manifest changed since the session was saved");
         }
-        validate_state(&snapshot.state)?;
+        validate_runtime_state(&snapshot.state)?;
+        validate_pending_continuations(&snapshot.pending_continuations)?;
+        if snapshot.continuations_used > self.max_continuations
+            || snapshot.pending_continuations.len() as u32 > snapshot.continuations_used
+        {
+            bail!("pack runtime continuation snapshot exceeds its declared budget");
+        }
         self.state = snapshot.state.clone();
-        self.continuations_used = snapshot.continuations_used.min(self.max_continuations);
+        self.continuations_used = snapshot.continuations_used;
         Ok(())
     }
 }
@@ -484,9 +671,34 @@ fn validate_schema_value(schema: &Value, value: &Value, path: &str, depth: usize
     Ok(())
 }
 
-fn validate_state(state: &Value) -> Result<()> {
+pub(crate) fn validate_runtime_state(state: &Value) -> Result<()> {
     if serde_json::to_vec(state)?.len() > RUNTIME_STATE_CAP {
         bail!("pack runtime state exceeds {RUNTIME_STATE_CAP} bytes");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_pending_continuations(prompts: &[(String, u64)]) -> Result<()> {
+    if prompts.len() > RUNTIME_PENDING_CONTINUATION_LIMIT {
+        bail!(
+            "pack runtime pending continuation count exceeds {RUNTIME_PENDING_CONTINUATION_LIMIT}"
+        );
+    }
+    let bytes = prompts
+        .iter()
+        .try_fold(0usize, |total, (prompt, delay_ms)| {
+            if prompt.trim().is_empty()
+                || prompt.len() > RUNTIME_CONTENT_CAP
+                || *delay_ms > RUNTIME_MAX_DELAY_MS
+            {
+                bail!("pack runtime pending continuation exceeds its size or delay limit");
+            }
+            total
+                .checked_add(prompt.len())
+                .context("pack runtime pending continuation size overflow")
+        })?;
+    if bytes > RUNTIME_STATE_CAP {
+        bail!("pack runtime pending continuations exceed {RUNTIME_STATE_CAP} bytes");
     }
     Ok(())
 }
@@ -506,17 +718,17 @@ fn validate_response(response: &RuntimeResponse) -> Result<()> {
         bail!("pack runtime returned more than {RUNTIME_EFFECT_LIMIT} effects");
     }
     if let Some(state) = &response.state {
-        validate_state(state)?;
+        validate_runtime_state(state)?;
     }
     for effect in &response.effects {
         match effect {
             RuntimeEffect::Steer { text }
-                if text.is_empty() || text.len() > RUNTIME_CONTENT_CAP =>
+                if text.trim().is_empty() || text.len() > RUNTIME_CONTENT_CAP =>
             {
                 bail!("pack runtime steer effect exceeds its size limit");
             }
             RuntimeEffect::Continue { prompt, delay_ms }
-                if prompt.is_empty()
+                if prompt.trim().is_empty()
                     || prompt.len() > RUNTIME_CONTENT_CAP
                     || *delay_ms > RUNTIME_MAX_DELAY_MS =>
             {
@@ -559,11 +771,30 @@ pub(crate) async fn invoke(
     interrupt: Arc<AtomicBool>,
     sandbox_profile: SandboxProfile,
 ) -> Result<RuntimeInvocation> {
-    validate_state(&runtime.state)?;
-    let (event_name, tool, input) = match event {
-        RuntimeEvent::Activate => ("activate", None, None),
-        RuntimeEvent::Tool { name, input } => ("tool", Some(name), Some(input)),
-        RuntimeEvent::Idle => ("idle", None, None),
+    validate_runtime_state(&runtime.state)?;
+    let executable_sha256 = sha256_regular_bounded(
+        &runtime.executable,
+        RUNTIME_EXECUTABLE_CAP,
+        "pack runtime executable",
+    )?;
+    if executable_sha256 != runtime.executable_sha256 {
+        bail!("pack runtime executable changed after activation; reactivate the pack to review it");
+    }
+    let (event_name, tool, input, sandbox_profile) = match event {
+        RuntimeEvent::Activate => ("activate", None, None, SandboxProfile::ReadOnly),
+        RuntimeEvent::Tool { name, input } => {
+            let tool = runtime
+                .tool(name)
+                .with_context(|| format!("pack runtime does not declare tool {name}"))?;
+            validate_tool_input(tool, input)?;
+            let sandbox_profile = if tool.risk == RuntimeRisk::Read {
+                SandboxProfile::ReadOnly
+            } else {
+                sandbox_profile
+            };
+            ("tool", Some(name), Some(input), sandbox_profile)
+        }
+        RuntimeEvent::Idle => ("idle", None, None, SandboxProfile::ReadOnly),
     };
     let request = RuntimeRequest {
         version: RUNTIME_PROTOCOL_VERSION,
@@ -591,6 +822,8 @@ pub(crate) async fn invoke(
             timeout: runtime.timeout,
             sandbox_profile,
             allow_tool_credentials: false,
+            stdout_cap: RUNTIME_RESPONSE_CAP + 1,
+            stderr_cap: 16 * 1024 + 1,
         },
     )
     .await
@@ -645,6 +878,17 @@ mod tests {
         assert!(validate_tool_input(&tool(), &json!({"count": 2})).is_err());
         assert!(validate_tool_input(&tool(), &json!({"name": "ok", "extra": true})).is_err());
         assert!(validate_tool_input(&tool(), &json!({"name": "ok", "count": 2.5})).is_err());
+
+        for schema in [
+            json!({"type": "object", "properties": {"x": {"type": "mystery"}}}),
+            json!({"type": "object", "properties": {"x": {"type": "string", "minLength": 1}}}),
+            json!({"type": "object", "properties": {"x": {"type": "array"}}}),
+            json!({"type": "object", "properties": {}, "required": ["missing"]}),
+            json!({"type": "object", "additionalProperties": {"type": "string"}}),
+            json!({"type": "object", "properties": {"x": {"type": "string", "enum": [1]}}}),
+        ] {
+            assert!(validate_schema(&schema).is_err(), "{schema}");
+        }
     }
 
     #[test]
@@ -690,9 +934,12 @@ mod tests {
         std::fs::create_dir_all(&pack_path).unwrap();
         std::fs::write(pack_path.join("PACK.md"), "# Demo\n").unwrap();
         let helper = pack_path.join("runtime.sh");
+        let large_markdown = "x".repeat(10_000);
         std::fs::write(
             &helper,
-            "#!/bin/sh\nset -eu\nrequest=$(cat)\nprintf '%s' \"$request\" | grep -q '\"event\":\"activate\"'\nprintf '%s\\n' '{\"version\":1,\"content\":\"ready\",\"state\":{\"runs\":1},\"effects\":[{\"type\":\"view\",\"title\":\"Demo\",\"markdown\":\"# Ready\"}]}'\n",
+            format!(
+                "#!/bin/sh\nset -eu\nrequest=$(cat)\nprintf '%s' \"$request\" | grep -q '\"event\":\"activate\"'\nprintf '%s\\n' '{{\"version\":1,\"content\":\"ready\",\"state\":{{\"runs\":1}},\"effects\":[{{\"type\":\"view\",\"title\":\"Demo\",\"markdown\":\"{large_markdown}\"}}]}}'\n"
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -748,8 +995,29 @@ mod tests {
             result.effects,
             vec![RuntimeEffect::View {
                 title: "Demo".to_string(),
-                markdown: "# Ready".to_string(),
+                markdown: large_markdown,
             }]
+        );
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        let error = invoke(
+            &runtime,
+            RuntimeEvent::Activate,
+            &root,
+            "session",
+            RuntimeContext {
+                turn_id: "turn-2",
+                iteration: 1,
+                history_messages: 0,
+                compacted: false,
+            },
+            Arc::new(AtomicBool::new(false)),
+            SandboxProfile::ReadOnly,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("executable changed"),
+            "{error:#}"
         );
         let _ = std::fs::remove_dir_all(root);
     }

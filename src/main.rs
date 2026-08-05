@@ -99,6 +99,7 @@ const READ_SYMBOL_INPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const PROMPT_CONTEXT_FILE_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const TODO_STATE_MAX_BYTES: usize = 256 * 1024;
 const PROCESS_STREAM_CAPTURE_CAP: usize = 6_000;
+const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const LIVE_OUTPUT_EVENT_QUEUE_CAP: usize = 256;
 const READ_SYMBOL_SUGGESTION_LIMIT: usize = 5;
 const CARGO_DIAGNOSTIC_SUMMARY_LIMIT: usize = 20;
@@ -2972,6 +2973,12 @@ enum ProcWaitOutcome {
     Interrupt,
 }
 
+enum ProcInputOutcome {
+    Written(std::io::Result<()>),
+    Timeout,
+    Interrupt,
+}
+
 #[derive(Clone)]
 struct LiveToolOutput {
     call_id: String,
@@ -3062,6 +3069,37 @@ impl LiveUtf8Emitter {
         self.pending.clear();
         self.emit_text(text);
     }
+}
+
+async fn await_limited_capture(
+    mut task: tokio::task::JoinHandle<LimitedByteCapture>,
+    cap: usize,
+    label: &'static str,
+) -> LimitedByteCapture {
+    let drain = tokio::time::sleep(PROCESS_OUTPUT_DRAIN_TIMEOUT);
+    tokio::pin!(drain);
+    tokio::select! {
+        result = &mut task => result.unwrap_or_default(),
+        _ = &mut drain => {
+            task.abort();
+            let mut capture = LimitedByteCapture::new(cap);
+            capture.push_head(format!("[{label} pipe remained open after process-tree cleanup]").as_bytes());
+            capture.mark_stopped_early();
+            capture
+        }
+    }
+}
+
+async fn await_process_captures(
+    out_task: tokio::task::JoinHandle<LimitedByteCapture>,
+    err_task: tokio::task::JoinHandle<LimitedByteCapture>,
+    stdout_cap: usize,
+    stderr_cap: usize,
+) -> (LimitedByteCapture, LimitedByteCapture) {
+    tokio::join!(
+        await_limited_capture(out_task, stdout_cap, "stdout"),
+        await_limited_capture(err_task, stderr_cap, "stderr")
+    )
 }
 
 async fn collect_async_limited<R>(reader: R, cap: usize) -> LimitedByteCapture
@@ -9011,6 +9049,8 @@ struct ExternalExecutionPolicy {
     timeout: std::time::Duration,
     sandbox_profile: SandboxProfile,
     allow_tool_credentials: bool,
+    stdout_cap: usize,
+    stderr_cap: usize,
 }
 
 async fn execute_external_async_status(
@@ -9067,20 +9107,73 @@ async fn execute_external_async_status(
 
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
-    let out_task = tokio::spawn(collect_async_limited(stdout, PROCESS_STREAM_CAPTURE_CAP));
-    let err_task = tokio::spawn(collect_async_limited(stderr, PROCESS_STREAM_CAPTURE_CAP));
-
-    if let Some(data) = stdin_data
-        && let Some(mut si) = child.stdin.take()
-        && let Err(error) = si.write_all(data.as_bytes()).await
-    {
-        process_tree.terminate_tokio_child(&mut child).await;
-        let _ = out_task.await;
-        let _ = err_task.await;
-        return Err(format!("failed to write {bin} stdin: {error}"));
-    }
+    let out_task = tokio::spawn(collect_async_limited(stdout, policy.stdout_cap));
+    let err_task = tokio::spawn(collect_async_limited(stderr, policy.stderr_cap));
 
     let deadline = tokio::time::Instant::now() + policy.timeout;
+    if let Some(data) = stdin_data
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let write = stdin.write_all(data.as_bytes());
+        tokio::pin!(write);
+        let outcome = loop {
+            let outcome = tokio::select! {
+                biased;
+                result = &mut write => ProcInputOutcome::Written(result),
+                _ = tokio::time::sleep_until(deadline) => ProcInputOutcome::Timeout,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    if interrupt.load(Ordering::SeqCst) {
+                        ProcInputOutcome::Interrupt
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            break outcome;
+        };
+        match outcome {
+            ProcInputOutcome::Written(Ok(())) => {}
+            ProcInputOutcome::Written(Err(error)) => {
+                process_tree.terminate_tokio_child(&mut child).await;
+                let _ = await_process_captures(
+                    out_task,
+                    err_task,
+                    policy.stdout_cap,
+                    policy.stderr_cap,
+                )
+                .await;
+                return Err(format!("failed to write {bin} stdin: {error}"));
+            }
+            ProcInputOutcome::Timeout => {
+                process_tree.terminate_tokio_child(&mut child).await;
+                let _ = await_process_captures(
+                    out_task,
+                    err_task,
+                    policy.stdout_cap,
+                    policy.stderr_cap,
+                )
+                .await;
+                return Err(format!(
+                    "timed out after {}s writing stdin to {bin}",
+                    policy.timeout.as_secs()
+                ));
+            }
+            ProcInputOutcome::Interrupt => {
+                process_tree.terminate_tokio_child(&mut child).await;
+                let _ = await_process_captures(
+                    out_task,
+                    err_task,
+                    policy.stdout_cap,
+                    policy.stderr_cap,
+                )
+                .await;
+                return Err(format!(
+                    "killed by interrupt (^C) while writing stdin to {bin}"
+                ));
+            }
+        }
+    }
+
     let status = loop {
         let outcome: ProcWaitOutcome = tokio::select! {
             biased;
@@ -9101,14 +9194,24 @@ async fn execute_external_async_status(
             }
             ProcWaitOutcome::Exited(Err(e)) => {
                 process_tree.terminate_tokio_child(&mut child).await;
-                let _ = out_task.await;
-                let _ = err_task.await;
+                let _ = await_process_captures(
+                    out_task,
+                    err_task,
+                    policy.stdout_cap,
+                    policy.stderr_cap,
+                )
+                .await;
                 return Err(format!("wait failed: {e}"));
             }
             ProcWaitOutcome::Interrupt => {
                 process_tree.terminate_tokio_child(&mut child).await;
-                let out = out_task.await.unwrap_or_default();
-                let err = err_task.await.unwrap_or_default();
+                let (out, err) = await_process_captures(
+                    out_task,
+                    err_task,
+                    policy.stdout_cap,
+                    policy.stderr_cap,
+                )
+                .await;
                 return Err(format!(
                     "killed by interrupt (^C)\n--- stdout ---\n{}--- stderr ---\n{}",
                     out.render("stdout"),
@@ -9117,8 +9220,13 @@ async fn execute_external_async_status(
             }
             ProcWaitOutcome::Timeout => {
                 process_tree.terminate_tokio_child(&mut child).await;
-                let out = out_task.await.unwrap_or_default();
-                let err = err_task.await.unwrap_or_default();
+                let (out, err) = await_process_captures(
+                    out_task,
+                    err_task,
+                    policy.stdout_cap,
+                    policy.stderr_cap,
+                )
+                .await;
                 return Err(format!(
                     "timed out after {}s running {bin}\n--- stdout ---\n{}--- stderr ---\n{}",
                     policy.timeout.as_secs(),
@@ -9129,8 +9237,8 @@ async fn execute_external_async_status(
         }
     };
 
-    let out = out_task.await.unwrap_or_default();
-    let err = err_task.await.unwrap_or_default();
+    let (out, err) =
+        await_process_captures(out_task, err_task, policy.stdout_cap, policy.stderr_cap).await;
     Ok((
         out.render("stdout"),
         err.render("stderr"),
@@ -9355,6 +9463,8 @@ async fn execute_git_commit_async(
         timeout: external_tool_timeout(),
         sandbox_profile,
         allow_tool_credentials: false,
+        stdout_cap: PROCESS_STREAM_CAPTURE_CAP,
+        stderr_cap: PROCESS_STREAM_CAPTURE_CAP,
     };
     let (stage_stdout, stage_stderr, stage_code) =
         execute_external_async_status("git", &stage_args, None, root, interrupt.clone(), policy)
@@ -9497,6 +9607,8 @@ async fn execute_builtin_call(
                 timeout: external_tool_timeout(),
                 sandbox_profile: ext_profile,
                 allow_tool_credentials: true,
+                stdout_cap: PROCESS_STREAM_CAPTURE_CAP,
+                stderr_cap: PROCESS_STREAM_CAPTURE_CAP,
             },
         )
         .await;
@@ -9513,6 +9625,8 @@ async fn execute_builtin_call(
                         timeout: external_tool_timeout(),
                         sandbox_profile: ext_profile,
                         allow_tool_credentials: true,
+                        stdout_cap: PROCESS_STREAM_CAPTURE_CAP,
+                        stderr_cap: PROCESS_STREAM_CAPTURE_CAP,
                     },
                 )
                 .await
@@ -12715,6 +12829,7 @@ struct Agent {
     pack_hook_env: Vec<(String, String)>,
     active_pack_hook_paths: HashSet<PathBuf>,
     active_pack_runtime: Option<pack_runtime::ActiveRuntime>,
+    approved_pack_runtime: Option<pack_runtime::RuntimeApprovalIdentity>,
     pending_pack_runtime_prompts: Vec<(String, u64)>,
     project_extensions_approved: Option<bool>,
     suppress_pack_activation: bool,
@@ -12906,6 +13021,7 @@ impl Agent {
             pack_hook_env: Vec::new(),
             active_pack_hook_paths: HashSet::new(),
             active_pack_runtime: None,
+            approved_pack_runtime: None,
             pending_pack_runtime_prompts: Vec::new(),
             project_extensions_approved: None,
             suppress_pack_activation: false,
@@ -13508,6 +13624,9 @@ impl Agent {
         if profile != ApprovalProfile::Always && self.allowed.remove(DIAGNOSTICS_APPROVAL_NAME) {
             changed += 1;
         }
+        if profile_changed {
+            self.approved_pack_runtime = None;
+        }
         if profile_changed && self.allowed.remove(HOOKS_APPROVAL_NAME) {
             changed += 1;
         }
@@ -13517,6 +13636,7 @@ impl Agent {
     fn set_sandbox_profile(&mut self, profile: SandboxProfile) {
         if self.sandbox_profile != profile {
             self.allowed.remove(HOOKS_APPROVAL_NAME);
+            self.approved_pack_runtime = None;
         }
         self.sandbox_profile = profile;
     }
@@ -13908,6 +14028,7 @@ impl Agent {
         self.active_pack_runtime = None;
         self.pending_pack_runtime_prompts.clear();
         if root_changed {
+            self.approved_pack_runtime = None;
             self.allowed.clear();
             self.project_extensions_approved = None;
             // The prompt scan cache is keyed on the epoch and on stat
@@ -13983,14 +14104,16 @@ impl Agent {
         if self.approval_profile == ApprovalProfile::Never {
             return false;
         }
-        if self.allowed.contains(PACK_RUNTIME_APPROVAL_NAME)
-            || self.approval_profile == ApprovalProfile::Always
+        let identity = runtime.approval_identity();
+        if self.approval_profile == ApprovalProfile::Always
+            || self.approved_pack_runtime.as_ref() == Some(&identity)
         {
             return true;
         }
         let approval_input = json!({
             "operation": format!("activate executable pack runtime '{}'", pack.name),
             "runtime": pack.runtime_path.as_ref().map(|path| path.display().to_string()),
+            "executable_sha256": &runtime.executable_sha256,
             "tools": runtime.tools.iter().map(|tool| format!("{}:{:?}", tool.name, tool.risk).to_ascii_lowercase()).collect::<Vec<_>>(),
             "risk": "executes a pack-owned native helper with credentials removed; activation and idle are read-only-confined, while declared write/danger tools retain normal per-call approval and Git checkpoint controls"
         });
@@ -14000,7 +14123,7 @@ impl Agent {
         {
             Choice::Once => true,
             Choice::Always => {
-                self.allowed.insert(PACK_RUNTIME_APPROVAL_NAME.to_string());
+                self.approved_pack_runtime = Some(identity);
                 true
             }
             Choice::Deny => false,
@@ -14034,9 +14157,18 @@ impl Agent {
             SandboxProfile::ReadOnly,
         )
         .await
-        .with_context(|| format!("activating pack runtime for {}", pack.name))?;
+        .map_err(|error| {
+            let detail = self
+                .privacy
+                .redact_text(&format!(
+                    "activating pack runtime for {}: {error:#}",
+                    pack.name
+                ))
+                .text;
+            anyhow::anyhow!(detail)
+        })?;
         self.active_pack_runtime = Some(runtime);
-        let content = match self.apply_pack_runtime_invocation(invocation) {
+        let content = match self.apply_pack_runtime_invocation(invocation, false) {
             Ok(content) => content,
             Err(error) => {
                 self.deactivate_pack_runtime();
@@ -14050,6 +14182,7 @@ impl Agent {
     fn apply_pack_runtime_invocation(
         &mut self,
         invocation: pack_runtime::RuntimeInvocation,
+        count_idle_content_as_continuation: bool,
     ) -> Result<String> {
         let mut content = self.privacy.redact_text(&invocation.content).text;
         if invocation.is_error {
@@ -14062,16 +14195,13 @@ impl Agent {
                 }
             );
         }
-        if let Some(state) = invocation.state
-            && let Some(runtime) = self.active_pack_runtime.as_mut()
-        {
-            runtime.state = state;
-        }
         let pack_name = self
             .active_pack_runtime
             .as_ref()
             .map(|runtime| runtime.pack_name.clone())
-            .unwrap_or_else(|| "pack".to_string());
+            .context("pack runtime invocation has no active runtime")?;
+        let mut prompts = Vec::new();
+        let mut views = Vec::new();
         for effect in invocation.effects {
             match effect {
                 pack_runtime::RuntimeEffect::Steer { text } => {
@@ -14083,30 +14213,56 @@ impl Agent {
                     content.push_str(&text);
                 }
                 pack_runtime::RuntimeEffect::Continue { prompt, delay_ms } => {
-                    let prompt = self.privacy.redact_text(&prompt).text;
-                    let runtime = self
-                        .active_pack_runtime
-                        .as_mut()
-                        .context("pack runtime continuation has no active runtime")?;
-                    if runtime.continuations_used >= runtime.max_continuations {
-                        bail!(
-                            "pack runtime continuation limit reached ({})",
-                            runtime.max_continuations
-                        );
-                    }
-                    runtime.continuations_used = runtime.continuations_used.saturating_add(1);
-                    self.pending_pack_runtime_prompts.push((prompt, delay_ms));
+                    prompts.push((self.privacy.redact_text(&prompt).text, delay_ms));
                 }
                 pack_runtime::RuntimeEffect::View { title, markdown } => {
-                    let title = self.privacy.redact_text(&title).text;
-                    let markdown = self.privacy.redact_text(&markdown).text;
-                    self.sink.emit(AgentEvent::RuntimeView {
-                        pack: pack_name.clone(),
-                        title,
-                        markdown,
-                    });
+                    views.push((
+                        self.privacy.redact_text(&title).text,
+                        self.privacy.redact_text(&markdown).text,
+                    ));
                 }
             }
+        }
+        let implicit_continuation = usize::from(
+            count_idle_content_as_continuation && !content.trim().is_empty() && prompts.is_empty(),
+        );
+        let continuations = prompts.len().saturating_add(implicit_continuation);
+        let mut next_pending = self.pending_pack_runtime_prompts.clone();
+        next_pending.extend(prompts);
+        pack_runtime::validate_pending_continuations(&next_pending)?;
+        let runtime = self
+            .active_pack_runtime
+            .as_ref()
+            .context("pack runtime invocation has no active runtime")?;
+        if let Some(state) = invocation.state.as_ref() {
+            pack_runtime::validate_runtime_state(state)?;
+        }
+        let next_continuations = runtime
+            .continuations_used
+            .checked_add(u32::try_from(continuations).unwrap_or(u32::MAX))
+            .context("pack runtime continuation counter overflow")?;
+        if next_continuations > runtime.max_continuations {
+            bail!(
+                "pack runtime continuation limit reached ({})",
+                runtime.max_continuations
+            );
+        }
+
+        let runtime = self
+            .active_pack_runtime
+            .as_mut()
+            .context("pack runtime invocation has no active runtime")?;
+        if let Some(state) = invocation.state {
+            runtime.state = state;
+        }
+        runtime.continuations_used = next_continuations;
+        self.pending_pack_runtime_prompts = next_pending;
+        for (title, markdown) in views {
+            self.sink.emit(AgentEvent::RuntimeView {
+                pack: pack_name.clone(),
+                title,
+                markdown,
+            });
         }
         Ok(content)
     }
@@ -14146,7 +14302,7 @@ impl Agent {
         )
         .await
         .map_err(|error| format!("{error:#}"))?;
-        self.apply_pack_runtime_invocation(invocation)
+        self.apply_pack_runtime_invocation(invocation, false)
             .map_err(|error| format!("{error:#}"))
     }
 
@@ -14171,25 +14327,18 @@ impl Agent {
                 compacted,
             },
             self.interrupt.clone(),
-            self.sandbox_profile,
+            SandboxProfile::ReadOnly,
         )
-        .await?;
-        let content = self.apply_pack_runtime_invocation(invocation)?;
-        let had_pending_continuation = !self.pending_pack_runtime_prompts.is_empty();
+        .await
+        .map_err(|error| {
+            let detail = self
+                .privacy
+                .redact_text(&format!("pack runtime idle failed: {error:#}"))
+                .text;
+            anyhow::anyhow!(detail)
+        })?;
+        let content = self.apply_pack_runtime_invocation(invocation, true)?;
         if !content.trim().is_empty() {
-            if !had_pending_continuation {
-                let runtime = self
-                    .active_pack_runtime
-                    .as_mut()
-                    .context("pack runtime idle response has no active runtime")?;
-                if runtime.continuations_used >= runtime.max_continuations {
-                    bail!(
-                        "pack runtime continuation limit reached ({})",
-                        runtime.max_continuations
-                    );
-                }
-                runtime.continuations_used = runtime.continuations_used.saturating_add(1);
-            }
             self.history.push(Message {
                 role: "user".to_string(),
                 content: vec![Block::Text {
@@ -14200,11 +14349,24 @@ impl Agent {
         Ok(!self.pending_pack_runtime_prompts.is_empty() || !content.trim().is_empty())
     }
 
+    fn cancel_pending_pack_runtime_prompts(&mut self, pending_count: usize) {
+        if let Some(runtime) = self.active_pack_runtime.as_mut() {
+            runtime.continuations_used = runtime
+                .continuations_used
+                .saturating_sub(u32::try_from(pending_count).unwrap_or(u32::MAX));
+        }
+        self.checkpoint_latest_session("after_pack_runtime_continue_cancel");
+    }
+
     async fn inject_pending_pack_runtime_prompt(&mut self) -> bool {
         if self.pending_pack_runtime_prompts.is_empty() {
             return false;
         }
         let pending = std::mem::take(&mut self.pending_pack_runtime_prompts);
+        if self.interrupt.load(Ordering::SeqCst) {
+            self.cancel_pending_pack_runtime_prompts(pending.len());
+            return false;
+        }
         let delay_ms = pending.iter().map(|(_, delay)| *delay).max().unwrap_or(0);
         if delay_ms > 0 {
             let sleep = tokio::time::sleep(std::time::Duration::from_millis(delay_ms));
@@ -14212,6 +14374,7 @@ impl Agent {
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
             loop {
                 if self.interrupt.load(Ordering::SeqCst) {
+                    self.cancel_pending_pack_runtime_prompts(pending.len());
                     return false;
                 }
                 tokio::select! {
@@ -14219,6 +14382,10 @@ impl Agent {
                     _ = ticker.tick() => {}
                 }
             }
+        }
+        if self.interrupt.load(Ordering::SeqCst) {
+            self.cancel_pending_pack_runtime_prompts(pending.len());
+            return false;
         }
         let prompts = pending
             .into_iter()
@@ -15705,7 +15872,7 @@ impl Agent {
             active_pack_runtimes: self
                 .active_pack_runtime
                 .as_ref()
-                .map(|runtime| vec![runtime.snapshot()])
+                .map(|runtime| vec![runtime.snapshot(&self.pending_pack_runtime_prompts)])
                 .unwrap_or_default(),
             provider_health: self.provider_health.clone(),
             privacy: self.privacy.clone(),
@@ -15824,7 +15991,13 @@ impl Agent {
         // fire repeatedly per turn and are debounced so a 20-tool turn doesn't write 20 times.
         let critical = matches!(
             reason,
-            "after_user_message" | "after_compact" | "outer_loop_autosave"
+            "after_user_message"
+                | "after_compact"
+                | "outer_loop_autosave"
+                | "after_pack_runtime_activation"
+                | "after_pack_runtime_idle"
+                | "after_pack_runtime_continue"
+                | "after_pack_runtime_continue_cancel"
         );
         if !critical
             && let Some(last) = self.last_checkpoint_at
@@ -15872,19 +16045,22 @@ impl Agent {
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut reader = io::BufReader::new(file);
         let header = read_session_header_line(&mut reader, path)?;
+        let current_approval_profile = self.approval_profile;
+        let current_approval_policy_source = self.approval_policy_source;
+        let current_sandbox_profile = self.sandbox_profile;
         let SessionHeader {
             model,
             system,
-            allowed,
+            allowed: _saved_allowed,
             sandbox,
             usage,
             thinking_effort,
             reasoning_mode,
             compact_threshold_chars,
             compact_threshold_percent,
-            approval_profile,
-            approval_policy_source,
-            sandbox_profile,
+            approval_profile: _saved_approval_profile,
+            approval_policy_source: _saved_approval_policy_source,
+            sandbox_profile: _saved_sandbox_profile,
             budget_cap,
             context_mode,
             context_mode_explicit,
@@ -15959,15 +16135,7 @@ impl Agent {
         self.model = model;
         self.refresh_context_window();
         self.system = system;
-        self.allowed = allowed
-            .into_iter()
-            .filter(|name| {
-                !matches!(
-                    name.as_str(),
-                    HOOKS_APPROVAL_NAME | PACK_RUNTIME_APPROVAL_NAME
-                )
-            })
-            .collect();
+        self.allowed.clear();
         self.session_usage = usage;
         self.thinking_effort = thinking_effort;
         self.reasoning_mode = reasoning_mode;
@@ -15979,9 +16147,9 @@ impl Agent {
                 compact_threshold_chars_for_window(self.context_window_tokens(), percent)
             })
             .or_else(|| compact_threshold_chars.filter(|v| *v > 0));
-        self.approval_profile = approval_profile;
-        self.approval_policy_source = approval_policy_source;
-        self.sandbox_profile = sandbox_profile;
+        self.approval_profile = current_approval_profile;
+        self.approval_policy_source = current_approval_policy_source;
+        self.sandbox_profile = current_sandbox_profile;
         self.budget_cap = budget_cap;
         self.budget_exhausted = false;
         self.work_ledger = work_ledger;
@@ -16002,8 +16170,8 @@ impl Agent {
         self.set_context_mode_automatic(restored_context_mode);
         self.tool_context_profile = tool_context_profile.effective(restored_context_mode);
         self.tool_profile = tool_profile;
-        self.refresh_tools_for_context();
         self.active_pack_runtime = None;
+        self.pending_pack_runtime_prompts.clear();
         if active_pack_runtimes.len() > 1 {
             anyhow::bail!("session declares more than one active pack runtime");
         }
@@ -16012,15 +16180,14 @@ impl Agent {
             if !project_runtime || approve_project_extensions(self) {
                 let pack = packs::find_pack(&self.sandbox_root, &snapshot.pack_name)
                     .with_context(|| format!("restoring pack runtime {}", snapshot.pack_name))?;
-                let occupied_names = self
-                    .tools
-                    .iter()
-                    .map(|tool| tool.name.to_string())
+                let occupied_names = tools::registered_tool_names()
+                    .map(str::to_string)
                     .collect::<HashSet<_>>();
                 let mut runtime = pack_runtime::load(&pack, &occupied_names)?
                     .context("saved pack no longer declares a runtime")?;
                 runtime.restore_state(snapshot)?;
                 if self.pack_runtime_execution_approved(&pack, &runtime) {
+                    self.pending_pack_runtime_prompts = snapshot.pending_continuations.clone();
                     self.active_pack_runtime = Some(runtime);
                 } else {
                     self.sink.emit(AgentEvent::Warn(format!(
@@ -16035,6 +16202,12 @@ impl Agent {
                 )));
             }
         }
+        self.allowed.clear();
+        self.refresh_tools_for_context();
+        self.set_resolved_approval_profile(
+            current_approval_profile,
+            current_approval_policy_source,
+        );
         self.history = hist;
         self.clear_pending_login();
         if recovery.total() > 0 {
@@ -23215,6 +23388,7 @@ async fn main() -> Result<()> {
         !opts.no_session && !opts.fork,
         will_use_tui,
     )?;
+    agent.set_resolved_approval_profile(approval_policy.profile, approval_policy.source);
     agent.prewarm_connection();
     if let Some(profile) = std::env::var("DEXT_SANDBOX_PROFILE")
         .ok()
@@ -23342,7 +23516,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-    agent.set_resolved_approval_profile(approval_policy.profile, approval_policy.source);
     if !opts.output.is_json() {
         eprintln!(
             "[approval] profile {} (source {})",
