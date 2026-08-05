@@ -25534,6 +25534,17 @@ fn context_state_resets_git_status_budget_after_mutation() {
 }
 
 #[test]
+fn context_state_omits_strategy_budget_before_first_action() {
+    let ledger = WorkLedger {
+        pending: vec!["deliver requested outcome".to_string()],
+        ..WorkLedger::default()
+    };
+    let state = render_context_state_prompt(&[], &ledger);
+    assert!(state.contains("Active checkpoints:"), "{state}");
+    assert!(!state.contains("Strategy budget:"), "{state}");
+}
+
+#[test]
 fn compose_system_parts_includes_context_state_section() {
     let root = temp_test_dir("context-state-env");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");

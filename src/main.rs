@@ -11515,28 +11515,26 @@ fn render_context_state_prompt(history: &[Message], ledger: &WorkLedger) -> Stri
         }
     }
 
-    // Every strategy row is emitted even at zero use: an absent entry means
-    // either "never used" or "reset by a worktree mutation", and the explicit
-    // "0/N used · OK" is what tells the model a previously exhausted budget is
-    // available again. Dropping idle rows would erase that affordance.
-    let budgets = context_strategy_budget_usage(&actions);
-    out.push_str("Strategy budget:\n");
-    for strategy in [
-        ContextStrategy::HttpUrlHunt,
-        ContextStrategy::BinaryHunt,
-        ContextStrategy::GitStatus,
-    ] {
-        let used = budgets
-            .get(&strategy)
-            .map(|budget| budget.used)
-            .unwrap_or(0);
-        out.push_str(&format!(
-            "- {}: {}/{} used · {}\n",
-            strategy.label(),
-            used,
-            strategy.limit(),
-            context_strategy_budget_status(strategy, used)
-        ));
+    if !actions.is_empty() {
+        let budgets = context_strategy_budget_usage(&actions);
+        out.push_str("Strategy budget:\n");
+        for strategy in [
+            ContextStrategy::HttpUrlHunt,
+            ContextStrategy::BinaryHunt,
+            ContextStrategy::GitStatus,
+        ] {
+            let used = budgets
+                .get(&strategy)
+                .map(|budget| budget.used)
+                .unwrap_or(0);
+            out.push_str(&format!(
+                "- {}: {}/{} used · {}\n",
+                strategy.label(),
+                used,
+                strategy.limit(),
+                context_strategy_budget_status(strategy, used)
+            ));
+        }
     }
 
     if !checkpoints.is_empty() {

@@ -50,7 +50,6 @@ Each measured experiment runs formatting plus focused prompt, context-state, sch
 ## Prior findings
 
 - Measured baseline: 8,781 bytes (~2,196 tokens): 4,250 system, 3,846 tools, 683 runtime tail.
-- Compact invariant-driven system prompt kept at 6,290 total bytes (~1,573 tokens), reducing the system contribution to 1,759 bytes while preserving semantic guardrail tests.
-- Largest remaining static duplication is in lean descriptions whose argument details already exist in schemas and whose cross-tool policy now exists in the compact system prompt.
-- Context State deliberately duplicates recent history after tool rounds; optimize that only after the stable baseline reaches the primary target.
+- Compact invariant-driven system prompt plus minimal lean descriptions reached 5,999 bytes (~1,500 tokens) while retaining all 13 default tools, schema fields, and semantic guardrail tests.
+- The clean first-request runtime tail still emits three all-zero strategy budgets before any tool action; omitting only that state should preserve explicit reset/pivot budgets after actions.
 - Under 1,000 tokens is structurally impossible with the current tool payload plus meaningful system/runtime context; reaching it likely requires on-demand/adaptive tool exposure, not unsafe prose deletion.

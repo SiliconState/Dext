@@ -160,10 +160,6 @@ history_compact_threshold_chars=3360000 active_history_compact_threshold_chars=3
 current_phase: probe
 
 ## Context State
-Strategy budget:
-- http_url_hunt: 0/2 used · OK
-- binary_hunt: 0/1 used · OK
-- git_status: 0/1 used · OK
 Active checkpoints:
 - [unresolved] deliver requested outcome with verifiable steps
 privacy=redact (user-readable files remain readable; private keys, secret assignments, and labeled SSNs/cards/accounts are redacted before model context/session logs)
