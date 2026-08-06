@@ -11,6 +11,7 @@ SOURCE_FALLBACK=${DEXT_SOURCE_FALLBACK:-1}
 REQUIRE_ATTESTATION=${DEXT_REQUIRE_ATTESTATION:-0}
 TEMP_DIR=
 STAGED_BINARY=
+INSTALLED_VERSION=
 
 say() {
     printf '%s\n' "dext-install: $*"
@@ -54,6 +55,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --install-dir)
             [ "$#" -ge 2 ] || fail "--install-dir requires a directory"
+            [ -n "$2" ] || fail "--install-dir requires a non-empty directory"
             INSTALL_DIR=$2
             shift 2
             ;;
@@ -133,6 +135,7 @@ latest_tag() {
 main_commit() {
     response="$TEMP_DIR/main-commit.json"
     commit_file="$TEMP_DIR/main-commit"
+    type_file="$TEMP_DIR/main-type"
     if ! status=$(curl --proto '=https' --tlsv1.2 -sSL \
         -H 'Accept: application/vnd.github+json' \
         -H 'User-Agent: dext-installer' \
@@ -140,6 +143,11 @@ main_commit() {
         fail "could not resolve the current main commit"
     fi
     [ "$status" = 200 ] || fail "main commit lookup returned HTTP $status"
+    sed -n 's/.*"type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$response" \
+        | awk 'NF { values[++count] = $0 } END { if (count != 1) exit 1; print values[1] }' \
+        > "$type_file" \
+        || fail "main ref response is malformed"
+    [ "$(cat "$type_file")" = commit ] || fail "main ref does not point to a commit"
     sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9A-Fa-f]*\)".*/\1/p' "$response" \
         | awk 'NF { values[++count] = tolower($0) } END { if (count != 1) exit 1; print values[1] }' \
         > "$commit_file" \
@@ -181,14 +189,38 @@ sha256_file() {
     fi
 }
 
+verify_binary() {
+    source_binary=$1
+    expected_version=${2:-}
+    [ -f "$source_binary" ] && [ ! -L "$source_binary" ] \
+        || fail "installer did not produce a regular Dext binary"
+    reported=$("$source_binary" --version) \
+        || fail "installed Dext candidate did not start"
+    case "$reported" in
+        "dext "*)
+            version=${reported#"dext "}
+            case "$version" in
+                ""|*[[:space:]]*) fail "installed Dext candidate returned an unexpected version string" ;;
+            esac
+            ;;
+        *) fail "installed Dext candidate returned an unexpected version string" ;;
+    esac
+    if [ -n "$expected_version" ] && [ "$reported" != "dext $expected_version" ]; then
+        fail "release binary reported '$reported', expected 'dext $expected_version'"
+    fi
+    printf '%s\n' "$reported"
+}
+
 install_binary() {
     source_binary=$1
+    expected_version=${2:-}
     [ -f "$source_binary" ] && [ ! -L "$source_binary" ] \
         || fail "installer did not produce a regular Dext binary"
     mkdir -p "$INSTALL_DIR"
     STAGED_BINARY=$(mktemp "$INSTALL_DIR/.dext-install.XXXXXX")
     cp "$source_binary" "$STAGED_BINARY"
     chmod 755 "$STAGED_BINARY"
+    verify_binary "$STAGED_BINARY" "$expected_version" >/dev/null
     mv -f "$STAGED_BINARY" "$INSTALL_DIR/dext"
     STAGED_BINARY=
 }
@@ -233,7 +265,8 @@ install_release() {
         END { if (unsafe || binaries != 1) exit 1 }
     ' "$TEMP_DIR/archive-list" || fail "release archive has an unsafe or unexpected layout"
     tar -xzf "$TEMP_DIR/$archive" -C "$TEMP_DIR/unpacked" dext
-    install_binary "$TEMP_DIR/unpacked/dext"
+    INSTALLED_VERSION=${tag#v}
+    install_binary "$TEMP_DIR/unpacked/dext" "$INSTALLED_VERSION"
     say "verified and installed release $tag"
 }
 
@@ -282,7 +315,7 @@ if [ -n "$TAG" ]; then
     fi
 fi
 
-"$INSTALL_DIR/dext" --version
+verify_binary "$INSTALL_DIR/dext" "$INSTALLED_VERSION"
 case ":${PATH:-}:" in
     *":$INSTALL_DIR:"*) ;;
     *)

@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A source-first coding agent that lives in your terminal.</strong><br>
-  One Rust binary. Native tools. Project-aware memory. Guardrails you can inspect.
+  One Rust binary. Native tools. Project-scoped sessions. Guardrails you can inspect.
 </p>
 
 <p align="center">
@@ -37,7 +37,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/SiliconState/Dext/main/scripts/install.ps1 | iex
 ```
 
-The installers select the matching release archive and verify its SHA-256 checksum. Dext has not published its first tagged release yet, so the current installers resolve and pin the current `main` commit before running a locked Cargo build; that fallback requires [Rust](https://rustup.rs). Set `DEXT_SOURCE_FALLBACK=0` to require a release instead. Set `DEXT_REQUIRE_ATTESTATION=1` to additionally require [GitHub CLI](https://cli.github.com/) verification of release provenance; because source builds have no release attestation, that setting also disables source fallback.
+The installers select the matching release archive, verify its SHA-256 checksum, and validate that it starts and reports the selected version before replacement. Dext has not published its first tagged release yet, so the current installers resolve and pin the current `main` commit before running a locked Cargo build; that fallback requires [Rust](https://rustup.rs). Set `DEXT_SOURCE_FALLBACK=0` to require a release instead. Set `DEXT_REQUIRE_ATTESTATION=1` to additionally require [GitHub CLI](https://cli.github.com/) verification of release provenance; because source builds have no release attestation, that setting also disables source fallback.
 
 Prefer to review before running? Download [`install.sh`](scripts/install.sh) or [`install.ps1`](scripts/install.ps1), inspect it, then execute it locally. Release provenance and manual verification are documented in [`docs/RELEASING.md`](docs/RELEASING.md).
 
@@ -60,8 +60,9 @@ cargo install --path . --force --locked
 # Browser login for ChatGPT/Codex
 dext auth login chatgpt
 
-# Or configure an API-key provider
-dext auth login anthropic <api-key>
+# Open the provider login page, then paste the key at Dext's prompt
+# (do not put secrets in shell command arguments)
+dext auth login anthropic
 
 # Work interactively in the current project
 dext
@@ -85,7 +86,7 @@ See [`docs/USAGE.md`](docs/USAGE.md) for provider setup, model routing, sessions
 - **Bounded by default.** Approval profiles, filesystem sandboxing, credential scrubbing, privacy redaction, and capped I/O.
 - **Provider-neutral.** Cloud and local providers share one compact native tool layer.
 - **Extensible without core bloat.** User-owned [packs and shelves](docs/PACKS.md) can add workflows and reviewed runtime tools.
-- **Durable when useful.** Project sessions resume naturally; optional [Seats](docs/USAGE.md#seats) preserve a role across disposable sessions.
+- **Explicit continuity.** By default, Dext autosaves session state under a project-specific key; `dext --resume` restores the latest session. Optional `recall.md` and [Seat](docs/USAGE.md#seats) summaries are user-authored context, not autonomous memory.
 
 ## A small working surface
 
