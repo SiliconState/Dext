@@ -22,7 +22,7 @@ cargo install --path . --force --locked
 - Keep edits surgical.
 - Prefer existing modules for small changes; when an existing file mixes several stable domains, extract one focused module instead of extending a monolith.
 - Avoid adding overlapping tools or prompt/schema bloat.
-- Do not commit runtime clutter, generated logs, session exports, screenshots, credentials, or local auth stores.
+- Do not commit runtime clutter, generated logs, session exports, credentials, local auth stores, or one-off screenshots. Curated product screenshots used by README/docs are reviewed documentation assets.
 - Treat `docs/index.html` as the canonical main technical documentation. Update it in the same change as user-visible/runtime/architecture/security/provider/tool/test/CI/release behavior, plus any focused Markdown guide for that subject.
 - Update `docs/RISK_REGISTER.md` when a non-documentation risk, control, owner, likelihood, impact, or review trigger changes. Do not add documentation-drift risks; prevent them with the canonical-page same-change rule.
 
@@ -32,6 +32,7 @@ cargo install --path . --force --locked
 - Add comments only for non-obvious invariants, security reasoning, or platform footguns.
 - No backwards-compatibility shims for unreleased internal behavior.
 - Keep terminal/TUI behavior text-first and sparse.
+- Installers in `scripts/` are user-facing supply-chain code. Keep them dependency-light, checksum-verifying, per-user by default, and covered by platform-native CI parsing/smoke checks.
 - Use Dext's built-in HTTP implementation rather than shelling to curl for core behavior.
 
 ## Verification

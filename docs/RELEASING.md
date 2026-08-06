@@ -6,9 +6,14 @@ Releases are owner-triggered by an immutable version tag. The workflow does not 
 
 1. Set the intended package version in `Cargo.toml`, update `Cargo.lock`, and confirm the future tag will be exactly `vX.Y.Z`.
 2. Review the complete diff and ignored/untracked files for generated state, credentials, or accidental artifacts.
-3. Run the local release gate:
+3. Run the installer checks and local release gate:
 
    ```bash
+   sh -n scripts/install.sh
+   sh -n scripts/test_install.sh
+   scripts/install.sh --help
+   sh scripts/test_install.sh
+   python3 scripts/validate_pages.py docs
    cargo fmt --all -- --check
    cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
    cargo audit --deny warnings
@@ -26,7 +31,7 @@ Releases are owner-triggered by an immutable version tag. The workflow does not 
 
    If an agent must orchestrate the gate, start a separate trusted Dext process with `dext --sandbox-profile danger-full-access --approval always` and use it only in a controlled checkout. Changing `DEXT_SANDBOX_PROFILE` inside an already-confined shell does not remove the parent process's kernel sandbox. Do not weaken `workspace-write` or grant shared temp, PTY, or Cargo-home access merely to make self-hosted tests pass.
 
-4. Confirm required branch CI is green on Linux, macOS, and Windows. Windows CI includes the native Job Object descendant-lifecycle test; Linux CI compiles Criterion benchmarks. Confirm the scheduled security workflow passes both vulnerability auditing and the dependency-license policy. If terminal dependencies or `src/tui.rs` changed, apply the renderer contract and live-terminal checks in [`TUI.md`](TUI.md). Review `.github/workflows/release.yml`, especially its full action commit pins, quality gate, four-target matrix, tag/version check, and publish-job permissions.
+4. Confirm required branch CI is green on Linux, macOS, and Windows. Windows CI includes the native Job Object descendant-lifecycle test and both installers receive platform-native parse/help coverage; Linux additionally runs deterministic offline release/checksum/source-fallback/attestation installer tests and compiles Criterion benchmarks. Confirm the scheduled security workflow passes both vulnerability auditing and the dependency-license policy. If terminal dependencies or `src/tui.rs` changed, apply the renderer contract and live-terminal checks in [`TUI.md`](TUI.md). Review `.github/workflows/release.yml`, especially its full action commit pins, quality gate, four-target matrix, tag/version check, and publish-job permissions.
 5. Confirm the tag and release do not already exist. Release artifacts are immutable; never replace bytes under an existing tag or checksum.
 
 ## First-release evidence
@@ -38,7 +43,7 @@ The publication workflow has not yet completed a version tag. Before treating it
 - [ ] Provenance verification passed for every checksummed asset.
 - [ ] Packaged binaries passed the workflow smoke checks.
 
-After the first successful release, replace these unchecked items with the tag and workflow URL.
+After the first successful release, replace these unchecked items with the tag and workflow URL. The README/usage installers will then consume the published archives automatically; until that point their default `latest` path deliberately falls back to a locked source build from one resolved `main` revision. Attestation-required mode refuses that fallback because a local source build has no release attestation.
 
 ## Publish
 
