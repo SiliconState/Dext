@@ -10026,7 +10026,14 @@ async fn external_runner_bounds_stdin_backpressure() {
     )
     .await
     .expect_err("expected stdin timeout");
+    assert!(err.contains("timed out after"), "{err}");
+    #[cfg(not(windows))]
     assert!(err.contains("writing stdin"), "{err}");
+    #[cfg(windows)]
+    assert!(
+        err.contains("writing stdin") || err.contains("running bash"),
+        "{err}"
+    );
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     let _ = std::fs::remove_dir_all(&root);
 }
