@@ -24,6 +24,36 @@ jobs:
           persist-credentials: false
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check Unix installer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n scripts/install.sh
+          sh -n scripts/test_install.sh
+          sh scripts/install.sh --help >/dev/null
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sh scripts/test_install.sh
+          fi
+      - name: Check PowerShell installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          & ./scripts/install.ps1 -Help | Out-Null
+      - name: Validate documentation site
+        if: runner.os == 'Linux'
+        run: python3 scripts/validate_pages.py docs
       - name: Run Clippy
         run: cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
       - name: Test Ratatui compatibility patch

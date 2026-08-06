@@ -1,5 +1,31 @@
 # Usage
 
+## Installation
+
+Linux and macOS:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/SiliconState/Dext/main/scripts/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/SiliconState/Dext/main/scripts/install.ps1 | iex
+```
+
+The installers query the latest GitHub release, select Linux x86_64 GNU, macOS x86_64/arm64, or Windows x86_64 as appropriate, verify the archive against the release `SHA256SUMS`, and atomically install `dext` for the current user. The default destination is `~/.local/bin` on Linux/macOS and `%LOCALAPPDATA%\Dext\bin` on Windows; the Windows installer adds its directory to the user `PATH`. Override the destination with `DEXT_INSTALL_DIR` and select a tag with `DEXT_VERSION=vX.Y.Z`. Dext has not published its first tagged release yet, so `latest` currently resolves and pins the current `main` commit before running `cargo install --git ... --rev ... --locked`; set `DEXT_SOURCE_FALLBACK=0` to fail instead. The source fallback requires stable Rust with edition 2024 support. Set `DEXT_REQUIRE_ATTESTATION=1` (and install GitHub CLI) to require build-provenance verification in addition to the default checksum verification; this also disables source fallback because source builds have no release attestation.
+
+A one-line installer executes repository code. For a review-first installation, download [`../scripts/install.sh`](../scripts/install.sh) or [`../scripts/install.ps1`](../scripts/install.ps1), inspect it, and run the local file. The installers verify release checksums; use [`RELEASING.md`](RELEASING.md#verify-published-assets) to additionally verify GitHub build provenance and the release SBOM. Windows shell-backed tools also require a real Bash such as Git for Windows; use `DEXT_BASH_PATH` when automatic discovery is not suitable.
+
+Source checkout installation remains available:
+
+```bash
+git clone https://github.com/SiliconState/Dext.git
+cd Dext
+cargo install --path . --force --locked
+```
+
 ## CLI overview
 
 ```text
