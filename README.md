@@ -37,7 +37,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/SiliconState/Dext/main/scripts/install.ps1 | iex
 ```
 
-The installers select the matching release archive, verify its SHA-256 checksum, and validate that it starts and reports the selected version before replacement. Dext has not published its first tagged release yet, so the current installers resolve and pin the current `main` commit before running a locked Cargo build; that fallback requires [Rust](https://rustup.rs). Set `DEXT_SOURCE_FALLBACK=0` to require a release instead. Set `DEXT_REQUIRE_ATTESTATION=1` to additionally require [GitHub CLI](https://cli.github.com/) verification of release provenance; because source builds have no release attestation, that setting also disables source fallback.
+The installers select the matching release archive, require an exact `vX.Y.Z` tag, verify its SHA-256 checksum, and validate that it starts and reports the selected version before replacement. Dext has not published its first tagged release yet, so the current installers resolve and pin the current `main` commit before running a locked Cargo build; that fallback requires [Rust](https://rustup.rs). Set `DEXT_SOURCE_FALLBACK=0` to require a release instead. Set `DEXT_REQUIRE_ATTESTATION=1` to additionally require [GitHub CLI](https://cli.github.com/) verification of release provenance; because source builds have no release attestation, that setting also disables source fallback.
 
 Prefer to review before running? Download [`install.sh`](scripts/install.sh) or [`install.ps1`](scripts/install.ps1), inspect it, then execute it locally. Release provenance and manual verification are documented in [`docs/RELEASING.md`](docs/RELEASING.md).
 

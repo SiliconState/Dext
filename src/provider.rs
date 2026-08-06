@@ -4633,7 +4633,7 @@ const AUTH_LOGIN_ARGUMENTS: &str = "[credential|web|import]";
 
 fn auth_retry_guidance(provider_id: &str) -> String {
     format!(
-        "rerun `dext auth login {provider_id}` in an interactive terminal and paste the credential at Dext's prompt; avoid command-line secrets because shell history and process listings may retain them"
+        "login for provider '{provider_id}' remains incomplete. retry `dext auth login {provider_id}`; to paste a credential or manual OAuth callback without putting it in shell arguments, open Dext and use `/login {provider_id}`. shell history and process listings may retain command-line secrets"
     )
 }
 
@@ -4775,8 +4775,10 @@ mod tests {
     fn auth_login_guidance_avoids_shell_secret_arguments() {
         assert_eq!(AUTH_LOGIN_ARGUMENTS, "[credential|web|import]");
         let guidance = auth_retry_guidance("anthropic");
+        assert!(guidance.contains("remains incomplete"), "{guidance}");
         assert!(guidance.contains("dext auth login anthropic"), "{guidance}");
-        assert!(guidance.contains("Dext's prompt"), "{guidance}");
+        assert!(guidance.contains("/login anthropic"), "{guidance}");
+        assert!(guidance.contains("manual OAuth callback"), "{guidance}");
         assert!(guidance.contains("shell history"), "{guidance}");
         assert!(!guidance.contains("<api-key"), "{guidance}");
     }

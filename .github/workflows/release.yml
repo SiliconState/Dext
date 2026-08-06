@@ -16,7 +16,23 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Require tag commit on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if [[ "$(git cat-file -t "$GITHUB_REF")" != tag ]]; then
+            printf 'release ref %s must be an annotated tag\n' "$GITHUB_REF" >&2
+            exit 1
+          fi
+          tag_commit=$(git rev-parse "${GITHUB_REF}^{commit}")
+          if ! git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main; then
+            printf 'release tag %s points to %s, which is not contained in origin/main\n' \
+              "$GITHUB_REF_NAME" "$tag_commit" >&2
+            exit 1
+          fi
       - name: Match tag to package version
         shell: bash
         run: |

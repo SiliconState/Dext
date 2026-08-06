@@ -60,8 +60,10 @@ function Get-Sha256([string]$Path) {
 }
 
 function Test-DextBinary([string]$Path, [string]$ExpectedVersion = "") {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "installer did not produce a regular Dext binary"
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or $item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "installer did not produce a regular non-reparse Dext binary"
     }
     $reported = ((& $Path --version) -join "`n").Trim()
     if ($LASTEXITCODE -ne 0) {
@@ -76,26 +78,93 @@ function Test-DextBinary([string]$Path, [string]$ExpectedVersion = "") {
     return $reported
 }
 
+function Replace-DextFile(
+    [string]$Staged,
+    [string]$Destination,
+    [string]$Backup
+) {
+    [System.IO.File]::Replace($Staged, $Destination, $Backup)
+}
+
+function Move-DextFile(
+    [string]$Source,
+    [string]$Destination
+) {
+    [System.IO.File]::Move($Source, $Destination)
+}
+
+function Move-DextFileWithRollback(
+    [string]$Staged,
+    [string]$Destination,
+    [string]$Backup
+) {
+    Move-DextFile $Destination $Backup
+    try {
+        Move-DextFile $Staged $Destination
+    }
+    catch {
+        $replacementError = $_
+        try {
+            Move-DextFile $Backup $Destination
+        }
+        catch {
+            throw "Dext replacement failed and the previous binary could not be restored; recover it from '$Backup': $($_.Exception.Message)"
+        }
+        throw $replacementError
+    }
+}
+
 function Install-DextBinary(
     [string]$Source,
     [string]$ExpectedVersion = ""
 ) {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
-        throw "installer did not produce a regular Dext binary"
+        throw "installer did not produce a Dext binary"
     }
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $destination = Join-Path $InstallDir "dext.exe"
+    $destinationItem = Get-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
+    if ($null -ne $destinationItem) {
+        if ($destinationItem.PSIsContainer -or
+            ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "existing Dext destination must be a regular non-reparse file or be absent"
+        }
+    }
     $staged = Join-Path $InstallDir (".dext-install-" + [Guid]::NewGuid().ToString("N") + ".exe")
     try {
         Copy-Item -LiteralPath $Source -Destination $staged
         [void](Test-DextBinary $staged $ExpectedVersion)
-        if ([System.IO.File]::Exists($destination)) {
+        if ($null -ne $destinationItem) {
             $backup = Join-Path $InstallDir (".dext-backup-" + [Guid]::NewGuid().ToString("N") + ".exe")
+            $replacementComplete = $false
             try {
-                [System.IO.File]::Replace($staged, $destination, $backup)
+                try {
+                    Replace-DextFile $staged $destination $backup
+                    $replacementComplete = $true
+                }
+                catch {
+                    $replacementError = $_
+                    $cause = $_.Exception
+                    $unsupported = $false
+                    while ($null -ne $cause) {
+                        if ($cause -is [System.PlatformNotSupportedException] -or
+                            $cause -is [System.NotSupportedException]) {
+                            $unsupported = $true
+                            break
+                        }
+                        $cause = $cause.InnerException
+                    }
+                    if (-not $unsupported) {
+                        throw $replacementError
+                    }
+                    Move-DextFileWithRollback $staged $destination $backup
+                    $replacementComplete = $true
+                }
             }
             finally {
-                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+                if ($replacementComplete) {
+                    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+                }
             }
         }
         else {
@@ -265,7 +334,11 @@ try {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($tag)) {
-        if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+        if (-not [regex]::IsMatch(
+            $tag,
+            '\Av[0-9]+\.[0-9]+\.[0-9]+\z',
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )) {
             throw "release version must have form vX.Y.Z"
         }
         $installedVersion = $tag.Substring(1)

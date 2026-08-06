@@ -32,7 +32,7 @@ cargo install --path . --force --locked
 - Add comments only for non-obvious invariants, security reasoning, or platform footguns.
 - No backwards-compatibility shims for unreleased internal behavior.
 - Keep terminal/TUI behavior text-first and sparse.
-- Installers in `scripts/` are user-facing supply-chain code. Keep them dependency-light, checksum-verifying, per-user by default, validate selected release versions before replacement, and cover release/fallback/failure paths with platform-native functional CI tests.
+- Installers in `scripts/` are user-facing supply-chain code. Keep them dependency-light, checksum-verifying, per-user by default, require exact release tags and safe regular-file destinations, validate selected release versions before replacement, preserve a recoverable prior binary across non-atomic fallback failures, and cover release/fallback/failure paths with platform-native functional CI tests.
 - Use Dext's built-in HTTP implementation rather than shelling to curl for core behavior.
 
 ## Verification

@@ -211,6 +211,40 @@ if run_installer source "$WORK/install-invalid" yes "$WORK/release/SHA256SUMS" \
 fi
 grep -F 'DEXT_SOURCE_FALLBACK must be 0 or 1' "$WORK/invalid.err" >/dev/null
 
+PHASE='unsafe destination rejection'
+mkdir -p "$WORK/install-unsafe/dext"
+if run_installer release "$WORK/install-unsafe" 1 "$WORK/release/SHA256SUMS" \
+    > "$WORK/unsafe-destination.out" 2> "$WORK/unsafe-destination.err"; then
+    printf '%s\n' 'directory destination unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'existing Dext destination must be a regular non-symlink file or be absent' \
+    "$WORK/unsafe-destination.err" >/dev/null
+test -d "$WORK/install-unsafe/dext"
+
+mkdir -p "$WORK/install-unsafe-link"
+printf '%s\n' unchanged > "$WORK/symlink-target"
+ln -s "$WORK/symlink-target" "$WORK/install-unsafe-link/dext"
+if run_installer release "$WORK/install-unsafe-link" 1 "$WORK/release/SHA256SUMS" \
+    > "$WORK/unsafe-link.out" 2> "$WORK/unsafe-link.err"; then
+    printf '%s\n' 'symlink destination unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'existing Dext destination must be a regular non-symlink file or be absent' \
+    "$WORK/unsafe-link.err" >/dev/null
+test -L "$WORK/install-unsafe-link/dext"
+test "$(cat "$WORK/symlink-target")" = unchanged
+
+PHASE='invalid release version rejection'
+invalid_version=$(printf 'v1.2.3\nbad')
+if run_installer release "$WORK/install-invalid-version" 1 "$WORK/release/SHA256SUMS" \
+    --version "$invalid_version" > "$WORK/invalid-version.out" 2> "$WORK/invalid-version.err"; then
+    printf '%s\n' 'newline-tainted release version unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F 'release version must have form vX.Y.Z' "$WORK/invalid-version.err" >/dev/null
+test ! -e "$WORK/install-invalid-version/dext"
+
 PHASE='empty install directory rejection'
 if run_installer release "" 1 "$WORK/release/SHA256SUMS" \
     --install-dir "" > "$WORK/empty-dir.out" 2> "$WORK/empty-dir.err"; then
