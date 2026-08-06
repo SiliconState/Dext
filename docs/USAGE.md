@@ -14,7 +14,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/SiliconState/Dext/main/scripts/install.ps1 | iex
 ```
 
-The installers query the latest GitHub release, select Linux x86_64 GNU, macOS x86_64/arm64, or Windows x86_64 as appropriate, verify the archive against the release `SHA256SUMS`, and atomically install `dext` for the current user. The default destination is `~/.local/bin` on Linux/macOS and `%LOCALAPPDATA%\Dext\bin` on Windows; the Windows installer adds its directory to the user `PATH`. Override the destination with `DEXT_INSTALL_DIR` and select a tag with `DEXT_VERSION=vX.Y.Z`. Dext has not published its first tagged release yet, so `latest` currently resolves and pins the current `main` commit before running `cargo install --git ... --rev ... --locked`; set `DEXT_SOURCE_FALLBACK=0` to fail instead. The source fallback requires stable Rust with edition 2024 support. Set `DEXT_REQUIRE_ATTESTATION=1` (and install GitHub CLI) to require build-provenance verification in addition to the default checksum verification; this also disables source fallback because source builds have no release attestation.
+The installers query the latest GitHub release, select Linux x86_64 GNU, macOS x86_64/arm64, or Windows x86_64 as appropriate, verify the archive against the release `SHA256SUMS`, validate that the candidate starts and reports the selected version, and replace `dext` for the current user from a same-directory staged file. The default destination is `~/.local/bin` on Linux/macOS and `%LOCALAPPDATA%\Dext\bin` on Windows; the Windows installer adds its directory to the user `PATH`. Override the destination with `DEXT_INSTALL_DIR` and select a tag with `DEXT_VERSION=vX.Y.Z`. Dext has not published its first tagged release yet, so `latest` currently resolves and pins the current `main` commit before running `cargo install --git ... --rev ... --locked`; set `DEXT_SOURCE_FALLBACK=0` to fail instead. The source fallback requires stable Rust with edition 2024 support. Set `DEXT_REQUIRE_ATTESTATION=1` (and install GitHub CLI) to require build-provenance verification in addition to the default checksum verification; this also disables source fallback because source builds have no release attestation.
 
 A one-line installer executes repository code. For a review-first installation, download [`../scripts/install.sh`](../scripts/install.sh) or [`../scripts/install.ps1`](../scripts/install.ps1), inspect it, and run the local file. The installers verify release checksums; use [`RELEASING.md`](RELEASING.md#verify-published-assets) to additionally verify GitHub build provenance and the release SBOM. Windows shell-backed tools also require a real Bash such as Git for Windows; use `DEXT_BASH_PATH` when automatic discovery is not suitable.
 
@@ -46,6 +46,8 @@ dext --eval [NAME]    run eval harness
 
 Run `dext --help` for the exact options supported by the installed binary.
 
+By default, Dext autosaves session state under a project-specific key, but a new invocation does not silently load the previous transcript. Use `dext --resume` (or `/resume` in an interactive session) to restore it. Optional `recall.md` and Seat summaries are user-authored context, not autonomous project memory; `--no-session` disables durable session/log writes.
+
 ## Seats
 
 A Seat is a durable project-scoped agent identity, while a session is one disposable incarnation of that identity. Start a new seated session with `dext --seat planner`; resume that identity's latest durable session with `dext --seat planner --resume`; inspect records with `dext seat list` or `dext seat show planner`; maintain context with `dext seat set planner --label "Planning role"` and `dext seat set planner --summary-file ./planner-context.txt`. Clear fields with `--clear-label` or `--clear-summary`; `--summary-file -` reads bounded UTF-8 from stdin.
@@ -71,15 +73,17 @@ dext auth login kimi
 
 `dext auth login kimi` opens `https://www.kimi.com/code/console`. Create or copy the API key associated with the Kimi coding plan, then paste it into Dext. Dext stores it as an API key and uses the isolated `https://api.kimi.com/coding` profile; it does not use Kimi device OAuth.
 
-Store an API key:
+For API-key providers, run the login command without putting the secret in the shell command, then paste the key at Dext's interactive prompt:
 
 ```bash
-dext auth login glm <api-key>
-dext auth login openai <api-key>
-dext auth login anthropic <api-key>
-dext auth login kimi <api-key>
-dext auth login deepseek <api-key>
+dext auth login glm
+dext auth login openai
+dext auth login anthropic
+dext auth login kimi
+dext auth login deepseek
 ```
+
+Passing a credential as a command argument remains supported for automation, but shell history and process listings may retain it; prefer an environment reference or Dext's prompt for interactive use.
 
 The bundled Kimi provider also accepts `KIMI_API_KEY`, using a key created at `https://www.kimi.com/code/console`. Kimi coding-plan API keys are separate from the independently billed Moonshot Open Platform and its `MOONSHOT_API_KEY`; Dext does not substitute one for the other. Custom Kimi-compatible catalog profiles remain API-key based and must use an ID other than the reserved built-in IDs `kimi`, `kimi-code`, `kimi-coding`, and `kimi-membership`. If an older catalog already uses one of those IDs, rename that custom profile before upgrading; Dext rejects the collision rather than silently converting it.
 

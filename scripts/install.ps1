@@ -16,6 +16,7 @@ $ProgressPreference = "SilentlyContinue"
 $repository = "https://github.com/SiliconState/Dext"
 $apiUrl = "https://api.github.com/repos/SiliconState/Dext/releases/latest"
 $mainCommitUrl = "https://api.github.com/repos/SiliconState/Dext/git/ref/heads/main"
+$installedVersion = $null
 
 if ($Help) {
     @"
@@ -32,12 +33,21 @@ Environment:
     return
 }
 
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+
 foreach ($setting in @("DEXT_SOURCE_FALLBACK", "DEXT_REQUIRE_ATTESTATION")) {
     $value = [Environment]::GetEnvironmentVariable($setting)
     if ($null -ne $value -and $value -notin @("0", "1")) {
         throw "$setting must be 0 or 1"
     }
 }
+if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    throw "InstallDir must be a non-empty directory"
+}
+$InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("dext-install-" + [Guid]::NewGuid().ToString("N"))
 
@@ -49,7 +59,27 @@ function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-function Install-DextBinary([string]$Source) {
+function Test-DextBinary([string]$Path, [string]$ExpectedVersion = "") {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "installer did not produce a regular Dext binary"
+    }
+    $reported = ((& $Path --version) -join "`n").Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "installed Dext candidate did not start"
+    }
+    if ($reported -notmatch '^dext [^\s]+$') {
+        throw "installed Dext candidate returned an unexpected version string"
+    }
+    if ($ExpectedVersion -and $reported -ne "dext $ExpectedVersion") {
+        throw "release binary reported '$reported', expected 'dext $ExpectedVersion'"
+    }
+    return $reported
+}
+
+function Install-DextBinary(
+    [string]$Source,
+    [string]$ExpectedVersion = ""
+) {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
         throw "installer did not produce a regular Dext binary"
     }
@@ -58,7 +88,13 @@ function Install-DextBinary([string]$Source) {
     $staged = Join-Path $InstallDir (".dext-install-" + [Guid]::NewGuid().ToString("N") + ".exe")
     try {
         Copy-Item -LiteralPath $Source -Destination $staged
-        Move-Item -LiteralPath $staged -Destination $destination -Force
+        [void](Test-DextBinary $staged $ExpectedVersion)
+        if ([System.IO.File]::Exists($destination)) {
+            [System.IO.File]::Replace($staged, $destination, $null)
+        }
+        else {
+            [System.IO.File]::Move($staged, $destination)
+        }
     }
     finally {
         Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
@@ -112,8 +148,8 @@ function Install-Release([string]$Tag) {
     $checksumsPath = Join-Path $tempDir "SHA256SUMS"
     $base = "$repository/releases/download/$Tag"
     Write-Install "downloading $archive"
-    Invoke-WebRequest -Uri "$base/$archive" -OutFile $archivePath
-    Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $checksumsPath
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/$archive" -OutFile $archivePath
+    Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS" -OutFile $checksumsPath
 
     $expectedDigests = @()
     foreach ($line in Get-Content -LiteralPath $checksumsPath) {
@@ -170,7 +206,8 @@ function Install-Release([string]$Tag) {
     finally {
         $zip.Dispose()
     }
-    Install-DextBinary $unpackedBinary
+    $expectedVersion = $Tag.Substring(1)
+    Install-DextBinary $unpackedBinary $expectedVersion
     Write-Install "verified and installed release $Tag"
 }
 
@@ -225,14 +262,12 @@ try {
         if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
             throw "release version must have form vX.Y.Z"
         }
+        $installedVersion = $tag.Substring(1)
         Install-Release $tag
     }
 
     $binary = Join-Path $InstallDir "dext.exe"
-    & $binary --version
-    if ($LASTEXITCODE -ne 0) {
-        throw "installed Dext binary did not start"
-    }
+    Write-Output (Test-DextBinary $binary $installedVersion)
     $pathParts = @($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $userParts = @($userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })

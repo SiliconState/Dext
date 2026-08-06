@@ -22,7 +22,7 @@ cargo install --path . --force --locked
 - Keep edits surgical.
 - Prefer existing modules for small changes; when an existing file mixes several stable domains, extract one focused module instead of extending a monolith.
 - Avoid adding overlapping tools or prompt/schema bloat.
-- Do not commit runtime clutter, generated logs, session exports, credentials, local auth stores, or one-off screenshots. Curated product screenshots used by README/docs are reviewed documentation assets.
+- Do not commit runtime clutter, generated logs, session exports, credentials, local auth stores, repository-local `.auto/` experiment workspaces, or one-off screenshots. Curated product screenshots used by README/docs are reviewed documentation assets.
 - Treat `docs/index.html` as the canonical main technical documentation. Update it in the same change as user-visible/runtime/architecture/security/provider/tool/test/CI/release behavior, plus any focused Markdown guide for that subject.
 - Update `docs/RISK_REGISTER.md` when a non-documentation risk, control, owner, likelihood, impact, or review trigger changes. Do not add documentation-drift risks; prevent them with the canonical-page same-change rule.
 
@@ -32,7 +32,7 @@ cargo install --path . --force --locked
 - Add comments only for non-obvious invariants, security reasoning, or platform footguns.
 - No backwards-compatibility shims for unreleased internal behavior.
 - Keep terminal/TUI behavior text-first and sparse.
-- Installers in `scripts/` are user-facing supply-chain code. Keep them dependency-light, checksum-verifying, per-user by default, and covered by platform-native CI parsing/smoke checks.
+- Installers in `scripts/` are user-facing supply-chain code. Keep them dependency-light, checksum-verifying, per-user by default, validate selected release versions before replacement, and cover release/fallback/failure paths with platform-native functional CI tests.
 - Use Dext's built-in HTTP implementation rather than shelling to curl for core behavior.
 
 ## Verification
@@ -43,6 +43,7 @@ Run the narrowest useful check first, then the release checks before publishing:
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
+cargo deny check licenses
 cargo test -p ratatui-core --lib --locked
 cargo bench --no-run --locked
 cargo build --release --locked
@@ -85,6 +86,7 @@ Do not commit:
 - `.env`
 - `.dext/`
 - `.dext/checkpoints/`
+- `.auto/`
 - `target/`
 - `dext-session-*`
 - `DEXT.todo.json`

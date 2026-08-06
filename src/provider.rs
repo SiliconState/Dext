@@ -4629,6 +4629,14 @@ pub(crate) fn list_models_for_available_providers(
     Ok(sections.join("\n\n"))
 }
 
+const AUTH_LOGIN_ARGUMENTS: &str = "[credential|web|import]";
+
+fn auth_retry_guidance(provider_id: &str) -> String {
+    format!(
+        "rerun `dext auth login {provider_id}` in an interactive terminal and paste the credential at Dext's prompt; avoid command-line secrets because shell history and process listings may retain them"
+    )
+}
+
 pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
     if argv.first().map(String::as_str) != Some("auth") {
         return Ok(None);
@@ -4645,7 +4653,10 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             println!("  dext auth provider [id|index]  show/set active provider");
             println!("  dext auth models [provider|index] list known models for provider");
             println!(
-                "  dext auth login [provider|index] [token|web|import]   web login + store credential"
+                "  dext auth login [provider|index] {AUTH_LOGIN_ARGUMENTS}   open login flow and store credentials"
+            );
+            println!(
+                "      omit the credential to paste at Dext's prompt; shell arguments may be retained"
             );
             println!("  dext auth logout [provider|index] remove stored credential");
             Ok(Some(0))
@@ -4708,13 +4719,10 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
                     let login = login_provider(selected.as_deref(), None, true)?;
                     println!("{}", login.message);
                     if login.awaiting_credentials {
-                        println!(
-                            "then run: dext auth login {} <api-key|token|code|callback-url|json>",
-                            login.provider_id
-                        );
+                        println!("{}", auth_retry_guidance(&login.provider_id));
                     }
                 } else {
-                    println!("usage: dext auth login <provider|index> [token|web|import]");
+                    println!("usage: dext auth login <provider|index> {AUTH_LOGIN_ARGUMENTS}");
                 }
                 return Ok(Some(0));
             }
@@ -4729,10 +4737,7 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             let login = login_provider(provider, key_buf.as_deref(), allow_prompt)?;
             println!("{}", login.message);
             if login.awaiting_credentials {
-                println!(
-                    "then run: dext auth login {} <api-key|token|code|callback-url|json>",
-                    login.provider_id
-                );
+                println!("{}", auth_retry_guidance(&login.provider_id));
             }
             Ok(Some(0))
         }
@@ -4764,6 +4769,16 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp home");
         path
+    }
+
+    #[test]
+    fn auth_login_guidance_avoids_shell_secret_arguments() {
+        assert_eq!(AUTH_LOGIN_ARGUMENTS, "[credential|web|import]");
+        let guidance = auth_retry_guidance("anthropic");
+        assert!(guidance.contains("dext auth login anthropic"), "{guidance}");
+        assert!(guidance.contains("Dext's prompt"), "{guidance}");
+        assert!(guidance.contains("shell history"), "{guidance}");
+        assert!(!guidance.contains("<api-key"), "{guidance}");
     }
 
     #[test]

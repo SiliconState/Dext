@@ -8,7 +8,7 @@ __pycache__/
 
 # Runtime/project state
 /.dext/
-/.auto/log.jsonl
+/.auto/
 /dext-session-*.jsonl
 /dext-session-*.html
 /semi_stderr.log

@@ -32,23 +32,23 @@ jobs:
           sh -n scripts/install.sh
           sh -n scripts/test_install.sh
           sh scripts/install.sh --help >/dev/null
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            sh scripts/test_install.sh
-          fi
-      - name: Check PowerShell installer
+          sh scripts/test_install.sh
+      - name: Check PowerShell installers
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $errors = $null
-          $tokens = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path scripts/install.ps1),
-            [ref]$tokens,
-            [ref]$errors
-          )
-          if ($errors.Count -ne 0) {
-            $errors | ForEach-Object { Write-Error $_.Message }
-            exit 1
+          foreach ($script in @("scripts/install.ps1", "scripts/test_install.ps1")) {
+            $errors = $null
+            $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error "$script`: $($_.Message)" }
+              exit 1
+            }
           }
           & ./scripts/install.ps1 -Help | Out-Null
       - name: Validate documentation site
@@ -63,6 +63,10 @@ jobs:
         run: cargo bench --no-run --locked
       - name: Build release binary
         run: cargo build --release --locked
+      - name: Test PowerShell installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test_install.ps1 -DextBinary ./target/release/dext.exe
       - name: Run release tests
         if: runner.os != 'Windows'
         run: cargo test --release --locked

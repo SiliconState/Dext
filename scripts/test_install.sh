@@ -7,20 +7,28 @@ trap 'rm -rf "$WORK"' EXIT HUP INT TERM
 unset DEXT_INSTALL_DIR DEXT_VERSION DEXT_SOURCE_FALLBACK DEXT_REQUIRE_ATTESTATION
 unset MOCK_MODE MOCK_CHECKSUMS MOCK_CARGO_ARGS
 
-mkdir -p "$WORK/bin" "$WORK/release" "$WORK/package"
+mkdir -p "$WORK/bin" "$WORK/release" "$WORK/package" "$WORK/wrong-package"
 cat > "$WORK/package/dext" <<'EOF'
 #!/bin/sh
 printf '%s\n' 'dext 1.2.3'
 EOF
-chmod 755 "$WORK/package/dext"
+cat > "$WORK/wrong-package/dext" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'dext 1.2.4'
+EOF
+chmod 755 "$WORK/package/dext" "$WORK/wrong-package/dext"
 tar -C "$WORK/package" -czf "$WORK/release/dext-v1.2.3-x86_64-unknown-linux-gnu.tar.gz" dext
+tar -C "$WORK/wrong-package" -czf "$WORK/release/dext-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" dext
 ARCHIVE="$WORK/release/dext-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
 if command -v sha256sum >/dev/null 2>&1; then
     DIGEST=$(sha256sum "$ARCHIVE" | awk '{print toupper($1)}')
+    WRONG_DIGEST=$(sha256sum "$WORK/release/dext-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" | awk '{print toupper($1)}')
 else
     DIGEST=$(shasum -a 256 "$ARCHIVE" | awk '{print toupper($1)}')
+    WRONG_DIGEST=$(shasum -a 256 "$WORK/release/dext-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" | awk '{print toupper($1)}')
 fi
 printf '%s  %s\n' "$DIGEST" "dext-v1.2.3-x86_64-unknown-linux-gnu.tar.gz" > "$WORK/release/SHA256SUMS"
+printf '%s  %s\n' "$WRONG_DIGEST" "dext-v9.9.9-x86_64-unknown-linux-gnu.tar.gz" >> "$WORK/release/SHA256SUMS"
 
 cat > "$WORK/bin/curl" <<'EOF'
 #!/bin/sh
@@ -40,18 +48,32 @@ done
 status=200
 case "$url" in
     */releases/latest)
-        if [ "${MOCK_MODE:-release}" = source ]; then
-            status=404
-            printf '%s\n' '{"message":"Not Found"}' > "$out"
-        else
-            printf '%s\n' '{"tag_name":"v1.2.3"}' > "$out"
-        fi
+        case "${MOCK_MODE:-release}" in
+            source|bad-ref|attested-source)
+                status=404
+                printf '%s\n' '{"message":"Not Found"}' > "$out"
+                ;;
+            malformed-release)
+                printf '%s\n' '{"name":"missing tag"}' > "$out"
+                ;;
+            wrong-version)
+                printf '%s\n' '{"tag_name":"v9.9.9"}' > "$out"
+                ;;
+            *)
+                printf '%s\n' '{"tag_name":"v1.2.3"}' > "$out"
+                ;;
+        esac
         ;;
     */git/ref/heads/main)
-        printf '%s\n' '{"ref":"refs/heads/main","object":{"type":"commit","sha":"0123456789ABCDEF0123456789ABCDEF01234567"}}' > "$out"
+        if [ "${MOCK_MODE:-release}" = bad-ref ]; then
+            printf '%s\n' '{"ref":"refs/heads/main","object":{"type":"tag","sha":"0123456789abcdef0123456789abcdef01234567"}}' > "$out"
+        else
+            printf '%s\n' '{"ref":"refs/heads/main","object":{"type":"commit","sha":"0123456789ABCDEF0123456789ABCDEF01234567"}}' > "$out"
+        fi
         ;;
-    */dext-v1.2.3-x86_64-unknown-linux-gnu.tar.gz)
-        cp "$MOCK_RELEASE/dext-v1.2.3-x86_64-unknown-linux-gnu.tar.gz" "$out"
+    */dext-v*-x86_64-unknown-linux-gnu.tar.gz)
+        name=${url##*/}
+        cp "$MOCK_RELEASE/$name" "$out"
         ;;
     */SHA256SUMS)
         cp "$MOCK_CHECKSUMS" "$out"
@@ -107,14 +129,18 @@ release_out=$(DEXT_INSTALL_DIR="$WORK/install release" run_installer)
 printf '%s\n' "$release_out" | grep -F 'verified and installed release v1.2.3' >/dev/null
 test "$("$WORK/install release/dext" --version)" = 'dext 1.2.3'
 
+installed_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$sha256_file" | awk '{print $1}'; else shasum -a 256 "$sha256_file" | awk '{print $1}'; fi)
+
 printf '%064d  %s\n' 0 'dext-v1.2.3-x86_64-unknown-linux-gnu.tar.gz' > "$WORK/release/BADSUMS"
-if DEXT_INSTALL_DIR="$WORK/install-bad" MOCK_CHECKSUMS="$WORK/release/BADSUMS" \
+if DEXT_INSTALL_DIR="$WORK/install release" MOCK_CHECKSUMS="$WORK/release/BADSUMS" \
     run_installer > "$WORK/bad.out" 2> "$WORK/bad.err"; then
     printf '%s\n' 'checksum mismatch unexpectedly succeeded' >&2
     exit 1
 fi
 grep -F 'checksum verification failed' "$WORK/bad.err" >/dev/null
-test ! -e "$WORK/install-bad/dext"
+test "$("$WORK/install release/dext" --version)" = 'dext 1.2.3'
+current_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$sha256_file" | awk '{print $1}'; else shasum -a 256 "$sha256_file" | awk '{print $1}'; fi)
+test "$current_digest" = "$installed_digest"
 
 source_out=$(MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-source" run_installer)
 printf '%s\n' "$source_out" \
@@ -137,11 +163,31 @@ if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-attested" DEXT_REQUIRE_ATTES
 fi
 grep -F 'attestation verification requires a tagged release' "$WORK/attested.err" >/dev/null
 
+for case in malformed-release bad-ref wrong-version; do
+    if MOCK_MODE=$case DEXT_INSTALL_DIR="$WORK/install release" \
+        run_installer > "$WORK/$case.out" 2> "$WORK/$case.err"; then
+        printf '%s\n' "$case unexpectedly succeeded" >&2
+        exit 1
+    fi
+done
+grep -F 'latest release response did not contain' "$WORK/malformed-release.err" >/dev/null
+grep -F 'main ref does not point to a commit' "$WORK/bad-ref.err" >/dev/null
+grep -F 'release binary reported' "$WORK/wrong-version.err" >/dev/null
+test "$("$WORK/install release/dext" --version)" = 'dext 1.2.3'
+current_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$sha256_file" | awk '{print $1}'; else shasum -a 256 "$sha256_file" | awk '{print $1}'; fi)
+test "$current_digest" = "$installed_digest"
+
 if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-invalid" DEXT_SOURCE_FALLBACK=yes \
     run_installer > "$WORK/invalid.out" 2> "$WORK/invalid.err"; then
     printf '%s\n' 'invalid source fallback toggle unexpectedly succeeded' >&2
     exit 1
 fi
 grep -F 'DEXT_SOURCE_FALLBACK must be 0 or 1' "$WORK/invalid.err" >/dev/null
+
+if run_installer --install-dir "" > "$WORK/empty-dir.out" 2> "$WORK/empty-dir.err"; then
+    printf '%s\n' 'empty install directory unexpectedly succeeded' >&2
+    exit 1
+fi
+grep -F -- '--install-dir requires a non-empty directory' "$WORK/empty-dir.err" >/dev/null
 
 printf '%s\n' 'Unix installer tests passed'
