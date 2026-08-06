@@ -3,7 +3,18 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d 2>/dev/null || mktemp -d -t dext-install-test)
-trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+PHASE=setup
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$status" -ne 0 ]; then
+        printf '%s\n' "Unix installer tests failed during: $PHASE" >&2
+    fi
+    rm -rf "$WORK"
+    exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+export COPYFILE_DISABLE=1
 unset DEXT_INSTALL_DIR DEXT_VERSION DEXT_SOURCE_FALLBACK DEXT_REQUIRE_ATTESTATION
 unset MOCK_MODE MOCK_CHECKSUMS MOCK_CARGO_ARGS
 
@@ -125,12 +136,14 @@ run_installer() {
     sh "$ROOT/scripts/install.sh" "$@"
 }
 
+PHASE='release install'
 release_out=$(DEXT_INSTALL_DIR="$WORK/install release" run_installer)
 printf '%s\n' "$release_out" | grep -F 'verified and installed release v1.2.3' >/dev/null
 test "$("$WORK/install release/dext" --version)" = 'dext 1.2.3'
 
 installed_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$sha256_file" | awk '{print $1}'; else shasum -a 256 "$sha256_file" | awk '{print $1}'; fi)
 
+PHASE='checksum rejection'
 printf '%064d  %s\n' 0 'dext-v1.2.3-x86_64-unknown-linux-gnu.tar.gz' > "$WORK/release/BADSUMS"
 if DEXT_INSTALL_DIR="$WORK/install release" MOCK_CHECKSUMS="$WORK/release/BADSUMS" \
     run_installer > "$WORK/bad.out" 2> "$WORK/bad.err"; then
@@ -142,6 +155,7 @@ test "$("$WORK/install release/dext" --version)" = 'dext 1.2.3'
 current_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$sha256_file" | awk '{print $1}'; else shasum -a 256 "$sha256_file" | awk '{print $1}'; fi)
 test "$current_digest" = "$installed_digest"
 
+PHASE='source fallback'
 source_out=$(MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-source" run_installer)
 printf '%s\n' "$source_out" \
     | grep -F 'main commit 0123456789abcdef0123456789abcdef01234567' >/dev/null
@@ -149,6 +163,7 @@ grep -F -- '--rev 0123456789abcdef0123456789abcdef01234567 --locked' \
     "$WORK/cargo.args" >/dev/null
 test "$("$WORK/install-source/dext" --version)" = 'dext 9.9.9'
 
+PHASE='disabled source fallback'
 if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-no-fallback" DEXT_SOURCE_FALLBACK=0 \
     run_installer > "$WORK/no-fallback.out" 2> "$WORK/no-fallback.err"; then
     printf '%s\n' 'disabled source fallback unexpectedly succeeded' >&2
@@ -156,6 +171,7 @@ if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-no-fallback" DEXT_SOURCE_FAL
 fi
 grep -F 'no tagged Dext release exists yet' "$WORK/no-fallback.err" >/dev/null
 
+PHASE='attestation source rejection'
 if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-attested" DEXT_REQUIRE_ATTESTATION=1 \
     run_installer > "$WORK/attested.out" 2> "$WORK/attested.err"; then
     printf '%s\n' 'attestation-required source fallback unexpectedly succeeded' >&2
@@ -163,6 +179,7 @@ if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-attested" DEXT_REQUIRE_ATTES
 fi
 grep -F 'attestation verification requires a tagged release' "$WORK/attested.err" >/dev/null
 
+PHASE='malformed API and version rejection'
 for case in malformed-release bad-ref wrong-version; do
     if MOCK_MODE=$case DEXT_INSTALL_DIR="$WORK/install release" \
         run_installer > "$WORK/$case.out" 2> "$WORK/$case.err"; then
@@ -177,6 +194,7 @@ test "$("$WORK/install release/dext" --version)" = 'dext 1.2.3'
 current_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha256sum >/dev/null 2>&1; then sha256sum "$sha256_file" | awk '{print $1}'; else shasum -a 256 "$sha256_file" | awk '{print $1}'; fi)
 test "$current_digest" = "$installed_digest"
 
+PHASE='invalid environment toggle'
 if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-invalid" DEXT_SOURCE_FALLBACK=yes \
     run_installer > "$WORK/invalid.out" 2> "$WORK/invalid.err"; then
     printf '%s\n' 'invalid source fallback toggle unexpectedly succeeded' >&2
@@ -184,6 +202,7 @@ if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-invalid" DEXT_SOURCE_FALLBAC
 fi
 grep -F 'DEXT_SOURCE_FALLBACK must be 0 or 1' "$WORK/invalid.err" >/dev/null
 
+PHASE='empty install directory rejection'
 if run_installer --install-dir "" > "$WORK/empty-dir.out" 2> "$WORK/empty-dir.err"; then
     printf '%s\n' 'empty install directory unexpectedly succeeded' >&2
     exit 1

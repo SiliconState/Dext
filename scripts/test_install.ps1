@@ -128,11 +128,12 @@ function Invoke-InstallerCase {
     )
     $global:DextInstallerMockMode = $Mode
     $global:DextInstallerMockTag = if ($RequestedTag -eq "latest") { $tag } else { $RequestedTag }
-    $arguments = @("-Version", $RequestedTag, "-InstallDir", $installDir)
-    if ($RequireAttestation) {
-        $arguments += "-RequireAttestation"
+    $parameters = @{
+        Version = $RequestedTag
+        InstallDir = $installDir
+        RequireAttestation = [bool]$RequireAttestation
     }
-    & $installer @arguments
+    & $installer @parameters
 }
 
 function Assert-Fails {
