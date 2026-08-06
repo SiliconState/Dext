@@ -227,12 +227,19 @@ fn ensure_owner_safe_dir(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => validate_owner_safe_dir(path, &metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
+            let builder = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt as _;
+                    let mut builder = std::fs::DirBuilder::new();
+                    builder.mode(0o700);
+                    builder
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::DirBuilder::new()
+                }
+            };
             builder
                 .create(path)
                 .with_context(|| format!("creating seat state ancestor {}", path.display()))
@@ -307,12 +314,19 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
+            let builder = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt as _;
+                    let mut builder = std::fs::DirBuilder::new();
+                    builder.mode(0o700);
+                    builder
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::DirBuilder::new()
+                }
+            };
             builder
                 .create(path)
                 .with_context(|| format!("creating seat state directory {}", path.display()))?;
