@@ -168,6 +168,8 @@ try {
     }
     $installerFunctionDefinitions = @{}
     foreach ($functionName in @(
+        "Test-WindowsHost",
+        "Get-WindowsArchitecture",
         "Test-DextBinary",
         "Replace-DextFile",
         "Move-DextFile",
@@ -185,6 +187,28 @@ try {
         $functionDefinition = $definitions[0].Extent.Text
         $installerFunctionDefinitions[$functionName] = $functionDefinition
         Invoke-Expression $functionDefinition
+    }
+
+    if (-not (Test-WindowsHost)) {
+        throw "Windows installer harness is not running on Windows"
+    }
+    $oldProcessorArchitecture = $env:PROCESSOR_ARCHITECTURE
+    $oldProcessorArchitectureW6432 = $env:PROCESSOR_ARCHITEW6432
+    try {
+        $env:PROCESSOR_ARCHITECTURE = "x86"
+        $env:PROCESSOR_ARCHITEW6432 = "AMD64"
+        if ((Get-WindowsArchitecture) -ne "X64") {
+            throw "native architecture detection failed for 32-bit PowerShell on 64-bit Windows"
+        }
+        $env:PROCESSOR_ARCHITECTURE = "AMD64"
+        $env:PROCESSOR_ARCHITEW6432 = $null
+        if ((Get-WindowsArchitecture) -ne "X64") {
+            throw "native architecture detection failed for 64-bit PowerShell"
+        }
+    }
+    finally {
+        $env:PROCESSOR_ARCHITECTURE = $oldProcessorArchitecture
+        $env:PROCESSOR_ARCHITEW6432 = $oldProcessorArchitectureW6432
     }
 
     New-Item -ItemType Directory -Force -Path $package, $wrongPackage, $mockBin, $installDir | Out-Null
@@ -223,6 +247,25 @@ exit /b 2
     $env:MOCK_CARGO_ARGS = Join-Path $work "cargo-args.txt"
     $env:DEXT_TEST_BINARY = $DextBinary
     $env:PATH = "$installDir;$mockBin;$oldProcessPath"
+
+    $iexInstallDir = Join-Path $work "install-iex"
+    $env:DEXT_INSTALL_DIR = $iexInstallDir
+    $global:DextInstallerMockMode = "release"
+    $global:DextInstallerMockTag = $tag
+    try {
+        $installerText = Get-Content -LiteralPath $installer -Raw
+        & {
+            $installerText | Invoke-Expression
+        } | Out-Null
+    }
+    finally {
+        $env:DEXT_INSTALL_DIR = $null
+        $env:PATH = "$installDir;$mockBin;$oldProcessPath"
+    }
+    $iexInstalled = Join-Path $iexInstallDir "dext.exe"
+    if (((& $iexInstalled --version) -join "`n").Trim() -ne "dext $version") {
+        throw "in-memory installer pipeline did not install the expected version"
+    }
 
     Invoke-InstallerCase -Mode "release" | Out-Null
     $installed = Join-Path $installDir "dext.exe"
@@ -404,7 +447,7 @@ exit /b 2
     }
     Remove-Item -LiteralPath $retainedBackups[0].FullName -Force
 
-    Write-Host "Windows installer tests passed"
+    Write-Host "Windows installer tests passed under $($PSVersionTable.PSEdition) PowerShell $($PSVersionTable.PSVersion)"
 }
 finally {
     Remove-Item Function:\Invoke-RestMethod -ErrorAction SilentlyContinue

@@ -51,6 +51,26 @@ $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("dext-install-" + [Guid]::NewGuid().ToString("N"))
 
+function Test-WindowsHost {
+    return [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+}
+
+function Get-WindowsArchitecture {
+    $architecture = [string]$env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = [string]$env:PROCESSOR_ARCHITECTURE
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        throw "could not determine the native Windows architecture"
+    }
+    switch ($architecture.Trim().ToUpperInvariant()) {
+        "AMD64" { return "X64" }
+        "X64" { return "X64" }
+        "ARM64" { return "Arm64" }
+        default { return $architecture.Trim() }
+    }
+}
+
 function Write-Install([string]$Message) {
     Write-Host "dext-install: $Message"
 }
@@ -305,15 +325,13 @@ function Install-Source {
 }
 
 try {
-    if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
-        [System.Runtime.InteropServices.OSPlatform]::Windows
-    )) {
+    if (-not (Test-WindowsHost)) {
         throw "this installer is for Windows; use scripts/install.sh on Linux or macOS"
     }
     if (-not [Environment]::Is64BitOperatingSystem) {
         throw "Dext supports 64-bit Windows"
     }
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $arch = Get-WindowsArchitecture
     if ($arch -ne "X64") {
         throw "no Dext release archive matches Windows/$arch"
     }
