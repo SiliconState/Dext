@@ -10898,7 +10898,9 @@ fn load_prompt_env_value(value: String) -> Result<String> {
 
 const LATEST_SESSION_NAME: &str = "_latest";
 const SEAT_TRANSITIONAL_FORMAT_VERSION: u32 = 3;
-const SESSION_FORMAT_VERSION: u32 = 4;
+const SEAT_FORMAT_VERSION: u32 = 4;
+const PACK_RUNTIME_FORMAT_VERSION: u32 = 5;
+const SESSION_FORMAT_VERSION: u32 = 5;
 
 fn default_context_mode_for_provider(
     provider_id: &str,
@@ -11255,7 +11257,7 @@ struct SessionHeader {
     work_ledger: WorkLedger,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seat: Option<SeatRef>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     active_pack_runtimes: Vec<pack_runtime::RuntimeSnapshot>,
     #[serde(default)]
     provider_health: ProviderHealthLedger,
@@ -16018,8 +16020,10 @@ impl Agent {
             .collect();
         auto_approved_tools.sort();
         SessionHeader {
-            version: if self.seat.is_some() {
-                SESSION_FORMAT_VERSION
+            version: if self.active_pack_runtime.is_some() {
+                PACK_RUNTIME_FORMAT_VERSION
+            } else if self.seat.is_some() {
+                SEAT_FORMAT_VERSION
             } else {
                 SEAT_TRANSITIONAL_FORMAT_VERSION
             },
@@ -19576,7 +19580,7 @@ fn doctor_latest_session(root: &Path, findings: &mut Vec<DoctorFinding>) -> Opti
             } else if source_version == SEAT_TRANSITIONAL_FORMAT_VERSION as u64
                 && header.seat.is_some()
             {
-                "valid transitional seated v3; next seated save uses v4".to_string()
+                "valid transitional seated v3; next Seat-only save uses v4".to_string()
             } else {
                 format!("valid v{source_version}")
             },

@@ -6724,7 +6724,14 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
             loaded.provider_health.providers["chatgpt"].retry_after,
             Some(10)
         );
-        assert_eq!(header.version, 3, "unseated writes retain v3 compatibility");
+        assert_eq!(
+            header.version, 3,
+            "plain unseated writes retain v3 compatibility"
+        );
+        assert!(
+            serde_json::to_value(&header)?["active_pack_runtimes"].is_null(),
+            "plain v3 headers must omit v4 runtime metadata"
+        );
         assert!(header.composed_system.is_some());
         assert_eq!(header.provenance.thinking_effort, ThinkingEffort::XHigh);
         assert_eq!(header.provenance.tool_catalog_version, TOOL_CATALOG_VERSION);
@@ -6799,6 +6806,9 @@ fn seat_identity_persists_across_sessions_without_breaking_legacy_headers() -> R
             .next()
             .context("session header")?
             .to_string();
+        let persisted_header: Value = serde_json::from_str(&header_line)?;
+        assert_eq!(persisted_header["version"], SEAT_FORMAT_VERSION);
+        assert!(persisted_header["active_pack_runtimes"].is_null());
         let header = parse_session_header(&header_line)?;
         assert_eq!(header.version, SESSION_FORMAT_VERSION);
         assert_eq!(
@@ -14836,6 +14846,13 @@ fn pack_runtime_invocation_application_is_atomic() {
         continuations_used: 0,
     });
 
+    let runtime_header = agent.session_header();
+    assert_eq!(
+        runtime_header.version, PACK_RUNTIME_FORMAT_VERSION,
+        "runtime-bearing sessions must fail closed on older binaries"
+    );
+    assert_eq!(runtime_header.active_pack_runtimes.len(), 1);
+
     let error = agent
         .apply_pack_runtime_invocation(
             pack_runtime::RuntimeInvocation {
@@ -17174,7 +17191,7 @@ fn session_state_fixtures_migrate_v1_v2_and_preserve_v3_semantics() -> Result<()
         .expect("future session fixture must fail")
         .to_string();
     assert!(
-        error.contains("unsupported session format version 5"),
+        error.contains("unsupported session format version 6"),
         "{error}"
     );
     assert_eq!(std::fs::read(&future_path)?, future_before);
@@ -17214,22 +17231,28 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
     let serialized_v3 = serde_json::to_string(&migrated_v3).expect("serialize migrated v3 header");
     assert!(!serialized_v3.contains("track_origin"));
 
-    let current = parse_session_header(
+    let seat_v4 = parse_session_header(
         r#"{"version":4,"model":"v4","system":"system","seat":{"id":"planner"}}"#,
     )
-    .expect("parse v4 session header");
-    assert_eq!(current.version, SESSION_FORMAT_VERSION);
+    .expect("parse v4 Seat session header");
+    assert_eq!(seat_v4.version, SESSION_FORMAT_VERSION);
     assert_eq!(
-        current.seat.as_ref().map(|seat| seat.id.as_str()),
+        seat_v4.seat.as_ref().map(|seat| seat.id.as_str()),
         Some("planner")
     );
 
-    let error = parse_session_header(r#"{"version":5,"model":"future","system":"system"}"#)
+    let runtime_v5 = parse_session_header(
+        r#"{"version":5,"model":"v5","system":"system","active_pack_runtimes":[]}"#,
+    )
+    .expect("parse v5 runtime-capable session header");
+    assert_eq!(runtime_v5.version, SESSION_FORMAT_VERSION);
+
+    let error = parse_session_header(r#"{"version":6,"model":"future","system":"system"}"#)
         .err()
         .expect("future session format must fail")
         .to_string();
     assert!(
-        error.contains("unsupported session format version 5"),
+        error.contains("unsupported session format version 6"),
         "{error}"
     );
     assert!(parse_session_header(r#"{"version":"3"}"#).is_err());
@@ -17255,6 +17278,25 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
         transitional_v3.seat.as_ref().map(|seat| seat.id.as_str()),
         Some("planner")
     );
+    let transitional_v3_empty_runtime = parse_session_header(
+        r#"{"version":3,"model":"v3-empty-runtime","system":"system","active_pack_runtimes":[]}"#,
+    )
+    .expect("parse v3 header emitted with an empty runtime list");
+    assert!(
+        transitional_v3_empty_runtime
+            .active_pack_runtimes
+            .is_empty()
+    );
+    let runtime_error = parse_session_header(
+        r#"{"version":3,"model":"bad","system":"system","active_pack_runtimes":[{}]}"#,
+    )
+    .err()
+    .expect("pre-v5 runtime metadata must fail")
+    .to_string();
+    assert!(
+        runtime_error.contains("pack runtime metadata is unsupported before format version 5"),
+        "{runtime_error}"
+    );
     assert!(
         parse_session_header(
             r#"{"version":3,"model":"bad","system":"system","seat":{"id":"../escape"}}"#
@@ -17267,6 +17309,13 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
             r#"{"version":4,"model":"bad","system":"system","seat":{"id":"../escape"}}"#
         )
         .is_err()
+    );
+    assert!(
+        parse_session_header(
+            r#"{"version":4,"model":"bad","system":"system","active_pack_runtimes":[{}]}"#
+        )
+        .is_err(),
+        "v4 Seat readers must not silently accept runtime metadata"
     );
     assert!(
         parse_session_header(

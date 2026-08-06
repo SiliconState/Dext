@@ -7,9 +7,10 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::{
     DEFAULT_SYSTEM, LATEST_LOG_ARCHIVE_MAX, LATEST_LOG_CAP, LATEST_SESSION_NAME, LOG_DETAIL_CAP,
-    ReasoningMode, SEAT_TRANSITIONAL_FORMAT_VERSION, SESSION_FORMAT_VERSION,
-    SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort, byte_prefix_at_char_boundary,
-    byte_suffix_at_char_boundary, cap_bytes_with_hint,
+    PACK_RUNTIME_FORMAT_VERSION, ReasoningMode, SEAT_FORMAT_VERSION,
+    SEAT_TRANSITIONAL_FORMAT_VERSION, SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME,
+    SessionHeader, ThinkingEffort, byte_prefix_at_char_boundary, byte_suffix_at_char_boundary,
+    cap_bytes_with_hint,
 };
 
 pub(crate) fn user_home_dir() -> PathBuf {
@@ -1124,6 +1125,17 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
     if source_version < SEAT_TRANSITIONAL_FORMAT_VERSION && object.contains_key("seat") {
         anyhow::bail!("session Seat metadata is unsupported before format version 3");
     }
+    if source_version < PACK_RUNTIME_FORMAT_VERSION {
+        match object.get("active_pack_runtimes") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(runtimes)) if runtimes.is_empty() => {}
+            Some(_) => {
+                anyhow::bail!(
+                    "session pack runtime metadata is unsupported before format version 5"
+                )
+            }
+        }
+    }
 
     match serde_json::from_value::<SessionHeader>(meta.clone()) {
         Ok(mut header) => {
@@ -1136,7 +1148,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             validate_session_header_accounting(&header)?;
             return Ok(header);
         }
-        Err(error) if source_version == SESSION_FORMAT_VERSION => {
+        Err(error) if source_version >= SEAT_FORMAT_VERSION => {
             return Err(error).context("invalid current session header");
         }
         Err(_) => {}
