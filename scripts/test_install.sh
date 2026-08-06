@@ -129,19 +129,24 @@ EOF
 chmod 755 "$WORK/bin/curl" "$WORK/bin/uname" "$WORK/bin/cargo"
 
 run_installer() {
-    MOCK_MODE="${MOCK_MODE:-release}" \
+    mock_mode=$1
+    install_dir=$2
+    source_fallback=$3
+    checksums=$4
+    shift 4
+    MOCK_MODE="$mock_mode" \
     MOCK_RELEASE="$WORK/release" \
-    MOCK_CHECKSUMS="${MOCK_CHECKSUMS:-$WORK/release/SHA256SUMS}" \
+    MOCK_CHECKSUMS="$checksums" \
     MOCK_CARGO_ARGS="$WORK/cargo.args" \
-    DEXT_INSTALL_DIR="${DEXT_INSTALL_DIR:-}" \
-    DEXT_SOURCE_FALLBACK="${DEXT_SOURCE_FALLBACK:-1}" \
-    DEXT_REQUIRE_ATTESTATION="${DEXT_REQUIRE_ATTESTATION:-0}" \
+    DEXT_INSTALL_DIR="$install_dir" \
+    DEXT_SOURCE_FALLBACK="$source_fallback" \
+    DEXT_REQUIRE_ATTESTATION=0 \
     PATH="$WORK/bin:$PATH" \
     sh "$ROOT/scripts/install.sh" "$@"
 }
 
 PHASE='release install'
-release_out=$(DEXT_INSTALL_DIR="$WORK/install release" run_installer)
+release_out=$(run_installer release "$WORK/install release" 1 "$WORK/release/SHA256SUMS")
 printf '%s\n' "$release_out" | grep -F 'verified and installed release v1.2.3' >/dev/null
 test "$("$WORK/install release/dext" --version)" = 'dext 1.2.3'
 
@@ -149,8 +154,8 @@ installed_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha25
 
 PHASE='checksum rejection'
 printf '%064d  %s\n' 0 'dext-v1.2.3-x86_64-unknown-linux-gnu.tar.gz' > "$WORK/release/BADSUMS"
-if DEXT_INSTALL_DIR="$WORK/install release" MOCK_CHECKSUMS="$WORK/release/BADSUMS" \
-    run_installer > "$WORK/bad.out" 2> "$WORK/bad.err"; then
+if run_installer release "$WORK/install release" 1 "$WORK/release/BADSUMS" \
+    > "$WORK/bad.out" 2> "$WORK/bad.err"; then
     printf '%s\n' 'checksum mismatch unexpectedly succeeded' >&2
     exit 1
 fi
@@ -160,7 +165,7 @@ current_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha256s
 test "$current_digest" = "$installed_digest"
 
 PHASE='source fallback'
-source_out=$(MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-source" run_installer)
+source_out=$(run_installer source "$WORK/install-source" 1 "$WORK/release/SHA256SUMS")
 printf '%s\n' "$source_out" \
     | grep -F 'main commit 0123456789abcdef0123456789abcdef01234567' >/dev/null
 grep -F -- '--rev 0123456789abcdef0123456789abcdef01234567 --locked' \
@@ -168,34 +173,26 @@ grep -F -- '--rev 0123456789abcdef0123456789abcdef01234567 --locked' \
 test "$("$WORK/install-source/dext" --version)" = 'dext 9.9.9'
 
 PHASE='disabled source fallback'
-if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-no-fallback" DEXT_SOURCE_FALLBACK=0 \
-    run_installer > "$WORK/no-fallback.out" 2> "$WORK/no-fallback.err"; then
+if run_installer source "$WORK/install-no-fallback" 0 "$WORK/release/SHA256SUMS" \
+    > "$WORK/no-fallback.out" 2> "$WORK/no-fallback.err"; then
     printf '%s\n' 'disabled source fallback unexpectedly succeeded' >&2
     exit 1
 fi
 grep -F 'no tagged Dext release exists yet' "$WORK/no-fallback.err" >/dev/null
 
 PHASE='attestation source rejection'
-if MOCK_MODE=source \
-    MOCK_RELEASE="$WORK/release" \
-    MOCK_CHECKSUMS="$WORK/release/SHA256SUMS" \
-    MOCK_CARGO_ARGS="$WORK/cargo.args" \
-    DEXT_INSTALL_DIR="$WORK/install-attested" \
-    DEXT_SOURCE_FALLBACK=1 \
-    DEXT_REQUIRE_ATTESTATION=0 \
-    PATH="$WORK/bin:$PATH" \
-    sh "$ROOT/scripts/install.sh" --require-attestation \
-    > "$WORK/attested.out" 2> "$WORK/attested.err"; then
+if run_installer source "$WORK/install-attested" 1 "$WORK/release/SHA256SUMS" \
+    --require-attestation > "$WORK/attested.out" 2> "$WORK/attested.err"; then
     printf '%s\n' 'attestation-required source fallback unexpectedly succeeded' >&2
     exit 1
 fi
 grep -F 'attestation verification requires a tagged release' "$WORK/attested.err" >/dev/null
 
 PHASE='malformed API and version rejection'
-for case in malformed-release bad-ref wrong-version; do
-    if MOCK_MODE=$case DEXT_INSTALL_DIR="$WORK/install release" \
-        run_installer > "$WORK/$case.out" 2> "$WORK/$case.err"; then
-        printf '%s\n' "$case unexpectedly succeeded" >&2
+for case_name in malformed-release bad-ref wrong-version; do
+    if run_installer "$case_name" "$WORK/install release" 1 "$WORK/release/SHA256SUMS" \
+        > "$WORK/$case_name.out" 2> "$WORK/$case_name.err"; then
+        printf '%s\n' "$case_name unexpectedly succeeded" >&2
         exit 1
     fi
 done
@@ -207,15 +204,16 @@ current_digest=$(sha256_file="$WORK/install release/dext"; if command -v sha256s
 test "$current_digest" = "$installed_digest"
 
 PHASE='invalid environment toggle'
-if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-invalid" DEXT_SOURCE_FALLBACK=yes \
-    run_installer > "$WORK/invalid.out" 2> "$WORK/invalid.err"; then
+if run_installer source "$WORK/install-invalid" yes "$WORK/release/SHA256SUMS" \
+    > "$WORK/invalid.out" 2> "$WORK/invalid.err"; then
     printf '%s\n' 'invalid source fallback toggle unexpectedly succeeded' >&2
     exit 1
 fi
 grep -F 'DEXT_SOURCE_FALLBACK must be 0 or 1' "$WORK/invalid.err" >/dev/null
 
 PHASE='empty install directory rejection'
-if run_installer --install-dir "" > "$WORK/empty-dir.out" 2> "$WORK/empty-dir.err"; then
+if run_installer release "" 1 "$WORK/release/SHA256SUMS" \
+    --install-dir "" > "$WORK/empty-dir.out" 2> "$WORK/empty-dir.err"; then
     printf '%s\n' 'empty install directory unexpectedly succeeded' >&2
     exit 1
 fi
