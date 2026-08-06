@@ -176,8 +176,16 @@ fi
 grep -F 'no tagged Dext release exists yet' "$WORK/no-fallback.err" >/dev/null
 
 PHASE='attestation source rejection'
-if MOCK_MODE=source DEXT_INSTALL_DIR="$WORK/install-attested" \
-    run_installer --require-attestation > "$WORK/attested.out" 2> "$WORK/attested.err"; then
+if MOCK_MODE=source \
+    MOCK_RELEASE="$WORK/release" \
+    MOCK_CHECKSUMS="$WORK/release/SHA256SUMS" \
+    MOCK_CARGO_ARGS="$WORK/cargo.args" \
+    DEXT_INSTALL_DIR="$WORK/install-attested" \
+    DEXT_SOURCE_FALLBACK=1 \
+    DEXT_REQUIRE_ATTESTATION=0 \
+    PATH="$WORK/bin:$PATH" \
+    sh "$ROOT/scripts/install.sh" --require-attestation \
+    > "$WORK/attested.out" 2> "$WORK/attested.err"; then
     printf '%s\n' 'attestation-required source fallback unexpectedly succeeded' >&2
     exit 1
 fi
