@@ -90,7 +90,13 @@ function Install-DextBinary(
         Copy-Item -LiteralPath $Source -Destination $staged
         [void](Test-DextBinary $staged $ExpectedVersion)
         if ([System.IO.File]::Exists($destination)) {
-            [System.IO.File]::Replace($staged, $destination, $null)
+            $backup = Join-Path $InstallDir (".dext-backup-" + [Guid]::NewGuid().ToString("N") + ".exe")
+            try {
+                [System.IO.File]::Replace($staged, $destination, $backup)
+            }
+            finally {
+                Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+            }
         }
         else {
             [System.IO.File]::Move($staged, $destination)
