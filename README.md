@@ -103,14 +103,12 @@ Use low-token mode (local providers choose `frugal` automatically unless you exp
 
 ```bash
 dext --frugal --effort off
-# even smaller local mode:
-dext --context-mode tiny --effort off
 # or inside Dext:
-/context tiny
+/context frugal
 /effort off
 ```
 
-The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/tools full` only when you need the complete catalog.
+The default provider-visible toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`). Use `dext --toolset full`, `DEXT_TOOLSET=full`, or `/tools full` only when you need the complete catalog; non-JSON startup prints `[tools] toolset full` whenever the full catalog is selected, including in frugal mode. Static tools and active pack-runtime tools share one provider-neutral `{name, description, schema}` layer before Anthropic, OpenAI Chat Completions, OpenAI Responses, or ChatGPT Responses wrapping; the selected lean/full schema profile applies to both. Frugal mode preserves explicit toolset/schema selections while applying smaller context/result/read-capture budgets. `/context` changes those live caps for subsequent native reads and tool results; an explicit context choice remains pinned across provider switches and session restore, while automatic defaults follow the active local/cloud provider. A valid CLI context mode overrides `DEXT_CONTEXT_MODE`. The retired `tiny` mode and `--tiny` alias are rejected rather than silently mapped to frugal.
 
 ## Common commands
 
@@ -118,6 +116,12 @@ CLI:
 
 ```bash
 dext --resume
+dext --seat planner
+dext --seat planner --resume
+dext seat list
+dext seat show planner
+dext seat set planner --label "Planning role"
+dext seat set planner --summary-file ./planner-context.txt
 dext --fork
 dext sessions
 dext session brief latest
@@ -133,6 +137,10 @@ dext pack run my-pack "task description"
 dext --eval
 ```
 
+A **Seat** is a durable project-scoped agent identity; a session is one disposable incarnation. `--seat NAME` starts a new session associated with the Seat, while `--seat NAME --resume` resumes its latest durable session. Seat ids are portable lowercase 1–128 byte path components using ASCII letters, digits, `-`, `_`, and `.`; trailing dots and Windows device names are rejected. Selecting a new Seat does not create an empty record: persistence begins with the first successful durable session save or explicit `dext seat set`. Use `dext seat set NAME --label TEXT`, `--summary-file PATH|-`, `--clear-label`, and `--clear-summary` to maintain bounded context without placing summaries directly in process arguments. Plain unseated writes remain format v3 and Seat-only writes use v4 for backward compatibility; runtime-bearing writes use v5 so pre-runtime binaries reject rather than silently ignore executable-runtime state. Valid transitional v3 Seat headers remain loadable and validated, then upgrade on the next Seat-only save. Explicit resume rejects a different Seat id, the same Seat name from another project, malformed or unprovenanced metadata, and headers over 256 KiB before applying saved state. `--no-session --seat NAME` supplies identity context without creating or updating durable state. Prompt-visible label/summary context is privacy-redacted and encoded as one JSON data line with an explicit non-authority note. Changing projects clears the active Seat. `/reset` updates the matching pointer and removes the transcript under one state-operation guard; on deletion failure it preserves history and attempts to restore the pointer.
+
+Crew maps directly portable role names to read-only contextual Seats such as `crew.reviewer`. Existing valid custom role names that cannot fit the portable Seat grammar receive a deterministic `crew.agent-<hash>` identity, preserving crew's prior role-name compatibility. Children retain `--no-session`, so the trusted parent remains authoritative and child runs do not advance durable pointers. Project-scoped roles can load an existing summary; isolated roles intentionally use their private temporary project's context. Captured, detached-systemd, and tmux-pane workers pin the same effective absolute Dext state root, preventing stale supervisor environments from selecting a different Seat store.
+
 Interactive slash commands:
 
 ```text
@@ -144,7 +152,7 @@ Interactive slash commands:
 /model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
 /approval ask|auto-read|auto-write|never|always
 /sandbox-profile read-only|workspace-write|danger-full-access
-/context standard|frugal|tiny
+/context standard|frugal
 /tools default|full
 /tool-profile lean|full     # default is lean
 /preview off|simple|git
@@ -245,11 +253,7 @@ update either file automatically.
 
 ## Packs
 
-Packs are Dext's modular “battery packs”: source-first workflows that add
-specialized behavior without adding provider-visible tools or bloating the core
-binary. Dext owns the create, discover, inspect, maintain, and run lifecycle but
-ships no pack content. Every pack lives inside a shelf at
-`<shelf>/packs/<name>`.
+Packs are Dext's modular “battery packs”: source-first workflows that add specialized behavior without bloating the core binary. A reviewed pack may optionally add a bounded executable `runtime.json` helper that exposes dynamic tools only while the pack is active. Dext owns the create, discover, inspect, maintain, and run lifecycle but ships no pack content. Every pack lives inside a shelf at `<shelf>/packs/<name>`.
 
 Create a reusable user pack, then edit and exercise it:
 
@@ -265,11 +269,7 @@ pack under `.dext/shelves/`. Dext discovers project shelves,
 `~/.dext/packs`, and `DEXT_PACKS_DIR` roots are not supported. Shelf repositories
 remain separate from Dext and should be reviewed and maintained on their own.
 
-Inside a session, use `/pack create`, `/pack list`, `/pack inspect`, and
-`/pack run`. Selected packs continue to use normal Dext tools, approvals,
-sandboxing, hooks, and helper environment variables. See
-[`docs/PACKS.md`](docs/PACKS.md) for the complete authoring and maintenance
-contract.
+Inside a session, use `/pack create`, `/pack list`, `/pack inspect`, and `/pack run`. Selected packs continue to use normal Dext tools, approvals, sandboxing, hooks, and helper environment variables. Optional executable runtimes are one-shot and credential-scrubbed; pin approved executable bytes, enforce the implemented recursive-schema subset and per-event confinement, preserve the full bounded protocol response, apply state/effects/continuations atomically, and persist bounded runtime state plus queued continuations. Policy changes revoke active runtimes and queued callbacks; resume preflights exact canonical pack-directory/source identity, manifest/hash/state accounting, project trust, and executable approval before applying saved session fields. Declared write/danger tools retain normal approval, journaling, and Git checkpoints, and active dynamic tools participate in `/allow`, `/revoke`, and `/allowed`. See [`docs/PACKS.md`](docs/PACKS.md) for the complete authoring, runtime protocol, and maintenance contract.
 
 ## Configuration and state
 
@@ -329,7 +329,7 @@ DEXT_CACHE_READ_USD_PER_MTOK=0.1
 DEXT_CACHE_CREATE_USD_PER_MTOK=1.25
 ```
 
-Runtime state and credentials live outside version control. Project-local runtime directories such as `.dext/`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored.
+Runtime state and credentials live outside version control. Project-local runtime artifacts such as `.dext/`, `.auto/log.jsonl`, `target/`, `.env`, `DEXT.todo.json`, and `dext-session-*` exports are ignored; reproducible autoresearch workflow files under `.auto/` may remain tracked.
 
 Usage metrics are recorded in session headers and `/usage` after provider turns. Cloud providers use returned usage objects when available; OpenAI-compatible streaming requests ask for usage chunks, while local llama.cpp derives exact prompt/cache/output counts from streamed `timings` and records zero dollar cost unless pricing env overrides are set.
 
@@ -360,6 +360,7 @@ Run the final full suite and install directly in a trusted host terminal. Dext's
 - `src/provider.rs` — provider catalog, auth, OAuth/API-key handling, request shaping, transport deadlines/body bounds, and side-effect-free bounded state/auth-permission inspection.
 - `src/sandbox.rs` — OS confinement, profile-specific write roots, private scratch, and offline diagnostic isolation.
 - `src/session.rs` — session persistence, project state paths, logs, lock cleanup, terminal restore.
+- `src/seats.rs` — project-scoped durable agent identity records and seat-specific session lookup.
 - `src/tools.rs` — tool catalog and provider-facing tool schemas.
 - `src/tool_policy.rs` — validation and command/external-source guardrails.
 - `src/sse.rs` — bounded SSE framing shared by runtime and Criterion benchmarks.

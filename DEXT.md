@@ -12,6 +12,7 @@ The `bash` tool is deliberately atomic. Dext launches bash in a separate process
 ## Architecture
 - `src/main.rs` — agent loop, provider HTTP, permissions/sandboxing, slash
   commands, CLI entry, eval, and remaining orchestration.
+- `src/seats.rs` — project-scoped durable agent identity records and Seat-specific session lookup.
 - `src/session.rs` — session/log persistence, project state locks, state paths,
   and TUI terminal restore helpers.
 - `src/tools.rs` — tool catalog, permission/parallel metadata, and lean/full
@@ -22,8 +23,7 @@ The `bash` tool is deliberately atomic. Dext launches bash in a separate process
   refs and file mutation previews.
 - `src/sandbox.rs`, `src/tool_policy.rs`, `src/orchestrator.rs` — OS
   confinement, tool risk/validation policy, and runtime work-state controls.
-- `src/packs.rs`, `src/shelves.rs` — shelf-contained pack creation, discovery,
-  invocation, and typed ability metadata.
+- `src/pack_runtime.rs`, `src/packs.rs`, `src/shelves.rs` — bounded executable pack runtime protocol, shelf-contained pack creation/discovery/invocation, and typed ability metadata.
 - `src/tui.rs` — Ratatui inline TUI using the regular terminal buffer.
 - `vendor/ratatui-core/` — exact upstream source plus Dext's narrow inline-terminal compatibility patch.
 - `benches/dext_bench.rs` — criterion perf harness.
@@ -66,7 +66,7 @@ When changing Dext itself:
 - Do not create or update `recall.md` unless the user asks.
 
 ## Packs and shelves
-- Packs extend Dext without bloating the core or provider-visible toolset.
+- Packs may optionally declare a reviewed `runtime.json` one-shot helper to expose dynamic tools, bounded state, continuation/steering effects, and markdown views; executable activation and write-risk calls retain approval, sandbox, credential-scrubbing, and checkpoint controls.
 - Every pack lives at `<shelf>/packs/<name>` under `.dext/shelves`,
   `~/.dext/shelves`, or a `DEXT_SHELVES_DIR` root.
 - Use `dext pack create <shelf>/<name>` for reusable user packs and add

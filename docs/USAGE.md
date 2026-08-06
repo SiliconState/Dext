@@ -7,6 +7,9 @@ dext [TASK...]        run one-shot with TASK
 dext -p               read task from stdin
 dext                  interactive TUI/REPL
 dext --resume         resume the project-scoped latest session
+dext --seat NAME      start a new session with a durable project identity
+dext --seat NAME --resume  resume that seat's latest session
+dext seat list|show NAME  inspect project seats
 dext --fork           resume latest into an isolated unsaved branch
 dext sessions         list project latest + named sessions
 dext session ...      brief/export/analyze/grep/failures/verify-log/decisions/prune
@@ -16,6 +19,14 @@ dext --eval [NAME]    run eval harness
 ```
 
 Run `dext --help` for the exact options supported by the installed binary.
+
+## Seats
+
+A Seat is a durable project-scoped agent identity, while a session is one disposable incarnation of that identity. Start a new seated session with `dext --seat planner`; resume that identity's latest durable session with `dext --seat planner --resume`; inspect records with `dext seat list` or `dext seat show planner`; maintain context with `dext seat set planner --label "Planning role"` and `dext seat set planner --summary-file ./planner-context.txt`. Clear fields with `--clear-label` or `--clear-summary`; `--summary-file -` reads bounded UTF-8 from stdin.
+
+Seat records contain bounded identity metadata and the latest session id under `~/.dext/projects/<project-key>/seats/<seat-id>/seat.json`. Seat ids are portable lowercase 1–128 byte components; trailing dots and Windows device names are rejected. Selection alone is contextual and does not persist an empty record: the first successful durable session save or explicit `seat set` creates it. Plain unseated writes remain format v3 and Seat-only writes use v4 for compatibility; runtime-bearing writes use v5 so pre-runtime binaries fail safely instead of ignoring executable-runtime state. Valid transitional v3 Seat headers remain loadable and fully validated, then upgrade on the next Seat-only save; Seat metadata is rejected in v1–v2. Headers are bounded at 256 KiB on save, review, and restore. A session attached to one Seat cannot be resumed under another id or a same-named Seat from another project; malformed metadata and seated headers without project sandbox provenance also fail before state mutation. Explicitly resuming an unseated legacy session while a Seat is selected attaches identity on the next durable save. `--no-session --seat NAME` neither creates a record nor advances a pointer. Prompt-visible labels and summaries are privacy-redacted single-line JSON marked as user-authored non-instruction data. Switching projects clears active identity. `/reset` serializes pointer update and transcript removal; failed removal preserves history and attempts pointer rollback.
+
+Crew maps directly portable role names to `crew.<agent>` and passes them to child Dext processes with `--no-session`. Existing valid custom role names outside the portable Seat grammar receive deterministic `crew.agent-<hash>` ids rather than becoming invalid. The child receives identity context but cannot update durable Seat state; crew's trusted parent remains authoritative. Project-scoped roles may read an existing summary; isolated roles intentionally use a private temporary project's context. Captured, detached-systemd, and tmux-pane workers use one effective absolute Dext state root even when supervisor home variables are stale.
 
 ## Authentication
 
@@ -92,7 +103,7 @@ The built-in Kimi Code catalog uses Anthropic Messages semantics at `https://api
 
 ## Local Qwen / llama.cpp
 
-Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Local providers use frugal context by default unless you explicitly select `standard` or `tiny`. On startup and provider/model switches, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) and uses the live runtime context window for whichever model alias the server exposes. You can select any local alias; no model-specific context value is built into the local provider. Start one server first, then select its alias:
+Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Local providers use frugal context by default unless you explicitly select `standard`. On startup and provider/model switches, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) and uses the live runtime context window for whichever model alias the server exposes. You can select any local alias; no model-specific context value is built into the local provider. Start one server first, then select its alias:
 
 ```bash
 dext auth provider local
@@ -113,7 +124,7 @@ cd /path/to/llama.cpp
   --host 127.0.0.1 --port 8080
 ```
 
-Use `--context-mode tiny --effort off` or `/context tiny` plus `/effort off` for the lowest local token/compute pressure.
+Use `--frugal --effort off` or `/context frugal` plus `/effort off` for the lowest local token/compute pressure.
 
 ## Interactive workflow
 
@@ -130,9 +141,11 @@ Useful slash commands:
 /status                       runtime diagnostics
 /tools                        list exposed/approval/auto-approved tools
 /tools full                   expose specialized tools for this session
+/allow <tool>                  auto-approve a native or active runtime tool
+/allowed                       list native and active-runtime grants
 /approval ask                 ask before privileged tools
 /sandbox-profile read-only    prevent write operations
-/context tiny                 skinny local/token mode
+/context frugal               low-token context mode
 /effort max                  select maximum model effort
 /reasoning-mode pro          select GPT-5.6 Pro mode; active only on official OpenAI Responses
 /compact status               inspect compaction threshold/history size
@@ -225,6 +238,8 @@ Inside a session:
 Conversational invocation also works when the message clearly asks to run or use a known pack, for example: `run my-pack on this task`. Conversational project-pack activation and project `shelf.json` metadata require one first-use confirmation for the active repository. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Choosing `Always` stores a bounded owner-private, single-link project-scoped approval marker on Unix; unsafe/permissive markers are ignored, and `/project-extensions reset` refuses unsafe marker shapes while removing a safe marker or clearing a session denial. Before approval, project metadata is omitted and cannot shadow a same-named user or run-shelf pack. Dext accepts `PACK.md` and `shelf.json` only as regular non-symlink files no larger than 1 MiB; the selected workflow is then capped to 32 KiB for model context.
 
 A running pack stays active for the current session. Dext passes `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` tool commands and pack hook processes, so workflows can invoke their own helpers. A pack from a user or `DEXT_SHELVES_DIR` shelf may declare exact names in the inline `credential-env` front-matter list; matching inherited values are available only to a simple direct invocation of that active pack's own native `bin/` helper. On Windows, only `.exe`/`.com` helpers qualify for this direct credential path; script helpers run through Bash with declared credentials removed. Project-local declarations are ignored and reported by `pack inspect`, so repository content cannot enable parent credential inheritance. Credential values are not exposed to hooks, arbitrary bash, pipelines/redirections, external tools, prompts, logs, or sessions, and provider-auth names remain excluded. A pack's `phooks.json`, when present, is added to the session hook set; changing the sandbox root clears active pack environment and hooks.
+
+A reviewed pack may also declare `runtime.json` protocol version 1. Its regular, non-symlink, pack-contained native executable receives one bounded JSON request on stdin for each activation, dynamic tool call, or idle event and must return one bounded JSON response on stdout. Runtime activation has separate executable-code approval; `never` disables it, and prompt-level `Always` approval applies only to the exact canonical pack-directory/source identity, manifest digest, and executable digest. Dext rehashes executable bytes before every call. Changing approval or sandbox policy revokes the active runtime, dynamic grants/denials, and queued callbacks; while active, dynamic tools participate in `/allow`, `/revoke`, and `/allowed`. Activation, idle, and tools declared `read` enforce read-only confinement inside the executor. Tools declared `write` or `danger` keep normal per-call approval, sandbox, durable side-effect journal, and fail-closed Git checkpoint controls. Runtime helpers receive no inherited credentials. A present malformed timeout override fails closed; the configured timeout bounds stdin delivery and root execution, and output drain after process-tree cleanup has a separate one-second cap. Bounded state, continuation counts, and queued prompts persist in session headers. Resume preserves current-run approval and sandbox policy, discards saved grants, and preflights project trust, exact source/directory identity, manifest/hash/state accounting, and current executable approval before applying saved sandbox/model/session fields; a changed, missing, shadowed, denied, or malformed runtime cannot partially mutate the live agent. Interrupted delayed prompts are canceled and refunded. Responses may return tool content, state, steering, a delayed bounded continuation, and a Markdown view. Content/effects and surfaced lifecycle errors are privacy-redacted; opaque bounded state is not rewritten and must not contain secrets. See [PACKS.md](PACKS.md#optional-executable-runtime-protocol) for the supported schema subset and exact caps.
 
 ## Git checkpoints, undo, and mutation previews
 
@@ -320,7 +335,6 @@ Inside a session:
 
 ```bash
 dext --frugal
-dext --context-mode tiny
 dext --context-mode frugal
 dext --tool-profile lean    # default schema verbosity
 dext --toolset full
@@ -330,7 +344,7 @@ dext --budget 200000t
 dext --budget '$2 + 200000t'  # stop at either dimension
 ```
 
-Frugal mode uses lean schemas by default, keeps the selected toolset, applies smaller caps, and compacts context more aggressively. Tiny mode uses a condensed prompt and caps history around 80% of the detected model window (bounded 8k–32k chars). Explicit `--toolset` and `--tool-profile` choices remain available in every context mode. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them.
+Frugal mode uses lean schemas by default, keeps explicit toolset/schema selections, applies smaller context/result/raw-capture caps, and compacts context more aggressively. `/context` applies the selected mode immediately to subsequent native reads and tool-result shaping in both sequential and parallel tool rounds. Frugal mode also uses the stricter pseudo-tool-protocol sanitizer for assistant text: serialized or multiline tool-call-like payloads are replaced with a redaction marker in partial-stream recovery, transcript rendering, and the inspector while surrounding prose is retained. An explicit context selection remains pinned across provider switches and is persisted on session save/restore; without one, local providers select frugal and cloud providers select standard automatically. The retired `tiny` mode and `--tiny` alias are rejected rather than silently mapped to frugal. Standard mode also uses a compact invariant-driven built-in prompt: universal workflow and safety rules remain there, while tool-specific syntax lives in the default lean schemas instead of being repeated. Explicit `--toolset` and `--tool-profile` choices remain available in both context modes and are order-independent; a valid CLI context mode overrides `DEXT_CONTEXT_MODE`, while an invalid environment value still fails when no CLI override is supplied. The default toolset hides specialized tools (`jq`, `fzf`, `awk`, `git_log`, `csvkit`); set `DEXT_TOOLSET=full`, run `dext --toolset full`, or use `/tools full` when you need them. Non-JSON startup prints `[tools] toolset full` whenever that opt-in catalog is selected, including in frugal mode.
 
 Budget caps accept the documented compact `t` suffix as well as `tok`, reject duplicate dollar or token dimensions in combined caps instead of silently keeping one value, and reject empty combined components. An invalid `DEXT_BUDGET_CAP` fails startup instead of silently disabling the guard.
 
@@ -369,6 +383,15 @@ Doctor reports `ok`, `info`, and `warn` findings for the effective approval prof
 Doctor does not repair or rewrite state, resolve environment or `!command` credential references, invoke provider/local-model APIs, or print credential-bearing JSON. Use the explicit flags to inspect the posture that those startup choices would produce.
 
 ## Session commands
+
+Seats select identity; sessions remain transcript and crash-recovery units:
+
+```bash
+dext --seat planner
+dext --seat planner --resume
+dext seat list
+dext seat show planner
+```
 
 ```bash
 dext sessions

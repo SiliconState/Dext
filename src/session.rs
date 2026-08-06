@@ -1,14 +1,16 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{self, Write};
+use std::io::{self, BufRead as _, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::{
     DEFAULT_SYSTEM, LATEST_LOG_ARCHIVE_MAX, LATEST_LOG_CAP, LATEST_SESSION_NAME, LOG_DETAIL_CAP,
-    ReasoningMode, SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort,
-    byte_prefix_at_char_boundary, byte_suffix_at_char_boundary, cap_bytes_with_hint,
+    PACK_RUNTIME_FORMAT_VERSION, ReasoningMode, SEAT_FORMAT_VERSION,
+    SEAT_TRANSITIONAL_FORMAT_VERSION, SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME,
+    SessionHeader, ThinkingEffort, byte_prefix_at_char_boundary, byte_suffix_at_char_boundary,
+    cap_bytes_with_hint,
 };
 
 pub(crate) fn user_home_dir() -> PathBuf {
@@ -1056,6 +1058,36 @@ pub(crate) fn render_limited_lines(
     out
 }
 
+pub(crate) const SESSION_HEADER_MAX_BYTES: usize = 256 * 1024;
+
+pub(crate) fn read_session_header_line<R: io::BufRead>(
+    reader: &mut R,
+    path: &Path,
+) -> Result<String> {
+    let mut line = String::new();
+    let mut limited = io::Read::take(
+        reader,
+        u64::try_from(SESSION_HEADER_MAX_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_add(2),
+    );
+    limited
+        .read_line(&mut line)
+        .with_context(|| format!("reading session header from {}", path.display()))?;
+    if line.is_empty() {
+        anyhow::bail!("empty session file: {}", path.display());
+    }
+    let content = line.strip_suffix('\n').unwrap_or(&line);
+    let content = content.strip_suffix('\r').unwrap_or(content);
+    if content.len() > SESSION_HEADER_MAX_BYTES {
+        anyhow::bail!(
+            "session header exceeds {SESSION_HEADER_MAX_BYTES} bytes: {}",
+            path.display()
+        );
+    }
+    Ok(line)
+}
+
 fn validate_session_header_accounting(header: &SessionHeader) -> Result<()> {
     if !header.usage.is_valid() {
         anyhow::bail!("session usage contains an invalid cost");
@@ -1063,10 +1095,16 @@ fn validate_session_header_accounting(header: &SessionHeader) -> Result<()> {
     if header.budget_cap.is_some_and(|cap| !cap.is_valid()) {
         anyhow::bail!("session budget cap is invalid");
     }
+    if let Some(seat) = &header.seat {
+        crate::seats::validate_seat_ref(seat)?;
+    }
     Ok(())
 }
 
 pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
+    if line.len() > SESSION_HEADER_MAX_BYTES {
+        anyhow::bail!("session header exceeds {SESSION_HEADER_MAX_BYTES} bytes");
+    }
     let meta: serde_json::Value = serde_json::from_str(line).context("bad session header")?;
     let object = meta
         .as_object()
@@ -1084,6 +1122,21 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         );
     }
 
+    if source_version < SEAT_TRANSITIONAL_FORMAT_VERSION && object.contains_key("seat") {
+        anyhow::bail!("session Seat metadata is unsupported before format version 3");
+    }
+    if source_version < PACK_RUNTIME_FORMAT_VERSION {
+        match object.get("active_pack_runtimes") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(runtimes)) if runtimes.is_empty() => {}
+            Some(_) => {
+                anyhow::bail!(
+                    "session pack runtime metadata is unsupported before format version 5"
+                )
+            }
+        }
+    }
+
     match serde_json::from_value::<SessionHeader>(meta.clone()) {
         Ok(mut header) => {
             if !object.contains_key("context_mode_explicit")
@@ -1095,7 +1148,7 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             validate_session_header_accounting(&header)?;
             return Ok(header);
         }
-        Err(error) if source_version == SESSION_FORMAT_VERSION => {
+        Err(error) if source_version >= SEAT_FORMAT_VERSION => {
             return Err(error).context("invalid current session header");
         }
         Err(_) => {}
@@ -1113,6 +1166,12 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             serde_json::from_value(meta["budget_cap"].clone())
                 .context("invalid legacy session budget cap")?,
         )
+    };
+    let seat = match object.get("seat") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            Some(serde_json::from_value(value.clone()).context("invalid session seat metadata")?)
+        }
     };
     let header = SessionHeader {
         version: SESSION_FORMAT_VERSION,
@@ -1201,6 +1260,9 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
             .unwrap_or_default(),
         provenance: serde_json::from_value(meta["provenance"].clone()).unwrap_or_default(),
         work_ledger: serde_json::from_value(meta["work_ledger"].clone()).unwrap_or_default(),
+        seat,
+        active_pack_runtimes: serde_json::from_value(meta["active_pack_runtimes"].clone())
+            .unwrap_or_default(),
         provider_health: serde_json::from_value(meta["provider_health"].clone())
             .unwrap_or_default(),
         privacy: serde_json::from_value(meta["privacy"].clone()).unwrap_or_default(),

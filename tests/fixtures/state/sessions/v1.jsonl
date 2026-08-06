@@ -1,2 +1,2 @@
-{"model":"fixture-v1","system":"fixture-system","context_mode":"tiny","allowed":["read_file"]}
+{"model":"fixture-v1","system":"fixture-system","context_mode":"frugal","allowed":["read_file"]}
 {"role":"user","content":[{"type":"text","text":"synthetic v1 message"}]}
