@@ -40,7 +40,7 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
 
 foreach ($setting in @("DEXT_SOURCE_FALLBACK", "DEXT_REQUIRE_ATTESTATION")) {
     $value = [Environment]::GetEnvironmentVariable($setting)
-    if ($null -ne $value -and $value -notin @("0", "1")) {
+    if (-not [string]::IsNullOrEmpty($value) -and $value -notin @("0", "1")) {
         throw "$setting must be 0 or 1"
     }
 }

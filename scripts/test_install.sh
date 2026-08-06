@@ -129,9 +129,13 @@ EOF
 chmod 755 "$WORK/bin/curl" "$WORK/bin/uname" "$WORK/bin/cargo"
 
 run_installer() {
+    MOCK_MODE="${MOCK_MODE:-release}" \
     MOCK_RELEASE="$WORK/release" \
     MOCK_CHECKSUMS="${MOCK_CHECKSUMS:-$WORK/release/SHA256SUMS}" \
     MOCK_CARGO_ARGS="$WORK/cargo.args" \
+    DEXT_INSTALL_DIR="${DEXT_INSTALL_DIR:-}" \
+    DEXT_SOURCE_FALLBACK="${DEXT_SOURCE_FALLBACK:-1}" \
+    DEXT_REQUIRE_ATTESTATION="${DEXT_REQUIRE_ATTESTATION:-0}" \
     PATH="$WORK/bin:$PATH" \
     sh "$ROOT/scripts/install.sh" "$@"
 }
