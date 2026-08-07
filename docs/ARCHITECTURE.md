@@ -257,7 +257,7 @@ Compaction preserves recent tool evidence and summarizes older conversation when
 
 ## Verification surface
 
-Expected release assets also include a CycloneDX JSON SBOM. The release workflow includes the SBOM in `SHA256SUMS`, provenance attestation, verification, and publication alongside the four platform archives. The first successful tag run remains explicitly tracked in [`RELEASING.md`](RELEASING.md) until this path has end-to-end evidence.
+Expected release assets also include a CycloneDX JSON SBOM. The release workflow includes the SBOM in `SHA256SUMS`, provenance attestation, verification, and publication alongside the four platform archives. This path completed end to end for `v0.1.0`; [`RELEASING.md`](RELEASING.md) records the workflow and verification evidence.
 
 Expected checks before releasing Dext changes:
 

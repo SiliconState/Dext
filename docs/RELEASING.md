@@ -1,6 +1,6 @@
 # Releasing Dext
 
-Releases are owner-triggered by an annotated version tag. The workflow does not publish from branches or manual dispatch, rejects tag commits outside `origin/main`, and treats published tags/assets as immutable by policy; repository tag protection and immutable-release settings remain owner controls tracked in [`R-008`](RISK_REGISTER.md).
+Releases are owner-triggered by an annotated version tag. The workflow does not publish from branches or manual dispatch and rejects tag commits outside `origin/main`. Active `v*` rules prevent updates and deletion, published releases are immutable, and initial tag creation remains a trusted maintainer action guarded by workflow validation.
 
 ## Dry review
 
@@ -32,18 +32,18 @@ Releases are owner-triggered by an annotated version tag. The workflow does not 
    If an agent must orchestrate the gate, start a separate trusted Dext process with `dext --sandbox-profile danger-full-access --approval always` and use it only in a controlled checkout. Changing `DEXT_SANDBOX_PROFILE` inside an already-confined shell does not remove the parent process's kernel sandbox. Do not weaken `workspace-write` or grant shared temp, PTY, or Cargo-home access merely to make self-hosted tests pass.
 
 4. Confirm branch CI is green on Linux, macOS, and Windows; do not rely only on the currently configured required checks. Windows CI includes the native Job Object descendant-lifecycle test and parses/executes the complete installer harness under both inbox Windows PowerShell 5.1 and PowerShell 7. Each engine evaluates `install.ps1` from in-memory text through `Invoke-Expression`, matching the public `irm | iex` path, and checks native architecture detection without nullable modern-.NET metadata. Linux and macOS execute the Unix installer harness. These offline tests cover successful replacement, checksum failure without clobbering the existing binary, exact-revision source fallback, malformed release/ref responses, strict tag parsing, unsafe destination refusal, version mismatch, fallback disablement, and attestation-required refusal of source fallback. Windows additionally forces unsupported `File.Replace`, successful fallback, rollback, and retained-backup recovery paths. Linux compiles Criterion benchmarks. Confirm the scheduled security workflow passes both vulnerability auditing and the dependency-license policy. If terminal dependencies or `src/tui.rs` changed, apply the renderer contract and live-terminal checks in [`TUI.md`](TUI.md). Review `.github/workflows/release.yml`, especially its full action commit pins, quality gate, four-target matrix, annotated-tag/origin-`main` ancestry checks, and publish-job permissions.
-5. Before the first public release, resolve the GitHub-setting gaps recorded in [`R-008`](RISK_REGISTER.md): require Windows CI alongside Ubuntu/macOS, protect `v*` tags, enable immutable releases, private vulnerability reporting, vulnerability alerts, and Dependabot security updates. Confirm the tag and release do not already exist. Treat release artifacts as immutable even before the setting is enabled: never move a published tag or replace bytes under an existing tag/checksum.
+5. Before every public release, recheck the owner-controlled GitHub settings: require Windows CI alongside Ubuntu/macOS, protect `v*` tags from update and deletion, and keep immutable releases, private vulnerability reporting, vulnerability alerts, and Dependabot security updates enabled. Confirm the tag and release do not already exist. Initial release-tag creation remains a trusted maintainer action because this personal repository does not currently enforce a creation-only rule with an owner bypass; the workflow must still reject lightweight tags, commits outside `origin/main`, and tag/package version mismatches.
 
 ## First-release evidence
 
-The publication workflow has not yet completed a version tag. Before treating it as proven, record the first successful tag run here:
+The publication path first completed for [`v0.1.0`](https://github.com/SiliconState/Dext/releases/tag/v0.1.0) in [release run `31139795179`](https://github.com/SiliconState/Dext/actions/runs/31139795179) from commit `9a48eb9a8f7065a2dd71041527e0b276a7444876`:
 
-- [ ] Annotated-tag, `origin/main` ancestry, and package-version validation passed.
-- [ ] Four platform archives and `dext.cdx.json` were published and listed in `SHA256SUMS`.
-- [ ] Provenance verification passed for every checksummed asset.
-- [ ] Packaged binaries passed the workflow smoke checks.
+- [x] Annotated-tag, `origin/main` ancestry, and package-version validation passed.
+- [x] Four platform archives and `dext.cdx.json` were published and listed in `SHA256SUMS`.
+- [x] Provenance verification passed for every checksummed asset in the workflow and an independent post-publication download.
+- [x] Packaged binaries passed the workflow smoke checks.
 
-After the first successful release, replace these unchecked items with the tag and workflow URL. The README/usage installers will then consume the published archives automatically; until that point their default `latest` path deliberately falls back to a locked source build from one resolved `main` revision. Attestation-required mode refuses that fallback because a local source build has no release attestation.
+The README/usage installers now consume the published archives automatically, so normal installation does not require Rust. Their exact-revision locked source fallback remains available only when no tagged release exists. Attestation-required mode refuses that fallback because a local source build has no release attestation.
 
 ## Publish
 
