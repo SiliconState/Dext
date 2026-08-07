@@ -33,7 +33,25 @@ jobs:
           sh -n scripts/test_install.sh
           sh scripts/install.sh --help >/dev/null
           sh scripts/test_install.sh
-      - name: Check PowerShell installers
+      - name: Check Windows PowerShell installers
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          foreach ($script in @("scripts/install.ps1", "scripts/test_install.ps1")) {
+            $errors = $null
+            $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error "$script`: $($_.Message)" }
+              exit 1
+            }
+          }
+          & ./scripts/install.ps1 -Help | Out-Null
+      - name: Check PowerShell 7 installers
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -63,7 +81,11 @@ jobs:
         run: cargo bench --no-run --locked
       - name: Build release binary
         run: cargo build --release --locked
-      - name: Test PowerShell installer
+      - name: Test Windows PowerShell installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test_install.ps1 -DextBinary ./target/release/dext.exe
+      - name: Test PowerShell 7 installer
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/test_install.ps1 -DextBinary ./target/release/dext.exe

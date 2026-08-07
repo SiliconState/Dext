@@ -124,7 +124,8 @@ function Invoke-InstallerCase {
     param(
         [string]$Mode,
         [string]$RequestedTag = "latest",
-        [switch]$RequireAttestation
+        [switch]$RequireAttestation,
+        [switch]$NoSourceFallback
     )
     $global:DextInstallerMockMode = $Mode
     $global:DextInstallerMockTag = if ($RequestedTag -eq "latest") { $tag } else { $RequestedTag }
@@ -132,6 +133,7 @@ function Invoke-InstallerCase {
         Version = $RequestedTag
         InstallDir = $installDir
         RequireAttestation = [bool]$RequireAttestation
+        NoSourceFallback = [bool]$NoSourceFallback
     }
     & $installer @parameters
 }
@@ -154,6 +156,61 @@ function Assert-Fails {
 }
 
 try {
+    $tokens = $null
+    $parseErrors = $null
+    $installerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $installer,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($parseErrors.Count -ne 0) {
+        throw "installer could not be parsed for replacement tests"
+    }
+    $installerFunctionDefinitions = @{}
+    foreach ($functionName in @(
+        "Test-WindowsHost",
+        "Get-WindowsArchitecture",
+        "Test-DextBinary",
+        "Replace-DextFile",
+        "Move-DextFile",
+        "Move-DextFileWithRollback",
+        "Install-DextBinary"
+    )) {
+        $definitions = @($installerAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $functionName
+        }, $true))
+        if ($definitions.Count -ne 1) {
+            throw "expected one $functionName definition in installer"
+        }
+        $functionDefinition = $definitions[0].Extent.Text
+        $installerFunctionDefinitions[$functionName] = $functionDefinition
+        Invoke-Expression $functionDefinition
+    }
+
+    if (-not (Test-WindowsHost)) {
+        throw "Windows installer harness is not running on Windows"
+    }
+    $oldProcessorArchitecture = $env:PROCESSOR_ARCHITECTURE
+    $oldProcessorArchitectureW6432 = $env:PROCESSOR_ARCHITEW6432
+    try {
+        $env:PROCESSOR_ARCHITECTURE = "x86"
+        $env:PROCESSOR_ARCHITEW6432 = "AMD64"
+        if ((Get-WindowsArchitecture) -ne "X64") {
+            throw "native architecture detection failed for 32-bit PowerShell on 64-bit Windows"
+        }
+        $env:PROCESSOR_ARCHITECTURE = "AMD64"
+        $env:PROCESSOR_ARCHITEW6432 = $null
+        if ((Get-WindowsArchitecture) -ne "X64") {
+            throw "native architecture detection failed for 64-bit PowerShell"
+        }
+    }
+    finally {
+        $env:PROCESSOR_ARCHITECTURE = $oldProcessorArchitecture
+        $env:PROCESSOR_ARCHITEW6432 = $oldProcessorArchitectureW6432
+    }
+
     New-Item -ItemType Directory -Force -Path $package, $wrongPackage, $mockBin, $installDir | Out-Null
     Copy-Item -LiteralPath $DextBinary -Destination (Join-Path $package "dext.exe")
     $wrongBinary = Join-Path $wrongPackage "dext.exe"
@@ -191,6 +248,25 @@ exit /b 2
     $env:DEXT_TEST_BINARY = $DextBinary
     $env:PATH = "$installDir;$mockBin;$oldProcessPath"
 
+    $iexInstallDir = Join-Path $work "install-iex"
+    $env:DEXT_INSTALL_DIR = $iexInstallDir
+    $global:DextInstallerMockMode = "release"
+    $global:DextInstallerMockTag = $tag
+    try {
+        $installerText = Get-Content -LiteralPath $installer -Raw
+        & {
+            $installerText | Invoke-Expression
+        } | Out-Null
+    }
+    finally {
+        $env:DEXT_INSTALL_DIR = $null
+        $env:PATH = "$installDir;$mockBin;$oldProcessPath"
+    }
+    $iexInstalled = Join-Path $iexInstallDir "dext.exe"
+    if (((& $iexInstalled --version) -join "`n").Trim() -ne "dext $version") {
+        throw "in-memory installer pipeline did not install the expected version"
+    }
+
     Invoke-InstallerCase -Mode "release" | Out-Null
     $installed = Join-Path $installDir "dext.exe"
     if (((& $installed --version) -join "`n").Trim() -ne "dext $version") {
@@ -224,11 +300,17 @@ exit /b 2
     Assert-Fails -Message "main ref does not point to a commit" -Action {
         Invoke-InstallerCase -Mode "bad-ref"
     }
+    Assert-Fails -Message "no tagged Dext release exists yet" -Action {
+        Invoke-InstallerCase -Mode "source" -NoSourceFallback
+    }
     Assert-Fails -Message "attestation verification requires a tagged release" -Action {
         Invoke-InstallerCase -Mode "attested-source" -RequireAttestation
     }
     Assert-Fails -Message "release binary reported" -Action {
         Invoke-InstallerCase -Mode "release" -RequestedTag "v9.9.9"
+    }
+    Assert-Fails -Message "release version must have form vX.Y.Z" -Action {
+        Invoke-InstallerCase -Mode "release" -RequestedTag "v1.2.3`nbad"
     }
     Assert-Fails -Message "InstallDir must be a non-empty directory" -Action {
         & $installer -Version latest -InstallDir ""
@@ -237,7 +319,135 @@ exit /b 2
         throw "a failed installer path replaced the existing installation"
     }
 
-    Write-Host "Windows installer tests passed"
+    $InstallDir = $installDir
+    $regularInstallDir = $InstallDir
+    $unsafeInstallDir = Join-Path $work "unsafe-install"
+    New-Item -ItemType Directory -Force -Path (Join-Path $unsafeInstallDir "dext.exe") | Out-Null
+    $InstallDir = $unsafeInstallDir
+    try {
+        Assert-Fails -Message "existing Dext destination must be a regular non-reparse file or be absent" -Action {
+            Install-DextBinary $DextBinary $version
+        }
+    }
+    finally {
+        $InstallDir = $regularInstallDir
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $unsafeInstallDir "dext.exe") -PathType Container)) {
+        throw "unsafe destination rejection changed the existing directory"
+    }
+    if (@(Get-ChildItem -LiteralPath $unsafeInstallDir -Filter ".dext-*.exe").Count -ne 0) {
+        throw "unsafe destination rejection left a staging file"
+    }
+
+    $script:MoveDextFileCalls = 0
+    Set-Item -Path Function:Replace-DextFile -Value {
+        throw [System.IO.IOException]::new("mock replacement I/O failure")
+    }
+    Set-Item -Path Function:Move-DextFile -Value {
+        param([string]$Source, [string]$Destination)
+        $script:MoveDextFileCalls++
+        [System.IO.File]::Move($Source, $Destination)
+    }
+    try {
+        Assert-Fails -Message "mock replacement I/O failure" -Action {
+            Install-DextBinary $DextBinary $version
+        }
+    }
+    finally {
+        Invoke-Expression $installerFunctionDefinitions["Replace-DextFile"]
+        Invoke-Expression $installerFunctionDefinitions["Move-DextFile"]
+    }
+    if ($script:MoveDextFileCalls -ne 0) {
+        throw "ordinary File.Replace I/O failure entered the unsupported-operation fallback"
+    }
+    if ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne $installedDigest) {
+        throw "ordinary File.Replace I/O failure changed the existing installation"
+    }
+    if (@(Get-ChildItem -LiteralPath $installDir -Filter ".dext-*.exe").Count -ne 0) {
+        throw "ordinary File.Replace I/O failure left staging or backup files"
+    }
+
+    Set-Item -Path Function:Replace-DextFile -Value {
+        throw [System.PlatformNotSupportedException]::new("mock unsupported replacement")
+    }
+    try {
+        Install-DextBinary $DextBinary $version
+    }
+    finally {
+        Invoke-Expression $installerFunctionDefinitions["Replace-DextFile"]
+    }
+    if ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $DextBinary -Algorithm SHA256).Hash) {
+        throw "unsupported File.Replace fallback did not install the staged binary"
+    }
+    if (@(Get-ChildItem -LiteralPath $installDir -Filter ".dext-*.exe").Count -ne 0) {
+        throw "successful replacement fallback left staging or backup files"
+    }
+
+    $previousBytes = [System.Text.Encoding]::UTF8.GetBytes("previous Dext binary")
+    [System.IO.File]::WriteAllBytes($installed, $previousBytes)
+    $script:MoveDextFileCalls = 0
+    Set-Item -Path Function:Replace-DextFile -Value {
+        throw [System.PlatformNotSupportedException]::new("mock unsupported replacement")
+    }
+    Set-Item -Path Function:Move-DextFile -Value {
+        param([string]$Source, [string]$Destination)
+        $script:MoveDextFileCalls++
+        if ($script:MoveDextFileCalls -eq 2) {
+            throw [System.IO.IOException]::new("mock staged move failure")
+        }
+        [System.IO.File]::Move($Source, $Destination)
+    }
+    try {
+        Assert-Fails -Message "mock staged move failure" -Action {
+            Install-DextBinary $DextBinary $version
+        }
+    }
+    finally {
+        Invoke-Expression $installerFunctionDefinitions["Replace-DextFile"]
+        Invoke-Expression $installerFunctionDefinitions["Move-DextFile"]
+    }
+    $restoredBytes = [System.IO.File]::ReadAllBytes($installed)
+    if ([Convert]::ToBase64String($restoredBytes) -ne [Convert]::ToBase64String($previousBytes)) {
+        throw "failed replacement fallback did not restore the previous binary"
+    }
+    if (@(Get-ChildItem -LiteralPath $installDir -Filter ".dext-*.exe").Count -ne 0) {
+        throw "rolled-back replacement fallback left staging or backup files"
+    }
+
+    [System.IO.File]::WriteAllBytes($installed, $previousBytes)
+    $script:MoveDextFileCalls = 0
+    Set-Item -Path Function:Replace-DextFile -Value {
+        throw [System.PlatformNotSupportedException]::new("mock unsupported replacement")
+    }
+    Set-Item -Path Function:Move-DextFile -Value {
+        param([string]$Source, [string]$Destination)
+        $script:MoveDextFileCalls++
+        if ($script:MoveDextFileCalls -ge 2) {
+            throw [System.IO.IOException]::new("mock move and rollback failure")
+        }
+        [System.IO.File]::Move($Source, $Destination)
+    }
+    try {
+        Assert-Fails -Message "recover it from" -Action {
+            Install-DextBinary $DextBinary $version
+        }
+    }
+    finally {
+        Invoke-Expression $installerFunctionDefinitions["Replace-DextFile"]
+        Invoke-Expression $installerFunctionDefinitions["Move-DextFile"]
+    }
+    $retainedBackups = @(Get-ChildItem -LiteralPath $installDir -Filter ".dext-backup-*.exe")
+    if ($retainedBackups.Count -ne 1 -or (Test-Path -LiteralPath $installed)) {
+        throw "failed rollback did not retain exactly one recoverable backup"
+    }
+    $retainedBytes = [System.IO.File]::ReadAllBytes($retainedBackups[0].FullName)
+    if ([Convert]::ToBase64String($retainedBytes) -ne [Convert]::ToBase64String($previousBytes)) {
+        throw "retained rollback backup does not contain the previous binary"
+    }
+    Remove-Item -LiteralPath $retainedBackups[0].FullName -Force
+
+    Write-Host "Windows installer tests passed under $($PSVersionTable.PSEdition) PowerShell $($PSVersionTable.PSVersion)"
 }
 finally {
     Remove-Item Function:\Invoke-RestMethod -ErrorAction SilentlyContinue

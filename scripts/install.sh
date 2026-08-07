@@ -95,7 +95,11 @@ command -v mktemp >/dev/null 2>&1 || fail "mktemp is required"
 TEMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t dext-install)
 
 validate_tag() {
-    printf '%s\n' "$1" | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ { valid = 1 } END { exit valid ? 0 : 1 }'
+    printf '%s\n' "$1" | awk '
+        NR == 1 && /^v[0-9]+\.[0-9]+\.[0-9]+$/ { valid = 1; next }
+        { valid = 0 }
+        END { exit (NR == 1 && valid) ? 0 : 1 }
+    '
 }
 
 latest_tag() {
@@ -217,11 +221,15 @@ install_binary() {
     [ -f "$source_binary" ] && [ ! -L "$source_binary" ] \
         || fail "installer did not produce a regular Dext binary"
     mkdir -p "$INSTALL_DIR"
+    destination="$INSTALL_DIR/dext"
+    if [ -L "$destination" ] || { [ -e "$destination" ] && [ ! -f "$destination" ]; }; then
+        fail "existing Dext destination must be a regular non-symlink file or be absent"
+    fi
     STAGED_BINARY=$(mktemp "$INSTALL_DIR/.dext-install.XXXXXX")
     cp "$source_binary" "$STAGED_BINARY"
     chmod 755 "$STAGED_BINARY"
     verify_binary "$STAGED_BINARY" "$expected_version" >/dev/null
-    mv -f "$STAGED_BINARY" "$INSTALL_DIR/dext"
+    mv -f "$STAGED_BINARY" "$destination"
     STAGED_BINARY=
 }
 
