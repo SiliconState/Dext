@@ -1,3 +1,4 @@
+mod claude_subscription;
 mod crash;
 mod events;
 mod git_checkpoints;
@@ -38,18 +39,18 @@ pub(crate) use usage::*;
 use anyhow::{Context, Result, bail};
 use provider::{
     ApiProvider, OpenAiResponsesReasoning, ProviderProfile, RequestContract, ResolvedModelSpec,
-    ResolvedProviderConfig, apply_provider_headers, auth_store_path, build_chatgpt_request,
-    build_chatgpt_summary_request, build_openai_responses_request, built_in_provider_profiles,
-    cancel_pending_oauth_login, canonical_provider_id, effective_request_contract,
-    extract_oauth_code_from_callback, find_provider_profile, handle_auth_cli, is_gpt_5_6_model,
-    is_official_kimi_profile, list_models_for_available_providers, list_models_for_provider,
-    load_auth_store, load_provider_catalog, login_provider, logout_provider,
-    looks_like_login_secret_input, normalize_provider_model_value,
-    official_openai_gpt_5_6_responses, provider_auth_status, provider_catalog_path,
-    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
-    render_provider_list, render_provider_picker, request_contract_for_profile,
-    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
-    resolve_runtime_provider, set_active_provider_in_catalog,
+    ResolvedProviderConfig, RuntimeAuthKind, apply_provider_headers, auth_store_path,
+    build_chatgpt_request, build_chatgpt_summary_request, build_openai_responses_request,
+    built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
+    effective_request_contract, extract_oauth_code_from_callback, find_provider_profile,
+    handle_auth_cli, is_gpt_5_6_model, is_official_anthropic_profile, is_official_kimi_profile,
+    list_models_for_available_providers, list_models_for_provider, load_auth_store,
+    load_provider_catalog, login_provider, logout_provider, looks_like_login_secret_input,
+    normalize_provider_model_value, official_openai_gpt_5_6_responses, provider_auth_status,
+    provider_catalog_path, provider_id_from_selector, provider_request_url,
+    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
+    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
+    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 #[cfg(unix)]
@@ -13048,6 +13049,7 @@ struct Agent {
     provider_id: String,
     provider_profile: Option<ProviderProfile>,
     api_key: String,
+    auth_kind: RuntimeAuthKind,
     key_source: String,
     provider_requires_api_key: bool,
     base_url: String,
@@ -13084,6 +13086,8 @@ struct Agent {
     state_lock: Option<Arc<SessionStateLock>>,
     session_enabled: bool,
     session_id: String,
+    claude_session_id: String,
+    claude_identity: Option<claude_subscription::ClaudeIdentity>,
     latest_session_path: PathBuf,
     latest_log_path: PathBuf,
     pending_login_provider: Option<String>,
@@ -13148,6 +13152,7 @@ impl Agent {
         let resolved = resolve_runtime_provider(None, false)?;
         let provider_id = resolved.profile.id.clone();
         let api_key = resolved.api_key;
+        let auth_kind = resolved.auth_kind;
         let key_source = resolved.key_source;
         let provider_requires_api_key = resolved.requires_api_key;
         let api_provider = request_contract_for_profile(&resolved.profile).api_provider();
@@ -13209,6 +13214,11 @@ impl Agent {
         }))
         .context("could not canonicalize sandbox root")?;
         let session_id = new_session_id();
+        let claude_session_id = claude_subscription::random_uuid_v4()?;
+        let claude_identity = (auth_kind == RuntimeAuthKind::OAuth
+            && is_official_anthropic_profile(&resolved.profile, &base_url))
+        .then(claude_subscription::discover_identity)
+        .flatten();
         let latest_session = if session_enabled {
             session_latest_session_path(&sandbox_root, &session_id)
         } else {
@@ -13244,6 +13254,7 @@ impl Agent {
             provider_id,
             provider_profile: Some(resolved.profile),
             api_key,
+            auth_kind,
             key_source,
             provider_requires_api_key,
             base_url,
@@ -13276,6 +13287,8 @@ impl Agent {
             state_lock,
             session_enabled,
             session_id,
+            claude_session_id,
+            claude_identity,
             latest_session_path: latest_session,
             latest_log_path: latest_log,
             pending_login_provider: None,
@@ -13466,10 +13479,18 @@ impl Agent {
         self.api_provider = request_contract_for_profile(&resolved.profile).api_provider();
         self.provider_profile = Some(resolved.profile);
         self.api_key = resolved.api_key;
+        self.auth_kind = resolved.auth_kind;
         self.key_source = resolved.key_source;
         self.provider_requires_api_key = resolved.requires_api_key;
         self.base_url = resolved.base_url;
         self.model = resolved.model;
+        self.claude_identity = (self.auth_kind == RuntimeAuthKind::OAuth
+            && self
+                .provider_profile
+                .as_ref()
+                .is_some_and(|profile| is_official_anthropic_profile(profile, &self.base_url)))
+        .then(claude_subscription::discover_identity)
+        .flatten();
         if let Some(pinned) = self
             .session_model_pins
             .get(&canonical_provider_id(&self.provider_id))
@@ -13485,6 +13506,31 @@ impl Agent {
             );
             self.set_context_mode_automatic(mode);
         }
+    }
+
+    fn anthropic_subscription_active(&self) -> bool {
+        self.auth_kind == RuntimeAuthKind::OAuth
+            && self
+                .provider_profile
+                .as_ref()
+                .is_some_and(|profile| is_official_anthropic_profile(profile, &self.base_url))
+    }
+
+    fn first_user_prompt(&self) -> String {
+        self.history
+            .iter()
+            .find(|message| message.role == "user")
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text { text } | Block::PartialStream { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
     }
 
     fn official_kimi_model(&self) -> Option<&str> {
@@ -13720,6 +13766,21 @@ impl Agent {
         }
     }
 
+    async fn refresh_runtime_provider_auth(&mut self) -> Result<()> {
+        if self.auth_kind != RuntimeAuthKind::OAuth {
+            return Ok(());
+        }
+        let provider_id = self.provider_id.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            resolve_runtime_provider(Some(&provider_id), false)
+        })
+        .await
+        .context("join provider credential refresh")??;
+        self.apply_runtime_provider(resolved);
+        self.refresh_tools_for_context();
+        Ok(())
+    }
+
     fn reload_provider(&mut self, selected: Option<&str>, require_credentials: bool) -> Result<()> {
         let resolved = resolve_runtime_provider(selected, require_credentials)?;
         self.apply_runtime_provider(resolved);
@@ -13798,7 +13859,7 @@ impl Agent {
             None => return Ok(None),
         };
 
-        if let Some(msg) = try_complete_oauth_from_callback(raw)? {
+        if let Some(msg) = try_complete_oauth_from_callback(raw, Some(&provider))? {
             self.clear_pending_login();
             self.reload_provider(None, false)?;
             return Ok(Some(format!(
@@ -15962,7 +16023,20 @@ impl Agent {
                     output_config,
                 };
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
-                Ok((url, bytes))
+                if self.anthropic_subscription_active() {
+                    let first_user_prompt = self.first_user_prompt();
+                    Ok((
+                        url,
+                        claude_subscription::transform_body(
+                            bytes,
+                            &first_user_prompt,
+                            &self.claude_session_id,
+                            self.claude_identity.as_ref(),
+                        )?,
+                    ))
+                } else {
+                    Ok((url, bytes))
+                }
             }
         }
     }
@@ -16759,6 +16833,44 @@ impl Agent {
         (summary_msgs, preserved_tool_msgs)
     }
 
+    fn build_anthropic_summary_request(
+        &self,
+        model: &str,
+        user_text: &str,
+        max_tokens: u32,
+    ) -> Result<Vec<u8>> {
+        let messages = vec![json!({
+            "role": "user",
+            "content": [{"type": "text", "text": user_text}],
+        })];
+        let sys_blocks = [SystemBlock {
+            kind: "text",
+            text: COMPACT_SYSTEM,
+            cache_control: None,
+        }];
+        let body = Request {
+            model,
+            max_tokens,
+            system: &sys_blocks,
+            messages: &messages,
+            tools: &[],
+            stream: false,
+            thinking: None,
+            output_config: None,
+        };
+        let bytes = serde_json::to_vec(&body).map_err(|error| anyhow::anyhow!(error))?;
+        if self.anthropic_subscription_active() {
+            claude_subscription::transform_body(
+                bytes,
+                user_text,
+                &self.claude_session_id,
+                self.claude_identity.as_ref(),
+            )
+        } else {
+            Ok(bytes)
+        }
+    }
+
     async fn one_shot_summary(
         &mut self,
         old: &[Message],
@@ -16809,6 +16921,8 @@ impl Agent {
                 self.provider_profile
                     .as_ref()
                     .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
+                false,
+                false,
                 None,
             )?;
             (
@@ -16862,36 +16976,25 @@ impl Agent {
                 SummaryParse::OpenAi,
             )
         } else {
-            let messages = vec![json!({
-                "role": "user",
-                "content": [{"type": "text", "text": user_text.clone()}],
-            })];
-            let sys_blocks = [SystemBlock {
-                kind: "text",
-                text: COMPACT_SYSTEM,
-                cache_control: None,
-            }];
-            let body = Request {
-                model: &summary_model,
-                max_tokens: summary_max_tokens,
-                system: &sys_blocks,
-                messages: &messages,
-                tools: &[],
-                stream: false,
-                thinking: None,
-                output_config: None,
-            };
+            let anthropic_subscription = self.anthropic_subscription_active();
+            let bytes = self.build_anthropic_summary_request(
+                &summary_model,
+                &user_text,
+                summary_max_tokens,
+            )?;
             let req = apply_provider_headers(
                 self.http_client()
                     .post(provider_request_url(&self.base_url, summary_contract))
                     .header("content-type", "application/json")
-                    .json(&body),
+                    .body(bytes),
                 summary_contract,
                 &self.api_key,
                 self.provider_profile
                     .as_ref()
                     .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
-                None,
+                anthropic_subscription,
+                false,
+                anthropic_subscription.then_some(self.claude_session_id.as_str()),
             )?;
             (
                 send_provider_request(req, self.first_byte_timeout()).await?,
@@ -16967,6 +17070,8 @@ impl Agent {
                                 self.provider_profile.as_ref().is_some_and(|profile| {
                                     is_official_kimi_profile(profile, &self.base_url)
                                 }),
+                                false,
+                                false,
                                 None,
                             )?;
                             let retry_resp =
@@ -17284,6 +17389,7 @@ impl Agent {
         mut user_input: String,
         suppress_pack_activation_for_turn: bool,
     ) -> Result<()> {
+        self.refresh_runtime_provider_auth().await?;
         let mut compacted_this_turn = false;
         // New user turn: force a fresh prompt filesystem scan (DEXT.md/recall.md
         // walks, pack discovery) on the first request of the turn.
@@ -17514,17 +17620,21 @@ impl Agent {
                 let mut attempt: u32 = 0;
                 let resp = loop {
                     attempt += 1;
-                    let mut builder = self
+                    let builder = self
                         .http_client()
                         .post(&url)
                         .header("content-type", "application/json")
                         .header("accept", "text/event-stream");
-                    if self.request_contract() == RequestContract::AnthropicMessages
+                    let extended_anthropic_cache = self.request_contract()
+                        == RequestContract::AnthropicMessages
                         && extended_prompt_cache_ttl().is_some()
-                        && self.model_supports_prompt_cache()
-                    {
-                        builder = builder.header("anthropic-beta", "extended-cache-ttl-2025-04-11");
-                    }
+                        && self.model_supports_prompt_cache();
+                    let anthropic_subscription = self.anthropic_subscription_active();
+                    let request_session_id = if anthropic_subscription {
+                        Some(self.claude_session_id.as_str())
+                    } else {
+                        chatgpt_session_id.as_deref()
+                    };
                     let req = apply_provider_headers(
                         builder.body(req_body.clone()),
                         self.request_contract(),
@@ -17532,7 +17642,9 @@ impl Agent {
                         self.provider_profile.as_ref().is_some_and(|profile| {
                             is_official_kimi_profile(profile, &self.base_url)
                         }),
-                        chatgpt_session_id.as_deref(),
+                        anthropic_subscription,
+                        extended_anthropic_cache,
+                        request_session_id,
                     )?;
                     let applied = try_apply_runtime_controls_for_stream(self);
                     if applied.aborted_stream {
@@ -21390,10 +21502,12 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 match login_provider(provider, key, false).map(|login| {
                     let awaiting = login.awaiting_credentials;
                     let provider_id = login.provider_id.clone();
+                    if awaiting {
+                        agent.set_pending_login_provider(Some(provider_id));
+                    }
                     match agent.reload_provider(None, false) {
                         Ok(()) => {
                             if awaiting {
-                                agent.set_pending_login_provider(Some(provider_id));
                                 format!(
                                     "{}\nPaste the API key/token, callback URL, or authorization code here when ready. /login cancel aborts.\nactive -> {}",
                                     login.message,
@@ -21409,10 +21523,15 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                                 )
                             }
                         }
-                        Err(e) => format!(
-                            "{}\n[warn] runtime provider refresh failed: {e:#}",
-                            login.message
-                        ),
+                        Err(e) => {
+                            if !awaiting {
+                                agent.clear_pending_login();
+                            }
+                            format!(
+                                "{}\n[warn] runtime provider refresh failed: {e:#}",
+                                login.message
+                            )
+                        }
                     }
                 }) {
                     Ok(msg) => {

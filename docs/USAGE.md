@@ -64,26 +64,35 @@ List providers:
 dext auth providers
 ```
 
-Login with browser/OAuth where supported, or open a provider console for an API key:
+Login with browser OAuth for ChatGPT/Codex or a Claude Pro/Max subscription:
 
 ```bash
 dext auth login chatgpt
+dext auth login anthropic
+```
+
+Anthropic subscription login is unofficial and version-pinned to the emulated Claude Code wire contract. It uses Dext's own OAuth storage and request transport; API-key requests and non-Anthropic providers do not receive subscription request shaping. `ANTHROPIC_API_KEY` remains the non-subscription path for an Anthropic Console API key. Re-run `dext auth login anthropic web` to replace an existing Anthropic OAuth credential.
+
+For console/API-key providers, open the provider console and paste the key at Dext's prompt:
+
+```bash
 dext auth login kimi
 ```
 
 `dext auth login kimi` opens `https://www.kimi.com/code/console`. Create or copy the API key associated with the Kimi coding plan, then paste it into Dext. Dext stores it as an API key and uses the isolated `https://api.kimi.com/coding` profile; it does not use Kimi device OAuth.
 
-For API-key providers, run the login command without putting the secret in the shell command, then paste the key at Dext's interactive prompt:
+For other API-key providers, run the login command without putting the secret in the shell command, then paste the key at Dext's interactive prompt:
 
 ```bash
 dext auth login glm
 dext auth login openai
-dext auth login anthropic
 dext auth login kimi
 dext auth login deepseek
 ```
 
-Passing a credential as a command argument remains supported for automation, but shell history and process listings may retain it. In an interactive Dext session, `/login <provider>` opens the flow and accepts an API key/token or manual OAuth callback directly in Dext; prefer that route when a CLI login remains incomplete.
+Passing a credential as a command argument remains supported for API-key automation, but shell history and process listings may retain it. In an interactive Dext session, `/login <provider>` opens the corresponding key or OAuth flow and accepts a manual OAuth callback directly in Dext; prefer that route when a CLI login remains incomplete.
+
+For official Anthropic subscription OAuth only, Dext uses Bearer authentication and the pinned Claude Code-compatible billing/system blocks, checksum, beta headers, request/session identifiers, and optional installation/account identity metadata. Identity is read in memory from `${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json` only when it is a bounded regular non-symlink file with the expected validated fields; Dext does not copy or persist those identifiers. Subscription shaping is enabled only for an OAuth credential on the built-in `anthropic` profile at `https://api.anthropic.com`; `ANTHROPIC_API_KEY`, GLM, Kimi, and custom Anthropic-compatible profiles retain their existing request forms. OAuth exchange and refresh use bounded, no-redirect HTTP requests and bounded JSON responses. Long-running sessions re-check OAuth expiry before each user turn; refresh-token rotation is persisted without replacing a newer concurrently stored credential. The local callback page reports success only after token exchange and credential storage complete, sends no credential data, and uses no-store/CSP response headers.
 
 The bundled Kimi provider also accepts `KIMI_API_KEY`, using a key created at `https://www.kimi.com/code/console`. Kimi coding-plan API keys are separate from the independently billed Moonshot Open Platform and its `MOONSHOT_API_KEY`; Dext does not substitute one for the other. Custom Kimi-compatible catalog profiles remain API-key based and must use an ID other than the reserved built-in IDs `kimi`, `kimi-code`, `kimi-coding`, and `kimi-membership`. If an older catalog already uses one of those IDs, rename that custom profile before upgrading; Dext rejects the collision rather than silently converting it.
 

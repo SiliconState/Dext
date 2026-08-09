@@ -78,6 +78,7 @@ fn test_agent(root: &Path) -> Agent {
         provider_profile: None,
         api_key: "test-key".to_string(),
         key_source: "test".to_string(),
+        auth_kind: RuntimeAuthKind::ApiKey,
         provider_requires_api_key: true,
         base_url: "http://127.0.0.1".to_string(),
         model: "test-model".to_string(),
@@ -112,6 +113,8 @@ fn test_agent(root: &Path) -> Agent {
         state_lock: None,
         session_enabled: true,
         session_id: session_id.clone(),
+        claude_session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+        claude_identity: None,
         latest_session_path: session_latest_session_path(root, &session_id),
         latest_log_path: session_latest_log_path(root, &session_id),
         pending_login_provider: None,
@@ -13832,10 +13835,11 @@ fn fd_tool_threads_extra_args_on_happy_path() {
     )
     .expect("prepare fd with extras");
     assert_eq!(bin, "fd");
-    // extras prepended, then pattern, then path (per prepare_external_tool).
+    // Explicit extras stay first; default excludes may follow. Pattern and path are always last.
     assert_eq!(&args[0..3], &["-H", "--type", "f"]);
-    assert_eq!(args[3], "\\.rs$");
-    assert_eq!(args.get(4).map(String::as_str), root.to_str());
+    assert_eq!(args.get(args.len() - 3).map(String::as_str), Some("--"));
+    assert_eq!(args.get(args.len() - 2).map(String::as_str), Some("\\.rs$"));
+    assert_eq!(args.last().map(String::as_str), root.to_str());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -17116,6 +17120,7 @@ fn provider_switches_update_only_automatic_context_mode() {
         profile: local,
         api_key: String::new(),
         key_source: "not-required".to_string(),
+        auth_kind: RuntimeAuthKind::None,
         base_url: String::new(),
         requires_api_key: false,
     });
@@ -17130,6 +17135,7 @@ fn provider_switches_update_only_automatic_context_mode() {
         profile: openai,
         api_key: "test".to_string(),
         key_source: "test".to_string(),
+        auth_kind: RuntimeAuthKind::ApiKey,
         base_url: "https://api.openai.com".to_string(),
         requires_api_key: true,
     });
@@ -17145,6 +17151,7 @@ fn provider_switches_update_only_automatic_context_mode() {
         profile: local,
         api_key: String::new(),
         key_source: "not-required".to_string(),
+        auth_kind: RuntimeAuthKind::None,
         base_url: String::new(),
         requires_api_key: false,
     });
@@ -20393,6 +20400,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         let anthropic = find_provider_profile(&catalog, "anthropic").context("anthropic")?;
         assert_eq!(anthropic.api_provider, ApiProvider::Anthropic);
         assert_eq!(anthropic.env_vars, vec!["ANTHROPIC_API_KEY"]);
+        assert!(anthropic.oauth_flow.is_some());
 
         let kimi = find_provider_profile(&catalog, "kimi").context("kimi")?;
         assert_eq!(kimi.api_provider, ApiProvider::Anthropic);
@@ -21690,6 +21698,423 @@ fn oauth_exchange_failure_stays_retryable() {
 }
 
 #[test]
+fn anthropic_subscription_oauth_defaults_and_runtime_auth_are_distinct() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("anthropic-subscription-auth");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_dext_key = std::env::var_os("DEXT_API_KEY");
+    let old_anthropic_key = std::env::var_os("ANTHROPIC_API_KEY");
+    let old_anthropic_base = std::env::var_os("ANTHROPIC_BASE_URL");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let profile = find_provider_profile(&catalog, "anthropic").context("anthropic profile")?;
+        let oauth = profile.oauth_flow.as_ref().context("Anthropic OAuth")?;
+        assert_eq!(
+            oauth.protocol,
+            crate::provider::OAuthProtocol::AnthropicClaude
+        );
+        assert_eq!(oauth.authorize_url, "https://claude.ai/oauth/authorize");
+        assert_eq!(
+            oauth.token_url,
+            "https://platform.claude.com/v1/oauth/token"
+        );
+        assert_eq!(
+            oauth.redirect_uri.as_deref(),
+            Some("http://localhost:53692/callback")
+        );
+        assert!(oauth.scope.contains("user:inference"));
+        assert!(oauth.scope.contains("user:sessions:claude_code"));
+
+        let mut store = AuthStore::default();
+        store.providers.insert(
+            "anthropic".to_string(),
+            StoredCredential::OAuth {
+                access_token: "oauth-access".to_string(),
+                refresh_token: Some("oauth-refresh".to_string()),
+                expires_at: Some(4_102_444_800),
+            },
+        );
+        save_auth_store(&store)?;
+        unsafe { std::env::set_var("ANTHROPIC_BASE_URL", "https://example.test") };
+        let error = resolve_runtime_provider(Some("anthropic"), true)
+            .expect_err("subscription OAuth must not fall through to a custom endpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("restricted to https://api.anthropic.com"),
+            "{error:#}"
+        );
+        unsafe { std::env::remove_var("ANTHROPIC_BASE_URL") };
+        let resolved = resolve_runtime_provider(Some("anthropic"), true)?;
+        assert_eq!(resolved.auth_kind, RuntimeAuthKind::OAuth);
+        assert_eq!(resolved.api_key, "oauth-access");
+
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "api-key") };
+        let resolved = resolve_runtime_provider(Some("anthropic"), true)?;
+        assert_eq!(resolved.auth_kind, RuntimeAuthKind::OAuth);
+        assert_eq!(resolved.api_key, "oauth-access");
+
+        store.providers.remove("anthropic");
+        save_auth_store(&store)?;
+        let resolved = resolve_runtime_provider(Some("anthropic"), true)?;
+        assert_eq!(resolved.auth_kind, RuntimeAuthKind::ApiKey);
+        assert_eq!(resolved.api_key, "api-key");
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_API_KEY", old_dext_key);
+    restore_env_var("ANTHROPIC_API_KEY", old_anthropic_key);
+    restore_env_var("ANTHROPIC_BASE_URL", old_anthropic_base);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn anthropic_subscription_headers_use_bearer_and_api_keys_do_not() -> Result<()> {
+    let client = reqwest::Client::new();
+    let subscription = apply_provider_headers(
+        client.post("https://api.anthropic.com/v1/messages"),
+        RequestContract::AnthropicMessages,
+        "oauth-access",
+        false,
+        true,
+        false,
+        Some("11111111-2222-4333-8444-555555555555"),
+    )?
+    .build()?;
+    assert_eq!(
+        subscription.headers()["authorization"],
+        "Bearer oauth-access"
+    );
+    assert!(!subscription.headers().contains_key("x-api-key"));
+    assert_eq!(subscription.headers()["x-app"], "cli");
+    assert_eq!(
+        subscription.headers()["anthropic-beta"],
+        "claude-code-20250219,oauth-2025-04-20"
+    );
+    assert_eq!(
+        subscription.headers()["anthropic-dangerous-direct-browser-access"],
+        "true"
+    );
+    assert_eq!(
+        subscription.headers()["x-claude-code-session-id"],
+        "11111111-2222-4333-8444-555555555555"
+    );
+    assert!(subscription.headers().contains_key("x-client-request-id"));
+    assert!(
+        subscription.headers()["user-agent"]
+            .to_str()?
+            .starts_with("claude-cli/2.1.224")
+    );
+
+    let second = apply_provider_headers(
+        client.post("https://api.anthropic.com/v1/messages"),
+        RequestContract::AnthropicMessages,
+        "oauth-access",
+        false,
+        true,
+        true,
+        Some("11111111-2222-4333-8444-555555555555"),
+    )?
+    .build()?;
+    assert_ne!(
+        subscription.headers()["x-client-request-id"],
+        second.headers()["x-client-request-id"]
+    );
+    assert_eq!(
+        second.headers()["anthropic-beta"],
+        "claude-code-20250219,oauth-2025-04-20,extended-cache-ttl-2025-04-11"
+    );
+
+    let api_key = apply_provider_headers(
+        client.post("https://api.anthropic.com/v1/messages"),
+        RequestContract::AnthropicMessages,
+        "api-key",
+        false,
+        false,
+        false,
+        None,
+    )?
+    .build()?;
+    assert_eq!(api_key.headers()["x-api-key"], "api-key");
+    assert!(!api_key.headers().contains_key("authorization"));
+    assert!(!api_key.headers().contains_key("x-app"));
+    Ok(())
+}
+
+#[test]
+fn anthropic_login_starts_subscription_oauth_even_when_api_key_env_exists() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("anthropic-subscription-login");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_anthropic_key = std::env::var_os("ANTHROPIC_API_KEY");
+    let old_skip_browser = std::env::var_os("DEXT_SKIP_BROWSER_OPEN");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("ANTHROPIC_API_KEY", "console-key");
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
+    }
+
+    let result = (|| -> Result<()> {
+        let login = login_provider(Some("anthropic"), None, false)?;
+        assert!(login.awaiting_credentials);
+        assert!(
+            login.message.contains("claude.ai/oauth/authorize"),
+            "{}",
+            login.message
+        );
+        assert!(login.message.contains("code=true"), "{}", login.message);
+        assert!(
+            login.message.contains("localhost%3A53692%2Fcallback"),
+            "{}",
+            login.message
+        );
+        assert!(!load_auth_store()?.providers.contains_key("anthropic"));
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("ANTHROPIC_API_KEY", old_anthropic_key);
+    restore_env_var("DEXT_SKIP_BROWSER_OPEN", old_skip_browser);
+    let _ = cancel_pending_oauth_login();
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn anthropic_web_reauth_keeps_existing_oauth_until_replacement_succeeds() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("anthropic-subscription-reauth");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_skip_browser = std::env::var_os("DEXT_SKIP_BROWSER_OPEN");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
+    }
+
+    let result = (|| -> Result<()> {
+        let mut store = AuthStore::default();
+        store.providers.insert(
+            "anthropic".to_string(),
+            StoredCredential::OAuth {
+                access_token: "existing-access".to_string(),
+                refresh_token: Some("existing-refresh".to_string()),
+                expires_at: Some(4_102_444_800),
+            },
+        );
+        save_auth_store(&store)?;
+        let login = login_provider(Some("anthropic"), Some("web"), false)?;
+        assert!(login.awaiting_credentials);
+        let store = load_auth_store()?;
+        assert_eq!(
+            store
+                .providers
+                .get("anthropic")
+                .and_then(StoredCredential::resolve_secret)
+                .as_deref(),
+            Some("existing-access")
+        );
+        Ok(())
+    })();
+
+    let _ = cancel_pending_oauth_login();
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_SKIP_BROWSER_OPEN", old_skip_browser);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn anthropic_api_key_argument_is_not_misclassified_as_oauth_code() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("anthropic-api-key-argument");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_dext_key = std::env::var_os("DEXT_API_KEY");
+    let old_anthropic_key = std::env::var_os("ANTHROPIC_API_KEY");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        crate::provider::save_pending_oauth(
+            "anthropic",
+            "verifier",
+            "expected-state",
+            "http://localhost:53692/callback",
+        )?;
+        let key = "sk-ant-api03-test-key-material";
+        let login = login_provider(Some("anthropic"), Some(key), false)?;
+        assert!(!login.awaiting_credentials);
+        let store = load_auth_store()?;
+        assert!(matches!(
+            store.providers.get("anthropic"),
+            Some(StoredCredential::ApiKey { key: stored }) if stored == key
+        ));
+        assert!(!crate::provider::pending_oauth_path().exists());
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_API_KEY", old_dext_key);
+    restore_env_var("ANTHROPIC_API_KEY", old_anthropic_key);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn structured_oauth_callback_requires_state() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("oauth-callback-missing-state");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
+
+    let result = (|| -> Result<()> {
+        crate::provider::save_pending_oauth(
+            "chatgpt",
+            "verifier",
+            "expected-state",
+            "http://localhost:1455/auth/callback",
+        )?;
+        let error = login_provider(
+            Some("chatgpt"),
+            Some("http://localhost:1455/auth/callback?code=manual-code"),
+            false,
+        )
+        .expect_err("structured callback must include state");
+        assert!(
+            error.to_string().contains("callback is missing state"),
+            "{error:#}"
+        );
+        assert!(crate::provider::pending_oauth_path().exists());
+        Ok(())
+    })();
+
+    let _ = cancel_pending_oauth_login();
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn oauth_callback_cannot_complete_a_different_provider_login() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("oauth-provider-binding");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
+
+    let result = (|| -> Result<()> {
+        crate::provider::save_pending_oauth(
+            "chatgpt",
+            "verifier",
+            "expected-state",
+            "http://localhost:1455/auth/callback",
+        )?;
+        let error = login_provider(
+            Some("anthropic"),
+            Some("http://localhost:1455/auth/callback?code=manual-code&state=expected-state"),
+            false,
+        )
+        .expect_err("callback must be bound to its pending provider");
+        assert!(
+            error
+                .to_string()
+                .contains("pending provider 'chatgpt', not 'anthropic'"),
+            "{error:#}"
+        );
+        Ok(())
+    })();
+
+    let _ = cancel_pending_oauth_login();
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<()> {
+    let root = temp_test_dir("anthropic-subscription-body");
+    let root = std::fs::canonicalize(&root)?;
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .context("anthropic profile")?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.provider_profile = Some(profile);
+    agent.base_url = "https://api.anthropic.com".to_string();
+    agent.model = "claude-sonnet-4-6".to_string();
+    agent.auth_kind = RuntimeAuthKind::OAuth;
+    agent.history = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "Reply with exactly: PROBE_OK".to_string(),
+        }],
+    }];
+    let system = [SystemBlock {
+        kind: "text",
+        text: "Dext system",
+        cache_control: None,
+    }];
+    let (_, body) = agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(
+        body["system"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("cc_version=2.1.224.f97"))
+    );
+    assert_eq!(
+        body["system"][1]["text"],
+        claude_subscription::AGENT_SDK_SYSTEM_PROMPT
+    );
+    assert_eq!(body["system"][2]["text"], "Dext system");
+
+    agent.auth_kind = RuntimeAuthKind::ApiKey;
+    let (_, api_body) =
+        agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let api_body: Value = serde_json::from_slice(&api_body)?;
+    assert_eq!(api_body["system"][0]["text"], "Dext system");
+    assert_eq!(api_body["system"].as_array().map(Vec::len), Some(1));
+
+    agent.auth_kind = RuntimeAuthKind::OAuth;
+    agent.base_url = "https://api.anthropic.com".to_string();
+    let summary = agent.build_anthropic_summary_request(
+        "claude-sonnet-4-6",
+        "Summarize this context",
+        1024,
+    )?;
+    let summary: Value = serde_json::from_slice(&summary)?;
+    assert_eq!(summary["stream"], false);
+    assert!(
+        summary["system"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("x-anthropic-billing-header: "))
+    );
+    assert_eq!(
+        summary["system"][1]["text"],
+        claude_subscription::AGENT_SDK_SYSTEM_PROMPT
+    );
+    assert_eq!(summary["system"][2]["text"], COMPACT_SYSTEM);
+
+    agent.base_url = "https://example.test".to_string();
+    let (_, custom_body) =
+        agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let custom_body: Value = serde_json::from_slice(&custom_body)?;
+    assert_eq!(custom_body["system"][0]["text"], "Dext system");
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn chatgpt_oauth_defaults_match_pi_flow() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("chatgpt-oauth-defaults");
@@ -21718,25 +22143,22 @@ fn chatgpt_oauth_defaults_match_pi_flow() -> Result<()> {
 }
 
 #[test]
-fn chatgpt_oauth_callback_host_env_override_is_respected() -> Result<()> {
+fn oauth_callback_host_override_must_remain_loopback() -> Result<()> {
     let _guard = env_lock();
-    let root = temp_test_dir("chatgpt-oauth-callback-host-override");
+    let root = temp_test_dir("oauth-callback-host-override");
     unsafe {
         std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
-        std::env::set_var("DEXT_OAUTH_CALLBACK_HOST", "256.0.0.1");
+        std::env::set_var("DEXT_OAUTH_CALLBACK_HOST", "0.0.0.0");
     }
 
-    let result = (|| -> Result<()> {
-        let login = login_provider(Some("chatgpt"), Some("web"), false)?;
-        assert!(login.awaiting_credentials);
-        assert!(
-            login.message.contains("256.0.0.1:1455"),
-            "{}",
-            login.message
-        );
+    let result = {
+        let error = login_provider(Some("chatgpt"), Some("web"), false)
+            .expect_err("OAuth callback listener must not bind non-loopback interfaces");
+        assert!(error.to_string().contains("loopback-only"), "{error:#}");
+        assert!(!crate::provider::pending_oauth_path().exists());
         Ok(())
-    })();
+    };
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
@@ -23142,6 +23564,8 @@ fn kimi_headers_use_plan_api_keys_and_isolate_official_metadata() -> Result<()> 
             RequestContract::AnthropicMessages,
             "kimi-key",
             true,
+            false,
+            false,
             None,
         )?
         .build()?;
@@ -23162,6 +23586,8 @@ fn kimi_headers_use_plan_api_keys_and_isolate_official_metadata() -> Result<()> 
             client.post("https://example.test/v1/messages"),
             RequestContract::AnthropicMessages,
             "custom-key",
+            false,
+            false,
             false,
             None,
         )?
