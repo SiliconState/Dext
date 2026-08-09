@@ -23401,7 +23401,7 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
     assert_eq!(value["thinking"]["type"], "adaptive");
-    assert_eq!(value["thinking"]["display"], "omitted");
+    assert!(value["thinking"].get("display").is_none(), "{value}");
     assert_eq!(value["output_config"]["effort"], "xhigh");
 
     agent.model = "claude-fable-5".to_string();
@@ -23409,7 +23409,7 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
     assert_eq!(value["thinking"]["type"], "adaptive");
-    assert_eq!(value["thinking"]["display"], "omitted");
+    assert!(value["thinking"].get("display").is_none(), "{value}");
     assert_eq!(value["output_config"]["effort"], "max");
 
     agent.model = "claude-opus-4-1".to_string();

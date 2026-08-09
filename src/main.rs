@@ -15999,11 +15999,10 @@ impl Agent {
                     )
                 } else if uses_anthropic_adaptive_thinking(&self.provider_id, &self.model) {
                     let effort = anthropic_output_config_effort(&self.model, effort);
-                    let always_adaptive = anthropic_model_is_always_adaptive(&self.model);
                     let thinking = effort.as_ref().map(|_| AnthropicThinking {
                         kind: "adaptive",
                         budget_tokens: None,
-                        display: always_adaptive.then_some("omitted"),
+                        display: None,
                     });
                     (
                         thinking,

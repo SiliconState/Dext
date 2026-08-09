@@ -1391,7 +1391,7 @@ credential-env: [SERVICE_TOKEN]
 </ul>
 <h3>Anthropic</h3>
 <ul>
-<li>The catalog includes current Sonnet, Opus, Fable, and Haiku model variants.</li>
+<li>The catalog includes current Sonnet, Opus, Fable, and Haiku model variants. Adaptive-thinking requests send no <code>thinking.display</code> preference, so always-adaptive models (Opus 4.7/4.8, Fable) stream visible thinking like Sonnet 4.6 instead of suppressing it with <code>display:"omitted"</code>.</li>
 <li>Context fallback: 200K tokens. <code>dext auth login anthropic</code> or <code>/login anthropic</code> starts the unofficial Claude Pro/Max subscription OAuth flow; re-run with <code>web</code> to replace an existing OAuth credential. <code>ANTHROPIC_API_KEY</code> remains the standard Anthropic Console API-key path.</li>
 <li>Subscription OAuth uses Dext-native request construction with a Claude Code 2.1.224-compatible billing/version fingerprint, seeded XXH64 body checksum, Agent SDK system block, OAuth beta/header set, and per-session/per-request UUIDs. Optional identity metadata is read in memory from <code>${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json</code> only after bounded regular non-symlink validation; identifiers are not copied, printed, or persisted by Dext.</li>
 <li>This compatibility path is unofficial, may be restricted by provider terms, and is version-specific. It fails closed during request construction and is isolated from API keys, non-official endpoints, GLM, Kimi, and custom Anthropic-compatible profiles.</li>
