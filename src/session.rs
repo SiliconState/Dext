@@ -34,7 +34,36 @@ pub(crate) fn dext_state_dir() -> PathBuf {
     if let Ok(p) = std::env::var("DEXT_HOME") {
         return PathBuf::from(p);
     }
-    user_home_dir().join(".dext")
+    // Unit tests that skip DEXT_HOME must never touch the real user state
+    // directory: live test agents would otherwise leak project/session
+    // residue into ~/.dext/projects. Give the test process one throwaway
+    // home under the OS temp root instead.
+    #[cfg(test)]
+    {
+        test_process_state_dir()
+    }
+    #[cfg(not(test))]
+    {
+        user_home_dir().join(".dext")
+    }
+}
+
+#[cfg(test)]
+fn test_process_state_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        // Match temp_test_dir: a fixed OS temp root, not TMPDIR, so parallel
+        // tests that override and then clean their own TMPDIR cannot relocate
+        // or delete the shared test state home mid-run.
+        #[cfg(unix)]
+        let temp_root = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let temp_root = std::env::temp_dir();
+        let dir = temp_root.join(format!("dext-test-home-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test state home");
+        dir
+    })
+    .clone()
 }
 
 fn canonicalize_with_missing_ancestors(path: &Path) -> std::result::Result<PathBuf, String> {

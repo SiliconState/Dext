@@ -127,6 +127,7 @@ pub(crate) enum AgentEvent {
     CompactEnd {
         before: usize,
         after: usize,
+        summary: String,
     },
     CompactFailed {
         message: String,

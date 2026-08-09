@@ -1701,7 +1701,14 @@ impl EventSink for ConsoleSink {
                 );
             }
             AgentEvent::CompactStart => {}
-            AgentEvent::CompactEnd { before, after } => {
+            AgentEvent::CompactEnd {
+                before,
+                after,
+                summary,
+            } => {
+                if !summary.trim().is_empty() {
+                    println!("{summary}");
+                }
                 println!("[compacted {before} → {after} messages]");
             }
             AgentEvent::CompactFailed { message } => {
@@ -13109,6 +13116,7 @@ struct Agent {
     last_checkpoint_at: Option<std::time::Instant>,
     session_model_pins: HashMap<String, String>,
     partial_stream_text: Option<String>,
+    quiet_stream_events: bool,
     compact_threshold_chars: Option<usize>,
     compact_threshold_percent: Option<u8>,
     context_window_tokens: u64,
@@ -13309,6 +13317,7 @@ impl Agent {
             last_checkpoint_at: None,
             session_model_pins: HashMap::new(),
             partial_stream_text: None,
+            quiet_stream_events: false,
             compact_threshold_chars: compact_threshold_percent
                 .map(|percent| compact_threshold_chars_for_window(context_window_tokens, percent)),
             compact_threshold_percent,
@@ -16889,6 +16898,21 @@ impl Agent {
         old: &[Message],
         evidence: &str,
     ) -> Result<(String, Usage)> {
+        // Responses-contract summaries reuse the shared streaming reader, which
+        // forwards deltas/blocks to the UI sink. Mute those events so every
+        // provider presents the summary exactly once through CompactEnd
+        // instead of some providers leaking it as live assistant output.
+        self.quiet_stream_events = true;
+        let result = self.one_shot_summary_request(old, evidence).await;
+        self.quiet_stream_events = false;
+        result
+    }
+
+    async fn one_shot_summary_request(
+        &mut self,
+        old: &[Message],
+        evidence: &str,
+    ) -> Result<(String, Usage)> {
         let transcript = render_transcript_for_summary(old, self.context_mode);
         let user_text = compaction_user_text_with_evidence(&transcript, evidence);
         let summary_model = self.compact_summary_model();
@@ -17260,7 +17284,11 @@ impl Agent {
         });
 
         let after = self.history.len();
-        self.sink.emit(AgentEvent::CompactEnd { before, after });
+        self.sink.emit(AgentEvent::CompactEnd {
+            before,
+            after,
+            summary,
+        });
         self.append_latest_log("compact_complete", &format!("{before} -> {after} messages"));
         self.checkpoint_latest_session("after_compact");
         Ok(())
@@ -18510,7 +18538,7 @@ impl Agent {
                 ),
             );
         }
-        if contract != RequestContract::AnthropicMessages {
+        if contract != RequestContract::AnthropicMessages && !self.quiet_stream_events {
             for block in &parsed.blocks {
                 match block {
                     Block::Thinking { text, .. } if contract.is_responses() => {
@@ -18524,25 +18552,30 @@ impl Agent {
                 }
             }
         }
-        for (idx, block) in parsed.blocks.iter().enumerate() {
-            let Block::ToolUse { id, name, input } = block else {
-                continue;
-            };
-            let privileged = self.tool_needs_permission(name) && !self.allowed.contains(name);
-            if contract == RequestContract::AnthropicMessages && privileged {
-                continue;
+        if !self.quiet_stream_events {
+            for (idx, block) in parsed.blocks.iter().enumerate() {
+                let Block::ToolUse { id, name, input } = block else {
+                    continue;
+                };
+                let privileged = self.tool_needs_permission(name) && !self.allowed.contains(name);
+                if contract == RequestContract::AnthropicMessages && privileged {
+                    continue;
+                }
+                self.sink.emit(AgentEvent::ToolCallPreview {
+                    call_id: normalize_tool_call_id(id, 0, idx),
+                    name: name.clone(),
+                    summary: summarize_call(name, input),
+                });
             }
-            self.sink.emit(AgentEvent::ToolCallPreview {
-                call_id: normalize_tool_call_id(id, 0, idx),
-                name: name.clone(),
-                summary: summarize_call(name, input),
-            });
         }
         self.partial_stream_text = None;
         Ok((parsed.blocks, parsed.stop_reason, parsed.usage))
     }
 
     fn emit_stream_updates(&mut self, updates: Vec<streaming::StreamUpdate>) {
+        if self.quiet_stream_events {
+            return;
+        }
         for update in updates {
             match update {
                 streaming::StreamUpdate::TextDelta(text) => {

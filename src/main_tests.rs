@@ -122,6 +122,7 @@ fn test_agent(root: &Path) -> Agent {
         last_checkpoint_at: None,
         session_model_pins: HashMap::new(),
         partial_stream_text: None,
+        quiet_stream_events: false,
         compact_threshold_chars: None,
         compact_threshold_percent: None,
         context_window_tokens: model_context_window("test-model"),
@@ -7930,7 +7931,9 @@ fn slash_resume_selector_loads_latest_autosaved_and_paths() -> Result<()> {
     unsafe {
         std::env::set_var("HOME", &home);
         std::env::set_var("USERPROFILE", &home);
-        std::env::remove_var("DEXT_HOME");
+        // The hermetic test state home lives outside $HOME; pin DEXT_HOME
+        // under the fake HOME so tilde-relative selectors stay testable.
+        std::env::set_var("DEXT_HOME", home.join(".dext"));
         std::env::remove_var("DEXT_SESSIONS_DIR");
     }
 

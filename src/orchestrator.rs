@@ -1461,6 +1461,19 @@ pub(crate) fn classify_http_failure(status: u16, body: &str) -> RetryPlan {
 pub(crate) fn classify_stream_error(body: &str) -> RetryPlan {
     let lower = body.to_ascii_lowercase();
 
+    // Responses streams that die inside a `response.incomplete` terminal event
+    // (missing/conflicting response objects) are backend truncation, not a
+    // request defect. Retry the request — bounded upstream by
+    // MAX_STREAM_ATTEMPTS and the visible-text guard — instead of failing the
+    // turn permanently. This must run before the token-limit rule below
+    // because these bodies can mention `max_output_tokens`.
+    if lower.contains("stream protocol error") && lower.contains("response.incomplete") {
+        return RetryPlan {
+            kind: FailureKind::Transient,
+            retry: true,
+        };
+    }
+
     // Explicit non-retryable signals win first (context exhausted, quota, auth).
     if lower.contains("context_length_exceeded")
         || lower.contains("context length")
@@ -2570,6 +2583,23 @@ mod tests {
         ] {
             assert!(!stream_error_is_context_overflow(body), "{body}");
         }
+    }
+
+    #[test]
+    fn classify_stream_error_retries_responses_incomplete_protocol_errors() {
+        // Exact historical failure shape that permanently failed live turns.
+        for body in [
+            "stream protocol error [chatgpt-responses/response.incomplete]: response did not complete; function calls were not accepted",
+            "stream protocol error [openai-responses/response.incomplete]: response.incomplete conflicted with response status",
+            "stream protocol error [chatgpt-responses/response.incomplete]: missing response",
+        ] {
+            let plan = classify_stream_error(body);
+            assert!(plan.retry, "{body}");
+            assert_eq!(plan.kind, FailureKind::Transient, "{body}");
+        }
+        // Plain incomplete markers without a protocol-error frame keep their
+        // existing classification.
+        assert!(!classify_stream_error("incomplete_details: max_output_tokens").retry);
     }
 
     #[test]
