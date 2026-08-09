@@ -1388,7 +1388,11 @@ fn api_tool_used_as_shell_filter(command: &str) -> Option<&'static str> {
         let Some(first) = words.next() else {
             continue;
         };
-        if !matches!(first, "rg" | "fd" | "jq") {
+        // Only always-exposed native tools belong here. Optional catalog
+        // tools (jq, awk, …) are absent from lean sessions, so advising
+        // "use the native tool" would steer the model at a tool it cannot
+        // call; their shell binaries are legitimate when installed.
+        if !matches!(first, "rg" | "fd") {
             continue;
         }
         if command.contains(&format!("command -v {first}"))
@@ -1399,7 +1403,6 @@ fn api_tool_used_as_shell_filter(command: &str) -> Option<&'static str> {
         return match first {
             "rg" => Some("rg"),
             "fd" => Some("fd"),
-            "jq" => Some("jq"),
             _ => None,
         };
     }
@@ -3343,6 +3346,15 @@ mod tests {
         )
         .expect("shell rg should warn");
         assert!(rg.contains("Dext API tool"), "{rg}");
+
+        assert!(
+            tool_input_advisory(
+                "bash",
+                &json!({"command": "git show HEAD:package.json | jq '.name'"}),
+            )
+            .is_none(),
+            "optional catalog tools like jq are not exposed in lean sessions and must not be advised as native"
+        );
 
         assert!(
             tool_input_advisory(

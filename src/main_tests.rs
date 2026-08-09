@@ -11242,6 +11242,18 @@ fn tool_result_metadata_parses_status_and_artifact_hints() {
     assert_eq!(parse_tool_exit_code("rg", true, "match\n"), None);
     assert!(looks_like_verification_command("cargo nextest run ui"));
 
+    // SIGPIPE truncation (`… | head` under pipefail): complete stdout is
+    // success; empty stdout or any other nonzero exit stays a failure.
+    assert!(bash_sigpipe_with_output(
+        "exit: 141\n--- stdout ---\ndata\n--- stderr ---\n"
+    ));
+    assert!(!bash_sigpipe_with_output(
+        "exit: 141\n--- stdout ---\n--- stderr ---\n"
+    ));
+    assert!(!bash_sigpipe_with_output(
+        "exit: 1\n--- stdout ---\ndata\n--- stderr ---\n"
+    ));
+
     let mut noted = failed.to_string();
     insert_runtime_notes(&mut noted, &["prefer native rg".to_string()]);
     assert_eq!(parse_tool_exit_code("bash", false, &noted), Some(101));

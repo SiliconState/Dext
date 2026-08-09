@@ -5969,6 +5969,18 @@ fn parse_bash_exit_code(content: &str) -> Option<i32> {
         .and_then(|raw| raw.trim().parse::<i32>().ok())
 }
 
+/// Under pipefail, pipelines feeding `head`-style consumers die with SIGPIPE
+/// (exit 141) even though the captured stdout is exactly what was requested.
+/// Classify that as success when stdout carried content; the raw `exit: 141`
+/// line stays visible so the model can still judge the truncation.
+fn bash_sigpipe_with_output(content: &str) -> bool {
+    parse_bash_exit_code(content) == Some(141)
+        && content
+            .split_once("--- stdout ---")
+            .map(|(_, tail)| tail.split("--- stderr ---").next().unwrap_or(""))
+            .is_some_and(|stdout| !stdout.trim().is_empty())
+}
+
 fn parse_tool_exit_code(name: &str, ok: bool, content: &str) -> Option<i32> {
     match name {
         "bash" => parse_bash_exit_code(content),
@@ -10174,7 +10186,8 @@ fn tool_journal_terminal_status(
         Err(_) => tool_journal::ToolJournalStatus::Failed,
         Ok(output)
             if name == "bash"
-                && parse_bash_exit_code(output).is_some_and(|exit_code| exit_code != 0) =>
+                && parse_bash_exit_code(output).is_some_and(|exit_code| exit_code != 0)
+                && !bash_sigpipe_with_output(output) =>
         {
             tool_journal::ToolJournalStatus::Failed
         }
