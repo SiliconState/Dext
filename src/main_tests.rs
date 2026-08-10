@@ -122,6 +122,7 @@ fn test_agent(root: &Path) -> Agent {
         last_checkpoint_at: None,
         session_model_pins: HashMap::new(),
         partial_stream_text: None,
+        last_stream_truncated_tool_calls: 0,
         quiet_stream_events: false,
         compact_threshold_chars: None,
         compact_threshold_percent: None,
@@ -14996,6 +14997,44 @@ fn chatgpt_incomplete_reason_is_contract_scoped() {
     );
     assert_eq!(
         chatgpt_incomplete_reason(RequestContract::ChatGptResponses, Some("completed")),
+        None
+    );
+}
+
+#[test]
+fn stream_recovery_reason_is_contract_scoped() {
+    assert_eq!(
+        stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 1)
+            .as_deref(),
+        Some("truncated_tool_call")
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::AnthropicMessages, None, 2).as_deref(),
+        Some("truncated_tool_call")
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 0),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::AnthropicMessages, Some("end_turn"), 0),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(
+            RequestContract::ChatGptResponses,
+            Some("incomplete:max_output_tokens"),
+            0
+        )
+        .as_deref(),
+        Some("max_output_tokens")
+    );
+    assert_eq!(
+        stream_recovery_reason(
+            RequestContract::OpenAiChatCompletions,
+            Some("incomplete"),
+            0
+        ),
         None
     );
 }

@@ -355,6 +355,19 @@ fn chatgpt_incomplete_reason(contract: RequestContract, stop_reason: Option<&str
     }
 }
 
+/// A response needs a bounded automatic continuation when the Responses API
+/// reported an incomplete status, or when the only streamed Anthropic tool
+/// calls were dropped because their argument JSON was cut off mid-stream.
+fn stream_recovery_reason(
+    contract: RequestContract,
+    stop_reason: Option<&str>,
+    truncated_tool_calls: usize,
+) -> Option<String> {
+    chatgpt_incomplete_reason(contract, stop_reason)
+        .map(str::to_string)
+        .or_else(|| (truncated_tool_calls > 0).then(|| "truncated_tool_call".to_string()))
+}
+
 fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
     let raw = e.to_string();
     let lower = raw.to_ascii_lowercase();
@@ -13116,6 +13129,7 @@ struct Agent {
     last_checkpoint_at: Option<std::time::Instant>,
     session_model_pins: HashMap<String, String>,
     partial_stream_text: Option<String>,
+    last_stream_truncated_tool_calls: usize,
     quiet_stream_events: bool,
     compact_threshold_chars: Option<usize>,
     compact_threshold_percent: Option<u8>,
@@ -13318,6 +13332,7 @@ impl Agent {
             session_model_pins: HashMap::new(),
             partial_stream_text: None,
             quiet_stream_events: false,
+            last_stream_truncated_tool_calls: 0,
             compact_threshold_chars: compact_threshold_percent
                 .map(|percent| compact_threshold_chars_for_window(context_window_tokens, percent)),
             compact_threshold_percent,
@@ -18057,9 +18072,13 @@ impl Agent {
                 })
                 .collect();
 
-            let incomplete_reason =
-                chatgpt_incomplete_reason(self.request_contract(), stop_reason.as_deref());
-            if let Some(reason) = incomplete_reason
+            let truncated_tool_calls = std::mem::take(&mut self.last_stream_truncated_tool_calls);
+            let incomplete_reason = stream_recovery_reason(
+                self.request_contract(),
+                stop_reason.as_deref(),
+                truncated_tool_calls,
+            );
+            if let Some(reason) = incomplete_reason.as_deref()
                 && tool_calls.is_empty()
             {
                 last_retry_reason = Some(format!("incomplete response ({reason})"));
@@ -18078,7 +18097,7 @@ impl Agent {
                 incomplete_response_recoveries = incomplete_response_recoveries.saturating_add(1);
                 if incomplete_response_recoveries > MAX_INCOMPLETE_RESPONSE_RECOVERIES {
                     let note = format!(
-                        "[provider recovery halted] The Responses API kept returning incomplete responses after {MAX_INCOMPLETE_RESPONSE_RECOVERIES} automatic recovery requests. The session remains usable; retry with `continue`, lower `/effort`, or switch models."
+                        "[provider recovery halted] The provider kept returning incomplete responses after {MAX_INCOMPLETE_RESPONSE_RECOVERIES} automatic recovery requests. The session remains usable; retry with `continue`, lower `/effort`, or switch models."
                     );
                     self.sink.emit(AgentEvent::Warn(note.clone()));
                     self.append_latest_log("incomplete_response_halt", &note);
@@ -18527,9 +18546,10 @@ impl Agent {
         }
 
         let parsed = parser.finish()?;
+        self.last_stream_truncated_tool_calls = parsed.truncated_tool_calls;
         if parsed.truncated_tool_calls > 0 {
             let note = format!(
-                "[provider truncation] Dropped {} tool call(s) whose streamed arguments were cut off (stop_reason={}). The turn continues with the remaining output; raise DEXT_MAX_OUTPUT_TOKENS or ask for smaller tool calls if this recurs.",
+                "[provider truncation] Dropped {} tool call(s) whose streamed arguments were cut off (stop_reason={}); continuing the turn.",
                 parsed.truncated_tool_calls,
                 parsed.stop_reason.as_deref().unwrap_or("unknown"),
             );
