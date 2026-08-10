@@ -18527,6 +18527,17 @@ impl Agent {
         }
 
         let parsed = parser.finish()?;
+        if parsed.truncated_tool_calls > 0 {
+            let note = format!(
+                "[provider truncation] Dropped {} tool call(s) whose streamed arguments were cut off (stop_reason={}). The turn continues with the remaining output; raise DEXT_MAX_OUTPUT_TOKENS or ask for smaller tool calls if this recurs.",
+                parsed.truncated_tool_calls,
+                parsed.stop_reason.as_deref().unwrap_or("unknown"),
+            );
+            if !self.quiet_stream_events {
+                self.sink.emit(AgentEvent::Warn(note.clone()));
+            }
+            self.append_latest_log("stream_truncated_tool_calls", &note);
+        }
         if parsed.unknown_events > 0 {
             self.append_latest_log(
                 "stream_unknown_events",

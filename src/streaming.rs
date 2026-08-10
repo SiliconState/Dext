@@ -22,6 +22,7 @@ pub(crate) struct ParsedStream {
     pub(crate) stop_reason: Option<String>,
     pub(crate) usage: Usage,
     pub(crate) unknown_events: usize,
+    pub(crate) truncated_tool_calls: usize,
 }
 
 pub(crate) struct ProviderStreamParser {
@@ -55,6 +56,7 @@ struct AnthropicBlock {
     thinking_signature: Option<String>,
     redacted_data: String,
     stopped: bool,
+    implicit_stop: bool,
 }
 
 #[derive(Default)]
@@ -603,6 +605,7 @@ fn parse_anthropic_frame(
                     continue;
                 }
                 block.stopped = true;
+                block.implicit_stop = true;
                 match block.kind.as_str() {
                     "text" => updates.push(StreamUpdate::TextBlockComplete(block.text.clone())),
                     "thinking" => {
@@ -676,6 +679,8 @@ fn finish_anthropic(contract: RequestContract, state: AnthropicState) -> Result<
             "stream ended before message_stop",
         ));
     }
+    let output_truncated = state.stop_reason.as_deref() == Some("max_tokens");
+    let mut truncated_tool_calls = 0usize;
     let mut blocks = Vec::new();
     for (idx, block) in state.blocks {
         if !block.stopped {
@@ -702,17 +707,27 @@ fn finish_anthropic(contract: RequestContract, state: AnthropicState) -> Result<
                 });
             }
             "tool_use" => {
-                let input = parse_tool_arguments(
+                match parse_tool_arguments(
                     contract,
                     "finalize",
                     &format!("block {idx}"),
                     block.input_json.as_deref().unwrap_or(""),
-                )?;
-                blocks.push(Block::ToolUse {
-                    id: block.id,
-                    name: block.name,
-                    input,
-                });
+                ) {
+                    Ok(input) => blocks.push(Block::ToolUse {
+                        id: block.id,
+                        name: block.name,
+                        input,
+                    }),
+                    // max_tokens (or an abrupt end that skipped
+                    // content_block_stop) can cut the stream mid
+                    // input_json_delta. The call is unexecutable; drop it
+                    // instead of failing the turn, mirroring the Responses
+                    // truncated-call recovery.
+                    Err(_) if output_truncated || block.implicit_stop => {
+                        truncated_tool_calls += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             _ => {}
         }
@@ -722,6 +737,7 @@ fn finish_anthropic(contract: RequestContract, state: AnthropicState) -> Result<
         stop_reason: state.stop_reason,
         usage: state.usage,
         unknown_events: state.unknown_events,
+        truncated_tool_calls,
     })
 }
 
@@ -864,6 +880,7 @@ fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<Parsed
         stop_reason: state.stop_reason,
         usage: state.usage,
         unknown_events: state.unknown_events,
+        truncated_tool_calls: 0,
     })
 }
 
@@ -1520,6 +1537,7 @@ fn finish_chatgpt(contract: RequestContract, mut state: ChatGptState) -> Result<
         stop_reason: state.stop_reason,
         usage: state.usage,
         unknown_events: state.unknown_events,
+        truncated_tool_calls: 0,
     })
 }
 
@@ -1656,6 +1674,86 @@ mod tests {
             parsed.blocks.as_slice(),
             [Block::Text { text }] if text == "partial answer"
         ));
+    }
+
+    #[test]
+    fn anthropic_truncated_tool_call_is_dropped_not_fatal() {
+        let contract = RequestContract::AnthropicMessages;
+        // Case 1: explicit content_block_stop, stop_reason=max_tokens, cut JSON.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":2}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"working"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"write_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"big.txt\",\"content\":\"trunc"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::Text { text }] if text == "working"
+        ));
+        assert_eq!(parsed.truncated_tool_calls, 1);
+        assert_eq!(parsed.stop_reason.as_deref(), Some("max_tokens"));
+
+        // Case 2: abrupt message_stop implicitly closes the cut tool block.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"write_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"big"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert!(parsed.blocks.is_empty());
+        assert_eq!(parsed.truncated_tool_calls, 1);
     }
 
     #[test]
