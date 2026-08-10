@@ -595,14 +595,24 @@ fn parse_anthropic_frame(
         }
         "message_stop" => {
             require_anthropic_message_open(contract, state, event)?;
-            if state.blocks.values().any(|block| !block.stopped) {
-                return Err(protocol_error(
-                    contract,
-                    event,
-                    "message stopped with an open content block",
-                ));
+            // Providers occasionally omit the final content_block_stop before
+            // message_stop; close open blocks implicitly instead of failing the turn.
+            let mut updates = Vec::new();
+            for block in state.blocks.values_mut() {
+                if block.stopped {
+                    continue;
+                }
+                block.stopped = true;
+                match block.kind.as_str() {
+                    "text" => updates.push(StreamUpdate::TextBlockComplete(block.text.clone())),
+                    "thinking" => {
+                        updates.push(StreamUpdate::ThinkingBlockComplete(block.text.clone()));
+                    }
+                    _ => {}
+                }
             }
             state.message_stopped = true;
+            return Ok(updates);
         }
         "error" => {
             let error_type = data
@@ -1602,6 +1612,50 @@ mod tests {
         }
         let error = parser.finish().unwrap_err().to_string();
         assert!(error.contains("arguments must be a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_message_stop_closes_open_blocks_implicitly() {
+        let contract = RequestContract::AnthropicMessages;
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":2}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}"#,
+            ),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let updates = parser
+            .push_frame(SseFrame {
+                event: Some("message_stop".to_string()),
+                data: Some(r#"{"type":"message_stop"}"#.to_string()),
+            })
+            .unwrap();
+        assert_eq!(
+            updates,
+            vec![StreamUpdate::TextBlockComplete(
+                "partial answer".to_string()
+            )]
+        );
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::Text { text }] if text == "partial answer"
+        ));
     }
 
     #[test]
