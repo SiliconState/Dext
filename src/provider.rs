@@ -184,6 +184,7 @@ const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_BUILTIN_PROFILE_MARKER: &str = "anthropic";
 const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const OAUTH_CALLBACK_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const OAUTH_RESPONSE_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3782,12 +3783,18 @@ fn spawn_oauth_code_listener(
             };
             use std::io::{Read, Write};
 
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+            let request_started = std::time::Instant::now();
+            let _ = stream.set_write_timeout(Some(OAUTH_CALLBACK_IO_TIMEOUT));
             let mut request = Vec::with_capacity(1024);
             let mut buf = [0u8; 1024];
             let mut headers_complete = false;
             while request.len() < 8192 {
+                let read_timeout =
+                    OAUTH_CALLBACK_IO_TIMEOUT.saturating_sub(request_started.elapsed());
+                if read_timeout.is_zero() {
+                    break;
+                }
+                let _ = stream.set_read_timeout(Some(read_timeout));
                 let remaining = 8192 - request.len();
                 let read_len = remaining.min(buf.len());
                 match stream.read(&mut buf[..read_len]) {
@@ -5486,7 +5493,7 @@ mod tests {
             stream.read_to_end(&mut response)?;
             Ok(response)
         });
-        let received = callback.recv_timeout(Duration::from_secs(2))?;
+        let received = callback.recv_timeout(Duration::from_secs(5))?;
         let OAuthCallbackKind::Code(code) = received.kind else {
             anyhow::bail!("expected OAuth code callback");
         };
@@ -5629,11 +5636,12 @@ mod tests {
         )?;
         let mut stream = std::net::TcpStream::connect(address)?;
         stream.write_all(b"GET /callback?code=fragmented")?;
-        std::thread::sleep(Duration::from_millis(25));
+        stream.flush()?;
+        std::thread::sleep(Duration::from_millis(350));
         stream.write_all(b"-code&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
         stream.flush()?;
         let mut response = Vec::new();
-        let received = callback.recv_timeout(Duration::from_secs(2))?;
+        let received = callback.recv_timeout(Duration::from_secs(5))?;
         let OAuthCallbackKind::Code(code) = received.kind else {
             anyhow::bail!("expected OAuth code callback");
         };
