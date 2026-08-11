@@ -78,6 +78,7 @@ fn test_agent(root: &Path) -> Agent {
         provider_profile: None,
         api_key: "test-key".to_string(),
         key_source: "test".to_string(),
+        auth_kind: RuntimeAuthKind::ApiKey,
         provider_requires_api_key: true,
         base_url: "http://127.0.0.1".to_string(),
         model: "test-model".to_string(),
@@ -112,6 +113,8 @@ fn test_agent(root: &Path) -> Agent {
         state_lock: None,
         session_enabled: true,
         session_id: session_id.clone(),
+        claude_session_id: "11111111-2222-4333-8444-555555555555".to_string(),
+        claude_identity: None,
         latest_session_path: session_latest_session_path(root, &session_id),
         latest_log_path: session_latest_log_path(root, &session_id),
         pending_login_provider: None,
@@ -119,6 +122,7 @@ fn test_agent(root: &Path) -> Agent {
         last_checkpoint_at: None,
         session_model_pins: HashMap::new(),
         partial_stream_text: None,
+        quiet_stream_events: false,
         compact_threshold_chars: None,
         compact_threshold_percent: None,
         context_window_tokens: model_context_window("test-model"),
@@ -7927,7 +7931,9 @@ fn slash_resume_selector_loads_latest_autosaved_and_paths() -> Result<()> {
     unsafe {
         std::env::set_var("HOME", &home);
         std::env::set_var("USERPROFILE", &home);
-        std::env::remove_var("DEXT_HOME");
+        // The hermetic test state home lives outside $HOME; pin DEXT_HOME
+        // under the fake HOME so tilde-relative selectors stay testable.
+        std::env::set_var("DEXT_HOME", home.join(".dext"));
         std::env::remove_var("DEXT_SESSIONS_DIR");
     }
 
@@ -11239,6 +11245,18 @@ fn tool_result_metadata_parses_status_and_artifact_hints() {
     assert_eq!(parse_tool_exit_code("rg", true, "match\n"), None);
     assert!(looks_like_verification_command("cargo nextest run ui"));
 
+    // SIGPIPE truncation (`… | head` under pipefail): complete stdout is
+    // success; empty stdout or any other nonzero exit stays a failure.
+    assert!(bash_sigpipe_with_output(
+        "exit: 141\n--- stdout ---\ndata\n--- stderr ---\n"
+    ));
+    assert!(!bash_sigpipe_with_output(
+        "exit: 141\n--- stdout ---\n--- stderr ---\n"
+    ));
+    assert!(!bash_sigpipe_with_output(
+        "exit: 1\n--- stdout ---\ndata\n--- stderr ---\n"
+    ));
+
     let mut noted = failed.to_string();
     insert_runtime_notes(&mut noted, &["prefer native rg".to_string()]);
     assert_eq!(parse_tool_exit_code("bash", false, &noted), Some(101));
@@ -13832,10 +13850,11 @@ fn fd_tool_threads_extra_args_on_happy_path() {
     )
     .expect("prepare fd with extras");
     assert_eq!(bin, "fd");
-    // extras prepended, then pattern, then path (per prepare_external_tool).
+    // Explicit extras stay first; default excludes may follow. Pattern and path are always last.
     assert_eq!(&args[0..3], &["-H", "--type", "f"]);
-    assert_eq!(args[3], "\\.rs$");
-    assert_eq!(args.get(4).map(String::as_str), root.to_str());
+    assert_eq!(args.get(args.len() - 3).map(String::as_str), Some("--"));
+    assert_eq!(args.get(args.len() - 2).map(String::as_str), Some("\\.rs$"));
+    assert_eq!(args.last().map(String::as_str), root.to_str());
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -14982,6 +15001,52 @@ fn chatgpt_incomplete_reason_is_contract_scoped() {
 }
 
 #[test]
+fn stream_recovery_reason_is_contract_scoped() {
+    assert_eq!(
+        stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 1)
+            .as_deref(),
+        Some("unfinished_tool_call")
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::AnthropicMessages, None, 2).as_deref(),
+        Some("unfinished_tool_call")
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 0),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::AnthropicMessages, Some("end_turn"), 0),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(
+            RequestContract::ChatGptResponses,
+            Some("incomplete:max_output_tokens"),
+            0
+        )
+        .as_deref(),
+        Some("max_output_tokens")
+    );
+    assert_eq!(
+        stream_recovery_reason(
+            RequestContract::OpenAiChatCompletions,
+            Some("incomplete"),
+            0
+        ),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::OpenAiChatCompletions, None, 1),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::ChatGptResponses, Some("completed"), 1),
+        None
+    );
+}
+
+#[test]
 fn partial_stream_preserve_only_text_blocks() {
     let blocks = vec![Block::Text {
         text: "partial".to_string(),
@@ -15066,6 +15131,89 @@ fn partial_stream_preserve_only_text_blocks() {
         &mut history,
         ContextMode::Frugal
     ));
+
+    let mut history = Vec::new();
+    assert!(maybe_preserve_assistant_response(
+        &tool_only,
+        &mut history,
+        ContextMode::Standard
+    ));
+    assert!(matches!(
+        history.as_slice(),
+        [Message { role, content }]
+            if role == "assistant" && content == &tool_only
+    ));
+    assert!(!maybe_preserve_assistant_response(
+        &tool_only,
+        &mut history,
+        ContextMode::Standard
+    ));
+    assert_eq!(history.len(), 1);
+}
+
+#[test]
+fn nontext_assistant_response_precedes_tool_results_on_every_wire_contract() {
+    let root = temp_test_dir("nontext-assistant-history-pairing");
+    let mut agent = test_agent(&root);
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "Read the todo list.".to_string(),
+        }],
+    });
+    let tool_only = vec![Block::ToolUse {
+        id: "call_1".to_string(),
+        name: "todo_read".to_string(),
+        input: json!({}),
+    }];
+    assert!(maybe_preserve_assistant_response(
+        &tool_only,
+        &mut agent.history,
+        ContextMode::Standard
+    ));
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_1", "(no todos)", None)],
+    });
+
+    let anthropic = anthropic_wire_messages(
+        &sanitize_anthropic_messages(&agent.history, false, false),
+        false,
+    )
+    .expect("Anthropic wire history");
+    assert_eq!(
+        anthropic
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        ["user", "assistant", "user"]
+    );
+    assert_eq!(anthropic[1]["content"][0]["type"], "tool_use");
+    assert_eq!(anthropic[2]["content"][0]["type"], "tool_result");
+
+    let responses = agent.history_to_chatgpt_input();
+    let call_index = responses
+        .iter()
+        .position(|item| item["type"] == "function_call")
+        .expect("Responses function call");
+    let result_index = responses
+        .iter()
+        .position(|item| item["type"] == "function_call_output")
+        .expect("Responses function output");
+    assert!(call_index < result_index, "{responses:?}");
+
+    let chat_completions = agent.history_to_oai_messages("system");
+    let assistant_index = chat_completions
+        .iter()
+        .position(|message| message.role == "assistant")
+        .expect("Chat Completions assistant tool call");
+    let result_index = chat_completions
+        .iter()
+        .position(|message| message.role == "tool")
+        .expect("Chat Completions tool result");
+    assert!(assistant_index < result_index);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -17116,6 +17264,7 @@ fn provider_switches_update_only_automatic_context_mode() {
         profile: local,
         api_key: String::new(),
         key_source: "not-required".to_string(),
+        auth_kind: RuntimeAuthKind::None,
         base_url: String::new(),
         requires_api_key: false,
     });
@@ -17130,6 +17279,7 @@ fn provider_switches_update_only_automatic_context_mode() {
         profile: openai,
         api_key: "test".to_string(),
         key_source: "test".to_string(),
+        auth_kind: RuntimeAuthKind::ApiKey,
         base_url: "https://api.openai.com".to_string(),
         requires_api_key: true,
     });
@@ -17145,6 +17295,7 @@ fn provider_switches_update_only_automatic_context_mode() {
         profile: local,
         api_key: String::new(),
         key_source: "not-required".to_string(),
+        auth_kind: RuntimeAuthKind::None,
         base_url: String::new(),
         requires_api_key: false,
     });
@@ -20393,6 +20544,7 @@ fn legacy_bundled_providers_are_pruned_from_catalog() -> Result<()> {
         let anthropic = find_provider_profile(&catalog, "anthropic").context("anthropic")?;
         assert_eq!(anthropic.api_provider, ApiProvider::Anthropic);
         assert_eq!(anthropic.env_vars, vec!["ANTHROPIC_API_KEY"]);
+        assert!(anthropic.oauth_flow.is_some());
 
         let kimi = find_provider_profile(&catalog, "kimi").context("kimi")?;
         assert_eq!(kimi.api_provider, ApiProvider::Anthropic);
@@ -21690,6 +21842,423 @@ fn oauth_exchange_failure_stays_retryable() {
 }
 
 #[test]
+fn anthropic_subscription_oauth_defaults_and_runtime_auth_are_distinct() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("anthropic-subscription-auth");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_dext_key = std::env::var_os("DEXT_API_KEY");
+    let old_anthropic_key = std::env::var_os("ANTHROPIC_API_KEY");
+    let old_anthropic_base = std::env::var_os("ANTHROPIC_BASE_URL");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        let catalog = load_provider_catalog()?;
+        let profile = find_provider_profile(&catalog, "anthropic").context("anthropic profile")?;
+        let oauth = profile.oauth_flow.as_ref().context("Anthropic OAuth")?;
+        assert_eq!(
+            oauth.protocol,
+            crate::provider::OAuthProtocol::AnthropicClaude
+        );
+        assert_eq!(oauth.authorize_url, "https://claude.ai/oauth/authorize");
+        assert_eq!(
+            oauth.token_url,
+            "https://platform.claude.com/v1/oauth/token"
+        );
+        assert_eq!(
+            oauth.redirect_uri.as_deref(),
+            Some("http://localhost:53692/callback")
+        );
+        assert!(oauth.scope.contains("user:inference"));
+        assert!(oauth.scope.contains("user:sessions:claude_code"));
+
+        let mut store = AuthStore::default();
+        store.providers.insert(
+            "anthropic".to_string(),
+            StoredCredential::OAuth {
+                access_token: "oauth-access".to_string(),
+                refresh_token: Some("oauth-refresh".to_string()),
+                expires_at: Some(4_102_444_800),
+            },
+        );
+        save_auth_store(&store)?;
+        unsafe { std::env::set_var("ANTHROPIC_BASE_URL", "https://example.test") };
+        let error = resolve_runtime_provider(Some("anthropic"), true)
+            .expect_err("subscription OAuth must not fall through to a custom endpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("restricted to https://api.anthropic.com"),
+            "{error:#}"
+        );
+        unsafe { std::env::remove_var("ANTHROPIC_BASE_URL") };
+        let resolved = resolve_runtime_provider(Some("anthropic"), true)?;
+        assert_eq!(resolved.auth_kind, RuntimeAuthKind::OAuth);
+        assert_eq!(resolved.api_key, "oauth-access");
+
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "api-key") };
+        let resolved = resolve_runtime_provider(Some("anthropic"), true)?;
+        assert_eq!(resolved.auth_kind, RuntimeAuthKind::OAuth);
+        assert_eq!(resolved.api_key, "oauth-access");
+
+        store.providers.remove("anthropic");
+        save_auth_store(&store)?;
+        let resolved = resolve_runtime_provider(Some("anthropic"), true)?;
+        assert_eq!(resolved.auth_kind, RuntimeAuthKind::ApiKey);
+        assert_eq!(resolved.api_key, "api-key");
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_API_KEY", old_dext_key);
+    restore_env_var("ANTHROPIC_API_KEY", old_anthropic_key);
+    restore_env_var("ANTHROPIC_BASE_URL", old_anthropic_base);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn anthropic_subscription_headers_use_bearer_and_api_keys_do_not() -> Result<()> {
+    let client = reqwest::Client::new();
+    let subscription = apply_provider_headers(
+        client.post("https://api.anthropic.com/v1/messages"),
+        RequestContract::AnthropicMessages,
+        "oauth-access",
+        false,
+        true,
+        false,
+        Some("11111111-2222-4333-8444-555555555555"),
+    )?
+    .build()?;
+    assert_eq!(
+        subscription.headers()["authorization"],
+        "Bearer oauth-access"
+    );
+    assert!(!subscription.headers().contains_key("x-api-key"));
+    assert_eq!(subscription.headers()["x-app"], "cli");
+    assert_eq!(
+        subscription.headers()["anthropic-beta"],
+        "claude-code-20250219,oauth-2025-04-20"
+    );
+    assert_eq!(
+        subscription.headers()["anthropic-dangerous-direct-browser-access"],
+        "true"
+    );
+    assert_eq!(
+        subscription.headers()["x-claude-code-session-id"],
+        "11111111-2222-4333-8444-555555555555"
+    );
+    assert!(subscription.headers().contains_key("x-client-request-id"));
+    assert!(
+        subscription.headers()["user-agent"]
+            .to_str()?
+            .starts_with("claude-cli/2.1.224")
+    );
+
+    let second = apply_provider_headers(
+        client.post("https://api.anthropic.com/v1/messages"),
+        RequestContract::AnthropicMessages,
+        "oauth-access",
+        false,
+        true,
+        true,
+        Some("11111111-2222-4333-8444-555555555555"),
+    )?
+    .build()?;
+    assert_ne!(
+        subscription.headers()["x-client-request-id"],
+        second.headers()["x-client-request-id"]
+    );
+    assert_eq!(
+        second.headers()["anthropic-beta"],
+        "claude-code-20250219,oauth-2025-04-20,extended-cache-ttl-2025-04-11"
+    );
+
+    let api_key = apply_provider_headers(
+        client.post("https://api.anthropic.com/v1/messages"),
+        RequestContract::AnthropicMessages,
+        "api-key",
+        false,
+        false,
+        false,
+        None,
+    )?
+    .build()?;
+    assert_eq!(api_key.headers()["x-api-key"], "api-key");
+    assert!(!api_key.headers().contains_key("authorization"));
+    assert!(!api_key.headers().contains_key("x-app"));
+    Ok(())
+}
+
+#[test]
+fn anthropic_login_starts_subscription_oauth_even_when_api_key_env_exists() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("anthropic-subscription-login");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_anthropic_key = std::env::var_os("ANTHROPIC_API_KEY");
+    let old_skip_browser = std::env::var_os("DEXT_SKIP_BROWSER_OPEN");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("ANTHROPIC_API_KEY", "console-key");
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
+    }
+
+    let result = (|| -> Result<()> {
+        let login = login_provider(Some("anthropic"), None, false)?;
+        assert!(login.awaiting_credentials);
+        assert!(
+            login.message.contains("claude.ai/oauth/authorize"),
+            "{}",
+            login.message
+        );
+        assert!(login.message.contains("code=true"), "{}", login.message);
+        assert!(
+            login.message.contains("localhost%3A53692%2Fcallback"),
+            "{}",
+            login.message
+        );
+        assert!(!load_auth_store()?.providers.contains_key("anthropic"));
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("ANTHROPIC_API_KEY", old_anthropic_key);
+    restore_env_var("DEXT_SKIP_BROWSER_OPEN", old_skip_browser);
+    let _ = cancel_pending_oauth_login();
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn anthropic_web_reauth_keeps_existing_oauth_until_replacement_succeeds() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("anthropic-subscription-reauth");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_skip_browser = std::env::var_os("DEXT_SKIP_BROWSER_OPEN");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
+    }
+
+    let result = (|| -> Result<()> {
+        let mut store = AuthStore::default();
+        store.providers.insert(
+            "anthropic".to_string(),
+            StoredCredential::OAuth {
+                access_token: "existing-access".to_string(),
+                refresh_token: Some("existing-refresh".to_string()),
+                expires_at: Some(4_102_444_800),
+            },
+        );
+        save_auth_store(&store)?;
+        let login = login_provider(Some("anthropic"), Some("web"), false)?;
+        assert!(login.awaiting_credentials);
+        let store = load_auth_store()?;
+        assert_eq!(
+            store
+                .providers
+                .get("anthropic")
+                .and_then(StoredCredential::resolve_secret)
+                .as_deref(),
+            Some("existing-access")
+        );
+        Ok(())
+    })();
+
+    let _ = cancel_pending_oauth_login();
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_SKIP_BROWSER_OPEN", old_skip_browser);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn anthropic_api_key_argument_is_not_misclassified_as_oauth_code() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("anthropic-api-key-argument");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    let old_dext_key = std::env::var_os("DEXT_API_KEY");
+    let old_anthropic_key = std::env::var_os("ANTHROPIC_API_KEY");
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    let result = (|| -> Result<()> {
+        crate::provider::save_pending_oauth(
+            "anthropic",
+            "verifier",
+            "expected-state",
+            "http://localhost:53692/callback",
+        )?;
+        let key = "sk-ant-api03-test-key-material";
+        let login = login_provider(Some("anthropic"), Some(key), false)?;
+        assert!(!login.awaiting_credentials);
+        let store = load_auth_store()?;
+        assert!(matches!(
+            store.providers.get("anthropic"),
+            Some(StoredCredential::ApiKey { key: stored }) if stored == key
+        ));
+        assert!(!crate::provider::pending_oauth_path().exists());
+        Ok(())
+    })();
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    restore_env_var("DEXT_API_KEY", old_dext_key);
+    restore_env_var("ANTHROPIC_API_KEY", old_anthropic_key);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn structured_oauth_callback_requires_state() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("oauth-callback-missing-state");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
+
+    let result = (|| -> Result<()> {
+        crate::provider::save_pending_oauth(
+            "chatgpt",
+            "verifier",
+            "expected-state",
+            "http://localhost:1455/auth/callback",
+        )?;
+        let error = login_provider(
+            Some("chatgpt"),
+            Some("http://localhost:1455/auth/callback?code=manual-code"),
+            false,
+        )
+        .expect_err("structured callback must include state");
+        assert!(
+            error.to_string().contains("callback is missing state"),
+            "{error:#}"
+        );
+        assert!(crate::provider::pending_oauth_path().exists());
+        Ok(())
+    })();
+
+    let _ = cancel_pending_oauth_login();
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn oauth_callback_cannot_complete_a_different_provider_login() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("oauth-provider-binding");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe { std::env::set_var("DEXT_HOME", &root) };
+
+    let result = (|| -> Result<()> {
+        crate::provider::save_pending_oauth(
+            "chatgpt",
+            "verifier",
+            "expected-state",
+            "http://localhost:1455/auth/callback",
+        )?;
+        let error = login_provider(
+            Some("anthropic"),
+            Some("http://localhost:1455/auth/callback?code=manual-code&state=expected-state"),
+            false,
+        )
+        .expect_err("callback must be bound to its pending provider");
+        assert!(
+            error
+                .to_string()
+                .contains("pending provider 'chatgpt', not 'anthropic'"),
+            "{error:#}"
+        );
+        Ok(())
+    })();
+
+    let _ = cancel_pending_oauth_login();
+    restore_env_var("DEXT_HOME", old_dext_home);
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<()> {
+    let root = temp_test_dir("anthropic-subscription-body");
+    let root = std::fs::canonicalize(&root)?;
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .context("anthropic profile")?;
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.provider_profile = Some(profile);
+    agent.base_url = "https://api.anthropic.com".to_string();
+    agent.model = "claude-sonnet-4-6".to_string();
+    agent.auth_kind = RuntimeAuthKind::OAuth;
+    agent.history = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "Reply with exactly: PROBE_OK".to_string(),
+        }],
+    }];
+    let system = [SystemBlock {
+        kind: "text",
+        text: "Dext system",
+        cache_control: None,
+    }];
+    let (_, body) = agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(
+        body["system"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("cc_version=2.1.224.f97"))
+    );
+    assert_eq!(
+        body["system"][1]["text"],
+        claude_subscription::AGENT_SDK_SYSTEM_PROMPT
+    );
+    assert_eq!(body["system"][2]["text"], "Dext system");
+
+    agent.auth_kind = RuntimeAuthKind::ApiKey;
+    let (_, api_body) =
+        agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let api_body: Value = serde_json::from_slice(&api_body)?;
+    assert_eq!(api_body["system"][0]["text"], "Dext system");
+    assert_eq!(api_body["system"].as_array().map(Vec::len), Some(1));
+
+    agent.auth_kind = RuntimeAuthKind::OAuth;
+    agent.base_url = "https://api.anthropic.com".to_string();
+    let summary = agent.build_anthropic_summary_request(
+        "claude-sonnet-4-6",
+        "Summarize this context",
+        1024,
+    )?;
+    let summary: Value = serde_json::from_slice(&summary)?;
+    assert_eq!(summary["stream"], false);
+    assert!(
+        summary["system"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("x-anthropic-billing-header: "))
+    );
+    assert_eq!(
+        summary["system"][1]["text"],
+        claude_subscription::AGENT_SDK_SYSTEM_PROMPT
+    );
+    assert_eq!(summary["system"][2]["text"], COMPACT_SYSTEM);
+
+    agent.base_url = "https://example.test".to_string();
+    let (_, custom_body) =
+        agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let custom_body: Value = serde_json::from_slice(&custom_body)?;
+    assert_eq!(custom_body["system"][0]["text"], "Dext system");
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn chatgpt_oauth_defaults_match_pi_flow() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("chatgpt-oauth-defaults");
@@ -21718,25 +22287,22 @@ fn chatgpt_oauth_defaults_match_pi_flow() -> Result<()> {
 }
 
 #[test]
-fn chatgpt_oauth_callback_host_env_override_is_respected() -> Result<()> {
+fn oauth_callback_host_override_must_remain_loopback() -> Result<()> {
     let _guard = env_lock();
-    let root = temp_test_dir("chatgpt-oauth-callback-host-override");
+    let root = temp_test_dir("oauth-callback-host-override");
     unsafe {
         std::env::set_var("DEXT_HOME", &root);
         std::env::set_var("DEXT_SKIP_BROWSER_OPEN", "1");
-        std::env::set_var("DEXT_OAUTH_CALLBACK_HOST", "256.0.0.1");
+        std::env::set_var("DEXT_OAUTH_CALLBACK_HOST", "0.0.0.0");
     }
 
-    let result = (|| -> Result<()> {
-        let login = login_provider(Some("chatgpt"), Some("web"), false)?;
-        assert!(login.awaiting_credentials);
-        assert!(
-            login.message.contains("256.0.0.1:1455"),
-            "{}",
-            login.message
-        );
+    let result = {
+        let error = login_provider(Some("chatgpt"), Some("web"), false)
+            .expect_err("OAuth callback listener must not bind non-loopback interfaces");
+        assert!(error.to_string().contains("loopback-only"), "{error:#}");
+        assert!(!crate::provider::pending_oauth_path().exists());
         Ok(())
-    })();
+    };
 
     unsafe {
         std::env::remove_var("DEXT_HOME");
@@ -22964,7 +23530,7 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
     assert_eq!(value["thinking"]["type"], "adaptive");
-    assert_eq!(value["thinking"]["display"], "omitted");
+    assert!(value["thinking"].get("display").is_none(), "{value}");
     assert_eq!(value["output_config"]["effort"], "xhigh");
 
     agent.model = "claude-fable-5".to_string();
@@ -22972,7 +23538,7 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
     assert_eq!(value["thinking"]["type"], "adaptive");
-    assert_eq!(value["thinking"]["display"], "omitted");
+    assert!(value["thinking"].get("display").is_none(), "{value}");
     assert_eq!(value["output_config"]["effort"], "max");
 
     agent.model = "claude-opus-4-1".to_string();
@@ -23142,6 +23708,8 @@ fn kimi_headers_use_plan_api_keys_and_isolate_official_metadata() -> Result<()> 
             RequestContract::AnthropicMessages,
             "kimi-key",
             true,
+            false,
+            false,
             None,
         )?
         .build()?;
@@ -23162,6 +23730,8 @@ fn kimi_headers_use_plan_api_keys_and_isolate_official_metadata() -> Result<()> 
             client.post("https://example.test/v1/messages"),
             RequestContract::AnthropicMessages,
             "custom-key",
+            false,
+            false,
             false,
             None,
         )?
@@ -23818,6 +24388,109 @@ async fn chatgpt_compact_summary_honors_summary_model_reasoning_capability() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn responses_compact_summary_retries_incomplete_text_and_accumulates_usage() {
+    let root = temp_test_dir("responses-summary-incomplete-retry");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        fn drain_request(stream: &mut std::net::TcpStream) {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read request");
+                assert!(read > 0, "client closed before request completed");
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read request body");
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..read]);
+            }
+        }
+
+        let responses = [
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Discarded partial summary.\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"text\":\"Discarded partial summary.\"}\n\n",
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+            ),
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Task\\nRecovered summary.\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"text\":\"Task\\nRecovered summary.\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":4}}}\n\n"
+            ),
+        ];
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            drain_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+    });
+
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "chatgpt")
+        .expect("chatgpt profile");
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.provider_profile = Some(profile);
+    agent.base_url = format!("http://{addr}");
+    agent.model = "gpt-5.4".to_string();
+    agent.api_key = "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let old = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "old context".to_string(),
+        }],
+    }];
+
+    let (summary, usage) = agent
+        .one_shot_summary(&old, "")
+        .await
+        .expect("incomplete summary should retry");
+    assert_eq!(summary, "Task\nRecovered summary.");
+    assert!(!summary.contains("Discarded partial"));
+    assert_eq!(usage.input, 8);
+    assert_eq!(usage.output, 6);
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HttpRetry {
+            attempt: 1,
+            wait_secs: 0,
+            reason,
+        } if reason == "incomplete summary response (max_output_tokens)"
+    )));
+
+    server.join().expect("server thread");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn chatgpt_request_body_maps_xhigh_to_actual_reasoning_effort_and_summary() {
     // Regression: ChatGPT/Codex models silently refuse to emit function_call items unless the
@@ -24002,6 +24675,128 @@ async fn chatgpt_incomplete_function_call_retries_with_lower_effort() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn anthropic_unfinished_tool_call_automatically_continues() {
+    let root = temp_test_dir("anthropic-unfinished-tool-recovery");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    let server = std::thread::spawn(move || {
+        fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read request");
+                assert!(read > 0, "client closed before request completed");
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read request body");
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..read]);
+            }
+            request[header_end..header_end + content_length].to_vec()
+        }
+
+        let responses = [
+            concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n",
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"write_file\",\"input\":{}}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README\"}}\n\n",
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ),
+            concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n",
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Recovered.\"}}\n\n",
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ),
+        ];
+        let mut bodies = Vec::new();
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            bodies.push(read_request_body(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        bodies
+    });
+
+    let mut agent = test_agent(&root);
+    agent.provider_id = "anthropic".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.base_url = format!("http://{addr}");
+    agent.model = "claude-sonnet-4-6".to_string();
+    agent.max_iterations = Some(1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    agent
+        .chat("Continue the existing work.".to_string())
+        .await
+        .expect("unfinished Anthropic tool call should recover");
+    let bodies = server.join().expect("server thread");
+    assert_eq!(bodies.len(), 2);
+    let retry: Value = serde_json::from_slice(&bodies[1]).expect("retry request JSON");
+    assert!(retry["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["content"].as_array().is_some_and(|content| {
+                content.iter().any(|block| {
+                    block["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("recovery 1/3"))
+                })
+            })
+        })
+    }));
+    assert!(agent.history.iter().any(|message| {
+        message.role == "assistant"
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == "Recovered."))
+    }));
+    assert!(agent.provider_health.providers.is_empty());
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Warn(message)
+            if message.contains("Dropped 1 unfinished tool call") && message.contains("continuing the turn")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnDiagnostics {
+            last_retry_reason: Some(reason),
+            ..
+        } if reason == "incomplete response (unfinished_tool_call)"
+    )));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
     let root = temp_test_dir("anthropic-omitted-thinking-stream");
@@ -24034,7 +24829,7 @@ async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
     let resp = reqwest::get(format!("http://{addr}/stream"))
         .await
         .expect("response");
-    let (blocks, _stop, _usage) = agent.read_stream(resp).await.expect("parse stream");
+    let ParsedProviderStream { blocks, .. } = agent.read_stream(resp).await.expect("parse stream");
     assert!(
         matches!(
             blocks.first(),
@@ -24088,7 +24883,7 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
     let resp = reqwest::get(format!("http://{addr}/stream"))
         .await
         .expect("response");
-    let (blocks, _stop, _usage) = agent
+    let ParsedProviderStream { blocks, .. } = agent
         .read_stream_responses(resp, RequestContract::ChatGptResponses)
         .await
         .expect("parse stream");

@@ -2269,7 +2269,11 @@ impl TuiState {
                 self.status = "compacting history".into();
             }
 
-            AgentEvent::CompactEnd { before, after } => {
+            AgentEvent::CompactEnd {
+                before,
+                after,
+                summary,
+            } => {
                 self.push_debug_event(format!("compact end · {before} → {after}"));
                 let resume_busy = self.compacting_resume_busy;
                 self.compacting = false;
@@ -2278,6 +2282,15 @@ impl TuiState {
                 self.last_turn_context_tokens = self
                     .last_turn_context_tokens
                     .max(((self.history_chars.saturating_add(3)) / 4).max(1));
+                let rendered = self.pseudo_tool_display_text(&summary);
+                if !rendered.trim().is_empty() {
+                    let dim_prefix = self.assistant_prefix_seen;
+                    self.assistant_prefix_seen = true;
+                    self.queue(Line_::Assistant {
+                        text: rendered,
+                        dim_prefix,
+                    });
+                }
                 self.queue(Line_::Info(format!(
                     "compacted {before} → {after} messages"
                 )));
@@ -12195,11 +12208,19 @@ mod tests {
         state.apply_event(AgentEvent::CompactEnd {
             before: 20,
             after: 4,
+            summary: "Task\n- reviewed compaction".to_string(),
         });
 
         assert!(!state.agent_busy);
         assert_eq!(state.status, "ready");
         assert!(transcript_live_indicator_text(&state, 80).is_none());
+        let summary_queued = state.pending_insert.iter().any(
+            |line| matches!(line, Line_::Assistant { text, .. } if text.contains("reviewed compaction")),
+        );
+        assert!(
+            summary_queued,
+            "compaction summary must land in TUI history"
+        );
     }
 
     #[test]
@@ -12217,6 +12238,7 @@ mod tests {
         state.apply_event(AgentEvent::CompactEnd {
             before: 20,
             after: 4,
+            summary: String::new(),
         });
 
         assert!(state.agent_busy);

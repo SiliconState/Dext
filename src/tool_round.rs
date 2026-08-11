@@ -755,7 +755,8 @@ impl Agent {
                 }) {
                     Ok(s) => {
                         if name == "bash" {
-                            let failed = parse_bash_exit_code(&s).is_some_and(|code| code != 0);
+                            let failed = parse_bash_exit_code(&s).is_some_and(|code| code != 0)
+                                && !bash_sigpipe_with_output(&s);
                             (s, failed.then_some(true))
                         } else {
                             (s, None)

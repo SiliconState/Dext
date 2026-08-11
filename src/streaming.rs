@@ -22,6 +22,7 @@ pub(crate) struct ParsedStream {
     pub(crate) stop_reason: Option<String>,
     pub(crate) usage: Usage,
     pub(crate) unknown_events: usize,
+    pub(crate) unfinished_tool_calls: usize,
 }
 
 pub(crate) struct ProviderStreamParser {
@@ -55,6 +56,7 @@ struct AnthropicBlock {
     thinking_signature: Option<String>,
     redacted_data: String,
     stopped: bool,
+    implicit_stop: bool,
 }
 
 #[derive(Default)]
@@ -266,6 +268,10 @@ fn append_capped(
     }
     target.push_str(fragment);
     Ok(())
+}
+
+fn tool_arguments_json_is_incomplete(raw: &str) -> bool {
+    raw.trim().is_empty() || serde_json::from_str::<Value>(raw).is_err_and(|error| error.is_eof())
 }
 
 fn parse_tool_arguments(
@@ -595,14 +601,25 @@ fn parse_anthropic_frame(
         }
         "message_stop" => {
             require_anthropic_message_open(contract, state, event)?;
-            if state.blocks.values().any(|block| !block.stopped) {
-                return Err(protocol_error(
-                    contract,
-                    event,
-                    "message stopped with an open content block",
-                ));
+            // Providers occasionally omit the final content_block_stop before
+            // message_stop; close open blocks implicitly instead of failing the turn.
+            let mut updates = Vec::new();
+            for block in state.blocks.values_mut() {
+                if block.stopped {
+                    continue;
+                }
+                block.stopped = true;
+                block.implicit_stop = true;
+                match block.kind.as_str() {
+                    "text" => updates.push(StreamUpdate::TextBlockComplete(block.text.clone())),
+                    "thinking" => {
+                        updates.push(StreamUpdate::ThinkingBlockComplete(block.text.clone()));
+                    }
+                    _ => {}
+                }
             }
             state.message_stopped = true;
+            return Ok(updates);
         }
         "error" => {
             let error_type = data
@@ -666,6 +683,8 @@ fn finish_anthropic(contract: RequestContract, state: AnthropicState) -> Result<
             "stream ended before message_stop",
         ));
     }
+    let output_truncated = state.stop_reason.as_deref() == Some("max_tokens");
+    let mut unfinished_tool_calls = 0usize;
     let mut blocks = Vec::new();
     for (idx, block) in state.blocks {
         if !block.stopped {
@@ -691,18 +710,35 @@ fn finish_anthropic(contract: RequestContract, state: AnthropicState) -> Result<
                     data: block.redacted_data,
                 });
             }
+            "tool_use" if block.implicit_stop => {
+                unfinished_tool_calls += 1;
+            }
             "tool_use" => {
-                let input = parse_tool_arguments(
+                match parse_tool_arguments(
                     contract,
                     "finalize",
                     &format!("block {idx}"),
                     block.input_json.as_deref().unwrap_or(""),
-                )?;
-                blocks.push(Block::ToolUse {
-                    id: block.id,
-                    name: block.name,
-                    input,
-                });
+                ) {
+                    Ok(input) => blocks.push(Block::ToolUse {
+                        id: block.id,
+                        name: block.name,
+                        input,
+                    }),
+                    // An explicitly stopped block can still be cut mid-JSON
+                    // when max_tokens ends the message. Implicitly stopped tool
+                    // blocks are discarded above regardless of buffer shape:
+                    // only an explicit completion marker makes a call executable.
+                    Err(_)
+                        if output_truncated
+                            && tool_arguments_json_is_incomplete(
+                                block.input_json.as_deref().unwrap_or(""),
+                            ) =>
+                    {
+                        unfinished_tool_calls += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             _ => {}
         }
@@ -712,6 +748,7 @@ fn finish_anthropic(contract: RequestContract, state: AnthropicState) -> Result<
         stop_reason: state.stop_reason,
         usage: state.usage,
         unknown_events: state.unknown_events,
+        unfinished_tool_calls,
     })
 }
 
@@ -854,6 +891,7 @@ fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<Parsed
         stop_reason: state.stop_reason,
         usage: state.usage,
         unknown_events: state.unknown_events,
+        unfinished_tool_calls: 0,
     })
 }
 
@@ -1510,6 +1548,7 @@ fn finish_chatgpt(contract: RequestContract, mut state: ChatGptState) -> Result<
         stop_reason: state.stop_reason,
         usage: state.usage,
         unknown_events: state.unknown_events,
+        unfinished_tool_calls: 0,
     })
 }
 
@@ -1590,6 +1629,212 @@ mod tests {
             (
                 "content_block_stop",
                 r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let error = parser.finish().unwrap_err().to_string();
+        assert!(error.contains("arguments must be a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_message_stop_closes_open_blocks_implicitly() {
+        let contract = RequestContract::AnthropicMessages;
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":2}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial answer"}}"#,
+            ),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let updates = parser
+            .push_frame(SseFrame {
+                event: Some("message_stop".to_string()),
+                data: Some(r#"{"type":"message_stop"}"#.to_string()),
+            })
+            .unwrap();
+        assert_eq!(
+            updates,
+            vec![StreamUpdate::TextBlockComplete(
+                "partial answer".to_string()
+            )]
+        );
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::Text { text }] if text == "partial answer"
+        ));
+    }
+
+    #[test]
+    fn anthropic_only_classifies_eof_argument_json_as_truncated() {
+        assert!(tool_arguments_json_is_incomplete(""));
+        assert!(tool_arguments_json_is_incomplete(r#"{"path":"cut"#));
+        assert!(!tool_arguments_json_is_incomplete(r#"{"path":]"#));
+        assert!(!tool_arguments_json_is_incomplete("[]"));
+        assert!(!tool_arguments_json_is_incomplete(r#"{"path":"ok"}"#));
+    }
+
+    #[test]
+    fn anthropic_unfinished_tool_call_is_dropped_not_fatal() {
+        let contract = RequestContract::AnthropicMessages;
+        // Case 1: explicit content_block_stop, stop_reason=max_tokens, cut JSON.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":2}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"working"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"write_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"big.txt\",\"content\":\"trunc"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::Text { text }] if text == "working"
+        ));
+        assert_eq!(parsed.unfinished_tool_calls, 1);
+        assert_eq!(parsed.stop_reason.as_deref(), Some("max_tokens"));
+
+        // Case 2: abrupt message_stop never authorizes a tool block, even if
+        // the buffered JSON happens to look complete.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"write_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"big.txt\"}"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let parsed = parser.finish().unwrap();
+        assert!(parsed.blocks.is_empty());
+        assert_eq!(parsed.unfinished_tool_calls, 1);
+        assert_eq!(parsed.stop_reason, None);
+
+        // Case 3: malformed non-EOF JSON remains fatal even at max_tokens.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"write_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":]"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+        let error = parser.finish().unwrap_err().to_string();
+        assert!(error.contains("has malformed arguments"), "{error}");
+
+        // Case 4: a syntactically complete non-object remains a protocol error
+        // even when max_tokens coincides with the terminal event; it was not cut off.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"write_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"[]"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
             ),
             ("message_stop", r#"{"type":"message_stop"}"#),
         ] {

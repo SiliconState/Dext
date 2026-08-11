@@ -88,7 +88,9 @@ pub(crate) fn crash_event_breadcrumb(event: &AgentEvent) -> Option<String> {
         )),
         AgentEvent::HttpRetry { attempt, .. } => Some(format!("http_retry:{attempt}")),
         AgentEvent::CompactStart => Some("compact_start".to_string()),
-        AgentEvent::CompactEnd { before, after } => Some(format!("compact_end:{before}->{after}")),
+        AgentEvent::CompactEnd { before, after, .. } => {
+            Some(format!("compact_end:{before}->{after}"))
+        }
         AgentEvent::CompactFailed { .. } => Some("compact_failed".to_string()),
         AgentEvent::Interrupted => Some("interrupted".to_string()),
         AgentEvent::RuntimeControl(_) => Some("runtime_control".to_string()),

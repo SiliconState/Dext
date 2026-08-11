@@ -180,6 +180,20 @@ const LLAMA_CONTEXT_DISCOVERY_PATHS: &[&str] = &["/props", "/slots", "/v1/models
 
 const KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding";
 const KIMI_BUILTIN_PROFILE_MARKER: &str = "kimi-code";
+const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+const ANTHROPIC_BUILTIN_PROFILE_MARKER: &str = "anthropic";
+const OAUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const OAUTH_CALLBACK_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const OAUTH_RESPONSE_MAX_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum OAuthProtocol {
+    #[default]
+    Generic,
+    AnthropicClaude,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OAuthFlow {
@@ -193,6 +207,8 @@ pub(crate) struct OAuthFlow {
     pub(crate) redirect_uri: Option<String>,
     #[serde(default)]
     pub(crate) callback_host: Option<String>,
+    #[serde(default)]
+    pub(crate) protocol: OAuthProtocol,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,10 +381,19 @@ pub(crate) struct AuthStoreInspection {
     pub(crate) integrity: AuthStoreIntegrity,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RuntimeAuthKind {
+    #[default]
+    None,
+    ApiKey,
+    OAuth,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedProviderConfig {
     pub(crate) profile: ProviderProfile,
     pub(crate) api_key: String,
+    pub(crate) auth_kind: RuntimeAuthKind,
     pub(crate) key_source: String,
     pub(crate) model: String,
     pub(crate) base_url: String,
@@ -640,6 +665,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 audience: String::new(),
                 redirect_uri: Some("http://localhost:1455/auth/callback".to_string()),
                 callback_host: Some("127.0.0.1".to_string()),
+                protocol: OAuthProtocol::Generic,
             }),
             notes: Some(
                 "ChatGPT/Codex login opens an OpenAI OAuth flow; paste the callback URL or authorization code if browser callback is unavailable."
@@ -714,10 +740,10 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
         },
         ProviderProfile {
             id: "anthropic".to_string(),
-            builtin: None,
+            builtin: Some(ANTHROPIC_BUILTIN_PROFILE_MARKER.to_string()),
             display_name: "Anthropic".to_string(),
             api_provider: ApiProvider::Anthropic,
-            base_url: "https://api.anthropic.com".to_string(),
+            base_url: ANTHROPIC_BASE_URL.to_string(),
             default_model: "claude-sonnet-4-6".to_string(),
             models: vec![
                 "claude-sonnet-4-6".to_string(),
@@ -734,8 +760,17 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             env_vars: vec!["ANTHROPIC_API_KEY".to_string()],
             requires_api_key: true,
             login_url: Some("https://console.anthropic.com/settings/keys".to_string()),
-            oauth_flow: None,
-            notes: Some("Use an Anthropic Console API key.".to_string()),
+            oauth_flow: Some(OAuthFlow {
+                authorize_url: "https://claude.ai/oauth/authorize".to_string(),
+                token_url: "https://platform.claude.com/v1/oauth/token".to_string(),
+                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string(),
+                scope: "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload".to_string(),
+                audience: String::new(),
+                redirect_uri: Some("http://localhost:53692/callback".to_string()),
+                callback_host: Some("127.0.0.1".to_string()),
+                protocol: OAuthProtocol::AnthropicClaude,
+            }),
+            notes: Some("Claude Pro/Max subscription OAuth is the default /login flow. ANTHROPIC_API_KEY continues to use standard API-key billing.".to_string()),
             context_window: Some(200_000),
             model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
@@ -1010,9 +1045,15 @@ pub(crate) fn normalize_provider_profile(mut profile: ProviderProfile) -> Option
     if profile.id.trim().is_empty() {
         return None;
     }
-    profile.builtin = (profile.id == "kimi"
-        && profile.builtin.as_deref() == Some(KIMI_BUILTIN_PROFILE_MARKER))
-    .then(|| KIMI_BUILTIN_PROFILE_MARKER.to_string());
+    profile.builtin = match (profile.id.as_str(), profile.builtin.as_deref()) {
+        ("kimi", Some(KIMI_BUILTIN_PROFILE_MARKER)) => {
+            Some(KIMI_BUILTIN_PROFILE_MARKER.to_string())
+        }
+        ("anthropic", Some(ANTHROPIC_BUILTIN_PROFILE_MARKER)) => {
+            Some(ANTHROPIC_BUILTIN_PROFILE_MARKER.to_string())
+        }
+        _ => None,
+    };
 
     let fallback_model = if profile.id == "local" {
         DEFAULT_LOCAL_MODEL
@@ -2006,12 +2047,12 @@ fn dext_api_key_override() -> Option<(String, String)> {
     (!key.is_empty()).then(|| (key.to_string(), "env:DEXT_API_KEY".to_string()))
 }
 
-fn resolve_provider_credential(
+fn resolve_provider_auth(
     profile: &ProviderProfile,
     store: &AuthStore,
-) -> Option<(String, String)> {
-    if let Some(credential) = dext_api_key_override() {
-        return Some(credential);
+) -> Option<(String, String, RuntimeAuthKind)> {
+    if let Some((secret, source)) = dext_api_key_override() {
+        return Some((secret, source, RuntimeAuthKind::ApiKey));
     }
 
     let canonical_id = canonical_provider_id(&profile.id);
@@ -2022,18 +2063,29 @@ fn resolve_provider_credential(
         && !(canonical_id == "kimi" && matches!(entry, StoredCredential::OAuth { .. }))
         && let Some(secret) = entry.resolve_secret()
     {
-        return Some((secret, format!("auth:{}", profile.id)));
+        let kind = match entry {
+            StoredCredential::ApiKey { .. } => RuntimeAuthKind::ApiKey,
+            StoredCredential::OAuth { .. } => RuntimeAuthKind::OAuth,
+        };
+        return Some((secret, format!("auth:{}", profile.id), kind));
     }
 
     for env in &profile.env_vars {
         if let Ok(v) = std::env::var(env) {
             let t = v.trim().to_string();
             if !t.is_empty() {
-                return Some((t, format!("env:{env}")));
+                return Some((t, format!("env:{env}"), RuntimeAuthKind::ApiKey));
             }
         }
     }
     None
+}
+
+fn resolve_provider_credential(
+    profile: &ProviderProfile,
+    store: &AuthStore,
+) -> Option<(String, String)> {
+    resolve_provider_auth(profile, store).map(|(secret, source, _)| (secret, source))
 }
 
 pub(crate) fn resolve_provider_api_key(
@@ -2611,6 +2663,20 @@ pub(crate) fn build_chatgpt_summary_request(
     body
 }
 
+fn is_marked_builtin_anthropic(profile: &ProviderProfile) -> bool {
+    profile.builtin.as_deref() == Some(ANTHROPIC_BUILTIN_PROFILE_MARKER)
+        && canonical_provider_id(&profile.id) == "anthropic"
+}
+
+pub(crate) fn is_builtin_anthropic_profile(profile: &ProviderProfile) -> bool {
+    is_marked_builtin_anthropic(profile)
+        && request_contract_for_profile(profile) == RequestContract::AnthropicMessages
+}
+
+pub(crate) fn is_official_anthropic_profile(profile: &ProviderProfile, base_url: &str) -> bool {
+    is_builtin_anthropic_profile(profile) && base_url.trim_end_matches('/') == ANTHROPIC_BASE_URL
+}
+
 pub(crate) fn is_official_kimi_profile(profile: &ProviderProfile, base_url: &str) -> bool {
     profile.builtin.as_deref() == Some(KIMI_BUILTIN_PROFILE_MARKER)
         && canonical_provider_id(&profile.id) == "kimi"
@@ -2623,6 +2689,8 @@ pub(crate) fn apply_provider_headers(
     contract: RequestContract,
     api_key: &str,
     official_kimi: bool,
+    anthropic_subscription: bool,
+    extended_anthropic_cache: bool,
     session_id: Option<&str>,
 ) -> Result<RequestBuilder> {
     Ok(match contract.api_provider() {
@@ -2654,6 +2722,30 @@ pub(crate) fn apply_provider_headers(
         }
         ApiProvider::Anthropic => {
             let mut req = req.header("anthropic-version", ANTHROPIC_API_VERSION);
+            if anthropic_subscription {
+                let beta = if extended_anthropic_cache {
+                    "claude-code-20250219,oauth-2025-04-20,extended-cache-ttl-2025-04-11"
+                } else {
+                    "claude-code-20250219,oauth-2025-04-20"
+                };
+                req = req
+                    .header("authorization", format!("Bearer {api_key}"))
+                    .header("anthropic-beta", beta)
+                    .header("anthropic-dangerous-direct-browser-access", "true")
+                    .header("user-agent", crate::claude_subscription::user_agent())
+                    .header("x-app", "cli")
+                    .header(
+                        "x-client-request-id",
+                        crate::claude_subscription::random_uuid_v4()?,
+                    );
+                if let Some(id) = session_id {
+                    req = req.header("x-claude-code-session-id", id);
+                }
+                return Ok(req);
+            }
+            if extended_anthropic_cache {
+                req = req.header("anthropic-beta", "extended-cache-ttl-2025-04-11");
+            }
             if official_kimi {
                 let version = env!("CARGO_PKG_VERSION");
                 req = req
@@ -2812,26 +2904,50 @@ pub(crate) fn resolve_runtime_provider(
     let base_url = resolve_provider_base_url(&profile);
     let mut store = store;
     let explicit_api_key = dext_api_key_override();
+    let stored_oauth = store
+        .providers
+        .get(&profile.id)
+        .or_else(|| store.providers.get(&canonical_provider_id(&profile.id)))
+        .is_some_and(|credential| matches!(credential, StoredCredential::OAuth { .. }));
+    if explicit_api_key.is_none()
+        && stored_oauth
+        && is_marked_builtin_anthropic(&profile)
+        && !is_official_anthropic_profile(&profile, &base_url)
+    {
+        anyhow::bail!(
+            "Anthropic subscription OAuth is restricted to {ANTHROPIC_BASE_URL}. Unset the Anthropic base-URL override or run `dext auth logout anthropic` and use an API key for the custom endpoint."
+        );
+    }
     let refreshed_token = if explicit_api_key.is_some() {
         None
     } else {
         refresh_oauth_credential_if_needed(&profile, &mut store)?
     };
-    let resolved_key = explicit_api_key
+    let resolved_auth = explicit_api_key
+        .map(|(key, source)| (key, source, RuntimeAuthKind::ApiKey))
         .or_else(|| {
-            refreshed_token.map(|token| (token, format!("auth:{} (refreshed)", profile.id)))
+            refreshed_token.map(|token| {
+                (
+                    token,
+                    format!("auth:{} (refreshed)", profile.id),
+                    RuntimeAuthKind::OAuth,
+                )
+            })
         })
-        .or_else(|| resolve_provider_credential(&profile, &store));
+        .or_else(|| resolve_provider_auth(&profile, &store));
 
-    let (api_key, key_source) = match (profile.requires_api_key, resolved_key) {
-        (_, Some((key, source))) => (key, source),
+    let (api_key, key_source, auth_kind) = match (profile.requires_api_key, resolved_auth) {
+        (_, Some((key, source, kind))) => (key, source, kind),
         (false, None) => (
             String::new(),
             "none (provider does not require key)".to_string(),
+            RuntimeAuthKind::None,
         ),
-        (true, None) if !require_credentials => {
-            (String::new(), "missing (login required)".to_string())
-        }
+        (true, None) if !require_credentials => (
+            String::new(),
+            "missing (login required)".to_string(),
+            RuntimeAuthKind::None,
+        ),
         (true, None) => {
             let env_hint = if profile.env_vars.is_empty() {
                 "(no env vars configured)".to_string()
@@ -2847,10 +2963,20 @@ pub(crate) fn resolve_runtime_provider(
         }
     };
 
+    if auth_kind == RuntimeAuthKind::OAuth
+        && is_marked_builtin_anthropic(&profile)
+        && !is_official_anthropic_profile(&profile, &base_url)
+    {
+        anyhow::bail!(
+            "Anthropic subscription OAuth is restricted to {ANTHROPIC_BASE_URL}. Unset the Anthropic base-URL override or run `dext auth logout anthropic` and use an API key for the custom endpoint."
+        );
+    }
+
     Ok(ResolvedProviderConfig {
         requires_api_key: profile.requires_api_key,
         profile,
         api_key,
+        auth_kind,
         key_source,
         model,
         base_url,
@@ -3522,10 +3648,10 @@ pub(crate) struct LoginResult {
     pub(crate) awaiting_credentials: bool,
 }
 
-fn generate_code_verifier() -> String {
+fn generate_code_verifier() -> Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).expect("failed to generate random bytes for PKCE");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    getrandom::fill(&mut bytes).context("generate OAuth PKCE verifier")?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn pkce_code_challenge(verifier: &str) -> String {
@@ -3534,93 +3660,346 @@ fn pkce_code_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
 
-fn generate_oauth_state() -> String {
+fn generate_oauth_state() -> Result<String> {
     let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("failed to generate OAuth state bytes");
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    getrandom::fill(&mut bytes).context("generate OAuth state")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
 fn oauth_html_response(status_line: &str, body: &str) -> String {
     format!(
-        "{status_line}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}"
+        "{status_line}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     )
+}
+
+fn oauth_result_page(success: bool) -> String {
+    let (eyebrow, title, detail, accent, mark) = if success {
+        (
+            "AUTHENTICATION COMPLETE",
+            "You're signed in",
+            "Dext received and stored your provider credentials. You can close this tab and return to your terminal.",
+            "#72e0a8",
+            "&#10003;",
+        )
+    } else {
+        (
+            "AUTHENTICATION INCOMPLETE",
+            "Return to Dext",
+            "The callback was received, but Dext could not finish the login. Check the terminal for details and retry there.",
+            "#ff8f8f",
+            "!",
+        )
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dext · {title}</title><style>:root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#090b10;color:#edf2f7;font:16px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}}main{{width:min(560px,100%);padding:38px;border:1px solid #28303d;border-radius:18px;background:linear-gradient(145deg,#121722,#0d1119);box-shadow:0 24px 80px #0009}}.brand{{margin-bottom:34px;color:#a9b4c5;letter-spacing:.16em}}.brand b{{color:#f5f7fa}}.mark{{display:grid;place-items:center;width:54px;height:54px;margin-bottom:22px;border:1px solid {accent};border-radius:14px;color:{accent};font-size:28px;font-weight:700;box-shadow:0 0 32px color-mix(in srgb,{accent} 24%,transparent)}}.eyebrow{{margin:0 0 8px;color:{accent};font-size:12px;font-weight:700;letter-spacing:.14em}}h1{{margin:0 0 14px;font:600 clamp(28px,7vw,42px)/1.15 ui-sans-serif,system-ui,sans-serif;letter-spacing:-.03em}}p{{margin:0;color:#aeb8c7}}.foot{{margin-top:30px;padding-top:20px;border-top:1px solid #252d39;color:#778397;font-size:13px}}</style></head><body><main><div class="brand"><b>DEXT</b> / LOGIN</div><div class="mark">{mark}</div><p class="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{detail}</p><div class="foot">This window contains no credential data.</div></main></body></html>"#
+    )
+}
+
+fn await_oauth_browser_result(
+    receiver: &std::sync::mpsc::Receiver<OAuthBrowserResult>,
+    cancelled: &std::sync::atomic::AtomicBool,
+    timeout: Duration,
+) -> Option<OAuthBrowserResult> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            Ok(result) => return Some(result),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OAuthBrowserResult {
+    Success,
+    Failure,
+}
+
+enum OAuthCallbackKind {
+    Code(String),
+    Rejected,
+}
+
+struct ReceivedOAuthCallback {
+    kind: OAuthCallbackKind,
+    browser_result: std::sync::mpsc::Sender<OAuthBrowserResult>,
+}
+
+struct OAuthCallbackListener {
+    receiver: std::sync::mpsc::Receiver<ReceivedOAuthCallback>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OAuthCallbackListener {
+    fn recv_timeout(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<ReceivedOAuthCallback, std::sync::mpsc::RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+}
+
+impl Drop for OAuthCallbackListener {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 fn spawn_oauth_code_listener(
     listener: std::net::TcpListener,
     expected_state: String,
-) -> std::sync::mpsc::Receiver<String> {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    expected_path: String,
+) -> Result<OAuthCallbackListener> {
+    listener
+        .set_nonblocking(true)
+        .context("configure OAuth callback listener")?;
+    let (tx, receiver) = std::sync::mpsc::channel::<ReceivedOAuthCallback>();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_cancelled = cancelled.clone();
 
-    std::thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
+    let thread = std::thread::spawn(move || {
+        while !thread_cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(_) => break,
+            };
             use std::io::{Read, Write};
 
-            let mut buf = [0u8; 8192];
-            if let Ok(n) = stream.try_clone().and_then(|mut s| s.read(&mut buf)) {
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("/");
-
-                let mut response = oauth_html_response(
-                    "HTTP/1.1 400 Bad Request",
-                    "<html><body><h2>Login failed</h2><p>Missing authorization code.</p></body></html>",
-                );
-
-                if let Ok(url) = reqwest::Url::parse(&format!("http://localhost{path}")) {
-                    if url.path() != "/auth/callback" {
-                        response = oauth_html_response(
-                            "HTTP/1.1 404 Not Found",
-                            "<html><body><h2>Login failed</h2><p>Callback route not found.</p></body></html>",
-                        );
-                    } else {
-                        let returned_state = url
-                            .query_pairs()
-                            .find(|(k, _)| k == "state")
-                            .map(|(_, v)| v.into_owned());
-                        if returned_state.as_deref() != Some(expected_state.as_str()) {
-                            response = oauth_html_response(
-                                "HTTP/1.1 400 Bad Request",
-                                "<html><body><h2>Login failed</h2><p>State mismatch.</p></body></html>",
-                            );
-                        } else if let Some(code) = url
-                            .query_pairs()
-                            .find(|(k, _)| k == "code")
-                            .map(|(_, v)| v.into_owned())
-                        {
-                            response = oauth_html_response(
-                                "HTTP/1.1 200 OK",
-                                "<html><body><h2>Login successful!</h2><p>You can close this tab.</p></body></html>",
-                            );
-                            let _ = tx.send(code);
+            let request_started = std::time::Instant::now();
+            if stream.set_nonblocking(false).is_err()
+                || stream
+                    .set_write_timeout(Some(OAUTH_CALLBACK_IO_TIMEOUT))
+                    .is_err()
+            {
+                continue;
+            }
+            let mut request = Vec::with_capacity(1024);
+            let mut buf = [0u8; 1024];
+            let mut headers_complete = false;
+            while request.len() < 8192 {
+                let read_timeout =
+                    OAUTH_CALLBACK_IO_TIMEOUT.saturating_sub(request_started.elapsed());
+                if read_timeout.is_zero() {
+                    break;
+                }
+                if stream.set_read_timeout(Some(read_timeout)).is_err() {
+                    break;
+                }
+                let remaining = 8192 - request.len();
+                let read_len = remaining.min(buf.len());
+                match stream.read(&mut buf[..read_len]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            headers_complete = true;
+                            break;
                         }
                     }
+                    Err(_) => break,
                 }
+            }
+            let req = String::from_utf8_lossy(&request);
+            let path = headers_complete
+                .then(|| req.lines().next())
+                .flatten()
+                .and_then(|line| {
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next()?;
+                    let path = parts.next()?;
+                    let version = parts.next()?;
+                    (method == "GET"
+                        && matches!(version, "HTTP/1.0" | "HTTP/1.1")
+                        && parts.next().is_none())
+                    .then_some(path)
+                });
 
-                let _ = stream
-                    .try_clone()
-                    .and_then(|mut s| s.write_all(response.as_bytes()));
+            let mut accepted_callback = false;
+            let response = if let Some(url) =
+                path.and_then(|path| reqwest::Url::parse(&format!("http://localhost{path}")).ok())
+            {
+                if url.path() != expected_path {
+                    oauth_html_response(
+                        "HTTP/1.1 404 Not Found",
+                        "<html><body><h2>Login failed</h2><p>Callback route not found.</p></body></html>",
+                    )
+                } else {
+                    let returned_state = url
+                        .query_pairs()
+                        .find(|(key, _)| key == "state")
+                        .map(|(_, value)| value.into_owned());
+                    if returned_state.as_deref() != Some(expected_state.as_str()) {
+                        oauth_html_response(
+                            "HTTP/1.1 400 Bad Request",
+                            "<html><body><h2>Login failed</h2><p>State mismatch.</p></body></html>",
+                        )
+                    } else if let Some(code) = url
+                        .query_pairs()
+                        .find(|(key, _)| key == "code")
+                        .map(|(_, value)| value.into_owned())
+                        .filter(|code| !code.trim().is_empty())
+                        .filter(|_| !url.query_pairs().any(|(key, _)| key == "error"))
+                    {
+                        let (browser_result, result_receiver) = std::sync::mpsc::channel();
+                        accepted_callback = true;
+                        let delivered = tx
+                            .send(ReceivedOAuthCallback {
+                                kind: OAuthCallbackKind::Code(code),
+                                browser_result,
+                            })
+                            .is_ok();
+                        match delivered.then(|| {
+                            await_oauth_browser_result(
+                                &result_receiver,
+                                &thread_cancelled,
+                                OAUTH_REQUEST_TIMEOUT + Duration::from_secs(5),
+                            )
+                        }) {
+                            Some(Some(OAuthBrowserResult::Success)) => {
+                                oauth_html_response("HTTP/1.1 200 OK", &oauth_result_page(true))
+                            }
+                            Some(Some(OAuthBrowserResult::Failure)) | Some(None) | None => {
+                                oauth_html_response(
+                                    "HTTP/1.1 500 Internal Server Error",
+                                    &oauth_result_page(false),
+                                )
+                            }
+                        }
+                    } else if url.query_pairs().any(|(key, _)| key == "error") {
+                        let (browser_result, result_receiver) = std::sync::mpsc::channel();
+                        accepted_callback = true;
+                        let delivered = tx
+                            .send(ReceivedOAuthCallback {
+                                kind: OAuthCallbackKind::Rejected,
+                                browser_result,
+                            })
+                            .is_ok();
+                        if delivered {
+                            let _ = await_oauth_browser_result(
+                                &result_receiver,
+                                &thread_cancelled,
+                                Duration::from_secs(2),
+                            );
+                        }
+                        oauth_html_response("HTTP/1.1 400 Bad Request", &oauth_result_page(false))
+                    } else {
+                        oauth_html_response(
+                            "HTTP/1.1 400 Bad Request",
+                            "<html><body><h2>Login failed</h2><p>Missing authorization code.</p></body></html>",
+                        )
+                    }
+                }
+            } else {
+                oauth_html_response(
+                    "HTTP/1.1 400 Bad Request",
+                    "<html><body><h2>Login failed</h2><p>Invalid callback request.</p></body></html>",
+                )
+            };
+            let _ = stream.write_all(response.as_bytes());
+            if accepted_callback {
+                break;
             }
         }
     });
 
-    rx
+    Ok(OAuthCallbackListener {
+        receiver,
+        cancelled,
+        thread: Some(thread),
+    })
 }
 
-fn oauth_callback_host(oauth: &OAuthFlow) -> String {
-    if let Ok(raw) = std::env::var("DEXT_OAUTH_CALLBACK_HOST") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+#[cfg(test)]
+fn receive_oauth_callback_for_test(
+    expected_state: &str,
+    expected_path: &str,
+    requests: &[String],
+) -> Result<String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let callback = spawn_oauth_code_listener(
+        listener,
+        expected_state.to_string(),
+        expected_path.to_string(),
+    )?;
+    for request in requests {
+        let request = request.clone();
+        let client = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut stream = std::net::TcpStream::connect(address)?;
+            stream.write_all(request.as_bytes())?;
+            stream.flush()?;
+            let mut response = Vec::new();
+            if let Err(error) = stream.read_to_end(&mut response)
+                && error.kind() != io::ErrorKind::ConnectionReset
+            {
+                return Err(error);
+            }
+            Ok(response)
+        });
+        match callback.recv_timeout(Duration::from_millis(500)) {
+            Ok(received) => {
+                let OAuthCallbackKind::Code(code) = received.kind else {
+                    let _ = received.browser_result.send(OAuthBrowserResult::Failure);
+                    let _ = client.join();
+                    continue;
+                };
+                let _ = received.browser_result.send(OAuthBrowserResult::Success);
+                let _ = client.join();
+                return Ok(code);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                client
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("OAuth test client panicked"))??;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("OAuth callback listener disconnected")
+            }
         }
     }
-    oauth
-        .callback_host
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string())
+    anyhow::bail!("receive OAuth callback in test")
+}
+
+fn oauth_callback_host(oauth: &OAuthFlow) -> Result<String> {
+    let host = std::env::var("DEXT_OAUTH_CALLBACK_HOST")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| oauth.callback_host.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let address = host
+        .parse::<std::net::IpAddr>()
+        .with_context(|| format!("OAuth callback host must be a loopback address, got '{host}'"))?;
+    if !address.is_loopback() {
+        anyhow::bail!("OAuth callback host must be loopback-only, got '{host}'");
+    }
+    Ok(address.to_string())
+}
+
+fn oauth_bind_address(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn oauth_callback_port(redirect_uri: &str) -> Result<u16> {
@@ -3664,6 +4043,9 @@ fn build_oauth_authorize_url(
         if !oauth.audience.trim().is_empty() {
             query.append_pair("audience", &oauth.audience);
         }
+        if oauth.protocol == OAuthProtocol::AnthropicClaude {
+            query.append_pair("code", "true");
+        }
         if profile.id == "chatgpt" {
             query.append_pair("id_token_add_organizations", "true");
             query.append_pair("codex_cli_simplified_flow", "true");
@@ -3688,27 +4070,34 @@ fn oauth_exchange_failure_result(
     }
 }
 
-fn run_oauth_login(
-    oauth: &OAuthFlow,
-    profile: &ProviderProfile,
-    catalog: &mut ProviderCatalog,
-    store: &mut AuthStore,
-) -> Result<LoginResult> {
-    let code_verifier = generate_code_verifier();
+fn run_oauth_login(oauth: &OAuthFlow, profile: &ProviderProfile) -> Result<LoginResult> {
+    let code_verifier = generate_code_verifier()?;
     let code_challenge = pkce_code_challenge(&code_verifier);
-    let state = generate_oauth_state();
+    let state = if oauth.protocol == OAuthProtocol::AnthropicClaude {
+        code_verifier.clone()
+    } else {
+        generate_oauth_state()?
+    };
 
     let redirect_uri = oauth
         .redirect_uri
         .as_deref()
         .unwrap_or("http://localhost:1455/auth/callback");
-    let callback_host = oauth_callback_host(oauth);
+    let callback_host = oauth_callback_host(oauth)?;
     let callback_port = oauth_callback_port(redirect_uri)?;
 
-    let bind_addr = format!("{callback_host}:{callback_port}");
+    let callback_path = reqwest::Url::parse(redirect_uri)
+        .context("parse OAuth callback URI")?
+        .path()
+        .to_string();
+    let bind_addr = oauth_bind_address(&callback_host, callback_port);
     let (rx2, listener_warning) = match std::net::TcpListener::bind(&bind_addr) {
         Ok(listener) => (
-            Some(spawn_oauth_code_listener(listener, state.clone())),
+            Some(spawn_oauth_code_listener(
+                listener,
+                state.clone(),
+                callback_path.clone(),
+            )?),
             None,
         ),
         Err(e) => (
@@ -3724,10 +4113,15 @@ fn run_oauth_login(
 
     save_pending_oauth(&profile.id, &code_verifier, &state, redirect_uri)?;
 
+    let manual_code_description = if oauth.protocol == OAuthProtocol::AnthropicClaude {
+        "the authorization code"
+    } else {
+        "the authorization code (starts with `ac_`)"
+    };
     let manual_hint = format!(
         "If the browser callback doesn't auto-complete, paste the callback URL \
-(http://localhost:{callback_port}/auth/callback?code=...) or just the authorization code \
-(starts with `ac_`) directly into dext. /login cancel aborts."
+(http://localhost:{callback_port}{callback_path}?code=...) or just {manual_code_description} \
+directly into dext. /login cancel aborts."
     );
     let listener_suffix = listener_warning
         .as_ref()
@@ -3736,8 +4130,7 @@ fn run_oauth_login(
 
     match open_url_in_browser(&authorize_url) {
         Ok(msg) if msg.starts_with("disabled-by-") => {
-            catalog.active_provider = profile.id.clone();
-            save_provider_catalog(catalog)?;
+            set_active_provider_in_catalog(&profile.id)?;
             let reason = if msg == "disabled-by-wsl" {
                 "browser open disabled on WSL by default for reliability. "
             } else {
@@ -3753,8 +4146,7 @@ fn run_oauth_login(
         }
         Ok(_) => {}
         Err(e) => {
-            catalog.active_provider = profile.id.clone();
-            save_provider_catalog(catalog)?;
+            set_active_provider_in_catalog(&profile.id)?;
             return Ok(LoginResult {
                 message: format!(
                     "could not open browser for OAuth login: {e:#}\n\nOpen this URL manually:\n{authorize_url}\n\n{manual_hint}{listener_suffix}"
@@ -3766,8 +4158,7 @@ fn run_oauth_login(
     }
 
     let Some(rx2) = rx2 else {
-        catalog.active_provider = profile.id.clone();
-        save_provider_catalog(catalog)?;
+        set_active_provider_in_catalog(&profile.id)?;
         return Ok(LoginResult {
             message: format!(
                 "browser opened for OAuth login, but callback listener is unavailable.\n\nOpen this URL manually:\n{authorize_url}\n\n{manual_hint}{listener_suffix}"
@@ -3777,11 +4168,10 @@ fn run_oauth_login(
         });
     };
 
-    let code = match rx2.recv_timeout(std::time::Duration::from_secs(120)) {
-        Ok(code) => code,
+    let received = match rx2.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(received) => received,
         Err(_) => {
-            catalog.active_provider = profile.id.clone();
-            save_provider_catalog(catalog)?;
+            set_active_provider_in_catalog(&profile.id)?;
             return Ok(LoginResult {
                 message: format!(
                     "OAuth login timed out (120s).\n\nOpen this URL manually:\n{authorize_url}\n\n{manual_hint}{listener_suffix}"
@@ -3792,38 +4182,62 @@ fn run_oauth_login(
         }
     };
 
-    let token_response = exchange_oauth_code(
-        &oauth.token_url,
-        &oauth.client_id,
-        &code,
-        &code_verifier,
-        redirect_uri,
-    );
+    let kind = received.kind;
+    let code = match kind {
+        OAuthCallbackKind::Code(code) => code,
+        OAuthCallbackKind::Rejected => {
+            let _ = received.browser_result.send(OAuthBrowserResult::Failure);
+            clear_pending_oauth_if_matches(&profile.id, &code_verifier, &state);
+            anyhow::bail!(
+                "OAuth authorization was declined for provider '{}'. Start a fresh login when ready.",
+                profile.id
+            );
+        }
+    };
+    let token_response = exchange_oauth_code(oauth, &code, &code_verifier, &state, redirect_uri);
 
     match token_response {
         Ok(tokens) => {
-            store.providers.insert(
-                canonical_provider_id(&profile.id),
-                StoredCredential::OAuth {
-                    access_token: tokens.access_token,
-                    refresh_token: tokens.refresh_token,
-                    expires_at: tokens.expires_at,
-                },
-            );
-            save_auth_store(store)?;
-            catalog.active_provider = profile.id.clone();
-            save_provider_catalog(catalog)?;
-            clear_pending_oauth();
-            Ok(LoginResult {
-                message: format!(
-                    "OAuth login successful for provider '{}'. Credentials stored.",
-                    profile.id
-                ),
-                provider_id: profile.id.clone(),
-                awaiting_credentials: false,
-            })
+            if !pending_oauth_matches(&profile.id, &code_verifier, &state) {
+                let _ = received.browser_result.send(OAuthBrowserResult::Failure);
+                anyhow::bail!(
+                    "OAuth login was superseded by a newer login attempt. Complete the newest browser flow instead."
+                );
+            }
+            let login = (|| -> Result<LoginResult> {
+                set_active_provider_in_catalog(&profile.id)?;
+                let mut current_store = load_auth_store()?;
+                current_store.providers.insert(
+                    canonical_provider_id(&profile.id),
+                    StoredCredential::OAuth {
+                        access_token: tokens.access_token,
+                        refresh_token: tokens.refresh_token,
+                        expires_at: tokens.expires_at,
+                    },
+                );
+                save_auth_store(&current_store)?;
+                clear_pending_oauth_if_matches(&profile.id, &code_verifier, &state);
+                Ok(LoginResult {
+                    message: format!(
+                        "OAuth login successful for provider '{}'. Credentials stored.",
+                        profile.id
+                    ),
+                    provider_id: profile.id.clone(),
+                    awaiting_credentials: false,
+                })
+            })();
+            let browser_result = if login.is_ok() {
+                OAuthBrowserResult::Success
+            } else {
+                OAuthBrowserResult::Failure
+            };
+            let _ = received.browser_result.send(browser_result);
+            login
         }
-        Err(e) => Ok(oauth_exchange_failure_result(&profile.id, &manual_hint, &e)),
+        Err(e) => {
+            let _ = received.browser_result.send(OAuthBrowserResult::Failure);
+            Ok(oauth_exchange_failure_result(&profile.id, &manual_hint, &e))
+        }
     }
 }
 
@@ -3884,8 +4298,21 @@ fn save_pending_oauth(
 
 fn load_pending_oauth() -> Option<PendingOAuthState> {
     let path = pending_oauth_path();
-    let data = std::fs::read_to_string(&path).ok()?;
-    let state: PendingOAuthState = serde_json::from_str(&data).ok()?;
+    let data = match read_runtime_state_file(&path, true) {
+        Ok(Some(data)) => data,
+        Ok(None) => return None,
+        Err(_) => {
+            remove_pending_oauth_file(&path);
+            return None;
+        }
+    };
+    let state: PendingOAuthState = match serde_json::from_str(&data) {
+        Ok(state) => state,
+        Err(_) => {
+            remove_pending_oauth_file(&path);
+            return None;
+        }
+    };
     let age = unix_timestamp_secs().saturating_sub(state.created_at);
     if age > 600 {
         remove_pending_oauth_file(&path);
@@ -3907,6 +4334,28 @@ fn clear_pending_oauth() {
     remove_pending_oauth_file(&path);
 }
 
+fn pending_oauth_matches(provider_id: &str, code_verifier: &str, state: &str) -> bool {
+    load_pending_oauth().is_some_and(|pending| {
+        canonical_provider_id(&pending.provider_id) == canonical_provider_id(provider_id)
+            && pending.code_verifier == code_verifier
+            && pending.state == state
+    })
+}
+
+fn clear_pending_oauth_for_provider(provider_id: &str) {
+    if load_pending_oauth().is_some_and(|pending| {
+        canonical_provider_id(&pending.provider_id) == canonical_provider_id(provider_id)
+    }) {
+        clear_pending_oauth();
+    }
+}
+
+fn clear_pending_oauth_if_matches(provider_id: &str, code_verifier: &str, state: &str) {
+    if pending_oauth_matches(provider_id, code_verifier, state) {
+        clear_pending_oauth();
+    }
+}
+
 pub(crate) fn cancel_pending_oauth_login() -> bool {
     let had_callback_login = pending_oauth_path().exists();
     clear_pending_oauth();
@@ -3917,11 +4366,13 @@ pub(crate) fn cancel_pending_oauth_login() -> bool {
 struct ParsedOAuthAuthorizationInput {
     code: String,
     state: Option<String>,
+    state_required: bool,
 }
 
 fn parse_oauth_authorization_input(
     input: &str,
     allow_plain_code_fallback: bool,
+    allow_secret_like_plain_code: bool,
 ) -> Option<ParsedOAuthAuthorizationInput> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -3931,18 +4382,25 @@ fn parse_oauth_authorization_input(
     if let Ok(url) = reqwest::Url::parse(trimmed) {
         let code = url
             .query_pairs()
-            .find(|(k, _)| k == "code")
+            .find(|(k, value)| k == "code" && !value.trim().is_empty())
             .map(|(_, v)| v.into_owned());
         if let Some(code) = code {
             let state = url
                 .query_pairs()
                 .find(|(k, _)| k == "state")
                 .map(|(_, v)| v.into_owned());
-            return Some(ParsedOAuthAuthorizationInput { code, state });
+            return Some(ParsedOAuthAuthorizationInput {
+                code,
+                state,
+                state_required: true,
+            });
         }
     }
 
-    if let Some((code, state)) = trimmed.split_once('#') {
+    if let Some((code, state)) = trimmed.split_once('#')
+        && !trimmed.contains("://")
+        && !trimmed.contains(char::is_whitespace)
+    {
         let code = code.trim();
         let state = state.trim();
         if !code.is_empty() {
@@ -3953,6 +4411,7 @@ fn parse_oauth_authorization_input(
                 } else {
                     Some(state.to_string())
                 },
+                state_required: true,
             });
         }
     }
@@ -3967,14 +4426,18 @@ fn parse_oauth_authorization_input(
     {
         let code = url
             .query_pairs()
-            .find(|(k, _)| k == "code")
+            .find(|(k, value)| k == "code" && !value.trim().is_empty())
             .map(|(_, v)| v.into_owned());
         if let Some(code) = code {
             let state = url
                 .query_pairs()
                 .find(|(k, _)| k == "state")
                 .map(|(_, v)| v.into_owned());
-            return Some(ParsedOAuthAuthorizationInput { code, state });
+            return Some(ParsedOAuthAuthorizationInput {
+                code,
+                state,
+                state_required: true,
+            });
         }
     }
 
@@ -3982,8 +4445,9 @@ fn parse_oauth_authorization_input(
         !trimmed.contains(char::is_whitespace)
             && !trimmed.contains("://")
             && !trimmed.starts_with('{')
-            && !trimmed.starts_with("sk-")
-            && !trimmed.starts_with("eyJ")
+            && !trimmed.starts_with("sk-ant-api")
+            && (allow_secret_like_plain_code
+                || (!trimmed.starts_with("sk-") && !trimmed.starts_with("eyJ")))
             && trimmed.len() >= 12
             && chatgpt_account_id_from_token(trimmed).is_none()
     } else {
@@ -3996,6 +4460,7 @@ fn parse_oauth_authorization_input(
         return Some(ParsedOAuthAuthorizationInput {
             code: trimmed.to_string(),
             state: None,
+            state_required: false,
         });
     }
 
@@ -4003,27 +4468,75 @@ fn parse_oauth_authorization_input(
 }
 
 pub(crate) fn extract_oauth_code_from_callback(input: &str) -> Option<String> {
-    parse_oauth_authorization_input(input, false).map(|parsed| parsed.code)
+    parse_oauth_authorization_input(input, false, false).map(|parsed| parsed.code)
 }
 
-pub(crate) fn try_complete_oauth_from_callback(input: &str) -> Result<Option<String>> {
-    let parsed = match parse_oauth_authorization_input(input, true) {
-        Some(parsed) => parsed,
-        None => return Ok(None),
+fn validate_pending_oauth_callback(
+    input: &str,
+    expected_provider: Option<&str>,
+) -> Result<Option<(ParsedOAuthAuthorizationInput, PendingOAuthState)>> {
+    let structured = parse_oauth_authorization_input(input, false, false);
+    let pending = load_pending_oauth();
+    let allow_plain_code = pending.is_some()
+        || expected_provider.is_some_and(|provider| canonical_provider_id(provider) != "anthropic");
+    let allow_secret_like_plain_code = expected_provider
+        .map(canonical_provider_id)
+        .or_else(|| {
+            pending
+                .as_ref()
+                .map(|pending| canonical_provider_id(&pending.provider_id))
+        })
+        .as_deref()
+        == Some("anthropic");
+    let parsed = structured.or_else(|| {
+        allow_plain_code
+            .then(|| parse_oauth_authorization_input(input, true, allow_secret_like_plain_code))
+            .flatten()
+    });
+    let Some(parsed) = parsed else {
+        return Ok(None);
     };
-
-    let pending = match load_pending_oauth() {
-        Some(p) => p,
+    let pending = match pending {
+        Some(pending) => pending,
         None => anyhow::bail!(
-            "received OAuth callback code but no pending OAuth session found. Start a fresh login with /login chatgpt web"
+            "received OAuth callback code but no pending OAuth session found. Start a fresh login with /login <provider> web"
         ),
     };
 
+    if let Some(expected_provider) = expected_provider
+        && canonical_provider_id(expected_provider) != canonical_provider_id(&pending.provider_id)
+    {
+        anyhow::bail!(
+            "OAuth callback belongs to pending provider '{}', not '{}'. Complete or cancel the pending login first.",
+            pending.provider_id,
+            expected_provider
+        );
+    }
+
+    if parsed.state_required && parsed.state.is_none() {
+        anyhow::bail!(
+            "OAuth callback is missing state. Paste the complete callback URL or just the authorization code, or start a fresh login with /login {} web",
+            pending.provider_id
+        );
+    }
     if let Some(returned_state) = parsed.state.as_deref()
         && returned_state != pending.state
     {
-        anyhow::bail!("OAuth state mismatch. Start a fresh login with /login chatgpt web");
+        anyhow::bail!(
+            "OAuth state mismatch. Start a fresh login with /login {} web",
+            pending.provider_id
+        );
     }
+    Ok(Some((parsed, pending)))
+}
+
+pub(crate) fn try_complete_oauth_from_callback(
+    input: &str,
+    expected_provider: Option<&str>,
+) -> Result<Option<String>> {
+    let Some((parsed, pending)) = validate_pending_oauth_callback(input, expected_provider)? else {
+        return Ok(None);
+    };
 
     let catalog = load_provider_catalog()?;
     let profile = find_provider_profile(&catalog, &pending.provider_id).ok_or_else(|| {
@@ -4039,12 +4552,19 @@ pub(crate) fn try_complete_oauth_from_callback(input: &str) -> Result<Option<Str
         .ok_or_else(|| anyhow::anyhow!("provider '{}' has no OAuth config", pending.provider_id))?;
 
     let tokens = exchange_oauth_code(
-        &oauth.token_url,
-        &oauth.client_id,
+        oauth,
         &parsed.code,
         &pending.code_verifier,
+        &pending.state,
         &pending.redirect_uri,
     )?;
+    if !pending_oauth_matches(&pending.provider_id, &pending.code_verifier, &pending.state) {
+        anyhow::bail!(
+            "OAuth login was superseded by a newer login attempt. Complete the newest browser flow instead."
+        );
+    }
+
+    set_active_provider_in_catalog(&pending.provider_id)?;
 
     let mut store = load_auth_store()?;
     store.providers.insert(
@@ -4056,11 +4576,7 @@ pub(crate) fn try_complete_oauth_from_callback(input: &str) -> Result<Option<Str
         },
     );
     save_auth_store(&store)?;
-
-    let mut catalog = catalog;
-    catalog.active_provider = pending.provider_id.clone();
-    save_provider_catalog(&catalog)?;
-    clear_pending_oauth();
+    clear_pending_oauth_if_matches(&pending.provider_id, &pending.code_verifier, &pending.state);
 
     Ok(Some(format!(
         "OAuth login successful for provider '{}'. Credentials stored.",
@@ -4075,12 +4591,15 @@ struct ExchangedTokens {
     expires_at: Option<u64>,
 }
 
-fn oauth_expires_at_from_response(body: &Value) -> Option<u64> {
+fn oauth_expires_at_from_response(body: &Value, refresh_early_secs: u64) -> Option<u64> {
     let expires_in = body.get("expires_in").and_then(|v| {
         v.as_u64()
             .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            .filter(|seconds| *seconds > 0)
     });
-    expires_in.map(|seconds| unix_timestamp_secs().saturating_add(seconds))
+    expires_in.map(|seconds| {
+        unix_timestamp_secs().saturating_add(seconds.saturating_sub(refresh_early_secs))
+    })
 }
 
 fn kimi_device_id_path() -> PathBuf {
@@ -4151,46 +4670,91 @@ fn kimi_device_name() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn oauth_http_client() -> Result<reqwest::blocking::Client> {
+    provider_blocking_http_client_builder()
+        .connect_timeout(OAUTH_CONNECT_TIMEOUT)
+        .timeout(OAUTH_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build OAuth HTTP client")
+}
+
+fn read_oauth_json_response(mut response: reqwest::blocking::Response) -> Result<Value> {
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(OAUTH_RESPONSE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read OAuth response")?;
+    if bytes.len() as u64 > OAUTH_RESPONSE_MAX_BYTES {
+        anyhow::bail!("OAuth response exceeded the {OAUTH_RESPONSE_MAX_BYTES} byte limit");
+    }
+    serde_json::from_slice(&bytes).context("OAuth response was not valid JSON")
+}
+
 fn exchange_oauth_code(
-    token_url: &str,
-    client_id: &str,
+    oauth: &OAuthFlow,
     code: &str,
     code_verifier: &str,
+    state: &str,
     redirect_uri: &str,
 ) -> Result<ExchangedTokens> {
-    let client = provider_blocking_http_client_builder()
-        .build()
-        .context("build OAuth HTTP client")?;
-    let params = [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("client_id", client_id),
-        ("code_verifier", code_verifier),
-        ("redirect_uri", redirect_uri),
-    ];
-    let resp = client
-        .post(token_url)
-        .form(&params)
-        .send()
-        .context("token exchange request failed")?;
+    let client = oauth_http_client()?;
+    let mut request = client.post(&oauth.token_url);
+    if oauth.protocol == OAuthProtocol::AnthropicClaude {
+        request = request.json(&json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": oauth.client_id,
+            "code_verifier": code_verifier,
+            "state": state,
+            "redirect_uri": redirect_uri,
+        }));
+    } else {
+        request = request.form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", oauth.client_id.as_str()),
+            ("code_verifier", code_verifier),
+            ("redirect_uri", redirect_uri),
+        ]);
+    }
+    let resp = request.send().context("token exchange request failed")?;
     let status = resp.status();
-    let body: Value = resp
-        .json()
-        .context("token exchange response was not valid JSON")?;
     if !status.is_success() {
         anyhow::bail!("token exchange failed ({status}): provider rejected the OAuth exchange");
     }
+    let body = read_oauth_json_response(resp).context("token exchange response was invalid")?;
 
     let access_token = body
         .get("access_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("no access_token in OAuth response"))?;
     let refresh_token = body
         .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let expires_at = oauth_expires_at_from_response(&body);
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    let expires_at = oauth_expires_at_from_response(
+        &body,
+        if oauth.protocol == OAuthProtocol::AnthropicClaude {
+            300
+        } else {
+            0
+        },
+    );
+    if oauth.protocol == OAuthProtocol::AnthropicClaude {
+        if refresh_token.is_none() {
+            anyhow::bail!("no refresh_token in Anthropic OAuth response");
+        }
+        if expires_at.is_none() {
+            anyhow::bail!("no valid expires_in in Anthropic OAuth response");
+        }
+    }
 
     Ok(ExchangedTokens {
         access_token,
@@ -4199,43 +4763,54 @@ fn exchange_oauth_code(
     })
 }
 
-fn exchange_oauth_refresh_token(
-    token_url: &str,
-    client_id: &str,
-    refresh_token: &str,
-) -> Result<ExchangedTokens> {
-    let client = provider_blocking_http_client_builder()
-        .build()
-        .context("build OAuth HTTP client")?;
-    let params = [
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("client_id", client_id),
-    ];
-    let resp = client
-        .post(token_url)
-        .form(&params)
-        .send()
-        .context("token refresh request failed")?;
+fn exchange_oauth_refresh_token(oauth: &OAuthFlow, refresh_token: &str) -> Result<ExchangedTokens> {
+    let client = oauth_http_client()?;
+    let mut request = client.post(&oauth.token_url);
+    if oauth.protocol == OAuthProtocol::AnthropicClaude {
+        request = request.json(&json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": oauth.client_id,
+        }));
+    } else {
+        request = request.form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", oauth.client_id.as_str()),
+        ]);
+    }
+    let resp = request.send().context("token refresh request failed")?;
     let status = resp.status();
-    let body: Value = resp
-        .json()
-        .context("token refresh response was not valid JSON")?;
     if !status.is_success() {
         anyhow::bail!("token refresh failed ({status}): provider rejected the OAuth refresh");
     }
+    let body = read_oauth_json_response(resp).context("token refresh response was invalid")?;
 
     let access_token = body
         .get("access_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("no access_token in OAuth refresh response"))?;
     let next_refresh = body
         .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
         .or_else(|| Some(refresh_token.to_string()));
-    let expires_at = oauth_expires_at_from_response(&body);
+    let expires_at = oauth_expires_at_from_response(
+        &body,
+        if oauth.protocol == OAuthProtocol::AnthropicClaude {
+            300
+        } else {
+            0
+        },
+    );
+    if oauth.protocol == OAuthProtocol::AnthropicClaude && expires_at.is_none() {
+        anyhow::bail!("no valid expires_in in Anthropic OAuth refresh response");
+    }
 
     Ok(ExchangedTokens {
         access_token,
@@ -4253,7 +4828,7 @@ fn refresh_oauth_credential_if_needed(
         return Ok(None);
     }
     let Some(StoredCredential::OAuth {
-        access_token: _access_token,
+        access_token,
         refresh_token,
         expires_at,
     }) = store
@@ -4268,12 +4843,20 @@ fn refresh_oauth_credential_if_needed(
     let Some(expires_at) = expires_at else {
         return Ok(None);
     };
-    if expires_at == 0 || unix_timestamp_secs().saturating_add(60) < expires_at {
+    let now = unix_timestamp_secs();
+    if expires_at == 0 || now.saturating_add(60) < expires_at {
         return Ok(None);
     }
 
     let Some(refresh_token) = refresh_token else {
-        return Ok(None);
+        if now < expires_at {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "OAuth access token for provider '{}' is expired and has no refresh token. Re-run /login {} web.",
+            profile.id,
+            profile.id
+        );
     };
     let refreshed = {
         let oauth = profile.oauth_flow.as_ref().ok_or_else(|| {
@@ -4282,18 +4865,68 @@ fn refresh_oauth_credential_if_needed(
                 profile.id
             )
         })?;
-        exchange_oauth_refresh_token(&oauth.token_url, &oauth.client_id, &refresh_token)?
+        match exchange_oauth_refresh_token(oauth, &refresh_token) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                let current_store = load_auth_store()?;
+                let credential_changed = current_store
+                    .providers
+                    .get(&profile.id)
+                    .or_else(|| current_store.providers.get(&canonical))
+                    .is_none_or(|credential| {
+                        !matches!(
+                            credential,
+                            StoredCredential::OAuth {
+                                access_token: current_access,
+                                refresh_token: Some(current_refresh),
+                                expires_at: Some(current_expires),
+                            } if current_access == &access_token
+                                && current_refresh == &refresh_token
+                                && *current_expires == expires_at
+                        )
+                    });
+                if credential_changed {
+                    *store = current_store;
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        }
     };
-    let token = refreshed.access_token;
-    store.providers.insert(
+
+    let mut current_store = load_auth_store()?;
+    let credential_is_current = current_store
+        .providers
+        .get(&profile.id)
+        .or_else(|| current_store.providers.get(&canonical))
+        .is_some_and(|credential| {
+            matches!(
+                credential,
+                StoredCredential::OAuth {
+                    access_token: current_access,
+                    refresh_token: Some(current_refresh),
+                    expires_at: Some(current_expires),
+                } if current_access == &access_token
+                    && current_refresh == &refresh_token
+                    && *current_expires == expires_at
+            )
+        });
+    if !credential_is_current {
+        *store = current_store;
+        return Ok(None);
+    }
+
+    let token = refreshed.access_token.clone();
+    current_store.providers.insert(
         canonical,
         StoredCredential::OAuth {
-            access_token: token.clone(),
+            access_token: refreshed.access_token,
             refresh_token: refreshed.refresh_token,
             expires_at: refreshed.expires_at,
         },
     );
-    save_auth_store(store)?;
+    save_auth_store(&current_store)?;
+    *store = current_store;
     Ok(Some(token))
 }
 
@@ -4319,6 +4952,10 @@ pub(crate) fn login_provider(
     let mut store = load_auth_store()?;
     let explicit_web = key_from_arg.is_some_and(login_arg_requests_web_flow);
     let explicit_import = key_from_arg.is_some_and(login_arg_requests_import);
+    let anthropic_subscription_login = profile
+        .oauth_flow
+        .as_ref()
+        .is_some_and(|oauth| oauth.protocol == OAuthProtocol::AnthropicClaude);
     let mut key = if explicit_web || explicit_import {
         String::new()
     } else {
@@ -4339,6 +4976,7 @@ pub(crate) fn login_provider(
         }
 
         if explicit_web
+            && !anthropic_subscription_login
             && store
                 .providers
                 .remove(&canonical_provider_id(&profile.id))
@@ -4347,7 +4985,31 @@ pub(crate) fn login_provider(
             save_auth_store(&store)?;
         }
 
-        if !explicit_web && let Some((secret, source)) = resolve_provider_api_key(&profile, &store)
+        if !explicit_web && anthropic_subscription_login {
+            let canonical = canonical_provider_id(&profile.id);
+            if let Some(entry @ StoredCredential::OAuth { .. }) = store
+                .providers
+                .get(&profile.id)
+                .or_else(|| store.providers.get(&canonical))
+                && entry.resolve_secret().is_some()
+            {
+                clear_pending_oauth_for_provider(&profile.id);
+                catalog.active_provider = profile.id.clone();
+                save_provider_catalog(&catalog)?;
+                return Ok(LoginResult {
+                    message: format!(
+                        "provider '{}' already authenticated via subscription OAuth and set active",
+                        profile.id
+                    ),
+                    provider_id: profile.id.clone(),
+                    awaiting_credentials: false,
+                });
+            }
+        }
+
+        if !explicit_web
+            && !anthropic_subscription_login
+            && let Some((secret, source)) = resolve_provider_api_key(&profile, &store)
         {
             catalog.active_provider = profile.id.clone();
             save_provider_catalog(&catalog)?;
@@ -4368,6 +5030,7 @@ pub(crate) fn login_provider(
                     StoredCredential::ApiKey { key: secret },
                 );
                 save_auth_store(&store)?;
+                clear_pending_oauth_for_provider(&profile.id);
                 return Ok(LoginResult {
                     message: format!(
                         "imported credentials for provider '{}' from {} into {} and set it active",
@@ -4384,6 +5047,7 @@ pub(crate) fn login_provider(
         if explicit_import {
             if let Some(source) = import_provider_credential_from_external(&profile, &mut store) {
                 save_auth_store(&store)?;
+                clear_pending_oauth_for_provider(&profile.id);
                 catalog.active_provider = profile.id.clone();
                 save_provider_catalog(&catalog)?;
                 return Ok(LoginResult {
@@ -4405,7 +5069,7 @@ pub(crate) fn login_provider(
         }
 
         if let Some(oauth) = &profile.oauth_flow {
-            return run_oauth_login(oauth, &profile, &mut catalog, &mut store);
+            return run_oauth_login(oauth, &profile);
         }
 
         let mut login_urls: Vec<String> = Vec::new();
@@ -4478,7 +5142,7 @@ pub(crate) fn login_provider(
     // would otherwise match the plain-code fallback and fail login with a
     // bogus "no pending OAuth session" error instead of being stored.
     if (profile.oauth_flow.is_some() || extract_oauth_code_from_callback(&key).is_some())
-        && let Some(msg) = try_complete_oauth_from_callback(&key)?
+        && let Some(msg) = try_complete_oauth_from_callback(&key, Some(&profile.id))?
     {
         catalog.active_provider = profile.id.clone();
         save_provider_catalog(&catalog)?;
@@ -4489,12 +5153,19 @@ pub(crate) fn login_provider(
         });
     }
 
+    if profile.oauth_flow.is_some() && (key.contains("://") || key.contains("code=")) {
+        anyhow::bail!(
+            "malformed OAuth callback. Paste the complete callback URL, including its non-empty code and state, or paste just the authorization code."
+        );
+    }
+
     validate_login_secret_for_provider(&profile, &key)?;
     store.providers.insert(
         canonical_provider_id(&profile.id),
         StoredCredential::ApiKey { key },
     );
     save_auth_store(&store)?;
+    clear_pending_oauth_for_provider(&profile.id);
 
     catalog.active_provider = profile.id.clone();
     save_provider_catalog(&catalog)?;
@@ -4769,6 +5440,231 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp home");
         path
+    }
+
+    #[test]
+    fn oauth_callback_listener_ignores_invalid_requests_until_valid_callback() -> Result<()> {
+        let code = receive_oauth_callback_for_test(
+            "expected-state",
+            "/callback",
+            &[
+                "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "GET /callback?code=wrong&state=wrong-state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    .to_string(),
+                "GET /callback?code=accepted-code&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    .to_string(),
+            ],
+        )?;
+        assert_eq!(code, "accepted-code");
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_callback_listener_rejects_malformed_and_oversized_requests() -> Result<()> {
+        let oversized = format!(
+            "GET /callback?code=oversized&state=expected-state HTTP/1.1\r\nX-Fill: {}\r\n\r\n",
+            "x".repeat(8192)
+        );
+        let code = receive_oauth_callback_for_test(
+            "expected-state",
+            "/callback",
+            &[
+                "POST /callback?code=post&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    .to_string(),
+                "GET /callback?code=incomplete&state=expected-state HTTP/1.1\r\nHost: localhost\r\n"
+                    .to_string(),
+                oversized,
+                "GET /callback?code=accepted-code&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    .to_string(),
+            ],
+        )?;
+        assert_eq!(code, "accepted-code");
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_callback_listener_renders_failure_only_after_completion_fails() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let callback = spawn_oauth_code_listener(
+            listener,
+            "expected-state".to_string(),
+            "/callback".to_string(),
+        )?;
+        let client = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut stream = std::net::TcpStream::connect(address)?;
+            stream.write_all(
+                b"GET /callback?code=accepted-code&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )?;
+            stream.flush()?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(response)
+        });
+        let received = callback.recv_timeout(Duration::from_secs(5))?;
+        let OAuthCallbackKind::Code(code) = received.kind else {
+            anyhow::bail!("expected OAuth code callback");
+        };
+        assert_eq!(code, "accepted-code");
+        received
+            .browser_result
+            .send(OAuthBrowserResult::Failure)
+            .map_err(|_| anyhow::anyhow!("send OAuth browser result"))?;
+        let response = client
+            .join()
+            .map_err(|_| anyhow::anyhow!("OAuth test client panicked"))??;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("500 Internal Server Error"));
+        assert!(response.contains("AUTHENTICATION INCOMPLETE"));
+        assert!(!response.contains("You're signed in"));
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_callback_listener_renders_provider_denial() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let callback = spawn_oauth_code_listener(
+            listener,
+            "expected-state".to_string(),
+            "/callback".to_string(),
+        )?;
+        let client = std::thread::spawn(move || -> io::Result<Vec<u8>> {
+            let mut stream = std::net::TcpStream::connect(address)?;
+            stream.write_all(
+                b"GET /callback?error=access_denied&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )?;
+            stream.flush()?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            Ok(response)
+        });
+        let received = callback.recv_timeout(Duration::from_secs(2))?;
+        assert!(matches!(received.kind, OAuthCallbackKind::Rejected));
+        received
+            .browser_result
+            .send(OAuthBrowserResult::Failure)
+            .map_err(|_| anyhow::anyhow!("send OAuth browser result"))?;
+        let response = client
+            .join()
+            .map_err(|_| anyhow::anyhow!("OAuth test client panicked"))??;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("400 Bad Request"));
+        assert!(response.contains("AUTHENTICATION INCOMPLETE"));
+        assert!(!response.contains("access_denied"));
+        Ok(())
+    }
+
+    #[test]
+    fn oauth_refresh_rotates_and_persists_tokens() -> Result<()> {
+        let _guard = crate::test_env_lock();
+        let home = temp_home("oauth-refresh-rotation");
+        let old_home = std::env::var_os("DEXT_HOME");
+        unsafe { std::env::set_var("DEXT_HOME", &home) };
+
+        let result = (|| -> Result<()> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let server = std::thread::spawn(move || -> io::Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = [0u8; 4096];
+                let size = stream.read(&mut request)?;
+                let request = String::from_utf8_lossy(&request[..size]);
+                assert!(request.contains("POST /token HTTP/1.1"));
+                assert!(request.contains("old-refresh"));
+                let body = r#"{"access_token":" new-access ","refresh_token":" new-refresh ","expires_in":3600}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+                Ok(())
+            });
+
+            let mut profile = built_in_provider_profiles()
+                .into_iter()
+                .find(|profile| profile.id == "anthropic")
+                .context("Anthropic profile")?;
+            profile
+                .oauth_flow
+                .as_mut()
+                .context("Anthropic OAuth")?
+                .token_url = format!("http://{address}/token");
+            let mut store = AuthStore::default();
+            store.providers.insert(
+                "anthropic".to_string(),
+                StoredCredential::OAuth {
+                    access_token: "old-access".to_string(),
+                    refresh_token: Some("old-refresh".to_string()),
+                    expires_at: Some(unix_timestamp_secs()),
+                },
+            );
+            save_auth_store(&store)?;
+
+            assert_eq!(
+                refresh_oauth_credential_if_needed(&profile, &mut store)?.as_deref(),
+                Some("new-access")
+            );
+            server
+                .join()
+                .map_err(|_| anyhow::anyhow!("OAuth refresh server panicked"))??;
+            let persisted = load_auth_store()?;
+            assert!(matches!(
+                persisted.providers.get("anthropic"),
+                Some(StoredCredential::OAuth {
+                    access_token,
+                    refresh_token: Some(refresh_token),
+                    expires_at: Some(expires_at),
+                }) if access_token == "new-access"
+                    && refresh_token == "new-refresh"
+                    && *expires_at > unix_timestamp_secs()
+            ));
+            Ok(())
+        })();
+
+        if let Some(value) = old_home {
+            unsafe { std::env::set_var("DEXT_HOME", value) };
+        } else {
+            unsafe { std::env::remove_var("DEXT_HOME") };
+        }
+        let _ = std::fs::remove_dir_all(home);
+        result
+    }
+
+    #[test]
+    fn oauth_callback_listener_accepts_fragmented_request_headers() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let callback = spawn_oauth_code_listener(
+            listener,
+            "expected-state".to_string(),
+            "/callback".to_string(),
+        )?;
+        let mut stream = std::net::TcpStream::connect(address)?;
+        stream.write_all(b"GET /callback?code=fragmented")?;
+        stream.flush()?;
+        std::thread::sleep(Duration::from_millis(350));
+        stream.write_all(b"-code&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+        stream.flush()?;
+        let mut response = Vec::new();
+        let received = callback.recv_timeout(Duration::from_secs(5))?;
+        let OAuthCallbackKind::Code(code) = received.kind else {
+            anyhow::bail!("expected OAuth code callback");
+        };
+        received
+            .browser_result
+            .send(OAuthBrowserResult::Success)
+            .map_err(|_| anyhow::anyhow!("send OAuth browser result"))?;
+        stream.read_to_end(&mut response)?;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("200 OK"));
+        assert!(response.contains("DEXT</b> / LOGIN"));
+        assert!(response.contains("You're signed in"));
+        assert!(response.contains("Cache-Control: no-store"));
+        assert_eq!(code, "fragmented-code");
+        Ok(())
     }
 
     #[test]

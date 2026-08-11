@@ -38,7 +38,7 @@ The main status row reserves its right edge for a live cumulative agent-active c
 
 ## Dependency stack
 
-The renderer dependencies are exact so unrelated lockfile refreshes cannot change terminal behavior:
+The renderer dependencies are exact so unrelated lockfile refreshes cannot change terminal behavior. The lockfile also pins Ratatui's transitive `lru` cache to patched `0.18.2`:
 
 - `ratatui = 0.30.2`
 - `ratatui-core = 0.1.2`

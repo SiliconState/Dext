@@ -57,12 +57,12 @@ cargo install --path . --force --locked
 ## Start
 
 ```bash
-# Browser login for ChatGPT/Codex
+# Browser login for ChatGPT/Codex or a Claude Pro/Max subscription
+# (Anthropic subscription compatibility is unofficial and version-pinned.)
 dext auth login chatgpt
-
-# Open the provider login page, then paste the key at Dext's prompt
-# (do not put secrets in shell command arguments)
 dext auth login anthropic
+
+# Anthropic Console API keys remain supported through ANTHROPIC_API_KEY.
 
 # Work interactively in the current project
 dext
@@ -112,6 +112,7 @@ Git checkpoints are recovery aids, not a substitute for commits. Credentials are
 - [Usage and configuration](docs/USAGE.md)
 - [Packs and shelves](docs/PACKS.md)
 - [Technical architecture](docs/ARCHITECTURE.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
 - [TUI behavior](docs/TUI.md)
 - [Release verification](docs/RELEASING.md)
 - [Contributing](CONTRIBUTING.md)
