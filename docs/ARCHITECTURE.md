@@ -15,12 +15,12 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 ## Core modules
 
 - `src/main.rs`
-  - Agent state and loop.
+  - Agent state and loop, including value-owned parsed-stream outcomes, bounded incomplete-response continuation, and preservation of every nonempty assistant response before any paired tool results are appended.
   - CLI parsing, top-level command dispatch, and structured `dext doctor` rendering.
   - Slash commands.
   - Built-in tool implementations, including bounded, cancellation-aware native file reads and an 8 MiB `read_symbol` source-input ceiling.
   - Eval harness.
-  - Prompt/context assembly and compaction; the standard built-in agent prompt is compact and invariant-driven, leaving tool-specific syntax in lean schemas rather than duplicating it in universal prose. Turn-stable guidance/pack/shelf prompt sections are cached separately from the volatile per-round environment tail. Context-file cache identity includes size/time metadata plus file identity/change metadata where the platform exposes it, so same-size atomic replacements invalidate within a turn. That tail omits toolset/schema labels already represented by provider definitions and host-only compaction thresholds, while retaining actionable runtime policy/model state; variable cwd/Git/provider/model values are byte-bounded and JSON-quoted when needed to remain one line, and persisted ledger/provider-health strings are collapsed and bounded before prompt rendering. Context strategy budgets omit all-zero rows before the first tool action, then remain explicit after actions to preserve reset/warning/pivot state. Each ancestor guidance/recall file is bounded at 1 MiB; provenance paths and raw-file hashes come from the same bounded reads actually included in the composed prompt. Aggregate project-context and per-section caps include headings or truncation markers as applicable, and wholly omitted files are excluded from prompt provenance.
+  - Prompt/context assembly and compaction; Responses-based summaries reject incomplete terminals, retry within the bounded summary stream budget, and carry parsed usage across retries. The standard built-in agent prompt is compact and invariant-driven, leaving tool-specific syntax in lean schemas rather than duplicating it in universal prose. Turn-stable guidance/pack/shelf prompt sections are cached separately from the volatile per-round environment tail. Context-file cache identity includes size/time metadata plus file identity/change metadata where the platform exposes it, so same-size atomic replacements invalidate within a turn. That tail omits toolset/schema labels already represented by provider definitions and host-only compaction thresholds, while retaining actionable runtime policy/model state; variable cwd/Git/provider/model values are byte-bounded and JSON-quoted when needed to remain one line, and persisted ledger/provider-health strings are collapsed and bounded before prompt rendering. Context strategy budgets omit all-zero rows before the first tool action, then remain explicit after actions to preserve reset/warning/pivot state. Each ancestor guidance/recall file is bounded at 1 MiB; provenance paths and raw-file hashes come from the same bounded reads actually included in the composed prompt. Aggregate project-context and per-section caps include headings or truncation markers as applicable, and wholly omitted files are excluded from prompt provenance.
   - Event emission through the sinks it owns.
 
 - `src/git_checkpoints.rs`
@@ -59,6 +59,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 - `src/streaming.rs`
   - Provider-specific event validation/assembly.
   - Provider-neutral streamed blocks and strict final tool-argument construction.
+  - Anthropic implicit terminal handling completes open display blocks but never authorizes an unstopped tool call; explicitly stopped max-token calls are discarded only for EOF-shaped argument JSON, while malformed values remain errors.
 
 - `src/tool_round.rs`
   - Tool-call planning, approval inputs, checkpoint/journal boundaries, dispatch, and result normalization.

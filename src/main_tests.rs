@@ -122,7 +122,6 @@ fn test_agent(root: &Path) -> Agent {
         last_checkpoint_at: None,
         session_model_pins: HashMap::new(),
         partial_stream_text: None,
-        last_stream_truncated_tool_calls: 0,
         quiet_stream_events: false,
         compact_threshold_chars: None,
         compact_threshold_percent: None,
@@ -15006,11 +15005,11 @@ fn stream_recovery_reason_is_contract_scoped() {
     assert_eq!(
         stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 1)
             .as_deref(),
-        Some("truncated_tool_call")
+        Some("unfinished_tool_call")
     );
     assert_eq!(
         stream_recovery_reason(RequestContract::AnthropicMessages, None, 2).as_deref(),
-        Some("truncated_tool_call")
+        Some("unfinished_tool_call")
     );
     assert_eq!(
         stream_recovery_reason(RequestContract::AnthropicMessages, Some("max_tokens"), 0),
@@ -15035,6 +15034,14 @@ fn stream_recovery_reason_is_contract_scoped() {
             Some("incomplete"),
             0
         ),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::OpenAiChatCompletions, None, 1),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::ChatGptResponses, Some("completed"), 1),
         None
     );
 }
@@ -15124,6 +15131,89 @@ fn partial_stream_preserve_only_text_blocks() {
         &mut history,
         ContextMode::Frugal
     ));
+
+    let mut history = Vec::new();
+    assert!(maybe_preserve_assistant_response(
+        &tool_only,
+        &mut history,
+        ContextMode::Standard
+    ));
+    assert!(matches!(
+        history.as_slice(),
+        [Message { role, content }]
+            if role == "assistant" && content == &tool_only
+    ));
+    assert!(!maybe_preserve_assistant_response(
+        &tool_only,
+        &mut history,
+        ContextMode::Standard
+    ));
+    assert_eq!(history.len(), 1);
+}
+
+#[test]
+fn nontext_assistant_response_precedes_tool_results_on_every_wire_contract() {
+    let root = temp_test_dir("nontext-assistant-history-pairing");
+    let mut agent = test_agent(&root);
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "Read the todo list.".to_string(),
+        }],
+    });
+    let tool_only = vec![Block::ToolUse {
+        id: "call_1".to_string(),
+        name: "todo_read".to_string(),
+        input: json!({}),
+    }];
+    assert!(maybe_preserve_assistant_response(
+        &tool_only,
+        &mut agent.history,
+        ContextMode::Standard
+    ));
+    agent.history.push(Message {
+        role: "user".to_string(),
+        content: vec![tool_result_block("call_1", "(no todos)", None)],
+    });
+
+    let anthropic = anthropic_wire_messages(
+        &sanitize_anthropic_messages(&agent.history, false, false),
+        false,
+    )
+    .expect("Anthropic wire history");
+    assert_eq!(
+        anthropic
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        ["user", "assistant", "user"]
+    );
+    assert_eq!(anthropic[1]["content"][0]["type"], "tool_use");
+    assert_eq!(anthropic[2]["content"][0]["type"], "tool_result");
+
+    let responses = agent.history_to_chatgpt_input();
+    let call_index = responses
+        .iter()
+        .position(|item| item["type"] == "function_call")
+        .expect("Responses function call");
+    let result_index = responses
+        .iter()
+        .position(|item| item["type"] == "function_call_output")
+        .expect("Responses function output");
+    assert!(call_index < result_index, "{responses:?}");
+
+    let chat_completions = agent.history_to_oai_messages("system");
+    let assistant_index = chat_completions
+        .iter()
+        .position(|message| message.role == "assistant")
+        .expect("Chat Completions assistant tool call");
+    let result_index = chat_completions
+        .iter()
+        .position(|message| message.role == "tool")
+        .expect("Chat Completions tool result");
+    assert!(assistant_index < result_index);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -24298,6 +24388,109 @@ async fn chatgpt_compact_summary_honors_summary_model_reasoning_capability() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn responses_compact_summary_retries_incomplete_text_and_accumulates_usage() {
+    let root = temp_test_dir("responses-summary-incomplete-retry");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        fn drain_request(stream: &mut std::net::TcpStream) {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read request");
+                assert!(read > 0, "client closed before request completed");
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read request body");
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..read]);
+            }
+        }
+
+        let responses = [
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Discarded partial summary.\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"text\":\"Discarded partial summary.\"}\n\n",
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+            ),
+            concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Task\\nRecovered summary.\"}\n\n",
+                "data: {\"type\":\"response.output_text.done\",\"text\":\"Task\\nRecovered summary.\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":4}}}\n\n"
+            ),
+        ];
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            drain_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+    });
+
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "chatgpt")
+        .expect("chatgpt profile");
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.provider_profile = Some(profile);
+    agent.base_url = format!("http://{addr}");
+    agent.model = "gpt-5.4".to_string();
+    agent.api_key = "eyJhbGciOiJIUzI1NiJ9.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF90ZXN0In19.signature".to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let old = vec![Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "old context".to_string(),
+        }],
+    }];
+
+    let (summary, usage) = agent
+        .one_shot_summary(&old, "")
+        .await
+        .expect("incomplete summary should retry");
+    assert_eq!(summary, "Task\nRecovered summary.");
+    assert!(!summary.contains("Discarded partial"));
+    assert_eq!(usage.input, 8);
+    assert_eq!(usage.output, 6);
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HttpRetry {
+            attempt: 1,
+            wait_secs: 0,
+            reason,
+        } if reason == "incomplete summary response (max_output_tokens)"
+    )));
+
+    server.join().expect("server thread");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn chatgpt_request_body_maps_xhigh_to_actual_reasoning_effort_and_summary() {
     // Regression: ChatGPT/Codex models silently refuse to emit function_call items unless the
@@ -24482,6 +24675,128 @@ async fn chatgpt_incomplete_function_call_retries_with_lower_effort() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn anthropic_unfinished_tool_call_automatically_continues() {
+    let root = temp_test_dir("anthropic-unfinished-tool-recovery");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    let server = std::thread::spawn(move || {
+        fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read request");
+                assert!(read > 0, "client closed before request completed");
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read request body");
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..read]);
+            }
+            request[header_end..header_end + content_length].to_vec()
+        }
+
+        let responses = [
+            concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n",
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"write_file\",\"input\":{}}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README\"}}\n\n",
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ),
+            concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n",
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Recovered.\"}}\n\n",
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ),
+        ];
+        let mut bodies = Vec::new();
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            bodies.push(read_request_body(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        bodies
+    });
+
+    let mut agent = test_agent(&root);
+    agent.provider_id = "anthropic".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.base_url = format!("http://{addr}");
+    agent.model = "claude-sonnet-4-6".to_string();
+    agent.max_iterations = Some(1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    agent
+        .chat("Continue the existing work.".to_string())
+        .await
+        .expect("unfinished Anthropic tool call should recover");
+    let bodies = server.join().expect("server thread");
+    assert_eq!(bodies.len(), 2);
+    let retry: Value = serde_json::from_slice(&bodies[1]).expect("retry request JSON");
+    assert!(retry["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["content"].as_array().is_some_and(|content| {
+                content.iter().any(|block| {
+                    block["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("recovery 1/3"))
+                })
+            })
+        })
+    }));
+    assert!(agent.history.iter().any(|message| {
+        message.role == "assistant"
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == "Recovered."))
+    }));
+    assert!(agent.provider_health.providers.is_empty());
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Warn(message)
+            if message.contains("Dropped 1 unfinished tool call") && message.contains("continuing the turn")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnDiagnostics {
+            last_retry_reason: Some(reason),
+            ..
+        } if reason == "incomplete response (unfinished_tool_call)"
+    )));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
     let root = temp_test_dir("anthropic-omitted-thinking-stream");
@@ -24514,7 +24829,7 @@ async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
     let resp = reqwest::get(format!("http://{addr}/stream"))
         .await
         .expect("response");
-    let (blocks, _stop, _usage) = agent.read_stream(resp).await.expect("parse stream");
+    let ParsedProviderStream { blocks, .. } = agent.read_stream(resp).await.expect("parse stream");
     assert!(
         matches!(
             blocks.first(),
@@ -24568,7 +24883,7 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
     let resp = reqwest::get(format!("http://{addr}/stream"))
         .await
         .expect("response");
-    let (blocks, _stop, _usage) = agent
+    let ParsedProviderStream { blocks, .. } = agent
         .read_stream_responses(resp, RequestContract::ChatGptResponses)
         .await
         .expect("parse stream");

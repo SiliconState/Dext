@@ -355,17 +355,19 @@ fn chatgpt_incomplete_reason(contract: RequestContract, stop_reason: Option<&str
     }
 }
 
-/// A response needs a bounded automatic continuation when the Responses API
-/// reported an incomplete status, or when the only streamed Anthropic tool
-/// calls were dropped because their argument JSON was cut off mid-stream.
+/// Classifies a recoverable incomplete stream. The caller only issues an
+/// automatic continuation when no executable tool call remains.
 fn stream_recovery_reason(
     contract: RequestContract,
     stop_reason: Option<&str>,
-    truncated_tool_calls: usize,
+    unfinished_tool_calls: usize,
 ) -> Option<String> {
     chatgpt_incomplete_reason(contract, stop_reason)
         .map(str::to_string)
-        .or_else(|| (truncated_tool_calls > 0).then(|| "truncated_tool_call".to_string()))
+        .or_else(|| {
+            (contract == RequestContract::AnthropicMessages && unfinished_tool_calls > 0)
+                .then(|| "unfinished_tool_call".to_string())
+        })
 }
 
 fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
@@ -379,6 +381,25 @@ fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
         )
     } else {
         anyhow::Error::new(e)
+    }
+}
+
+#[derive(Debug)]
+struct ParsedProviderStream {
+    blocks: Vec<Block>,
+    stop_reason: Option<String>,
+    usage: Usage,
+    unfinished_tool_calls: usize,
+}
+
+impl ParsedProviderStream {
+    fn stopped(reason: &str) -> Self {
+        Self {
+            blocks: Vec::new(),
+            stop_reason: Some(reason.to_string()),
+            usage: Usage::default(),
+            unfinished_tool_calls: 0,
+        }
     }
 }
 
@@ -670,6 +691,28 @@ fn maybe_preserve_partial_stream(
     if let Some(last) = history.last()
         && last.role == "assistant"
         && last.content == visible_blocks
+    {
+        return false;
+    }
+    history.push(Message {
+        role: "assistant".to_string(),
+        content: visible_blocks,
+    });
+    true
+}
+
+fn maybe_preserve_assistant_response(
+    blocks: &[Block],
+    history: &mut Vec<Message>,
+    context_mode: ContextMode,
+) -> bool {
+    if blocks.is_empty() {
+        return false;
+    }
+    let visible_blocks = assistant_blocks_for_context(blocks, context_mode);
+    if history
+        .last()
+        .is_some_and(|message| message.role == "assistant" && message.content == visible_blocks)
     {
         return false;
     }
@@ -13129,7 +13172,6 @@ struct Agent {
     last_checkpoint_at: Option<std::time::Instant>,
     session_model_pins: HashMap<String, String>,
     partial_stream_text: Option<String>,
-    last_stream_truncated_tool_calls: usize,
     quiet_stream_events: bool,
     compact_threshold_chars: Option<usize>,
     compact_threshold_percent: Option<u8>,
@@ -13332,7 +13374,6 @@ impl Agent {
             session_model_pins: HashMap::new(),
             partial_stream_text: None,
             quiet_stream_events: false,
-            last_stream_truncated_tool_calls: 0,
             compact_threshold_chars: compact_threshold_percent
                 .map(|percent| compact_threshold_chars_for_window(context_window_tokens, percent)),
             compact_threshold_percent,
@@ -16080,7 +16121,7 @@ impl Agent {
     async fn parse_stream_response(
         &mut self,
         resp: reqwest::Response,
-    ) -> Result<(Vec<Block>, Option<String>, Usage)> {
+    ) -> Result<ParsedProviderStream> {
         match self.request_contract() {
             RequestContract::OpenAiChatCompletions => self.read_stream_oai(resp).await,
             RequestContract::OpenAiResponses | RequestContract::ChatGptResponses => {
@@ -16907,6 +16948,39 @@ impl Agent {
         }
     }
 
+    async fn send_responses_summary_request(
+        &self,
+        contract: RequestContract,
+        body: &Value,
+    ) -> Result<reqwest::Response> {
+        let url = provider_request_url(&self.base_url, contract);
+        let bytes = serde_json::to_vec(body).map_err(|error| anyhow::anyhow!(error))?;
+        let req = apply_provider_headers(
+            self.http_client()
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .body(bytes),
+            contract,
+            &self.api_key,
+            self.provider_profile
+                .as_ref()
+                .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
+            false,
+            false,
+            None,
+        )?;
+        let resp = send_provider_request(req, self.first_byte_timeout()).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = read_provider_error_body(resp, self.stream_idle_timeout())
+                .await
+                .unwrap_or_default();
+            anyhow::bail!("summary {}", http_status_error(status, &text));
+        }
+        Ok(resp)
+    }
+
     async fn one_shot_summary(
         &mut self,
         old: &[Message],
@@ -16959,25 +17033,9 @@ impl Agent {
         };
         let (mut resp, parse_mode): (reqwest::Response, SummaryParse) = if is_responses_summary {
             let body = make_responses_summary_body();
-            let url = provider_request_url(&self.base_url, summary_contract);
-            let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
-            let req = apply_provider_headers(
-                self.http_client()
-                    .post(&url)
-                    .header("content-type", "application/json")
-                    .header("accept", "text/event-stream")
-                    .body(bytes),
-                summary_contract,
-                &self.api_key,
-                self.provider_profile
-                    .as_ref()
-                    .is_some_and(|profile| is_official_kimi_profile(profile, &self.base_url)),
-                false,
-                false,
-                None,
-            )?;
             (
-                send_provider_request(req, self.first_byte_timeout()).await?,
+                self.send_responses_summary_request(summary_contract, &body)
+                    .await?,
                 SummaryParse::Responses(summary_contract),
             )
         } else if summary_contract == RequestContract::OpenAiChatCompletions {
@@ -17067,14 +17125,50 @@ impl Agent {
         };
         if let Some(responses_contract) = responses_contract {
             let mut attempt = 0u32;
+            let mut summary_usage = Usage::default();
             loop {
                 attempt += 1;
                 match self.read_stream_responses(resp, responses_contract).await {
-                    Ok((blocks, _finish_reason, mut usage)) => {
+                    Ok(ParsedProviderStream {
+                        blocks,
+                        stop_reason,
+                        mut usage,
+                        ..
+                    }) => {
                         let fallback_input =
                             ((user_text.len() as u64).saturating_add(3) / 4).max(1);
                         Self::fill_missing_usage_metrics(&mut usage, fallback_input, &blocks);
                         self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
+                        summary_usage.add(usage);
+                        if let Some(reason) =
+                            chatgpt_incomplete_reason(responses_contract, stop_reason.as_deref())
+                        {
+                            let incomplete = format!("summary response was incomplete ({reason})");
+                            if reason == "content_filter" {
+                                anyhow::bail!(incomplete);
+                            }
+                            if attempt >= MAX_STREAM_ATTEMPTS {
+                                anyhow::bail!(
+                                    "{incomplete} after {attempt} attempts; provider kept truncating compaction summaries"
+                                );
+                            }
+                            self.append_latest_log(
+                                "summary_stream_retry",
+                                &format!(
+                                    "attempt={attempt} kind=incomplete reason={reason} wait=0s"
+                                ),
+                            );
+                            self.sink.emit(AgentEvent::HttpRetry {
+                                attempt,
+                                wait_secs: 0,
+                                reason: format!("incomplete summary response ({reason})"),
+                            });
+                            let body = make_responses_summary_body();
+                            resp = self
+                                .send_responses_summary_request(responses_contract, &body)
+                                .await?;
+                            continue;
+                        }
                         let text = blocks
                             .into_iter()
                             .filter_map(|b| match b {
@@ -17086,7 +17180,7 @@ impl Agent {
                         if text.trim().is_empty() {
                             anyhow::bail!("summary response had no text blocks");
                         }
-                        return Ok((text, usage));
+                        return Ok((text, summary_usage));
                     }
                     Err(e) => {
                         let body = stream_error_body(&e);
@@ -17107,37 +17201,9 @@ impl Agent {
                             });
                             let _ = self.interrupt_aware_sleep(wait).await;
                             let body = make_responses_summary_body();
-                            let url = provider_request_url(&self.base_url, summary_contract);
-                            let bytes =
-                                serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
-                            let req = apply_provider_headers(
-                                self.http_client()
-                                    .post(&url)
-                                    .header("content-type", "application/json")
-                                    .header("accept", "text/event-stream")
-                                    .body(bytes),
-                                summary_contract,
-                                &self.api_key,
-                                self.provider_profile.as_ref().is_some_and(|profile| {
-                                    is_official_kimi_profile(profile, &self.base_url)
-                                }),
-                                false,
-                                false,
-                                None,
-                            )?;
-                            let retry_resp =
-                                send_provider_request(req, self.first_byte_timeout()).await?;
-                            let retry_status = retry_resp.status();
-                            if !retry_status.is_success() {
-                                let text = read_provider_error_body(
-                                    retry_resp,
-                                    self.stream_idle_timeout(),
-                                )
-                                .await
-                                .unwrap_or_default();
-                                anyhow::bail!("summary {}", http_status_error(retry_status, &text));
-                            }
-                            resp = retry_resp;
+                            resp = self
+                                .send_responses_summary_request(responses_contract, &body)
+                                .await?;
                             continue;
                         }
                         anyhow::bail!(body);
@@ -17661,7 +17727,7 @@ impl Agent {
             // are allowed per request round. Neither invalid call is executed.
             let mut context_overflow_compact_attempted = false;
             let mut malformed_tool_call_recovery_attempted = false;
-            let (blocks, stop_reason, mut usage) = 'stream_retry: loop {
+            let parsed_stream = 'stream_retry: loop {
                 let wire_tools = self.wire_tools();
                 let (url, req_body) = self.build_streaming_request_with_effort(
                     &sys_stable,
@@ -17703,11 +17769,7 @@ impl Agent {
                     )?;
                     let applied = try_apply_runtime_controls_for_stream(self);
                     if applied.aborted_stream {
-                        break 'stream_retry (
-                            Vec::new(),
-                            Some("runtime_control".to_string()),
-                            Usage::default(),
-                        );
+                        break 'stream_retry ParsedProviderStream::stopped("runtime_control");
                     }
                     let mut interrupt_ticker =
                         tokio::time::interval(std::time::Duration::from_millis(25));
@@ -17729,11 +17791,7 @@ impl Agent {
                             msg = queued_runtime_control_waiter(&mut self.runtime_control_rx) => {
                                 let runtime_control = apply_runtime_control_for_stream(self, msg);
                                 if runtime_control.aborted_stream {
-                                    break 'stream_retry (
-                                        Vec::new(),
-                                        Some("runtime_control".to_string()),
-                                        Usage::default(),
-                                    );
+                                    break 'stream_retry ParsedProviderStream::stopped("runtime_control");
                                 }
                                 continue;
                             },
@@ -17819,10 +17877,8 @@ impl Agent {
                             emit_external_telemetry(self.sink.as_mut(), &turn_state);
                             let runtime_controls = self.interrupt_aware_sleep(wait).await;
                             if runtime_controls.aborted_stream {
-                                break 'stream_retry (
-                                    Vec::new(),
-                                    Some("runtime_control".to_string()),
-                                    Usage::default(),
+                                break 'stream_retry ParsedProviderStream::stopped(
+                                    "runtime_control",
                                 );
                             }
                         }
@@ -17850,10 +17906,8 @@ impl Agent {
                                 emit_external_telemetry(self.sink.as_mut(), &turn_state);
                                 let runtime_controls = self.interrupt_aware_sleep(wait).await;
                                 if runtime_controls.aborted_stream {
-                                    break 'stream_retry (
-                                        Vec::new(),
-                                        Some("runtime_control".to_string()),
-                                        Usage::default(),
+                                    break 'stream_retry ParsedProviderStream::stopped(
+                                        "runtime_control",
                                     );
                                 }
                                 continue;
@@ -17869,17 +17923,15 @@ impl Agent {
 
                 let runtime_control = try_apply_runtime_controls_for_stream(self);
                 if runtime_control.aborted_stream {
-                    break 'stream_retry (
-                        Vec::new(),
-                        Some("runtime_control".to_string()),
-                        Usage::default(),
-                    );
+                    break 'stream_retry ParsedProviderStream::stopped("runtime_control");
                 }
                 match self.parse_stream_response(resp).await {
                     Ok(result) => {
-                        if let Some(reason) =
-                            chatgpt_incomplete_reason(self.request_contract(), result.1.as_deref())
-                        {
+                        if let Some(reason) = stream_recovery_reason(
+                            self.request_contract(),
+                            result.stop_reason.as_deref(),
+                            result.unfinished_tool_calls,
+                        ) {
                             self.record_provider_stream_failure(&format!(
                                 "provider returned an incomplete response ({reason})"
                             ));
@@ -17892,11 +17944,7 @@ impl Agent {
                         if stream_error_body(&e)
                             .contains("runtime control changed active stream") =>
                     {
-                        break 'stream_retry (
-                            Vec::new(),
-                            Some("runtime_control".to_string()),
-                            Usage::default(),
-                        );
+                        break 'stream_retry ParsedProviderStream::stopped("runtime_control");
                     }
                     Err(e) => {
                         let body = stream_error_body(&e);
@@ -17970,10 +18018,8 @@ impl Agent {
                             emit_external_telemetry(self.sink.as_mut(), &turn_state);
                             let runtime_controls = self.interrupt_aware_sleep(wait).await;
                             if runtime_controls.aborted_stream {
-                                break 'stream_retry (
-                                    Vec::new(),
-                                    Some("runtime_control".to_string()),
-                                    Usage::default(),
+                                break 'stream_retry ParsedProviderStream::stopped(
+                                    "runtime_control",
                                 );
                             }
                             continue 'stream_retry;
@@ -17989,11 +18035,12 @@ impl Agent {
                                 self.sink.emit(AgentEvent::Warn(
                                     "provider closed the stream after partial text; preserved partial response instead of replaying the same turn".to_string(),
                                 ));
-                                break 'stream_retry (
-                                    partial_blocks,
-                                    Some("partial_stream_eof".to_string()),
-                                    Usage::default(),
-                                );
+                                break 'stream_retry ParsedProviderStream {
+                                    blocks: partial_blocks,
+                                    stop_reason: Some("partial_stream_eof".to_string()),
+                                    usage: Usage::default(),
+                                    unfinished_tool_calls: 0,
+                                };
                             }
                         }
                         self.append_latest_log(
@@ -18010,6 +18057,12 @@ impl Agent {
                     }
                 }
             };
+            let ParsedProviderStream {
+                blocks,
+                stop_reason,
+                mut usage,
+                unfinished_tool_calls,
+            } = parsed_stream;
 
             if stop_reason.as_deref() == Some("runtime_control") {
                 self.partial_stream_text = None;
@@ -18045,23 +18098,8 @@ impl Agent {
                 action_contract_must_mutate = true;
             }
 
-            if maybe_preserve_partial_stream(&blocks, &mut self.history, self.context_mode) {
+            if maybe_preserve_assistant_response(&blocks, &mut self.history, self.context_mode) {
                 self.checkpoint_latest_session("after_assistant_message");
-            } else {
-                // maybe_preserve_partial_stream skips messages that lack Text/PartialStream
-                // blocks (e.g. ChatGPT responses that are pure tool_use). If the assistant
-                // message wasn't pushed and we're about to execute tool calls, we must
-                // push it now — otherwise the history goes user→user instead of
-                // assistant→user and the provider loops on repeated tool_result blocks
-                // with no matching assistant tool_use.
-                let has_tool_use = blocks.iter().any(|b| matches!(b, Block::ToolUse { .. }));
-                if has_tool_use {
-                    self.history.push(Message {
-                        role: "assistant".to_string(),
-                        content: assistant_blocks_for_context(&blocks, self.context_mode),
-                    });
-                    self.checkpoint_latest_session("after_assistant_message");
-                }
             }
 
             let tool_calls: Vec<(String, String, Value)> = blocks
@@ -18072,11 +18110,10 @@ impl Agent {
                 })
                 .collect();
 
-            let truncated_tool_calls = std::mem::take(&mut self.last_stream_truncated_tool_calls);
             let incomplete_reason = stream_recovery_reason(
                 self.request_contract(),
                 stop_reason.as_deref(),
-                truncated_tool_calls,
+                unfinished_tool_calls,
             );
             if let Some(reason) = incomplete_reason.as_deref()
                 && tool_calls.is_empty()
@@ -18521,7 +18558,7 @@ impl Agent {
         &mut self,
         resp: reqwest::Response,
         contract: RequestContract,
-    ) -> Result<(Vec<Block>, Option<String>, Usage)> {
+    ) -> Result<ParsedProviderStream> {
         let preserve_timing_cache = contract == RequestContract::OpenAiChatCompletions
             && provider::is_local_llama_provider(
                 &self.provider_id,
@@ -18546,17 +18583,16 @@ impl Agent {
         }
 
         let parsed = parser.finish()?;
-        self.last_stream_truncated_tool_calls = parsed.truncated_tool_calls;
-        if parsed.truncated_tool_calls > 0 {
+        if parsed.unfinished_tool_calls > 0 {
             let note = format!(
-                "[provider truncation] Dropped {} tool call(s) whose streamed arguments were cut off (stop_reason={}); continuing the turn.",
-                parsed.truncated_tool_calls,
+                "[provider incomplete] Dropped {} unfinished tool call(s) that lacked a trustworthy streamed completion (stop_reason={}); continuing the turn.",
+                parsed.unfinished_tool_calls,
                 parsed.stop_reason.as_deref().unwrap_or("unknown"),
             );
             if !self.quiet_stream_events {
                 self.sink.emit(AgentEvent::Warn(note.clone()));
             }
-            self.append_latest_log("stream_truncated_tool_calls", &note);
+            self.append_latest_log("stream_unfinished_tool_calls", &note);
         }
         if parsed.unknown_events > 0 {
             self.append_latest_log(
@@ -18599,7 +18635,12 @@ impl Agent {
             }
         }
         self.partial_stream_text = None;
-        Ok((parsed.blocks, parsed.stop_reason, parsed.usage))
+        Ok(ParsedProviderStream {
+            blocks: parsed.blocks,
+            stop_reason: parsed.stop_reason,
+            usage: parsed.usage,
+            unfinished_tool_calls: parsed.unfinished_tool_calls,
+        })
     }
 
     fn emit_stream_updates(&mut self, updates: Vec<streaming::StreamUpdate>) {
@@ -18627,18 +18668,12 @@ impl Agent {
         }
     }
 
-    async fn read_stream(
-        &mut self,
-        resp: reqwest::Response,
-    ) -> Result<(Vec<Block>, Option<String>, Usage)> {
+    async fn read_stream(&mut self, resp: reqwest::Response) -> Result<ParsedProviderStream> {
         self.read_provider_stream(resp, RequestContract::AnthropicMessages)
             .await
     }
 
-    async fn read_stream_oai(
-        &mut self,
-        resp: reqwest::Response,
-    ) -> Result<(Vec<Block>, Option<String>, Usage)> {
+    async fn read_stream_oai(&mut self, resp: reqwest::Response) -> Result<ParsedProviderStream> {
         self.read_provider_stream(resp, RequestContract::OpenAiChatCompletions)
             .await
     }
@@ -18659,7 +18694,7 @@ impl Agent {
         &mut self,
         resp: reqwest::Response,
         contract: RequestContract,
-    ) -> Result<(Vec<Block>, Option<String>, Usage)> {
+    ) -> Result<ParsedProviderStream> {
         self.read_provider_stream(resp, contract).await
     }
 }
