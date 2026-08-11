@@ -101,7 +101,7 @@ optional = true
 version = "2.12"
 
 [dependencies.compact_str]
-version = "0.9"
+version = "0.10"
 default-features = false
 
 [dependencies.critical-section]
