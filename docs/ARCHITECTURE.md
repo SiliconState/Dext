@@ -44,7 +44,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Connect, first-byte, stream/body-idle, and non-stream body-size limits for provider transport.
   - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, Kimi Code, DeepSeek, and local OpenAI-compatible profiles.
   - Live llama.cpp runtime context probing for the local provider; unavailable local servers fall back cleanly without aborting startup.
-  - API-key, ChatGPT OAuth, and Anthropic Claude Pro/Max OAuth login flows; runtime auth retains whether a resolved secret is an API key or OAuth token. OAuth callback binding is loopback-only, complete headers share one two-second deadline, result pages wait for exchange/storage completion, exchange/refresh transport is bounded and redirect-free, and active OAuth credentials are rechecked at user-turn boundaries.
+  - API-key, ChatGPT OAuth, and Anthropic Claude Pro/Max OAuth login flows; runtime auth retains whether a resolved secret is an API key or OAuth token. OAuth callback binding is loopback-only, accepted connections use blocking I/O under one two-second complete-header deadline, result pages wait for exchange/storage completion, exchange/refresh transport is bounded and redirect-free, and active OAuth credentials are rechecked at user-turn boundaries.
   - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs.
   - Model alias normalization and provider/model switching helpers.
 

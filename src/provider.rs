@@ -3784,7 +3784,13 @@ fn spawn_oauth_code_listener(
             use std::io::{Read, Write};
 
             let request_started = std::time::Instant::now();
-            let _ = stream.set_write_timeout(Some(OAUTH_CALLBACK_IO_TIMEOUT));
+            if stream.set_nonblocking(false).is_err()
+                || stream
+                    .set_write_timeout(Some(OAUTH_CALLBACK_IO_TIMEOUT))
+                    .is_err()
+            {
+                continue;
+            }
             let mut request = Vec::with_capacity(1024);
             let mut buf = [0u8; 1024];
             let mut headers_complete = false;
@@ -3794,7 +3800,9 @@ fn spawn_oauth_code_listener(
                 if read_timeout.is_zero() {
                     break;
                 }
-                let _ = stream.set_read_timeout(Some(read_timeout));
+                if stream.set_read_timeout(Some(read_timeout)).is_err() {
+                    break;
+                }
                 let remaining = 8192 - request.len();
                 let read_len = remaining.min(buf.len());
                 match stream.read(&mut buf[..read_len]) {
