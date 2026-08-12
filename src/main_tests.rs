@@ -17854,6 +17854,36 @@ fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> 
 }
 
 #[test]
+fn model_context_window_uses_builtin_anthropic_profile_when_catalog_isolated() -> Result<()> {
+    let _guard = env_lock();
+    clear_cached_local_llama_context_windows();
+    let root = temp_test_dir("ctx-window-builtin-anthropic");
+    let root = std::fs::canonicalize(&root)?;
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+
+    let result = {
+        for model in ["claude-sonnet-5", "claude-opus-5", "claude-fable-5"] {
+            assert_eq!(model_context_window(model), 1_000_000, "{model}");
+        }
+        assert_eq!(model_context_window("claude-sonnet-4-6"), 200_000);
+        assert_eq!(model_context_window("claude-opus-4-8"), 200_000);
+        Ok(())
+    };
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn llama_context_parser_prefers_runtime_ctx_fields() {
     assert_eq!(
         parse_llama_context_window(&json!({
@@ -19209,7 +19239,7 @@ fn gpt_5_6_pricing_applies_documented_long_context_tier() {
 }
 
 #[test]
-fn anthropic_fable_pricing_matches_console_session_cost() {
+fn anthropic_fable_pricing_matches_published_rates() {
     let pricing = usage_pricing_default_for(
         "anthropic",
         ApiProvider::Anthropic,
@@ -19226,12 +19256,46 @@ fn anthropic_fable_pricing_matches_console_session_cost() {
     let estimate = pricing.estimate(usage);
 
     assert!(
-        (estimate - 5.83).abs() < 0.0001,
-        "expected $5.83, got ${estimate:.8}"
+        (estimate - 4.9736735).abs() < 0.0001,
+        "expected $4.9736735, got ${estimate:.8}"
     );
     assert!((pricing.output / pricing.input - 5.0).abs() < 0.000001);
     assert!((pricing.cache_read / pricing.input - 0.1).abs() < 0.000001);
     assert!((pricing.cache_create / pricing.input - 1.25).abs() < 0.000001);
+}
+
+#[test]
+fn anthropic_generation_pricing_matches_published_rates() {
+    let for_model = |model: &str| {
+        usage_pricing_default_for(
+            "anthropic",
+            ApiProvider::Anthropic,
+            "https://api.anthropic.com",
+            model,
+        )
+    };
+    for (model, input, output, cache_read, cache_create) in [
+        ("claude-sonnet-5", 2.0, 10.0, 0.2, 2.5),
+        ("claude-opus-5", 5.0, 25.0, 0.5, 6.25),
+        ("claude-opus-4-8", 5.0, 25.0, 0.5, 6.25),
+        ("claude-opus-4-6", 5.0, 25.0, 0.5, 6.25),
+        ("claude-opus-4-5-20251101", 5.0, 25.0, 0.5, 6.25),
+        ("claude-opus-4-1", 15.0, 75.0, 1.5, 18.75),
+        ("claude-sonnet-4-6", 3.0, 15.0, 0.3, 3.75),
+        ("claude-fable-5", 10.0, 50.0, 1.0, 12.5),
+    ] {
+        let pricing = for_model(model);
+        assert_eq!(
+            (
+                pricing.input,
+                pricing.output,
+                pricing.cache_read,
+                pricing.cache_create
+            ),
+            (input, output, cache_read, cache_create),
+            "{model}"
+        );
+    }
 }
 
 #[test]
@@ -19253,7 +19317,7 @@ fn anthropic_wire_cost_is_repriced_for_supported_claude_models() {
     agent.finalize_usage_metrics(&mut usage);
 
     assert!(
-        (usage.estimated_cost_usd() - 5.83).abs() < 0.0001,
+        (usage.estimated_cost_usd() - 4.9736735).abs() < 0.0001,
         "expected Anthropic model pricing to override stale wire/default cost, got ${:.8}",
         usage.estimated_cost_usd()
     );
@@ -22184,7 +22248,7 @@ fn oauth_callback_cannot_complete_a_different_provider_login() -> Result<()> {
 }
 
 #[test]
-fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<()> {
+fn anthropic_subscription_body_is_scoped_and_preserves_adaptive_fields() -> Result<()> {
     let root = temp_test_dir("anthropic-subscription-body");
     let root = std::fs::canonicalize(&root)?;
     let profile = built_in_provider_profiles()
@@ -22196,8 +22260,9 @@ fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<(
     agent.api_provider = profile.api_provider;
     agent.provider_profile = Some(profile);
     agent.base_url = "https://api.anthropic.com".to_string();
-    agent.model = "claude-sonnet-4-6".to_string();
+    agent.model = "claude-opus-4-8".to_string();
     agent.auth_kind = RuntimeAuthKind::OAuth;
+    agent.thinking_effort = ThinkingEffort::XHigh;
     agent.history = vec![Message {
         role: "user".to_string(),
         content: vec![Block::Text {
@@ -22221,6 +22286,9 @@ fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<(
         claude_subscription::AGENT_SDK_SYSTEM_PROMPT
     );
     assert_eq!(body["system"][2]["text"], "Dext system");
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert!(body["thinking"].get("display").is_none(), "{body}");
+    assert_eq!(body["output_config"]["effort"], "xhigh");
 
     agent.auth_kind = RuntimeAuthKind::ApiKey;
     let (_, api_body) =
@@ -22228,6 +22296,38 @@ fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<(
     let api_body: Value = serde_json::from_slice(&api_body)?;
     assert_eq!(api_body["system"][0]["text"], "Dext system");
     assert_eq!(api_body["system"].as_array().map(Vec::len), Some(1));
+    assert_eq!(api_body["thinking"]["type"], "adaptive");
+    assert!(api_body["thinking"].get("display").is_none(), "{api_body}");
+    assert_eq!(api_body["output_config"]["effort"], "xhigh");
+
+    agent.model = "claude-sonnet-5".to_string();
+    agent.auth_kind = RuntimeAuthKind::OAuth;
+    let (_, sonnet_body) =
+        agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let sonnet_body: Value = serde_json::from_slice(&sonnet_body)?;
+    assert_eq!(
+        sonnet_body["system"][1]["text"],
+        claude_subscription::AGENT_SDK_SYSTEM_PROMPT
+    );
+    assert_eq!(sonnet_body["thinking"]["type"], "adaptive");
+    assert!(
+        sonnet_body["thinking"].get("display").is_none(),
+        "{sonnet_body}"
+    );
+    assert_eq!(sonnet_body["output_config"]["effort"], "xhigh");
+
+    agent.auth_kind = RuntimeAuthKind::ApiKey;
+    let (_, sonnet_api_body) =
+        agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let sonnet_api_body: Value = serde_json::from_slice(&sonnet_api_body)?;
+    assert_eq!(sonnet_api_body["system"][0]["text"], "Dext system");
+    assert_eq!(sonnet_api_body["thinking"]["type"], "adaptive");
+    assert!(
+        sonnet_api_body["thinking"].get("display").is_none(),
+        "{sonnet_api_body}"
+    );
+    assert_eq!(sonnet_api_body["output_config"]["effort"], "xhigh");
+    agent.model = "claude-opus-4-8".to_string();
 
     agent.auth_kind = RuntimeAuthKind::OAuth;
     agent.base_url = "https://api.anthropic.com".to_string();
@@ -23516,30 +23616,37 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
     assert_eq!(value["thinking"]["budget_tokens"], 6_144);
     assert!(value.get("output_config").is_none(), "{value}");
 
-    agent.model = "claude-sonnet-4-6".to_string();
-    agent.thinking_effort = ThinkingEffort::Medium;
-    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
-    let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["thinking"]["type"], "adaptive");
-    assert!(value["thinking"].get("display").is_none(), "{value}");
-    assert!(value["thinking"].get("budget_tokens").is_none(), "{value}");
-    assert_eq!(value["output_config"]["effort"], "medium");
-
-    agent.model = "claude-opus-4-8".to_string();
-    agent.thinking_effort = ThinkingEffort::XHigh;
-    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
-    let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["thinking"]["type"], "adaptive");
-    assert!(value["thinking"].get("display").is_none(), "{value}");
-    assert_eq!(value["output_config"]["effort"], "xhigh");
-
-    agent.model = "claude-fable-5".to_string();
-    agent.thinking_effort = ThinkingEffort::Max;
-    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
-    let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["thinking"]["type"], "adaptive");
-    assert!(value["thinking"].get("display").is_none(), "{value}");
-    assert_eq!(value["output_config"]["effort"], "max");
+    for (model, thinking_effort, provider_effort) in [
+        ("claude-sonnet-4-6", ThinkingEffort::Medium, "medium"),
+        ("claude-sonnet-4-6", ThinkingEffort::XHigh, "high"),
+        ("claude-sonnet-4-6", ThinkingEffort::Max, "max"),
+        ("claude-sonnet-5", ThinkingEffort::Medium, "medium"),
+        ("claude-sonnet-5", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-sonnet-5", ThinkingEffort::Max, "max"),
+        ("claude-opus-4-6", ThinkingEffort::High, "high"),
+        ("claude-opus-4-6", ThinkingEffort::XHigh, "high"),
+        ("claude-opus-4-6", ThinkingEffort::Max, "max"),
+        ("claude-opus-4-7", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-opus-4-8", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-opus-5", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-opus-5", ThinkingEffort::Max, "max"),
+        ("claude-fable-5", ThinkingEffort::Max, "max"),
+    ] {
+        agent.model = model.to_string();
+        agent.thinking_effort = thinking_effort;
+        let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+        let value: Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["thinking"]["type"], "adaptive", "{model}");
+        assert!(
+            value["thinking"].get("display").is_none(),
+            "{model}: {value}"
+        );
+        assert!(
+            value["thinking"].get("budget_tokens").is_none(),
+            "{model}: {value}"
+        );
+        assert_eq!(value["output_config"]["effort"], provider_effort, "{model}");
+    }
 
     agent.model = "claude-opus-4-1".to_string();
     agent.thinking_effort = ThinkingEffort::Off;
@@ -23550,6 +23657,26 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[test]
+fn anthropic_builtin_catalog_lists_generation_5_models() {
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .expect("anthropic profile");
+    assert_eq!(profile.default_model, "claude-sonnet-4-6");
+    for model in ["claude-sonnet-5", "claude-opus-5", "claude-fable-5"] {
+        assert!(
+            profile.models.iter().any(|entry| entry == model),
+            "{model} missing from builtin catalog"
+        );
+        assert_eq!(
+            profile.model_context_windows.get(model),
+            Some(&1_000_000),
+            "{model}"
+        );
+    }
 }
 
 #[test]
@@ -24798,8 +24925,8 @@ async fn anthropic_unfinished_tool_call_automatically_continues() {
 }
 
 #[tokio::test]
-async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
-    let root = temp_test_dir("anthropic-omitted-thinking-stream");
+async fn anthropic_stream_visible_thinking_reaches_sink_and_preserves_signed_roundtrip() {
+    let root = temp_test_dir("anthropic-visible-thinking-stream");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
@@ -24815,7 +24942,7 @@ async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
             assert!(read > 0, "client closed before sending request headers");
             request.extend_from_slice(&buf[..read]);
         }
-        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-full\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"visible reasoning\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-full\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -24826,14 +24953,26 @@ async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
 
     let mut agent = test_agent(&root);
     agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-sonnet-5".to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
     let resp = reqwest::get(format!("http://{addr}/stream"))
         .await
         .expect("response");
     let ParsedProviderStream { blocks, .. } = agent.read_stream(resp).await.expect("parse stream");
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ThinkingDelta(text) if text == "visible reasoning"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ThinkingBlockComplete(text) if text == "visible reasoning"
+    )));
     assert!(
         matches!(
             blocks.first(),
-            Some(Block::Thinking { text, signature: Some(signature) }) if text.is_empty() && signature == "sig-full"
+            Some(Block::Thinking { text, signature: Some(signature) }) if text == "visible reasoning" && signature == "sig-full"
         ),
         "{blocks:?}"
     );

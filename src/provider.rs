@@ -487,13 +487,23 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
         "glm" => Some(model_pricing(1.0, 5.0, 0.1, 1.25)),
         "deepseek" if model.contains("reasoner") => Some(model_pricing(0.55, 2.19, 0.14, 0.55)),
         "deepseek" if model.contains("chat") => Some(model_pricing(0.27, 1.1, 0.07, 0.27)),
-        "anthropic" if model.contains("fable") => Some(model_pricing(
-            11.721718363700392,
-            58.60859181850196,
-            1.1721718363700393,
-            14.65214795462549,
-        )),
+        "anthropic" if model.contains("fable") => Some(model_pricing(10.0, 50.0, 1.0, 12.5)),
+        // Opus 4.5 through Opus 5 share one published rate; Opus 4.1-and-earlier
+        // retain legacy pricing via the plain "opus" arm below.
+        "anthropic"
+            if [
+                "opus-5", "opus5", "opus-4-5", "opus-4.5", "opus-4-6", "opus-4.6", "opus-4-7",
+                "opus-4.7", "opus-4-8", "opus-4.8",
+            ]
+            .iter()
+            .any(|generation| model.contains(generation)) =>
+        {
+            Some(model_pricing(5.0, 25.0, 0.5, 6.25))
+        }
         "anthropic" if model.contains("opus") => Some(model_pricing(15.0, 75.0, 1.5, 18.75)),
+        "anthropic" if model.contains("sonnet-5") || model.contains("sonnet5") => {
+            Some(model_pricing(2.0, 10.0, 0.2, 2.5))
+        }
         "anthropic" if model.contains("sonnet") => Some(model_pricing(3.0, 15.0, 0.3, 3.75)),
         "anthropic" if model.contains("haiku-4-5") || model.contains("haiku-4.5") => {
             Some(model_pricing(1.0, 5.0, 0.1, 1.25))
@@ -747,6 +757,8 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             default_model: "claude-sonnet-4-6".to_string(),
             models: vec![
                 "claude-sonnet-4-6".to_string(),
+                "claude-sonnet-5".to_string(),
+                "claude-opus-5".to_string(),
                 "claude-opus-4-8".to_string(),
                 "claude-opus-4-7".to_string(),
                 "claude-opus-4-6".to_string(),
@@ -772,7 +784,11 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             }),
             notes: Some("Claude Pro/Max subscription OAuth is the default /login flow. ANTHROPIC_API_KEY continues to use standard API-key billing.".to_string()),
             context_window: Some(200_000),
-            model_context_windows: HashMap::new(),
+            model_context_windows: HashMap::from([
+                ("claude-sonnet-5".to_string(), 1_000_000),
+                ("claude-opus-5".to_string(), 1_000_000),
+                ("claude-fable-5".to_string(), 1_000_000),
+            ]),
             model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::AnthropicMessages),
             model_aliases: HashMap::new(),

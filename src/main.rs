@@ -2557,14 +2557,14 @@ fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option
         ThinkingEffort::Medium => "medium",
         ThinkingEffort::High => "high",
         ThinkingEffort::XHigh => {
-            if anthropic_model_supports_extended_effort(model) {
+            if anthropic_model_supports_xhigh_effort(model) {
                 "xhigh"
             } else {
                 "high"
             }
         }
         ThinkingEffort::Max => {
-            if anthropic_model_supports_extended_effort(model) {
+            if anthropic_model_supports_max_effort(model) {
                 "max"
             } else {
                 "high"
@@ -2574,19 +2574,30 @@ fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option
     Some(effort.to_string())
 }
 
-fn anthropic_model_is_always_adaptive(model: &str) -> bool {
+// Effort availability follows the official effort doc: `xhigh` exists on
+// Sonnet 5, Opus 4.7/4.8, Opus 5, and Fable 5; `max` additionally covers the
+// 4.6 generation.
+fn anthropic_model_supports_xhigh_effort(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
     model.contains("opus-4-7")
         || model.contains("opus-4.7")
         || model.contains("opus-4-8")
         || model.contains("opus-4.8")
+        || model.contains("opus-5")
+        || model.contains("opus5")
+        || model.contains("sonnet-5")
+        || model.contains("sonnet5")
         || model.contains("fable-5")
         || model.contains("fable5")
-        || model.contains("mythos")
 }
 
-fn anthropic_model_supports_extended_effort(model: &str) -> bool {
-    anthropic_model_is_always_adaptive(model)
+fn anthropic_model_supports_max_effort(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    anthropic_model_supports_xhigh_effort(&model)
+        || model.contains("opus-4-6")
+        || model.contains("opus-4.6")
+        || model.contains("sonnet-4-6")
+        || model.contains("sonnet-4.6")
 }
 
 fn anthropic_model_supports_adaptive_thinking(model: &str) -> bool {
@@ -2597,11 +2608,14 @@ fn anthropic_model_supports_adaptive_thinking(model: &str) -> bool {
         || model.contains("opus-4.7")
         || model.contains("opus-4-8")
         || model.contains("opus-4.8")
+        || model.contains("opus-5")
+        || model.contains("opus5")
         || model.contains("sonnet-4-6")
         || model.contains("sonnet-4.6")
+        || model.contains("sonnet-5")
+        || model.contains("sonnet5")
         || model.contains("fable-5")
         || model.contains("fable5")
-        || model.contains("mythos")
 }
 
 fn uses_anthropic_adaptive_thinking(provider_id: &str, model: &str) -> bool {
@@ -2698,8 +2712,6 @@ struct AnthropicThinking {
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display: Option<&'static str>,
 }
 
 #[derive(Serialize, Clone)]
@@ -16049,7 +16061,6 @@ impl Agent {
                         Some(AnthropicThinking {
                             kind: if kimi_adaptive { "adaptive" } else { "enabled" },
                             budget_tokens: None,
-                            display: None,
                         }),
                         Some(AnthropicOutputConfig { effort }),
                     )
@@ -16058,7 +16069,6 @@ impl Agent {
                     let thinking = effort.as_ref().map(|_| AnthropicThinking {
                         kind: "adaptive",
                         budget_tokens: None,
-                        display: None,
                     });
                     (
                         thinking,
@@ -16073,7 +16083,6 @@ impl Agent {
                             .map(|budget_tokens| AnthropicThinking {
                                 kind: "enabled",
                                 budget_tokens: Some(budget_tokens),
-                                display: None,
                             }),
                         None,
                     )
