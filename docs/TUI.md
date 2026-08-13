@@ -15,7 +15,8 @@ TUI and dependency changes must preserve these behaviors:
 - The main status row shows the exact `main` branch label as `Main`, including `Main (dirty)` when the working tree is dirty, without renaming the branch or changing any other branch casing. It keeps a live cumulative agent-active elapsed clock at its right edge while Dext works; the clock pauses and hides while Dext is idle awaiting input.
 - Anthropic thinking deltas are retained in the provider event stream and finalized with their signatures for tool-loop replay. The TUI shows live and completed thinking only while verbose display is enabled (the default); toggling verbose hides it without changing stored provider blocks. `stream-json` exposes thinking events, while console text and final JSON omit thinking content.
 - Input and the viewport remain responsive while output streams and while the terminal is resized.
-- Resize replay is cohesive: no item-by-item reconstruction, whole-screen flash, cursor-query stall, or cursor-query timeout.
+- Resize replay is cohesive: no item-by-item reconstruction, whole-screen flash, cursor-query stall, or cursor-query timeout. Width-change replay for transcripts at least one screen tall repaints the visible tail in place through the vendored `Terminal::overwrite_before` and must not append a duplicate history copy to terminal scrollback; shorter transcripts keep the bounded insert replay.
+- Pending permission prompts render inside the inline viewport, never into scrollback; only the compact decision line is appended once resolved. Approval prompts and decisions must not trigger a full-history re-emit.
 - The backend viewer remains the only alternate-screen surface.
 - `Ctrl+L` opens a read-only todo modal in the inline UI; it never enters the alternate screen and remains available during ordinary idle or busy work. Permission and local-auth prompts intentionally retain input and rendering priority.
 
@@ -53,11 +54,12 @@ Unmodified Ratatui 0.30.2 regressed Dext's inline experience. Its fallback `inse
 
 Enabling Ratatui's `scrolling-regions` feature was rejected because it changed settled rendering and expanded the backend dependency graph.
 
-Dext patches the exact upstream `ratatui-core 0.1.2` source through `[patch.crates-io]`. The patch is limited to three inline-terminal corrections:
+Dext patches the exact upstream `ratatui-core 0.1.2` source through `[patch.crates-io]`. The patch is limited to four inline-terminal corrections:
 
 1. `Terminal::clear` preserves Ratatui's tracked cursor position instead of synchronously querying the backend.
 2. Fallback `insert_before` clears the viewport directly rather than calling the cursor-preserving public clear.
 3. Horizontal shrink avoids `ClearType::All` for inline viewports; the normal viewport clear and full next draw remain in place.
+4. `Terminal::overwrite_before` repaints rows directly above the inline viewport in place with absolute writes, so width-change replay does not scroll a duplicate transcript copy into terminal scrollback.
 
 The vendored source and hunk-level rationale live under `vendor/ratatui-core/`. This is a narrow compatibility patch, not a renderer fork. Remove it when a released upstream version satisfies the same regression gate without changing settled behavior.
 

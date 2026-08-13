@@ -13,6 +13,8 @@ Dext uses this exact vendored source through the root `[patch.crates-io]` entry.
 - `src/terminal/inline.rs`
   - The no-scrolling-regions `insert_before` fallback calls `clear_viewport` directly instead of the public cursor-preserving `clear`.
   - Reason: this path has already positioned the cursor and does not need another backend round trip for every insertion chunk.
+  - Adds `Terminal::overwrite_before`, which draws the bottom rows of a rendered buffer directly above the inline viewport with absolute writes and no scrolling.
+  - Reason: inline scrollback is append-only, so replaying a resized transcript through `insert_before` permanently appends a duplicate history copy to terminal scrollback; the overwrite repaints the visible tail in place.
 
 - `src/terminal/resize.rs`
   - Horizontal shrink retains `ClearType::All` for fullscreen/fixed viewports but skips it for inline viewports.

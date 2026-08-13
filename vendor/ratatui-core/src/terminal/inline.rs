@@ -119,6 +119,48 @@ impl<B: Backend> Terminal<B> {
         }
     }
 
+    /// Redraw content directly above the current inline viewport in place.
+    ///
+    /// Dext patch: inline resize replay must repaint the visible transcript tail at the new
+    /// terminal width. [`Terminal::insert_before`] scrolls the region above the viewport, so
+    /// replaying history through it appends a duplicate copy of that history to the terminal's
+    /// scrollback on every replay. This method instead draws the last `min(height, viewport_top)`
+    /// rows of the rendered buffer into the rows immediately above the viewport using plain
+    /// absolute-position writes: nothing scrolls, the viewport is untouched, and scrollback is
+    /// not mutated.
+    ///
+    /// When `height` exceeds the rows available above the viewport, the top of the rendered
+    /// buffer is skipped so the buffer's bottom rows land directly above the viewport. This has
+    /// no effect when the viewport is not inline or sits at the top of the screen.
+    pub fn overwrite_before<F>(&mut self, height: u16, draw_fn: F) -> Result<(), B::Error>
+    where
+        F: FnOnce(&mut Buffer),
+    {
+        if !matches!(self.viewport, Viewport::Inline(_)) {
+            return Ok(());
+        }
+        let viewport_top = self.viewport_area.top();
+        if height == 0 || viewport_top == 0 {
+            return Ok(());
+        }
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: self.viewport_area.width,
+            height,
+        };
+        let mut buffer = Buffer::empty(area);
+        draw_fn(&mut buffer);
+        let to_draw = height.min(viewport_top);
+        let skip_cells = usize::from(height - to_draw) * usize::from(area.width);
+        self.draw_lines(
+            viewport_top - to_draw,
+            to_draw,
+            &buffer.content[skip_cells..],
+        )?;
+        Ok(())
+    }
+
     /// Implement `Self::insert_before` using standard backend capabilities.
     ///
     /// This is the fallback implementation when the `scrolling-regions` feature is disabled. It
@@ -481,6 +523,60 @@ mod tests {
             compute_inline_size(&mut backend, 4, Size::new(10, 10), 5).unwrap();
 
         assert_eq!(area, Rect::new(0, 0, 10, 4));
+    }
+
+    #[test]
+    fn overwrite_before_redraws_above_viewport_without_scrollback() {
+        // Diagram (terminal 10x6, viewport = Inline(2) anchored at y=4):
+        //
+        //   0  old-0      <- redraw target rows
+        //   1  old-1
+        //   2  old-2
+        //   3  old-3
+        //   4  viewport-a <- viewport (must stay untouched)
+        //   5  viewport-b
+        //
+        // A 5-row buffer is drawn above a 4-row region: the top buffer row is
+        // skipped, the remaining rows land at y=0..4, and nothing scrolls into
+        // the scrollback buffer.
+        let mut backend = TestBackend::with_lines([
+            "old-0     ",
+            "old-1     ",
+            "old-2     ",
+            "old-3     ",
+            "viewport-a",
+            "viewport-b",
+        ]);
+        backend
+            .set_cursor_position(Position { x: 0, y: 4 })
+            .unwrap();
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )
+        .unwrap();
+        let scrollback_before = terminal.backend().scrollback().clone();
+
+        terminal
+            .overwrite_before(5, |buf| {
+                let rows = ["skipped", "new-0", "new-1", "new-2", "new-3"];
+                for (y, text) in rows.into_iter().enumerate() {
+                    buf.set_string(0, y as u16, text, Style::default());
+                }
+            })
+            .unwrap();
+
+        terminal.backend().assert_buffer_lines([
+            "new-0     ",
+            "new-1     ",
+            "new-2     ",
+            "new-3     ",
+            "viewport-a",
+            "viewport-b",
+        ]);
+        assert_eq!(*terminal.backend().scrollback(), scrollback_before);
     }
 
     #[cfg(not(feature = "scrolling-regions"))]

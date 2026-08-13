@@ -213,6 +213,8 @@ impl PermissionTier {
 struct PendingPermission {
     tool: String,
     audit_label: String,
+    command: String,
+    risk: crate::tool_policy::CommandRisk,
     tier: PermissionTier,
     responder: std::sync::mpsc::SyncSender<Choice>,
 }
@@ -260,12 +262,6 @@ enum Line_ {
         dim: bool,
         density_rank: usize,
         expanded: bool,
-    },
-    PermissionPrompt {
-        tool: String,
-        command: String,
-        tier: PermissionTier,
-        risk: crate::tool_policy::CommandRisk,
     },
     PermissionResult {
         command: String,
@@ -3252,35 +3248,6 @@ fn permission_prompt_text(
     Text::from(lines)
 }
 
-fn dim_text(text: &mut Text<'static>) {
-    for line in &mut text.lines {
-        for span in &mut line.spans {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        }
-    }
-}
-
-fn transcript_item_should_dim(item: &Line_, state: &TuiState) -> bool {
-    (state.pending_perm.is_some() && !matches!(item, Line_::PermissionPrompt { .. }))
-        || state.pending_local_auth.is_some()
-}
-
-fn replace_last_permission_entry(items: &mut Vec<Line_>, replacement: Line_) -> bool {
-    if let Some(idx) = items
-        .iter()
-        .rposition(|item| matches!(item, Line_::PermissionPrompt { .. }))
-    {
-        let resolved = matches!(replacement, Line_::PermissionResult { .. });
-        items[idx] = replacement;
-        if resolved && !matches!(items.get(idx + 1), Some(Line_::Blank)) {
-            items.insert(idx + 1, Line_::Blank);
-        }
-        true
-    } else {
-        false
-    }
-}
-
 fn extract_path_from_summary(summary: &str) -> Option<String> {
     let after_colon = summary.split_once(": ").map(|(_, r)| r).unwrap_or(summary);
     let path_part = after_colon
@@ -6242,14 +6209,6 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 ]));
             }
         }
-        Line_::PermissionPrompt {
-            tool,
-            command,
-            risk,
-            ..
-        } => {
-            return permission_prompt_text(tool, command, *risk, width);
-        }
         Line_::PermissionResult {
             command,
             approved,
@@ -6631,18 +6590,6 @@ fn cached_transcript_render(
     width: u16,
 ) -> (Text<'static>, u16) {
     let render_width = transcript_render_width(width);
-    if let Line_::PermissionPrompt {
-        tool,
-        command,
-        risk,
-        ..
-    } = item
-    {
-        let text = permission_prompt_text(tool, command, *risk, render_width);
-        let height = text_visual_height(&text, render_width);
-        return (text, height);
-    }
-
     let key = line_cache_key(item);
     if state.render_cache.len() >= RENDER_CACHE_MAX_ENTRIES
         && !state.render_cache.contains_key(&key)
@@ -6654,11 +6601,7 @@ fn cached_transcript_render(
         .get(&key)
         .and_then(|entry| entry.renders.get(&render_width))
     {
-        let mut text = cached.text.clone();
-        if transcript_item_should_dim(item, state) {
-            dim_text(&mut text);
-        }
-        return (text, cached.height);
+        return (cached.text.clone(), cached.height);
     }
 
     if let Some(entry) = state.render_cache.get_mut(&key)
@@ -6700,10 +6643,6 @@ fn cached_transcript_render(
         state.render_cache_weight = state.render_cache_weight.saturating_add(weight);
     }
 
-    let mut text = text;
-    if transcript_item_should_dim(item, state) {
-        dim_text(&mut text);
-    }
     (text, height)
 }
 
@@ -6812,6 +6751,38 @@ struct PreparedTranscriptRender {
     tint_bg: Option<Color>,
 }
 
+fn render_prepared_transcript(
+    buf: &mut ratatui::buffer::Buffer,
+    items: Vec<PreparedTranscriptRender>,
+    render_width: u16,
+) {
+    let mut y = buf.area.y;
+    for item in items {
+        let area = Rect {
+            y,
+            width: render_width.min(buf.area.width),
+            height: item.height,
+            ..buf.area
+        };
+        let text = borrowed_text_lines(item.text.as_ref(), item.line_start, item.line_end);
+        let para = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((item.scroll, 0));
+        Widget::render(para, area, buf);
+        if let Some(bg) = item.tint_bg {
+            for row in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    let cell = &mut buf[(x, row)];
+                    if cell.bg == Color::Reset {
+                        cell.bg = bg;
+                    }
+                }
+            }
+        }
+        y = y.saturating_add(item.height);
+    }
+}
+
 fn insert_prepared_transcript<B: Backend>(
     terminal: &mut Terminal<B>,
     items: Vec<PreparedTranscriptRender>,
@@ -6819,31 +6790,7 @@ fn insert_prepared_transcript<B: Backend>(
     height: u16,
 ) -> Result<(), B::Error> {
     terminal.insert_before(height, move |buf| {
-        let mut y = buf.area.y;
-        for item in items {
-            let area = Rect {
-                y,
-                width: render_width.min(buf.area.width),
-                height: item.height,
-                ..buf.area
-            };
-            let text = borrowed_text_lines(item.text.as_ref(), item.line_start, item.line_end);
-            let para = Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((item.scroll, 0));
-            Widget::render(para, area, buf);
-            if let Some(bg) = item.tint_bg {
-                for row in area.top()..area.bottom() {
-                    for x in area.left()..area.right() {
-                        let cell = &mut buf[(x, row)];
-                        if cell.bg == Color::Reset {
-                            cell.bg = bg;
-                        }
-                    }
-                }
-            }
-            y = y.saturating_add(item.height);
-        }
+        render_prepared_transcript(buf, items, render_width);
     })?;
     Ok(())
 }
@@ -6978,6 +6925,78 @@ fn rebuild_transcript<B: Backend>(
     Ok(())
 }
 
+// Width-change replay: repaint the visible tail above the viewport in place.
+// Inline scrollback is append-only, so replaying through insert_before
+// permanently duplicates the whole transcript in terminal scrollback on every
+// resize. The overwrite only covers rows above the viewport on the visible
+// screen, so it requires a re-wrapped transcript at least one screen tall;
+// shorter transcripts keep the insert replay, whose duplication is bounded by
+// their own height. Deeper scrollback keeps the terminal's native rewrap.
+fn overwrite_transcript_tail<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut TuiState,
+    width: u16,
+) -> Result<bool, B::Error> {
+    let screen_rows = terminal.size()?.height;
+    if screen_rows == 0 {
+        return Ok(false);
+    }
+    let items = std::mem::take(&mut state.transcript);
+    let render_width = transcript_render_width(width);
+    let mut tool_tint_parity = false;
+    let mut rendered: Vec<(Arc<Text<'static>>, u16, Option<Color>)> =
+        Vec::with_capacity(items.len());
+    let mut total_height = 0u32;
+    for item in &items {
+        let (text, height) = cached_transcript_render(state, item, width);
+        let tint_bg = match item {
+            Line_::Thinking(_) => Some(thinking_bg()),
+            Line_::Steering(_) => Some(steering_bg()),
+            _ => next_transcript_tint(item, &mut tool_tint_parity),
+        };
+        let height = height.max(1);
+        total_height = total_height.saturating_add(u32::from(height));
+        rendered.push((Arc::new(text), height, tint_bg));
+    }
+    if total_height < u32::from(screen_rows) {
+        state.transcript = items;
+        return Ok(false);
+    }
+
+    let mut skip = total_height - u32::from(screen_rows);
+    let mut tail: Vec<PreparedTranscriptRender> = Vec::new();
+    for (text, height, tint_bg) in rendered {
+        let height = u32::from(height);
+        if skip >= height {
+            skip -= height;
+            continue;
+        }
+        let scroll = skip as u16;
+        skip = 0;
+        let line_end = text.lines.len();
+        tail.push(PreparedTranscriptRender {
+            text,
+            line_start: 0,
+            line_end,
+            scroll,
+            height: (height - u32::from(scroll)) as u16,
+            tint_bg,
+        });
+    }
+
+    let overwrite = terminal.overwrite_before(screen_rows, move |buf| {
+        render_prepared_transcript(buf, tail, render_width);
+    });
+    state.transcript = items;
+    if let Err(err) = overwrite {
+        state.transcript_needs_rebuild = true;
+        return Err(err);
+    }
+    state.tool_tint_parity = tool_tint_parity;
+    state.transcript_rendered_width = width;
+    Ok(true)
+}
+
 fn transcript_pane_width(area_width: u16, area_height: u16, state: &TuiState) -> u16 {
     compute_layout(Rect::new(0, 0, area_width, area_height), state)
         .transcript_area
@@ -7011,7 +7030,14 @@ fn flush_pending_insert_for_width<B: Backend>(
         return Ok(());
     }
     let width_changed = state.transcript_rendered_width != width && !state.transcript.is_empty();
-    if state.transcript_needs_rebuild || (width_changed && replay_width_change) {
+    if state.transcript_needs_rebuild {
+        // Explicit rebuilds (expand/collapse, error recovery) intentionally
+        // re-emit: their new content must become scrollable scrollback.
+        rebuild_transcript(terminal, state, width)?;
+    } else if width_changed
+        && replay_width_change
+        && !overwrite_transcript_tail(terminal, state, width)?
+    {
         rebuild_transcript(terminal, state, width)?;
     }
     if width_changed && state.transcript_rendered_width != width {
@@ -7157,6 +7183,36 @@ fn cap_live_indicator_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>>
     lines
 }
 
+// The pending approval prompt lives in the viewport, not the transcript:
+// inline scrollback is append-only, so a scrollback prompt entry could only be
+// updated after the decision by re-emitting the whole history.
+fn pending_permission_prompt_text(state: &TuiState, width: u16) -> Option<Text<'static>> {
+    let pending = state.pending_perm.as_ref()?;
+    if width == 0 {
+        return None;
+    }
+    Some(permission_prompt_text(
+        &pending.tool,
+        &pending.command,
+        pending.risk,
+        width,
+    ))
+}
+
+fn cap_permission_prompt_lines(
+    mut lines: Vec<Line<'static>>,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    if max_rows == 0 || lines.len() <= max_rows {
+        return lines;
+    }
+    // Keep the command head and the trailing key-hint row when clipping.
+    let hint = lines.pop();
+    lines.truncate(max_rows.saturating_sub(1));
+    lines.extend(hint);
+    lines
+}
+
 fn count_lines_by_width(text: &Text<'_>, width: u16) -> usize {
     text_visual_height(text, width) as usize
 }
@@ -7178,10 +7234,19 @@ fn collect_wrapped_lines(text: &Text<'static>, width: u16) -> Vec<Line<'static>>
 fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcript_area: Rect) {
     let content_area = transcript_content_rect(transcript_area);
     let content_width = transcript_render_width(content_area.width);
-    let live_text = transcript_live_indicator_text(state, content_width);
+    let pending_prompt = pending_permission_prompt_text(state, content_width);
+    let prompt_active = pending_prompt.is_some();
+    let live_text = pending_prompt.or_else(|| transcript_live_indicator_text(state, content_width));
     let mut live_lines = live_text
         .as_ref()
-        .map(|text| cap_live_indicator_lines(collect_wrapped_lines(text, content_width)))
+        .map(|text| {
+            let lines = collect_wrapped_lines(text, content_width);
+            if prompt_active {
+                cap_permission_prompt_lines(lines, transcript_area.height as usize)
+            } else {
+                cap_live_indicator_lines(lines)
+            }
+        })
         .unwrap_or_default();
     if !live_lines.is_empty()
         && transcript_area.height as usize > live_lines.len()
@@ -7262,21 +7327,14 @@ fn queue_permission_request(
     state.show_help = false;
     state.show_todos = false;
     state.status = "thinking".to_string();
-    let prompt = Line_::PermissionPrompt {
-        tool: name.clone(),
-        command: command.clone(),
-        tier,
-        risk,
-    };
-    if !replace_last_permission_entry(&mut state.pending_insert, prompt.clone())
-        && !replace_last_permission_entry(&mut state.transcript, prompt.clone())
-    {
-        state.queue(prompt);
-    }
-    state.transcript_needs_rebuild = true;
+    // The pending prompt renders inside the viewport, never into scrollback:
+    // inline scrollback is append-only, so updating a flushed prompt entry
+    // after the decision would force a duplicate full-history re-emit.
     state.pending_perm = Some(PendingPermission {
         tool: name,
         audit_label,
+        command,
+        risk,
         tier,
         responder,
     });
@@ -8725,17 +8783,11 @@ fn handle_key(
         if let Some(choice) = choice
             && let Some(pending) = state.pending_perm.take()
         {
-            let result = Line_::PermissionResult {
+            state.queue(Line_::PermissionResult {
                 command: pending.audit_label.clone(),
                 approved: !matches!(choice, Choice::Deny),
                 always: matches!(choice, Choice::Always),
-            };
-            if !replace_last_permission_entry(&mut state.pending_insert, result.clone())
-                && !replace_last_permission_entry(&mut state.transcript, result.clone())
-            {
-                state.queue(result);
-            }
-            state.transcript_needs_rebuild = true;
+            });
             let _ = pending.responder.send(choice);
             match choice {
                 Choice::Deny => {
@@ -10132,6 +10184,8 @@ mod tests {
         state.pending_perm = Some(PendingPermission {
             tool: "bash".to_string(),
             audit_label: "echo $DEXT_MODEL".to_string(),
+            command: "echo $DEXT_MODEL".to_string(),
+            risk: crate::tool_policy::CommandRisk::Read,
             tier: PermissionTier::Read,
             responder: std::sync::mpsc::sync_channel(0).0,
         });
@@ -10467,6 +10521,8 @@ mod tests {
         state.pending_perm = Some(PendingPermission {
             tool: "bash".to_string(),
             audit_label: "echo $DEXT_MODEL".to_string(),
+            command: "echo $DEXT_MODEL".to_string(),
+            risk: crate::tool_policy::CommandRisk::Read,
             tier: PermissionTier::Read,
             responder: std::sync::mpsc::sync_channel(0).0,
         });
@@ -10477,6 +10533,111 @@ mod tests {
             .map(|span| span.content)
             .collect::<String>();
         assert!(!rendered.contains("awaiting permission"));
+    }
+
+    #[test]
+    fn pending_permission_prompt_renders_in_viewport_not_scrollback() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.pending_perm = Some(PendingPermission {
+            tool: "bash".to_string(),
+            audit_label: "echo ok".to_string(),
+            command: "echo ok".to_string(),
+            risk: crate::tool_policy::CommandRisk::Read,
+            tier: PermissionTier::Read,
+            responder: std::sync::mpsc::sync_channel(0).0,
+        });
+
+        let text = pending_permission_prompt_text(&state, 78).expect("prompt text");
+        let flat: String = text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(flat.contains("ask bash"), "{flat}");
+        assert!(flat.contains("echo ok"), "{flat}");
+        assert!(flat.contains("[y] once"), "{flat}");
+
+        let capped = cap_permission_prompt_lines(
+            vec![
+                Line::from("head"),
+                Line::from("body-1"),
+                Line::from("body-2"),
+                Line::from("hint"),
+            ],
+            3,
+        );
+        let capped: Vec<String> = capped
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(capped, ["head", "body-1", "hint"]);
+    }
+
+    #[test]
+    fn permission_flow_never_rebuilds_transcript_history() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.transcript.push(Line_::Assistant {
+            text: "earlier history".to_string(),
+            dim_prefix: false,
+        });
+        let (permission_tx, permission_rx) = std::sync::mpsc::sync_channel(1);
+        queue_permission_request(
+            &mut state,
+            "bash".to_string(),
+            serde_json::json!({"command": "echo ok"}),
+            permission_tx,
+        );
+        assert!(state.pending_perm.is_some());
+        assert!(
+            state.pending_insert.is_empty(),
+            "pending prompt must not enter scrollback"
+        );
+        assert!(!state.transcript_needs_rebuild);
+
+        let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_tx, _runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &agent_tx,
+            &runtime_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(matches!(
+            permission_rx.try_recv().expect("choice"),
+            Choice::Once
+        ));
+        assert!(
+            !state.transcript_needs_rebuild,
+            "approval decisions must not re-emit history"
+        );
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::PermissionResult { approved: true, .. }, Line_::Blank]
+        ));
     }
 
     #[test]
@@ -11542,16 +11703,12 @@ mod tests {
                 ApprovalProfile::Ask,
                 ThinkingEffort::Medium,
             );
-            state.queue(Line_::PermissionPrompt {
-                tool: "bash".to_string(),
-                command: "echo ok".to_string(),
-                tier: PermissionTier::Read,
-                risk: crate::tool_policy::CommandRisk::Read,
-            });
             let (permission_tx, permission_rx) = std::sync::mpsc::sync_channel(1);
             state.pending_perm = Some(PendingPermission {
                 tool: "bash".to_string(),
                 audit_label: "echo ok".to_string(),
+                command: "echo ok".to_string(),
+                risk: crate::tool_policy::CommandRisk::Read,
                 tier: PermissionTier::Read,
                 responder: permission_tx,
             });
@@ -14670,6 +14827,59 @@ mod tests {
         let wider_render_width = transcript_render_width(wider);
         let entry = state.render_cache.get(&key).expect("cache entry");
         assert!(entry.renders.contains_key(&wider_render_width));
+    }
+
+    #[test]
+    fn resize_replay_overwrites_visible_tail_without_scrollback_growth() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        for index in 0..30 {
+            state.queue(Line_::Assistant {
+                text: format!(
+                    "block {index} lorem ipsum dolor sit amet consectetur adipiscing elit"
+                ),
+                dim_prefix: false,
+            });
+        }
+        let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
+        flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
+        assert_eq!(state.transcript_rendered_width, wide);
+        assert!(
+            terminal.backend().scrollback().area.height > 0,
+            "history must overflow into scrollback for this regression test"
+        );
+
+        terminal.backend_mut().resize(60, 20);
+        let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
+        assert!(narrow < wide);
+        // TestBackend::resize reflows the scrollback buffer to the new width,
+        // so snapshot it after the resize settles and immediately before the
+        // replay flush: the replay itself must leave scrollback untouched.
+        let scrollback_before = terminal.backend().scrollback().clone();
+        flush_pending_insert(&mut terminal, &mut state, narrow).expect("narrow flush");
+        assert_eq!(state.transcript_rendered_width, narrow);
+        assert!(!state.transcript_needs_rebuild);
+        assert_eq!(
+            *terminal.backend().scrollback(),
+            scrollback_before,
+            "width replay must repaint in place, not append history to scrollback"
+        );
     }
 
     #[test]
