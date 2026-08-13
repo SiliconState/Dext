@@ -895,6 +895,7 @@ struct TuiState {
     render_cache: HashMap<u64, CachedTranscriptRender>,
     render_cache_weight: usize,
     transcript_rendered_width: u16,
+    transcript_rendered_rows: u16,
     transcript_scroll_offset: usize,
     transcript_hover_expandable: Option<usize>,
     transcript_area: Rect,
@@ -1024,6 +1025,7 @@ impl TuiState {
             render_cache: HashMap::new(),
             render_cache_weight: 0,
             transcript_rendered_width: 0,
+            transcript_rendered_rows: 0,
             transcript_scroll_offset: 0,
             transcript_hover_expandable: None,
             transcript_area: Rect::default(),
@@ -3217,21 +3219,14 @@ fn permission_prompt_text(
     let tier = PermissionTier::from_risk(risk);
     let accent = tier.accent();
     let prefix_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-    let body_width = width.saturating_sub(2).max(1) as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut push_line = |body: String, style: Style| {
-        let first_prefix = "▌ ".to_string();
-        let cont_prefix = "▌ ".to_string();
-        let text_width = body_width.saturating_sub(first_prefix.len()).max(1);
+        let prefix = if width >= 3 { "▌ " } else { "" };
+        let text_width = usize::from(width).saturating_sub(text_width(prefix)).max(1);
         let wrapped = wrap_plain_visual(&body, text_width);
-        for (idx, row) in wrapped.into_iter().enumerate() {
-            let prefix = if idx == 0 {
-                &first_prefix
-            } else {
-                &cont_prefix
-            };
+        for row in wrapped {
             lines.push(Line::from(vec![
-                Span::styled(prefix.clone(), prefix_style),
+                Span::styled(prefix.to_string(), prefix_style),
                 Span::styled(row, style),
             ]));
         }
@@ -6755,8 +6750,9 @@ fn render_prepared_transcript(
     buf: &mut ratatui::buffer::Buffer,
     items: Vec<PreparedTranscriptRender>,
     render_width: u16,
+    top_padding: u16,
 ) {
-    let mut y = buf.area.y;
+    let mut y = buf.area.y.saturating_add(top_padding.min(buf.area.height));
     for item in items {
         let area = Rect {
             y,
@@ -6790,7 +6786,7 @@ fn insert_prepared_transcript<B: Backend>(
     height: u16,
 ) -> Result<(), B::Error> {
     terminal.insert_before(height, move |buf| {
-        render_prepared_transcript(buf, items, render_width);
+        render_prepared_transcript(buf, items, render_width, 0);
     })?;
     Ok(())
 }
@@ -6814,18 +6810,20 @@ fn insert_transcript_items<B: Backend>(
     items: &[Line_],
     width: u16,
     tool_tint_parity: &mut bool,
-) -> Result<(), B::Error> {
+) -> Result<u32, B::Error> {
     if items.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     let render_width = transcript_render_width(width);
     let chunk_rows = terminal.size()?.height.max(1);
     let mut chunk = Vec::new();
     let mut chunk_height = 0u16;
+    let mut inserted_rows = 0u32;
 
     for item in items {
         let (text, height) = cached_transcript_render(state, item, width);
+        inserted_rows = inserted_rows.saturating_add(u32::from(height));
         let tint_bg = match item {
             Line_::Thinking(_) => Some(thinking_bg()),
             Line_::Steering(_) => Some(steering_bg()),
@@ -6898,7 +6896,57 @@ fn insert_transcript_items<B: Backend>(
     }
 
     flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)?;
-    Ok(())
+    Ok(inserted_rows)
+}
+
+fn prepare_transcript_tail(
+    state: &mut TuiState,
+    items: &[Line_],
+    width: u16,
+    row_budget: u16,
+) -> (Vec<PreparedTranscriptRender>, u16) {
+    let mut tool_tint_parity = state.tool_tint_parity;
+    let mut reverse_tail: Vec<PreparedTranscriptRender> = Vec::new();
+    let mut retained_rows = 0u16;
+
+    for item in items.iter().rev() {
+        if retained_rows >= row_budget {
+            break;
+        }
+        let (text, height) = cached_transcript_render(state, item, width);
+        let tint_bg = match item {
+            Line_::Thinking(_) => Some(thinking_bg()),
+            Line_::Steering(_) => Some(steering_bg()),
+            Line_::Tool {
+                name, group_count, ..
+            } => {
+                tool_tint_parity = !tool_tint_parity;
+                if name == "read_file" && *group_count > 1 {
+                    Some(Color::Indexed(235))
+                } else if tool_tint_parity {
+                    Some(Color::Indexed(236))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let take = height.min(row_budget.saturating_sub(retained_rows));
+        let scroll = height.saturating_sub(take);
+        let text = Arc::new(text);
+        let line_end = text.lines.len();
+        reverse_tail.push(PreparedTranscriptRender {
+            text,
+            line_start: 0,
+            line_end,
+            scroll,
+            height: take,
+            tint_bg,
+        });
+        retained_rows = retained_rows.saturating_add(take);
+    }
+    reverse_tail.reverse();
+    (reverse_tail, retained_rows)
 }
 
 fn rebuild_transcript<B: Backend>(
@@ -6907,94 +6955,83 @@ fn rebuild_transcript<B: Backend>(
     width: u16,
 ) -> Result<(), B::Error> {
     terminal.clear()?;
-    // mem::take instead of clone: rebuilds fire on resize/expand and the transcript can be
-    // large. Nothing in the insert path reads state.transcript, so loaning it out is safe.
+    // mem::take avoids cloning a potentially large transcript during explicit
+    // expand/collapse and error-recovery rebuilds. Nothing in the insert path
+    // reads state.transcript, so loaning it out is safe.
     let items = std::mem::take(&mut state.transcript);
     sync_last_expandable(state, &items);
     let mut tool_tint_parity = false;
     let rebuild_result =
         insert_transcript_items(terminal, state, &items, width, &mut tool_tint_parity);
     state.transcript = items;
-    if let Err(err) = rebuild_result {
-        state.transcript_needs_rebuild = true;
-        return Err(err);
-    }
+    let inserted_rows = match rebuild_result {
+        Ok(inserted_rows) => inserted_rows,
+        Err(err) => {
+            state.transcript_needs_rebuild = true;
+            return Err(err);
+        }
+    };
     state.tool_tint_parity = tool_tint_parity;
     state.transcript_rendered_width = width;
+    state.transcript_rendered_rows = inserted_rows
+        .min(u32::from(terminal.get_frame().area().top()))
+        .min(u32::from(u16::MAX)) as u16;
     state.transcript_needs_rebuild = false;
     Ok(())
 }
 
-// Width-change replay: repaint the visible tail above the viewport in place.
-// Inline scrollback is append-only, so replaying through insert_before
-// permanently duplicates the whole transcript in terminal scrollback on every
-// resize. The overwrite only covers rows above the viewport on the visible
-// screen, so it requires a re-wrapped transcript at least one screen tall;
-// shorter transcripts keep the insert replay, whose duplication is bounded by
-// their own height. Deeper scrollback keeps the terminal's native rewrap.
+// Width-change replay repaints only rows owned by the transcript. Inline
+// scrollback is append-only: replaying through insert_before would append a
+// second content copy. When narrower wrapping needs more visible rows, insert
+// only the blank row delta to allocate space, then overwrite the resulting
+// bounded tail. Wider wrapping keeps the existing allocation and clears its
+// unused leading rows, avoiding destructive scrollback deletion.
 fn overwrite_transcript_tail<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &mut TuiState,
     width: u16,
-) -> Result<bool, B::Error> {
+) -> Result<(), B::Error> {
     let screen_rows = terminal.size()?.height;
-    if screen_rows == 0 {
-        return Ok(false);
+    let viewport = terminal.get_frame().area();
+    let viewport_top = viewport.top();
+    let available_rows = screen_rows.saturating_sub(viewport.height);
+    let owned_rows = state.transcript_rendered_rows.min(viewport_top);
+    if screen_rows == 0 || viewport.height == screen_rows {
+        state.transcript_rendered_width = width;
+        state.transcript_rendered_rows = 0;
+        return Ok(());
     }
+
     let items = std::mem::take(&mut state.transcript);
     let render_width = transcript_render_width(width);
-    let mut tool_tint_parity = false;
-    let mut rendered: Vec<(Arc<Text<'static>>, u16, Option<Color>)> =
-        Vec::with_capacity(items.len());
-    let mut total_height = 0u32;
-    for item in &items {
-        let (text, height) = cached_transcript_render(state, item, width);
-        let tint_bg = match item {
-            Line_::Thinking(_) => Some(thinking_bg()),
-            Line_::Steering(_) => Some(steering_bg()),
-            _ => next_transcript_tint(item, &mut tool_tint_parity),
-        };
-        let height = height.max(1);
-        total_height = total_height.saturating_add(u32::from(height));
-        rendered.push((Arc::new(text), height, tint_bg));
-    }
-    if total_height < u32::from(screen_rows) {
+    let (tail, retained_rows) = prepare_transcript_tail(state, &items, width, available_rows);
+    let allocated_rows = owned_rows.max(retained_rows);
+    let additional_rows = allocated_rows.saturating_sub(owned_rows);
+    let allocation = if additional_rows > 0 {
+        terminal.insert_before(additional_rows, |_| {})
+    } else {
+        Ok(())
+    };
+    if let Err(err) = allocation {
         state.transcript = items;
-        return Ok(false);
-    }
-
-    let mut skip = total_height - u32::from(screen_rows);
-    let mut tail: Vec<PreparedTranscriptRender> = Vec::new();
-    for (text, height, tint_bg) in rendered {
-        let height = u32::from(height);
-        if skip >= height {
-            skip -= height;
-            continue;
-        }
-        let scroll = skip as u16;
-        skip = 0;
-        let line_end = text.lines.len();
-        tail.push(PreparedTranscriptRender {
-            text,
-            line_start: 0,
-            line_end,
-            scroll,
-            height: (height - u32::from(scroll)) as u16,
-            tint_bg,
-        });
-    }
-
-    let overwrite = terminal.overwrite_before(screen_rows, move |buf| {
-        render_prepared_transcript(buf, tail, render_width);
-    });
-    state.transcript = items;
-    if let Err(err) = overwrite {
         state.transcript_needs_rebuild = true;
         return Err(err);
     }
-    state.tool_tint_parity = tool_tint_parity;
+    let top_padding = allocated_rows.saturating_sub(retained_rows);
+    let overwrite = terminal.overwrite_before(allocated_rows, move |buf| {
+        render_prepared_transcript(buf, tail, render_width, top_padding);
+    });
+    state.transcript = items;
+    let overwritten_rows = match overwrite {
+        Ok(overwritten_rows) => overwritten_rows,
+        Err(err) => {
+            state.transcript_needs_rebuild = true;
+            return Err(err);
+        }
+    };
     state.transcript_rendered_width = width;
-    Ok(true)
+    state.transcript_rendered_rows = overwritten_rows;
+    Ok(())
 }
 
 fn transcript_pane_width(area_width: u16, area_height: u16, state: &TuiState) -> u16 {
@@ -7034,11 +7071,8 @@ fn flush_pending_insert_for_width<B: Backend>(
         // Explicit rebuilds (expand/collapse, error recovery) intentionally
         // re-emit: their new content must become scrollable scrollback.
         rebuild_transcript(terminal, state, width)?;
-    } else if width_changed
-        && replay_width_change
-        && !overwrite_transcript_tail(terminal, state, width)?
-    {
-        rebuild_transcript(terminal, state, width)?;
+    } else if width_changed && replay_width_change {
+        overwrite_transcript_tail(terminal, state, width)?;
     }
     if width_changed && state.transcript_rendered_width != width {
         return Ok(());
@@ -7095,10 +7129,15 @@ fn flush_prepared_items<B: Backend>(
     }
 
     let mut tool_tint_parity = state.tool_tint_parity;
-    insert_transcript_items(terminal, state, items, width, &mut tool_tint_parity)?;
+    let inserted_rows =
+        insert_transcript_items(terminal, state, items, width, &mut tool_tint_parity)?;
     state.tool_tint_parity = tool_tint_parity;
     state.transcript.append(items);
     state.transcript_rendered_width = width;
+    state.transcript_rendered_rows = state
+        .transcript_rendered_rows
+        .saturating_add(inserted_rows.min(u32::from(u16::MAX)) as u16)
+        .min(terminal.get_frame().area().top());
     Ok(())
 }
 
@@ -7203,12 +7242,19 @@ fn cap_permission_prompt_lines(
     mut lines: Vec<Line<'static>>,
     max_rows: usize,
 ) -> Vec<Line<'static>> {
-    if max_rows == 0 || lines.len() <= max_rows {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    if lines.len() <= max_rows {
+        return lines;
+    }
+    if max_rows == 1 {
+        lines.truncate(1);
         return lines;
     }
     // Keep the command head and the trailing key-hint row when clipping.
     let hint = lines.pop();
-    lines.truncate(max_rows.saturating_sub(1));
+    lines.truncate(max_rows - 1);
     lines.extend(hint);
     lines
 }
@@ -7327,6 +7373,14 @@ fn queue_permission_request(
     state.show_help = false;
     state.show_todos = false;
     state.status = "thinking".to_string();
+    if let Some(previous) = state.pending_perm.take() {
+        state.queue(Line_::PermissionResult {
+            command: previous.audit_label,
+            approved: false,
+            always: false,
+        });
+        let _ = previous.responder.try_send(Choice::Deny);
+    }
     // The pending prompt renders inside the viewport, never into scrollback:
     // inline scrollback is append-only, so updating a flushed prompt entry
     // after the decision would force a duplicate full-history re-emit.
@@ -8771,13 +8825,26 @@ fn handle_key(
             .as_ref()
             .map(|pending| pending.tier.default_choice())
             .unwrap_or(Choice::Deny);
+        let plain_choice_key = |modifiers: KeyModifiers| {
+            !modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::META,
+            )
+        };
         let choice = match (key.code, key.modifiers) {
-            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => Some(Choice::Once),
-            (KeyCode::Char('a'), _) | (KeyCode::Char('A'), _) => Some(Choice::Always),
-            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+            (KeyCode::Char('y') | KeyCode::Char('Y'), modifiers) if plain_choice_key(modifiers) => {
+                Some(Choice::Once)
+            }
+            (KeyCode::Char('a') | KeyCode::Char('A'), modifiers) if plain_choice_key(modifiers) => {
+                Some(Choice::Always)
+            }
+            (KeyCode::Char('n') | KeyCode::Char('N'), modifiers) if plain_choice_key(modifiers) => {
                 Some(Choice::Deny)
             }
-            (KeyCode::Enter, _) => Some(default_choice),
+            (KeyCode::Esc, _) => Some(Choice::Deny),
+            (KeyCode::Enter, modifiers) if plain_choice_key(modifiers) => Some(default_choice),
             _ => None,
         };
         if let Some(choice) = choice
@@ -10584,6 +10651,75 @@ mod tests {
             })
             .collect();
         assert_eq!(capped, ["head", "body-1", "hint"]);
+        assert!(cap_permission_prompt_lines(vec![Line::from("head")], 0).is_empty());
+        let one_row = cap_permission_prompt_lines(
+            vec![Line::from("head"), Line::from("body"), Line::from("hint")],
+            1,
+        );
+        assert_eq!(flatten_lines(&Text::from(one_row)), ["head"]);
+
+        for width in 1..=8 {
+            let unicode_gutter = permission_prompt_text(
+                "bash",
+                "abcdefghij",
+                crate::tool_policy::CommandRisk::Read,
+                width,
+            );
+            assert!(
+                unicode_gutter
+                    .lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width)),
+                "permission gutter must fit {width} terminal cells: {unicode_gutter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_pending_permission_denies_previous_request() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_tx, _second_rx) = std::sync::mpsc::sync_channel(1);
+        queue_permission_request(
+            &mut state,
+            "bash".to_string(),
+            serde_json::json!({"command": "first"}),
+            first_tx,
+        );
+        queue_permission_request(
+            &mut state,
+            "bash".to_string(),
+            serde_json::json!({"command": "second"}),
+            second_tx,
+        );
+
+        assert!(matches!(
+            first_rx.try_recv().expect("first denied"),
+            Choice::Deny
+        ));
+        assert_eq!(
+            state
+                .pending_perm
+                .as_ref()
+                .map(|pending| pending.command.as_str()),
+            Some("second")
+        );
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [
+                Line_::PermissionResult {
+                    approved: false,
+                    ..
+                },
+                Line_::Blank
+            ]
+        ));
     }
 
     #[test]
@@ -14827,6 +14963,83 @@ mod tests {
         let wider_render_width = transcript_render_width(wider);
         let entry = state.render_cache.get(&key).expect("cache entry");
         assert!(entry.renders.contains_key(&wider_render_width));
+    }
+
+    #[test]
+    fn short_transcript_resize_replay_does_not_grow_scrollback() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .expect("terminal");
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::Assistant {
+            text: "x".repeat(120),
+            dim_prefix: false,
+        });
+        let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
+        flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
+        let owned_rows = state.transcript_rendered_rows;
+        assert!(owned_rows > 0 && owned_rows < terminal.size().unwrap().height);
+
+        terminal.backend_mut().resize(28, 20);
+        let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
+        let item = state.transcript[0].clone();
+        let (_, narrow_rows) = cached_transcript_render(&mut state, &item, narrow);
+        assert!(
+            narrow_rows > owned_rows,
+            "test fixture must grow on narrow wrap: wide_rows={owned_rows} narrow_rows={narrow_rows} wide={wide} narrow={narrow} viewport_top={}",
+            terminal.get_frame().area().top()
+        );
+        let scrollback_before = terminal.backend().scrollback().clone();
+        flush_pending_insert(&mut terminal, &mut state, narrow).expect("narrow flush");
+
+        assert_eq!(state.transcript_rendered_width, narrow);
+        assert!(
+            state.transcript_rendered_rows > owned_rows,
+            "resize allocation did not grow: wide_rows={owned_rows} narrow_rows={narrow_rows} allocated={} viewport_top={}",
+            state.transcript_rendered_rows,
+            terminal.get_frame().area().top()
+        );
+        assert_eq!(*terminal.backend().scrollback(), scrollback_before);
+    }
+
+    #[test]
+    fn resize_tail_preparation_renders_only_screen_bounded_suffix() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let items: Vec<Line_> = (0..200)
+            .map(|index| Line_::Assistant {
+                text: format!("history block {index}"),
+                dim_prefix: false,
+            })
+            .collect();
+
+        let (tail, retained_rows) = prepare_transcript_tail(&mut state, &items, 80, 12);
+        assert_eq!(retained_rows, 12);
+        assert!(tail.len() <= 12);
+        assert!(tail.len() < items.len());
+        assert!(
+            state.render_cache.len() <= 12,
+            "resize replay should not re-render the full transcript"
+        );
     }
 
     #[test]

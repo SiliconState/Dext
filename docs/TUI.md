@@ -15,7 +15,7 @@ TUI and dependency changes must preserve these behaviors:
 - The main status row shows the exact `main` branch label as `Main`, including `Main (dirty)` when the working tree is dirty, without renaming the branch or changing any other branch casing. It keeps a live cumulative agent-active elapsed clock at its right edge while Dext works; the clock pauses and hides while Dext is idle awaiting input.
 - Anthropic thinking deltas are retained in the provider event stream and finalized with their signatures for tool-loop replay. The TUI shows live and completed thinking only while verbose display is enabled (the default); toggling verbose hides it without changing stored provider blocks. `stream-json` exposes thinking events, while console text and final JSON omit thinking content.
 - Input and the viewport remain responsive while output streams and while the terminal is resized.
-- Resize replay is cohesive: no item-by-item reconstruction, whole-screen flash, cursor-query stall, or cursor-query timeout. Width-change replay for transcripts at least one screen tall repaints the visible tail in place through the vendored `Terminal::overwrite_before` and must not append a duplicate history copy to terminal scrollback; shorter transcripts keep the bounded insert replay.
+- Resize replay is cohesive: no item-by-item reconstruction, whole-screen flash, cursor-query stall, or cursor-query timeout. Width changes render only the screen-bounded transcript suffix, allocate any extra narrow-wrap rows as blank lines, and repaint all transcript-owned visible rows through the vendored `Terminal::overwrite_before`; short and long histories alike must not append duplicate transcript content to terminal scrollback.
 - Pending permission prompts render inside the inline viewport, never into scrollback; only the compact decision line is appended once resolved. Approval prompts and decisions must not trigger a full-history re-emit.
 - The backend viewer remains the only alternate-screen surface.
 - `Ctrl+L` opens a read-only todo modal in the inline UI; it never enters the alternate screen and remains available during ordinary idle or busy work. Permission and local-auth prompts intentionally retain input and rendering priority.
@@ -59,7 +59,7 @@ Dext patches the exact upstream `ratatui-core 0.1.2` source through `[patch.crat
 1. `Terminal::clear` preserves Ratatui's tracked cursor position instead of synchronously querying the backend.
 2. Fallback `insert_before` clears the viewport directly rather than calling the cursor-preserving public clear.
 3. Horizontal shrink avoids `ClearType::All` for inline viewports; the normal viewport clear and full next draw remain in place.
-4. `Terminal::overwrite_before` repaints rows directly above the inline viewport in place with absolute writes, so width-change replay does not scroll a duplicate transcript copy into terminal scrollback.
+4. `Terminal::overwrite_before` repaints rows directly above the inline viewport in place with absolute writes, reports the actual replaced row count, and restores the backend cursor to the viewport origin without changing Ratatui's tracked frame cursor. Width-change replay uses blank row-delta insertion plus this overwrite, so neither short nor long transcripts scroll duplicate content into terminal scrollback.
 
 The vendored source and hunk-level rationale live under `vendor/ratatui-core/`. This is a narrow compatibility patch, not a renderer fork. Remove it when a released upstream version satisfies the same regression gate without changing settled behavior.
 
@@ -84,7 +84,8 @@ The PTY smoke suite exercises the real binary and requires:
 - process survival and responsive input through a populated-history resize burst;
 - zero whole-screen clears during inline resize;
 - cursor queries bounded by resize events rather than transcript size;
-- terminal-height-bounded replay chunks;
+- resize replay rendering is bounded to the visible suffix rather than the full stored transcript;
+- short and long transcript resizes leave existing terminal scrollback content unchanged;
 - completed stream output and accepted input after resize, with a bounded 10-second completion wait so slower macOS CI hosts do not create false negatives.
 
 Before releasing a renderer/backend update, also perform a live WSL2 check because ConPTY latency and perceptual flicker cannot be fully modeled by the Linux PTY. Resize a populated streaming session repeatedly and reject any visible replay, flash, input stall, scrollback loss, or mode-switching change. Native Linux and tmux checks are also recommended when terminal behavior changes.

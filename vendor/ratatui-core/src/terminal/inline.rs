@@ -130,18 +130,20 @@ impl<B: Backend> Terminal<B> {
     /// not mutated.
     ///
     /// When `height` exceeds the rows available above the viewport, the top of the rendered
-    /// buffer is skipped so the buffer's bottom rows land directly above the viewport. This has
-    /// no effect when the viewport is not inline or sits at the top of the screen.
-    pub fn overwrite_before<F>(&mut self, height: u16, draw_fn: F) -> Result<(), B::Error>
+    /// buffer is skipped so the buffer's bottom rows land directly above the viewport. The
+    /// returned row count is the number of rows actually replaced; it can be smaller than
+    /// `height` when the viewport has fewer rows above it. Non-inline viewports and inline
+    /// viewports at the top return zero.
+    pub fn overwrite_before<F>(&mut self, height: u16, draw_fn: F) -> Result<u16, B::Error>
     where
         F: FnOnce(&mut Buffer),
     {
         if !matches!(self.viewport, Viewport::Inline(_)) {
-            return Ok(());
+            return Ok(0);
         }
         let viewport_top = self.viewport_area.top();
         if height == 0 || viewport_top == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let area = Rect {
             x: 0,
@@ -158,7 +160,12 @@ impl<B: Backend> Terminal<B> {
             to_draw,
             &buffer.content[skip_cells..],
         )?;
-        Ok(())
+        // Direct backend draws leave the hardware cursor on the rewritten history. Put it back in
+        // the viewport without changing Ratatui's tracked frame cursor; the next draw restores the
+        // application cursor through the normal render path.
+        self.backend
+            .set_cursor_position(self.viewport_area.as_position())?;
+        Ok(to_draw)
     }
 
     /// Implement `Self::insert_before` using standard backend capabilities.
@@ -558,8 +565,10 @@ mod tests {
         )
         .unwrap();
         let scrollback_before = terminal.backend().scrollback().clone();
+        let viewport_before = terminal.get_frame().area();
+        let tracked_cursor_before = terminal.last_known_cursor_pos;
 
-        terminal
+        let overwritten = terminal
             .overwrite_before(5, |buf| {
                 let rows = ["skipped", "new-0", "new-1", "new-2", "new-3"];
                 for (y, text) in rows.into_iter().enumerate() {
@@ -568,6 +577,9 @@ mod tests {
             })
             .unwrap();
 
+        assert_eq!(overwritten, 4);
+        assert_eq!(terminal.get_frame().area(), viewport_before);
+        assert_eq!(terminal.last_known_cursor_pos, tracked_cursor_before);
         terminal.backend().assert_buffer_lines([
             "new-0     ",
             "new-1     ",
@@ -576,6 +588,10 @@ mod tests {
             "viewport-a",
             "viewport-b",
         ]);
+        assert_eq!(
+            terminal.backend().cursor_position(),
+            terminal.viewport_area.as_position()
+        );
         assert_eq!(*terminal.backend().scrollback(), scrollback_before);
     }
 
