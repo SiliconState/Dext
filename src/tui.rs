@@ -676,10 +676,12 @@ fn provider_arg_completions(cmd: &str, arg_part: &str) -> Vec<SlashCompletion> {
             text: format!("/{cmd} {}", profile.id),
             hint: hint.clone(),
         });
-        out.push(SlashCompletion {
-            text: format!("/{cmd} {}", index),
-            hint,
-        });
+        if cmd != "login" {
+            out.push(SlashCompletion {
+                text: format!("/{cmd} {}", index),
+                hint,
+            });
+        }
     }
 
     out
@@ -13242,10 +13244,10 @@ mod tests {
     }
 
     #[test]
-    fn model_arg_completions_lists_authenticated_provider_models() {
+    fn provider_and_model_arg_completions_use_canonical_choices() {
         let _guard = env_lock();
         let root = std::env::temp_dir().join(format!(
-            "dext-tui-model-completions-{}-{}",
+            "dext-tui-provider-model-completions-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -13253,6 +13255,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).expect("create temp dir");
+        let old_dext_home = std::env::var_os("DEXT_HOME");
         unsafe {
             std::env::set_var("DEXT_HOME", &root);
         }
@@ -13273,6 +13276,17 @@ mod tests {
             );
             crate::save_auth_store(&store)?;
 
+            let login_texts = slash_completions("/login ")
+                .into_iter()
+                .map(|completion| completion.text)
+                .collect::<Vec<_>>();
+            let expected_login_texts = load_provider_catalog()?
+                .providers
+                .into_iter()
+                .map(|profile| format!("/login {}", profile.id))
+                .collect::<Vec<_>>();
+            assert_eq!(login_texts, expected_login_texts);
+
             let completions = model_arg_completions("");
             let texts: Vec<String> = completions.into_iter().map(|c| c.text).collect();
             assert!(
@@ -13288,10 +13302,14 @@ mod tests {
         })();
 
         unsafe {
-            std::env::remove_var("DEXT_HOME");
+            if let Some(value) = old_dext_home {
+                std::env::set_var("DEXT_HOME", value);
+            } else {
+                std::env::remove_var("DEXT_HOME");
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
-        result.expect("model completions should load auth-backed providers");
+        result.expect("provider and model completions should use canonical choices");
     }
 
     #[test]
