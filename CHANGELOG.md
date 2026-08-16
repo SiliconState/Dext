@@ -62,6 +62,18 @@
   project, user, or `DEXT_SHELVES_DIR` roots; direct pack roots and
   `DEXT_PACKS_DIR` are no longer discovery inputs.
 
+- Replaced `/plan` with conversational planning turn policies. The objective
+  tracker now classifies planning/analysis-only prompts (including explicit
+  “don’t change anything” phrasing) and bare plan approvals (“go”, “proceed
+  with the plan”); Dext injects a matching advisory-only or
+  implementation-authorized turn policy into the volatile runtime status —
+  never the cached stable prompt — so weaker models get deterministic per-turn
+  structure without hard tool gating. Explicit mutation intent always
+  overrides advisory phrasing, question-phrased prompts are never read as
+  approvals, and mid-turn queued user updates re-evaluate the policy;
+  approval prompts and `/sandbox-profile read-only` remain the enforcement
+  layers.
+
 ### Removed
 
 - Removed the completed repository-local `.auto` prompt-efficiency experiment scaffold and now ignore the entire root `.auto/` workspace. Dext runtime/build/CI and the user-owned autoresearch pack do not depend on those project experiment files.
@@ -89,8 +101,13 @@
 - Removed the subagent feature completely: `/subagent` slash command,
   `subagent-runtime` CLI subcommand, detached/inline runners, steering,
   quality gates, TUI state, session artifacts dir, and all associated
-  tests/fixtures. `/plan` preserved via a direct read-only planner.
-  Net -1544 lines.
+  tests/fixtures. Net -1544 lines.
+- Removed the unused `/plan` slash command and its hidden read-only planner turn,
+  temporary agent-state swapping, duplicated CLI/TUI dispatch, completion entry,
+  welcome tip, and planner-only regression test. Planning is now an ordinary
+  conversation: ask Dext to inspect and propose a plan without editing, revise
+  it in context, then tell it to proceed. A former `/plan ...` input is no
+  longer intercepted and is delivered as a normal prompt.
 - Removed all repository-owned and embedded pack payloads. Dext ships the pack
   lifecycle and shelf integration, but no pack content; users own and
   distribute shelf repositories separately.

@@ -110,6 +110,7 @@ fn test_agent(root: &Path) -> Agent {
         pending_pack_runtime_prompts: Vec::new(),
         project_extensions_approved: None,
         suppress_pack_activation: false,
+        turn_policy_note: None,
         state_lock: None,
         session_enabled: true,
         session_id: session_id.clone(),
@@ -5621,6 +5622,8 @@ fn slash_routing_distinguishes_commands_from_absolute_and_wsl_paths() {
         "/track",
         "/branches",
         "/browser-recipe",
+        "/plan",
+        "/plan this change",
     ] {
         assert!(!is_slash_command(retired), "{retired}");
     }
@@ -16436,6 +16439,74 @@ fn compose_system_parts_caps_dext_md() {
 }
 
 #[test]
+fn turn_policy_note_rides_volatile_env_only_when_set() {
+    let root = temp_test_dir("turn-policy-env");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+
+    let (_, env) = agent.compose_system_parts();
+    assert!(!env.contains("Turn policy"), "{env}");
+
+    agent.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+    let (stable, env) = agent.compose_system_parts();
+    assert!(env.contains("## Turn policy"), "{env}");
+    assert!(env.contains("advisory_only=true"), "{env}");
+    assert!(env.contains("read_file, read_symbol, fd, rg"), "{env}");
+    assert!(
+        !stable.contains("advisory_only=true"),
+        "turn policy must stay out of the cached stable block: {stable}"
+    );
+
+    agent.turn_policy_note = Some(IMPLEMENTATION_TURN_RUNTIME_NOTE);
+    let (_, env) = agent.compose_system_parts();
+    assert!(env.contains("implementation_authorized=true"), "{env}");
+    assert!(env.contains("todo_write"), "{env}");
+
+    agent.turn_policy_note = None;
+    let (_, env) = agent.compose_system_parts();
+    assert!(!env.contains("Turn policy"), "{env}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn steering_updates_turn_policy_note() {
+    let root = temp_test_dir("steering-turn-policy");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+
+    agent.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+    agent.update_turn_policy_from_steering("go ahead and fix it");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(IMPLEMENTATION_TURN_RUNTIME_NOTE)
+    );
+
+    agent.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+    agent.update_turn_policy_from_steering("also fix the typo in the docs");
+    assert_eq!(agent.turn_policy_note, None);
+
+    agent.update_turn_policy_from_steering("actually don't change anything yet");
+    assert_eq!(agent.turn_policy_note, Some(ADVISORY_TURN_RUNTIME_NOTE));
+
+    agent.update_turn_policy_from_steering("src/main.rs");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(ADVISORY_TURN_RUNTIME_NOTE),
+        "neutral steering must leave the policy untouched"
+    );
+
+    agent.update_turn_policy_from_steering("should I go ahead?");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(ADVISORY_TURN_RUNTIME_NOTE),
+        "question-shaped steering is not an approval"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn frugal_mode_uses_condensed_context_and_slim_env() {
     let root = temp_test_dir("frugal-system-prompt");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -25972,67 +26043,6 @@ async fn compact_uses_deterministic_evidence_fallback_when_summary_request_error
     );
 
     restore_env_var("DEXT_HOME", old_dext_home);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn read_only_plan_suppresses_internal_planner_events_hooks_and_restores_sink() {
-    let root = temp_test_dir("plan-silent-sink");
-    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
-    std::fs::write(
-        root.join("hooks.json"),
-        r#"{"user_prompt":[{"match":"*","command":"printf fired > hook-fired"}]}"#,
-    )
-    .expect("write hooks");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-    let addr = listener.local_addr().expect("local addr");
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0u8; 4096];
-        let _ = stream.read(&mut request);
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"plan text\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
-    });
-
-    let mut agent = test_agent(&root);
-    agent.api_provider = ApiProvider::OpenAi;
-    agent.provider_id = "local".to_string();
-    agent.provider_requires_api_key = false;
-    agent.api_key.clear();
-    agent.base_url = format!("http://{addr}");
-    agent.model = DEFAULT_LOCAL_MODEL.to_string();
-    agent.hooks = Hooks::load(&root);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    agent.set_sink(Box::new(ChannelSink { tx }));
-
-    let plan = agent
-        .generate_read_only_plan("write a plan")
-        .await
-        .expect("plan completes");
-    assert_eq!(plan, "plan text");
-    assert!(
-        drain_events(&mut rx).is_empty(),
-        "internal planner events must not leak to the active sink"
-    );
-    assert!(
-        !root.join("hook-fired").exists(),
-        "planning must not fire user_prompt hooks"
-    );
-
-    agent.sink.emit(AgentEvent::Slash("restored".to_string()));
-    assert!(
-        drain_events(&mut rx)
-            .into_iter()
-            .any(|event| matches!(event, AgentEvent::Slash(text) if text == "restored")),
-        "original sink should be restored after planning"
-    );
-
-    server.join().expect("server thread");
     let _ = std::fs::remove_dir_all(&root);
 }
 

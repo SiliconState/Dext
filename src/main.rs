@@ -1944,18 +1944,6 @@ fn emit_external_telemetry(sink: &mut dyn EventSink, state: &orchestrator::TurnR
     });
 }
 
-struct SilentSink;
-
-impl EventSink for SilentSink {
-    fn emit(&mut self, _event: AgentEvent) {}
-
-    fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
-        Choice::Deny
-    }
-
-    fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
-}
-
 #[cfg(test)]
 struct NullSink;
 
@@ -10365,7 +10353,7 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 - Use only exposed tools via real provider calls; never print call JSON/syntax or bash envelopes. Obey approval and sandbox policy; if denied, ask. Use unsafe pip only if requested; avoid external state-store mutations.
 - Before each call, honor runtime notes and Context State. At PIVOT REQUIRED or a pattern, stop repeating and pivot or ask.
 - `[queued-user-update]` is literal active user input. Never dismiss path-only or context-looking updates; inspect an exact path first—read_file for a file, fd/rg for a directory—not guessed paths or bash/sudo discovery, and address it in the response.
-- For nontrivial work use todo. Treat DEXT.md/recall.md as guidance; modify neither unless asked.
+- For nontrivial work use todo; when the user approves a proposed plan, convert its agreed steps to todos before editing. Treat DEXT.md/recall.md as guidance; modify neither unless asked.
 - Prefer native tools: fd for files, rg for text/symbols, then focused read_file/read_symbol; use git_diff, edits, and http for their domains. Parallelize independent reads. Bash is only for orchestration, build/test/install, or gaps. Absolute reads are allowed; writes stay confined.
 - Read before editing. Inspect tracked diffs first and use native git_commit. Keep calls and results focused; reuse reads instead of repeating them.
 - Bash calls are atomic: backgrounding/nohup/disown cannot persist; setsid is unsupported. Use an OS supervisor with a dext- unit for requested persistent services. Inspect stderr, validate external sources before scaling, and ask on auth failure.
@@ -10374,6 +10362,10 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 - Invoke requested packs directly. Reusable packs are user-global unless explicitly project-local.";
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
+
+const ADVISORY_TURN_RUNTIME_NOTE: &str = "advisory_only=true — the user asked for planning/analysis, not changes. Use read-only tools (read_file, read_symbol, fd, rg, git_diff, todo_read); do not call write_file/edit_file/multi_edit/git_commit/todo_write, mutating bash, or network tools this turn. Finish with sections: Goal, Findings, Steps (numbered), Risks (omit if none) — then stop. Implementation begins only after explicit user approval (e.g. 'go').";
+
+const IMPLEMENTATION_TURN_RUNTIME_NOTE: &str = "implementation_authorized=true — the user approved execution. If the recent conversation contains an agreed plan, first record its steps with todo_write, then execute them in order: read before editing, keep todo status current, verify after changes.";
 
 #[cfg(test)]
 fn prompt_context_file_hash(path: &Path) -> Option<String> {
@@ -10682,15 +10674,6 @@ fn push_env_section(env: &mut String, heading: &str, body: String, cap: usize, h
     }
 }
 
-const READ_ONLY_TOOLS: &[&str] = &[
-    "read_file",
-    "read_symbol",
-    "fd",
-    "rg",
-    "git_diff",
-    "todo_read",
-];
-
 fn todo_summary_from_path(path: &Path, max_items: usize) -> Option<String> {
     let content =
         read_utf8_regular_file_with_limit(path, TODO_STATE_MAX_BYTES, None, "todo summary").ok()?;
@@ -10738,18 +10721,6 @@ fn read_session_todo_summary(root: &Path, session_id: &str, max_items: usize) ->
     todo_summary_from_path(&session_todo_path(root, session_id), max_items)
         .or_else(|| read_project_todo_summary(root, max_items))
 }
-
-const PLAN_SYSTEM: &str = "\
-You are a planning agent. You have READ-ONLY tools: read_file, read_symbol, fd, rg, \
-git_diff, todo_read. Explore the codebase and produce a concrete implementation plan.
-
-Output sections, in this order:
-1. Task — restate in one sentence.
-2. Files — paths you'll touch, one per line, each with a brief reason.
-3. Plan — numbered steps, short imperative sentences.
-4. Risks — assumptions or open questions (omit if none).
-
-Be terse. Plan only — do NOT write code.";
 
 const COMPACT_SYSTEM: &str = "\
 You are a transcript summarizer. Output ONLY a dense, factual resume packet using these exact sections:\n\
@@ -12110,7 +12081,6 @@ fn slash_command_name(text: &str) -> Option<&str> {
             | "session"
             | "hooks"
             | "undo"
-            | "plan"
     )
     .then_some(cmd)
 }
@@ -13171,6 +13141,9 @@ struct Agent {
     pending_pack_runtime_prompts: Vec<(String, u64)>,
     project_extensions_approved: Option<bool>,
     suppress_pack_activation: bool,
+    // Per-turn planning/execution policy note injected into the volatile env
+    // tail; set from the objective at each user-turn start, never persisted.
+    turn_policy_note: Option<&'static str>,
     state_lock: Option<Arc<SessionStateLock>>,
     session_enabled: bool,
     session_id: String,
@@ -13365,6 +13338,7 @@ impl Agent {
             pending_pack_runtime_prompts: Vec::new(),
             project_extensions_approved: None,
             suppress_pack_activation: false,
+            turn_policy_note: None,
             sandbox_root,
             git_context,
             silent: false,
@@ -15319,6 +15293,15 @@ impl Agent {
                 &format!("work ledger trimmed for {}.", caps.suffix),
             );
         }
+        if let Some(policy) = self.turn_policy_note {
+            push_env_section(
+                &mut env,
+                "Turn policy",
+                policy.to_string(),
+                1_000,
+                "turn policy trimmed.",
+            );
+        }
         let context_state = self.context_state_prompt();
         if !context_state.trim().is_empty() {
             push_env_section(
@@ -15460,6 +15443,22 @@ impl Agent {
         preview
     }
 
+    // Mid-turn steering can change planning intent: an approval must retire an
+    // advisory note immediately, and a new hold-off must reinstate one.
+    fn update_turn_policy_from_steering(&mut self, steering_text: &str) {
+        let objective = orchestrator::ObjectiveTracker::from_user_prompt(steering_text);
+        // A question asks about proceeding; it neither grants nor revokes
+        // approval, so it must not clear an active advisory policy.
+        let question = steering_text.trim_end().ends_with('?');
+        if objective.planned_execution() {
+            self.turn_policy_note = Some(IMPLEMENTATION_TURN_RUNTIME_NOTE);
+        } else if objective.apply_fixes_allowed() && !question {
+            self.turn_policy_note = None;
+        } else if objective.advisory_only() {
+            self.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+        }
+    }
+
     fn inject_queued_steering(
         &mut self,
         turn_state: &mut orchestrator::TurnRuntimeState,
@@ -15506,6 +15505,9 @@ impl Agent {
             )
         };
         let combined = pending_steering.join("\n\n");
+        if !combined.trim().is_empty() {
+            self.update_turn_policy_from_steering(&combined);
+        }
         let user_update = if combined.trim().is_empty() {
             "(runtime control command only)".to_string()
         } else {
@@ -17383,108 +17385,6 @@ impl Agent {
         Ok(())
     }
 
-    async fn run_plan(&mut self, task: String) -> Result<()> {
-        let plan = self.generate_read_only_plan(&task).await?;
-        self.sink.emit(AgentEvent::Slash(format!(
-            "=== PLAN ===\n{plan}\n=== END ==="
-        )));
-        self.history.push(Message {
-            role: "user".to_string(),
-            content: vec![Block::Text {
-                text: format!("Task: {task}\n\nProposed plan:\n\n{plan}"),
-            }],
-        });
-        self.history.push(Message {
-            role: "assistant".to_string(),
-            content: vec![Block::Text {
-                text: "Plan ready. Say 'go' to execute, or give revisions.".to_string(),
-            }],
-        });
-        Ok(())
-    }
-
-    async fn generate_read_only_plan(&mut self, task: &str) -> Result<String> {
-        let saved_system = std::mem::replace(&mut self.system, PLAN_SYSTEM.to_string());
-        let saved_tools = std::mem::replace(
-            &mut self.tools,
-            provider_tool_definitions()
-                .into_iter()
-                .filter(|tool| READ_ONLY_TOOLS.contains(&tool.name))
-                .collect(),
-        );
-        let saved_max_iterations = self.max_iterations.replace(15);
-        let saved_history = std::mem::take(&mut self.history);
-        let saved_silent = self.silent;
-        let saved_pretty = self.pretty;
-        let saved_sink = std::mem::replace(&mut self.sink, Box::new(SilentSink));
-        let saved_suppress_checkpoints = self.suppress_checkpoints;
-        let saved_hooks = self.hooks.clone();
-        let saved_pack_hook_env = self.pack_hook_env.clone();
-        let saved_active_pack_hook_paths = self.active_pack_hook_paths.clone();
-        let saved_active_pack_runtime = self.active_pack_runtime.take();
-        let saved_pending_pack_runtime_prompts =
-            std::mem::take(&mut self.pending_pack_runtime_prompts);
-        let saved_suppress_pack_activation = self.suppress_pack_activation;
-        let saved_work_ledger = self.work_ledger.clone();
-        let saved_budget_exhausted = self.budget_exhausted;
-        self.silent = true;
-        self.pretty = false;
-        self.suppress_checkpoints = true;
-        self.suppress_pack_activation = true;
-        self.hooks = Hooks::default();
-        self.pack_hook_env.clear();
-        self.active_pack_hook_paths.clear();
-        self.budget_exhausted = false;
-
-        let prompt = format!("Produce a read-only implementation plan for this task:\n\n{task}");
-        let chat_result = self.chat(prompt).await;
-
-        let plan = self
-            .history
-            .iter()
-            .rev()
-            .find_map(|message| {
-                if message.role != "assistant" {
-                    return None;
-                }
-                let text: String = message
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        Block::Text { text } | Block::PartialStream { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                if text.trim().is_empty() {
-                    None
-                } else {
-                    Some(text)
-                }
-            })
-            .unwrap_or_else(|| "(planner returned no text)".to_string());
-
-        self.history = saved_history;
-        self.system = saved_system;
-        self.tools = saved_tools;
-        self.max_iterations = saved_max_iterations;
-        self.silent = saved_silent;
-        self.pretty = saved_pretty;
-        self.suppress_checkpoints = saved_suppress_checkpoints;
-        self.hooks = saved_hooks;
-        self.pack_hook_env = saved_pack_hook_env;
-        self.active_pack_hook_paths = saved_active_pack_hook_paths;
-        self.active_pack_runtime = saved_active_pack_runtime;
-        self.pending_pack_runtime_prompts = saved_pending_pack_runtime_prompts;
-        self.suppress_pack_activation = saved_suppress_pack_activation;
-        self.work_ledger = saved_work_ledger;
-        self.budget_exhausted = saved_budget_exhausted;
-        self.sink = saved_sink;
-
-        chat_result?;
-        Ok(plan)
-    }
-
     async fn chat(&mut self, user_input: String) -> Result<()> {
         self.chat_with_pack_activation(user_input, false).await
     }
@@ -17619,6 +17519,19 @@ impl Agent {
                 .unwrap_or_default(),
         );
         let objective_line = objective.display_line();
+        self.turn_policy_note = if objective.advisory_only() {
+            Some(ADVISORY_TURN_RUNTIME_NOTE)
+        } else if objective.planned_execution() {
+            Some(IMPLEMENTATION_TURN_RUNTIME_NOTE)
+        } else {
+            None
+        };
+        if let Some(policy) = self.turn_policy_note {
+            let label = policy.split_whitespace().next().unwrap_or("turn policy");
+            self.sink
+                .emit(AgentEvent::Info(format!("[turn-policy] {label}")));
+            self.append_latest_log("turn_policy", label);
+        }
         self.update_work_ledger_from_objective(&objective);
         self.sink
             .emit(AgentEvent::Info(format!("[{}]", objective_line)));
@@ -21193,10 +21106,6 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "  /session                  alias for /sessions");
             let _ = writeln!(
                 w,
-                "  /plan <task>              run a read-only planner, seed the plan into history"
-            );
-            let _ = writeln!(
-                w,
                 "  /hooks [reload]           show hook config or reload from disk"
             );
             let _ = writeln!(
@@ -24211,21 +24120,6 @@ async fn main() -> Result<()> {
                     println!("compact threshold set to {percent}% -> {chars} chars");
                 }
                 Err(msg) => println!("{msg}"),
-            }
-            autosave_latest(&mut agent);
-            continue;
-        }
-
-        if input == "/plan" || input.starts_with("/plan ") {
-            let task = input.strip_prefix("/plan").unwrap_or("").trim();
-            if task.is_empty() {
-                println!("usage: /plan <task>");
-            } else {
-                agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Err(e) = agent.run_plan(task.to_string()).await {
-                    eprintln!("[plan error] {e:#}");
-                }
-                agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
             }
             autosave_latest(&mut agent);
             continue;

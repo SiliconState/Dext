@@ -175,6 +175,8 @@ Start Dext:
 dext
 ```
 
+Planning is conversational, not a mode. Ask for a plan (“plan the refactor”, “review this for bugs, don’t change anything”) and Dext applies an advisory-only turn policy: read-only tools and a structured Goal/Findings/Steps/Risks answer. Revise the plan in the same thread, then approve it (“go”, “proceed with the plan”) and Dext converts the agreed steps into todos and executes them. The policy steers the model; approval prompts and `/sandbox-profile read-only` remain the hard enforcement layers.
+
 Useful slash commands:
 
 ```text

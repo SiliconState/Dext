@@ -161,7 +161,6 @@ const TIPS: &[&str] = &[
     "Ctrl+O expands or collapses the latest tool output.",
     "Ctrl+B opens captured bash output after a command starts.",
     "Shift+Enter or Alt+Enter inserts a newline.",
-    "Use /plan <task> to run the read-only planner.",
 ];
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -588,11 +587,6 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         name: "/session",
         args: "[list|analyze|brief|grep|failures|verify-log|decisions]",
         help: "alias for /sessions",
-    },
-    SlashCmd {
-        name: "/plan",
-        args: "<task>",
-        help: "run read-only planner",
     },
     SlashCmd {
         name: "/pack",
@@ -9584,17 +9578,6 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                                     )));
                                 }
                                 Err(msg) => agent.sink.emit(AgentEvent::Slash(msg.to_string())),
-                            }
-                        } else if trimmed == "/plan" || trimmed.starts_with("/plan ") {
-                            let task = trimmed.strip_prefix("/plan").unwrap_or("").trim();
-                            if task.is_empty() {
-                                agent
-                                    .sink
-                                    .emit(AgentEvent::Slash("usage: /plan <task>".into()));
-                            } else if let Err(e) = agent.run_plan(task.to_string()).await {
-                                agent
-                                    .sink
-                                    .emit(AgentEvent::Error(format!("[plan error] {e:#}")));
                             }
                         } else if trimmed == "/pack"
                             || trimmed.starts_with("/pack ")

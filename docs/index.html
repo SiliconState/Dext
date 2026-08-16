@@ -1207,7 +1207,7 @@ credential-env: [SERVICE_TOKEN]
 <section class="collapsible-section">
 <h2 id="slash-commands" class="collapsible-header">Slash Commands</h2>
 <div class="collapsible-content">
-<p>Slash completion lists each <code>/login</code> provider exactly once by its provider id; numbered selector aliases remain accepted but are not shown as duplicate login choices.</p>
+<p>Slash completion lists each <code>/login</code> provider exactly once by its provider id; numbered selector aliases remain accepted but are not shown as duplicate login choices. Planning is conversational rather than a separate mode: ask Dext to inspect and propose a plan without editing, revise it in the same thread, then tell it to proceed. The retired <code>/plan</code> command is no longer intercepted, so equivalent text is handled as an ordinary prompt. When a prompt reads as planning/analysis-only (for example “plan …”, “review …”, “don’t change anything”), Dext injects an advisory-only turn policy into the volatile runtime status directing read-only tools and a structured Goal/Findings/Steps/Risks answer; a bare approval such as “go” or “proceed with the plan” injects an implementation policy directing the agreed plan into todos before editing. Explicit mutation requests always win over scoping clauses, question-phrased prompts (ending in <code>?</code>) are never treated as approvals, and mid-turn queued user updates re-evaluate the policy so a steering approval or hold-off takes effect immediately. The policy note steers rather than blocks — approval prompts and <code>/sandbox-profile read-only</code> remain the deterministic enforcement layers for untrusted or weaker models.</p>
 <table>
 <tr><th>Command</th><th>Description</th></tr>
 <tr><td><code>/help</code></td><td>Show available commands</td></tr>
@@ -1244,7 +1244,6 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>/export [html|jsonl] [path]</code></td><td>Export the current session</td></tr>
 <tr><td><code>/resume [name]</code></td><td>Resume latest or named session</td></tr>
 <tr><td><code>/sessions ...</code></td><td>List/analyze/brief/grep/failures/verification/decisions session history</td></tr>
-<tr><td><code>/plan &lt;task&gt;</code></td><td>Run read-only planning and seed the plan into history</td></tr>
 <tr><td><code>/budget [cap]</code></td><td>Set/show a dollar, token, or combined cap; <code>off</code> clears it</td></tr>
 <tr><td><code>/pack create|list|inspect|run</code></td><td>Create or use shelf-contained packs</td></tr>
 <tr><td><code>/shelves</code></td><td>Show shelf registry</td></tr>
