@@ -487,7 +487,15 @@ pub(crate) fn render_pack_list(
 ) -> String {
     use std::fmt::Write as _;
     if packs.is_empty() {
-        return "Packs  none found\nsearch paths: .dext/shelves/*/packs, DEXT_SHELVES_DIR, ~/.dext/shelves/*/packs".to_string();
+        let mut out = list_render::render_header("Packs", 0, opts);
+        out.push_str(&list_render::render_section_header("Search paths", opts));
+        list_render::write_wrapped(
+            &mut out,
+            ".dext/shelves/*/packs, DEXT_SHELVES_DIR, ~/.dext/shelves/*/packs",
+            2,
+            opts.effective_width(),
+        );
+        return out.trim_end().to_string();
     }
     let mut out = String::new();
     let _ = write!(
@@ -512,10 +520,11 @@ pub(crate) fn render_pack_list(
         out.push_str(&list_render::render_entry(&pack.name, desc, &meta, opts));
     }
     if packs.len() > PACK_LIST_LIMIT {
-        let _ = writeln!(
-            out,
-            "  … [{} more packs omitted]",
-            packs.len() - PACK_LIST_LIMIT
+        list_render::write_wrapped(
+            &mut out,
+            &format!("… [{} more packs omitted]", packs.len() - PACK_LIST_LIMIT),
+            2,
+            opts.effective_width(),
         );
     }
     out.push_str(&list_render::render_footer(

@@ -14,6 +14,7 @@ pub(crate) struct PlannedCall {
     pub(crate) event_call_id: String,
     pub(crate) name: String,
     pub(crate) input: Value,
+    pub(crate) journal_input: Value,
     pub(crate) input_str: String,
     pub(crate) summary: String,
     pub(crate) hosts: Vec<String>,
@@ -98,10 +99,13 @@ impl Agent {
         let mut plans: Vec<PlannedCall> = Vec::new();
         let mut journal_terminal_errors: Vec<String> = Vec::new();
         for (ordinal, (id, name, input)) in tool_calls.into_iter().enumerate() {
+            let mut journal_input = input.clone();
+            self.privacy
+                .redact_recall_tool_input(&name, &mut journal_input, &self.sandbox_root);
             let event_call_id = normalize_tool_call_id(&id, 0, ordinal);
-            let input_str = input.to_string();
+            let input_str = journal_input.to_string();
             let summary = summarize_call(&name, &input);
-            let call_sig = format!("{name}\n{input_str}");
+            let call_sig = format!("{name}\n{input}");
             let hosts = tool_policy::hosts_for_tool_call(&name, &input);
             let bulk_network = tool_policy::looks_like_bulk_network_call(&name, &input);
             let cache_key = orchestrator::network_cache_key(&name, &input);
@@ -207,19 +211,20 @@ impl Agent {
             if plan.is_none() {
                 match mutation_preview::prepare_tool_mutation(&name, &input, &self.sandbox_root) {
                     Ok(mut prepared) => {
-                        // recall.md is agent-authored memory that later re-enters
-                        // the system prompt; scrub secrets before the content is
-                        // previewed, approved, or written. Case-insensitive match:
-                        // on case-insensitive filesystems the prompt scan's
-                        // stat("recall.md") also finds differently-cased names.
                         if let Some(mutation) = prepared.as_mut()
-                            && mutation
-                                .path()
-                                .file_name()
-                                .and_then(|f| f.to_str())
-                                .is_some_and(|f| f.eq_ignore_ascii_case("recall.md"))
+                            && privacy::is_recall_memory_file(mutation.path())
                         {
                             mutation.rewrite_after_text(|text| self.privacy.redact_text(text).text);
+                            if mutation.after_text().len() > privacy::RECALL_MEMORY_MAX_BYTES {
+                                plan = Some(Plan::Immediate {
+                                    content: format!(
+                                        "recall.md would exceed the {}-byte working-memory cap; prune lower-value entries in the same edit",
+                                        privacy::RECALL_MEMORY_MAX_BYTES
+                                    ),
+                                    is_error: Some(true),
+                                });
+                                prepared = None;
+                            }
                         }
                         prepared_mutation = prepared;
                     }
@@ -350,6 +355,7 @@ impl Agent {
                 event_call_id,
                 name,
                 input,
+                journal_input,
                 input_str,
                 summary,
                 hosts,
@@ -592,7 +598,7 @@ impl Agent {
                             call_id: &plans[idx].tool_use_id,
                             tool_name: &n,
                             summary: &tool_journal_summary(&n, &inp),
-                            input: &inp,
+                            input: &plans[idx].journal_input,
                         },
                     ) {
                         Ok(record_id) => plans[idx].journal_record_id = Some(record_id),
@@ -739,6 +745,7 @@ impl Agent {
                 event_call_id,
                 name,
                 input,
+                journal_input: _journal_input,
                 input_str,
                 summary,
                 hosts,

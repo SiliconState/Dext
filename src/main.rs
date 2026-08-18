@@ -701,6 +701,18 @@ fn maybe_preserve_partial_stream(
     true
 }
 
+fn sanitize_recall_tool_inputs_for_history(
+    blocks: &mut [Block],
+    privacy: &PrivacyPolicy,
+    root: &Path,
+) {
+    for block in blocks {
+        if let Block::ToolUse { name, input, .. } = block {
+            privacy.redact_recall_tool_input(name, input, root);
+        }
+    }
+}
+
 fn maybe_preserve_assistant_response(
     blocks: &[Block],
     history: &mut Vec<Message>,
@@ -9866,6 +9878,21 @@ fn json_prompt_value(value: &Value) -> String {
     prompt_safe_json_text(serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()))
 }
 
+fn utc_date_from_unix_secs(timestamp: u64) -> String {
+    let z = (timestamp / 86_400) as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 fn prompt_env_value(raw: &str, max_bytes: usize) -> String {
     if max_bytes == 0 {
         return String::new();
@@ -10353,7 +10380,7 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 - Use only exposed tools via real provider calls; never print call JSON/syntax or bash envelopes. Obey approval and sandbox policy; if denied, ask. Use unsafe pip only if requested; avoid external state-store mutations.
 - Before each call, honor runtime notes and Context State. At PIVOT REQUIRED or a pattern, stop repeating and pivot or ask.
 - `[queued-user-update]` is literal active user input. Never dismiss path-only or context-looking updates; inspect an exact path first—read_file for a file, fd/rg for a directory—not guessed paths or bash/sudo discovery, and address it in the response.
-- For nontrivial work use todo; when the user approves a proposed plan, convert its agreed steps to todos before editing. Treat DEXT.md/recall.md as guidance; modify neither unless asked.
+- For nontrivial work use todo; when the user approves a proposed plan, convert its agreed steps to todos before editing. Treat DEXT.md as human-authored policy and never modify it. Treat recall.md as working memory governed by applicable DEXT.md guidance.
 - Prefer native tools: fd for files, rg for text/symbols, then focused read_file/read_symbol; use git_diff, edits, and http for their domains. Parallelize independent reads. Bash is only for orchestration, build/test/install, or gaps. Absolute reads are allowed; writes stay confined.
 - Read before editing. Inspect tracked diffs first and use native git_commit. Keep calls and results focused; reuse reads instead of repeating them.
 - Bash calls are atomic: backgrounding/nohup/disown cannot persist; setsid is unsupported. Use an OS supervisor with a dext- unit for requested persistent services. Inspect stderr, validate external sources before scaling, and ask on auth failure.
@@ -11089,23 +11116,27 @@ fn render_tools_status(agent: &Agent) -> String {
         list_render::render_count_header("Tools", header.exposed_tools.len(), "exposed", &opts)
     );
 
-    let _ = writeln!(out, "{}", list_render::bold("Profile", opts.color));
-    let _ = writeln!(
-        out,
-        "    {} (schemas {})",
-        agent.tool_context_profile().as_str(),
-        agent.wire_tool_profile().as_str()
+    out.push_str(&list_render::render_section_header("Profiles", &opts));
+    list_render::write_wrapped(
+        &mut out,
+        &format!(
+            "toolset: {}    schemas: {}    approval: {}",
+            agent.tool_context_profile().as_str(),
+            agent.wire_tool_profile().as_str(),
+            agent.approval_profile.as_str(),
+        ),
+        4,
+        opts.effective_width(),
     );
     out.push('\n');
 
     let push_names_section = |out: &mut String, title: &str, names: &[String], empty: &str| {
-        let _ = writeln!(
-            out,
-            "{}",
-            list_render::bold(&format!("{title} ({})", names.len()), opts.color)
-        );
+        out.push_str(&list_render::render_section_header(
+            &format!("{title} ({})", names.len()),
+            &opts,
+        ));
         if names.is_empty() {
-            let _ = writeln!(out, "    {empty}");
+            list_render::write_wrapped(out, empty, 4, opts.effective_width());
         } else {
             let shown: Vec<&str> = names
                 .iter()
@@ -11114,10 +11145,11 @@ fn render_tools_status(agent: &Agent) -> String {
                 .collect();
             list_render::write_wrapped(out, &shown.join(", "), 4, opts.effective_width());
             if names.len() > SLASH_LIST_LIMIT {
-                let _ = writeln!(
+                list_render::write_wrapped(
                     out,
-                    "  … [{} more tools omitted]",
-                    names.len() - SLASH_LIST_LIMIT
+                    &format!("… [{} more tools omitted]", names.len() - SLASH_LIST_LIMIT),
+                    2,
+                    opts.effective_width(),
                 );
             }
         }
@@ -11127,14 +11159,14 @@ fn render_tools_status(agent: &Agent) -> String {
     push_names_section(&mut out, "Exposed", &header.exposed_tools, "(none)");
     push_names_section(
         &mut out,
-        "Approval required",
+        "Permission-gated",
         &header.approval_required_tools,
         "(none)",
     );
     push_names_section(
         &mut out,
-        "Auto-approved now",
-        &header.auto_approved_tools,
+        "Explicit session grants",
+        &header.allowed,
         "(none; use /allow <tool>)",
     );
 
@@ -11169,34 +11201,39 @@ fn render_system_prompt_view(agent: &Agent) -> String {
     let details = agent.compose_system_details();
     let composed = format!("{}\n\n{}", details.stable, details.env);
     let mut out = String::new();
-    let _ = writeln!(
+    let _ = write!(
         out,
-        "{}  {}",
-        list_render::bold("System prompt", opts.color),
-        list_render::dim(&format!("{} chars", composed.len()), opts.color)
+        "{}",
+        list_render::render_count_header("System prompt", composed.chars().count(), "chars", &opts,)
     );
     out.push('\n');
 
-    let _ = writeln!(out, "{}", list_render::bold("Sources", opts.color));
-    let _ = writeln!(out, "    base prompt ({} chars)", agent.system.len());
+    out.push_str(&list_render::render_section_header("Sources", &opts));
+    list_render::write_wrapped(
+        &mut out,
+        &format!("base prompt ({} chars)", agent.system.chars().count()),
+        4,
+        opts.effective_width(),
+    );
     for path in &details.prompt_sources {
-        let _ = writeln!(
-            out,
-            "    {}",
-            list_render::display_path(path, &opts, &agent.sandbox_root)
+        list_render::write_wrapped(
+            &mut out,
+            &list_render::display_path(path, &opts, &agent.sandbox_root),
+            4,
+            opts.effective_width(),
         );
     }
     out.push('\n');
 
-    let _ = writeln!(out, "{}", list_render::bold("Prompt", opts.color));
-    let _ = writeln!(
-        out,
-        "{}",
-        cap_bytes_with_hint(
+    out.push_str(&list_render::render_section_header("Prompt", &opts));
+    list_render::write_preformatted_wrapped(
+        &mut out,
+        &cap_bytes_with_hint(
             composed,
             SLASH_TEXT_CAP,
             "system prompt display truncated; use /system <text> to replace the base prompt.",
-        )
+        ),
+        opts.effective_width(),
     );
     out.push('\n');
     let _ = write!(
@@ -11365,14 +11402,15 @@ fn render_help_listing() -> String {
         list_render::render_count_header("Commands", total, "total", &opts)
     );
     for (group, entries) in HELP_GROUPS {
-        let _ = writeln!(out, "{}", list_render::bold(group, opts.color));
+        out.push_str(&list_render::render_section_header(group, &opts));
         for (cmd, desc) in *entries {
             let prefix = format!("  {cmd}");
-            if prefix.len() + 2 > CMD_COL {
-                let _ = writeln!(out, "{prefix}");
-                list_render::write_wrapped(&mut out, desc, CMD_COL, opts.effective_width());
+            let prefix_width = unicode_width::UnicodeWidthStr::width(prefix.as_str());
+            if prefix_width + 2 > CMD_COL || CMD_COL >= opts.effective_width() {
+                list_render::write_wrapped(&mut out, cmd, 2, opts.effective_width());
+                list_render::write_wrapped(&mut out, desc, 4, opts.effective_width());
             } else {
-                let body_w = opts.effective_width().saturating_sub(CMD_COL).max(20);
+                let body_w = opts.effective_width().saturating_sub(CMD_COL).max(1);
                 let lines = list_render::wrap_lines(desc, body_w);
                 let _ = writeln!(out, "{prefix:<CMD_COL$}{}", lines[0]);
                 for line in &lines[1..] {
@@ -15441,21 +15479,31 @@ impl Agent {
             }
         }
 
+        let mut recall_budget = privacy::RECALL_MEMORY_MAX_BYTES;
         for (label, path, content, content_hash) in &recall_sections {
-            if context_budget == 0 {
+            if context_budget == 0 || recall_budget == 0 {
                 break;
             }
             prompt_sources.push(path.clone());
             prompt_source_hashes.push((path.clone(), content_hash.clone()));
+            let content = self.privacy.redact_text(content).text;
+            let recall_truncated = content.len() > recall_budget;
+            let content = cap_bytes_with_hint_to_total(
+                &content,
+                recall_budget,
+                "recall.md capped at 4096 bytes total; prune lower-value entries.",
+            );
+            recall_budget = recall_budget.saturating_sub(content.len());
             let label = prompt_env_value(label, 512);
             let heading = format!("Recall (recall.md from {label})");
             match push_prompt_context_section(
                 &mut stable,
                 &heading,
-                content,
+                &content,
                 &mut context_budget,
                 "recall.md truncated; keep durable facts concise.",
             ) {
+                PromptContextSectionResult::Complete if recall_truncated => break,
                 PromptContextSectionResult::Complete => {}
                 PromptContextSectionResult::Truncated => break,
                 PromptContextSectionResult::Omitted => {
@@ -15500,13 +15548,15 @@ impl Agent {
             env.push_str(&format!(" git={}", prompt_env_value(git, 256)));
         }
         env.push_str(&format!(
-            " provider={} model={} effort={} context={} approval={} sandbox={}\n",
+            " provider={} model={} effort={} context={} approval={} sandbox={} session={} date={}\n",
             prompt_env_value(&self.provider_id, 128),
             prompt_env_value(&self.model, 256),
             self.thinking_effort.as_str(),
             self.context_mode.as_str(),
             self.approval_profile.as_str(),
-            self.sandbox_profile.as_str()
+            self.sandbox_profile.as_str(),
+            prompt_env_value(&self.session_id, 128),
+            utc_date_from_unix_secs(unix_timestamp_secs())
         ));
 
         if let Some(seat) = &self.seat {
@@ -18246,6 +18296,12 @@ impl Agent {
                 continue;
             }
 
+            let mut history_blocks = blocks.clone();
+            sanitize_recall_tool_inputs_for_history(
+                &mut history_blocks,
+                &self.privacy,
+                &self.sandbox_root,
+            );
             self.finalize_turn_usage_metrics(&mut usage, &blocks);
 
             self.last_request_usage = usage;
@@ -18273,7 +18329,11 @@ impl Agent {
                 action_contract_must_mutate = true;
             }
 
-            if maybe_preserve_assistant_response(&blocks, &mut self.history, self.context_mode) {
+            if maybe_preserve_assistant_response(
+                &history_blocks,
+                &mut self.history,
+                self.context_mode,
+            ) {
                 self.checkpoint_latest_session("after_assistant_message");
             }
 
@@ -19067,7 +19127,7 @@ fn render_session_listing(root: &Path) -> String {
         list_render::render_header("Sessions", total, &opts)
     );
 
-    let _ = writeln!(out, "{}", list_render::bold("Latest", opts.color));
+    out.push_str(&list_render::render_section_header("Latest", &opts));
     if latest_exists {
         let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
         out.push_str(&render_session_entry(
@@ -19086,7 +19146,7 @@ fn render_session_listing(root: &Path) -> String {
     }
     out.push('\n');
 
-    let _ = writeln!(out, "{}", list_render::bold("Autosaved", opts.color));
+    out.push_str(&list_render::render_section_header("Autosaved", &opts));
     if autosaved_sessions.is_empty() {
         let _ = writeln!(
             out,
@@ -19107,7 +19167,7 @@ fn render_session_listing(root: &Path) -> String {
     }
     out.push('\n');
 
-    let _ = writeln!(out, "{}", list_render::bold("Named", opts.color));
+    out.push_str(&list_render::render_section_header("Named", &opts));
     match &named_records {
         Ok(records) if records.is_empty() => {
             let _ = writeln!(
@@ -21264,7 +21324,11 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 let _ = writeln!(w, "{}", render_system_prompt_view(agent));
             } else {
                 agent.system = arg.to_string();
-                let _ = writeln!(w, "system prompt replaced ({} chars)", agent.system.len());
+                let _ = writeln!(
+                    w,
+                    "system prompt replaced ({} chars)",
+                    agent.system.chars().count()
+                );
             }
         }
         "allow" => {

@@ -1,4 +1,5 @@
-//! Compact terminal-first list rendering shared by `/pack`, `/sessions`, `/shelves`, and `/help`.
+//! Compact terminal-first list rendering shared by `/pack`, `/sessions`, `/shelves`,
+//! `/help`, `/tools`, and `/system`.
 //!
 //! All list renderers share the same look: a bold header, separated per-entry
 //! blocks with a prominent name, hanging-indent wrapped descriptions, and a
@@ -11,7 +12,6 @@ use std::path::Path;
 
 use crate::session::user_home_dir;
 
-const MIN_WIDTH: usize = 20;
 const DEFAULT_WIDTH: usize = 100;
 // Keep wrapped text off the terminal's right edge and cap the measure for
 // readability on wide terminals.
@@ -46,7 +46,7 @@ impl ListOptions {
     }
 
     pub(crate) fn effective_width(&self) -> usize {
-        self.width.max(MIN_WIDTH)
+        self.width.max(1)
     }
 }
 
@@ -62,39 +62,62 @@ pub(crate) fn use_color() -> bool {
 /// Terminal width from the controlling TTY minus a small right gutter,
 /// clamped to a readable maximum measure. Non-TTY output (pipes, redirects,
 /// tests) keeps the fixed default.
+pub(crate) fn width_for_terminal_cols(cols: usize) -> usize {
+    cols.saturating_sub(RIGHT_GUTTER).clamp(1, DEFAULT_WIDTH)
+}
+
 pub(crate) fn terminal_width() -> usize {
-    if let Ok((cols, _)) = crossterm::terminal::size()
-        && cols >= MIN_WIDTH as u16
-    {
-        return (cols as usize)
-            .saturating_sub(RIGHT_GUTTER)
-            .clamp(MIN_WIDTH, DEFAULT_WIDTH);
+    if let Ok((cols, _)) = crossterm::terminal::size() {
+        return width_for_terminal_cols(cols as usize);
     }
     DEFAULT_WIDTH
 }
 
 // --- styling primitives -----------------------------------------------------
 
+fn terminal_safe_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() != Some(&'\n') {
+                    out.push('\n');
+                }
+            }
+            '\n' => out.push(ch),
+            '\t' => out.push_str("    "),
+            _ if ch.is_control() => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Bold (`\x1b[1m`) when color is enabled; identity otherwise.
 pub(crate) fn bold(s: &str, color: bool) -> String {
+    let s = terminal_safe_text(s);
     if color {
         format!("\x1b[1m{s}\x1b[0m")
     } else {
-        s.to_string()
+        s
     }
 }
 
 /// Dim/faint (`\x1b[2m`) when color is enabled.
 pub(crate) fn dim(s: &str, color: bool) -> String {
+    let s = terminal_safe_text(s);
     if color {
         format!("\x1b[2m{s}\x1b[0m")
     } else {
-        s.to_string()
+        s
     }
 }
 
 /// Inline styled label such as `source:` keys.
 pub(crate) fn label(key: &str, value: &str, color: bool) -> String {
+    let key = terminal_safe_text(key);
+    let value = terminal_safe_text(value);
     if color {
         format!("\x1b[36m{key}\x1b[0m {value}")
     } else {
@@ -161,6 +184,8 @@ fn word_chunks(word: &str, width: usize) -> Vec<&str> {
 /// Word-wrap `text` to `width` columns, returning lines. Each line is at most
 /// `width` display columns except for a single glyph wider than `width`.
 pub(crate) fn wrap_lines(text: &str, width: usize) -> Vec<String> {
+    let sanitized = terminal_safe_text(text);
+    let text = sanitized.as_str();
     let width = width.max(1);
     let mut out = Vec::new();
     for paragraph in text.split('\n') {
@@ -200,10 +225,28 @@ pub(crate) fn wrap_lines(text: &str, width: usize) -> Vec<String> {
 
 /// Append `text` wrapped to `width` with a `hang`-column hanging indent.
 pub(crate) fn write_wrapped(out: &mut String, text: &str, hang: usize, width: usize) {
+    let width = width.max(1);
+    let hang = hang.min(width.saturating_sub(1));
     let body_w = width.saturating_sub(hang).max(1);
     let pad = " ".repeat(hang);
     for line in wrap_lines(text, body_w) {
         let _ = writeln!(out, "{pad}{line}");
+    }
+}
+
+/// Preserve input line boundaries while hard-wrapping each line to the display
+/// width. Terminal controls are removed before rendering.
+pub(crate) fn write_preformatted_wrapped(out: &mut String, text: &str, width: usize) {
+    let safe = terminal_safe_text(text);
+    let width = width.max(1);
+    for line in safe.split('\n') {
+        if line.is_empty() {
+            out.push('\n');
+        } else {
+            for chunk in word_chunks(line, width) {
+                let _ = writeln!(out, "{chunk}");
+            }
+        }
     }
 }
 
@@ -220,27 +263,51 @@ pub(crate) fn render_entry(
 ) -> String {
     let mut out = String::new();
     let hang = 4;
-    let _ = writeln!(out, "  {}", bold(name, opts.color));
+    let width = opts.effective_width();
+    let name_indent = 2.min(width.saturating_sub(1));
+    let name_width = width.saturating_sub(name_indent).max(1);
+    for line in wrap_lines(name, name_width) {
+        let _ = writeln!(
+            out,
+            "{}{}",
+            " ".repeat(name_indent),
+            bold(&line, opts.color)
+        );
+    }
     if !description.trim().is_empty() {
-        write_wrapped(&mut out, description.trim(), hang, opts.effective_width());
+        write_wrapped(&mut out, description.trim(), hang, width);
     }
     if !meta.is_empty() {
-        let pairs: Vec<String> = meta
-            .iter()
-            .map(|(k, v)| label(&format!("{k}:"), v, opts.color))
-            .collect();
-        let _ = writeln!(out, "{}{}", " ".repeat(hang), pairs.join("    "));
+        let plain_pairs: Vec<String> = meta.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+        let plain = plain_pairs.join("    ");
+        if hang + unicode_width::UnicodeWidthStr::width(plain.as_str()) <= width {
+            let pairs: Vec<String> = meta
+                .iter()
+                .map(|(k, v)| label(&format!("{k}:"), v, opts.color))
+                .collect();
+            let _ = writeln!(out, "{}{}", " ".repeat(hang), pairs.join("    "));
+        } else {
+            write_wrapped(&mut out, &plain, hang, width);
+        }
     }
     out.push('\n');
     out
 }
 
+/// Render a width-bounded bold section heading.
+pub(crate) fn render_section_header(title: &str, opts: &ListOptions) -> String {
+    let mut out = String::new();
+    for line in wrap_lines(title, opts.effective_width()) {
+        let _ = writeln!(out, "{}", bold(&line, opts.color));
+    }
+    out
+}
+
 /// Standard `Use:` footer block.
 pub(crate) fn render_footer(commands: &[&str], opts: &ListOptions) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "{}", bold("Use:", opts.color));
+    let mut out = render_section_header("Use:", opts);
     for cmd in commands {
-        let _ = writeln!(out, "  {cmd}");
+        write_wrapped(&mut out, cmd, 2, opts.effective_width());
     }
     out
 }
@@ -252,11 +319,26 @@ pub(crate) fn render_count_header(
     noun: &str,
     opts: &ListOptions,
 ) -> String {
-    format!(
-        "{}  {}\n",
-        bold(title, opts.color),
-        dim(&format!("{count} {noun}"), opts.color),
-    )
+    let width = opts.effective_width();
+    let count_text = format!("{count} {noun}");
+    let combined_width = unicode_width::UnicodeWidthStr::width(title)
+        .saturating_add(2)
+        .saturating_add(unicode_width::UnicodeWidthStr::width(count_text.as_str()));
+    if combined_width <= width {
+        return format!(
+            "{}  {}\n",
+            bold(title, opts.color),
+            dim(&count_text, opts.color),
+        );
+    }
+    let mut out = String::new();
+    for line in wrap_lines(title, width) {
+        let _ = writeln!(out, "{}", bold(&line, opts.color));
+    }
+    for line in wrap_lines(&count_text, width) {
+        let _ = writeln!(out, "{}", dim(&line, opts.color));
+    }
+    out
 }
 
 /// Discovery-list header line: `Title  <count> found`.

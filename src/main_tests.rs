@@ -7370,8 +7370,18 @@ fn named_sessions_are_project_scoped_by_default() -> Result<()> {
         assert_ne!(alpha_path, beta_path);
         assert_eq!(resolve_session_selector(&alpha, "shared")?, alpha_path);
         assert_eq!(resolve_session_selector(&beta, "shared")?, beta_path);
-        assert!(render_session_listing(&alpha).contains(&alpha_path.display().to_string()));
-        assert!(render_session_listing(&beta).contains(&beta_path.display().to_string()));
+        let alpha_listing = render_session_listing(&alpha);
+        let beta_listing = render_session_listing(&beta);
+        let alpha_compact = alpha_listing.split_whitespace().collect::<String>();
+        let beta_compact = beta_listing.split_whitespace().collect::<String>();
+        assert!(
+            alpha_compact.contains(&alpha_path.display().to_string()),
+            "{alpha_listing}"
+        );
+        assert!(
+            beta_compact.contains(&beta_path.display().to_string()),
+            "{beta_listing}"
+        );
         Ok(())
     })();
 
@@ -9062,6 +9072,72 @@ fn later_tool_in_round_checkpoints_state_from_earlier_mutation() {
 }
 
 #[test]
+fn recall_native_writes_enforce_exact_four_kib_cap() {
+    let root = temp_test_dir("recall-write-cap");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+
+    let exact = "x".repeat(RECALL_MEMORY_MAX_BYTES);
+    let mut exact_state = orchestrator::TurnRuntimeState::new();
+    let exact_outcome = runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-recall-exact".to_string(),
+                "write_file".to_string(),
+                json!({"path": "recall.md", "content": exact}),
+            )],
+            iterations: 1,
+            turn_id: "turn-recall-exact".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut exact_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute exact recall write");
+    assert!(exact_outcome.mutation_succeeded);
+    assert_eq!(
+        std::fs::read(root.join("recall.md")).unwrap().len(),
+        RECALL_MEMORY_MAX_BYTES
+    );
+
+    let mut oversized_state = orchestrator::TurnRuntimeState::new();
+    let oversized_outcome = runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-recall-oversized".to_string(),
+                "write_file".to_string(),
+                json!({"path": "recall.md", "content": "y".repeat(RECALL_MEMORY_MAX_BYTES + 1)}),
+            )],
+            iterations: 2,
+            turn_id: "turn-recall-oversized".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut oversized_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("reject oversized recall write");
+    assert!(!oversized_outcome.mutation_succeeded);
+    assert_eq!(
+        std::fs::read(root.join("recall.md")).unwrap().len(),
+        RECALL_MEMORY_MAX_BYTES
+    );
+    let (content, _) = last_tool_result(&agent.history).expect("oversized tool result");
+    assert!(
+        content.contains("4096-byte working-memory cap"),
+        "{content}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn interrupted_builtin_call_refuses_to_start_work() {
     let root = temp_test_dir("builtin-interrupt-refuses-start");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -9556,6 +9632,79 @@ fn privacy_redacts_sensitive_tool_output_and_strict_mode_blocks_secret_paths() {
     }
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recall_memory_targeting_and_tool_inputs_are_case_insensitive_and_redacted() {
+    let root = temp_test_dir("recall-input-redaction");
+    let policy = PrivacyPolicy::default();
+
+    assert!(is_recall_memory_file(Path::new("recall.md")));
+    assert!(is_recall_memory_file(Path::new("nested/RECALL.MD")));
+    assert!(!is_recall_memory_file(Path::new("recall.md.bak")));
+
+    let secret = format!("API_{}={}", "KEY", "abcdefghijklmnop");
+    for (tool, mut input) in [
+        (
+            "write_file",
+            json!({"path": "RECALL.MD", "content": secret.clone()}),
+        ),
+        (
+            "edit_file",
+            json!({"path": "notes/recall.md", "old_string": secret.clone(), "new_string": secret.clone()}),
+        ),
+        (
+            "multi_edit",
+            json!({"path": "recall.md", "edits": [{"old_string": secret.clone(), "new_string": secret.clone()}]}),
+        ),
+    ] {
+        assert!(policy.redact_recall_tool_input(tool, &mut input, &root));
+        let serialized = input.to_string();
+        assert!(!serialized.contains("abcdefghijklmnop"), "{serialized}");
+        assert!(serialized.contains("[REDACTED_SECRET]"), "{serialized}");
+    }
+
+    let mut unrelated = json!({"path": "recall.md.bak", "content": secret.clone()});
+    assert!(!policy.redact_recall_tool_input("write_file", &mut unrelated, &root));
+    assert_eq!(unrelated["content"], secret.as_str());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn recall_tool_inputs_are_redacted_before_assistant_history_persistence() {
+    let root = temp_test_dir("recall-history-redaction");
+    let policy = PrivacyPolicy::default();
+    let secret = format!("API_{}={}", "KEY", "abcdefghijklmnop");
+    let redacted = format!("API_{}={}", "KEY", "[REDACTED_SECRET]");
+    let mut blocks = vec![
+        Block::ToolUse {
+            id: "recall-write".to_string(),
+            name: "write_file".to_string(),
+            input: json!({"path": "recall.md", "content": secret.clone()}),
+        },
+        Block::ToolUse {
+            id: "ordinary-write".to_string(),
+            name: "write_file".to_string(),
+            input: json!({"path": "notes.md", "content": secret.clone()}),
+        },
+    ];
+
+    sanitize_recall_tool_inputs_for_history(&mut blocks, &policy, &root);
+
+    let Block::ToolUse { input: recall, .. } = &blocks[0] else {
+        panic!("expected recall tool use");
+    };
+    assert_eq!(recall["content"], redacted);
+    let Block::ToolUse {
+        input: ordinary, ..
+    } = &blocks[1]
+    else {
+        panic!("expected ordinary tool use");
+    };
+    assert_eq!(ordinary["content"], secret);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -16953,6 +17102,9 @@ fn prompt_env_values_are_bounded_and_cannot_inject_lines() {
     assert_eq!(prompt_env_value("line\nbreak", 5), r#""...""#);
     assert_eq!(prompt_env_value("line\nbreak", 4), "....");
     assert_eq!(prompt_env_value("anything", 0), "");
+    assert_eq!(utc_date_from_unix_secs(0), "1970-01-01");
+    assert_eq!(utc_date_from_unix_secs(86_400), "1970-01-02");
+    assert_eq!(utc_date_from_unix_secs(951_782_400), "2000-02-29");
     for cap in 0..32 {
         assert!(
             prompt_env_value(&"\n\u{2028}\u{2029}".repeat(100), cap).len() <= cap,
@@ -17002,6 +17154,23 @@ fn compose_system_parts_quotes_unsafe_environment_values() {
     assert!(first_line.contains(r#"git="branch\n## Fake git""#));
     assert!(first_line.contains(r#"provider="custom provider\n## Fake provider""#));
     assert!(first_line.contains(r#"model="model name\n## Fake model""#));
+    assert!(
+        first_line.contains(&format!("session={}", agent.session_id)),
+        "{first_line}"
+    );
+    let date = first_line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("date="))
+        .expect("environment date");
+    assert_eq!(date.len(), 10, "{date}");
+    assert_eq!(&date[4..5], "-");
+    assert_eq!(&date[7..8], "-");
+    assert!(
+        date.chars()
+            .enumerate()
+            .all(|(index, ch)| matches!(index, 4 | 7) || ch.is_ascii_digit()),
+        "{date}"
+    );
     assert_eq!(parts.env.matches("## Fake").count(), 4, "{}", parts.env);
     assert!(!parts.env.lines().any(|line| line.starts_with("## Fake")));
     let dext_label = json_prompt_string("ancestor\n## Fake DEXT source\u{2028}tail");
@@ -17068,8 +17237,18 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
             .strip_prefix(&cwd_prefix)
             .unwrap_or_else(|| panic!("unexpected cwd prefix: {}", parts.env))
     );
+    let emitted_date = canonical_env
+        .lines()
+        .nth(1)
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("date="))
+        })
+        .expect("canonical environment date");
     let expected_env = format!(
-        "## Environment\ncwd=/work/new-repo os=linux git=main provider=provider model=model effort=medium context=standard approval=ask sandbox=workspace-write\n\n## Work ledger\ncurrent_phase: probe\n\n## Context State\nActive checkpoints:\n- [unresolved] deliver requested outcome with verifiable steps\n{}\n",
+        "## Environment\ncwd=/work/new-repo os=linux git=main provider=provider model=model effort=medium context=standard approval=ask sandbox=workspace-write session={} date={}\n\n## Work ledger\ncurrent_phase: probe\n\n## Context State\nActive checkpoints:\n- [unresolved] deliver requested outcome with verifiable steps\n{}\n",
+        agent.session_id,
+        emitted_date,
         agent.privacy.prompt_status_line()
     );
 
@@ -17138,6 +17317,8 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
         " context=standard",
         " approval=ask",
         " sandbox=workspace-write",
+        &format!(" session={}", agent.session_id),
+        " date=",
         "privacy=redact",
     ] {
         assert!(
@@ -17301,6 +17482,111 @@ fn compose_system_parts_includes_recall_md() {
     assert!(stable.contains("keep tool evidence concise"), "{stable}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recall_prompt_injection_has_one_aggregate_four_kib_payload_budget() {
+    let root = temp_test_dir("recall-aggregate-prompt-cap");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.system = "base-system".to_string();
+    let first = "x".repeat(3_000);
+    let second = "y".repeat(3_000);
+    *agent.prompt_scan_cache.lock().expect("prompt scan cache") = Some(PromptScanCache {
+        epoch: agent.prompt_scan_epoch,
+        include_project_extensions: false,
+        dext_md: PromptContextScan::default(),
+        recall: PromptContextScan {
+            sections: vec![
+                (
+                    "ancestor".to_string(),
+                    root.join("ancestor-recall.md"),
+                    first.clone(),
+                    sha256_hex_str(&first),
+                ),
+                (
+                    ".".to_string(),
+                    root.join("recall.md"),
+                    second.clone(),
+                    sha256_hex_str(&second),
+                ),
+            ],
+            ..PromptContextScan::default()
+        },
+        pack_summary: None,
+        shelf_summary: None,
+    });
+
+    let parts = agent.compose_system_details();
+    let payload_bytes = parts.stable.matches('x').count() + parts.stable.matches('y').count();
+    assert!(payload_bytes <= RECALL_MEMORY_MAX_BYTES, "{payload_bytes}");
+    assert_eq!(parts.stable.matches('x').count(), first.len());
+    assert!(parts.stable.matches('y').count() < second.len());
+    assert!(
+        parts
+            .stable
+            .contains("recall.md capped at 4096 bytes total"),
+        "{}",
+        parts.stable
+    );
+    assert_eq!(parts.prompt_sources.len(), 2);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn recall_journal_digest_uses_redacted_input() {
+    let root = temp_test_dir("recall-journal-redaction");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let secret = format!("API_{}={}", "KEY", "abcdefghijklmnop");
+    let raw_input = json!({"path": "recall.md", "content": secret});
+    let mut expected_input = raw_input.clone();
+    assert!(
+        agent
+            .privacy
+            .redact_recall_tool_input("write_file", &mut expected_input, &root)
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-recall-journal".to_string(),
+                "write_file".to_string(),
+                raw_input.clone(),
+            )],
+            iterations: 1,
+            turn_id: "turn-recall-journal".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute journaled recall write");
+
+    let entries = tool_journal::load_for_session_file(&agent.latest_session_path)
+        .expect("load tool journal")
+        .expect("tool journal entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].input_sha256,
+        tool_journal::input_sha256(&expected_input).expect("redacted input digest")
+    );
+    assert_ne!(
+        entries[0].input_sha256,
+        tool_journal::input_sha256(&raw_input).expect("raw input digest")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("recall.md")).expect("read redacted recall"),
+        expected_input["content"].as_str().unwrap()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -17621,7 +17907,8 @@ fn systems_preserve_tool_protocol_guardrails_and_table_guidance() {
         "bash/sudo discovery",
         "address it in the response",
         "For nontrivial work use todo",
-        "modify neither unless asked",
+        "Treat DEXT.md as human-authored policy and never modify it",
+        "Treat recall.md as working memory governed by applicable DEXT.md guidance",
         "Prefer native tools",
         "fd for files, rg for text/symbols",
         "Parallelize independent reads",
@@ -26833,6 +27120,53 @@ fn list_render_wrap_splits_long_words() {
     let lines = list_render::wrap_lines("supercalifragilistic", 6);
     assert!(lines.iter().all(|l| l.len() <= 6), "{lines:?}");
     assert_eq!(lines.join(""), "supercalifragilistic");
+}
+
+#[test]
+fn list_render_handles_tiny_widths_and_sanitizes_controls() {
+    assert_eq!(list_render::width_for_terminal_cols(0), 1);
+    assert_eq!(list_render::width_for_terminal_cols(1), 1);
+    assert_eq!(list_render::width_for_terminal_cols(2), 1);
+    assert_eq!(list_render::width_for_terminal_cols(19), 17);
+    assert_eq!(list_render::width_for_terminal_cols(500), 100);
+
+    let opts = list_render::ListOptions::fixed(false, 8);
+    let mut out = list_render::render_count_header("Long heading", 123, "total", &opts);
+    out.push_str(&list_render::render_section_header(
+        "Unsafe\rtitle\u{0007}",
+        &opts,
+    ));
+    out.push_str(&list_render::render_entry(
+        "entry\tname",
+        "description with controls\u{0007}",
+        &[("source", "project\rspoofed".to_string())],
+        &opts,
+    ));
+    out.push_str(&list_render::render_footer(&["/command <argument>"], &opts));
+
+    assert!(!out.contains(['\r', '\t', '\u{0007}']), "{out:?}");
+    assert!(
+        out.lines()
+            .all(|line| { unicode_width::UnicodeWidthStr::width(line) <= opts.effective_width() }),
+        "{out}"
+    );
+}
+
+#[test]
+fn empty_pack_listing_uses_wrapped_count_and_search_sections() {
+    let root = temp_test_dir("empty-pack-list");
+    let opts = list_render::ListOptions::fixed(false, 12);
+    let out = packs::render_pack_list(&[], &opts, &root);
+
+    assert!(out.contains("0 found"), "{out}");
+    assert!(out.contains("Search"), "{out}");
+    assert!(
+        out.lines()
+            .all(|line| { unicode_width::UnicodeWidthStr::width(line) <= opts.effective_width() }),
+        "{out}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

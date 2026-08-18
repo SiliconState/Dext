@@ -8,6 +8,42 @@ use serde_json::Value;
 
 use crate::{byte_suffix_at_char_boundary, canonicalize_read_tool_path, provider, str_array};
 
+pub(crate) const RECALL_MEMORY_MAX_BYTES: usize = 4 * 1024;
+
+pub(crate) fn is_recall_memory_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("recall.md"))
+}
+
+fn targets_recall_memory(root: &Path, input: &Value) -> bool {
+    let Some(raw_path) = input["path"].as_str() else {
+        return false;
+    };
+    let raw_path = Path::new(raw_path);
+    is_recall_memory_file(raw_path)
+        || crate::session::canonicalize_mutation_path(root, raw_path.to_string_lossy().as_ref())
+            .ok()
+            .is_some_and(|path| is_recall_memory_file(&path))
+}
+
+fn redact_json_strings(policy: &PrivacyPolicy, value: &mut Value) {
+    match value {
+        Value::String(text) => *text = policy.redact_text(text).text,
+        Value::Array(items) => {
+            for item in items {
+                redact_json_strings(policy, item);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                redact_json_strings(policy, value);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn text_is_potential_local_secret(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -315,6 +351,40 @@ impl PrivacyPolicy {
             ));
         }
         out
+    }
+
+    pub(crate) fn redact_recall_tool_input(
+        &self,
+        tool_name: &str,
+        input: &mut Value,
+        root: &Path,
+    ) -> bool {
+        if !matches!(tool_name, "write_file" | "edit_file" | "multi_edit")
+            || !targets_recall_memory(root, input)
+        {
+            return false;
+        }
+        match tool_name {
+            "write_file" => {
+                if let Some(content) = input.get_mut("content") {
+                    redact_json_strings(self, content);
+                }
+            }
+            "edit_file" => {
+                for field in ["old_string", "new_string"] {
+                    if let Some(value) = input.get_mut(field) {
+                        redact_json_strings(self, value);
+                    }
+                }
+            }
+            "multi_edit" => {
+                if let Some(edits) = input.get_mut("edits") {
+                    redact_json_strings(self, edits);
+                }
+            }
+            _ => unreachable!(),
+        }
+        true
     }
 
     pub(crate) fn redact_text(&self, text: &str) -> PrivacyRedaction {

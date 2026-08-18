@@ -271,6 +271,7 @@ enum Line_ {
         tool: String,
         message: String,
     },
+    Slash(String),
     Info(String),
     RuntimeView {
         pack: String,
@@ -2213,7 +2214,7 @@ impl TuiState {
                 self.live_tools.clear();
                 self.set_agent_busy(false);
                 self.status = phase_status_text(&s).unwrap_or_else(|| "ready".into());
-                self.queue(Line_::Info(s));
+                self.queue(Line_::Slash(s));
             }
             AgentEvent::TurnEnd { failed, .. } => {
                 self.push_debug_event(if failed {
@@ -3746,24 +3747,46 @@ fn push_diff_preview(
     preview_lines.len().saturating_sub(take)
 }
 
+fn ansi_escape_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start.saturating_add(1);
+    if i >= bytes.len() {
+        return i;
+    }
+    match bytes[i] {
+        b'[' => {
+            i += 1;
+            while i < bytes.len() {
+                let byte = bytes[i];
+                i += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+        }
+        b']' | b'P' | b'^' | b'_' => {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == 0x07 {
+                    return i + 1;
+                }
+                if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                    return i + 2;
+                }
+                i += 1;
+            }
+        }
+        _ => {}
+    }
+    i.min(bytes.len())
+}
+
 fn strip_ansi_escapes(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == 0x1b {
-            i += 1;
-            if i < bytes.len() && bytes[i] == b'[' {
-                i += 1;
-                while i < bytes.len() {
-                    let b = bytes[i];
-                    i += 1;
-                    if (0x40..=0x7e).contains(&b) {
-                        break;
-                    }
-                }
-                continue;
-            }
+            i = ansi_escape_end(bytes, i);
             continue;
         }
         if let Some(ch) = text[i..].chars().next() {
@@ -3790,7 +3813,11 @@ fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
     macro_rules! flush {
         () => {
             if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), style));
+                let sanitized = sanitize_display_text(&buf);
+                if !sanitized.is_empty() {
+                    spans.push(Span::styled(sanitized, style));
+                }
+                buf.clear();
             }
         };
     }
@@ -3828,7 +3855,7 @@ fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
                     i += 1;
                 }
             } else {
-                i += 1;
+                i = ansi_escape_end(bytes, i);
             }
         } else {
             let ch = text[i..].chars().next().unwrap_or('\0');
@@ -3838,7 +3865,7 @@ fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
     }
     flush!();
     if spans.is_empty() {
-        spans.push(Span::raw(strip_ansi_escapes(text)));
+        spans.push(Span::raw(sanitize_display_text(&strip_ansi_escapes(text))));
     }
     spans
 }
@@ -6232,6 +6259,12 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 Style::default().fg(Color::Yellow),
                 width,
             );
+        }
+        Line_::Slash(s) => {
+            let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+            for seg in normalized.split('\n') {
+                lines.push(Line::from(ansi_to_spans(seg)));
+            }
         }
         Line_::Info(s) => {
             let trimmed = s.trim_start();
@@ -10159,6 +10192,22 @@ mod tests {
     }
 
     #[test]
+    fn slash_lines_preserve_supported_sgr_and_sanitize_controls() {
+        let text = line_to_text(
+            &Line_::Slash("\x1b[1mHeading\x1b[0m\r\nplain\u{0007}\x1b]0;title\u{0007}".to_string()),
+            80,
+        );
+        assert_eq!(flatten_lines(&text), vec!["Heading", "plain"]);
+        let heading = span_style_for(&text, "Heading").expect("styled slash heading");
+        assert!(heading.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !flatten_lines(&text)
+                .join("\n")
+                .contains(['\x1b', '\r', '\u{0007}'])
+        );
+    }
+
+    #[test]
     fn user_cards_pad_body_lines_so_right_border_stays_clear() {
         let text = line_to_text(&Line_::User("- line one\n- line two".to_string()), 120);
         let lines = flatten_lines(&text);
@@ -12560,7 +12609,7 @@ mod tests {
             state
                 .pending_insert
                 .last()
-                .is_some_and(|line| matches!(line, Line_::Info(msg) if msg == "ok"))
+                .is_some_and(|line| matches!(line, Line_::Slash(msg) if msg == "ok"))
         );
     }
 
