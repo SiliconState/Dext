@@ -13,6 +13,9 @@ use crate::session::user_home_dir;
 
 const MIN_WIDTH: usize = 20;
 const DEFAULT_WIDTH: usize = 100;
+// Keep wrapped text off the terminal's right edge and cap the measure for
+// readability on wide terminals.
+const RIGHT_GUTTER: usize = 2;
 
 /// Rendering knobs for list views. `color` should already account for TTY,
 /// `NO_COLOR`, and `TERM=dumb`; `width` is the wrapped column budget.
@@ -56,13 +59,16 @@ pub(crate) fn use_color() -> bool {
         && std::io::stdout().is_terminal()
 }
 
-/// Terminal width from the controlling TTY, clamped to a sane default for
-/// non-TTY output (pipes, redirects, tests).
+/// Terminal width from the controlling TTY minus a small right gutter,
+/// clamped to a readable maximum measure. Non-TTY output (pipes, redirects,
+/// tests) keeps the fixed default.
 pub(crate) fn terminal_width() -> usize {
     if let Ok((cols, _)) = crossterm::terminal::size()
         && cols >= MIN_WIDTH as u16
     {
-        return cols as usize;
+        return (cols as usize)
+            .saturating_sub(RIGHT_GUTTER)
+            .clamp(MIN_WIDTH, DEFAULT_WIDTH);
     }
     DEFAULT_WIDTH
 }
@@ -239,14 +245,23 @@ pub(crate) fn render_footer(commands: &[&str], opts: &ListOptions) -> String {
     out
 }
 
-/// Standard list header line: `Title  <count> found`.
-pub(crate) fn render_header(title: &str, count: usize, opts: &ListOptions) -> String {
+/// Standard list header line: `Title  <count> <noun>`.
+pub(crate) fn render_count_header(
+    title: &str,
+    count: usize,
+    noun: &str,
+    opts: &ListOptions,
+) -> String {
     format!(
-        "{}  {} {}\n",
+        "{}  {}\n",
         bold(title, opts.color),
-        dim(&count.to_string(), opts.color),
-        dim("found", opts.color),
+        dim(&format!("{count} {noun}"), opts.color),
     )
+}
+
+/// Discovery-list header line: `Title  <count> found`.
+pub(crate) fn render_header(title: &str, count: usize, opts: &ListOptions) -> String {
+    render_count_header(title, count, "found", opts)
 }
 
 /// Parse `--verbose` / `-v` / `--paths` out of a slash argument, returning

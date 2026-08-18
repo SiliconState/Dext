@@ -11086,7 +11086,7 @@ fn render_tools_status(agent: &Agent) -> String {
     let _ = write!(
         out,
         "{}",
-        list_render::render_header("Tools", header.exposed_tools.len(), &opts)
+        list_render::render_count_header("Tools", header.exposed_tools.len(), "exposed", &opts)
     );
 
     let _ = writeln!(out, "{}", list_render::bold("Profile", opts.color));
@@ -11362,7 +11362,7 @@ fn render_help_listing() -> String {
     let _ = write!(
         out,
         "{}",
-        list_render::render_header("Commands", total, &opts)
+        list_render::render_count_header("Commands", total, "total", &opts)
     );
     for (group, entries) in HELP_GROUPS {
         let _ = writeln!(out, "{}", list_render::bold(group, opts.color));
