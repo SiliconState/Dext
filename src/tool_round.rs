@@ -209,12 +209,15 @@ impl Agent {
                     Ok(mut prepared) => {
                         // recall.md is agent-authored memory that later re-enters
                         // the system prompt; scrub secrets before the content is
-                        // previewed, approved, or written.
+                        // previewed, approved, or written. Case-insensitive match:
+                        // on case-insensitive filesystems the prompt scan's
+                        // stat("recall.md") also finds differently-cased names.
                         if let Some(mutation) = prepared.as_mut()
                             && mutation
                                 .path()
                                 .file_name()
-                                .is_some_and(|f| f == "recall.md")
+                                .and_then(|f| f.to_str())
+                                .is_some_and(|f| f.eq_ignore_ascii_case("recall.md"))
                         {
                             mutation.rewrite_after_text(|text| self.privacy.redact_text(text).text);
                         }
