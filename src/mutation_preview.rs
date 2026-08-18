@@ -55,6 +55,13 @@ impl PreparedMutation {
         std::str::from_utf8(&self.after).expect("native text mutation prepared from UTF-8")
     }
 
+    /// Rewrite pending content before preview/approval/apply so the user
+    /// reviews and the disk receives the same bytes. The before-image and
+    /// expected fingerprint are untouched.
+    pub(crate) fn rewrite_after_text(&mut self, rewrite: impl FnOnce(&str) -> String) {
+        self.after = rewrite(self.after_text()).into_bytes();
+    }
+
     pub(crate) fn preview(&self) -> MutationPreview {
         compute_preview(
             self.path.clone(),

@@ -11080,42 +11080,62 @@ struct ToolsCommandResult {
 fn render_tools_status(agent: &Agent) -> String {
     use std::fmt::Write as _;
 
+    let opts = list_render::ListOptions::detect(false);
     let header = agent.session_header();
     let mut out = String::new();
+    let _ = write!(
+        out,
+        "{}",
+        list_render::render_header("Tools", header.exposed_tools.len(), &opts)
+    );
+
+    let _ = writeln!(out, "{}", list_render::bold("Profile", opts.color));
     let _ = writeln!(
         out,
-        "tools: {} (schemas {})",
+        "    {} (schemas {})",
         agent.tool_context_profile().as_str(),
         agent.wire_tool_profile().as_str()
     );
-    let _ = writeln!(out, "usage: /tools [status|default|full]");
-    let _ = writeln!(
-        out,
-        "exposed ({}): {}",
-        header.exposed_tools.len(),
-        render_limited_csv(&header.exposed_tools, SLASH_LIST_LIMIT, "(none)", "tools")
+    out.push('\n');
+
+    let push_names_section = |out: &mut String, title: &str, names: &[String], empty: &str| {
+        let _ = writeln!(
+            out,
+            "{}",
+            list_render::bold(&format!("{title} ({})", names.len()), opts.color)
+        );
+        if names.is_empty() {
+            let _ = writeln!(out, "    {empty}");
+        } else {
+            let shown: Vec<&str> = names
+                .iter()
+                .take(SLASH_LIST_LIMIT)
+                .map(String::as_str)
+                .collect();
+            list_render::write_wrapped(out, &shown.join(", "), 4, opts.effective_width());
+            if names.len() > SLASH_LIST_LIMIT {
+                let _ = writeln!(
+                    out,
+                    "  … [{} more tools omitted]",
+                    names.len() - SLASH_LIST_LIMIT
+                );
+            }
+        }
+        out.push('\n');
+    };
+
+    push_names_section(&mut out, "Exposed", &header.exposed_tools, "(none)");
+    push_names_section(
+        &mut out,
+        "Approval required",
+        &header.approval_required_tools,
+        "(none)",
     );
-    let _ = writeln!(
-        out,
-        "approval-required ({}): {}",
-        header.approval_required_tools.len(),
-        render_limited_csv(
-            &header.approval_required_tools,
-            SLASH_LIST_LIMIT,
-            "(none)",
-            "tools"
-        )
-    );
-    let _ = writeln!(
-        out,
-        "auto-approved now ({}): {}",
-        header.auto_approved_tools.len(),
-        render_limited_csv(
-            &header.auto_approved_tools,
-            SLASH_LIST_LIMIT,
-            "(none)",
-            "tools"
-        )
+    push_names_section(
+        &mut out,
+        "Auto-approved now",
+        &header.auto_approved_tools,
+        "(none; use /allow <tool>)",
     );
 
     let hidden_specialized: Vec<String> = tools::specialized_tool_names()
@@ -11123,12 +11143,250 @@ fn render_tools_status(agent: &Agent) -> String {
         .map(str::to_string)
         .collect();
     if !hidden_specialized.is_empty() {
-        let _ = writeln!(
-            out,
-            "hidden until /tools full: {}",
-            hidden_specialized.join(", ")
+        push_names_section(
+            &mut out,
+            "Hidden until /tools full",
+            &hidden_specialized,
+            "(none)",
         );
     }
+
+    let _ = write!(
+        out,
+        "{}",
+        list_render::render_footer(
+            &["/tools default|full", "/allow <tool>", "/revoke <tool>"],
+            &opts,
+        )
+    );
+    out.trim_end().to_string()
+}
+
+fn render_system_prompt_view(agent: &Agent) -> String {
+    use std::fmt::Write as _;
+
+    let opts = list_render::ListOptions::detect(false);
+    let details = agent.compose_system_details();
+    let composed = format!("{}\n\n{}", details.stable, details.env);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}  {}",
+        list_render::bold("System prompt", opts.color),
+        list_render::dim(&format!("{} chars", composed.len()), opts.color)
+    );
+    out.push('\n');
+
+    let _ = writeln!(out, "{}", list_render::bold("Sources", opts.color));
+    let _ = writeln!(out, "    base prompt ({} chars)", agent.system.len());
+    for path in &details.prompt_sources {
+        let _ = writeln!(
+            out,
+            "    {}",
+            list_render::display_path(path, &opts, &agent.sandbox_root)
+        );
+    }
+    out.push('\n');
+
+    let _ = writeln!(out, "{}", list_render::bold("Prompt", opts.color));
+    let _ = writeln!(
+        out,
+        "{}",
+        cap_bytes_with_hint(
+            composed,
+            SLASH_TEXT_CAP,
+            "system prompt display truncated; use /system <text> to replace the base prompt.",
+        )
+    );
+    out.push('\n');
+    let _ = write!(
+        out,
+        "{}",
+        list_render::render_footer(&["/system <text>  (replace the base prompt)"], &opts)
+    );
+    out.trim_end().to_string()
+}
+
+const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Core",
+        &[
+            ("/help", "show this list"),
+            ("/quit, /exit", "exit dext"),
+            ("/reset", "clear conversation history"),
+        ],
+    ),
+    (
+        "Tools & policy",
+        &[
+            (
+                "/tools [default|full]",
+                "list or switch provider-visible tools",
+            ),
+            ("/history", "show turn count and last 5 messages"),
+            ("/system [text]", "show or replace the system prompt"),
+            (
+                "/allow <tool>",
+                "auto-approve a native or active runtime tool",
+            ),
+            ("/revoke <tool>", "remove auto-approval"),
+            ("/allowed", "list native and active-runtime grants"),
+            (
+                "/trust [on|off|status]",
+                "auto-approve all privileged tools",
+            ),
+            (
+                "/privacy [on|strict|off|status]",
+                "redact sensitive tool output before model context",
+            ),
+            (
+                "/approval [profile]",
+                "ask|auto-read|auto-write|never|always",
+            ),
+            ("/preview [mode]", "off|simple|git mutation previews"),
+            (
+                "/sandbox-profile [profile]",
+                "read-only|workspace-write|danger-full-access",
+            ),
+            ("/budget [cap|off]", "show/set budget cap ($ or tokens)"),
+        ],
+    ),
+    (
+        "Packs & shelves",
+        &[
+            (
+                "/pack [list|inspect|run|create]",
+                "create, discover, or invoke shelf packs",
+            ),
+            (
+                "/shelves",
+                "list typed shelf manifests and ability metadata",
+            ),
+            (
+                "/project-extensions [status|reset]",
+                "inspect or reset repository extension approval",
+            ),
+            ("/sandbox [path]", "show or change the sandbox root"),
+        ],
+    ),
+    (
+        "Provider & auth",
+        &[
+            (
+                "/model [id]",
+                "show or change model (persists per provider)",
+            ),
+            ("/providers", "list providers + auth status"),
+            ("/provider [id|#]", "show or switch active provider"),
+            (
+                "/models [provider|#|all]",
+                "list curated models for active/authenticated providers",
+            ),
+            (
+                "/login [provider|#] [token|web|import]",
+                "login or store token/key",
+            ),
+            ("/login cancel", "abort a pending OAuth or browser login"),
+            ("/logout [provider|#]", "remove stored key for provider"),
+        ],
+    ),
+    (
+        "Context & diagnostics",
+        &[
+            (
+                "/effort [level]",
+                "model reasoning depth/tool persistence: off|minimal|low|medium|high|xhigh|max",
+            ),
+            (
+                "/reasoning-mode [mode]",
+                "standard|pro (official OpenAI GPT-5.6 Responses only)",
+            ),
+            (
+                "/context [standard|frugal]",
+                "context/cap mode; local providers default to frugal",
+            ),
+            (
+                "/tool-profile [lean|full]",
+                "provider tool schema verbosity (default lean)",
+            ),
+            (
+                "/compact [status|auto|N]",
+                "summarize older history or set the auto-compaction threshold",
+            ),
+            ("/usage", "cumulative token usage this session"),
+            ("/status", "runtime diagnostics (provider, auth, model)"),
+            ("/tokens", "approximate tokens per message + top hogs"),
+            (
+                "/diagnostics",
+                "rust-analyzer diagnostics (fallback: cargo check)",
+            ),
+        ],
+    ),
+    (
+        "Sessions",
+        &[
+            (
+                "/save <name>",
+                "write history + config to sessions dir as JSONL",
+            ),
+            (
+                "/export [html|jsonl] [path]",
+                "export session (default JSONL)",
+            ),
+            (
+                "/resume [name]",
+                "load the latest autosaved or a named session",
+            ),
+            (
+                "/sessions",
+                "list sessions; also analyze|brief|grep|failures|verify-log|decisions",
+            ),
+            ("/session", "alias for /sessions"),
+            ("/hooks [reload]", "show hook config or reload from disk"),
+            (
+                "/undo [--apply|--list|<id>]",
+                "preview or restore latest checkpoint",
+            ),
+            ("/version", "show dext version"),
+        ],
+    ),
+];
+
+fn render_help_listing() -> String {
+    use std::fmt::Write as _;
+
+    const CMD_COL: usize = 30;
+    let opts = list_render::ListOptions::detect(false);
+    let total: usize = HELP_GROUPS.iter().map(|(_, entries)| entries.len()).sum();
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "{}",
+        list_render::render_header("Commands", total, &opts)
+    );
+    for (group, entries) in HELP_GROUPS {
+        let _ = writeln!(out, "{}", list_render::bold(group, opts.color));
+        for (cmd, desc) in *entries {
+            let prefix = format!("  {cmd}");
+            if prefix.len() + 2 > CMD_COL {
+                let _ = writeln!(out, "{prefix}");
+                list_render::write_wrapped(&mut out, desc, CMD_COL, opts.effective_width());
+            } else {
+                let body_w = opts.effective_width().saturating_sub(CMD_COL).max(20);
+                let lines = list_render::wrap_lines(desc, body_w);
+                let _ = writeln!(out, "{prefix:<CMD_COL$}{}", lines[0]);
+                for line in &lines[1..] {
+                    let _ = writeln!(out, "{}{line}", " ".repeat(CMD_COL));
+                }
+            }
+        }
+        out.push('\n');
+    }
+    let _ = write!(
+        out,
+        "{}",
+        list_render::render_footer(&["/<command> — [args] optional, <args> required"], &opts,)
+    );
     out.trim_end().to_string()
 }
 
@@ -16223,11 +16481,6 @@ impl Agent {
         }
     }
 
-    fn composed_system_prompt(&self) -> String {
-        let (sys_stable, sys_env) = self.compose_system_parts();
-        format!("{sys_stable}\n\n{sys_env}")
-    }
-
     fn session_provenance_from(
         &self,
         details: &SystemParts,
@@ -20948,171 +21201,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             );
         }
         "help" | "?" => {
-            let _ = writeln!(w, "── Core ──");
-            let _ = writeln!(w, "  /help                     show this");
-            let _ = writeln!(w, "  /quit, /exit              exit dext");
-            let _ = writeln!(w, "  /reset                    clear conversation history");
-            let _ = writeln!(w);
-            let _ = writeln!(w, "── Tools & policy ──");
-            let _ = writeln!(
-                w,
-                "  /tools [default|full]     list or switch provider-visible tools"
-            );
-            let _ = writeln!(
-                w,
-                "  /history                  show turn count and last 5 messages"
-            );
-            let _ = writeln!(
-                w,
-                "  /system [text]            show or replace the system prompt"
-            );
-            let _ = writeln!(
-                w,
-                "  /allow <tool>             auto-approve a native or active runtime tool"
-            );
-            let _ = writeln!(w, "  /revoke <tool>            remove auto-approval");
-            let _ = writeln!(
-                w,
-                "  /allowed                  list native and active-runtime grants"
-            );
-            let _ = writeln!(
-                w,
-                "  /trust [on|off|status]   auto-approve all privileged tools"
-            );
-            let _ = writeln!(
-                w,
-                "  /privacy [on|strict|off|status]  redact sensitive tool output before model context"
-            );
-            let _ = writeln!(
-                w,
-                "  /approval [profile]       ask|auto-read|auto-write|never|always"
-            );
-            let _ = writeln!(
-                w,
-                "  /preview [mode]          off|simple|git mutation previews"
-            );
-            let _ = writeln!(
-                w,
-                "  /sandbox-profile [profile] read-only|workspace-write|danger-full-access"
-            );
-            let _ = writeln!(
-                w,
-                "  /budget [cap|off]         show/set budget cap ($ or tokens)"
-            );
-            let _ = writeln!(w);
-            let _ = writeln!(w, "── Packs & shelves ──");
-            let _ = writeln!(
-                w,
-                "  /pack [list|inspect|run|create]  create, discover, or invoke shelf packs"
-            );
-            let _ = writeln!(
-                w,
-                "  /shelves                  list typed shelf manifests and ability metadata"
-            );
-            let _ = writeln!(
-                w,
-                "  /project-extensions [status|reset]  inspect or reset repository extension approval"
-            );
-            let _ = writeln!(
-                w,
-                "  /sandbox [path]           show or change the sandbox root"
-            );
-            let _ = writeln!(w);
-            let _ = writeln!(w, "── Provider & auth ──");
-            let _ = writeln!(
-                w,
-                "  /model [id]               show or change model (persists per provider)"
-            );
-            let _ = writeln!(
-                w,
-                "  /providers                list providers + auth status"
-            );
-            let _ = writeln!(
-                w,
-                "  /provider [id|#]          show or switch active provider"
-            );
-            let _ = writeln!(
-                w,
-                "  /models [provider|#|all]  list curated models for active/authenticated providers"
-            );
-            let _ = writeln!(
-                w,
-                "  /login [provider|#] [token|web|import] login or store token/key"
-            );
-            let _ = writeln!(
-                w,
-                "  /logout [provider|#]      remove stored key for provider"
-            );
-            let _ = writeln!(
-                w,
-                "  /login cancel             abort a pending OAuth or browser login"
-            );
-            let _ = writeln!(w);
-            let _ = writeln!(w, "── Context & diagnostics ──");
-            let _ = writeln!(
-                w,
-                "  /effort [level]           set model reasoning depth/tool persistence: off|minimal|low|medium|high|xhigh|max"
-            );
-            let _ = writeln!(
-                w,
-                "  /reasoning-mode [mode]    select standard|pro (active only for official OpenAI GPT-5.6 Responses)"
-            );
-            let _ = writeln!(
-                w,
-                "  /context [standard|frugal]  context/cap mode; local providers default to frugal"
-            );
-            let _ = writeln!(
-                w,
-                "  /tool-profile [lean|full] provider tool schema verbosity (default lean)"
-            );
-            let _ = writeln!(
-                w,
-                "  /compact [status|auto|N]   summarize older history or set the auto-compaction threshold"
-            );
-            let _ = writeln!(
-                w,
-                "  /usage                    show cumulative token usage this session"
-            );
-            let _ = writeln!(
-                w,
-                "  /status                   show runtime diagnostics (provider, auth, model)"
-            );
-            let _ = writeln!(
-                w,
-                "  /tokens                   approximate tokens per message + top hogs"
-            );
-            let _ = writeln!(
-                w,
-                "  /diagnostics              run rust-analyzer diagnostics (fallback: cargo check)"
-            );
-            let _ = writeln!(w);
-            let _ = writeln!(w, "── Sessions ──");
-            let _ = writeln!(
-                w,
-                "  /save <name>              write history + config to sessions dir as JSONL"
-            );
-            let _ = writeln!(
-                w,
-                "  /export [html|jsonl] [path] export session (HTML or JSONL; default JSONL)"
-            );
-            let _ = writeln!(
-                w,
-                "  /resume [name]            load the latest autosaved or a named session"
-            );
-            let _ = writeln!(
-                w,
-                "  /sessions                 list latest + autosaved/named sessions; /sessions analyze|brief|grep|failures|verify-log|decisions"
-            );
-            let _ = writeln!(w, "  /session                  alias for /sessions");
-            let _ = writeln!(
-                w,
-                "  /hooks [reload]           show hook config or reload from disk"
-            );
-            let _ = writeln!(
-                w,
-                "  /undo [--apply|--list|<id>] preview or restore latest checkpoint"
-            );
-            let _ = writeln!(w, "  /version                  show dext version");
+            let _ = writeln!(w, "{}", render_help_listing());
         }
         "version" => {
             let _ = writeln!(w, "dext {}", env!("CARGO_PKG_VERSION"));
@@ -21172,16 +21261,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         }
         "system" => {
             if arg.is_empty() {
-                let composed = agent.composed_system_prompt();
-                let _ = writeln!(
-                    w,
-                    "{}",
-                    cap_bytes_with_hint(
-                        composed,
-                        SLASH_TEXT_CAP,
-                        "system prompt display truncated; use /system <text> to replace the base prompt.",
-                    )
-                );
+                let _ = writeln!(w, "{}", render_system_prompt_view(agent));
             } else {
                 agent.system = arg.to_string();
                 let _ = writeln!(w, "system prompt replaced ({} chars)", agent.system.len());

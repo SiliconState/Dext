@@ -60,10 +60,23 @@ When changing Dext itself:
 
 ## Context files
 - `DEXT.md` is tracked project guidance and is auto-injected from the sandbox
-  root and its ancestors. Keep it terse and machine-facing.
-- `recall.md` is an optional ignored prompt cache. It is auto-injected when
-  present, but Dext does not create or update it automatically.
-- Do not create or update `recall.md` unless the user asks.
+  root and its ancestors. Keep it terse and machine-facing. DEXT.md is
+  human-authored policy; agents never edit it.
+- `recall.md` is agent working memory, ignored by Git and auto-injected when
+  present.
+
+## Recall policy
+- Create/update `recall.md` without asking, at task boundaries (task done,
+  correction received, gotcha resolved) — not mid-exploration.
+- Hard cap ~4KB. To add when full, prune the least-valuable entry in the same
+  edit.
+- One line per entry: date, tag `[fact]`|`[pref]`|`[proc]`|`[fix]`, session id.
+- Declarative observations only — record what is true, never what to do.
+  Imperatives and instructions to future sessions are forbidden; DEXT.md alone
+  carries policy.
+- Never write secrets, credentials, or personal data.
+- New entries end with `?`. Strip the `?` only when a later session relies on
+  the entry and it holds. Delete entries the repo contradicts.
 
 ## Packs and shelves
 - Packs may optionally declare a reviewed `runtime.json` one-shot helper to expose dynamic tools, bounded state, continuation/steering effects, and markdown views; executable activation and write-risk calls retain approval, sandbox, credential-scrubbing, and checkpoint controls.
