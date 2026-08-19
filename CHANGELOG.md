@@ -45,9 +45,10 @@
 - Upgraded the terminal stack to exact Ratatui 0.30.2, ratatui-core 0.1.2,
   tui-markdown 0.3.8, Crossterm 0.29.0, and unicode-width 0.2.2 versions.
   Dext carries a narrow exact-source ratatui-core compatibility patch for its
-  inline viewport; the real-PTY suite now gates streaming input, populated
-  resize bursts, whole-screen clears, cursor-query counts, replay bounds, and a
-  bounded completion wait that tolerates slower macOS CI hosts.
+  inline viewport; the real-PTY suite now starts each child with a controlling
+  terminal and gates streaming input, populated resize bursts, whole-screen
+  clears, cursor-query counts, replay bounds, and a bounded completion wait
+  that tolerates slower macOS CI hosts.
 - macOS Seatbelt profiles now allow both canonical `/private/...` scratch paths
   and their standard `/var` or `/tmp` aliases, keeping temp APIs confined and
   usable.

@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -444,6 +445,18 @@ fn spawn_dext_with_env(
 
     for (key, value) in extra_env {
         cmd.env(key, value);
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            // A real controlling PTY is required for macOS to deliver resize state consistently.
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 
     cmd.spawn()
