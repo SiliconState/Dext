@@ -7370,18 +7370,8 @@ fn named_sessions_are_project_scoped_by_default() -> Result<()> {
         assert_ne!(alpha_path, beta_path);
         assert_eq!(resolve_session_selector(&alpha, "shared")?, alpha_path);
         assert_eq!(resolve_session_selector(&beta, "shared")?, beta_path);
-        let alpha_listing = render_session_listing(&alpha);
-        let beta_listing = render_session_listing(&beta);
-        let alpha_compact = alpha_listing.split_whitespace().collect::<String>();
-        let beta_compact = beta_listing.split_whitespace().collect::<String>();
-        assert!(
-            alpha_compact.contains(&alpha_path.display().to_string()),
-            "{alpha_listing}"
-        );
-        assert!(
-            beta_compact.contains(&beta_path.display().to_string()),
-            "{beta_listing}"
-        );
+        assert!(render_session_listing(&alpha).contains(&alpha_path.display().to_string()));
+        assert!(render_session_listing(&beta).contains(&beta_path.display().to_string()));
         Ok(())
     })();
 
@@ -27123,56 +27113,106 @@ fn list_render_wrap_splits_long_words() {
 }
 
 #[test]
-fn list_render_handles_tiny_widths_and_sanitizes_controls() {
+fn list_render_keeps_session_blueprint_and_sanitizes_controls() {
     assert_eq!(list_render::width_for_terminal_cols(0), 1);
     assert_eq!(list_render::width_for_terminal_cols(1), 1);
     assert_eq!(list_render::width_for_terminal_cols(2), 1);
     assert_eq!(list_render::width_for_terminal_cols(19), 17);
     assert_eq!(list_render::width_for_terminal_cols(500), 100);
 
-    let opts = list_render::ListOptions::fixed(false, 8);
-    let mut out = list_render::render_count_header("Long heading", 123, "total", &opts);
+    let opts = list_render::ListOptions::fixed(false, 80);
+    let mut out = list_render::render_count_header("Items", 1, "found", &opts);
     out.push_str(&list_render::render_section_header(
-        "Unsafe\rtitle\u{0007}",
+        "Unsafe\rsection\u{0007}\x1b]0;hidden\u{0007}",
         &opts,
     ));
     out.push_str(&list_render::render_entry(
-        "entry\tname",
-        "description with controls\u{0007}",
-        &[("source", "project\rspoofed".to_string())],
+        "entry\tname\x1b[31m!\x1b[0m",
+        "description with controls\u{0007}\x1b]0;hidden\u{0007}",
+        &[("source", "project\rspoofed\x1b[31mred\x1b[0m".to_string())],
         &opts,
     ));
-    out.push_str(&list_render::render_footer(&["/command <argument>"], &opts));
+    out.push_str(&list_render::render_footer(
+        &["/command\x1b]0;hidden\u{0007} <argument>"],
+        &opts,
+    ));
 
-    assert!(!out.contains(['\r', '\t', '\u{0007}']), "{out:?}");
-    assert!(
-        out.lines()
-            .all(|line| { unicode_width::UnicodeWidthStr::width(line) <= opts.effective_width() }),
-        "{out}"
+    assert!(!out.contains(['\x1b', '\r', '\t', '\u{0007}']), "{out:?}");
+    assert!(!out.contains("hidden"), "{out:?}");
+    assert_eq!(
+        out,
+        "Items  1 found\nUnsafe\nsection\n  entry    name!\n    description with controls\n    source: project\n    spoofedred\n\nUse:\n  /command <argument>\n"
     );
 }
 
 #[test]
-fn empty_pack_listing_uses_wrapped_count_and_search_sections() {
-    let root = temp_test_dir("empty-pack-list");
-    let opts = list_render::ListOptions::fixed(false, 12);
-    let out = packs::render_pack_list(&[], &opts, &root);
+fn structured_slash_renderers_follow_session_blueprint() {
+    let root = temp_test_dir("structured-slash-session-blueprint");
+    let agent = test_agent(&root);
 
-    assert!(out.contains("0 found"), "{out}");
-    assert!(out.contains("Search"), "{out}");
+    let help = render_help_listing();
+    assert!(help.starts_with("Commands  "), "{help}");
     assert!(
-        out.lines()
-            .all(|line| { unicode_width::UnicodeWidthStr::width(line) <= opts.effective_width() }),
-        "{out}"
+        help.contains("\nCore\n  /help\n    show this list\n\n  /quit, /exit\n"),
+        "{help}"
+    );
+    assert!(
+        help.ends_with("Use:\n  /<command> — [args] optional, <args> required"),
+        "{help}"
+    );
+
+    let tools = render_tools_status(&agent);
+    assert!(tools.starts_with("Tools  "), "{tools}");
+    assert!(
+        tools.contains(&format!(
+            "\nProfile\n    toolset: {}    schemas: {}    approval: {}\n",
+            agent.tool_context_profile().as_str(),
+            agent.wire_tool_profile().as_str(),
+            agent.approval_profile.as_str(),
+        )),
+        "{tools}"
+    );
+    assert!(
+        tools.ends_with("Use:\n  /tools default|full\n  /allow <tool>\n  /revoke <tool>"),
+        "{tools}"
+    );
+
+    let system = render_system_prompt_view(&agent);
+    assert!(system.starts_with("System prompt  "), "{system}");
+    assert!(
+        system.contains("\n\nSources\n    base prompt: "),
+        "{system}"
+    );
+    assert!(system.contains("\n\nPrompt\n"), "{system}");
+    assert!(
+        system.ends_with("\nUse:\n  /system <text>  (replace the base prompt)"),
+        "{system}"
     );
 
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn list_render_bold_only_with_color() {
+fn empty_pack_listing_uses_session_style_header_and_search_section() {
+    let root = temp_test_dir("empty-pack-list");
+    let opts = list_render::ListOptions::fixed(false, 12);
+    let out = packs::render_pack_list(&[], &opts, &root);
+
+    assert!(out.starts_with("Packs  0 found\nSearch paths\n"), "{out}");
+    let compact = out.split_whitespace().collect::<String>();
+    assert!(compact.contains(".dext/shelves/*/packs"), "{out}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn list_render_bold_only_with_color_and_strips_source_escapes() {
     assert_eq!(list_render::bold("x", false), "x");
     assert_eq!(list_render::bold("x", true), "\x1b[1mx\x1b[0m");
+    assert_eq!(
+        list_render::bold("x\x1b[31my\x1b[0m", true),
+        "\x1b[1mxy\x1b[0m"
+    );
 }
 
 #[test]
@@ -27199,11 +27239,13 @@ fn session_listing_shows_header_and_footer() -> Result<()> {
         agent.save_latest_session()?;
 
         let listing = render_session_listing(&project);
-        assert!(listing.contains("Sessions"), "{listing}");
-        assert!(listing.contains("Latest"), "{listing}");
-        assert!(listing.contains("Named"), "{listing}");
-        assert!(listing.contains("Autosaved"), "{listing}");
-        assert!(listing.contains("Use:"), "{listing}");
+        assert!(
+            listing.starts_with("Sessions  2 found\nLatest\n  latest\n"),
+            "{listing}"
+        );
+        assert!(listing.contains("\nAutosaved\n"), "{listing}");
+        assert!(listing.contains("\nNamed\n"), "{listing}");
+        assert!(listing.contains("\nUse:\n  /resume [name]\n"), "{listing}");
         Ok(())
     })();
     unsafe {

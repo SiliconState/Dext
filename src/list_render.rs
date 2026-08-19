@@ -1,11 +1,11 @@
-//! Compact terminal-first list rendering shared by `/pack`, `/sessions`, `/shelves`,
-//! `/help`, `/tools`, and `/system`.
+//! Compact terminal-first rendering based on the established `/sessions` layout
+//! and shared by `/pack`, `/shelves`, `/help`, `/tools`, and `/system`.
 //!
-//! All list renderers share the same look: a bold header, separated per-entry
-//! blocks with a prominent name, hanging-indent wrapped descriptions, and a
-//! detached `Use:` footer. Styling is emitted as ANSI escapes only when color is
-//! enabled (interactive TTY, not piped, `NO_COLOR` unset, `TERM != dumb`); the
-//! TUI translates these escapes back into styled spans.
+//! All structured renderers use the session layout: a bold count header, bold
+//! section labels, two-space entry names, four-space details, separated blocks,
+//! and a detached `Use:` footer. Styling is emitted as ANSI escapes only when
+//! color is enabled (interactive TTY, not piped, `NO_COLOR` unset,
+//! `TERM != dumb`); the TUI translates these escapes back into styled spans.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -75,13 +75,57 @@ pub(crate) fn terminal_width() -> usize {
 
 // --- styling primitives -----------------------------------------------------
 
+fn terminal_escape_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = start.saturating_add(1);
+    if i >= bytes.len() {
+        return i;
+    }
+    match bytes[i] {
+        b'[' => {
+            i += 1;
+            while i < bytes.len() {
+                let byte = bytes[i];
+                i += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+        }
+        b']' | b'P' | b'^' | b'_' => {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == 0x07 {
+                    return i + 1;
+                }
+                if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                    return i + 2;
+                }
+                i += 1;
+            }
+        }
+        _ => {
+            i += text[i..].chars().next().map_or(0, char::len_utf8);
+        }
+    }
+    i.min(bytes.len())
+}
+
 fn terminal_safe_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let mut i = 0usize;
+    while i < text.len() {
+        if text.as_bytes()[i] == 0x1b {
+            i = terminal_escape_end(text, i);
+            continue;
+        }
+        let Some(ch) = text[i..].chars().next() else {
+            break;
+        };
+        i += ch.len_utf8();
         match ch {
             '\r' => {
-                if chars.peek() != Some(&'\n') {
+                if !text[i..].starts_with('\n') {
                     out.push('\n');
                 }
             }
@@ -252,6 +296,20 @@ pub(crate) fn write_preformatted_wrapped(out: &mut String, text: &str, width: us
 
 // --- layout helpers ---------------------------------------------------------
 
+/// Render one compact four-space-indented metadata line. Embedded line breaks
+/// remain indented so untrusted values cannot escape the detail column.
+pub(crate) fn render_metadata(meta: &[(&str, String)], opts: &ListOptions) -> String {
+    let pairs: Vec<String> = meta
+        .iter()
+        .map(|(k, v)| label(&format!("{k}:"), v, opts.color))
+        .collect();
+    let mut out = String::new();
+    for line in pairs.join("    ").split('\n') {
+        let _ = writeln!(out, "    {line}");
+    }
+    out
+}
+
 /// Render a single list entry block: a bold name line, an indented description
 /// (wrapped), and indented metadata pairs. Ends with a trailing blank line so
 /// consecutive entries are visually separated.
@@ -263,42 +321,32 @@ pub(crate) fn render_entry(
 ) -> String {
     let mut out = String::new();
     let hang = 4;
-    let width = opts.effective_width();
-    let name_indent = 2.min(width.saturating_sub(1));
-    let name_width = width.saturating_sub(name_indent).max(1);
-    for line in wrap_lines(name, name_width) {
-        let _ = writeln!(
-            out,
-            "{}{}",
-            " ".repeat(name_indent),
-            bold(&line, opts.color)
+    let safe_name = terminal_safe_text(name);
+    for line in safe_name.split('\n') {
+        let _ = writeln!(out, "  {}", bold(line, opts.color));
+    }
+    let safe_description = terminal_safe_text(description);
+    if !safe_description.trim().is_empty() {
+        write_wrapped(
+            &mut out,
+            safe_description.trim(),
+            hang,
+            opts.effective_width(),
         );
     }
-    if !description.trim().is_empty() {
-        write_wrapped(&mut out, description.trim(), hang, width);
-    }
     if !meta.is_empty() {
-        let plain_pairs: Vec<String> = meta.iter().map(|(k, v)| format!("{k}: {v}")).collect();
-        let plain = plain_pairs.join("    ");
-        if hang + unicode_width::UnicodeWidthStr::width(plain.as_str()) <= width {
-            let pairs: Vec<String> = meta
-                .iter()
-                .map(|(k, v)| label(&format!("{k}:"), v, opts.color))
-                .collect();
-            let _ = writeln!(out, "{}{}", " ".repeat(hang), pairs.join("    "));
-        } else {
-            write_wrapped(&mut out, &plain, hang, width);
-        }
+        out.push_str(&render_metadata(meta, opts));
     }
     out.push('\n');
     out
 }
 
-/// Render a width-bounded bold section heading.
+/// Render a bold section heading in the established session layout.
 pub(crate) fn render_section_header(title: &str, opts: &ListOptions) -> String {
     let mut out = String::new();
-    for line in wrap_lines(title, opts.effective_width()) {
-        let _ = writeln!(out, "{}", bold(&line, opts.color));
+    let safe_title = terminal_safe_text(title);
+    for line in safe_title.split('\n') {
+        let _ = writeln!(out, "{}", bold(line, opts.color));
     }
     out
 }
@@ -307,7 +355,10 @@ pub(crate) fn render_section_header(title: &str, opts: &ListOptions) -> String {
 pub(crate) fn render_footer(commands: &[&str], opts: &ListOptions) -> String {
     let mut out = render_section_header("Use:", opts);
     for cmd in commands {
-        write_wrapped(&mut out, cmd, 2, opts.effective_width());
+        let safe_cmd = terminal_safe_text(cmd);
+        for line in safe_cmd.split('\n') {
+            let _ = writeln!(out, "  {line}");
+        }
     }
     out
 }
@@ -319,26 +370,11 @@ pub(crate) fn render_count_header(
     noun: &str,
     opts: &ListOptions,
 ) -> String {
-    let width = opts.effective_width();
-    let count_text = format!("{count} {noun}");
-    let combined_width = unicode_width::UnicodeWidthStr::width(title)
-        .saturating_add(2)
-        .saturating_add(unicode_width::UnicodeWidthStr::width(count_text.as_str()));
-    if combined_width <= width {
-        return format!(
-            "{}  {}\n",
-            bold(title, opts.color),
-            dim(&count_text, opts.color),
-        );
-    }
-    let mut out = String::new();
-    for line in wrap_lines(title, width) {
-        let _ = writeln!(out, "{}", bold(&line, opts.color));
-    }
-    for line in wrap_lines(&count_text, width) {
-        let _ = writeln!(out, "{}", dim(&line, opts.color));
-    }
-    out
+    format!(
+        "{}  {}\n",
+        bold(title, opts.color),
+        dim(&format!("{count} {noun}"), opts.color),
+    )
 }
 
 /// Discovery-list header line: `Title  <count> found`.

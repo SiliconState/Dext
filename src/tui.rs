@@ -271,7 +271,6 @@ enum Line_ {
         tool: String,
         message: String,
     },
-    Slash(String),
     Info(String),
     RuntimeView {
         pack: String,
@@ -2214,7 +2213,7 @@ impl TuiState {
                 self.live_tools.clear();
                 self.set_agent_busy(false);
                 self.status = phase_status_text(&s).unwrap_or_else(|| "ready".into());
-                self.queue(Line_::Slash(s));
+                self.queue(Line_::Info(s));
             }
             AgentEvent::TurnEnd { failed, .. } => {
                 self.push_debug_event(if failed {
@@ -6260,12 +6259,6 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 width,
             );
         }
-        Line_::Slash(s) => {
-            let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
-            for seg in normalized.split('\n') {
-                lines.push(Line::from(ansi_to_spans(seg)));
-            }
-        }
         Line_::Info(s) => {
             let trimmed = s.trim_start();
             if let Some(rest) = trimmed.strip_prefix("[sub]") {
@@ -6325,7 +6318,8 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
             } else if has_ansi(s) {
                 // List output (packs/sessions/shelves) styled with ANSI codes:
                 // render as styled spans without the dim-italic bullet treatment.
-                for seg in s.split('\n') {
+                let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+                for seg in normalized.split('\n') {
                     lines.push(Line::from(ansi_to_spans(seg)));
                 }
             } else {
@@ -10192,9 +10186,9 @@ mod tests {
     }
 
     #[test]
-    fn slash_lines_preserve_supported_sgr_and_sanitize_controls() {
+    fn structured_slash_info_preserves_supported_sgr_and_sanitizes_controls() {
         let text = line_to_text(
-            &Line_::Slash("\x1b[1mHeading\x1b[0m\r\nplain\u{0007}\x1b]0;title\u{0007}".to_string()),
+            &Line_::Info("\x1b[1mHeading\x1b[0m\r\nplain\u{0007}\x1b]0;title\u{0007}".to_string()),
             80,
         );
         assert_eq!(flatten_lines(&text), vec!["Heading", "plain"]);
@@ -12609,7 +12603,7 @@ mod tests {
             state
                 .pending_insert
                 .last()
-                .is_some_and(|line| matches!(line, Line_::Slash(msg) if msg == "ok"))
+                .is_some_and(|line| matches!(line, Line_::Info(msg) if msg == "ok"))
         );
     }
 

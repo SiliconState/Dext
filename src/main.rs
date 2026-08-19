@@ -11116,18 +11116,13 @@ fn render_tools_status(agent: &Agent) -> String {
         list_render::render_count_header("Tools", header.exposed_tools.len(), "exposed", &opts)
     );
 
-    out.push_str(&list_render::render_section_header("Profiles", &opts));
-    list_render::write_wrapped(
-        &mut out,
-        &format!(
-            "toolset: {}    schemas: {}    approval: {}",
-            agent.tool_context_profile().as_str(),
-            agent.wire_tool_profile().as_str(),
-            agent.approval_profile.as_str(),
-        ),
-        4,
-        opts.effective_width(),
-    );
+    let profile_meta = vec![
+        ("toolset", agent.tool_context_profile().as_str().to_string()),
+        ("schemas", agent.wire_tool_profile().as_str().to_string()),
+        ("approval", agent.approval_profile.as_str().to_string()),
+    ];
+    out.push_str(&list_render::render_section_header("Profile", &opts));
+    out.push_str(&list_render::render_metadata(&profile_meta, &opts));
     out.push('\n');
 
     let push_names_section = |out: &mut String, title: &str, names: &[String], empty: &str| {
@@ -11209,12 +11204,13 @@ fn render_system_prompt_view(agent: &Agent) -> String {
     out.push('\n');
 
     out.push_str(&list_render::render_section_header("Sources", &opts));
-    list_render::write_wrapped(
-        &mut out,
-        &format!("base prompt ({} chars)", agent.system.chars().count()),
-        4,
-        opts.effective_width(),
-    );
+    out.push_str(&list_render::render_metadata(
+        &[(
+            "base prompt",
+            format!("{} chars", agent.system.chars().count()),
+        )],
+        &opts,
+    ));
     for path in &details.prompt_sources {
         list_render::write_wrapped(
             &mut out,
@@ -11392,7 +11388,6 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
 fn render_help_listing() -> String {
     use std::fmt::Write as _;
 
-    const CMD_COL: usize = 30;
     let opts = list_render::ListOptions::detect(false);
     let total: usize = HELP_GROUPS.iter().map(|(_, entries)| entries.len()).sum();
     let mut out = String::new();
@@ -11404,21 +11399,8 @@ fn render_help_listing() -> String {
     for (group, entries) in HELP_GROUPS {
         out.push_str(&list_render::render_section_header(group, &opts));
         for (cmd, desc) in *entries {
-            let prefix = format!("  {cmd}");
-            let prefix_width = unicode_width::UnicodeWidthStr::width(prefix.as_str());
-            if prefix_width + 2 > CMD_COL || CMD_COL >= opts.effective_width() {
-                list_render::write_wrapped(&mut out, cmd, 2, opts.effective_width());
-                list_render::write_wrapped(&mut out, desc, 4, opts.effective_width());
-            } else {
-                let body_w = opts.effective_width().saturating_sub(CMD_COL).max(1);
-                let lines = list_render::wrap_lines(desc, body_w);
-                let _ = writeln!(out, "{prefix:<CMD_COL$}{}", lines[0]);
-                for line in &lines[1..] {
-                    let _ = writeln!(out, "{}{line}", " ".repeat(CMD_COL));
-                }
-            }
+            out.push_str(&list_render::render_entry(cmd, desc, &[], &opts));
         }
-        out.push('\n');
     }
     let _ = write!(
         out,
@@ -19127,7 +19109,7 @@ fn render_session_listing(root: &Path) -> String {
         list_render::render_header("Sessions", total, &opts)
     );
 
-    out.push_str(&list_render::render_section_header("Latest", &opts));
+    let _ = writeln!(out, "{}", list_render::bold("Latest", opts.color));
     if latest_exists {
         let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
         out.push_str(&render_session_entry(
@@ -19146,7 +19128,7 @@ fn render_session_listing(root: &Path) -> String {
     }
     out.push('\n');
 
-    out.push_str(&list_render::render_section_header("Autosaved", &opts));
+    let _ = writeln!(out, "{}", list_render::bold("Autosaved", opts.color));
     if autosaved_sessions.is_empty() {
         let _ = writeln!(
             out,
@@ -19167,7 +19149,7 @@ fn render_session_listing(root: &Path) -> String {
     }
     out.push('\n');
 
-    out.push_str(&list_render::render_section_header("Named", &opts));
+    let _ = writeln!(out, "{}", list_render::bold("Named", opts.color));
     match &named_records {
         Ok(records) if records.is_empty() => {
             let _ = writeln!(
