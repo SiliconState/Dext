@@ -13,6 +13,7 @@ use std::path::Path;
 use crate::session::user_home_dir;
 
 const DEFAULT_WIDTH: usize = 100;
+const MAX_WIDTH: usize = 120;
 // Keep wrapped text off the terminal's right edge and cap the measure for
 // readability on wide terminals.
 const RIGHT_GUTTER: usize = 2;
@@ -27,10 +28,10 @@ pub(crate) struct ListOptions {
 }
 
 impl ListOptions {
-    pub(crate) fn detect(verbose: bool) -> Self {
+    pub(crate) fn detect_with_width(verbose: bool, width: Option<usize>) -> Self {
         Self {
             color: use_color(),
-            width: terminal_width(),
+            width: width.map_or_else(terminal_width, width_for_terminal_cols),
             verbose,
         }
     }
@@ -63,7 +64,7 @@ pub(crate) fn use_color() -> bool {
 /// clamped to a readable maximum measure. Non-TTY output (pipes, redirects,
 /// tests) keeps the fixed default.
 pub(crate) fn width_for_terminal_cols(cols: usize) -> usize {
-    cols.saturating_sub(RIGHT_GUTTER).clamp(1, DEFAULT_WIDTH)
+    cols.saturating_sub(RIGHT_GUTTER).clamp(1, MAX_WIDTH)
 }
 
 pub(crate) fn terminal_width() -> usize {
@@ -111,6 +112,17 @@ fn terminal_escape_end(text: &str, start: usize) -> usize {
     i.min(bytes.len())
 }
 
+fn is_bidi_format_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 fn terminal_safe_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
@@ -129,9 +141,9 @@ fn terminal_safe_text(text: &str) -> String {
                     out.push('\n');
                 }
             }
-            '\n' => out.push(ch),
+            '\n' | '\u{2028}' | '\u{2029}' => out.push('\n'),
             '\t' => out.push_str("    "),
-            _ if ch.is_control() => {}
+            _ if ch.is_control() || is_bidi_format_control(ch) => {}
             _ => out.push(ch),
         }
     }
@@ -204,23 +216,29 @@ pub(crate) fn display_path(path: &Path, opts: &ListOptions, root: &Path) -> Stri
 
 // --- word wrap --------------------------------------------------------------
 
-fn word_chunks(word: &str, width: usize) -> Vec<&str> {
+fn word_chunks(word: &str, width: usize) -> Vec<String> {
     let mut chunks = Vec::new();
-    let mut start = 0usize;
+    let mut chunk = String::new();
     let mut cells = 0usize;
-    for c in crate::tui::display_clusters(word) {
-        if cells > 0 && cells + c.width > width {
-            chunks.push(&word[start..c.byte_start]);
-            start = c.byte_start;
+    for cluster in crate::tui::display_clusters(word) {
+        let source = &word[cluster.byte_start..cluster.byte_start + cluster.byte_len];
+        let (text, cluster_width) = if cluster.width > width {
+            ("?", 1)
+        } else {
+            (source, cluster.width)
+        };
+        if cells > 0 && cells + cluster_width > width {
+            chunks.push(std::mem::take(&mut chunk));
             cells = 0;
         }
-        cells += c.width;
+        chunk.push_str(text);
+        cells += cluster_width;
     }
-    if start < word.len() {
-        chunks.push(&word[start..]);
+    if !chunk.is_empty() {
+        chunks.push(chunk);
     }
     if chunks.is_empty() {
-        chunks.push(word);
+        chunks.push(word.to_string());
     }
     chunks
 }
@@ -242,17 +260,17 @@ pub(crate) fn wrap_lines(text: &str, width: usize) -> Vec<String> {
         let mut line_w = 0usize;
         for word in words {
             for chunk in word_chunks(word, width) {
-                let w = unicode_width::UnicodeWidthStr::width(chunk);
+                let w = unicode_width::UnicodeWidthStr::width(chunk.as_str());
                 if line.is_empty() {
-                    line.push_str(chunk);
+                    line.push_str(&chunk);
                     line_w = w;
                 } else if line_w + 1 + w > width {
                     out.push(std::mem::take(&mut line));
-                    line.push_str(chunk);
+                    line.push_str(&chunk);
                     line_w = w;
                 } else {
                     line.push(' ');
-                    line.push_str(chunk);
+                    line.push_str(&chunk);
                     line_w += 1 + w;
                 }
             }
@@ -278,18 +296,42 @@ pub(crate) fn write_wrapped(out: &mut String, text: &str, hang: usize, width: us
     }
 }
 
-/// Preserve input line boundaries while hard-wrapping each line to the display
-/// width. Terminal controls are removed before rendering.
+/// Preserve input line and indentation boundaries while word-wrapping prose.
+/// Oversized tokens are split only when they cannot fit on an otherwise empty line.
 pub(crate) fn write_preformatted_wrapped(out: &mut String, text: &str, width: usize) {
     let safe = terminal_safe_text(text);
     let width = width.max(1);
     for line in safe.split('\n') {
-        if line.is_empty() {
+        if line.trim().is_empty() {
             out.push('\n');
-        } else {
-            for chunk in word_chunks(line, width) {
-                let _ = writeln!(out, "{chunk}");
-            }
+            continue;
+        }
+        let body = line.trim_start_matches(' ');
+        let indent = line
+            .len()
+            .saturating_sub(body.len())
+            .min(width.saturating_sub(1));
+        let padding = " ".repeat(indent);
+        for wrapped in wrap_lines(body, width.saturating_sub(indent).max(1)) {
+            let _ = writeln!(out, "{padding}{wrapped}");
+        }
+    }
+}
+
+fn write_indented_preformatted(
+    out: &mut String,
+    text: &str,
+    indent: usize,
+    width: usize,
+    color: bool,
+) {
+    let width = width.max(1);
+    let indent = indent.min(width.saturating_sub(1));
+    let body_width = width.saturating_sub(indent).max(1);
+    let padding = " ".repeat(indent);
+    for source_line in text.split('\n') {
+        for chunk in word_chunks(source_line, body_width) {
+            let _ = writeln!(out, "{padding}{}", bold(&chunk, color));
         }
     }
 }
@@ -299,13 +341,119 @@ pub(crate) fn write_preformatted_wrapped(out: &mut String, text: &str, width: us
 /// Render one compact four-space-indented metadata line. Embedded line breaks
 /// remain indented so untrusted values cannot escape the detail column.
 pub(crate) fn render_metadata(meta: &[(&str, String)], opts: &ListOptions) -> String {
-    let pairs: Vec<String> = meta
+    let width = opts.effective_width();
+    let safe_pairs: Vec<(String, String)> = meta
         .iter()
-        .map(|(k, v)| label(&format!("{k}:"), v, opts.color))
+        .map(|(key, value)| {
+            (
+                terminal_safe_text(key).trim().to_string(),
+                terminal_safe_text(value),
+            )
+        })
         .collect();
+    if safe_pairs.is_empty() {
+        return String::new();
+    }
+    let metadata_indent = 4.min(width.saturating_sub(1));
+    let metadata_padding = " ".repeat(metadata_indent);
+    let inline_plain = safe_pairs
+        .iter()
+        .map(|(key, value)| format!("{key}: {value}"))
+        .collect::<Vec<_>>()
+        .join("    ");
     let mut out = String::new();
-    for line in pairs.join("    ").split('\n') {
-        let _ = writeln!(out, "    {line}");
+    if !inline_plain.contains('\n')
+        && metadata_indent
+            .saturating_add(unicode_width::UnicodeWidthStr::width(inline_plain.as_str()))
+            <= width
+    {
+        let inline_styled = safe_pairs
+            .iter()
+            .map(|(key, value)| label(&format!("{key}:"), value, opts.color))
+            .collect::<Vec<_>>()
+            .join("    ");
+        let _ = writeln!(out, "{metadata_padding}{inline_styled}");
+        return out;
+    }
+
+    let body_width = width.saturating_sub(metadata_indent).max(1);
+    for (key, value) in safe_pairs {
+        let key = format!("{key}:");
+        let pair = if value.is_empty() {
+            key.clone()
+        } else {
+            format!("{key} {value}")
+        };
+        for (index, row) in wrap_lines(&pair, body_width).into_iter().enumerate() {
+            if index == 0
+                && let Some(rest) = row.strip_prefix(&key)
+            {
+                let _ = writeln!(
+                    out,
+                    "{metadata_padding}{}",
+                    label(&key, rest.trim_start(), opts.color)
+                );
+            } else {
+                let _ = writeln!(out, "{metadata_padding}{row}");
+            }
+        }
+    }
+    out
+}
+
+/// Render compact name/description rows. Wide views align descriptions into a
+/// shared column; narrow views retain the familiar stacked session hierarchy.
+pub(crate) fn render_entry_rows(entries: &[(&str, &str)], opts: &ListOptions) -> String {
+    const MIN_COLUMNS_WIDTH: usize = 64;
+    const MAX_NAME_WIDTH: usize = 38;
+    const DESCRIPTION_GAP: usize = 3;
+
+    let width = opts.effective_width();
+    let safe_entries: Vec<(String, String)> = entries
+        .iter()
+        .map(|(name, description)| {
+            (
+                terminal_safe_text(name).trim().to_string(),
+                terminal_safe_text(description).trim().to_string(),
+            )
+        })
+        .collect();
+    let name_width = safe_entries
+        .iter()
+        .map(|(name, _)| unicode_width::UnicodeWidthStr::width(name.as_str()))
+        .max()
+        .unwrap_or(0)
+        .min(MAX_NAME_WIDTH);
+    let description_indent = 2 + name_width + DESCRIPTION_GAP;
+    let use_columns = width >= MIN_COLUMNS_WIDTH
+        && description_indent.saturating_add(20) <= width
+        && safe_entries.iter().all(|(name, _)| {
+            !name.contains('\n')
+                && unicode_width::UnicodeWidthStr::width(name.as_str()) <= name_width
+        });
+
+    let mut out = String::new();
+    for (name, description) in safe_entries {
+        if !use_columns {
+            write_indented_preformatted(&mut out, &name, 2, width, opts.color);
+            if !description.is_empty() {
+                write_wrapped(&mut out, &description, 4, width);
+            }
+            continue;
+        }
+
+        let display_width = unicode_width::UnicodeWidthStr::width(name.as_str());
+        let padding = " ".repeat(name_width.saturating_sub(display_width) + DESCRIPTION_GAP);
+        let wrapped = wrap_lines(
+            &description,
+            width.saturating_sub(description_indent).max(1),
+        );
+        let first = wrapped.first().map_or("", String::as_str);
+        let _ = writeln!(out, "  {}{padding}{first}", bold(&name, opts.color));
+        let continuation_padding = " ".repeat(description_indent);
+        for line in wrapped.iter().skip(1) {
+            let _ = writeln!(out, "{continuation_padding}{line}");
+        }
     }
     out
 }
@@ -322,9 +470,7 @@ pub(crate) fn render_entry(
     let mut out = String::new();
     let hang = 4;
     let safe_name = terminal_safe_text(name);
-    for line in safe_name.split('\n') {
-        let _ = writeln!(out, "  {}", bold(line, opts.color));
-    }
+    write_indented_preformatted(&mut out, &safe_name, 2, opts.effective_width(), opts.color);
     let safe_description = terminal_safe_text(description);
     if !safe_description.trim().is_empty() {
         write_wrapped(
@@ -345,9 +491,7 @@ pub(crate) fn render_entry(
 pub(crate) fn render_section_header(title: &str, opts: &ListOptions) -> String {
     let mut out = String::new();
     let safe_title = terminal_safe_text(title);
-    for line in safe_title.split('\n') {
-        let _ = writeln!(out, "{}", bold(line, opts.color));
-    }
+    write_indented_preformatted(&mut out, &safe_title, 0, opts.effective_width(), opts.color);
     out
 }
 
@@ -356,9 +500,7 @@ pub(crate) fn render_footer(commands: &[&str], opts: &ListOptions) -> String {
     let mut out = render_section_header("Use:", opts);
     for cmd in commands {
         let safe_cmd = terminal_safe_text(cmd);
-        for line in safe_cmd.split('\n') {
-            let _ = writeln!(out, "  {line}");
-        }
+        write_indented_preformatted(&mut out, &safe_cmd, 2, opts.effective_width(), false);
     }
     out
 }
@@ -370,11 +512,27 @@ pub(crate) fn render_count_header(
     noun: &str,
     opts: &ListOptions,
 ) -> String {
-    format!(
-        "{}  {}\n",
-        bold(title, opts.color),
-        dim(&format!("{count} {noun}"), opts.color),
-    )
+    let safe_title = terminal_safe_text(title);
+    let count_label = terminal_safe_text(&format!("{count} {noun}"));
+    let compact = format!("{safe_title}  {count_label}");
+    if !compact.contains('\n')
+        && unicode_width::UnicodeWidthStr::width(compact.as_str()) <= opts.effective_width()
+    {
+        return format!(
+            "{}  {}\n",
+            bold(&safe_title, opts.color),
+            dim(&count_label, opts.color),
+        );
+    }
+
+    let mut out = String::new();
+    write_indented_preformatted(&mut out, &safe_title, 0, opts.effective_width(), opts.color);
+    for source_line in count_label.split('\n') {
+        for chunk in word_chunks(source_line, opts.effective_width()) {
+            let _ = writeln!(out, "{}", dim(&chunk, opts.color));
+        }
+    }
+    out
 }
 
 /// Discovery-list header line: `Title  <count> found`.

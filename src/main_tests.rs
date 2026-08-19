@@ -97,6 +97,7 @@ fn test_agent(root: &Path) -> Agent {
         git_context: None,
         silent: true,
         pretty: false,
+        slash_render_width: None,
         max_iterations: Some(1),
         session_usage: Usage::default(),
         last_request_usage: Usage::default(),
@@ -7314,8 +7315,9 @@ fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<(
         assert!(listing.contains("latest"), "{listing}");
         assert!(listing.contains("Named"), "{listing}");
         let project_named_dir = named_sessions_dir_for_root(&project);
+        let compact = listing.split_whitespace().collect::<String>();
         assert!(
-            listing.contains(&format!("none in {}", project_named_dir.display())),
+            compact.contains(&format!("nonein{}", project_named_dir.display())),
             "{listing}"
         );
         assert!(listing.contains("use /save <name>"), "{listing}");
@@ -7370,8 +7372,17 @@ fn named_sessions_are_project_scoped_by_default() -> Result<()> {
         assert_ne!(alpha_path, beta_path);
         assert_eq!(resolve_session_selector(&alpha, "shared")?, alpha_path);
         assert_eq!(resolve_session_selector(&beta, "shared")?, beta_path);
-        assert!(render_session_listing(&alpha).contains(&alpha_path.display().to_string()));
-        assert!(render_session_listing(&beta).contains(&beta_path.display().to_string()));
+        for (project, path) in [(&alpha, &alpha_path), (&beta, &beta_path)] {
+            let listing = render_session_listing_width(project, Some(40));
+            let compact = listing.split_whitespace().collect::<String>();
+            assert!(compact.contains(&path.display().to_string()), "{listing}");
+            assert!(
+                listing
+                    .lines()
+                    .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 40),
+                "{listing}"
+            );
+        }
         Ok(())
     })();
 
@@ -17386,6 +17397,28 @@ fn slash_tools_switches_specialized_tool_visibility() {
 }
 
 #[test]
+fn slash_presentation_distinguishes_structured_views_and_faded_confirmations() {
+    let root = temp_test_dir("slash-presentation");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(handle_slash("/help", &mut agent), Some(true));
+    assert_eq!(handle_slash("/effort high", &mut agent), Some(true));
+
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::StructuredSlash(text) if text.contains("Commands"))
+    ));
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Slash(text) if text.contains("thinking effort: high"))
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn slash_allow_and_allowed_include_active_runtime_tools() {
     let root = temp_test_dir("slash-runtime-allow");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -17442,7 +17475,7 @@ fn slash_system_displays_composed_prompt_with_project_context() {
     let slash = drain_events(&mut rx)
         .into_iter()
         .find_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .unwrap_or_default();
@@ -17526,6 +17559,7 @@ fn recall_prompt_injection_has_one_aggregate_four_kib_payload_budget() {
 
 #[test]
 fn recall_journal_digest_uses_redacted_input() {
+    let _guard = env_lock();
     let root = temp_test_dir("recall-journal-redaction");
     let mut agent = test_agent(&root);
     agent.set_approval_profile(ApprovalProfile::Always);
@@ -26798,7 +26832,7 @@ fn slash_shelves_lists_typed_manifest_registry() {
     let slash = drain_events(&mut rx)
         .into_iter()
         .find_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .unwrap_or_default();
@@ -26877,7 +26911,7 @@ fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
     let slash_text = drain_events(&mut rx)
         .into_iter()
         .filter_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -26917,7 +26951,7 @@ fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
     let slash_text = drain_events(&mut rx)
         .into_iter()
         .find_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .unwrap_or_default();
@@ -26936,7 +26970,7 @@ fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
     let followup = drain_events(&mut rx)
         .into_iter()
         .filter_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::Slash(text) | AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -27118,12 +27152,12 @@ fn list_render_keeps_session_blueprint_and_sanitizes_controls() {
     assert_eq!(list_render::width_for_terminal_cols(1), 1);
     assert_eq!(list_render::width_for_terminal_cols(2), 1);
     assert_eq!(list_render::width_for_terminal_cols(19), 17);
-    assert_eq!(list_render::width_for_terminal_cols(500), 100);
+    assert_eq!(list_render::width_for_terminal_cols(500), 120);
 
     let opts = list_render::ListOptions::fixed(false, 80);
     let mut out = list_render::render_count_header("Items", 1, "found", &opts);
     out.push_str(&list_render::render_section_header(
-        "Unsafe\rsection\u{0007}\x1b]0;hidden\u{0007}",
+        "Unsafe\rsection\u{2028}next\u{2029}last\u{202e}spoof\u{2066}isolated\u{0007}\x1b]0;hidden\u{0007}",
         &opts,
     ));
     out.push_str(&list_render::render_entry(
@@ -27141,7 +27175,77 @@ fn list_render_keeps_session_blueprint_and_sanitizes_controls() {
     assert!(!out.contains("hidden"), "{out:?}");
     assert_eq!(
         out,
-        "Items  1 found\nUnsafe\nsection\n  entry    name!\n    description with controls\n    source: project\n    spoofedred\n\nUse:\n  /command <argument>\n"
+        "Items  1 found\nUnsafe\nsection\nnext\nlastspoofisolated\n  entry    name!\n    description with controls\n    source: project\n    spoofedred\n\nUse:\n  /command <argument>\n"
+    );
+}
+
+#[test]
+fn list_render_bounds_every_structured_row_by_display_cells() {
+    let width = 12;
+    let opts = list_render::ListOptions::fixed(false, width);
+    let mut out = list_render::render_count_header("界界界界界界界", 123, "found", &opts);
+    out.push_str(&list_render::render_section_header("分類\r見出し", &opts));
+    out.push_str(&list_render::render_entry(
+        "項目    名前界界界",
+        "説明 界界界界界 長い説明",
+        &[("metadata-key", "値界界界界界界".to_string())],
+        &opts,
+    ));
+    out.push_str(&list_render::render_footer(
+        &["/command-with-a-long-name <argument>"],
+        &opts,
+    ));
+
+    assert!(!out.contains(['\x1b', '\r', '\t', '\u{0007}']), "{out:?}");
+    for line in out.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(line) <= width,
+            "line exceeds {width} cells: {line:?}\n{out}"
+        );
+    }
+    assert!(
+        out.contains("項目    "),
+        "preformatted spacing was lost: {out}"
+    );
+
+    let wide_opts = list_render::ListOptions::fixed(false, 80);
+    let multiline =
+        list_render::render_entry_rows(&[("unsafe\rname", "description\rcontinued")], &wide_opts);
+    assert_eq!(
+        multiline,
+        "  unsafe\n  name\n    description\n    continued\n"
+    );
+}
+
+#[test]
+fn list_render_one_cell_rows_replace_only_impossible_wide_clusters() {
+    let one_cell = list_render::ListOptions::fixed(false, 1);
+    let mut out = list_render::render_count_header("界", 1, "件", &one_cell);
+    out.push_str(&list_render::render_entry(
+        "🙂",
+        "界 🙂",
+        &[("界", "🙂".to_string())],
+        &one_cell,
+    ));
+    out.push_str(&list_render::render_footer(&["/界🙂"], &one_cell));
+
+    assert!(
+        out.lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 1),
+        "{out:?}"
+    );
+    assert!(!out.contains(['界', '🙂']), "{out:?}");
+    assert!(out.contains('?'), "{out:?}");
+
+    let two_cells = list_render::ListOptions::fixed(false, 2);
+    let preserved = list_render::render_section_header("界🙂", &two_cells);
+    assert!(preserved.contains('界'), "{preserved:?}");
+    assert!(preserved.contains('🙂'), "{preserved:?}");
+    assert!(
+        preserved
+            .lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 2),
+        "{preserved:?}"
     );
 }
 
@@ -27150,10 +27254,10 @@ fn structured_slash_renderers_follow_session_blueprint() {
     let root = temp_test_dir("structured-slash-session-blueprint");
     let agent = test_agent(&root);
 
-    let help = render_help_listing();
+    let help = render_help_listing(Some(100));
     assert!(help.starts_with("Commands  "), "{help}");
     assert!(
-        help.contains("\nCore\n  /help\n    show this list\n\n  /quit, /exit\n"),
+        help.contains("\nCore\n  /help          show this list\n  /quit, /exit   exit dext\n"),
         "{help}"
     );
     assert!(
@@ -27198,7 +27302,12 @@ fn empty_pack_listing_uses_session_style_header_and_search_section() {
     let opts = list_render::ListOptions::fixed(false, 12);
     let out = packs::render_pack_list(&[], &opts, &root);
 
-    assert!(out.starts_with("Packs  0 found\nSearch paths\n"), "{out}");
+    assert!(out.starts_with("Packs\n0 found\nSearch paths\n"), "{out}");
+    assert!(
+        out.lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 12),
+        "{out}"
+    );
     let compact = out.split_whitespace().collect::<String>();
     assert!(compact.contains(".dext/shelves/*/packs"), "{out}");
 

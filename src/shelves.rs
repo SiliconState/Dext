@@ -779,8 +779,15 @@ fn push_shelf_manifest_dir(
 }
 
 pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
+    render_registry_listing_width(registry, None)
+}
+
+pub(crate) fn render_registry_listing_width(
+    registry: &ShelfRegistry,
+    width: Option<usize>,
+) -> String {
     use std::fmt::Write as _;
-    let opts = crate::list_render::ListOptions::detect(false);
+    let opts = crate::list_render::ListOptions::detect_with_width(false, width);
 
     if registry.is_empty() {
         let mut out = crate::list_render::render_header("Shelves", 0, &opts);

@@ -1,4 +1,4 @@
-use crate::backend::Backend;
+use crate::backend::{Backend, ClearType};
 use crate::buffer::{Buffer, Cell};
 use crate::layout::{Position, Rect, Size};
 use crate::terminal::{Terminal, Viewport};
@@ -119,53 +119,26 @@ impl<B: Backend> Terminal<B> {
         }
     }
 
-    /// Redraw content directly above the current inline viewport in place.
+    /// Clear the visible display and reset an inline viewport to the terminal origin.
     ///
-    /// Dext patch: inline resize replay must repaint the visible transcript tail at the new
-    /// terminal width. [`Terminal::insert_before`] scrolls the region above the viewport, so
-    /// replaying history through it appends a duplicate copy of that history to the terminal's
-    /// scrollback on every replay. This method instead draws the last `min(height, viewport_top)`
-    /// rows of the rendered buffer into the rows immediately above the viewport using plain
-    /// absolute-position writes: nothing scrolls, the viewport is untouched, and scrollback is
-    /// not mutated.
-    ///
-    /// When `height` exceeds the rows available above the viewport, the top of the rendered
-    /// buffer is skipped so the buffer's bottom rows land directly above the viewport. The
-    /// returned row count is the number of rows actually replaced; it can be smaller than
-    /// `height` when the viewport has fewer rows above it. Non-inline viewports and inline
-    /// viewports at the top return zero.
-    pub fn overwrite_before<F>(&mut self, height: u16, draw_fn: F) -> Result<u16, B::Error>
-    where
-        F: FnOnce(&mut Buffer),
-    {
-        if !matches!(self.viewport, Viewport::Inline(_)) {
-            return Ok(0);
-        }
-        let viewport_top = self.viewport_area.top();
-        if height == 0 || viewport_top == 0 {
-            return Ok(0);
-        }
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: self.viewport_area.width,
-            height,
+    /// This is intended for applications that have deliberately purged terminal scrollback and
+    /// will immediately replay their complete logical transcript. It avoids a cursor query, resets
+    /// both diff buffers, and leaves non-inline viewports unchanged.
+    pub fn reset_inline_viewport(&mut self) -> Result<(), B::Error> {
+        let Viewport::Inline(requested_height) = self.viewport else {
+            return Ok(());
         };
-        let mut buffer = Buffer::empty(area);
-        draw_fn(&mut buffer);
-        let to_draw = height.min(viewport_top);
-        let skip_cells = usize::from(height - to_draw) * usize::from(area.width);
-        self.draw_lines(
-            viewport_top - to_draw,
-            to_draw,
-            &buffer.content[skip_cells..],
-        )?;
-        // Direct backend draws leave the hardware cursor on the rewritten history. Put it back in
-        // the viewport without changing Ratatui's tracked frame cursor; the next draw restores the
-        // application cursor through the normal render path.
-        self.backend
-            .set_cursor_position(self.viewport_area.as_position())?;
-        Ok(to_draw)
+        let size = self.backend.size()?;
+        let area = Rect::new(0, 0, size.width, size.height.min(requested_height));
+        self.backend.set_cursor_position(Position::ORIGIN)?;
+        self.backend.clear_region(ClearType::All)?;
+        self.set_viewport_area(area);
+        self.buffers[0].reset();
+        self.buffers[1].reset();
+        self.last_known_area = size.into();
+        self.last_known_cursor_pos = Position::ORIGIN;
+        self.backend.flush()?;
+        Ok(())
     }
 
     /// Implement `Self::insert_before` using standard backend capabilities.
@@ -472,6 +445,8 @@ pub(crate) fn compute_inline_size<B: Backend>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use crate::backend::{Backend, TestBackend};
     use crate::layout::{Position, Rect, Size};
     use crate::style::Style;
@@ -533,24 +508,12 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_before_redraws_above_viewport_without_scrollback() {
-        // Diagram (terminal 10x6, viewport = Inline(2) anchored at y=4):
-        //
-        //   0  old-0      <- redraw target rows
-        //   1  old-1
-        //   2  old-2
-        //   3  old-3
-        //   4  viewport-a <- viewport (must stay untouched)
-        //   5  viewport-b
-        //
-        // A 5-row buffer is drawn above a 4-row region: the top buffer row is
-        // skipped, the remaining rows land at y=0..4, and nothing scrolls into
-        // the scrollback buffer.
+    fn reset_inline_viewport_starts_full_replay_from_origin() {
         let mut backend = TestBackend::with_lines([
-            "old-0     ",
-            "old-1     ",
-            "old-2     ",
-            "old-3     ",
+            "shell-----",
+            "history---",
+            "old-0-----",
+            "old-1-----",
             "viewport-a",
             "viewport-b",
         ]);
@@ -564,35 +527,22 @@ mod tests {
             },
         )
         .unwrap();
-        let scrollback_before = terminal.backend().scrollback().clone();
-        let viewport_before = terminal.get_frame().area();
-        let tracked_cursor_before = terminal.last_known_cursor_pos;
-
-        let overwritten = terminal
-            .overwrite_before(5, |buf| {
-                let rows = ["skipped", "new-0", "new-1", "new-2", "new-3"];
-                for (y, text) in rows.into_iter().enumerate() {
-                    buf.set_string(0, y as u16, text, Style::default());
+        terminal
+            .insert_before(8, |buf| {
+                for y in 0..8 {
+                    buf.set_string(0, y, format!("row-{y}"), Style::default());
                 }
             })
             .unwrap();
+        assert!(terminal.backend().scrollback().area.height > 0);
 
-        assert_eq!(overwritten, 4);
-        assert_eq!(terminal.get_frame().area(), viewport_before);
-        assert_eq!(terminal.last_known_cursor_pos, tracked_cursor_before);
-        terminal.backend().assert_buffer_lines([
-            "new-0     ",
-            "new-1     ",
-            "new-2     ",
-            "new-3     ",
-            "viewport-a",
-            "viewport-b",
-        ]);
-        assert_eq!(
-            terminal.backend().cursor_position(),
-            terminal.viewport_area.as_position()
-        );
-        assert_eq!(*terminal.backend().scrollback(), scrollback_before);
+        terminal.backend_mut().purge_scrollback();
+        terminal.reset_inline_viewport().unwrap();
+
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 10, 2));
+        assert_eq!(terminal.backend().scrollback().area.height, 0);
+        terminal.backend().assert_buffer_lines(["          "; 6]);
+        assert_eq!(terminal.backend().cursor_position(), Position::ORIGIN);
     }
 
     #[cfg(not(feature = "scrolling-regions"))]

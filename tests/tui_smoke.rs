@@ -91,6 +91,7 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
     pty.pump_for(&mut child, Duration::from_millis(160))
         .expect("settle populated transcript");
     let before_resize = pty.terminal_io_counts();
+    let before_resize_capture = pty.capture.len();
 
     let resize_burst = [
         (100, 32),
@@ -115,9 +116,17 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
         narrow_resize.dsr_queries <= resize_burst.len().saturating_add(1),
         "resize burst issued more than one cursor query per OS resize: {narrow_resize:?}"
     );
+    assert!(
+        narrow_resize.clear_all > 0 && narrow_resize.clear_all <= resize_burst.len(),
+        "resize burst must rebuild at least once and at most once per effective width: {narrow_resize:?}"
+    );
     assert_eq!(
-        narrow_resize.clear_all, 0,
-        "narrow resize cleared the whole inline screen: {narrow_resize:?}"
+        narrow_resize.purge_scrollback, narrow_resize.clear_all,
+        "every full replay must pair one scrollback purge with one display clear: {narrow_resize:?}"
+    );
+    assert_resize_resets_clear_before_purge_and_replay_one_banner(
+        &pty.capture[before_resize_capture..],
+        narrow_resize.clear_all,
     );
     let rendered_row_budget = TRANSCRIPT_BLOCKS
         .saturating_mul(ROWS_PER_SUBMITTED_COMMAND)
@@ -125,16 +134,17 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
         .saturating_add(BANNER_ROW_BUDGET);
     let narrow_clear_bound = resize_clear_after_bound(
         rendered_row_budget,
-        2,
+        resize_burst.len(),
         usize::from(TUI_NARROW_ROWS),
         resize_burst.len(),
     );
     assert!(
         narrow_resize.clear_after_cursor <= narrow_clear_bound,
-        "narrow resize exceeded its two-replay, terminal-height chunk bound ({narrow_clear_bound}): {narrow_resize:?}"
+        "narrow resize exceeded its per-width, terminal-height chunk bound ({narrow_clear_bound}): {narrow_resize:?}"
     );
 
     let before_wide = pty.terminal_io_counts();
+    let before_wide_capture = pty.capture.len();
     pty.resize(&child, TUI_WIDE_COLS, TUI_WIDE_ROWS)
         .expect("resize wide");
     pty.pump_for(&mut child, Duration::from_millis(500))
@@ -146,8 +156,16 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
         "wide resize issued transcript-proportional cursor queries: {wide_resize:?}"
     );
     assert_eq!(
-        wide_resize.clear_all, 0,
-        "wide resize cleared the whole inline screen: {wide_resize:?}"
+        wide_resize.clear_all, 1,
+        "one effective wide resize must clear the visible display once before full replay: {wide_resize:?}"
+    );
+    assert_eq!(
+        wide_resize.purge_scrollback, wide_resize.clear_all,
+        "the wide replay must pair its scrollback purge and display clear: {wide_resize:?}"
+    );
+    assert_resize_resets_clear_before_purge_and_replay_one_banner(
+        &pty.capture[before_wide_capture..],
+        wide_resize.clear_all,
     );
     let wide_clear_bound =
         resize_clear_after_bound(rendered_row_budget, 1, usize::from(TUI_WIDE_ROWS), 1);
@@ -497,15 +515,58 @@ fn assert_no_crash_text(visible: &str) {
     }
 }
 
+fn byte_offsets(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == needle).then_some(index))
+        .collect()
+}
+
+fn assert_resize_resets_clear_before_purge_and_replay_one_banner(
+    capture: &[u8],
+    expected_resets: usize,
+) {
+    let clears = byte_offsets(capture, b"\x1b[2J");
+    let purges = byte_offsets(capture, b"\x1b[3J");
+    assert_eq!(clears.len(), expected_resets, "unexpected display clears");
+    assert_eq!(
+        purges.len(),
+        expected_resets,
+        "unexpected scrollback purges"
+    );
+
+    for index in 0..expected_resets {
+        assert!(
+            clears[index] < purges[index] && (index == 0 || purges[index - 1] < clears[index]),
+            "reset {index} did not clear the visible display before purging scrollback"
+        );
+        let segment_end = clears.get(index + 1).copied().unwrap_or(capture.len());
+        let replay = strip_ansi(&String::from_utf8_lossy(
+            &capture[purges[index] + b"\x1b[3J".len()..segment_end],
+        ));
+        assert_eq!(
+            replay.matches("◆ Dext  v").count(),
+            1,
+            "reset {index} did not replay exactly one Dext intro: {replay:?}"
+        );
+    }
+}
+
 fn resize_clear_after_bound(
     rendered_row_budget: usize,
-    replay_count: usize,
+    max_replay_count: usize,
     chunk_rows: usize,
     resize_events: usize,
 ) -> usize {
-    let chunks_per_replay = rendered_row_budget.div_ceil(chunk_rows.max(1));
-    replay_count
-        .saturating_mul(chunks_per_replay.saturating_add(1))
+    let item_boundary_chunks = rendered_row_budget
+        .div_ceil(chunk_rows.max(1))
+        .saturating_add(1);
+    max_replay_count
+        .saturating_mul(item_boundary_chunks.saturating_add(1))
         .saturating_add(resize_events)
 }
 
@@ -513,6 +574,7 @@ fn resize_clear_after_bound(
 struct TerminalIoCounts {
     dsr_queries: usize,
     clear_all: usize,
+    purge_scrollback: usize,
     clear_after_cursor: usize,
     clear_current_line: usize,
 }
@@ -524,6 +586,9 @@ impl std::ops::Sub for TerminalIoCounts {
         Self {
             dsr_queries: self.dsr_queries.saturating_sub(earlier.dsr_queries),
             clear_all: self.clear_all.saturating_sub(earlier.clear_all),
+            purge_scrollback: self
+                .purge_scrollback
+                .saturating_sub(earlier.purge_scrollback),
             clear_after_cursor: self
                 .clear_after_cursor
                 .saturating_sub(earlier.clear_after_cursor),
@@ -667,6 +732,7 @@ impl Pty {
         TerminalIoCounts {
             dsr_queries: self.dsr_queries,
             clear_all: count_bytes(&self.capture, b"\x1b[2J"),
+            purge_scrollback: count_bytes(&self.capture, b"\x1b[3J"),
             clear_after_cursor: count_bytes(&self.capture, b"\x1b[J")
                 + count_bytes(&self.capture, b"\x1b[0J"),
             clear_current_line: count_bytes(&self.capture, b"\x1b[2K"),

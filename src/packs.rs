@@ -472,9 +472,17 @@ pub(crate) fn render_pack_listing(root: &Path) -> String {
 }
 
 pub(crate) fn render_pack_listing_opts(root: &Path, verbose: bool) -> String {
+    render_pack_listing_opts_width(root, verbose, None)
+}
+
+pub(crate) fn render_pack_listing_opts_width(
+    root: &Path,
+    verbose: bool,
+    width: Option<usize>,
+) -> String {
     render_pack_list(
         &discover_packs(root),
-        &list_render::ListOptions::detect(verbose),
+        &list_render::ListOptions::detect_with_width(verbose, width),
         root,
     )
 }

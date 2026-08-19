@@ -132,7 +132,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `vendor/ratatui-core/`
   - Exact upstream `ratatui-core 0.1.2` source selected through `[patch.crates-io]`.
-  - Narrow inline-terminal fixes that avoid synchronous cursor-query stalls and whole-display clears during resize.
+  - Narrow inline-terminal fixes that avoid synchronous cursor-query stalls and extra whole-display clears before Dext's owned resize replay, plus an origin-reset primitive that clears the visible display before stale-width scrollback is purged so complete transcript reconstruction replays the intro exactly once.
   - Hunk rationale and refresh instructions in `vendor/ratatui-core/DEXT_PATCH.md`.
 
 ## Tool model
@@ -279,6 +279,6 @@ cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture
 ```
 
-The TUI smoke suite launches the real compiled binary inside a pseudo-terminal. In addition to launch/help/exit coverage, it checks narrow and wide layouts, multiline input, live-stream input, resize survival, bounded cursor queries, zero whole-screen resize clears, and completed output after resize. Renderer changes also follow the live-terminal checks in [`TUI.md`](TUI.md).
+The TUI smoke suite launches the real compiled binary inside a pseudo-terminal. In addition to launch/help/exit coverage, it checks narrow and wide layouts, multiline input, live-stream input, resize survival, bounded cursor queries, a visible-display clear before each paired scrollback purge, exactly one Dext intro per replay segment, terminal-height-bounded complete replay, and completed output after resize. Renderer changes also follow the live-terminal checks in [`TUI.md`](TUI.md).
 
 On Windows CI and release builders, the scheduler-sensitive `fast_bash_command_returns_without_100ms_poll_tail` regression runs alone after the remaining release tests. Its original `<90 ms` assertion remains unchanged; isolation prevents unrelated suite load from obscuring the process-wait regression it measures. The external-runner stdin-backpressure regression still requires bounded completion under the shared deadline, but accepts either the stdin-write or root-process timeout phase on Windows because pipe buffering can make the full write complete at the deadline boundary; Unix continues to require the stdin-write phase. The tool-call mock provider consumes its bounded `Content-Length` request body before responding so Windows does not reset the connection with unread request data.

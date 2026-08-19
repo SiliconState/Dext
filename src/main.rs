@@ -1564,6 +1564,12 @@ impl OutputMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashPresentation {
+    Faded,
+    Structured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlashUiUpdate {
     None,
     ModelProvider,
@@ -1761,7 +1767,7 @@ impl EventSink for ConsoleSink {
             AgentEvent::Info(s) => println!("{s}"),
             AgentEvent::Warn(s) => eprintln!("{s}"),
             AgentEvent::Error(s) => eprintln!("{s}"),
-            AgentEvent::Slash(s) => println!("{s}"),
+            AgentEvent::Slash(s) | AgentEvent::StructuredSlash(s) => println!("{s}"),
             AgentEvent::TurnEnd { usage, .. } => {
                 println!(
                     "{}",
@@ -11107,7 +11113,7 @@ struct ToolsCommandResult {
 fn render_tools_status(agent: &Agent) -> String {
     use std::fmt::Write as _;
 
-    let opts = list_render::ListOptions::detect(false);
+    let opts = list_render::ListOptions::detect_with_width(false, agent.slash_render_width);
     let header = agent.session_header();
     let mut out = String::new();
     let _ = write!(
@@ -11192,7 +11198,7 @@ fn render_tools_status(agent: &Agent) -> String {
 fn render_system_prompt_view(agent: &Agent) -> String {
     use std::fmt::Write as _;
 
-    let opts = list_render::ListOptions::detect(false);
+    let opts = list_render::ListOptions::detect_with_width(false, agent.slash_render_width);
     let details = agent.compose_system_details();
     let composed = format!("{}\n\n{}", details.stable, details.env);
     let mut out = String::new();
@@ -11274,12 +11280,12 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "/approval [profile]",
-                "ask|auto-read|auto-write|never|always",
+                "ask · auto-read · auto-write · never · always",
             ),
             ("/preview [mode]", "off|simple|git mutation previews"),
             (
                 "/sandbox-profile [profile]",
-                "read-only|workspace-write|danger-full-access",
+                "read-only · workspace-write · danger-full-access",
             ),
             ("/budget [cap|off]", "show/set budget cap ($ or tokens)"),
         ],
@@ -11328,11 +11334,11 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
         &[
             (
                 "/effort [level]",
-                "model reasoning depth/tool persistence: off|minimal|low|medium|high|xhigh|max",
+                "model reasoning depth/tool persistence: off · minimal · low · medium · high · xhigh · max",
             ),
             (
                 "/reasoning-mode [mode]",
-                "standard|pro (official OpenAI GPT-5.6 Responses only)",
+                "standard · pro (official OpenAI GPT-5.6 Responses only)",
             ),
             (
                 "/context [standard|frugal]",
@@ -11372,7 +11378,7 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "/sessions",
-                "list sessions; also analyze|brief|grep|failures|verify-log|decisions",
+                "list sessions; also analyze · brief · grep · failures · verify-log · decisions",
             ),
             ("/session", "alias for /sessions"),
             ("/hooks [reload]", "show hook config or reload from disk"),
@@ -11385,10 +11391,10 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-fn render_help_listing() -> String {
+fn render_help_listing(width: Option<usize>) -> String {
     use std::fmt::Write as _;
 
-    let opts = list_render::ListOptions::detect(false);
+    let opts = list_render::ListOptions::detect_with_width(false, width);
     let total: usize = HELP_GROUPS.iter().map(|(_, entries)| entries.len()).sum();
     let mut out = String::new();
     let _ = write!(
@@ -11398,9 +11404,8 @@ fn render_help_listing() -> String {
     );
     for (group, entries) in HELP_GROUPS {
         out.push_str(&list_render::render_section_header(group, &opts));
-        for (cmd, desc) in *entries {
-            out.push_str(&list_render::render_entry(cmd, desc, &[], &opts));
-        }
+        out.push_str(&list_render::render_entry_rows(entries, &opts));
+        out.push('\n');
     }
     let _ = write!(
         out,
@@ -13402,6 +13407,7 @@ struct Agent {
     git_context: Option<String>,
     silent: bool,
     pretty: bool,
+    slash_render_width: Option<usize>,
     max_iterations: Option<u32>,
     session_usage: Usage,
     // Usage of the most recent provider request. This is the context-pressure
@@ -13621,6 +13627,7 @@ impl Agent {
             git_context,
             silent: false,
             pretty,
+            slash_render_width: None,
             max_iterations: None,
             session_usage: Usage::default(),
             last_request_usage: Usage::default(),
@@ -19073,8 +19080,12 @@ fn render_session_entry(
 }
 
 fn render_session_listing(root: &Path) -> String {
+    render_session_listing_width(root, None)
+}
+
+fn render_session_listing_width(root: &Path, width: Option<usize>) -> String {
     use std::fmt::Write as _;
-    let opts = list_render::ListOptions::detect(false);
+    let opts = list_render::ListOptions::detect_with_width(false, width);
 
     let latest_path = latest_session_path(root);
     let sessions_root = named_sessions_dir_for_root(root);
@@ -19109,7 +19120,7 @@ fn render_session_listing(root: &Path) -> String {
         list_render::render_header("Sessions", total, &opts)
     );
 
-    let _ = writeln!(out, "{}", list_render::bold("Latest", opts.color));
+    out.push_str(&list_render::render_section_header("Latest", &opts));
     if latest_exists {
         let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
         out.push_str(&render_session_entry(
@@ -19120,42 +19131,58 @@ fn render_session_listing(root: &Path) -> String {
             root,
         ));
     } else {
-        let _ = writeln!(
-            out,
-            "    (none yet; send a message to create {})",
-            list_render::display_path(&latest_path, &opts, root)
+        list_render::write_wrapped(
+            &mut out,
+            &format!(
+                "(none yet; send a message to create {})",
+                list_render::display_path(&latest_path, &opts, root)
+            ),
+            4,
+            opts.effective_width(),
         );
     }
     out.push('\n');
 
-    let _ = writeln!(out, "{}", list_render::bold("Autosaved", opts.color));
+    out.push_str(&list_render::render_section_header("Autosaved", &opts));
     if autosaved_sessions.is_empty() {
-        let _ = writeln!(
-            out,
-            "    (none in {})",
-            list_render::display_path(&sessions_root, &opts, root)
+        list_render::write_wrapped(
+            &mut out,
+            &format!(
+                "(none in {})",
+                list_render::display_path(&sessions_root, &opts, root)
+            ),
+            4,
+            opts.effective_width(),
         );
     } else {
         for (name, path, modified) in autosaved_sessions.iter().take(SLASH_LIST_LIMIT) {
             out.push_str(&render_session_entry(path, name, *modified, &opts, root));
         }
         if autosaved_sessions.len() > SLASH_LIST_LIMIT {
-            let _ = writeln!(
-                out,
-                "  … [{} more session dirs omitted]",
-                autosaved_sessions.len() - SLASH_LIST_LIMIT
+            list_render::write_wrapped(
+                &mut out,
+                &format!(
+                    "… [{} more session dirs omitted]",
+                    autosaved_sessions.len() - SLASH_LIST_LIMIT
+                ),
+                2,
+                opts.effective_width(),
             );
         }
     }
     out.push('\n');
 
-    let _ = writeln!(out, "{}", list_render::bold("Named", opts.color));
+    out.push_str(&list_render::render_section_header("Named", &opts));
     match &named_records {
         Ok(records) if records.is_empty() => {
-            let _ = writeln!(
-                out,
-                "    (none in {}; use /save <name>)",
-                list_render::display_path(&named_sessions_dir_for_root(root), &opts, root)
+            list_render::write_wrapped(
+                &mut out,
+                &format!(
+                    "(none in {}; use /save <name>)",
+                    list_render::display_path(&named_sessions_dir_for_root(root), &opts, root)
+                ),
+                4,
+                opts.effective_width(),
             );
         }
         Ok(records) => {
@@ -19169,15 +19196,24 @@ fn render_session_listing(root: &Path) -> String {
                 ));
             }
             if records.len() > SLASH_LIST_LIMIT {
-                let _ = writeln!(
-                    out,
-                    "  … [{} more named sessions omitted]",
-                    records.len() - SLASH_LIST_LIMIT
+                list_render::write_wrapped(
+                    &mut out,
+                    &format!(
+                        "… [{} more named sessions omitted]",
+                        records.len() - SLASH_LIST_LIMIT
+                    ),
+                    2,
+                    opts.effective_width(),
                 );
             }
         }
         Err(e) => {
-            let _ = writeln!(out, "  [err] {e:#}");
+            list_render::write_wrapped(
+                &mut out,
+                &format!("[err] {e:#}"),
+                2,
+                opts.effective_width(),
+            );
         }
     }
 
@@ -21137,6 +21173,7 @@ fn diagnostics_approved(agent: &mut Agent) -> bool {
 fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
     use std::fmt::Write as _;
     let mut ui_update = SlashUiUpdate::None;
+    let mut presentation = SlashPresentation::Faded;
     let line = line.trim();
     if !is_slash_command(line) {
         return None;
@@ -21171,15 +21208,21 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             } else {
                 match sub {
                     "" | "list" | "ls" => {
+                        presentation = SlashPresentation::Structured;
                         let (_, inline_verbose) = list_render::take_verbose(pack_arg);
                         let verbose = leading_verbose || inline_verbose;
                         let _ = write!(
                             w,
                             "{}",
-                            packs::render_pack_listing_opts(&agent.sandbox_root, verbose)
+                            packs::render_pack_listing_opts_width(
+                                &agent.sandbox_root,
+                                verbose,
+                                agent.slash_render_width,
+                            )
                         );
                     }
                     "inspect" | "info" | "show" => {
+                        presentation = SlashPresentation::Structured;
                         let selector = parts.next().unwrap_or("").trim();
                         if selector.is_empty() {
                             let _ = writeln!(w, "usage: /pack inspect <name>");
@@ -21236,14 +21279,19 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
         }
         "shelf" | "shelves" => {
+            presentation = SlashPresentation::Structured;
             let _ = write!(
                 w,
                 "{}",
-                shelves::render_registry_listing(&agent.shelf_registry)
+                shelves::render_registry_listing_width(
+                    &agent.shelf_registry,
+                    agent.slash_render_width,
+                )
             );
         }
         "help" | "?" => {
-            let _ = writeln!(w, "{}", render_help_listing());
+            presentation = SlashPresentation::Structured;
+            let _ = writeln!(w, "{}", render_help_listing(agent.slash_render_width));
         }
         "version" => {
             let _ = writeln!(w, "dext {}", env!("CARGO_PKG_VERSION"));
@@ -21278,6 +21326,12 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             let _ = writeln!(w, "cleared {n} messages");
         }
         "tools" => {
+            if matches!(
+                arg.to_ascii_lowercase().as_str(),
+                "" | "status" | "list" | "ls"
+            ) {
+                presentation = SlashPresentation::Structured;
+            }
             let result = handle_tools_command(agent, arg);
             let _ = writeln!(w, "{}", result.output);
         }
@@ -21303,6 +21357,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         }
         "system" => {
             if arg.is_empty() {
+                presentation = SlashPresentation::Structured;
                 let _ = writeln!(w, "{}", render_system_prompt_view(agent));
             } else {
                 agent.system = arg.to_string();
@@ -21566,19 +21621,22 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 let _ = writeln!(w, "[err] {e:#}");
             }
         },
-        "providers" => match (load_provider_catalog(), load_auth_store()) {
-            (Ok(catalog), Ok(store)) => {
-                let active = resolve_active_provider_id(&catalog);
-                let _ = writeln!(w, "active provider: {active}");
-                let _ = writeln!(w, "{}", render_provider_list(&catalog, &store, &active));
-                let _ = writeln!(w, "provider catalog: {}", provider_catalog_path().display());
-                let _ = writeln!(w, "auth store: {}", auth_store_path().display());
-                let _ = writeln!(w, "runtime: {}", agent.provider_status_line());
+        "providers" => {
+            presentation = SlashPresentation::Structured;
+            match (load_provider_catalog(), load_auth_store()) {
+                (Ok(catalog), Ok(store)) => {
+                    let active = resolve_active_provider_id(&catalog);
+                    let _ = writeln!(w, "active provider: {active}");
+                    let _ = writeln!(w, "{}", render_provider_list(&catalog, &store, &active));
+                    let _ = writeln!(w, "provider catalog: {}", provider_catalog_path().display());
+                    let _ = writeln!(w, "auth store: {}", auth_store_path().display());
+                    let _ = writeln!(w, "runtime: {}", agent.provider_status_line());
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    let _ = writeln!(w, "[err] {e:#}");
+                }
             }
-            (Err(e), _) | (_, Err(e)) => {
-                let _ = writeln!(w, "[err] {e:#}");
-            }
-        },
+        }
         "provider" => {
             if arg.is_empty() {
                 let _ = writeln!(w, "{}", agent.provider_status_line());
@@ -21606,27 +21664,32 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                 }
             }
         }
-        "models" => match (load_provider_catalog(), load_auth_store()) {
-            (Ok(catalog), Ok(store)) => {
-                let active = resolve_active_provider_id(&catalog);
-                let list = match arg {
-                    "" | "all" => list_models_for_available_providers(&catalog, &store, &active),
-                    _ => provider_id_from_selector(&catalog, arg)
-                        .and_then(|target| list_models_for_provider(&catalog, &target)),
-                };
-                match list {
-                    Ok(list) => {
-                        let _ = writeln!(w, "{list}");
-                    }
-                    Err(e) => {
-                        let _ = writeln!(w, "[err] {e:#}");
+        "models" => {
+            presentation = SlashPresentation::Structured;
+            match (load_provider_catalog(), load_auth_store()) {
+                (Ok(catalog), Ok(store)) => {
+                    let active = resolve_active_provider_id(&catalog);
+                    let list = match arg {
+                        "" | "all" => {
+                            list_models_for_available_providers(&catalog, &store, &active)
+                        }
+                        _ => provider_id_from_selector(&catalog, arg)
+                            .and_then(|target| list_models_for_provider(&catalog, &target)),
+                    };
+                    match list {
+                        Ok(list) => {
+                            let _ = writeln!(w, "{list}");
+                        }
+                        Err(e) => {
+                            let _ = writeln!(w, "[err] {e:#}");
+                        }
                     }
                 }
+                (Err(e), _) | (_, Err(e)) => {
+                    let _ = writeln!(w, "[err] {e:#}");
+                }
             }
-            (Err(e), _) | (_, Err(e)) => {
-                let _ = writeln!(w, "[err] {e:#}");
-            }
-        },
+        }
         "login" => {
             if arg.eq_ignore_ascii_case("cancel") {
                 let cancelled_oauth = cancel_pending_oauth_login();
@@ -21638,6 +21701,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     let _ = writeln!(w, "no login is waiting for credentials");
                 }
             } else if arg.is_empty() {
+                presentation = SlashPresentation::Structured;
                 match (load_provider_catalog(), load_auth_store()) {
                     (Ok(catalog), Ok(store)) => {
                         let active = resolve_active_provider_id(&catalog);
@@ -22062,12 +22126,17 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
             }
         }
         "sessions" | "session" => {
+            presentation = SlashPresentation::Structured;
             let mut parts = arg.splitn(2, char::is_whitespace);
             let sub = parts.next().unwrap_or("");
             let rest = parts.next().unwrap_or("").trim();
             match sub {
                 "" | "list" => {
-                    let _ = write!(w, "{}", render_session_listing(&agent.sandbox_root));
+                    let _ = write!(
+                        w,
+                        "{}",
+                        render_session_listing_width(&agent.sandbox_root, agent.slash_render_width,)
+                    );
                 }
                 "analyze" | "analysis" => {
                     let selector = if rest.is_empty() { "latest" } else { rest };
@@ -22298,7 +22367,10 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         if out.ends_with('\n') {
             out.pop();
         }
-        agent.sink.emit(AgentEvent::Slash(out));
+        match presentation {
+            SlashPresentation::Faded => agent.sink.emit(AgentEvent::Slash(out)),
+            SlashPresentation::Structured => agent.sink.emit(AgentEvent::StructuredSlash(out)),
+        }
     }
     match ui_update {
         SlashUiUpdate::None => {}
