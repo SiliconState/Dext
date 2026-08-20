@@ -45,9 +45,10 @@
 - Upgraded the terminal stack to exact Ratatui 0.30.2, ratatui-core 0.1.2,
   tui-markdown 0.3.8, Crossterm 0.29.0, and unicode-width 0.2.2 versions.
   Dext carries a narrow exact-source ratatui-core compatibility patch for its
-  inline viewport; the real-PTY suite now gates streaming input, populated
-  resize bursts, whole-screen clears, cursor-query counts, replay bounds, and a
-  bounded completion wait that tolerates slower macOS CI hosts.
+  inline viewport; the real-PTY suite now starts each child with a controlling
+  terminal and gates streaming input, populated resize bursts, whole-screen
+  clears, cursor-query counts, replay bounds, and a bounded completion wait
+  that tolerates slower macOS CI hosts.
 - macOS Seatbelt profiles now allow both canonical `/private/...` scratch paths
   and their standard `/var` or `/tmp` aliases, keeping temp APIs confined and
   usable.
@@ -61,6 +62,18 @@
   shelf-only. Packs now live exclusively at `<shelf>/packs/<name>` under
   project, user, or `DEXT_SHELVES_DIR` roots; direct pack roots and
   `DEXT_PACKS_DIR` are no longer discovery inputs.
+
+- Replaced `/plan` with conversational planning turn policies. The objective
+  tracker now classifies planning/analysis-only prompts (including explicit
+  “don’t change anything” phrasing) and bare plan approvals (“go”, “proceed
+  with the plan”); Dext injects a matching advisory-only or
+  implementation-authorized turn policy into the volatile runtime status —
+  never the cached stable prompt — so weaker models get deterministic per-turn
+  structure without hard tool gating. Explicit mutation intent always
+  overrides advisory phrasing, question-phrased prompts are never read as
+  approvals, and mid-turn queued user updates re-evaluate the policy;
+  approval prompts and `/sandbox-profile read-only` remain the enforcement
+  layers.
 
 ### Removed
 
@@ -89,8 +102,13 @@
 - Removed the subagent feature completely: `/subagent` slash command,
   `subagent-runtime` CLI subcommand, detached/inline runners, steering,
   quality gates, TUI state, session artifacts dir, and all associated
-  tests/fixtures. `/plan` preserved via a direct read-only planner.
-  Net -1544 lines.
+  tests/fixtures. Net -1544 lines.
+- Removed the unused `/plan` slash command and its hidden read-only planner turn,
+  temporary agent-state swapping, duplicated CLI/TUI dispatch, completion entry,
+  welcome tip, and planner-only regression test. Planning is now an ordinary
+  conversation: ask Dext to inspect and propose a plan without editing, revise
+  it in context, then tell it to proceed. A former `/plan ...` input is no
+  longer intercepted and is delivered as a normal prompt.
 - Removed all repository-owned and embedded pack payloads. Dext ships the pack
   lifecycle and shelf integration, but no pack content; users own and
   distribute shelf repositories separately.

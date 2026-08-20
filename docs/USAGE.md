@@ -138,6 +138,8 @@ The OAuth-backed `chatgpt` provider remains on the Codex Responses contract. Its
 
 Built-in input/cached-input/output prices per million tokens are Sol `$5/$0.50/$30`, Terra `$2.50/$0.25/$15`, and Luna `$1/$0.10/$6`; above 272,000 input tokens, Dext applies the documented 2× input/cache and 1.5× output tier unless explicit pricing overrides are set.
 
+The built-in Anthropic catalog enables adaptive thinking for Sonnet 4.6, Sonnet 5, Opus 4.6/4.7/4.8, Opus 5, and Fable 5. These requests carry the selected output effort and omit `thinking.display`, allowing the provider stream to include thinking deltas. The transformed official OAuth request and the API-key request retain the same adaptive fields. `xhigh` effort maps natively on Sonnet 5, Opus 4.7/4.8, Opus 5, and Fable 5; `max` additionally covers Sonnet 4.6 and Opus 4.6; unsupported extended levels downgrade to `high`. Sonnet 5, Opus 5, and Fable 5 declare 1,000,000-token context windows; other Claude models keep the 200K fallback. Built-in input/cache-read/output prices per million tokens are Sonnet 5 `$2/$0.20/$10`, Opus 4.5–4.8 and Opus 5 `$5/$0.50/$25`, earlier Sonnet `$3/$0.30/$15`, Fable 5 `$10/$1/$50`, and Opus 4.1-and-earlier `$15/$1.50/$75`; Anthropic documents standard per-token rates across the full 1M window for these models, so no long-context tier applies. TUI visibility remains a presentation choice: verbose display shows thinking, `stream-json` emits thinking events, and console text/final JSON omit thinking content.
+
 The built-in Kimi Code catalog uses Anthropic Messages semantics at `https://api.kimi.com/coding`, defaults to K3, and reports zero incremental token cost because access is covered by the coding plan. Verified K3 metadata enables adaptive thinking with `max` effort and preserves empty thinking signatures required by that model; these compatibility rules do not apply to generic/custom Anthropic profiles.
 
 ## Local Qwen / llama.cpp
@@ -172,6 +174,8 @@ Start Dext:
 ```bash
 dext
 ```
+
+Planning is conversational, not a mode. Ask for a plan (“plan the refactor”, “review this for bugs, don’t change anything”) and Dext applies an advisory-only turn policy: read-only tools and a structured Goal/Findings/Steps/Risks answer. Revise the plan in the same thread, then approve it (“go”, “proceed with the plan”) and Dext converts the agreed steps into todos and executes them. The policy steers the model; approval prompts and `/sandbox-profile read-only` remain the hard enforcement layers.
 
 Useful slash commands:
 

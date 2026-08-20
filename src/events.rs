@@ -119,6 +119,7 @@ pub(crate) enum AgentEvent {
     Warn(String),
     Error(String),
     Slash(String),
+    StructuredSlash(String),
     TurnEnd {
         usage: Usage,
         failed: bool,

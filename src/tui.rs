@@ -4,7 +4,10 @@ use crossterm::event::{
     KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode};
+use crossterm::terminal::{
+    BeginSynchronizedUpdate, Clear as CrosstermClear, ClearType as CrosstermClearType,
+    EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode,
+};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -149,8 +152,6 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 const LIVE_BACKEND_RING_CAP: usize = 256_000;
 const LIVE_BACKEND_MAX_TOOLS: usize = 8;
 const LIVE_OUTPUT_DRAIN_BATCH: usize = 32;
-const RESIZE_REPLAY_QUIET: Duration = Duration::from_millis(120);
-const RESIZE_REPLAY_MAX_LATENCY: Duration = Duration::from_millis(360);
 const WELCOME_RIGHT_MIN_WIDTH: usize = 80;
 const WELCOME_LABEL_GUTTER: usize = 14;
 const TIPS: &[&str] = &[
@@ -161,7 +162,6 @@ const TIPS: &[&str] = &[
     "Ctrl+O expands or collapses the latest tool output.",
     "Ctrl+B opens captured bash output after a command starts.",
     "Shift+Enter or Alt+Enter inserts a newline.",
-    "Use /plan <task> to run the read-only planner.",
 ];
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -213,6 +213,8 @@ impl PermissionTier {
 struct PendingPermission {
     tool: String,
     audit_label: String,
+    command: String,
+    risk: crate::tool_policy::CommandRisk,
     tier: PermissionTier,
     responder: std::sync::mpsc::SyncSender<Choice>,
 }
@@ -261,12 +263,6 @@ enum Line_ {
         density_rank: usize,
         expanded: bool,
     },
-    PermissionPrompt {
-        tool: String,
-        command: String,
-        tier: PermissionTier,
-        risk: crate::tool_policy::CommandRisk,
-    },
     PermissionResult {
         command: String,
         approved: bool,
@@ -277,6 +273,7 @@ enum Line_ {
         message: String,
     },
     Info(String),
+    Slash(String),
     RuntimeView {
         pack: String,
         title: String,
@@ -311,7 +308,7 @@ enum ToTui {
 }
 
 enum FromTui {
-    Submit(String),
+    Submit { text: String, pane_width: u16 },
     LoginInput(String),
     LoginCancel,
     CycleEffort(i8),
@@ -594,11 +591,6 @@ static SLASH_COMMANDS: &[SlashCmd] = &[
         help: "alias for /sessions",
     },
     SlashCmd {
-        name: "/plan",
-        args: "<task>",
-        help: "run read-only planner",
-    },
-    SlashCmd {
         name: "/pack",
         args: "[list|inspect|run|create]",
         help: "create/discover/invoke shelf packs",
@@ -680,10 +672,12 @@ fn provider_arg_completions(cmd: &str, arg_part: &str) -> Vec<SlashCompletion> {
             text: format!("/{cmd} {}", profile.id),
             hint: hint.clone(),
         });
-        out.push(SlashCompletion {
-            text: format!("/{cmd} {}", index),
-            hint,
-        });
+        if cmd != "login" {
+            out.push(SlashCompletion {
+                text: format!("/{cmd} {}", index),
+                hint,
+            });
+        }
     }
 
     out
@@ -895,6 +889,7 @@ struct TranscriptLayoutState {
 
 struct TuiState {
     pending_insert: Vec<Line_>,
+    prepared_insert_retry: Vec<Line_>,
     transcript: Vec<Line_>,
     render_cache: HashMap<u64, CachedTranscriptRender>,
     render_cache_weight: usize,
@@ -1024,6 +1019,7 @@ impl TuiState {
     ) -> Self {
         Self {
             pending_insert: Vec::new(),
+            prepared_insert_retry: Vec::new(),
             transcript: Vec::new(),
             render_cache: HashMap::new(),
             render_cache_weight: 0,
@@ -1494,6 +1490,7 @@ impl TuiState {
     fn last_line_needs_history_spacing(&self) -> bool {
         self.pending_insert
             .last()
+            .or_else(|| self.prepared_insert_retry.last())
             .or_else(|| self.transcript.last())
             .is_some_and(|line| {
                 Self::line_needs_history_spacing(line)
@@ -1787,6 +1784,24 @@ impl TuiState {
 
     fn pseudo_tool_display_text(&self, text: &str) -> String {
         pseudo_tool_protocol_text_for_context(text, self.context_mode)
+    }
+
+    fn apply_slash_output(&mut self, output: String, structured: bool) {
+        self.push_debug_event(format!("slash/system · {}", sanitize_display_text(&output)));
+        self.compacting = false;
+        self.compacting_resume_busy = false;
+        self.streaming_text.clear();
+        self.streaming_thinking.clear();
+        self.stream_started_at = None;
+        self.stream_chars = 0;
+        self.live_tools.clear();
+        self.set_agent_busy(false);
+        self.status = phase_status_text(&output).unwrap_or_else(|| "ready".into());
+        if structured {
+            self.queue(Line_::Slash(output));
+        } else {
+            self.queue(Line_::Info(output));
+        }
     }
 
     fn apply_event(&mut self, ev: AgentEvent) {
@@ -2208,19 +2223,8 @@ impl TuiState {
                 self.push_debug_event(format!("error · {}", sanitize_display_text(&s)));
                 self.queue(Line_::Error(s));
             }
-            AgentEvent::Slash(s) => {
-                self.push_debug_event(format!("slash/system · {}", sanitize_display_text(&s)));
-                self.compacting = false;
-                self.compacting_resume_busy = false;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
-                self.stream_started_at = None;
-                self.stream_chars = 0;
-                self.live_tools.clear();
-                self.set_agent_busy(false);
-                self.status = phase_status_text(&s).unwrap_or_else(|| "ready".into());
-                self.queue(Line_::Info(s));
-            }
+            AgentEvent::Slash(s) => self.apply_slash_output(s, false),
+            AgentEvent::StructuredSlash(s) => self.apply_slash_output(s, true),
             AgentEvent::TurnEnd { failed, .. } => {
                 self.push_debug_event(if failed {
                     "turn end · failed"
@@ -3221,21 +3225,14 @@ fn permission_prompt_text(
     let tier = PermissionTier::from_risk(risk);
     let accent = tier.accent();
     let prefix_style = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-    let body_width = width.saturating_sub(2).max(1) as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut push_line = |body: String, style: Style| {
-        let first_prefix = "▌ ".to_string();
-        let cont_prefix = "▌ ".to_string();
-        let text_width = body_width.saturating_sub(first_prefix.len()).max(1);
+        let prefix = if width >= 3 { "▌ " } else { "" };
+        let text_width = usize::from(width).saturating_sub(text_width(prefix)).max(1);
         let wrapped = wrap_plain_visual(&body, text_width);
-        for (idx, row) in wrapped.into_iter().enumerate() {
-            let prefix = if idx == 0 {
-                &first_prefix
-            } else {
-                &cont_prefix
-            };
+        for row in wrapped {
             lines.push(Line::from(vec![
-                Span::styled(prefix.clone(), prefix_style),
+                Span::styled(prefix.to_string(), prefix_style),
                 Span::styled(row, style),
             ]));
         }
@@ -3250,35 +3247,6 @@ fn permission_prompt_text(
         Style::default().fg(Color::DarkGray),
     );
     Text::from(lines)
-}
-
-fn dim_text(text: &mut Text<'static>) {
-    for line in &mut text.lines {
-        for span in &mut line.spans {
-            span.style = span.style.add_modifier(Modifier::DIM);
-        }
-    }
-}
-
-fn transcript_item_should_dim(item: &Line_, state: &TuiState) -> bool {
-    (state.pending_perm.is_some() && !matches!(item, Line_::PermissionPrompt { .. }))
-        || state.pending_local_auth.is_some()
-}
-
-fn replace_last_permission_entry(items: &mut Vec<Line_>, replacement: Line_) -> bool {
-    if let Some(idx) = items
-        .iter()
-        .rposition(|item| matches!(item, Line_::PermissionPrompt { .. }))
-    {
-        let resolved = matches!(replacement, Line_::PermissionResult { .. });
-        items[idx] = replacement;
-        if resolved && !matches!(items.get(idx + 1), Some(Line_::Blank)) {
-            items.insert(idx + 1, Line_::Blank);
-        }
-        true
-    } else {
-        false
-    }
 }
 
 fn extract_path_from_summary(summary: &str) -> Option<String> {
@@ -3603,12 +3571,14 @@ fn merge_consecutive_tools(items: Vec<Line_>) -> Vec<Line_> {
             summary,
             ok,
             content,
+            group_count: new_count,
             group_chunks: new_chunks,
             group_lines: new_lines,
             duration_secs: new_duration,
             denied: new_denied,
             dim: new_dim,
-            ..
+            density_rank: new_density_rank,
+            expanded: new_expanded,
         } = item
         else {
             unreachable!()
@@ -3624,14 +3594,14 @@ fn merge_consecutive_tools(items: Vec<Line_>) -> Vec<Line_> {
                 summary,
                 ok,
                 content,
-                group_count: 1,
+                group_count: new_count,
                 group_lines: new_lines,
                 group_chunks: new_chunks,
                 duration_secs: new_duration,
                 denied: new_denied,
-                dim: false,
-                density_rank: 1,
-                expanded: false,
+                dim: new_dim,
+                density_rank: new_density_rank,
+                expanded: new_expanded,
             });
             continue;
         }
@@ -3639,8 +3609,8 @@ fn merge_consecutive_tools(items: Vec<Line_>) -> Vec<Line_> {
         *l_duration = l_duration.saturating_add(new_duration);
         *l_denied = *l_denied || new_denied;
         *l_dim = *l_dim || new_dim;
-        *group_count += 1;
-        *group_lines += new_lines;
+        *group_count = group_count.saturating_add(new_count);
+        *group_lines = group_lines.saturating_add(new_lines);
         group_chunks.extend(new_chunks);
         *ls = grouped_tool_summary(ln, *lok, *group_count, *group_lines, group_chunks);
         // Keep the first chunk as the preview content; expansion shows all.
@@ -3788,24 +3758,46 @@ fn push_diff_preview(
     preview_lines.len().saturating_sub(take)
 }
 
+fn ansi_escape_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start.saturating_add(1);
+    if i >= bytes.len() {
+        return i;
+    }
+    match bytes[i] {
+        b'[' => {
+            i += 1;
+            while i < bytes.len() {
+                let byte = bytes[i];
+                i += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+        }
+        b']' | b'P' | b'^' | b'_' => {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == 0x07 {
+                    return i + 1;
+                }
+                if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                    return i + 2;
+                }
+                i += 1;
+            }
+        }
+        _ => {}
+    }
+    i.min(bytes.len())
+}
+
 fn strip_ansi_escapes(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == 0x1b {
-            i += 1;
-            if i < bytes.len() && bytes[i] == b'[' {
-                i += 1;
-                while i < bytes.len() {
-                    let b = bytes[i];
-                    i += 1;
-                    if (0x40..=0x7e).contains(&b) {
-                        break;
-                    }
-                }
-                continue;
-            }
+            i = ansi_escape_end(bytes, i);
             continue;
         }
         if let Some(ch) = text[i..].chars().next() {
@@ -3832,7 +3824,11 @@ fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
     macro_rules! flush {
         () => {
             if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), style));
+                let sanitized = sanitize_display_text(&buf);
+                if !sanitized.is_empty() {
+                    spans.push(Span::styled(sanitized, style));
+                }
+                buf.clear();
             }
         };
     }
@@ -3870,7 +3866,7 @@ fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
                     i += 1;
                 }
             } else {
-                i += 1;
+                i = ansi_escape_end(bytes, i);
             }
         } else {
             let ch = text[i..].chars().next().unwrap_or('\0');
@@ -3880,7 +3876,7 @@ fn ansi_to_spans(text: &str) -> Vec<Span<'static>> {
     }
     flush!();
     if spans.is_empty() {
-        spans.push(Span::raw(strip_ansi_escapes(text)));
+        spans.push(Span::raw(sanitize_display_text(&strip_ansi_escapes(text))));
     }
     spans
 }
@@ -3890,20 +3886,42 @@ fn has_ansi(text: &str) -> bool {
     text.as_bytes().windows(2).any(|w| w == b"\x1b[")
 }
 
-fn sanitize_display_text(text: &str) -> String {
-    let text = strip_ansi_escapes(text);
+fn is_bidi_format_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn normalize_display_line_breaks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
             '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    continue;
+                if chars.peek() != Some(&'\n') {
+                    out.push('\n');
                 }
-                out.push('\n');
             }
+            '\n' | '\u{2028}' | '\u{2029}' => out.push('\n'),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn sanitize_display_text(text: &str) -> String {
+    let text = strip_ansi_escapes(text);
+    let text = normalize_display_line_breaks(&text);
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
             '\n' | '\t' => out.push(ch),
-            _ if ch.is_control() => {}
+            _ if ch.is_control() || is_bidi_format_control(ch) => {}
             _ => out.push(ch),
         }
     }
@@ -6242,14 +6260,6 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 ]));
             }
         }
-        Line_::PermissionPrompt {
-            tool,
-            command,
-            risk,
-            ..
-        } => {
-            return permission_prompt_text(tool, command, *risk, width);
-        }
         Line_::PermissionResult {
             command,
             approved,
@@ -6282,6 +6292,12 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
                 Style::default().fg(Color::Yellow),
                 width,
             );
+        }
+        Line_::Slash(s) => {
+            let normalized = normalize_display_line_breaks(s);
+            for seg in normalized.split('\n') {
+                lines.push(Line::from(ansi_to_spans(seg)));
+            }
         }
         Line_::Info(s) => {
             let trimmed = s.trim_start();
@@ -6342,7 +6358,8 @@ fn line_to_text(item: &Line_, width: u16) -> Text<'static> {
             } else if has_ansi(s) {
                 // List output (packs/sessions/shelves) styled with ANSI codes:
                 // render as styled spans without the dim-italic bullet treatment.
-                for seg in s.split('\n') {
+                let normalized = normalize_display_line_breaks(s);
+                for seg in normalized.split('\n') {
                     lines.push(Line::from(ansi_to_spans(seg)));
                 }
             } else {
@@ -6631,18 +6648,6 @@ fn cached_transcript_render(
     width: u16,
 ) -> (Text<'static>, u16) {
     let render_width = transcript_render_width(width);
-    if let Line_::PermissionPrompt {
-        tool,
-        command,
-        risk,
-        ..
-    } = item
-    {
-        let text = permission_prompt_text(tool, command, *risk, render_width);
-        let height = text_visual_height(&text, render_width);
-        return (text, height);
-    }
-
     let key = line_cache_key(item);
     if state.render_cache.len() >= RENDER_CACHE_MAX_ENTRIES
         && !state.render_cache.contains_key(&key)
@@ -6654,11 +6659,7 @@ fn cached_transcript_render(
         .get(&key)
         .and_then(|entry| entry.renders.get(&render_width))
     {
-        let mut text = cached.text.clone();
-        if transcript_item_should_dim(item, state) {
-            dim_text(&mut text);
-        }
-        return (text, cached.height);
+        return (cached.text.clone(), cached.height);
     }
 
     if let Some(entry) = state.render_cache.get_mut(&key)
@@ -6700,10 +6701,6 @@ fn cached_transcript_render(
         state.render_cache_weight = state.render_cache_weight.saturating_add(weight);
     }
 
-    let mut text = text;
-    if transcript_item_should_dim(item, state) {
-        dim_text(&mut text);
-    }
     (text, height)
 }
 
@@ -6748,61 +6745,6 @@ fn next_transcript_tint(item: &Line_, tool_tint_parity: &mut bool) -> Option<Col
     }
 }
 
-struct TranscriptResizeReplay {
-    observed_width: Option<u16>,
-    last_change: Instant,
-    last_replay: Instant,
-    burst_active: bool,
-}
-
-impl TranscriptResizeReplay {
-    fn new(now: Instant) -> Self {
-        Self {
-            observed_width: None,
-            last_change: now,
-            last_replay: now,
-            burst_active: false,
-        }
-    }
-
-    fn should_replay(
-        &mut self,
-        width: u16,
-        rendered_width: u16,
-        has_transcript: bool,
-        now: Instant,
-    ) -> bool {
-        if !has_transcript {
-            self.observed_width = Some(width);
-            self.last_change = now;
-            self.last_replay = now;
-            self.burst_active = false;
-            return true;
-        }
-
-        if self.observed_width != Some(width) {
-            let leading_edge = !self.burst_active;
-            self.observed_width = Some(width);
-            self.last_change = now;
-            self.burst_active = true;
-            if leading_edge || now.duration_since(self.last_replay) >= RESIZE_REPLAY_MAX_LATENCY {
-                self.last_replay = now;
-                return true;
-            }
-            return false;
-        }
-
-        if self.burst_active && now.duration_since(self.last_change) >= RESIZE_REPLAY_QUIET {
-            self.burst_active = false;
-            if rendered_width != width {
-                self.last_replay = now;
-                return true;
-            }
-        }
-        false
-    }
-}
-
 struct PreparedTranscriptRender {
     text: Arc<Text<'static>>,
     line_start: usize,
@@ -6812,6 +6754,39 @@ struct PreparedTranscriptRender {
     tint_bg: Option<Color>,
 }
 
+fn render_prepared_transcript(
+    buf: &mut ratatui::buffer::Buffer,
+    items: Vec<PreparedTranscriptRender>,
+    render_width: u16,
+    top_padding: u16,
+) {
+    let mut y = buf.area.y.saturating_add(top_padding.min(buf.area.height));
+    for item in items {
+        let area = Rect {
+            y,
+            width: render_width.min(buf.area.width),
+            height: item.height,
+            ..buf.area
+        };
+        let text = borrowed_text_lines(item.text.as_ref(), item.line_start, item.line_end);
+        let para = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((item.scroll, 0));
+        Widget::render(para, area, buf);
+        if let Some(bg) = item.tint_bg {
+            for row in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    let cell = &mut buf[(x, row)];
+                    if cell.bg == Color::Reset {
+                        cell.bg = bg;
+                    }
+                }
+            }
+        }
+        y = y.saturating_add(item.height);
+    }
+}
+
 fn insert_prepared_transcript<B: Backend>(
     terminal: &mut Terminal<B>,
     items: Vec<PreparedTranscriptRender>,
@@ -6819,31 +6794,7 @@ fn insert_prepared_transcript<B: Backend>(
     height: u16,
 ) -> Result<(), B::Error> {
     terminal.insert_before(height, move |buf| {
-        let mut y = buf.area.y;
-        for item in items {
-            let area = Rect {
-                y,
-                width: render_width.min(buf.area.width),
-                height: item.height,
-                ..buf.area
-            };
-            let text = borrowed_text_lines(item.text.as_ref(), item.line_start, item.line_end);
-            let para = Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((item.scroll, 0));
-            Widget::render(para, area, buf);
-            if let Some(bg) = item.tint_bg {
-                for row in area.top()..area.bottom() {
-                    for x in area.left()..area.right() {
-                        let cell = &mut buf[(x, row)];
-                        if cell.bg == Color::Reset {
-                            cell.bg = bg;
-                        }
-                    }
-                }
-            }
-            y = y.saturating_add(item.height);
-        }
+        render_prepared_transcript(buf, items, render_width, 0);
     })?;
     Ok(())
 }
@@ -6866,6 +6817,7 @@ fn insert_transcript_items<B: Backend>(
     state: &mut TuiState,
     items: &[Line_],
     width: u16,
+    chunk_rows: u16,
     tool_tint_parity: &mut bool,
 ) -> Result<(), B::Error> {
     if items.is_empty() {
@@ -6873,7 +6825,6 @@ fn insert_transcript_items<B: Backend>(
     }
 
     let render_width = transcript_render_width(width);
-    let chunk_rows = terminal.size()?.height.max(1);
     let mut chunk = Vec::new();
     let mut chunk_height = 0u16;
 
@@ -6950,8 +6901,39 @@ fn insert_transcript_items<B: Backend>(
         }
     }
 
-    flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)?;
-    Ok(())
+    flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)
+}
+
+#[cfg(test)]
+fn rebuild_transcript_from_origin<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut TuiState,
+    width: u16,
+) -> Result<(), B::Error> {
+    terminal.reset_inline_viewport()?;
+    rebuild_transcript(terminal, state, width)
+}
+
+fn purge_and_rebuild_transcript<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    state: &mut TuiState,
+    width: u16,
+) -> io::Result<()> {
+    crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let rebuild = (|| {
+        if renderable_transcript_chunk_rows(terminal, state, width)?.is_none() {
+            state.transcript_needs_rebuild = true;
+            return Ok(());
+        }
+        terminal.reset_inline_viewport()?;
+        crossterm::execute!(
+            terminal.backend_mut(),
+            CrosstermClear(CrosstermClearType::Purge)
+        )?;
+        rebuild_transcript(terminal, state, width)
+    })();
+    let end = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    rebuild.and(end)
 }
 
 fn rebuild_transcript<B: Backend>(
@@ -6959,29 +6941,62 @@ fn rebuild_transcript<B: Backend>(
     state: &mut TuiState,
     width: u16,
 ) -> Result<(), B::Error> {
-    terminal.clear()?;
-    // mem::take instead of clone: rebuilds fire on resize/expand and the transcript can be
-    // large. Nothing in the insert path reads state.transcript, so loaning it out is safe.
+    let Some(chunk_rows) = renderable_transcript_chunk_rows(terminal, state, width)? else {
+        state.transcript_needs_rebuild = true;
+        return Ok(());
+    };
+
+    // mem::take avoids cloning a potentially large transcript during explicit
+    // expand/collapse and error-recovery rebuilds. Nothing in the insert path
+    // reads state.transcript, so loaning it out is safe.
     let items = std::mem::take(&mut state.transcript);
     sync_last_expandable(state, &items);
     let mut tool_tint_parity = false;
-    let rebuild_result =
-        insert_transcript_items(terminal, state, &items, width, &mut tool_tint_parity);
+    let rebuild_result = insert_transcript_items(
+        terminal,
+        state,
+        &items,
+        width,
+        chunk_rows,
+        &mut tool_tint_parity,
+    );
     state.transcript = items;
-    if let Err(err) = rebuild_result {
-        state.transcript_needs_rebuild = true;
-        return Err(err);
+    match rebuild_result {
+        Ok(()) => {
+            state.tool_tint_parity = tool_tint_parity;
+            state.transcript_rendered_width = width;
+            state.transcript_needs_rebuild = false;
+            Ok(())
+        }
+        Err(err) => {
+            state.transcript_needs_rebuild = true;
+            Err(err)
+        }
     }
-    state.tool_tint_parity = tool_tint_parity;
-    state.transcript_rendered_width = width;
-    state.transcript_needs_rebuild = false;
-    Ok(())
 }
 
 fn transcript_pane_width(area_width: u16, area_height: u16, state: &TuiState) -> u16 {
     compute_layout(Rect::new(0, 0, area_width, area_height), state)
         .transcript_area
         .width
+}
+
+fn renderable_transcript_chunk_rows<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &TuiState,
+    expected_width: u16,
+) -> Result<Option<u16>, B::Error> {
+    if expected_width == 0 {
+        return Ok(None);
+    }
+    terminal.autoresize()?;
+    let size = terminal.size()?;
+    let current_width = transcript_pane_width(size.width, size.height, state);
+    if size.width == 0 || size.height == 0 || current_width == 0 || current_width != expected_width
+    {
+        return Ok(None);
+    }
+    Ok(Some(size.height))
 }
 
 fn terminal_has_render_area<B: Backend>(terminal: &Terminal<B>) -> Result<bool, B::Error> {
@@ -6993,38 +7008,17 @@ fn current_transcript_pane_width<B: Backend>(
     terminal: &mut Terminal<B>,
     state: &TuiState,
 ) -> Result<u16, B::Error> {
-    if !terminal_has_render_area(terminal)? {
+    let size = terminal.size()?;
+    if size.width == 0 || size.height == 0 {
         return Ok(0);
     }
-    terminal.autoresize()?;
-    let size = terminal.size()?;
     Ok(transcript_pane_width(size.width, size.height, state))
 }
 
-fn flush_pending_insert_for_width<B: Backend>(
-    terminal: &mut Terminal<B>,
-    state: &mut TuiState,
-    width: u16,
-    replay_width_change: bool,
-) -> Result<(), B::Error> {
-    if !terminal_has_render_area(terminal)? {
-        return Ok(());
-    }
-    let width_changed = state.transcript_rendered_width != width && !state.transcript.is_empty();
-    if state.transcript_needs_rebuild || (width_changed && replay_width_change) {
-        rebuild_transcript(terminal, state, width)?;
-    }
-    if width_changed && state.transcript_rendered_width != width {
-        return Ok(());
-    }
-
-    let raw: Vec<Line_> = std::mem::take(&mut state.pending_insert);
-    let mut items: Vec<Line_> = merge_consecutive_tools(raw);
-    if let Err(err) = flush_prepared_items(terminal, state, &mut items, width) {
-        state.pending_insert = items;
-        return Err(err);
-    }
-    Ok(())
+fn transcript_requires_rebuild(state: &TuiState, width: u16) -> bool {
+    width > 0
+        && !state.transcript.is_empty()
+        && (state.transcript_needs_rebuild || state.transcript_rendered_width != width)
 }
 
 fn flush_pending_insert<B: Backend>(
@@ -7032,15 +7026,42 @@ fn flush_pending_insert<B: Backend>(
     state: &mut TuiState,
     width: u16,
 ) -> Result<(), B::Error> {
-    flush_pending_insert_for_width(terminal, state, width, true)
+    if renderable_transcript_chunk_rows(terminal, state, width)?.is_none() {
+        return Ok(());
+    }
+
+    if !state.prepared_insert_retry.is_empty() {
+        let mut retry = std::mem::take(&mut state.prepared_insert_retry);
+        match flush_prepared_items(terminal, state, &mut retry, width) {
+            Ok(true) => {}
+            Ok(false) => {
+                state.prepared_insert_retry = retry;
+                return Ok(());
+            }
+            Err(err) => {
+                state.prepared_insert_retry = retry;
+                return Err(err);
+            }
+        }
+    }
+
+    let mut items = std::mem::take(&mut state.pending_insert);
+    prepare_pending_items(state, &mut items);
+    match flush_prepared_items(terminal, state, &mut items, width) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            state.prepared_insert_retry = items;
+            Ok(())
+        }
+        Err(err) => {
+            state.prepared_insert_retry = items;
+            Err(err)
+        }
+    }
 }
 
-fn flush_prepared_items<B: Backend>(
-    terminal: &mut Terminal<B>,
-    state: &mut TuiState,
-    items: &mut Vec<Line_>,
-    width: u16,
-) -> Result<(), B::Error> {
+fn prepare_pending_items(state: &mut TuiState, items: &mut Vec<Line_>) {
+    *items = merge_consecutive_tools(std::mem::take(items));
     mark_retry_cycles(items);
     // Inline viewport output is real terminal scrollback: already-inserted lines cannot be
     // rewritten without appending another copy of the transcript. Keep grouping within the
@@ -7063,17 +7084,35 @@ fn flush_prepared_items<B: Backend>(
     if !expansion_active {
         sync_last_expandable(state, items);
     }
+}
+
+fn flush_prepared_items<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut TuiState,
+    items: &mut Vec<Line_>,
+    width: u16,
+) -> Result<bool, B::Error> {
+    let Some(chunk_rows) = renderable_transcript_chunk_rows(terminal, state, width)? else {
+        return Ok(false);
+    };
 
     if items.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
     let mut tool_tint_parity = state.tool_tint_parity;
-    insert_transcript_items(terminal, state, items, width, &mut tool_tint_parity)?;
+    insert_transcript_items(
+        terminal,
+        state,
+        items,
+        width,
+        chunk_rows,
+        &mut tool_tint_parity,
+    )?;
     state.tool_tint_parity = tool_tint_parity;
     state.transcript.append(items);
     state.transcript_rendered_width = width;
-    Ok(())
+    Ok(true)
 }
 
 fn set_last_tool_expanded(items: &mut [Line_], name: &str, expanded: bool) -> bool {
@@ -7157,6 +7196,43 @@ fn cap_live_indicator_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>>
     lines
 }
 
+// The pending approval prompt lives in the viewport, not the transcript:
+// inline scrollback is append-only, so a scrollback prompt entry could only be
+// updated after the decision by re-emitting the whole history.
+fn pending_permission_prompt_text(state: &TuiState, width: u16) -> Option<Text<'static>> {
+    let pending = state.pending_perm.as_ref()?;
+    if width == 0 {
+        return None;
+    }
+    Some(permission_prompt_text(
+        &pending.tool,
+        &pending.command,
+        pending.risk,
+        width,
+    ))
+}
+
+fn cap_permission_prompt_lines(
+    mut lines: Vec<Line<'static>>,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    if lines.len() <= max_rows {
+        return lines;
+    }
+    if max_rows == 1 {
+        lines.truncate(1);
+        return lines;
+    }
+    // Keep the command head and the trailing key-hint row when clipping.
+    let hint = lines.pop();
+    lines.truncate(max_rows - 1);
+    lines.extend(hint);
+    lines
+}
+
 fn count_lines_by_width(text: &Text<'_>, width: u16) -> usize {
     text_visual_height(text, width) as usize
 }
@@ -7178,10 +7254,19 @@ fn collect_wrapped_lines(text: &Text<'static>, width: u16) -> Vec<Line<'static>>
 fn render_transcript(frame: &mut ratatui::Frame, state: &mut TuiState, transcript_area: Rect) {
     let content_area = transcript_content_rect(transcript_area);
     let content_width = transcript_render_width(content_area.width);
-    let live_text = transcript_live_indicator_text(state, content_width);
+    let pending_prompt = pending_permission_prompt_text(state, content_width);
+    let prompt_active = pending_prompt.is_some();
+    let live_text = pending_prompt.or_else(|| transcript_live_indicator_text(state, content_width));
     let mut live_lines = live_text
         .as_ref()
-        .map(|text| cap_live_indicator_lines(collect_wrapped_lines(text, content_width)))
+        .map(|text| {
+            let lines = collect_wrapped_lines(text, content_width);
+            if prompt_active {
+                cap_permission_prompt_lines(lines, transcript_area.height as usize)
+            } else {
+                cap_live_indicator_lines(lines)
+            }
+        })
         .unwrap_or_default();
     if !live_lines.is_empty()
         && transcript_area.height as usize > live_lines.len()
@@ -7262,21 +7347,22 @@ fn queue_permission_request(
     state.show_help = false;
     state.show_todos = false;
     state.status = "thinking".to_string();
-    let prompt = Line_::PermissionPrompt {
-        tool: name.clone(),
-        command: command.clone(),
-        tier,
-        risk,
-    };
-    if !replace_last_permission_entry(&mut state.pending_insert, prompt.clone())
-        && !replace_last_permission_entry(&mut state.transcript, prompt.clone())
-    {
-        state.queue(prompt);
+    if let Some(previous) = state.pending_perm.take() {
+        state.queue(Line_::PermissionResult {
+            command: previous.audit_label,
+            approved: false,
+            always: false,
+        });
+        let _ = previous.responder.try_send(Choice::Deny);
     }
-    state.transcript_needs_rebuild = true;
+    // The pending prompt renders inside the viewport, never into scrollback:
+    // inline scrollback is append-only, so updating a flushed prompt entry
+    // after the decision would force a duplicate full-history re-emit.
     state.pending_perm = Some(PendingPermission {
         tool: name,
         audit_label,
+        command,
+        risk,
         tier,
         responder,
     });
@@ -8537,7 +8623,10 @@ fn handle_login_input_key(
                 };
                 state.clear_slash_completion_selection();
                 if non_secret_command {
-                    let _ = agent_input.send(FromTui::Submit(text));
+                    let _ = agent_input.send(FromTui::Submit {
+                        text,
+                        pane_width: state.transcript_area.width,
+                    });
                 } else {
                     let _ = agent_input.send(FromTui::LoginInput(text));
                 }
@@ -8713,29 +8802,36 @@ fn handle_key(
             .as_ref()
             .map(|pending| pending.tier.default_choice())
             .unwrap_or(Choice::Deny);
+        let plain_choice_key = |modifiers: KeyModifiers| {
+            !modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::META,
+            )
+        };
         let choice = match (key.code, key.modifiers) {
-            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => Some(Choice::Once),
-            (KeyCode::Char('a'), _) | (KeyCode::Char('A'), _) => Some(Choice::Always),
-            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+            (KeyCode::Char('y') | KeyCode::Char('Y'), modifiers) if plain_choice_key(modifiers) => {
+                Some(Choice::Once)
+            }
+            (KeyCode::Char('a') | KeyCode::Char('A'), modifiers) if plain_choice_key(modifiers) => {
+                Some(Choice::Always)
+            }
+            (KeyCode::Char('n') | KeyCode::Char('N'), modifiers) if plain_choice_key(modifiers) => {
                 Some(Choice::Deny)
             }
-            (KeyCode::Enter, _) => Some(default_choice),
+            (KeyCode::Esc, _) => Some(Choice::Deny),
+            (KeyCode::Enter, modifiers) if plain_choice_key(modifiers) => Some(default_choice),
             _ => None,
         };
         if let Some(choice) = choice
             && let Some(pending) = state.pending_perm.take()
         {
-            let result = Line_::PermissionResult {
+            state.queue(Line_::PermissionResult {
                 command: pending.audit_label.clone(),
                 approved: !matches!(choice, Choice::Deny),
                 always: matches!(choice, Choice::Always),
-            };
-            if !replace_last_permission_entry(&mut state.pending_insert, result.clone())
-                && !replace_last_permission_entry(&mut state.transcript, result.clone())
-            {
-                state.queue(result);
-            }
-            state.transcript_needs_rebuild = true;
+            });
             let _ = pending.responder.send(choice);
             match choice {
                 Choice::Deny => {
@@ -8798,10 +8894,12 @@ fn handle_key(
                 let next_expanded = !block.expanded;
                 let updated_pending =
                     set_last_tool_expanded(&mut state.pending_insert, &name, next_expanded);
+                let updated_retry =
+                    set_last_tool_expanded(&mut state.prepared_insert_retry, &name, next_expanded);
                 let updated_transcript =
                     set_last_tool_expanded(&mut state.transcript, &name, next_expanded);
-                if updated_pending || updated_transcript {
-                    state.transcript_needs_rebuild = true;
+                if updated_pending || updated_retry || updated_transcript {
+                    state.transcript_needs_rebuild |= updated_transcript;
                     state.jump_transcript_to_bottom();
                     state.status = if next_expanded {
                         "expanded".to_string()
@@ -8964,7 +9062,10 @@ fn handle_key(
             state.history_idx = None;
             state.clear_input();
             state.clear_slash_completion_selection();
-            let _ = agent_input.send(FromTui::Submit(text));
+            let _ = agent_input.send(FromTui::Submit {
+                text,
+                pane_width: state.transcript_area.width,
+            });
         }
         (KeyCode::PageUp, _) => {
             let step = state.transcript_visible_lines.saturating_sub(2).max(1) as isize;
@@ -9408,7 +9509,10 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     queue_welcome_banner(&mut state, banner);
     if let Some(task) = initial_task {
         state.queue(Line_::User(task.clone()));
-        let _ = in_tx.send(FromTui::Submit(task));
+        let _ = in_tx.send(FromTui::Submit {
+            text: task,
+            pane_width: 0,
+        });
     }
 
     // Move agent into a task; communicate via channels
@@ -9422,7 +9526,8 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let handle = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                FromTui::Submit(text) => {
+                FromTui::Submit { text, pane_width } => {
+                    agent.slash_render_width = (pane_width > 0).then_some(usize::from(pane_width));
                     if crate::is_slash_command(&text) {
                         let trimmed = text.trim();
                         if let Some(parsed) = parse_compact_slash(trimmed) {
@@ -9463,17 +9568,6 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                                     )));
                                 }
                                 Err(msg) => agent.sink.emit(AgentEvent::Slash(msg.to_string())),
-                            }
-                        } else if trimmed == "/plan" || trimmed.starts_with("/plan ") {
-                            let task = trimmed.strip_prefix("/plan").unwrap_or("").trim();
-                            if task.is_empty() {
-                                agent
-                                    .sink
-                                    .emit(AgentEvent::Slash("usage: /plan <task>".into()));
-                            } else if let Err(e) = agent.run_plan(task.to_string()).await {
-                                agent
-                                    .sink
-                                    .emit(AgentEvent::Error(format!("[plan error] {e:#}")));
                             }
                         } else if trimmed == "/pack"
                             || trimmed.starts_with("/pack ")
@@ -9579,7 +9673,6 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
 
     let tick = Duration::from_millis(80);
     let mut last_tick = Instant::now();
-    let mut resize_replay = TranscriptResizeReplay::new(last_tick);
 
     while !state.quit {
         if state.backend_viewer_open {
@@ -9609,13 +9702,12 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         }
         if terminal_has_render_area(&terminal)? {
             let width = current_transcript_pane_width(&mut terminal, &state)?;
-            let replay_width_change = resize_replay.should_replay(
-                width,
-                state.transcript_rendered_width,
-                !state.transcript.is_empty(),
-                Instant::now(),
-            );
-            flush_pending_insert_for_width(&mut terminal, &mut state, width, replay_width_change)?;
+            if transcript_requires_rebuild(&state, width) {
+                purge_and_rebuild_transcript(&mut terminal, &mut state, width)?;
+            }
+            if !transcript_requires_rebuild(&state, width) {
+                flush_pending_insert(&mut terminal, &mut state, width)?;
+            }
             terminal.draw(|f| draw(f, &mut state))?;
             state.frame_count = state.frame_count.wrapping_add(1);
         }
@@ -9698,7 +9790,12 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     }
     if terminal_has_render_area(&terminal).unwrap_or(false) {
         if let Ok(width) = current_transcript_pane_width(&mut terminal, &state) {
-            let _ = flush_pending_insert(&mut terminal, &mut state, width);
+            if transcript_requires_rebuild(&state, width) {
+                let _ = purge_and_rebuild_transcript(&mut terminal, &mut state, width);
+            }
+            if !transcript_requires_rebuild(&state, width) {
+                let _ = flush_pending_insert(&mut terminal, &mut state, width);
+            }
         }
         let _ = terminal.draw(|f| draw(f, &mut state));
     }
@@ -10055,6 +10152,22 @@ mod tests {
     }
 
     #[test]
+    fn structured_slash_info_preserves_supported_sgr_and_sanitizes_controls() {
+        let text = line_to_text(
+            &Line_::Info("\x1b[1mHeading\x1b[0m\r\nplain\u{0007}\x1b]0;title\u{0007}".to_string()),
+            80,
+        );
+        assert_eq!(flatten_lines(&text), vec!["Heading", "plain"]);
+        let heading = span_style_for(&text, "Heading").expect("styled slash heading");
+        assert!(heading.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !flatten_lines(&text)
+                .join("\n")
+                .contains(['\x1b', '\r', '\u{0007}'])
+        );
+    }
+
+    #[test]
     fn user_cards_pad_body_lines_so_right_border_stays_clear() {
         let text = line_to_text(&Line_::User("- line one\n- line two".to_string()), 120);
         let lines = flatten_lines(&text);
@@ -10132,6 +10245,8 @@ mod tests {
         state.pending_perm = Some(PendingPermission {
             tool: "bash".to_string(),
             audit_label: "echo $DEXT_MODEL".to_string(),
+            command: "echo $DEXT_MODEL".to_string(),
+            risk: crate::tool_policy::CommandRisk::Read,
             tier: PermissionTier::Read,
             responder: std::sync::mpsc::sync_channel(0).0,
         });
@@ -10467,6 +10582,8 @@ mod tests {
         state.pending_perm = Some(PendingPermission {
             tool: "bash".to_string(),
             audit_label: "echo $DEXT_MODEL".to_string(),
+            command: "echo $DEXT_MODEL".to_string(),
+            risk: crate::tool_policy::CommandRisk::Read,
             tier: PermissionTier::Read,
             responder: std::sync::mpsc::sync_channel(0).0,
         });
@@ -10477,6 +10594,180 @@ mod tests {
             .map(|span| span.content)
             .collect::<String>();
         assert!(!rendered.contains("awaiting permission"));
+    }
+
+    #[test]
+    fn pending_permission_prompt_renders_in_viewport_not_scrollback() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.agent_busy = true;
+        state.pending_perm = Some(PendingPermission {
+            tool: "bash".to_string(),
+            audit_label: "echo ok".to_string(),
+            command: "echo ok".to_string(),
+            risk: crate::tool_policy::CommandRisk::Read,
+            tier: PermissionTier::Read,
+            responder: std::sync::mpsc::sync_channel(0).0,
+        });
+
+        let text = pending_permission_prompt_text(&state, 78).expect("prompt text");
+        let flat: String = text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(flat.contains("ask bash"), "{flat}");
+        assert!(flat.contains("echo ok"), "{flat}");
+        assert!(flat.contains("[y] once"), "{flat}");
+
+        let capped = cap_permission_prompt_lines(
+            vec![
+                Line::from("head"),
+                Line::from("body-1"),
+                Line::from("body-2"),
+                Line::from("hint"),
+            ],
+            3,
+        );
+        let capped: Vec<String> = capped
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(capped, ["head", "body-1", "hint"]);
+        assert!(cap_permission_prompt_lines(vec![Line::from("head")], 0).is_empty());
+        let one_row = cap_permission_prompt_lines(
+            vec![Line::from("head"), Line::from("body"), Line::from("hint")],
+            1,
+        );
+        assert_eq!(flatten_lines(&Text::from(one_row)), ["head"]);
+
+        for width in 1..=8 {
+            let unicode_gutter = permission_prompt_text(
+                "bash",
+                "abcdefghij",
+                crate::tool_policy::CommandRisk::Read,
+                width,
+            );
+            assert!(
+                unicode_gutter
+                    .lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width)),
+                "permission gutter must fit {width} terminal cells: {unicode_gutter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replacing_pending_permission_denies_previous_request() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_tx, _second_rx) = std::sync::mpsc::sync_channel(1);
+        queue_permission_request(
+            &mut state,
+            "bash".to_string(),
+            serde_json::json!({"command": "first"}),
+            first_tx,
+        );
+        queue_permission_request(
+            &mut state,
+            "bash".to_string(),
+            serde_json::json!({"command": "second"}),
+            second_tx,
+        );
+
+        assert!(matches!(
+            first_rx.try_recv().expect("first denied"),
+            Choice::Deny
+        ));
+        assert_eq!(
+            state
+                .pending_perm
+                .as_ref()
+                .map(|pending| pending.command.as_str()),
+            Some("second")
+        );
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [
+                Line_::PermissionResult {
+                    approved: false,
+                    ..
+                },
+                Line_::Blank
+            ]
+        ));
+    }
+
+    #[test]
+    fn permission_flow_never_rebuilds_transcript_history() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.transcript.push(Line_::Assistant {
+            text: "earlier history".to_string(),
+            dim_prefix: false,
+        });
+        let (permission_tx, permission_rx) = std::sync::mpsc::sync_channel(1);
+        queue_permission_request(
+            &mut state,
+            "bash".to_string(),
+            serde_json::json!({"command": "echo ok"}),
+            permission_tx,
+        );
+        assert!(state.pending_perm.is_some());
+        assert!(
+            state.pending_insert.is_empty(),
+            "pending prompt must not enter scrollback"
+        );
+        assert!(!state.transcript_needs_rebuild);
+
+        let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_tx, _runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+            &agent_tx,
+            &runtime_tx,
+            &steering_tx,
+            &interrupt,
+        );
+
+        assert!(matches!(
+            permission_rx.try_recv().expect("choice"),
+            Choice::Once
+        ));
+        assert!(
+            !state.transcript_needs_rebuild,
+            "approval decisions must not re-emit history"
+        );
+        assert!(matches!(
+            state.pending_insert.as_slice(),
+            [Line_::PermissionResult { approved: true, .. }, Line_::Blank]
+        ));
     }
 
     #[test]
@@ -11542,16 +11833,12 @@ mod tests {
                 ApprovalProfile::Ask,
                 ThinkingEffort::Medium,
             );
-            state.queue(Line_::PermissionPrompt {
-                tool: "bash".to_string(),
-                command: "echo ok".to_string(),
-                tier: PermissionTier::Read,
-                risk: crate::tool_policy::CommandRisk::Read,
-            });
             let (permission_tx, permission_rx) = std::sync::mpsc::sync_channel(1);
             state.pending_perm = Some(PendingPermission {
                 tool: "bash".to_string(),
                 audit_label: "echo ok".to_string(),
+                command: "echo ok".to_string(),
+                risk: crate::tool_policy::CommandRisk::Read,
                 tier: PermissionTier::Read,
                 responder: permission_tx,
             });
@@ -12154,6 +12441,49 @@ mod tests {
     }
 
     #[test]
+    fn merge_consecutive_tools_is_idempotent_for_prepared_retry_batches() {
+        let mut items = merge_consecutive_tools(vec![
+            tool_line(
+                "#1.44",
+                "read_file",
+                "read_file: src/main.rs (offset=6410, limit=2)",
+                Some(true),
+                "6410\talpha\n6411\tbravo\n",
+            ),
+            tool_line(
+                "#1.45",
+                "read_file",
+                "read_file: src/main.rs (offset=6412, limit=2)",
+                Some(true),
+                "6412\tcharlie\n6413\tdelta\n",
+            ),
+        ]);
+        let prepared = items.clone();
+        assert!(merge_consecutive_tools(prepared.clone()) == prepared);
+
+        items.push(tool_line(
+            "#1.46",
+            "read_file",
+            "read_file: src/main.rs (offset=6414, limit=2)",
+            Some(true),
+            "6414\techo\n6415\tfoxtrot\n",
+        ));
+        let merged = merge_consecutive_tools(items);
+        let Line_::Tool {
+            group_count,
+            group_lines,
+            group_chunks,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected grouped tool");
+        };
+        assert_eq!(*group_count, 3);
+        assert_eq!(*group_lines, 6);
+        assert_eq!(group_chunks.len(), 3);
+    }
+
+    #[test]
     fn density_separator_renders_every_tenth_tool_call() {
         let mut item = tool_line("#1.10", "bash", "bash: true", Some(true), "ok");
         if let Line_::Tool { density_rank, .. } = &mut item {
@@ -12246,7 +12576,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_event_clears_live_preview_state() {
+    fn generic_slash_event_clears_live_preview_state_and_uses_faded_info() {
         let mut state = TuiState::new(
             "test-model".to_string(),
             model_context_window("test-model"),
@@ -12284,6 +12614,25 @@ mod tests {
                 .last()
                 .is_some_and(|line| matches!(line, Line_::Info(msg) if msg == "ok"))
         );
+    }
+
+    #[test]
+    fn structured_slash_event_keeps_unadorned_layout_line() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+
+        state.apply_event(AgentEvent::StructuredSlash(
+            "Heading\n  /help   show help".to_string(),
+        ));
+
+        assert!(state.pending_insert.last().is_some_and(
+            |line| matches!(line, Line_::Slash(msg) if msg == "Heading\n  /help   show help")
+        ));
     }
 
     #[test]
@@ -12949,10 +13298,10 @@ mod tests {
     }
 
     #[test]
-    fn model_arg_completions_lists_authenticated_provider_models() {
+    fn provider_and_model_arg_completions_use_canonical_choices() {
         let _guard = env_lock();
         let root = std::env::temp_dir().join(format!(
-            "dext-tui-model-completions-{}-{}",
+            "dext-tui-provider-model-completions-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -12960,6 +13309,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).expect("create temp dir");
+        let old_dext_home = std::env::var_os("DEXT_HOME");
         unsafe {
             std::env::set_var("DEXT_HOME", &root);
         }
@@ -12980,6 +13330,17 @@ mod tests {
             );
             crate::save_auth_store(&store)?;
 
+            let login_texts = slash_completions("/login ")
+                .into_iter()
+                .map(|completion| completion.text)
+                .collect::<Vec<_>>();
+            let expected_login_texts = load_provider_catalog()?
+                .providers
+                .into_iter()
+                .map(|profile| format!("/login {}", profile.id))
+                .collect::<Vec<_>>();
+            assert_eq!(login_texts, expected_login_texts);
+
             let completions = model_arg_completions("");
             let texts: Vec<String> = completions.into_iter().map(|c| c.text).collect();
             assert!(
@@ -12995,10 +13356,14 @@ mod tests {
         })();
 
         unsafe {
-            std::env::remove_var("DEXT_HOME");
+            if let Some(value) = old_dext_home {
+                std::env::set_var("DEXT_HOME", value);
+            } else {
+                std::env::remove_var("DEXT_HOME");
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
-        result.expect("model completions should load auth-backed providers");
+        result.expect("provider and model completions should use canonical choices");
     }
 
     #[test]
@@ -13628,7 +13993,10 @@ mod tests {
             );
 
             match submit_rx.try_recv() {
-                Ok(FromTui::Submit(text)) => assert_eq!(text, command),
+                Ok(FromTui::Submit { text, pane_width }) => {
+                    assert_eq!(text, command);
+                    assert_eq!(pane_width, state.transcript_area.width);
+                }
                 _ => panic!("expected ordinary slash-command submission"),
             }
             assert!(submit_rx.try_recv().is_err());
@@ -14343,17 +14711,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_pending_insert_keeps_logical_transcript_state() {
+    fn failed_pending_insert_retries_prepared_batch_without_merging_new_output() {
         use ratatui::backend::{ClearType, TestBackend, WindowSize};
         use ratatui::buffer::Cell;
         use ratatui::layout::{Position, Size};
         use ratatui::{Terminal, TerminalOptions, Viewport};
 
-        struct FailClearBackend {
+        struct FailOnceClearBackend {
             inner: TestBackend,
+            fail_clear: bool,
         }
 
-        impl Backend for FailClearBackend {
+        impl Backend for FailOnceClearBackend {
             type Error = io::Error;
 
             fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
@@ -14391,8 +14760,14 @@ mod tests {
                 self.inner.clear().map_err(|error| match error {})
             }
 
-            fn clear_region(&mut self, _clear_type: ClearType) -> io::Result<()> {
-                Err(io::Error::other("injected clear failure"))
+            fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+                if std::mem::replace(&mut self.fail_clear, false) {
+                    Err(io::Error::other("injected clear failure"))
+                } else {
+                    self.inner
+                        .clear_region(clear_type)
+                        .map_err(|error| match error {})
+                }
             }
 
             fn size(&self) -> io::Result<Size> {
@@ -14408,8 +14783,9 @@ mod tests {
             }
         }
 
-        let backend = FailClearBackend {
+        let backend = FailOnceClearBackend {
             inner: TestBackend::new(80, 20),
+            fail_clear: true,
         };
         let mut terminal = Terminal::with_options(
             backend,
@@ -14425,28 +14801,121 @@ mod tests {
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        state.queue(Line_::Assistant {
-            text: "must remain pending".to_string(),
-            dim_prefix: false,
-        });
+        state.pending_insert = vec![
+            tool_line(
+                "#1.44",
+                "read_file",
+                "read_file: src/main.rs (offset=6410, limit=2)",
+                Some(true),
+                "6410\talpha\n6411\tbravo\n",
+            ),
+            tool_line(
+                "#1.45",
+                "read_file",
+                "read_file: src/main.rs (offset=6412, limit=2)",
+                Some(true),
+                "6412\tcharlie\n6413\tdelta\n",
+            ),
+        ];
 
         let error = flush_pending_insert(&mut terminal, &mut state, 80)
             .expect_err("injected clear failure must escape");
 
         assert!(error.to_string().contains("injected clear failure"));
         assert!(state.transcript.is_empty());
+        assert!(state.pending_insert.is_empty());
+        assert!(matches!(
+            state.prepared_insert_retry.as_slice(),
+            [Line_::Tool {
+                group_count: 2,
+                group_chunks,
+                ..
+            }] if group_chunks.len() == 2
+        ));
+
+        state.queue(tool_line(
+            "#1.46",
+            "read_file",
+            "read_file: src/main.rs (offset=6414, limit=2)",
+            Some(true),
+            "6414\techo\n6415\tfoxtrot\n",
+        ));
+        assert_eq!(state.prepared_insert_retry.len(), 1);
         assert!(matches!(
             state.pending_insert.as_slice(),
-            [Line_::Assistant { text, .. }] if text == "must remain pending"
+            [Line_::Blank, Line_::Tool { group_count: 1, .. }]
+        ));
+
+        flush_pending_insert(&mut terminal, &mut state, 80).expect("retry prepared batch");
+
+        assert!(state.prepared_insert_retry.is_empty());
+        assert!(state.pending_insert.is_empty());
+        assert!(matches!(
+            state.transcript.as_slice(),
+            [
+                Line_::Tool { group_count: 2, .. },
+                Line_::Blank,
+                Line_::Tool { group_count: 1, .. }
+            ]
         ));
     }
 
     #[test]
-    fn zero_sized_terminal_defers_pending_insert_until_recovery() {
+    fn zero_sized_or_status_only_terminal_defers_pending_insert_until_recovery() {
         use ratatui::backend::TestBackend;
         use ratatui::{Terminal, TerminalOptions, Viewport};
 
-        let backend = TestBackend::new(80, 0);
+        for minimized_height in [0, 1] {
+            let backend = TestBackend::new(80, minimized_height);
+            let mut terminal = Terminal::with_options(
+                backend,
+                TerminalOptions {
+                    viewport: Viewport::Inline(8),
+                },
+            )
+            .expect("terminal");
+            let mut state = TuiState::new(
+                "test-model".to_string(),
+                model_context_window("test-model"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            state.queue(Line_::Assistant {
+                text: "defer while minimized".to_string(),
+                dim_prefix: false,
+            });
+
+            let width =
+                current_transcript_pane_width(&mut terminal, &state).expect("minimized pane width");
+            assert_eq!(width, 0);
+            flush_pending_insert(&mut terminal, &mut state, width)
+                .expect("minimized flush must defer");
+            assert!(state.transcript.is_empty());
+            assert!(matches!(
+                state.pending_insert.as_slice(),
+                [Line_::Assistant { text, .. }] if text == "defer while minimized"
+            ));
+
+            terminal.backend_mut().resize(80, 20);
+            terminal.autoresize().expect("restore terminal size");
+            let width =
+                current_transcript_pane_width(&mut terminal, &state).expect("restored width");
+            flush_pending_insert(&mut terminal, &mut state, width).expect("flush after restore");
+            assert!(state.pending_insert.is_empty());
+            assert!(matches!(
+                state.transcript.as_slice(),
+                [Line_::Assistant { text, .. }] if text == "defer while minimized"
+            ));
+        }
+    }
+
+    #[test]
+    fn replay_deferred_after_mid_frame_minimize_remains_required() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {
@@ -14462,28 +14931,27 @@ mod tests {
             ThinkingEffort::Medium,
         );
         state.queue(Line_::Assistant {
-            text: "defer while minimized".to_string(),
+            text: "logical history survives minimize".to_string(),
             dim_prefix: false,
         });
+        let width = current_transcript_pane_width(&mut terminal, &state).expect("initial width");
+        flush_pending_insert(&mut terminal, &mut state, width).expect("initial flush");
+        state.transcript_needs_rebuild = true;
 
-        flush_pending_insert_for_width(&mut terminal, &mut state, 1, true)
-            .expect("zero-sized flush must defer");
-        assert!(state.transcript.is_empty());
-        assert!(matches!(
-            state.pending_insert.as_slice(),
-            [Line_::Assistant { text, .. }] if text == "defer while minimized"
-        ));
+        terminal.backend_mut().resize(80, 0);
+        rebuild_transcript_from_origin(&mut terminal, &mut state, width)
+            .expect("zero-height replay must defer");
+
+        assert_eq!(state.transcript_rendered_width, width);
+        assert!(state.transcript_needs_rebuild);
+        assert!(transcript_requires_rebuild(&state, width));
+        assert_eq!(state.transcript.len(), 1);
 
         terminal.backend_mut().resize(80, 20);
         terminal.autoresize().expect("restore terminal size");
-        let width = current_transcript_pane_width(&mut terminal, &state).expect("restored width");
-        flush_pending_insert_for_width(&mut terminal, &mut state, width, true)
-            .expect("flush after restore");
-        assert!(state.pending_insert.is_empty());
-        assert!(matches!(
-            state.transcript.as_slice(),
-            [Line_::Assistant { text, .. }] if text == "defer while minimized"
-        ));
+        rebuild_transcript_from_origin(&mut terminal, &mut state, width).expect("restored replay");
+        assert!(!state.transcript_needs_rebuild);
+        assert!(!transcript_requires_rebuild(&state, width));
     }
 
     #[test]
@@ -14553,11 +15021,13 @@ mod tests {
                 ThinkingEffort::Medium,
             );
             let mut tint = false;
+            let chunk_rows = chunked_terminal.size().expect("chunk terminal size").height;
             insert_transcript_items(
                 &mut chunked_terminal,
                 &mut chunked_state,
                 std::slice::from_ref(&item),
                 width,
+                chunk_rows,
                 &mut tint,
             )
             .expect("chunked insert");
@@ -14574,41 +15044,31 @@ mod tests {
     }
 
     #[test]
-    fn resize_replay_uses_leading_trailing_and_forced_bounds() {
-        let start = Instant::now();
-        let mut replay = TranscriptResizeReplay::new(start);
+    fn every_effective_transcript_width_change_requires_rebuild() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
 
-        assert!(replay.should_replay(100, 120, true, start));
-        assert!(!replay.should_replay(90, 100, true, start + Duration::from_millis(25)));
-        assert!(!replay.should_replay(80, 100, true, start + Duration::from_millis(80)));
-        assert!(!replay.should_replay(80, 100, true, start + Duration::from_millis(150)));
-        assert!(replay.should_replay(80, 100, true, start + Duration::from_millis(200)));
-
-        let mut continuous = TranscriptResizeReplay::new(start);
-        assert!(continuous.should_replay(100, 120, true, start));
-        assert!(!continuous.should_replay(90, 100, true, start + Duration::from_millis(100)));
-        assert!(!continuous.should_replay(80, 100, true, start + Duration::from_millis(200)));
-        assert!(continuous.should_replay(70, 100, true, start + RESIZE_REPLAY_MAX_LATENCY));
-        assert!(!continuous.should_replay(
-            60,
-            70,
-            true,
-            start + RESIZE_REPLAY_MAX_LATENCY + Duration::from_millis(25),
-        ));
+        assert!(!transcript_requires_rebuild(&state, 60));
+        state.transcript.push(Line_::Assistant {
+            text: "history".to_string(),
+            dim_prefix: false,
+        });
+        state.transcript_rendered_width = 90;
+        assert!(!transcript_requires_rebuild(&state, 0));
+        assert!(transcript_requires_rebuild(&state, 60));
+        state.transcript_rendered_width = 60;
+        assert!(!transcript_requires_rebuild(&state, 60));
+        state.transcript_needs_rebuild = true;
+        assert!(transcript_requires_rebuild(&state, 60));
     }
 
     #[test]
-    fn resize_replay_without_history_never_defers_viewport_work() {
-        let start = Instant::now();
-        let mut replay = TranscriptResizeReplay::new(start);
-
-        assert!(replay.should_replay(80, 0, false, start));
-        assert!(replay.should_replay(70, 0, false, start + Duration::from_millis(10)));
-        assert!(!replay.burst_active);
-    }
-
-    #[test]
-    fn resize_rebuilds_existing_transcript_for_current_pane_width() {
+    fn width_change_rebuilds_complete_logical_transcript_before_pending_output() {
         use ratatui::backend::TestBackend;
         use ratatui::{Terminal, TerminalOptions, Viewport};
 
@@ -14627,53 +15087,53 @@ mod tests {
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        state.queue(Line_::Assistant {
-            text: "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(5),
-            dim_prefix: false,
-        });
-
-        let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
-        flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
-        assert_eq!(state.transcript.len(), 1);
-        assert_eq!(state.transcript_rendered_width, wide);
-
-        terminal.backend_mut().resize(38, 20);
-        let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
-        assert!(narrow < wide);
-        flush_pending_insert(&mut terminal, &mut state, narrow).expect("narrow flush");
-        assert_eq!(state.transcript.len(), 1);
-        assert_eq!(state.transcript_rendered_width, narrow);
-        assert!(!state.transcript_needs_rebuild);
-
-        let item = state.transcript[0].clone();
-        let key = line_cache_key(&item);
-        let wide_render_width = transcript_render_width(wide);
-        let narrow_render_width = transcript_render_width(narrow);
-        {
-            let entry = state.render_cache.get(&key).expect("cache entry");
-            assert!(entry.renders.contains_key(&wide_render_width));
-            assert!(entry.renders.contains_key(&narrow_render_width));
-            assert!(
-                entry.renders[&narrow_render_width].height
-                    >= entry.renders[&wide_render_width].height
-            );
+        for index in 0..30 {
+            state.queue(Line_::Assistant {
+                text: format!(
+                    "block {index} lorem ipsum dolor sit amet consectetur adipiscing elit"
+                ),
+                dim_prefix: false,
+            });
         }
+        let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
+        flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
+        assert!(terminal.backend().scrollback().area.height > 0);
+        let logical_blocks = state.transcript.len();
 
-        terminal.backend_mut().resize(110, 20);
-        let wider = current_transcript_pane_width(&mut terminal, &state).expect("wider width");
-        assert!(wider > narrow);
-        flush_pending_insert(&mut terminal, &mut state, wider).expect("wider flush");
-        assert_eq!(state.transcript.len(), 1);
-        assert_eq!(state.transcript_rendered_width, wider);
+        terminal.backend_mut().resize(52, 20);
+        let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
+        assert!(transcript_requires_rebuild(&state, narrow));
+        state.queue(Line_::Assistant {
+            text: "queued during resize 界🙂 café".to_string(),
+            dim_prefix: false,
+        });
+
+        terminal.backend_mut().purge_scrollback();
+        rebuild_transcript_from_origin(&mut terminal, &mut state, narrow)
+            .expect("full narrow rebuild");
+        flush_pending_insert(&mut terminal, &mut state, narrow).expect("pending narrow flush");
+
+        assert_eq!(state.transcript_rendered_width, narrow);
         assert!(!state.transcript_needs_rebuild);
-
-        let wider_render_width = transcript_render_width(wider);
-        let entry = state.render_cache.get(&key).expect("cache entry");
-        assert!(entry.renders.contains_key(&wider_render_width));
+        assert!(!transcript_requires_rebuild(&state, narrow));
+        assert_eq!(state.transcript.len(), logical_blocks + 2);
+        let rendered = terminal
+            .backend()
+            .scrollback()
+            .content
+            .iter()
+            .chain(terminal.backend().buffer().content.iter())
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("block 0"), "{rendered}");
+        assert!(rendered.contains("block 29"), "{rendered}");
+        assert!(rendered.contains("queued during resize"), "{rendered}");
+        assert!(rendered.contains('界'), "{rendered}");
+        assert!(rendered.contains('🙂'), "{rendered}");
     }
 
     #[test]
-    fn pending_insert_waits_for_settled_transcript_width() {
+    fn simultaneous_width_and_height_shrink_replays_from_origin() {
         use ratatui::backend::TestBackend;
         use ratatui::{Terminal, TerminalOptions, Viewport};
 
@@ -14692,41 +15152,38 @@ mod tests {
             ApprovalProfile::Ask,
             ThinkingEffort::Medium,
         );
-        state.queue(Line_::Assistant {
-            text: "first block".to_string(),
-            dim_prefix: false,
-        });
+        for index in 0..40 {
+            state.queue(Line_::Assistant {
+                text: format!("full-screen shrink block {index:02} with wrapped text"),
+                dim_prefix: false,
+            });
+        }
         let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
         flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
+        let logical_len = state.transcript.len();
 
-        terminal.backend_mut().resize(50, 20);
+        terminal.backend_mut().resize(36, 6);
         let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
-        state.queue(Line_::Assistant {
-            text: "queued during resize".to_string(),
-            dim_prefix: false,
-        });
-        state.input = "live resize".to_string();
-        state.cursor = state.input.len();
-        flush_pending_insert_for_width(&mut terminal, &mut state, narrow, false)
-            .expect("deferred resize flush");
-        let mut frame_width = 0;
-        terminal
-            .draw(|frame| {
-                frame_width = frame.area().width;
-                draw(frame, &mut state);
-            })
-            .expect("draw latest viewport width");
-        assert_eq!(frame_width, 50);
-        assert_eq!(state.input_area.width, 50);
-        assert_eq!(state.transcript.len(), 1);
-        assert_eq!(state.pending_insert.len(), 2);
-        assert_eq!(state.transcript_rendered_width, wide);
+        assert!(transcript_requires_rebuild(&state, narrow));
+        terminal.backend_mut().purge_scrollback();
+        rebuild_transcript_from_origin(&mut terminal, &mut state, narrow)
+            .expect("full-screen rebuild");
 
-        flush_pending_insert_for_width(&mut terminal, &mut state, narrow, true)
-            .expect("settled resize flush");
-        assert!(state.pending_insert.is_empty());
-        assert_eq!(state.transcript.len(), 3);
+        assert_eq!(state.transcript.len(), logical_len);
         assert_eq!(state.transcript_rendered_width, narrow);
+        assert_eq!(terminal.get_frame().area().top(), 0);
+        assert_eq!(terminal.get_frame().area().height, 6);
+        assert!(terminal.backend().scrollback().area.height > 0);
+        let rendered = terminal
+            .backend()
+            .scrollback()
+            .content
+            .iter()
+            .chain(terminal.backend().buffer().content.iter())
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("block 00"), "{rendered}");
+        assert!(rendered.contains("block 39"), "{rendered}");
     }
 
     #[test]
@@ -15504,6 +15961,40 @@ mod tests {
         let flat = flatten_lines(&text);
         let joined = flat.join("\n");
         assert!(joined.contains("7"));
+    }
+
+    #[test]
+    fn generic_slash_lines_use_faded_info_presentation() {
+        let text = line_to_text(&Line_::Info("thinking effort: high".to_string()), 80);
+        assert_eq!(flatten_lines(&text), vec!["• thinking effort: high"]);
+        let style = span_style_for(&text, "thinking effort: high").expect("info style");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+        assert!(style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn slash_lines_keep_structured_layout_without_ansi_or_info_bullets() {
+        let plain = line_to_text(
+            &Line_::Slash("Heading\n  /help   show help".to_string()),
+            80,
+        );
+        assert_eq!(
+            flatten_lines(&plain),
+            vec!["Heading", "  /help   show help"]
+        );
+
+        let styled = line_to_text(
+            &Line_::Slash("\x1b[1mHeading\x1b[0m\n  /help   show help".to_string()),
+            80,
+        );
+        assert_eq!(
+            flatten_lines(&styled),
+            vec!["Heading", "  /help   show help"]
+        );
+        assert!(
+            span_style_for(&styled, "Heading")
+                .is_some_and(|style| style.add_modifier.contains(Modifier::BOLD))
+        );
     }
 
     #[test]

@@ -408,6 +408,8 @@ pub(crate) struct ObjectiveTracker {
     pub(crate) summary: String,
     pub(crate) checkpoints: Vec<String>,
     pub(crate) apply_fixes_requested: bool,
+    pub(crate) advisory_only_requested: bool,
+    pub(crate) plan_execution_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,17 +567,160 @@ fn explicit_implementation_requested(lowered: &str) -> bool {
         &["fix", "them"],
         &["fix", "this"],
         &["fix", "the"],
+        &["fix", "anything"],
+        &["fix", "any"],
+        &["fix", "issues"],
+        &["fix", "errors"],
+        &["fix", "bugs"],
+        &["fix", "problems"],
+        &["fix", "whatever"],
         &["implement"],
+        &["execute", "the", "plan"],
+        &["execute", "that", "plan"],
+        &["start", "implementation"],
+        &["proceed", "with", "implementation"],
+        &["proceed", "with", "the", "plan"],
+        &["go", "ahead"],
+        &["rip", "it", "out"],
+        &["rip", "out"],
         &["patch"],
         &["merge"],
         &["go", "for", "it"],
         &["handle", "my", "todo"],
         &["make", "changes"],
         &["update", "the", "code"],
+        &["update", "docs"],
+        &["update", "documentation"],
+        &["update", "tests"],
         &["do", "it"],
     ]
     .iter()
+    .any(|sequence| contains_non_negated_sequence(lowered, sequence))
+}
+
+fn planning_requested_as_action(words: &[&str]) -> bool {
+    for (index, word) in words.iter().enumerate() {
+        if *word != "plan" {
+            continue;
+        }
+        if words.get(index + 1).is_some_and(|next| {
+            matches!(
+                *next,
+                "mode" | "command" | "feature" | "implementation" | "workflow" | "slash"
+            )
+        }) {
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|i| words.get(i)).copied();
+        let polite = index >= 2
+            && matches!(
+                words.get(index - 2).copied(),
+                Some("can" | "could" | "would")
+            )
+            && words.get(index - 1) == Some(&"you");
+        let lets = index >= 2
+            && words.get(index - 2) == Some(&"let")
+            && words.get(index - 1) == Some(&"s");
+        if index == 0
+            || polite
+            || lets
+            || matches!(
+                previous,
+                Some(
+                    "please"
+                        | "first"
+                        | "then"
+                        | "also"
+                        | "just"
+                        | "only"
+                        | "create"
+                        | "draft"
+                        | "propose"
+                        | "produce"
+                        | "outline"
+                        | "lets"
+                        | "to"
+                        | "me"
+                )
+            )
+        {
+            return true;
+        }
+    }
+    [
+        &["want", "a", "plan"][..],
+        &["want", "to", "plan"],
+        &["need", "a", "plan"],
+        &["give", "me", "a", "plan"],
+        &["show", "me", "a", "plan"],
+        &["come", "up", "with", "a", "plan"],
+    ]
+    .iter()
+    .any(|sequence| {
+        words
+            .windows(sequence.len())
+            .any(|window| window == *sequence)
+    })
+}
+
+fn explicit_no_mutation_requested(lowered: &str) -> bool {
+    [
+        &["plan", "only"][..],
+        &["only", "plan"],
+        &["just", "plan"],
+        &["do", "not", "implement"],
+        &["do", "not", "fix"],
+        &["do", "not", "patch"],
+        &["do", "not", "make", "changes"],
+        &["do", "not", "make", "any", "changes"],
+        &["do", "not", "change", "anything"],
+        &["do", "not", "edit", "anything"],
+        &["do", "not", "modify", "anything"],
+        &["don", "t", "implement"],
+        &["don", "t", "fix"],
+        &["don", "t", "patch"],
+        &["don", "t", "make", "changes"],
+        &["don", "t", "change", "anything"],
+        &["don", "t", "edit", "anything"],
+        &["dont", "implement"],
+        &["dont", "fix"],
+        &["dont", "patch"],
+        &["dont", "make", "changes"],
+        &["dont", "change", "anything"],
+        &["dont", "edit", "anything"],
+        &["no", "changes", "yet"],
+        &["no", "edits", "yet"],
+        &["without", "making", "changes"],
+        &["without", "editing"],
+        &["without", "modifying"],
+        &["look", "but", "don", "t", "touch"],
+        &["look", "but", "dont", "touch"],
+    ]
+    .iter()
     .any(|sequence| contains_word_sequence(lowered, sequence))
+}
+
+fn planned_execution_requested(lowered: &str) -> bool {
+    let words = normalized_words(lowered);
+    if matches!(
+        words.as_slice(),
+        ["go"] | ["proceed"] | ["approved"] | ["ship", "it"] | ["continue", "work"]
+    ) {
+        return true;
+    }
+    [
+        &["execute", "the", "plan"][..],
+        &["execute", "that", "plan"],
+        &["implement", "the", "plan"],
+        &["implement", "that", "plan"],
+        &["proceed", "with", "the", "plan"],
+        &["start", "implementation"],
+        &["go", "ahead"],
+        &["go", "for", "it"],
+        &["do", "it"],
+    ]
+    .iter()
+    .any(|sequence| contains_non_negated_sequence(lowered, sequence))
 }
 
 fn explicit_apply_fixes_requested(lowered: &str) -> bool {
@@ -598,6 +743,8 @@ impl ObjectiveTracker {
                 summary: "(empty prompt)".to_string(),
                 checkpoints: Vec::new(),
                 apply_fixes_requested: false,
+                advisory_only_requested: false,
+                plan_execution_requested: false,
             };
         }
 
@@ -606,13 +753,26 @@ impl ObjectiveTracker {
         let cleanup_requested = cleanup_requested_as_action(&words);
         let commit_requested = commit_requested_as_action(&words);
         let implementation_requested = explicit_implementation_requested(&lowered);
-        let apply_fixes_requested = explicit_apply_fixes_requested(&lowered);
+        // A trailing question mark means the user is asking about proceeding,
+        // not granting approval; never inject the implementation policy for it.
+        let plan_execution_requested =
+            !compact.ends_with('?') && planned_execution_requested(&lowered);
+        let apply_fixes_requested =
+            explicit_apply_fixes_requested(&lowered) || plan_execution_requested;
+        let planning_requested = planning_requested_as_action(&words);
+        let analysis_requested = any_word_starts_with(&words, &["analy", "review"]);
+        // Explicit mutation intent wins: a "don't touch X" scoping clause inside
+        // a fix request must not demote the turn to advisory.
+        let advisory_only_requested = !apply_fixes_requested
+            && (explicit_no_mutation_requested(&lowered)
+                || planning_requested
+                || analysis_requested);
         let mut checkpoints: Vec<String> = Vec::new();
 
-        if any_word_starts_with(&words, &["plan"]) {
+        if planning_requested {
             checkpoints.push("produce execution plan".to_string());
         }
-        if any_word_starts_with(&words, &["analy", "review"]) {
+        if analysis_requested {
             checkpoints.push("analyze current behavior and constraints".to_string());
         }
         if implementation_requested {
@@ -654,11 +814,21 @@ impl ObjectiveTracker {
             summary,
             checkpoints,
             apply_fixes_requested,
+            advisory_only_requested,
+            plan_execution_requested,
         }
     }
 
     pub(crate) fn apply_fixes_allowed(&self) -> bool {
         self.apply_fixes_requested
+    }
+
+    pub(crate) fn advisory_only(&self) -> bool {
+        self.advisory_only_requested
+    }
+
+    pub(crate) fn planned_execution(&self) -> bool {
+        self.plan_execution_requested
     }
 
     pub(crate) fn display_line(&self) -> String {
@@ -914,7 +1084,6 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                         "recall.md",
                         "pending",
                         "follow-up",
-                        "dext.md",
                     ],
                 )
         }
@@ -1114,7 +1283,7 @@ fn commands_contain(commands: &[String], needles: &[&str]) -> bool {
 }
 
 fn is_decision_log_path(path: &str) -> bool {
-    path.ends_with("recall.md") || path.ends_with("DEXT.md")
+    path.to_ascii_lowercase().ends_with("recall.md")
 }
 
 fn adaptive_tool_cap_for_pressure(
@@ -1774,6 +1943,66 @@ mod tests {
             "{:?}",
             terse.checkpoints
         );
+    }
+
+    #[test]
+    fn advisory_and_plan_execution_intent_detection() {
+        for advisory in [
+            "plan the auth refactor",
+            "please plan the migration first",
+            "plan the removal, do not implement",
+            "let's plan how to restructure the session store",
+            "give me a plan for the upgrade",
+            "review dext for bugs",
+            "analyze the resize flicker, no changes yet",
+            "how does compaction work? don't change anything",
+        ] {
+            let tracker = ObjectiveTracker::from_user_prompt(advisory);
+            assert!(tracker.advisory_only(), "{advisory}");
+            assert!(!tracker.apply_fixes_allowed(), "{advisory}");
+        }
+
+        for mutating in [
+            "fix the read-only sandbox bug",
+            "fix the bug but don't change anything else",
+            "plan then implement the retry backoff",
+            "review the flow, then apply fixes",
+            "review plan mode and rip it out",
+            "update docs for the new flag",
+        ] {
+            let tracker = ObjectiveTracker::from_user_prompt(mutating);
+            assert!(!tracker.advisory_only(), "{mutating}");
+            assert!(tracker.apply_fixes_allowed(), "{mutating}");
+        }
+
+        for approval in [
+            "go",
+            "proceed",
+            "approved",
+            "ship it",
+            "go ahead",
+            "proceed with the plan",
+            "execute the plan",
+        ] {
+            let tracker = ObjectiveTracker::from_user_prompt(approval);
+            assert!(tracker.planned_execution(), "{approval}");
+            assert!(tracker.apply_fixes_allowed(), "{approval}");
+            assert!(!tracker.advisory_only(), "{approval}");
+        }
+
+        for neutral in [
+            "summarize the team's commitment risks",
+            "what cleanup is still pending?",
+            "the plan mode code is in main.rs",
+            "we should not go with option B",
+            "should I go ahead?",
+            "how should I go ahead with this?",
+            "execute the plan?",
+        ] {
+            let tracker = ObjectiveTracker::from_user_prompt(neutral);
+            assert!(!tracker.planned_execution(), "{neutral}");
+            assert!(!tracker.advisory_only(), "{neutral}");
+        }
     }
 
     #[test]

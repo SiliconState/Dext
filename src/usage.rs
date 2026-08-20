@@ -422,15 +422,19 @@ pub(crate) fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
         return Some(UsagePricing::default());
     }
     if model.contains("fable") {
-        // Inferred from Anthropic Console billing for claude-fable-5 until public rates are listed.
-        Some(UsagePricing::new(
-            11.721718363700392,
-            58.60859181850196,
-            1.1721718363700393,
-            14.65214795462549,
-        ))
+        Some(UsagePricing::new(10.0, 50.0, 1.0, 12.5))
+    } else if [
+        "opus-5", "opus5", "opus-4-5", "opus-4.5", "opus-4-6", "opus-4.6", "opus-4-7", "opus-4.7",
+        "opus-4-8", "opus-4.8",
+    ]
+    .iter()
+    .any(|generation| model.contains(generation))
+    {
+        Some(UsagePricing::new(5.0, 25.0, 0.5, 6.25))
     } else if model.contains("opus") {
         Some(UsagePricing::new(15.0, 75.0, 1.5, 18.75))
+    } else if model.contains("sonnet-5") || model.contains("sonnet5") {
+        Some(UsagePricing::new(2.0, 10.0, 0.2, 2.5))
     } else if model.contains("sonnet") {
         Some(UsagePricing::new(3.0, 15.0, 0.3, 3.75))
     } else if model.contains("haiku-4-5") || model.contains("haiku-4.5") {

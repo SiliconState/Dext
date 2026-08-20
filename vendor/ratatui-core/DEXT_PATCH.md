@@ -2,7 +2,7 @@
 
 Upstream: `ratatui-core 0.1.2` from crates.io.
 
-Dext uses this exact vendored source through the root `[patch.crates-io]` entry. The patch preserves Dext's inline viewport and native-scrollback behavior on the current Ratatui stack. It must remain small and should be removed when a released upstream version passes Dext's PTY and WSL checks without it.
+Dext uses this exact vendored source through the root `[patch.crates-io]` entry. The patch preserves Dext's inline viewport and ordinary native-scrollback behavior on the current Ratatui stack, with the documented full-ownership resize rebuild. It must remain small and should be removed when a released upstream version passes Dext's PTY and WSL checks without it.
 
 ## Patch hunks
 
@@ -13,10 +13,12 @@ Dext uses this exact vendored source through the root `[patch.crates-io]` entry.
 - `src/terminal/inline.rs`
   - The no-scrolling-regions `insert_before` fallback calls `clear_viewport` directly instead of the public cursor-preserving `clear`.
   - Reason: this path has already positioned the cursor and does not need another backend round trip for every insertion chunk.
+  - Adds `Terminal::reset_inline_viewport`, which clears the visible display, resets both diff buffers, anchors an inline viewport at the terminal origin, and avoids a cursor query.
+  - Reason: Dext clears the still-visible stale-width display before purging scrollback on every effective transcript-pane width change; the complete logical transcript must then replay from a known origin without racing Crossterm's input reader or retaining a duplicate intro.
 
 - `src/terminal/resize.rs`
   - Horizontal shrink retains `ClearType::All` for fullscreen/fixed viewports but skips it for inline viewports.
-  - Reason: a whole-display clear flashes native scrollback and exposes transcript replay. The following viewport clear plus complete draw repaints Dext's inline surface.
+  - Reason: OS-level horizontal shrink must not perform an extra whole-display clear before Dext's owned synchronized clear/purge/full replay. Dext performs that replay immediately for every effective transcript-pane width change.
 
 ## Refresh procedure
 

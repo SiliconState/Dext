@@ -134,6 +134,14 @@ impl TestBackend {
         &self.scrollback
     }
 
+    /// Clears the simulated terminal scrollback buffer.
+    pub fn purge_scrollback(&mut self) {
+        self.scrollback = Buffer::empty(Rect {
+            width: self.buffer.area.width,
+            ..Rect::ZERO
+        });
+    }
+
     /// Resizes the `TestBackend` to the specified width and height.
     pub fn resize(&mut self, width: u16, height: u16) {
         self.buffer.resize(Rect::new(0, 0, width, height));

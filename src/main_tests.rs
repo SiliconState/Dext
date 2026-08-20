@@ -97,6 +97,7 @@ fn test_agent(root: &Path) -> Agent {
         git_context: None,
         silent: true,
         pretty: false,
+        slash_render_width: None,
         max_iterations: Some(1),
         session_usage: Usage::default(),
         last_request_usage: Usage::default(),
@@ -110,6 +111,7 @@ fn test_agent(root: &Path) -> Agent {
         pending_pack_runtime_prompts: Vec::new(),
         project_extensions_approved: None,
         suppress_pack_activation: false,
+        turn_policy_note: None,
         state_lock: None,
         session_enabled: true,
         session_id: session_id.clone(),
@@ -5621,6 +5623,8 @@ fn slash_routing_distinguishes_commands_from_absolute_and_wsl_paths() {
         "/track",
         "/branches",
         "/browser-recipe",
+        "/plan",
+        "/plan this change",
     ] {
         assert!(!is_slash_command(retired), "{retired}");
     }
@@ -7311,8 +7315,9 @@ fn sessions_listing_includes_project_latest_without_named_sessions() -> Result<(
         assert!(listing.contains("latest"), "{listing}");
         assert!(listing.contains("Named"), "{listing}");
         let project_named_dir = named_sessions_dir_for_root(&project);
+        let compact = listing.split_whitespace().collect::<String>();
         assert!(
-            listing.contains(&format!("none in {}", project_named_dir.display())),
+            compact.contains(&format!("nonein{}", project_named_dir.display())),
             "{listing}"
         );
         assert!(listing.contains("use /save <name>"), "{listing}");
@@ -7367,8 +7372,17 @@ fn named_sessions_are_project_scoped_by_default() -> Result<()> {
         assert_ne!(alpha_path, beta_path);
         assert_eq!(resolve_session_selector(&alpha, "shared")?, alpha_path);
         assert_eq!(resolve_session_selector(&beta, "shared")?, beta_path);
-        assert!(render_session_listing(&alpha).contains(&alpha_path.display().to_string()));
-        assert!(render_session_listing(&beta).contains(&beta_path.display().to_string()));
+        for (project, path) in [(&alpha, &alpha_path), (&beta, &beta_path)] {
+            let listing = render_session_listing_width(project, Some(40));
+            let compact = listing.split_whitespace().collect::<String>();
+            assert!(compact.contains(&path.display().to_string()), "{listing}");
+            assert!(
+                listing
+                    .lines()
+                    .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 40),
+                "{listing}"
+            );
+        }
         Ok(())
     })();
 
@@ -9059,6 +9073,72 @@ fn later_tool_in_round_checkpoints_state_from_earlier_mutation() {
 }
 
 #[test]
+fn recall_native_writes_enforce_exact_four_kib_cap() {
+    let root = temp_test_dir("recall-write-cap");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+
+    let exact = "x".repeat(RECALL_MEMORY_MAX_BYTES);
+    let mut exact_state = orchestrator::TurnRuntimeState::new();
+    let exact_outcome = runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-recall-exact".to_string(),
+                "write_file".to_string(),
+                json!({"path": "recall.md", "content": exact}),
+            )],
+            iterations: 1,
+            turn_id: "turn-recall-exact".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut exact_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute exact recall write");
+    assert!(exact_outcome.mutation_succeeded);
+    assert_eq!(
+        std::fs::read(root.join("recall.md")).unwrap().len(),
+        RECALL_MEMORY_MAX_BYTES
+    );
+
+    let mut oversized_state = orchestrator::TurnRuntimeState::new();
+    let oversized_outcome = runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-recall-oversized".to_string(),
+                "write_file".to_string(),
+                json!({"path": "recall.md", "content": "y".repeat(RECALL_MEMORY_MAX_BYTES + 1)}),
+            )],
+            iterations: 2,
+            turn_id: "turn-recall-oversized".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut oversized_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("reject oversized recall write");
+    assert!(!oversized_outcome.mutation_succeeded);
+    assert_eq!(
+        std::fs::read(root.join("recall.md")).unwrap().len(),
+        RECALL_MEMORY_MAX_BYTES
+    );
+    let (content, _) = last_tool_result(&agent.history).expect("oversized tool result");
+    assert!(
+        content.contains("4096-byte working-memory cap"),
+        "{content}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn interrupted_builtin_call_refuses_to_start_work() {
     let root = temp_test_dir("builtin-interrupt-refuses-start");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -9553,6 +9633,79 @@ fn privacy_redacts_sensitive_tool_output_and_strict_mode_blocks_secret_paths() {
     }
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recall_memory_targeting_and_tool_inputs_are_case_insensitive_and_redacted() {
+    let root = temp_test_dir("recall-input-redaction");
+    let policy = PrivacyPolicy::default();
+
+    assert!(is_recall_memory_file(Path::new("recall.md")));
+    assert!(is_recall_memory_file(Path::new("nested/RECALL.MD")));
+    assert!(!is_recall_memory_file(Path::new("recall.md.bak")));
+
+    let secret = format!("API_{}={}", "KEY", "abcdefghijklmnop");
+    for (tool, mut input) in [
+        (
+            "write_file",
+            json!({"path": "RECALL.MD", "content": secret.clone()}),
+        ),
+        (
+            "edit_file",
+            json!({"path": "notes/recall.md", "old_string": secret.clone(), "new_string": secret.clone()}),
+        ),
+        (
+            "multi_edit",
+            json!({"path": "recall.md", "edits": [{"old_string": secret.clone(), "new_string": secret.clone()}]}),
+        ),
+    ] {
+        assert!(policy.redact_recall_tool_input(tool, &mut input, &root));
+        let serialized = input.to_string();
+        assert!(!serialized.contains("abcdefghijklmnop"), "{serialized}");
+        assert!(serialized.contains("[REDACTED_SECRET]"), "{serialized}");
+    }
+
+    let mut unrelated = json!({"path": "recall.md.bak", "content": secret.clone()});
+    assert!(!policy.redact_recall_tool_input("write_file", &mut unrelated, &root));
+    assert_eq!(unrelated["content"], secret.as_str());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn recall_tool_inputs_are_redacted_before_assistant_history_persistence() {
+    let root = temp_test_dir("recall-history-redaction");
+    let policy = PrivacyPolicy::default();
+    let secret = format!("API_{}={}", "KEY", "abcdefghijklmnop");
+    let redacted = format!("API_{}={}", "KEY", "[REDACTED_SECRET]");
+    let mut blocks = vec![
+        Block::ToolUse {
+            id: "recall-write".to_string(),
+            name: "write_file".to_string(),
+            input: json!({"path": "recall.md", "content": secret.clone()}),
+        },
+        Block::ToolUse {
+            id: "ordinary-write".to_string(),
+            name: "write_file".to_string(),
+            input: json!({"path": "notes.md", "content": secret.clone()}),
+        },
+    ];
+
+    sanitize_recall_tool_inputs_for_history(&mut blocks, &policy, &root);
+
+    let Block::ToolUse { input: recall, .. } = &blocks[0] else {
+        panic!("expected recall tool use");
+    };
+    assert_eq!(recall["content"], redacted);
+    let Block::ToolUse {
+        input: ordinary, ..
+    } = &blocks[1]
+    else {
+        panic!("expected ordinary tool use");
+    };
+    assert_eq!(ordinary["content"], secret);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -16436,6 +16589,74 @@ fn compose_system_parts_caps_dext_md() {
 }
 
 #[test]
+fn turn_policy_note_rides_volatile_env_only_when_set() {
+    let root = temp_test_dir("turn-policy-env");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+
+    let (_, env) = agent.compose_system_parts();
+    assert!(!env.contains("Turn policy"), "{env}");
+
+    agent.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+    let (stable, env) = agent.compose_system_parts();
+    assert!(env.contains("## Turn policy"), "{env}");
+    assert!(env.contains("advisory_only=true"), "{env}");
+    assert!(env.contains("read_file, read_symbol, fd, rg"), "{env}");
+    assert!(
+        !stable.contains("advisory_only=true"),
+        "turn policy must stay out of the cached stable block: {stable}"
+    );
+
+    agent.turn_policy_note = Some(IMPLEMENTATION_TURN_RUNTIME_NOTE);
+    let (_, env) = agent.compose_system_parts();
+    assert!(env.contains("implementation_authorized=true"), "{env}");
+    assert!(env.contains("todo_write"), "{env}");
+
+    agent.turn_policy_note = None;
+    let (_, env) = agent.compose_system_parts();
+    assert!(!env.contains("Turn policy"), "{env}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn steering_updates_turn_policy_note() {
+    let root = temp_test_dir("steering-turn-policy");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+
+    agent.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+    agent.update_turn_policy_from_steering("go ahead and fix it");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(IMPLEMENTATION_TURN_RUNTIME_NOTE)
+    );
+
+    agent.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+    agent.update_turn_policy_from_steering("also fix the typo in the docs");
+    assert_eq!(agent.turn_policy_note, None);
+
+    agent.update_turn_policy_from_steering("actually don't change anything yet");
+    assert_eq!(agent.turn_policy_note, Some(ADVISORY_TURN_RUNTIME_NOTE));
+
+    agent.update_turn_policy_from_steering("src/main.rs");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(ADVISORY_TURN_RUNTIME_NOTE),
+        "neutral steering must leave the policy untouched"
+    );
+
+    agent.update_turn_policy_from_steering("should I go ahead?");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(ADVISORY_TURN_RUNTIME_NOTE),
+        "question-shaped steering is not an approval"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn frugal_mode_uses_condensed_context_and_slim_env() {
     let root = temp_test_dir("frugal-system-prompt");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -16882,6 +17103,9 @@ fn prompt_env_values_are_bounded_and_cannot_inject_lines() {
     assert_eq!(prompt_env_value("line\nbreak", 5), r#""...""#);
     assert_eq!(prompt_env_value("line\nbreak", 4), "....");
     assert_eq!(prompt_env_value("anything", 0), "");
+    assert_eq!(utc_date_from_unix_secs(0), "1970-01-01");
+    assert_eq!(utc_date_from_unix_secs(86_400), "1970-01-02");
+    assert_eq!(utc_date_from_unix_secs(951_782_400), "2000-02-29");
     for cap in 0..32 {
         assert!(
             prompt_env_value(&"\n\u{2028}\u{2029}".repeat(100), cap).len() <= cap,
@@ -16931,6 +17155,23 @@ fn compose_system_parts_quotes_unsafe_environment_values() {
     assert!(first_line.contains(r#"git="branch\n## Fake git""#));
     assert!(first_line.contains(r#"provider="custom provider\n## Fake provider""#));
     assert!(first_line.contains(r#"model="model name\n## Fake model""#));
+    assert!(
+        first_line.contains(&format!("session={}", agent.session_id)),
+        "{first_line}"
+    );
+    let date = first_line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("date="))
+        .expect("environment date");
+    assert_eq!(date.len(), 10, "{date}");
+    assert_eq!(&date[4..5], "-");
+    assert_eq!(&date[7..8], "-");
+    assert!(
+        date.chars()
+            .enumerate()
+            .all(|(index, ch)| matches!(index, 4 | 7) || ch.is_ascii_digit()),
+        "{date}"
+    );
     assert_eq!(parts.env.matches("## Fake").count(), 4, "{}", parts.env);
     assert!(!parts.env.lines().any(|line| line.starts_with("## Fake")));
     let dext_label = json_prompt_string("ancestor\n## Fake DEXT source\u{2028}tail");
@@ -16997,8 +17238,18 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
             .strip_prefix(&cwd_prefix)
             .unwrap_or_else(|| panic!("unexpected cwd prefix: {}", parts.env))
     );
+    let emitted_date = canonical_env
+        .lines()
+        .nth(1)
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("date="))
+        })
+        .expect("canonical environment date");
     let expected_env = format!(
-        "## Environment\ncwd=/work/new-repo os=linux git=main provider=provider model=model effort=medium context=standard approval=ask sandbox=workspace-write\n\n## Work ledger\ncurrent_phase: probe\n\n## Context State\nActive checkpoints:\n- [unresolved] deliver requested outcome with verifiable steps\n{}\n",
+        "## Environment\ncwd=/work/new-repo os=linux git=main provider=provider model=model effort=medium context=standard approval=ask sandbox=workspace-write session={} date={}\n\n## Work ledger\ncurrent_phase: probe\n\n## Context State\nActive checkpoints:\n- [unresolved] deliver requested outcome with verifiable steps\n{}\n",
+        agent.session_id,
+        emitted_date,
         agent.privacy.prompt_status_line()
     );
 
@@ -17067,6 +17318,8 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
         " context=standard",
         " approval=ask",
         " sandbox=workspace-write",
+        &format!(" session={}", agent.session_id),
+        " date=",
         "privacy=redact",
     ] {
         assert!(
@@ -17144,6 +17397,28 @@ fn slash_tools_switches_specialized_tool_visibility() {
 }
 
 #[test]
+fn slash_presentation_distinguishes_structured_views_and_faded_confirmations() {
+    let root = temp_test_dir("slash-presentation");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    assert_eq!(handle_slash("/help", &mut agent), Some(true));
+    assert_eq!(handle_slash("/effort high", &mut agent), Some(true));
+
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::StructuredSlash(text) if text.contains("Commands"))
+    ));
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Slash(text) if text.contains("thinking effort: high"))
+    ));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn slash_allow_and_allowed_include_active_runtime_tools() {
     let root = temp_test_dir("slash-runtime-allow");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -17200,7 +17475,7 @@ fn slash_system_displays_composed_prompt_with_project_context() {
     let slash = drain_events(&mut rx)
         .into_iter()
         .find_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .unwrap_or_default();
@@ -17230,6 +17505,112 @@ fn compose_system_parts_includes_recall_md() {
     assert!(stable.contains("keep tool evidence concise"), "{stable}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recall_prompt_injection_has_one_aggregate_four_kib_payload_budget() {
+    let root = temp_test_dir("recall-aggregate-prompt-cap");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    let mut agent = test_agent(&root);
+    agent.system = "base-system".to_string();
+    let first = "x".repeat(3_000);
+    let second = "y".repeat(3_000);
+    *agent.prompt_scan_cache.lock().expect("prompt scan cache") = Some(PromptScanCache {
+        epoch: agent.prompt_scan_epoch,
+        include_project_extensions: false,
+        dext_md: PromptContextScan::default(),
+        recall: PromptContextScan {
+            sections: vec![
+                (
+                    "ancestor".to_string(),
+                    root.join("ancestor-recall.md"),
+                    first.clone(),
+                    sha256_hex_str(&first),
+                ),
+                (
+                    ".".to_string(),
+                    root.join("recall.md"),
+                    second.clone(),
+                    sha256_hex_str(&second),
+                ),
+            ],
+            ..PromptContextScan::default()
+        },
+        pack_summary: None,
+        shelf_summary: None,
+    });
+
+    let parts = agent.compose_system_details();
+    let payload_bytes = parts.stable.matches('x').count() + parts.stable.matches('y').count();
+    assert!(payload_bytes <= RECALL_MEMORY_MAX_BYTES, "{payload_bytes}");
+    assert_eq!(parts.stable.matches('x').count(), first.len());
+    assert!(parts.stable.matches('y').count() < second.len());
+    assert!(
+        parts
+            .stable
+            .contains("recall.md capped at 4096 bytes total"),
+        "{}",
+        parts.stable
+    );
+    assert_eq!(parts.prompt_sources.len(), 2);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn recall_journal_digest_uses_redacted_input() {
+    let _guard = env_lock();
+    let root = temp_test_dir("recall-journal-redaction");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let secret = format!("API_{}={}", "KEY", "abcdefghijklmnop");
+    let raw_input = json!({"path": "recall.md", "content": secret});
+    let mut expected_input = raw_input.clone();
+    assert!(
+        agent
+            .privacy
+            .redact_recall_tool_input("write_file", &mut expected_input, &root)
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-recall-journal".to_string(),
+                "write_file".to_string(),
+                raw_input.clone(),
+            )],
+            iterations: 1,
+            turn_id: "turn-recall-journal".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute journaled recall write");
+
+    let entries = tool_journal::load_for_session_file(&agent.latest_session_path)
+        .expect("load tool journal")
+        .expect("tool journal entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].input_sha256,
+        tool_journal::input_sha256(&expected_input).expect("redacted input digest")
+    );
+    assert_ne!(
+        entries[0].input_sha256,
+        tool_journal::input_sha256(&raw_input).expect("raw input digest")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("recall.md")).expect("read redacted recall"),
+        expected_input["content"].as_str().unwrap()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -17550,7 +17931,8 @@ fn systems_preserve_tool_protocol_guardrails_and_table_guidance() {
         "bash/sudo discovery",
         "address it in the response",
         "For nontrivial work use todo",
-        "modify neither unless asked",
+        "Treat DEXT.md as human-authored policy and never modify it",
+        "Treat recall.md as working memory governed by applicable DEXT.md guidance",
         "Prefer native tools",
         "fd for files, rg for text/symbols",
         "Parallelize independent reads",
@@ -17841,6 +18223,36 @@ fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> 
         for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             assert_eq!(model_context_window(model), 1_050_000, "{model}");
         }
+        Ok(())
+    };
+
+    unsafe {
+        std::env::remove_var("DEXT_HOME");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn model_context_window_uses_builtin_anthropic_profile_when_catalog_isolated() -> Result<()> {
+    let _guard = env_lock();
+    clear_cached_local_llama_context_windows();
+    let root = temp_test_dir("ctx-window-builtin-anthropic");
+    let root = std::fs::canonicalize(&root)?;
+    unsafe {
+        std::env::set_var("DEXT_HOME", &root);
+        std::env::remove_var("DEXT_CONTEXT_WINDOW");
+        std::env::remove_var("DEXT_CONTEXT_WINDOW_TOKENS");
+    }
+
+    let result = {
+        for model in ["claude-sonnet-5", "claude-opus-5", "claude-fable-5"] {
+            assert_eq!(model_context_window(model), 1_000_000, "{model}");
+        }
+        assert_eq!(model_context_window("claude-sonnet-4-6"), 200_000);
+        assert_eq!(model_context_window("claude-opus-4-8"), 200_000);
         Ok(())
     };
 
@@ -19209,7 +19621,7 @@ fn gpt_5_6_pricing_applies_documented_long_context_tier() {
 }
 
 #[test]
-fn anthropic_fable_pricing_matches_console_session_cost() {
+fn anthropic_fable_pricing_matches_published_rates() {
     let pricing = usage_pricing_default_for(
         "anthropic",
         ApiProvider::Anthropic,
@@ -19226,12 +19638,46 @@ fn anthropic_fable_pricing_matches_console_session_cost() {
     let estimate = pricing.estimate(usage);
 
     assert!(
-        (estimate - 5.83).abs() < 0.0001,
-        "expected $5.83, got ${estimate:.8}"
+        (estimate - 4.9736735).abs() < 0.0001,
+        "expected $4.9736735, got ${estimate:.8}"
     );
     assert!((pricing.output / pricing.input - 5.0).abs() < 0.000001);
     assert!((pricing.cache_read / pricing.input - 0.1).abs() < 0.000001);
     assert!((pricing.cache_create / pricing.input - 1.25).abs() < 0.000001);
+}
+
+#[test]
+fn anthropic_generation_pricing_matches_published_rates() {
+    let for_model = |model: &str| {
+        usage_pricing_default_for(
+            "anthropic",
+            ApiProvider::Anthropic,
+            "https://api.anthropic.com",
+            model,
+        )
+    };
+    for (model, input, output, cache_read, cache_create) in [
+        ("claude-sonnet-5", 2.0, 10.0, 0.2, 2.5),
+        ("claude-opus-5", 5.0, 25.0, 0.5, 6.25),
+        ("claude-opus-4-8", 5.0, 25.0, 0.5, 6.25),
+        ("claude-opus-4-6", 5.0, 25.0, 0.5, 6.25),
+        ("claude-opus-4-5-20251101", 5.0, 25.0, 0.5, 6.25),
+        ("claude-opus-4-1", 15.0, 75.0, 1.5, 18.75),
+        ("claude-sonnet-4-6", 3.0, 15.0, 0.3, 3.75),
+        ("claude-fable-5", 10.0, 50.0, 1.0, 12.5),
+    ] {
+        let pricing = for_model(model);
+        assert_eq!(
+            (
+                pricing.input,
+                pricing.output,
+                pricing.cache_read,
+                pricing.cache_create
+            ),
+            (input, output, cache_read, cache_create),
+            "{model}"
+        );
+    }
 }
 
 #[test]
@@ -19253,7 +19699,7 @@ fn anthropic_wire_cost_is_repriced_for_supported_claude_models() {
     agent.finalize_usage_metrics(&mut usage);
 
     assert!(
-        (usage.estimated_cost_usd() - 5.83).abs() < 0.0001,
+        (usage.estimated_cost_usd() - 4.9736735).abs() < 0.0001,
         "expected Anthropic model pricing to override stale wire/default cost, got ${:.8}",
         usage.estimated_cost_usd()
     );
@@ -22184,7 +22630,7 @@ fn oauth_callback_cannot_complete_a_different_provider_login() -> Result<()> {
 }
 
 #[test]
-fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<()> {
+fn anthropic_subscription_body_is_scoped_and_preserves_adaptive_fields() -> Result<()> {
     let root = temp_test_dir("anthropic-subscription-body");
     let root = std::fs::canonicalize(&root)?;
     let profile = built_in_provider_profiles()
@@ -22196,8 +22642,9 @@ fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<(
     agent.api_provider = profile.api_provider;
     agent.provider_profile = Some(profile);
     agent.base_url = "https://api.anthropic.com".to_string();
-    agent.model = "claude-sonnet-4-6".to_string();
+    agent.model = "claude-opus-4-8".to_string();
     agent.auth_kind = RuntimeAuthKind::OAuth;
+    agent.thinking_effort = ThinkingEffort::XHigh;
     agent.history = vec![Message {
         role: "user".to_string(),
         content: vec![Block::Text {
@@ -22221,6 +22668,9 @@ fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<(
         claude_subscription::AGENT_SDK_SYSTEM_PROMPT
     );
     assert_eq!(body["system"][2]["text"], "Dext system");
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert!(body["thinking"].get("display").is_none(), "{body}");
+    assert_eq!(body["output_config"]["effort"], "xhigh");
 
     agent.auth_kind = RuntimeAuthKind::ApiKey;
     let (_, api_body) =
@@ -22228,6 +22678,38 @@ fn anthropic_subscription_body_is_scoped_to_official_oauth_profile() -> Result<(
     let api_body: Value = serde_json::from_slice(&api_body)?;
     assert_eq!(api_body["system"][0]["text"], "Dext system");
     assert_eq!(api_body["system"].as_array().map(Vec::len), Some(1));
+    assert_eq!(api_body["thinking"]["type"], "adaptive");
+    assert!(api_body["thinking"].get("display").is_none(), "{api_body}");
+    assert_eq!(api_body["output_config"]["effort"], "xhigh");
+
+    agent.model = "claude-sonnet-5".to_string();
+    agent.auth_kind = RuntimeAuthKind::OAuth;
+    let (_, sonnet_body) =
+        agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let sonnet_body: Value = serde_json::from_slice(&sonnet_body)?;
+    assert_eq!(
+        sonnet_body["system"][1]["text"],
+        claude_subscription::AGENT_SDK_SYSTEM_PROMPT
+    );
+    assert_eq!(sonnet_body["thinking"]["type"], "adaptive");
+    assert!(
+        sonnet_body["thinking"].get("display").is_none(),
+        "{sonnet_body}"
+    );
+    assert_eq!(sonnet_body["output_config"]["effort"], "xhigh");
+
+    agent.auth_kind = RuntimeAuthKind::ApiKey;
+    let (_, sonnet_api_body) =
+        agent.build_streaming_request("Dext system", "env", &system, &[], "unused")?;
+    let sonnet_api_body: Value = serde_json::from_slice(&sonnet_api_body)?;
+    assert_eq!(sonnet_api_body["system"][0]["text"], "Dext system");
+    assert_eq!(sonnet_api_body["thinking"]["type"], "adaptive");
+    assert!(
+        sonnet_api_body["thinking"].get("display").is_none(),
+        "{sonnet_api_body}"
+    );
+    assert_eq!(sonnet_api_body["output_config"]["effort"], "xhigh");
+    agent.model = "claude-opus-4-8".to_string();
 
     agent.auth_kind = RuntimeAuthKind::OAuth;
     agent.base_url = "https://api.anthropic.com".to_string();
@@ -23516,30 +23998,37 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
     assert_eq!(value["thinking"]["budget_tokens"], 6_144);
     assert!(value.get("output_config").is_none(), "{value}");
 
-    agent.model = "claude-sonnet-4-6".to_string();
-    agent.thinking_effort = ThinkingEffort::Medium;
-    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
-    let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["thinking"]["type"], "adaptive");
-    assert!(value["thinking"].get("display").is_none(), "{value}");
-    assert!(value["thinking"].get("budget_tokens").is_none(), "{value}");
-    assert_eq!(value["output_config"]["effort"], "medium");
-
-    agent.model = "claude-opus-4-8".to_string();
-    agent.thinking_effort = ThinkingEffort::XHigh;
-    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
-    let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["thinking"]["type"], "adaptive");
-    assert!(value["thinking"].get("display").is_none(), "{value}");
-    assert_eq!(value["output_config"]["effort"], "xhigh");
-
-    agent.model = "claude-fable-5".to_string();
-    agent.thinking_effort = ThinkingEffort::Max;
-    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
-    let value: Value = serde_json::from_slice(&body)?;
-    assert_eq!(value["thinking"]["type"], "adaptive");
-    assert!(value["thinking"].get("display").is_none(), "{value}");
-    assert_eq!(value["output_config"]["effort"], "max");
+    for (model, thinking_effort, provider_effort) in [
+        ("claude-sonnet-4-6", ThinkingEffort::Medium, "medium"),
+        ("claude-sonnet-4-6", ThinkingEffort::XHigh, "high"),
+        ("claude-sonnet-4-6", ThinkingEffort::Max, "max"),
+        ("claude-sonnet-5", ThinkingEffort::Medium, "medium"),
+        ("claude-sonnet-5", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-sonnet-5", ThinkingEffort::Max, "max"),
+        ("claude-opus-4-6", ThinkingEffort::High, "high"),
+        ("claude-opus-4-6", ThinkingEffort::XHigh, "high"),
+        ("claude-opus-4-6", ThinkingEffort::Max, "max"),
+        ("claude-opus-4-7", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-opus-4-8", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-opus-5", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-opus-5", ThinkingEffort::Max, "max"),
+        ("claude-fable-5", ThinkingEffort::Max, "max"),
+    ] {
+        agent.model = model.to_string();
+        agent.thinking_effort = thinking_effort;
+        let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+        let value: Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["thinking"]["type"], "adaptive", "{model}");
+        assert!(
+            value["thinking"].get("display").is_none(),
+            "{model}: {value}"
+        );
+        assert!(
+            value["thinking"].get("budget_tokens").is_none(),
+            "{model}: {value}"
+        );
+        assert_eq!(value["output_config"]["effort"], provider_effort, "{model}");
+    }
 
     agent.model = "claude-opus-4-1".to_string();
     agent.thinking_effort = ThinkingEffort::Off;
@@ -23550,6 +24039,26 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+#[test]
+fn anthropic_builtin_catalog_lists_generation_5_models() {
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .expect("anthropic profile");
+    assert_eq!(profile.default_model, "claude-sonnet-4-6");
+    for model in ["claude-sonnet-5", "claude-opus-5", "claude-fable-5"] {
+        assert!(
+            profile.models.iter().any(|entry| entry == model),
+            "{model} missing from builtin catalog"
+        );
+        assert_eq!(
+            profile.model_context_windows.get(model),
+            Some(&1_000_000),
+            "{model}"
+        );
+    }
 }
 
 #[test]
@@ -24798,8 +25307,8 @@ async fn anthropic_unfinished_tool_call_automatically_continues() {
 }
 
 #[tokio::test]
-async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
-    let root = temp_test_dir("anthropic-omitted-thinking-stream");
+async fn anthropic_stream_visible_thinking_reaches_sink_and_preserves_signed_roundtrip() {
+    let root = temp_test_dir("anthropic-visible-thinking-stream");
     let root = std::fs::canonicalize(&root).expect("canonical temp dir");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
@@ -24815,7 +25324,7 @@ async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
             assert!(read > 0, "client closed before sending request headers");
             request.extend_from_slice(&buf[..read]);
         }
-        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-full\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"visible reasoning\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-full\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-redacted\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -24826,14 +25335,26 @@ async fn anthropic_stream_omitted_thinking_preserves_signature_for_roundtrip() {
 
     let mut agent = test_agent(&root);
     agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "claude-sonnet-5".to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
     let resp = reqwest::get(format!("http://{addr}/stream"))
         .await
         .expect("response");
     let ParsedProviderStream { blocks, .. } = agent.read_stream(resp).await.expect("parse stream");
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ThinkingDelta(text) if text == "visible reasoning"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ThinkingBlockComplete(text) if text == "visible reasoning"
+    )));
     assert!(
         matches!(
             blocks.first(),
-            Some(Block::Thinking { text, signature: Some(signature) }) if text.is_empty() && signature == "sig-full"
+            Some(Block::Thinking { text, signature: Some(signature) }) if text == "visible reasoning" && signature == "sig-full"
         ),
         "{blocks:?}"
     );
@@ -25836,67 +26357,6 @@ async fn compact_uses_deterministic_evidence_fallback_when_summary_request_error
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn read_only_plan_suppresses_internal_planner_events_hooks_and_restores_sink() {
-    let root = temp_test_dir("plan-silent-sink");
-    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
-    std::fs::write(
-        root.join("hooks.json"),
-        r#"{"user_prompt":[{"match":"*","command":"printf fired > hook-fired"}]}"#,
-    )
-    .expect("write hooks");
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-    let addr = listener.local_addr().expect("local addr");
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut request = [0u8; 4096];
-        let _ = stream.read(&mut request);
-        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"plan text\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
-    });
-
-    let mut agent = test_agent(&root);
-    agent.api_provider = ApiProvider::OpenAi;
-    agent.provider_id = "local".to_string();
-    agent.provider_requires_api_key = false;
-    agent.api_key.clear();
-    agent.base_url = format!("http://{addr}");
-    agent.model = DEFAULT_LOCAL_MODEL.to_string();
-    agent.hooks = Hooks::load(&root);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    agent.set_sink(Box::new(ChannelSink { tx }));
-
-    let plan = agent
-        .generate_read_only_plan("write a plan")
-        .await
-        .expect("plan completes");
-    assert_eq!(plan, "plan text");
-    assert!(
-        drain_events(&mut rx).is_empty(),
-        "internal planner events must not leak to the active sink"
-    );
-    assert!(
-        !root.join("hook-fired").exists(),
-        "planning must not fire user_prompt hooks"
-    );
-
-    agent.sink.emit(AgentEvent::Slash("restored".to_string()));
-    assert!(
-        drain_events(&mut rx)
-            .into_iter()
-            .any(|event| matches!(event, AgentEvent::Slash(text) if text == "restored")),
-        "original sink should be restored after planning"
-    );
-
-    server.join().expect("server thread");
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 #[test]
 fn packs_discover_user_global_pack_from_dext_home() -> Result<()> {
     let _guard = env_lock();
@@ -26372,7 +26832,7 @@ fn slash_shelves_lists_typed_manifest_registry() {
     let slash = drain_events(&mut rx)
         .into_iter()
         .find_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .unwrap_or_default();
@@ -26451,7 +26911,7 @@ fn slash_pack_list_and_inspect_use_discovered_packs() -> Result<()> {
     let slash_text = drain_events(&mut rx)
         .into_iter()
         .filter_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -26491,7 +26951,7 @@ fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
     let slash_text = drain_events(&mut rx)
         .into_iter()
         .find_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .unwrap_or_default();
@@ -26510,7 +26970,7 @@ fn slash_pack_verbose_flag_lists_with_paths() -> Result<()> {
     let followup = drain_events(&mut rx)
         .into_iter()
         .filter_map(|event| match event {
-            AgentEvent::Slash(text) => Some(text),
+            AgentEvent::Slash(text) | AgentEvent::StructuredSlash(text) => Some(text),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -26687,9 +27147,181 @@ fn list_render_wrap_splits_long_words() {
 }
 
 #[test]
-fn list_render_bold_only_with_color() {
+fn list_render_keeps_session_blueprint_and_sanitizes_controls() {
+    assert_eq!(list_render::width_for_terminal_cols(0), 1);
+    assert_eq!(list_render::width_for_terminal_cols(1), 1);
+    assert_eq!(list_render::width_for_terminal_cols(2), 1);
+    assert_eq!(list_render::width_for_terminal_cols(19), 17);
+    assert_eq!(list_render::width_for_terminal_cols(500), 120);
+
+    let opts = list_render::ListOptions::fixed(false, 80);
+    let mut out = list_render::render_count_header("Items", 1, "found", &opts);
+    out.push_str(&list_render::render_section_header(
+        "Unsafe\rsection\u{2028}next\u{2029}last\u{202e}spoof\u{2066}isolated\u{0007}\x1b]0;hidden\u{0007}",
+        &opts,
+    ));
+    out.push_str(&list_render::render_entry(
+        "entry\tname\x1b[31m!\x1b[0m",
+        "description with controls\u{0007}\x1b]0;hidden\u{0007}",
+        &[("source", "project\rspoofed\x1b[31mred\x1b[0m".to_string())],
+        &opts,
+    ));
+    out.push_str(&list_render::render_footer(
+        &["/command\x1b]0;hidden\u{0007} <argument>"],
+        &opts,
+    ));
+
+    assert!(!out.contains(['\x1b', '\r', '\t', '\u{0007}']), "{out:?}");
+    assert!(!out.contains("hidden"), "{out:?}");
+    assert_eq!(
+        out,
+        "Items  1 found\nUnsafe\nsection\nnext\nlastspoofisolated\n  entry    name!\n    description with controls\n    source: project\n    spoofedred\n\nUse:\n  /command <argument>\n"
+    );
+}
+
+#[test]
+fn list_render_bounds_every_structured_row_by_display_cells() {
+    let width = 12;
+    let opts = list_render::ListOptions::fixed(false, width);
+    let mut out = list_render::render_count_header("界界界界界界界", 123, "found", &opts);
+    out.push_str(&list_render::render_section_header("分類\r見出し", &opts));
+    out.push_str(&list_render::render_entry(
+        "項目    名前界界界",
+        "説明 界界界界界 長い説明",
+        &[("metadata-key", "値界界界界界界".to_string())],
+        &opts,
+    ));
+    out.push_str(&list_render::render_footer(
+        &["/command-with-a-long-name <argument>"],
+        &opts,
+    ));
+
+    assert!(!out.contains(['\x1b', '\r', '\t', '\u{0007}']), "{out:?}");
+    for line in out.lines() {
+        assert!(
+            unicode_width::UnicodeWidthStr::width(line) <= width,
+            "line exceeds {width} cells: {line:?}\n{out}"
+        );
+    }
+    assert!(
+        out.contains("項目    "),
+        "preformatted spacing was lost: {out}"
+    );
+
+    let wide_opts = list_render::ListOptions::fixed(false, 80);
+    let multiline =
+        list_render::render_entry_rows(&[("unsafe\rname", "description\rcontinued")], &wide_opts);
+    assert_eq!(
+        multiline,
+        "  unsafe\n  name\n    description\n    continued\n"
+    );
+}
+
+#[test]
+fn list_render_one_cell_rows_replace_only_impossible_wide_clusters() {
+    let one_cell = list_render::ListOptions::fixed(false, 1);
+    let mut out = list_render::render_count_header("界", 1, "件", &one_cell);
+    out.push_str(&list_render::render_entry(
+        "🙂",
+        "界 🙂",
+        &[("界", "🙂".to_string())],
+        &one_cell,
+    ));
+    out.push_str(&list_render::render_footer(&["/界🙂"], &one_cell));
+
+    assert!(
+        out.lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 1),
+        "{out:?}"
+    );
+    assert!(!out.contains(['界', '🙂']), "{out:?}");
+    assert!(out.contains('?'), "{out:?}");
+
+    let two_cells = list_render::ListOptions::fixed(false, 2);
+    let preserved = list_render::render_section_header("界🙂", &two_cells);
+    assert!(preserved.contains('界'), "{preserved:?}");
+    assert!(preserved.contains('🙂'), "{preserved:?}");
+    assert!(
+        preserved
+            .lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 2),
+        "{preserved:?}"
+    );
+}
+
+#[test]
+fn structured_slash_renderers_follow_session_blueprint() {
+    let root = temp_test_dir("structured-slash-session-blueprint");
+    let agent = test_agent(&root);
+
+    let help = render_help_listing(Some(100));
+    assert!(help.starts_with("Commands  "), "{help}");
+    assert!(
+        help.contains("\nCore\n  /help          show this list\n  /quit, /exit   exit dext\n"),
+        "{help}"
+    );
+    assert!(
+        help.ends_with("Use:\n  /<command> — [args] optional, <args> required"),
+        "{help}"
+    );
+
+    let tools = render_tools_status(&agent);
+    assert!(tools.starts_with("Tools  "), "{tools}");
+    assert!(
+        tools.contains(&format!(
+            "\nProfile\n    toolset: {}    schemas: {}    approval: {}\n",
+            agent.tool_context_profile().as_str(),
+            agent.wire_tool_profile().as_str(),
+            agent.approval_profile.as_str(),
+        )),
+        "{tools}"
+    );
+    assert!(
+        tools.ends_with("Use:\n  /tools default|full\n  /allow <tool>\n  /revoke <tool>"),
+        "{tools}"
+    );
+
+    let system = render_system_prompt_view(&agent);
+    assert!(system.starts_with("System prompt  "), "{system}");
+    assert!(
+        system.contains("\n\nSources\n    base prompt: "),
+        "{system}"
+    );
+    assert!(system.contains("\n\nPrompt\n"), "{system}");
+    assert!(
+        system.ends_with("\nUse:\n  /system <text>  (replace the base prompt)"),
+        "{system}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn empty_pack_listing_uses_session_style_header_and_search_section() {
+    let root = temp_test_dir("empty-pack-list");
+    let opts = list_render::ListOptions::fixed(false, 12);
+    let out = packs::render_pack_list(&[], &opts, &root);
+
+    assert!(out.starts_with("Packs\n0 found\nSearch paths\n"), "{out}");
+    assert!(
+        out.lines()
+            .all(|line| unicode_width::UnicodeWidthStr::width(line) <= 12),
+        "{out}"
+    );
+    let compact = out.split_whitespace().collect::<String>();
+    assert!(compact.contains(".dext/shelves/*/packs"), "{out}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn list_render_bold_only_with_color_and_strips_source_escapes() {
     assert_eq!(list_render::bold("x", false), "x");
     assert_eq!(list_render::bold("x", true), "\x1b[1mx\x1b[0m");
+    assert_eq!(
+        list_render::bold("x\x1b[31my\x1b[0m", true),
+        "\x1b[1mxy\x1b[0m"
+    );
 }
 
 #[test]
@@ -26716,11 +27348,13 @@ fn session_listing_shows_header_and_footer() -> Result<()> {
         agent.save_latest_session()?;
 
         let listing = render_session_listing(&project);
-        assert!(listing.contains("Sessions"), "{listing}");
-        assert!(listing.contains("Latest"), "{listing}");
-        assert!(listing.contains("Named"), "{listing}");
-        assert!(listing.contains("Autosaved"), "{listing}");
-        assert!(listing.contains("Use:"), "{listing}");
+        assert!(
+            listing.starts_with("Sessions  2 found\nLatest\n  latest\n"),
+            "{listing}"
+        );
+        assert!(listing.contains("\nAutosaved\n"), "{listing}");
+        assert!(listing.contains("\nNamed\n"), "{listing}");
+        assert!(listing.contains("\nUse:\n  /resume [name]\n"), "{listing}");
         Ok(())
     })();
     unsafe {

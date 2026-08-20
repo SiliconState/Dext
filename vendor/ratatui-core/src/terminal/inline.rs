@@ -1,4 +1,4 @@
-use crate::backend::Backend;
+use crate::backend::{Backend, ClearType};
 use crate::buffer::{Buffer, Cell};
 use crate::layout::{Position, Rect, Size};
 use crate::terminal::{Terminal, Viewport};
@@ -117,6 +117,28 @@ impl<B: Backend> Terminal<B> {
             Viewport::Inline(_) => self.insert_before_no_scrolling_regions(height, draw_fn),
             _ => Ok(()),
         }
+    }
+
+    /// Clear the visible display and reset an inline viewport to the terminal origin.
+    ///
+    /// This is intended for applications that have deliberately purged terminal scrollback and
+    /// will immediately replay their complete logical transcript. It avoids a cursor query, resets
+    /// both diff buffers, and leaves non-inline viewports unchanged.
+    pub fn reset_inline_viewport(&mut self) -> Result<(), B::Error> {
+        let Viewport::Inline(requested_height) = self.viewport else {
+            return Ok(());
+        };
+        let size = self.backend.size()?;
+        let area = Rect::new(0, 0, size.width, size.height.min(requested_height));
+        self.backend.set_cursor_position(Position::ORIGIN)?;
+        self.backend.clear_region(ClearType::All)?;
+        self.set_viewport_area(area);
+        self.buffers[0].reset();
+        self.buffers[1].reset();
+        self.last_known_area = size.into();
+        self.last_known_cursor_pos = Position::ORIGIN;
+        self.backend.flush()?;
+        Ok(())
     }
 
     /// Implement `Self::insert_before` using standard backend capabilities.
@@ -423,6 +445,8 @@ pub(crate) fn compute_inline_size<B: Backend>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+
     use crate::backend::{Backend, TestBackend};
     use crate::layout::{Position, Rect, Size};
     use crate::style::Style;
@@ -481,6 +505,44 @@ mod tests {
             compute_inline_size(&mut backend, 4, Size::new(10, 10), 5).unwrap();
 
         assert_eq!(area, Rect::new(0, 0, 10, 4));
+    }
+
+    #[test]
+    fn reset_inline_viewport_starts_full_replay_from_origin() {
+        let mut backend = TestBackend::with_lines([
+            "shell-----",
+            "history---",
+            "old-0-----",
+            "old-1-----",
+            "viewport-a",
+            "viewport-b",
+        ]);
+        backend
+            .set_cursor_position(Position { x: 0, y: 4 })
+            .unwrap();
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )
+        .unwrap();
+        terminal
+            .insert_before(8, |buf| {
+                for y in 0..8 {
+                    buf.set_string(0, y, format!("row-{y}"), Style::default());
+                }
+            })
+            .unwrap();
+        assert!(terminal.backend().scrollback().area.height > 0);
+
+        terminal.backend_mut().purge_scrollback();
+        terminal.reset_inline_viewport().unwrap();
+
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 10, 2));
+        assert_eq!(terminal.backend().scrollback().area.height, 0);
+        terminal.backend().assert_buffer_lines(["          "; 6]);
+        assert_eq!(terminal.backend().cursor_position(), Position::ORIGIN);
     }
 
     #[cfg(not(feature = "scrolling-regions"))]

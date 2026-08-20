@@ -779,11 +779,29 @@ fn push_shelf_manifest_dir(
 }
 
 pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
+    render_registry_listing_width(registry, None)
+}
+
+pub(crate) fn render_registry_listing_width(
+    registry: &ShelfRegistry,
+    width: Option<usize>,
+) -> String {
     use std::fmt::Write as _;
-    let opts = crate::list_render::ListOptions::detect(false);
+    let opts = crate::list_render::ListOptions::detect_with_width(false, width);
 
     if registry.is_empty() {
-        return "Shelves  none found\nsearch paths: .dext/shelves/*/shelf.json, DEXT_SHELVES_DIR, ~/.dext/shelves/*/shelf.json".to_string();
+        let mut out = crate::list_render::render_header("Shelves", 0, &opts);
+        out.push_str(&crate::list_render::render_section_header(
+            "Search paths",
+            &opts,
+        ));
+        crate::list_render::write_wrapped(
+            &mut out,
+            ".dext/shelves/*/shelf.json, DEXT_SHELVES_DIR, ~/.dext/shelves/*/shelf.json",
+            2,
+            opts.effective_width(),
+        );
+        return out.trim_end().to_string();
     }
 
     let manifests = registry.manifests();
@@ -813,16 +831,20 @@ pub(crate) fn render_registry_listing(registry: &ShelfRegistry) -> String {
     let resolved = registry.resolve();
     if !resolved.is_empty() {
         out.push('\n');
-        let _ = writeln!(
-            out,
-            "{}",
-            crate::list_render::bold("Resolved abilities", opts.color)
-        );
+        out.push_str(&crate::list_render::render_section_header(
+            "Resolved abilities",
+            &opts,
+        ));
         for ability in resolved.iter().take(50) {
             out.push_str(&format_resolved_ability_styled(ability, &opts));
         }
         if resolved.len() > 50 {
-            let _ = writeln!(out, "  … [{} more abilities omitted]", resolved.len() - 50);
+            crate::list_render::write_wrapped(
+                &mut out,
+                &format!("… [{} more abilities omitted]", resolved.len() - 50),
+                2,
+                opts.effective_width(),
+            );
         }
     }
     out.push_str(&crate::list_render::render_footer(
