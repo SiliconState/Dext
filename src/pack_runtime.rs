@@ -798,21 +798,16 @@ pub(crate) async fn invoke(
     if executable_sha256 != runtime.executable_sha256 {
         bail!("pack runtime executable changed after activation; reactivate the pack to review it");
     }
-    let (event_name, tool, input, sandbox_profile) = match event {
-        RuntimeEvent::Activate => ("activate", None, None, SandboxProfile::ReadOnly),
+    let (event_name, tool, input) = match event {
+        RuntimeEvent::Activate => ("activate", None, None),
         RuntimeEvent::Tool { name, input } => {
             let tool = runtime
                 .tool(name)
                 .with_context(|| format!("pack runtime does not declare tool {name}"))?;
             validate_tool_input(tool, input)?;
-            let sandbox_profile = if tool.risk == RuntimeRisk::Read {
-                SandboxProfile::ReadOnly
-            } else {
-                sandbox_profile
-            };
-            ("tool", Some(name), Some(input), sandbox_profile)
+            ("tool", Some(name), Some(input))
         }
-        RuntimeEvent::Idle => ("idle", None, None, SandboxProfile::ReadOnly),
+        RuntimeEvent::Idle => ("idle", None, None),
     };
     let request = RuntimeRequest {
         version: RUNTIME_PROTOCOL_VERSION,

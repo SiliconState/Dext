@@ -1392,22 +1392,22 @@ impl MutationPreviewMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ApprovalProfile {
-    #[default]
     Ask,
     AutoRead,
     AutoWrite,
     Never,
+    #[default]
     Always,
 }
 
 impl ApprovalProfile {
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "ask" | "on-request" | "request" | "prompt" | "default" | "guarded" => Some(Self::Ask),
+            "ask" | "on-request" | "request" | "prompt" | "guarded" => Some(Self::Ask),
             "auto-read" | "read" | "read-only" => Some(Self::AutoRead),
             "auto-write" | "trusted" | "on-failure" => Some(Self::AutoWrite),
             "never" | "deny" | "no-ask" => Some(Self::Never),
-            "always" | "auto" | "trust" | "danger" => Some(Self::Always),
+            "always" | "auto" | "trust" | "danger" | "default" => Some(Self::Always),
             _ => None,
         }
     }
@@ -1465,6 +1465,7 @@ fn resolve_approval_policy(
     env_trust: Option<&str>,
 ) -> ResolvedApprovalPolicy {
     let mut warnings = Vec::new();
+    let mut invalid_environment = false;
     if let Some(profile) = cli_override {
         return ResolvedApprovalPolicy {
             profile,
@@ -1481,9 +1482,10 @@ fn resolve_approval_policy(
             };
         }
         warnings.push(
-            "invalid DEXT_APPROVAL; expected ask|auto-read|auto-write|never|always; ignoring it"
+            "invalid DEXT_APPROVAL; expected ask|auto-read|auto-write|never|always; using ask unless a valid DEXT_TRUST enables always"
                 .to_string(),
         );
+        invalid_environment = true;
     }
     if let Some(raw) = env_trust {
         match parse_strict_env_bool(raw) {
@@ -1495,14 +1497,21 @@ fn resolve_approval_policy(
                 };
             }
             Some(false) => {}
-            None => warnings.push(
-                "invalid DEXT_TRUST; expected 1/true/on/yes or 0/false/off/no; ignoring it"
-                    .to_string(),
-            ),
+            None => {
+                warnings.push(
+                    "invalid DEXT_TRUST; expected 1/true/on/yes or 0/false/off/no; using ask"
+                        .to_string(),
+                );
+                invalid_environment = true;
+            }
         }
     }
     ResolvedApprovalPolicy {
-        profile: ApprovalProfile::Ask,
+        profile: if invalid_environment {
+            ApprovalProfile::Ask
+        } else {
+            ApprovalProfile::Always
+        },
         source: ApprovalPolicySource::Default,
         warnings,
     }
@@ -1511,8 +1520,13 @@ fn resolve_approval_policy(
 fn resolve_approval_policy_from_env(
     cli_override: Option<ApprovalProfile>,
 ) -> ResolvedApprovalPolicy {
-    let env_approval = std::env::var("DEXT_APPROVAL").ok();
-    let env_trust = std::env::var("DEXT_TRUST").ok();
+    let env_value = |name| match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => Some("\0".to_string()),
+    };
+    let env_approval = env_value("DEXT_APPROVAL");
+    let env_trust = env_value("DEXT_TRUST");
     resolve_approval_policy(cli_override, env_approval.as_deref(), env_trust.as_deref())
 }
 
@@ -1520,8 +1534,8 @@ fn resolve_approval_policy_from_env(
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SandboxProfile {
     ReadOnly,
-    #[default]
     WorkspaceWrite,
+    #[default]
     DangerFullAccess,
 }
 
@@ -1529,10 +1543,8 @@ impl SandboxProfile {
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "read-only" | "readonly" | "ro" => Some(Self::ReadOnly),
-            "workspace-write" | "workspace" | "write" | "default" | "guarded" => {
-                Some(Self::WorkspaceWrite)
-            }
-            "danger-full-access" | "full-access" | "danger" | "unrestricted" => {
+            "workspace-write" | "workspace" | "write" | "guarded" => Some(Self::WorkspaceWrite),
+            "danger-full-access" | "full-access" | "danger" | "unrestricted" | "default" => {
                 Some(Self::DangerFullAccess)
             }
             _ => None,
@@ -1545,6 +1557,38 @@ impl SandboxProfile {
             Self::WorkspaceWrite => "workspace-write",
             Self::DangerFullAccess => "danger-full-access",
         }
+    }
+}
+
+fn resolve_sandbox_profile(
+    cli_override: Option<SandboxProfile>,
+    env_profile: Option<&str>,
+) -> std::result::Result<SandboxProfile, String> {
+    if let Some(profile) = cli_override {
+        return Ok(profile);
+    }
+    match env_profile {
+        Some(raw) => SandboxProfile::parse(raw).ok_or_else(|| {
+            "invalid DEXT_SANDBOX_PROFILE; expected read-only|workspace-write|danger-full-access"
+                .to_string()
+        }),
+        None => Ok(SandboxProfile::default()),
+    }
+}
+
+fn resolve_sandbox_profile_from_env(
+    cli_override: Option<SandboxProfile>,
+) -> std::result::Result<SandboxProfile, String> {
+    if let Some(profile) = cli_override {
+        return Ok(profile);
+    }
+    match std::env::var("DEXT_SANDBOX_PROFILE") {
+        Ok(value) => resolve_sandbox_profile(None, Some(&value)),
+        Err(std::env::VarError::NotPresent) => resolve_sandbox_profile(None, None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(
+            "invalid DEXT_SANDBOX_PROFILE; value must be valid Unicode and one of read-only|workspace-write|danger-full-access"
+                .to_string(),
+        ),
     }
 }
 
@@ -3620,14 +3664,11 @@ fn run_sync_command_limited_with_scratch(
     use std::io::Write as _;
     use std::process::Stdio;
 
-    let scratch = match scratch {
-        Some(scratch) => scratch,
-        None => sandbox::PrivateScratch::create()
-            .map_err(|error| format!("create private temp for {spawn_label}: {error}"))?,
-    };
-    cmd.env("TMPDIR", &scratch.path)
-        .env("TMP", &scratch.path)
-        .env("TEMP", &scratch.path);
+    if let Some(scratch) = scratch.as_ref() {
+        cmd.env("TMPDIR", &scratch.path)
+            .env("TMP", &scratch.path)
+            .env("TEMP", &scratch.path);
+    }
     deny_interactive_prompt_env_std(&mut cmd);
     scrub_startup_env_from_std_command(&mut cmd);
     scrub_tool_credentials_from_std_command(&mut cmd);
@@ -3738,7 +3779,16 @@ fn run_sync_command_limited(
     spawn_label: &str,
     timeout: std::time::Duration,
 ) -> std::result::Result<(LimitedByteCapture, LimitedByteCapture, i32), String> {
-    run_sync_command_limited_with_scratch(cmd, stdin_data, capture_cap, spawn_label, timeout, None)
+    let scratch = sandbox::PrivateScratch::create()
+        .map_err(|error| format!("create private temp for {spawn_label}: {error}"))?;
+    run_sync_command_limited_with_scratch(
+        cmd,
+        stdin_data,
+        capture_cap,
+        spawn_label,
+        timeout,
+        Some(scratch),
+    )
 }
 
 fn internal_secret_command_timeout() -> std::time::Duration {
@@ -6460,20 +6510,26 @@ fn rust_analyzer_unavailable_output(raw: &str) -> bool {
 fn diagnostics_command(
     program: &Path,
     root: &Path,
+    profile: SandboxProfile,
 ) -> std::result::Result<sandbox::SandboxedStdCommand, String> {
-    let mut command = sandbox::std_command_offline(program, SandboxProfile::ReadOnly, root)
-        .map_err(|error| format!("prepare offline diagnostics sandbox: {error}"))?;
-    if let Some(scratch) = command.scratch_path().map(Path::to_path_buf) {
-        command.env("CARGO_TARGET_DIR", scratch.join("cargo-target"));
+    let mut command = sandbox::std_command(program, profile, root)
+        .map_err(|error| format!("prepare diagnostics process: {error}"))?;
+    if profile != SandboxProfile::DangerFullAccess {
+        if let Some(scratch) = command.scratch_path().map(Path::to_path_buf) {
+            command.env("CARGO_TARGET_DIR", scratch.join("cargo-target"));
+        }
+        command.env("CARGO_NET_OFFLINE", "true");
     }
-    command.env("CARGO_NET_OFFLINE", "true");
     harden_internal_command_env(&mut command);
     Ok(command)
 }
 
-fn rust_analyzer_command(root: &Path) -> Option<sandbox::SandboxedStdCommand> {
+fn rust_analyzer_command(
+    root: &Path,
+    profile: SandboxProfile,
+) -> Option<sandbox::SandboxedStdCommand> {
     let binary = find_binary_on_path("rust-analyzer")?;
-    diagnostics_command(&binary, root).ok()
+    diagnostics_command(&binary, root, profile).ok()
 }
 
 fn diagnostics_source_file(path: &Path, root: &Path) -> Option<(PathBuf, String)> {
@@ -6627,13 +6683,16 @@ fn rust_files_for_diagnostics(root: &Path) -> Vec<(PathBuf, String)> {
     out
 }
 
-fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsReport> {
+fn run_rust_analyzer_diagnostics(
+    root: &Path,
+    profile: SandboxProfile,
+) -> Option<WorkflowDiagnosticsReport> {
     if !root.join("Cargo.toml").exists() {
         return None;
     }
 
     let started = std::time::Instant::now();
-    let mut sandboxed = rust_analyzer_command(root)?;
+    let mut sandboxed = rust_analyzer_command(root, profile)?;
     sandboxed
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -6801,9 +6860,9 @@ fn run_rust_analyzer_diagnostics(root: &Path) -> Option<WorkflowDiagnosticsRepor
     })
 }
 
-fn run_cargo_check_diagnostics(root: &Path) -> WorkflowDiagnosticsReport {
+fn run_cargo_check_diagnostics(root: &Path, profile: SandboxProfile) -> WorkflowDiagnosticsReport {
     let started = std::time::Instant::now();
-    let sandboxed = match diagnostics_command(Path::new("cargo"), root) {
+    let sandboxed = match diagnostics_command(Path::new("cargo"), root, profile) {
         Ok(mut command) => {
             command
                 .args(["check", "--message-format=json", "--quiet"])
@@ -7047,8 +7106,9 @@ fn prepend_cargo_json_diagnostics_summary(output: String, root: &Path) -> String
     }
 }
 
-fn run_workflow_diagnostics(root: &Path) -> WorkflowDiagnosticsReport {
-    run_rust_analyzer_diagnostics(root).unwrap_or_else(|| run_cargo_check_diagnostics(root))
+fn run_workflow_diagnostics(root: &Path, profile: SandboxProfile) -> WorkflowDiagnosticsReport {
+    run_rust_analyzer_diagnostics(root, profile)
+        .unwrap_or_else(|| run_cargo_check_diagnostics(root, profile))
 }
 
 fn is_ident_continue(ch: char) -> bool {
@@ -10886,13 +10946,8 @@ impl Hooks {
             {
                 continue;
             }
-            let hook_profile = if sandbox_profile == SandboxProfile::ReadOnly {
-                SandboxProfile::ReadOnly
-            } else {
-                SandboxProfile::WorkspaceWrite
-            };
             let bash = bash_executable_path();
-            let sandboxed = match sandbox::std_command(&bash, hook_profile, root) {
+            let sandboxed = match sandbox::std_command(&bash, sandbox_profile, root) {
                 Ok(command) => command,
                 Err(error) => {
                     out.push((format!("prepare hook sandbox: {error}"), -1));
@@ -11548,6 +11603,14 @@ struct SeatRef {
     label: Option<String>,
 }
 
+fn legacy_approval_profile() -> ApprovalProfile {
+    ApprovalProfile::Ask
+}
+
+fn legacy_sandbox_profile() -> SandboxProfile {
+    SandboxProfile::WorkspaceWrite
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct SessionHeader {
     #[serde(default = "default_session_version")]
@@ -11578,11 +11641,11 @@ struct SessionHeader {
     compact_threshold_chars: Option<usize>,
     #[serde(default)]
     compact_threshold_percent: Option<u8>,
-    #[serde(default)]
+    #[serde(default = "legacy_approval_profile")]
     approval_profile: ApprovalProfile,
     #[serde(default)]
     approval_policy_source: ApprovalPolicySource,
-    #[serde(default)]
+    #[serde(default = "legacy_sandbox_profile")]
     sandbox_profile: SandboxProfile,
     #[serde(default)]
     budget_cap: Option<BudgetCap>,
@@ -14770,7 +14833,10 @@ impl Agent {
             "runtime": pack.runtime_path.as_ref().map(|path| path.display().to_string()),
             "executable_sha256": &runtime.executable_sha256,
             "tools": runtime.tools.iter().map(|tool| format!("{}:{:?}", tool.name, tool.risk).to_ascii_lowercase()).collect::<Vec<_>>(),
-            "risk": "executes a pack-owned native helper with credentials removed; activation and idle are read-only-confined, while declared write/danger tools retain normal per-call approval and Git checkpoint controls"
+            "risk": format!(
+                "executes a pack-owned native helper with credentials removed under the current {} sandbox profile; declared write/danger tools retain Git checkpoint controls",
+                self.sandbox_profile.as_str()
+            )
         });
         match self
             .sink
@@ -14817,7 +14883,7 @@ impl Agent {
                 compacted: false,
             },
             self.interrupt.clone(),
-            SandboxProfile::ReadOnly,
+            self.sandbox_profile,
         )
         .await
         .map_err(|error| {
@@ -14941,14 +15007,7 @@ impl Agent {
             .active_pack_runtime
             .clone()
             .ok_or_else(|| format!("pack runtime tool {name} has no active runtime"))?;
-        let sandbox_profile = if runtime
-            .tool(name)
-            .is_some_and(|tool| tool.risk == pack_runtime::RuntimeRisk::Read)
-        {
-            SandboxProfile::ReadOnly
-        } else {
-            self.sandbox_profile
-        };
+        let sandbox_profile = self.sandbox_profile;
         let invocation = pack_runtime::invoke(
             &runtime,
             pack_runtime::RuntimeEvent::Tool { name, input },
@@ -14990,7 +15049,7 @@ impl Agent {
                 compacted,
             },
             self.interrupt.clone(),
-            SandboxProfile::ReadOnly,
+            self.sandbox_profile,
         )
         .await
         .map_err(|error| {
@@ -15129,21 +15188,26 @@ impl Agent {
                 if self.approval_profile == ApprovalProfile::Never {
                     return Err(error);
                 }
-                let approval_input = json!({
-                    "operation": "run write-risk arbitrary commands with partial untracked-file recovery for this repository",
-                    "recovery_gap": error,
-                    "risk": "tracked and staged Git state remains checkpointed, but listed untracked paths outside bounded sidecar capture may not be recoverable"
-                });
-                match self
-                    .sink
-                    .request_permission(CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME, &approval_input)
-                {
-                    Choice::Deny => {
-                        return Err("partial checkpoint recovery was not approved".to_string());
-                    }
-                    Choice::Once | Choice::Always => {
-                        self.checkpoint_partial_untracked_approved = true;
-                        create(self, true)
+                if self.approval_profile == ApprovalProfile::Always {
+                    self.checkpoint_partial_untracked_approved = true;
+                    create(self, true)
+                } else {
+                    let approval_input = json!({
+                        "operation": "run write-risk arbitrary commands with partial untracked-file recovery for this repository",
+                        "recovery_gap": error,
+                        "risk": "tracked and staged Git state remains checkpointed, but listed untracked paths outside bounded sidecar capture may not be recoverable"
+                    });
+                    match self
+                        .sink
+                        .request_permission(CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME, &approval_input)
+                    {
+                        Choice::Deny => {
+                            return Err("partial checkpoint recovery was not approved".to_string());
+                        }
+                        Choice::Once | Choice::Always => {
+                            self.checkpoint_partial_untracked_approved = true;
+                            create(self, true)
+                        }
                     }
                 }
             }
@@ -19872,7 +19936,7 @@ fn sandbox_doctor_status(profile: SandboxProfile) -> (bool, String) {
     if profile == SandboxProfile::DangerFullAccess {
         return (
             true,
-            "profile danger-full-access; kernel confinement intentionally disabled".to_string(),
+            "profile danger-full-access; Dext adds no kernel confinement (ambient environment authority)".to_string(),
         );
     }
     (
@@ -20355,32 +20419,33 @@ fn doctor_report_with_overrides(
         findings.push(DoctorFinding::warn("approval environment", warning));
     }
 
-    let sandbox_profile = sandbox_override
-        .or_else(|| {
-            std::env::var("DEXT_SANDBOX_PROFILE")
-                .ok()
-                .and_then(|value| SandboxProfile::parse(&value))
-        })
-        .unwrap_or_default();
-    findings.push(DoctorFinding::info(
-        "sandbox",
-        format!("effective profile {}", sandbox_profile.as_str()),
-    ));
-    if sandbox_profile == SandboxProfile::DangerFullAccess {
-        findings.push(DoctorFinding::info(
-            "sandbox kernel",
-            "intentionally disabled by danger-full-access",
-        ));
-    } else if sandbox::is_enforced() {
-        findings.push(DoctorFinding::ok("sandbox kernel", sandbox::describe()));
-    } else {
-        findings.push(DoctorFinding::warn(
-            "sandbox kernel",
-            format!(
-                "not enforced for {}; native path guards remain, subprocesses are unconfined",
-                sandbox::describe()
-            ),
-        ));
+    match resolve_sandbox_profile_from_env(sandbox_override) {
+        Ok(sandbox_profile) => {
+            findings.push(DoctorFinding::info(
+                "sandbox",
+                format!("effective profile {}", sandbox_profile.as_str()),
+            ));
+            if sandbox_profile == SandboxProfile::DangerFullAccess {
+                findings.push(DoctorFinding::info(
+                    "sandbox kernel",
+                    "Dext adds no kernel confinement; ambient environment authority applies",
+                ));
+            } else if sandbox::is_enforced() {
+                findings.push(DoctorFinding::ok("sandbox kernel", sandbox::describe()));
+            } else {
+                findings.push(DoctorFinding::warn(
+                    "sandbox kernel",
+                    format!(
+                        "not enforced for {}; native path guards remain, subprocesses are unconfined",
+                        sandbox::describe()
+                    ),
+                ));
+            }
+        }
+        Err(error) => findings.push(DoctorFinding::warn(
+            "sandbox",
+            format!("{error}; normal startup would fail"),
+        )),
     }
 
     findings.push(DoctorFinding::info(
@@ -21053,14 +21118,17 @@ fn project_extensions_approval_decision(
     root: &Path,
     cached: Option<bool>,
 ) -> bool {
+    if agent.approval_profile == ApprovalProfile::Always {
+        return true;
+    }
+    if agent.approval_profile == ApprovalProfile::Never {
+        return false;
+    }
     if let Some(approved) = cached {
         return approved;
     }
     if project_extensions_always_approved(root) {
         return true;
-    }
-    if agent.approval_profile == ApprovalProfile::Never {
-        return false;
     }
     let input = json!({
         "operation": "load project-controlled shelf context or PACK.md workflows for this repository",
@@ -21100,13 +21168,18 @@ fn hooks_approved(agent: &mut Agent) -> bool {
     if agent.approval_profile == ApprovalProfile::Never {
         return false;
     }
-    if agent.allowed.contains(HOOKS_APPROVAL_NAME) {
+    if agent.approval_profile == ApprovalProfile::Always
+        || agent.allowed.contains(HOOKS_APPROVAL_NAME)
+    {
         return true;
     }
     let input = json!({
         "operation": "run project, active-pack, or repository Git hooks for this turn",
         "phases": ["user_prompt", "pre_tool", "post_tool", "git_commit hooks"],
-        "risk": "executes hook programs selected by project, pack, or Git configuration; hooks are credential-isolated, bounded, and confined to the active workspace"
+        "risk": format!(
+            "executes hook programs selected by project, pack, or Git configuration; credentials are removed, output and runtime are bounded, and the current {} sandbox profile applies",
+            agent.sandbox_profile().as_str()
+        )
     });
     match agent.sink.request_permission(HOOKS_APPROVAL_NAME, &input) {
         Choice::Once => true,
@@ -21122,7 +21195,9 @@ fn git_commit_hooks_approved(agent: &mut Agent) -> bool {
     if agent.approval_profile == ApprovalProfile::Never {
         return false;
     }
-    if agent.allowed.contains(HOOKS_APPROVAL_NAME) {
+    if agent.approval_profile == ApprovalProfile::Always
+        || agent.allowed.contains(HOOKS_APPROVAL_NAME)
+    {
         return true;
     }
     let input = json!({
@@ -21155,7 +21230,10 @@ fn diagnostics_approved(agent: &mut Agent) -> bool {
     let input = json!({
         "operation": "run project diagnostics",
         "executables": ["rust-analyzer", "cargo check"],
-        "risk": "executes project build scripts and procedural macros in a read-only sandbox"
+        "risk": format!(
+            "executes project build scripts and procedural macros under the current {} sandbox profile",
+            agent.sandbox_profile().as_str()
+        )
     });
     match agent
         .sink
@@ -22021,7 +22099,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     "permission denied: diagnostics execute project code; approve once or always to run"
                 );
             } else {
-                let report = run_workflow_diagnostics(&agent.sandbox_root);
+                let report = run_workflow_diagnostics(&agent.sandbox_root, agent.sandbox_profile());
                 let errors = report
                     .diagnostics
                     .iter()
@@ -22767,10 +22845,11 @@ fn final_objective_warning_from_coverage(coverage: &orchestrator::ObjectiveCover
 fn run_eval_shell_command(
     root: &Path,
     command: &str,
+    profile: SandboxProfile,
 ) -> std::result::Result<(i32, String, String), String> {
     let bash = bash_executable_path();
-    let mut sandboxed = sandbox::std_command(&bash, SandboxProfile::ReadOnly, root)
-        .map_err(|error| format!("prepare eval sandbox: {error}"))?;
+    let mut sandboxed = sandbox::std_command(&bash, profile, root)
+        .map_err(|error| format!("prepare eval process: {error}"))?;
     sandboxed
         .arg("--noprofile")
         .arg("--norc")
@@ -22807,7 +22886,7 @@ fn run_eval_shell_command(
     Ok((code, stdout, stderr))
 }
 
-async fn run_eval_case(case: &EvalCase) -> (bool, Vec<String>) {
+async fn run_eval_case(case: &EvalCase, sandbox_profile: SandboxProfile) -> (bool, Vec<String>) {
     let sandbox = PathBuf::from(format!("target/evals/{}", case.name));
     let _ = std::fs::remove_dir_all(&sandbox);
     if let Err(e) = std::fs::create_dir_all(&sandbox) {
@@ -22825,6 +22904,7 @@ async fn run_eval_case(case: &EvalCase) -> (bool, Vec<String>) {
     if let Err(e) = agent.set_sandbox_root(sandbox.clone()) {
         return (false, vec![format!("sandbox switch failed: {e:#}")]);
     }
+    agent.set_sandbox_profile(sandbox_profile);
     agent.pretty = false;
     agent.silent = true;
     agent.max_iterations = Some(10);
@@ -22893,7 +22973,7 @@ async fn run_eval_case(case: &EvalCase) -> (bool, Vec<String>) {
                 (t <= *n, format!("assistant turns ≤ {n} (was {t})"))
             }
             Assertion::CommandSucceeds(command) => {
-                match run_eval_shell_command(&sandbox, command) {
+                match run_eval_shell_command(&sandbox, command, agent.sandbox_profile()) {
                     Ok((code, stdout, stderr)) => (
                         code == 0,
                         format!(
@@ -22906,7 +22986,7 @@ async fn run_eval_case(case: &EvalCase) -> (bool, Vec<String>) {
                 }
             }
             Assertion::CommandOutputContains(command, needle) => {
-                match run_eval_shell_command(&sandbox, command) {
+                match run_eval_shell_command(&sandbox, command, agent.sandbox_profile()) {
                     Ok((code, stdout, stderr)) => (
                         code == 0 && stdout.contains(needle),
                         format!(
@@ -22922,7 +23002,7 @@ async fn run_eval_case(case: &EvalCase) -> (bool, Vec<String>) {
                 }
             }
             Assertion::CommandOutputEquals(command, expected) => {
-                match run_eval_shell_command(&sandbox, command) {
+                match run_eval_shell_command(&sandbox, command, agent.sandbox_profile()) {
                     Ok((code, stdout, stderr)) => (
                         code == 0 && stdout == *expected,
                         format!(
@@ -23115,7 +23195,7 @@ fn default_eval_cases() -> &'static [EvalCase] {
     ]
 }
 
-async fn run_all_evals(filter: Option<&str>) -> bool {
+async fn run_all_evals(filter: Option<&str>, sandbox_profile: SandboxProfile) -> bool {
     let cases = default_eval_cases();
     let mut all_ok = true;
     let mut total = 0usize;
@@ -23132,7 +23212,7 @@ async fn run_all_evals(filter: Option<&str>) -> bool {
     for (i, case) in selected.iter().enumerate() {
         print!("[{}/{}] {}: ", i + 1, selected.len(), case.name);
         io::stdout().flush().ok();
-        let (ok, failures) = run_eval_case(case).await;
+        let (ok, failures) = run_eval_case(case, sandbox_profile).await;
         total += 1;
         if ok {
             passed += 1;
@@ -23158,6 +23238,8 @@ pub(crate) struct CliOptions {
     pub(crate) resume_selector: Option<String>,
     pub(crate) no_session: bool,
     pub(crate) no_tui: bool,
+    pub(crate) eval: bool,
+    pub(crate) eval_filter: Option<String>,
     pub(crate) approval_policy_override: Option<ApprovalProfile>,
     pub(crate) output: OutputMode,
     pub(crate) cd: Option<PathBuf>,
@@ -23181,6 +23263,8 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut resume_selector: Option<String> = None;
     let mut no_session = false;
     let mut no_tui = false;
+    let mut eval = false;
+    let mut eval_filter = None;
     let mut approval_policy_override: Option<ApprovalProfile> = None;
     let mut output = OutputMode::Text;
     let mut cd: Option<PathBuf> = None;
@@ -23203,6 +23287,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             "--resume" => resume_latest = true,
             "--no-session" => no_session = true,
             "--no-tui" => no_tui = true,
+            "--eval" => eval = true,
             "--trust" => approval_policy_override = Some(ApprovalProfile::Always),
             "--no-trust" => approval_policy_override = Some(ApprovalProfile::Ask),
             "--fork" => fork = true,
@@ -23317,6 +23402,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                         | "full-access"
                         | "danger"
                         | "unrestricted"
+                        | "default"
                 ) {
                     sandbox_profile = Some(SandboxProfile::parse(value).ok_or_else(|| {
                         anyhow::anyhow!("invalid --sandbox '{value}' (expected read-only|workspace-write|danger-full-access)")
@@ -23360,6 +23446,14 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     .get(i)
                     .ok_or_else(|| anyhow::anyhow!("--cd requires a directory"))?;
                 cd = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with("--eval=") => {
+                eval = true;
+                let value = arg.trim_start_matches("--eval=").trim();
+                if value.is_empty() {
+                    anyhow::bail!("--eval= requires a case name");
+                }
+                eval_filter = Some(value.to_string());
             }
             _ if arg.starts_with("--resume=") => {
                 resume_latest = true;
@@ -23472,6 +23566,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                         | "full-access"
                         | "danger"
                         | "unrestricted"
+                        | "default"
                 ) {
                     sandbox_profile = Some(SandboxProfile::parse(value).ok_or_else(|| {
                         anyhow::anyhow!("invalid sandbox profile '{value}' (expected read-only|workspace-write|danger-full-access)")
@@ -23490,6 +23585,17 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         }
         i += 1;
     }
+    if eval {
+        if eval_filter.is_some() && !positional.is_empty() {
+            anyhow::bail!("--eval accepts at most one case name");
+        }
+        if eval_filter.is_none() {
+            if positional.len() > 1 {
+                anyhow::bail!("--eval accepts at most one case name");
+            }
+            eval_filter = positional.pop();
+        }
+    }
     Ok(CliOptions {
         argv,
         positional,
@@ -23498,6 +23604,8 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         resume_selector,
         no_session,
         no_tui,
+        eval,
+        eval_filter,
         approval_policy_override,
         output,
         cd,
@@ -23897,26 +24005,30 @@ async fn main() -> Result<()> {
         println!(
             "       dext --tool-profile lean|full  choose provider tool schema verbosity (default lean)"
         );
-        println!("       dext --eval [NAME]    run eval harness (optionally a single case)");
-        println!("       dext --trust          opt into auto-approval for privileged tools");
-        println!("       dext --no-trust       explicitly select the default ask profile");
+        println!("       dext --eval [NAME] [--sandbox PROFILE]  run eval harness");
+        println!("       dext --trust          select auto-approval for privileged tools");
+        println!("       dext --no-trust       explicitly select the ask profile");
         println!("       dext auth ...         provider/model/auth management commands");
         println!("       dext undo --list      list recent Dext checkpoints");
         println!("       dext undo --preview <id>  non-interactive preview");
         println!("       dext undo --apply <id>   non-interactive apply");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
         println!(
-            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 to opt into approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
+            "env:   DEXT_PROVIDER, DEXT_PROFILE, DEXT_MODEL, DEXT_MODEL_<PROVIDER>, DEXT_MODEL_FORCE=1, DEXT_BASE_URL, DEXT_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, CHATGPT_ACCESS_TOKEN, ZAI_API_KEY, ANTHROPIC_BASE_URL, OPENAI_BASE_URL, DEXT_SYSTEM, DEXT_EXTERNAL_TIMEOUT_SECS, DEXT_BASH_TIMEOUT_SECS, DEXT_HOOK_TIMEOUT_SECS, DEXT_SESSIONS_DIR, DEXT_LOGS_DIR, DEXT_LOG_ARCHIVES (0-16 rotated archives of latest.log; default 0 keeps truncation-only), DEXT_APPROVAL=ask|auto-read|auto-write|never|always, DEXT_TRUST=1 as an alias for approval=always, DEXT_PRIVACY=0 to disable output redaction or DEXT_PRIVACY=strict to block sensitive-looking native read paths, DEXT_INHERIT_TOOL_CREDENTIALS=1 to explicitly pass provider API credentials to tool subprocesses, DEXT_NO_TUI=1, DEXT_THINKING_EFFORT=off|minimal|low|medium|high|xhigh|max, DEXT_REASONING_MODE=standard|pro, DEXT_CONTEXT_MODE=standard|frugal, DEXT_TOOLSET=default|full, DEXT_TOOL_PROFILE=lean|full, DEXT_MUTATION_PREVIEW=off|simple|git, DEXT_BUDGET_CAP, DEXT_SANDBOX_PROFILE, DEXT_SHELVES_DIR"
         );
         return Ok(());
     }
-    if let Some(pos) = argv.iter().position(|a| a == "--eval") {
-        let filter = argv.get(pos + 1).map(|s| s.as_str());
-        let ok = run_all_evals(filter).await;
+    let opts = parse_cli_options(argv.clone())?;
+    let sandbox_profile =
+        resolve_sandbox_profile_from_env(opts.sandbox_profile).map_err(anyhow::Error::msg)?;
+    if opts.eval {
+        if !opts.positional.is_empty() {
+            anyhow::bail!("unexpected eval argument(s): {}", opts.positional.join(" "));
+        }
+        let ok = run_all_evals(opts.eval_filter.as_deref(), sandbox_profile).await;
         release_registered_locks();
         std::process::exit(if ok { 0 } else { 1 });
     }
-    let opts = parse_cli_options(argv.clone())?;
     let configured_context_mode = resolve_context_mode_configuration(opts.context_mode)?;
     let approval_policy = resolve_approval_policy_from_env(opts.approval_policy_override);
     for warning in &approval_policy.warnings {
@@ -23951,18 +24063,10 @@ async fn main() -> Result<()> {
         configured_context_mode,
     )?;
     agent.set_resolved_approval_profile(approval_policy.profile, approval_policy.source);
+    agent.set_sandbox_profile(sandbox_profile);
     agent.prewarm_connection();
-    if let Some(profile) = std::env::var("DEXT_SANDBOX_PROFILE")
-        .ok()
-        .and_then(|v| SandboxProfile::parse(&v))
-    {
-        agent.set_sandbox_profile(profile);
-    }
     if let Some(cap) = opts.budget_cap {
         agent.set_budget_cap(Some(cap));
-    }
-    if let Some(profile) = opts.sandbox_profile {
-        agent.set_sandbox_profile(profile);
     }
     if let Some(effort) = opts.thinking_effort {
         agent.set_thinking_effort(effort);
@@ -24085,7 +24189,7 @@ async fn main() -> Result<()> {
         if let Some(seat) = &agent.seat {
             eprintln!("[seat] {}", seat.id);
         }
-        if agent.sandbox_profile() != SandboxProfile::WorkspaceWrite {
+        if agent.sandbox_profile() != SandboxProfile::DangerFullAccess {
             eprintln!("[sandbox] profile {}", agent.sandbox_profile().as_str());
         }
         if agent.sandbox_profile() != SandboxProfile::DangerFullAccess && !sandbox::is_enforced() {

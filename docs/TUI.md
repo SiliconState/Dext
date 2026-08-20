@@ -80,7 +80,7 @@ cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture
 ```
 
-The PTY smoke suite starts each Dext child in a fresh session with the slave PTY as its controlling terminal and applies resize geometry through that slave endpoint, matching real terminal resize delivery on macOS and Linux. Resize assertions wait for the replay marker with a bounded deadline rather than assuming a fixed scheduler delay on shared CI hosts. It exercises the real binary and requires:
+The Unix PTY smoke suite starts each Dext child in a fresh session with the slave PTY as its controlling terminal and applies resize geometry through that slave endpoint, matching real terminal resize delivery on macOS and Linux. Resize assertions wait for the replay marker with a bounded deadline rather than assuming a fixed scheduler delay on shared CI hosts. It exercises the real binary and requires:
 
 - banner and composer visibility at narrow and wide sizes;
 - editable input during live streaming;
@@ -90,7 +90,9 @@ The PTY smoke suite starts each Dext child in a fresh session with the slave PTY
 - cursor queries bounded by resize events rather than transcript size;
 - replay chunks bounded by terminal height, with pending output appended only after reconstruction;
 
-Before releasing a renderer/backend update, also perform a live WSL2 check because ConPTY latency and perceptual flicker cannot be fully modeled by the Linux PTY. Resize a populated streaming session repeatedly and reject any crash, input stall, mixed-width or duplicate history, unexpected scrollback loss outside the documented full-ownership rebuild, or mode-switching change. Full replay during each observed width change and loss of pre-Dext shell scrollback are documented tradeoffs, not regressions. Native Linux and tmux checks are also recommended when terminal behavior changes.
+Windows CI and release workflows also run `tests/tui_smoke_windows.rs`, a native ConPTY real-binary smoke test that submits `/status`, verifies the default `approval=always` and `sandbox=danger-full-access` policy, exits through the TUI, and requires clean termination. This addresses the previous Windows interactive-test gap without adding a runtime dependency; the risk-register entry remains open until the harness completes its first required Windows-host CI run.
+
+Before releasing a renderer/backend update, also perform a live WSL2 check because ConPTY latency and perceptual flicker cannot be fully modeled by automated smoke tests. Resize a populated streaming session repeatedly and reject any crash, input stall, mixed-width or duplicate history, unexpected scrollback loss outside the documented full-ownership rebuild, or mode-switching change. Full replay during each observed width change and loss of pre-Dext shell scrollback are documented tradeoffs, not regressions. Native Linux and tmux checks are also recommended when terminal behavior changes.
 
 ## Dependency maintenance
 
