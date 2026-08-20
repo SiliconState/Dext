@@ -730,7 +730,13 @@ impl Pty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let rc = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
+        let rc = unsafe {
+            libc::ioctl(
+                self.slave.as_raw_fd(),
+                libc::TIOCSWINSZ as libc::c_ulong,
+                &winsize,
+            )
+        };
         if rc == -1 {
             return Err(io::Error::last_os_error());
         }

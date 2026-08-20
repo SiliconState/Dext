@@ -80,7 +80,7 @@ cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture
 ```
 
-The PTY smoke suite starts each Dext child in a fresh session with the slave PTY as its controlling terminal, matching real terminal resize delivery on macOS and Linux. It exercises the real binary and requires:
+The PTY smoke suite starts each Dext child in a fresh session with the slave PTY as its controlling terminal and applies resize geometry through that slave endpoint, matching real terminal resize delivery on macOS and Linux. It exercises the real binary and requires:
 
 - banner and composer visibility at narrow and wide sizes;
 - editable input during live streaming;
