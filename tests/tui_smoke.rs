@@ -148,7 +148,19 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
     let before_wide_capture = pty.capture.len();
     pty.resize(&child, TUI_WIDE_COLS, TUI_WIDE_ROWS)
         .expect("resize wide");
-    pty.pump_for(&mut child, Duration::from_millis(500))
+    let wide_rebuilt = pty
+        .wait_for_clear_all(
+            &mut child,
+            before_wide.clear_all.saturating_add(1),
+            Duration::from_secs(3),
+        )
+        .expect("wait for wide resize replay");
+    assert!(
+        wide_rebuilt,
+        "wide resize replay did not start within the bounded wait: {:?}",
+        pty.terminal_io_counts() - before_wide
+    );
+    pty.pump_for(&mut child, Duration::from_millis(200))
         .expect("settle wide resize");
     let wide_resize = pty.terminal_io_counts() - before_wide;
     eprintln!("wide resize terminal I/O: {wide_resize:?}");
@@ -702,6 +714,30 @@ impl Pty {
                 return Ok(false);
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_clear_all(
+        &mut self,
+        child: &mut Child,
+        minimum: usize,
+        timeout: Duration,
+    ) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.read_available()?;
+            self.answer_cursor_position_queries()?;
+            if self.terminal_io_counts().clear_all >= minimum {
+                return Ok(true);
+            }
+            if child.try_wait()?.is_some() {
+                self.read_available()?;
+                return Ok(self.terminal_io_counts().clear_all >= minimum);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
