@@ -299,6 +299,7 @@ pub(crate) fn std_command(
     std_command_inner(program.as_ref(), profile, root, false)
 }
 
+#[cfg(test)]
 pub(crate) fn std_command_offline(
     program: impl AsRef<OsStr>,
     profile: SandboxProfile,
@@ -342,7 +343,11 @@ fn std_command_inner(
         ));
     }
 
-    let scratch = Some(PrivateScratch::create()?);
+    let scratch = if confines(profile) || offline {
+        Some(PrivateScratch::create()?)
+    } else {
+        None
+    };
 
     #[cfg(target_os = "macos")]
     let mut command = if confines(profile) && macos::sandbox_exec_available() {
@@ -401,7 +406,11 @@ pub(crate) fn tokio_command(
     root: &Path,
 ) -> std::io::Result<SandboxedCommand> {
     let program = program.as_ref();
-    let scratch = Some(PrivateScratch::create()?);
+    let scratch = if confines(profile) {
+        Some(PrivateScratch::create()?)
+    } else {
+        None
+    };
 
     #[cfg(target_os = "macos")]
     let mut command = if confines(profile) && macos::sandbox_exec_available() {
@@ -788,6 +797,28 @@ mod tests {
                 .contains("(literal ")
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_access_command_has_no_sandbox_scratch_or_temp_override() {
+        let root = temp_dir("full-access-fast-path");
+        let command = std_command(
+            "dext-fast-path-probe",
+            SandboxProfile::DangerFullAccess,
+            &root,
+        )
+        .expect("prepare full-access command");
+        assert!(command.scratch_path().is_none());
+        let temp_overrides = command
+            .get_envs()
+            .filter_map(|(name, value)| value.map(|_| name.to_string_lossy().into_owned()))
+            .filter(|name| matches!(name.as_str(), "TMPDIR" | "TMP" | "TEMP"))
+            .collect::<Vec<_>>();
+        assert!(
+            temp_overrides.is_empty(),
+            "full access must preserve ambient temp configuration: {temp_overrides:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

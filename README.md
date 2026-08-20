@@ -18,7 +18,7 @@
 
 <p align="center">
   <img src="docs/dext-tui.png" alt="Dext inline terminal interface showing model, approval, context, and token details" width="900"><br>
-  <sub>Inline TUI with native scrollback. Trust mode is explicitly enabled in this capture; Dext defaults to Ask.</sub>
+  <sub>Inline TUI with native scrollback. The capture uses approval Always, which is now the default.</sub>
 </p>
 
 Dext is an interactive terminal agent and automation-friendly CLI. It supports ChatGPT/Codex, OpenAI, Anthropic, GLM, Kimi Code, DeepSeek, and local OpenAI-compatible models without requiring a Dext-hosted service.
@@ -83,7 +83,7 @@ See [`docs/USAGE.md`](docs/USAGE.md) for provider setup, model routing, sessions
 - **Terminal-native.** Inline Ratatui UI with normal scrollback, streaming input, one-shot output, JSON, and stream-JSON.
 - **Source-first.** Prompts, provider adapters, policies, state, tools, and UI are auditable in this repository.
 - **Recoverable.** Git-native pre-mutation checkpoints, previews, side-effect journals, and explicit undo.
-- **Bounded by default.** Approval profiles, filesystem sandboxing, credential scrubbing, privacy redaction, and capped I/O.
+- **Bounded where it matters.** Credential scrubbing, privacy redaction, capped I/O, process cleanup, and recovery remain active without constraining the default agent runtime.
 - **Provider-neutral.** Cloud and local providers share one compact native tool layer.
 - **Extensible without core bloat.** User-owned [packs and shelves](docs/PACKS.md) can add workflows and reviewed runtime tools.
 - **Explicit continuity.** By default, Dext autosaves session state under a project-specific key; `dext --resume` restores the latest session. Optional `recall.md` and [Seat](docs/USAGE.md#seats) summaries are user-authored context, not autonomous memory.
@@ -103,7 +103,7 @@ Inside Dext, type `/help` for commands and `?` on an empty prompt for the keymap
 
 ## Safety, plainly
 
-Dext asks before privileged tools by default. `workspace-write` confines writes to the project, scratch space, and selected toolchain caches on supported Linux/macOS hosts; Windows and unsupported hosts retain native guards but do not have equivalent kernel filesystem confinement. Outbound network access from approved subprocesses is not sandboxed.
+A no-argument Dext run is equivalent to `dext --sandbox-profile danger-full-access --approval always`: agent-selected privileged tools run without approval prompts and subprocesses use the ambient filesystem and network authority already granted by the host, container, VM, namespace, WSL environment, CI worker, remote shell, or service account. Dext neither adds confinement nor attempts to escape an existing boundary. Select `--approval ask|auto-read|auto-write|never` and/or `--sandbox read-only|workspace-write` when a task needs stricter controls; optional confinement remains best-effort and platform-dependent.
 
 Git checkpoints are recovery aids, not a substitute for commits. Credentials are scrubbed from agent-run subprocesses unless you explicitly opt in. Run `dext doctor` to inspect the current posture, and read [`SECURITY.md`](SECURITY.md) plus the [risk register](docs/RISK_REGISTER.md) for exact boundaries.
 

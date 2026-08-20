@@ -66,9 +66,7 @@ cargo install --path . --force --locked
 
 On Windows, branch CI also runs the native descendant-lifecycle test for kill-on-close Job Objects. If install fails with `Access is denied`, close running `dext.exe` processes and retry.
 
-Run the complete release suite and install directly in a trusted host terminal. Dext's default `workspace-write` sandbox intentionally denies shared `/tmp`, arbitrary PTYs, and writes to Cargo metadata outside its approved cache roots. Consequently, running Dext's own full test suite through a confined Dext `bash` tool may cause many temporary-directory failures, all TUI PTY tests to fail, and `cargo install` to report an unwritable `~/.cargo/.crates.toml`. These are sandbox capability denials, not evidence that the corresponding code assertions failed, but they leave the release gate unverified.
-
-For agent-orchestrated release verification, launch a separate controlled process with `dext --sandbox-profile danger-full-access --approval always`. An environment assignment inside an existing command cannot relax its parent kernel sandbox. Do not broaden the default sandbox to accommodate self-hosted release tests.
+Run the complete release suite and install directly in the active environment. The default `danger-full-access` profile already adds no filesystem confinement and therefore needs no special release escape process. If you explicitly select `workspace-write` or `read-only`, shared `/tmp`, arbitrary PTYs, and Cargo metadata outside approved roots may be denied; run the final gate under the default profile or directly in the parent environment instead. A child cannot relax container, VM, namespace, seccomp, Seatbelt, service-account, or host restrictions inherited from its parent.
 
 ## Security hygiene
 

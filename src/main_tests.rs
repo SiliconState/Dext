@@ -128,9 +128,9 @@ fn test_agent(root: &Path) -> Agent {
         compact_threshold_chars: None,
         compact_threshold_percent: None,
         context_window_tokens: model_context_window("test-model"),
-        approval_profile: ApprovalProfile::default(),
+        approval_profile: ApprovalProfile::Ask,
         approval_policy_source: ApprovalPolicySource::default(),
-        sandbox_profile: SandboxProfile::default(),
+        sandbox_profile: SandboxProfile::WorkspaceWrite,
         context_mode: ContextMode::default(),
         context_mode_explicit: false,
         tool_context_profile: ToolContextProfile::default(),
@@ -5352,6 +5352,7 @@ fn eval_shell_ignores_login_and_noninteractive_startup_files() -> Result<()> {
         let (code, stdout, stderr) = run_eval_shell_command(
             &root,
             "printf '%s|%s|%s|%s' \"${EVAL_TEST_API_KEY-unset}\" \"${EVAL_LOGIN_PROFILE_RAN-unset}\" \"${EVAL_BASH_ENV_RAN-unset}\" \"${BASH_ENV-unset}\"",
+            SandboxProfile::DangerFullAccess,
         )
         .map_err(anyhow::Error::msg)?;
         assert_eq!(code, 0, "{stderr}");
@@ -5389,8 +5390,8 @@ fn eval_shell_confines_project_and_external_writes() -> Result<()> {
         shell_single_quote(&outside.to_string_lossy()),
     );
 
-    let (code, _stdout, stderr) =
-        run_eval_shell_command(&root, &command).map_err(anyhow::Error::msg)?;
+    let (code, _stdout, stderr) = run_eval_shell_command(&root, &command, SandboxProfile::ReadOnly)
+        .map_err(anyhow::Error::msg)?;
     assert_eq!(code, 0, "{stderr}");
     assert!(!inside.exists(), "eval assertion mutated its fixture");
     assert!(!outside.exists(), "eval assertion escaped its fixture");
@@ -8261,6 +8262,34 @@ fn slash_trust_emits_profile_update_for_tui_status() {
 }
 
 #[test]
+fn always_profile_approves_host_operations_without_prompting() {
+    let root = temp_test_dir("always-host-operations");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.hooks.user_prompt.push(Hook {
+        tool_match: None,
+        command: "printf hook".to_string(),
+    });
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: requests.clone(),
+    }));
+
+    assert!(hooks_approved(&mut agent));
+    assert!(git_commit_hooks_approved(&mut agent));
+    assert!(diagnostics_approved(&mut agent));
+    assert!(approve_project_extensions(&mut agent));
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "approval=always must not delegate host-operation permission to the frontend"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn hook_execution_requires_explicit_non_persistent_approval() {
     let root = temp_test_dir("hook-approval-policy");
     let mut agent = test_agent(&root);
@@ -8293,11 +8322,12 @@ fn hook_execution_requires_explicit_non_persistent_approval() {
     );
 
     agent.set_approval_profile(ApprovalProfile::Always);
-    assert!(
-        !hooks_approved(&mut agent),
-        "global approval=always must not implicitly authorize project hooks"
+    assert!(hooks_approved(&mut agent));
+    assert_eq!(
+        requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "approval=always must authorize hooks without prompting"
     );
-    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
 
     agent.set_approval_profile(ApprovalProfile::Ask);
     let once_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -8375,11 +8405,12 @@ fn git_commit_hook_execution_requires_explicit_non_persistent_approval() {
         requests: deny_requests.clone(),
     }));
 
-    assert!(
-        !git_commit_hooks_approved(&mut agent),
-        "global approval=always must not authorize repository Git hooks"
+    assert!(git_commit_hooks_approved(&mut agent));
+    assert_eq!(
+        deny_requests.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "approval=always must authorize repository Git hooks without prompting"
     );
-    assert_eq!(deny_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(!agent.allowed.contains(HOOKS_APPROVAL_NAME));
 
     agent.set_approval_profile(ApprovalProfile::Ask);
@@ -8554,7 +8585,7 @@ fn rust_analyzer_diagnostics_bounds_frame_queue_and_cleanup() -> Result<()> {
     }
 
     let started = std::time::Instant::now();
-    let report = run_rust_analyzer_diagnostics(&root);
+    let report = run_rust_analyzer_diagnostics(&root, SandboxProfile::ReadOnly);
     let elapsed = started.elapsed();
 
     restore_env_var("PATH", old_path);
@@ -8686,7 +8717,7 @@ fn cargo_diagnostics_confine_hostile_build_script_writes_to_private_scratch() ->
 "#,
     )?;
 
-    let report = run_cargo_check_diagnostics(&root);
+    let report = run_cargo_check_diagnostics(&root, SandboxProfile::ReadOnly);
     assert_eq!(report.status, "failed", "{}", report.raw_output);
     assert!(
         report
@@ -8964,7 +8995,7 @@ fn workflow_diagnostics_render_and_ledger_are_prompt_visible() {
 }
 
 #[test]
-fn partial_checkpoint_recovery_approval_is_repo_session_scoped() {
+fn partial_checkpoint_recovery_always_profile_is_repo_session_scoped() {
     let root = temp_test_dir("checkpoint-partial-approval");
     git_ok(&root, &["init", "-q"]);
     git_ok(&root, &["config", "user.email", "test@example.invalid"]);
@@ -8992,9 +9023,9 @@ fn partial_checkpoint_recovery_approval_is_repo_session_scoped() {
     agent
         .maybe_create_tool_checkpoint("bash", &json!({"command": "touch two"}))
         .expect("cached partial checkpoint approval");
-    assert_eq!(
-        names.lock().unwrap().as_slice(),
-        [CHECKPOINT_RECOVERY_GAP_APPROVAL_NAME]
+    assert!(
+        names.lock().unwrap().is_empty(),
+        "approval=always must not prompt for a recovery-gap acknowledgement"
     );
     assert!(agent.checkpoint_partial_untracked_approved);
     assert_eq!(
@@ -10256,10 +10287,11 @@ fn doctor_report_covers_core_checks() {
     ] {
         assert!(report.contains(needle), "missing '{needle}' in:\n{report}");
     }
-    // The sandbox line must reflect the real platform status, never be empty.
     assert!(
-        report.contains(&crate::sandbox::describe()),
-        "sandbox line should embed the platform description:\n{report}"
+        report.contains(
+            "sandbox kernel: Dext adds no kernel confinement; ambient environment authority applies"
+        ),
+        "default doctor report must explain ambient full access:\n{report}"
     );
 }
 
@@ -10307,7 +10339,7 @@ fn doctor_findings_render_levels_and_effective_policy_source() {
         "{report}"
     );
     assert!(
-        report.contains("sandbox kernel: intentionally disabled"),
+        report.contains("sandbox kernel: Dext adds no kernel confinement"),
         "{report}"
     );
 }
@@ -10486,7 +10518,7 @@ fn doctor_rejects_symlinked_latest_session_entries() -> Result<()> {
 fn doctor_treats_intentional_full_access_as_configured_not_unavailable() {
     let (ok, detail) = sandbox_doctor_status(SandboxProfile::DangerFullAccess);
     assert!(ok);
-    assert!(detail.contains("intentionally disabled"), "{detail}");
+    assert!(detail.contains("adds no kernel confinement"), "{detail}");
     assert!(!detail.contains("path-validation"), "{detail}");
 
     let (ok, detail) = sandbox_doctor_status(SandboxProfile::WorkspaceWrite);
@@ -14635,6 +14667,47 @@ fn stream_error_classification_retries_chunked_eof() {
 }
 
 #[test]
+fn pack_runtime_default_always_profile_does_not_prompt() {
+    let root = temp_test_dir("pack-runtime-default-always");
+    let mut agent = test_agent(&root);
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: requests.clone(),
+    }));
+    let runtime = pack_runtime::ActiveRuntime {
+        pack_name: "demo".to_string(),
+        pack_source: "user:test".to_string(),
+        executable: root.join("runtime"),
+        executable_sha256: "digest".to_string(),
+        args: Vec::new(),
+        timeout: std::time::Duration::from_secs(1),
+        tools: Vec::new(),
+        manifest_sha256: "manifest".to_string(),
+        state: Value::Null,
+        max_continuations: 1,
+        continuations_used: 0,
+    };
+    let pack = packs::PackInfo {
+        name: "demo".to_string(),
+        description: "demo".to_string(),
+        path: root.clone(),
+        pack_md_path: root.join("PACK.md"),
+        phooks_path: None,
+        runtime_path: Some(root.join("runtime.json")),
+        credential_env: Vec::new(),
+        credential_env_ignored: false,
+        source: "user:test".to_string(),
+        shelf: Some("test".to_string()),
+    };
+
+    assert!(agent.pack_runtime_execution_approved(&pack, &runtime));
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn pack_runtime_always_approval_is_exact_identity_scoped() {
     let root = temp_test_dir("pack-runtime-approval-identity");
     let mut agent = test_agent(&root);
@@ -16368,7 +16441,7 @@ fn hooks_capture_is_capped() {
 
 #[cfg(unix)]
 #[test]
-fn automatic_hooks_never_inherit_danger_full_access() {
+fn automatic_hooks_use_the_selected_sandbox_profile() {
     let root = temp_test_dir("hook-sandbox-ceiling");
     let outside = root.parent().expect("temp root parent").join(format!(
         "dext-hook-outside-{}-{}",
@@ -16401,12 +16474,14 @@ fn automatic_hooks_never_inherit_danger_full_access() {
     );
     assert_eq!(out.len(), 1);
     assert_eq!(std::fs::read_to_string(&inside).unwrap(), "inside");
-    if crate::sandbox::is_enforced() {
-        assert_ne!(out[0].1, 0, "outside hook write unexpectedly succeeded");
-        assert!(!outside.exists(), "hook escaped workspace confinement");
-    }
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside");
+    assert_eq!(
+        out[0].1, 0,
+        "full-access hook must inherit ambient authority"
+    );
 
-    std::fs::remove_file(&inside).expect("remove workspace-write fixture");
+    std::fs::remove_file(&inside).expect("remove full-access fixture");
+    std::fs::remove_file(&outside).expect("remove outside fixture");
     let read_only = hooks.fire("user_prompt", "", &[], &[], &root, SandboxProfile::ReadOnly);
     assert_eq!(read_only.len(), 1);
     if crate::sandbox::is_enforced() {
@@ -17753,6 +17828,8 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
     assert_eq!(legacy.version, SESSION_FORMAT_VERSION);
     assert_eq!(legacy.model, "legacy");
     assert_eq!(legacy.reasoning_mode, ReasoningMode::Standard);
+    assert_eq!(legacy.approval_profile, ApprovalProfile::Ask);
+    assert_eq!(legacy.sandbox_profile, SandboxProfile::WorkspaceWrite);
 
     let v2 = parse_session_header(r#"{"version":2,"model":"v2","system":"system"}"#)
         .expect("parse v2 session header");
@@ -18854,9 +18931,34 @@ fn json_sink_crash_recording_ownership_avoids_text_delegation_duplicates() {
 }
 
 #[test]
+fn default_policy_matches_explicit_full_access_and_always() {
+    assert_eq!(ApprovalProfile::default(), ApprovalProfile::Always);
+    assert_eq!(SandboxProfile::default(), SandboxProfile::DangerFullAccess);
+    assert_eq!(
+        ApprovalProfile::parse("default"),
+        Some(ApprovalProfile::Always)
+    );
+    assert_eq!(
+        SandboxProfile::parse("default"),
+        Some(SandboxProfile::DangerFullAccess)
+    );
+
+    let implicit = resolve_approval_policy(None, None, None);
+    let explicit = resolve_approval_policy(Some(ApprovalProfile::Always), None, None);
+    assert_eq!(implicit.profile, explicit.profile);
+    assert_eq!(implicit.profile, ApprovalProfile::Always);
+    assert_eq!(implicit.source, ApprovalPolicySource::Default);
+    assert_eq!(explicit.source, ApprovalPolicySource::Cli);
+
+    let options = parse_cli_options(Vec::new()).expect("parse no-argument policy");
+    assert_eq!(options.approval_policy_override, None);
+    assert_eq!(options.sandbox_profile, None);
+}
+
+#[test]
 fn approval_policy_resolver_is_fail_safe_and_has_fixed_precedence() {
     let resolved = resolve_approval_policy(None, None, None);
-    assert_eq!(resolved.profile, ApprovalProfile::Ask);
+    assert_eq!(resolved.profile, ApprovalProfile::Always);
     assert_eq!(resolved.source, ApprovalPolicySource::Default);
 
     let resolved = resolve_approval_policy(None, Some("auto-write"), Some("1"));
@@ -18872,6 +18974,11 @@ fn approval_policy_resolver_is_fail_safe_and_has_fixed_precedence() {
     assert_eq!(resolved.source, ApprovalPolicySource::DextTrust);
     assert_eq!(resolved.warnings.len(), 1);
 
+    let resolved = resolve_approval_policy(None, Some("invalid"), None);
+    assert_eq!(resolved.profile, ApprovalProfile::Ask);
+    assert_eq!(resolved.source, ApprovalPolicySource::Default);
+    assert_eq!(resolved.warnings.len(), 1);
+
     let resolved = resolve_approval_policy(None, None, Some("invalid"));
     assert_eq!(resolved.profile, ApprovalProfile::Ask);
     assert_eq!(resolved.source, ApprovalPolicySource::Default);
@@ -18879,9 +18986,123 @@ fn approval_policy_resolver_is_fail_safe_and_has_fixed_precedence() {
 
     for false_value in ["0", "false", "off", "no"] {
         let resolved = resolve_approval_policy(None, None, Some(false_value));
-        assert_eq!(resolved.profile, ApprovalProfile::Ask);
+        assert_eq!(resolved.profile, ApprovalProfile::Always);
         assert_eq!(resolved.source, ApprovalPolicySource::Default);
     }
+}
+
+#[test]
+fn sandbox_profile_resolution_is_strict_and_cli_has_precedence() {
+    assert_eq!(
+        resolve_sandbox_profile(None, None),
+        Ok(SandboxProfile::DangerFullAccess)
+    );
+    assert_eq!(
+        resolve_sandbox_profile(None, Some("workspace-write")),
+        Ok(SandboxProfile::WorkspaceWrite)
+    );
+    assert_eq!(
+        resolve_sandbox_profile(Some(SandboxProfile::ReadOnly), Some("invalid")),
+        Ok(SandboxProfile::ReadOnly)
+    );
+    assert!(resolve_sandbox_profile(None, Some("invalid")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_policy_environment_fails_safe() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let _guard = env_lock();
+    let old_approval = std::env::var_os("DEXT_APPROVAL");
+    let old_trust = std::env::var_os("DEXT_TRUST");
+    let old_sandbox = std::env::var_os("DEXT_SANDBOX_PROFILE");
+    unsafe {
+        std::env::set_var("DEXT_APPROVAL", std::ffi::OsString::from_vec(vec![0xff]));
+        std::env::remove_var("DEXT_TRUST");
+        std::env::set_var(
+            "DEXT_SANDBOX_PROFILE",
+            std::ffi::OsString::from_vec(vec![0xff]),
+        );
+    }
+
+    let approval = resolve_approval_policy_from_env(None);
+    assert_eq!(approval.profile, ApprovalProfile::Ask);
+    assert_eq!(approval.source, ApprovalPolicySource::Default);
+    assert_eq!(approval.warnings.len(), 1);
+
+    unsafe {
+        std::env::remove_var("DEXT_APPROVAL");
+        std::env::set_var("DEXT_TRUST", std::ffi::OsString::from_vec(vec![0xff]));
+    }
+    let trust = resolve_approval_policy_from_env(None);
+    assert_eq!(trust.profile, ApprovalProfile::Ask);
+    assert_eq!(trust.source, ApprovalPolicySource::Default);
+    assert_eq!(trust.warnings.len(), 1);
+    assert_eq!(
+        resolve_approval_policy_from_env(Some(ApprovalProfile::Never)).profile,
+        ApprovalProfile::Never
+    );
+
+    assert!(resolve_sandbox_profile_from_env(None).is_err());
+    assert_eq!(
+        resolve_sandbox_profile_from_env(Some(SandboxProfile::ReadOnly)),
+        Ok(SandboxProfile::ReadOnly)
+    );
+
+    restore_env_var("DEXT_APPROVAL", old_approval);
+    restore_env_var("DEXT_TRUST", old_trust);
+    restore_env_var("DEXT_SANDBOX_PROFILE", old_sandbox);
+}
+
+#[test]
+fn eval_and_default_sandbox_cli_forms_are_parsed_as_policy() -> Result<()> {
+    let opts = parse_cli_options(vec![
+        "--eval".to_string(),
+        "create_file".to_string(),
+        "--sandbox".to_string(),
+        "default".to_string(),
+    ])?;
+    assert!(opts.eval);
+    assert_eq!(opts.eval_filter.as_deref(), Some("create_file"));
+    assert!(opts.positional.is_empty());
+    assert_eq!(opts.sandbox_profile, Some(SandboxProfile::DangerFullAccess));
+    assert_eq!(opts.cd, None);
+
+    let opts = parse_cli_options(vec![
+        "--sandbox=default".to_string(),
+        "--eval=create_file".to_string(),
+    ])?;
+    assert!(opts.eval);
+    assert_eq!(opts.eval_filter.as_deref(), Some("create_file"));
+    assert_eq!(opts.sandbox_profile, Some(SandboxProfile::DangerFullAccess));
+    assert_eq!(opts.cd, None);
+    let opts = parse_cli_options(vec![
+        "--eval".to_string(),
+        "--sandbox=read-only".to_string(),
+        "create_file".to_string(),
+    ])?;
+    assert!(opts.eval);
+    assert_eq!(opts.eval_filter.as_deref(), Some("create_file"));
+    assert!(opts.positional.is_empty());
+    assert_eq!(opts.sandbox_profile, Some(SandboxProfile::ReadOnly));
+
+    assert!(
+        parse_cli_options(vec![
+            "--eval".to_string(),
+            "create_file".to_string(),
+            "read_file".to_string(),
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_cli_options(vec![
+            "--eval=create_file".to_string(),
+            "read_file".to_string(),
+        ])
+        .is_err()
+    );
+    Ok(())
 }
 
 #[test]

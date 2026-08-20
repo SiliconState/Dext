@@ -183,11 +183,14 @@ jobs:
         run: cargo test --release --locked --target ${{ matrix.target }}
       - name: Run Windows release tests
         if: runner.os == 'Windows'
-        run: cargo test --release --locked --target ${{ matrix.target }} -- --skip main_tests::fast_bash_command_returns_without_100ms_poll_tail
+        run: cargo test --release --locked --target ${{ matrix.target }} -- --skip main_tests::fast_bash_command_returns_without_100ms_poll_tail --skip tui_smoke_launches_real_binary_in_conpty_and_restores_terminal
       - name: Run Windows bash fast-path latency test in isolation
         if: runner.os == 'Windows'
         run: cargo test --release --locked --target ${{ matrix.target }} main_tests::fast_bash_command_returns_without_100ms_poll_tail -- --exact --nocapture
-      - name: Run TUI smoke tests
+      - name: Run Windows ConPTY smoke test
+        if: runner.os == 'Windows'
+        run: cargo test --release --locked --target ${{ matrix.target }} --test tui_smoke_windows -- --nocapture
+      - name: Run Unix TUI smoke tests
         if: runner.os != 'Windows'
         run: cargo test --release --locked --target ${{ matrix.target }} --test tui_smoke -- --nocapture
       - name: Package Unix archive and smoke test packaged binary
