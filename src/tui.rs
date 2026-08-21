@@ -9802,8 +9802,21 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
 
     drop(key_rx);
     let _ = key_kill_tx.send(());
-    // key reader thread should exit within one poll cycle (80 ms)
-    let _ = key_handle.join();
+    // The reader can sit inside a blocking console read that only returns on
+    // further input (notably Windows ConPTY after quit, where no input records
+    // ever arrive again), so never let process exit depend on an unbounded
+    // join; detach the thread once the bounded wait elapses.
+    let key_join_deadline = Instant::now() + Duration::from_millis(600);
+    loop {
+        if key_handle.is_finished() {
+            let _ = key_handle.join();
+            break;
+        }
+        if Instant::now() >= key_join_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     let _ = terminal.clear();
     {
