@@ -16,8 +16,8 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 const COLS: i16 = 120;
@@ -269,6 +269,16 @@ impl ConPty {
             let mut startup = STARTUPINFOEXW::default();
             startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
             startup.lpAttributeList = attribute_list;
+            // With redirected parent stdio (cargo test capture pipes), CreateProcess
+            // duplicates the parent's pipe std handles into the child even when a
+            // pseudoconsole attribute is attached, so the child sees non-console
+            // stdio and its output bypasses the ConPTY. Explicit null std handles
+            // force the console subsystem to hand the child fresh handles from the
+            // attached pseudoconsole instead.
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup.StartupInfo.hStdInput = null_mut();
+            startup.StartupInfo.hStdOutput = null_mut();
+            startup.StartupInfo.hStdError = null_mut();
             let executable = wide_null(executable);
             let mut command = wide_null(OsStr::new(command));
             let current_dir = wide_null(current_dir.as_os_str());
