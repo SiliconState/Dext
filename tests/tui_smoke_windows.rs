@@ -66,6 +66,63 @@ fn tui_smoke_launches_real_binary_in_conpty_and_restores_terminal() {
     );
 }
 
+#[test]
+fn conpty_harness_selfcheck_echoes_through_pseudoconsole() {
+    let temp = TempDir::new("dext-conpty-selfcheck").expect("temp directory");
+    let comspec = std::env::var_os("COMSPEC")
+        .unwrap_or_else(|| OsString::from("C:\\Windows\\System32\\cmd.exe"));
+    let command = format!(
+        "\"{}\" /c echo conpty-harness-selfcheck-ok",
+        Path::new(&comspec).display()
+    );
+    let environment = environment_block([("NO_COLOR", OsStr::new("1"))]);
+    let mut conpty = ConPty::spawn_with(&comspec, &command, &temp.path, environment)
+        .expect("spawn cmd in ConPTY");
+    let exit = conpty.wait_for_exit(TIMEOUT).expect("wait for cmd exit");
+    let output = conpty.text();
+    assert_eq!(exit, 0, "cmd exited with {exit}; output:\n{output}");
+    assert!(
+        output.contains("conpty-harness-selfcheck-ok"),
+        "ConPTY harness did not relay child output:\n{output}"
+    );
+}
+
+#[test]
+fn conpty_dext_version_exits_noninteractively() {
+    let temp = TempDir::new("dext-conpty-version").expect("temp directory");
+    let dext_home = temp.path.join("dext-home");
+    std::fs::create_dir_all(&dext_home).expect("dext home");
+    let command = format!("\"{}\" --version", env!("CARGO_BIN_EXE_dext"));
+    let environment = environment_block([
+        ("DEXT_HOME", dext_home.as_os_str()),
+        ("HOME", temp.path.as_os_str()),
+        ("USERPROFILE", temp.path.as_os_str()),
+        ("TEMP", temp.path.as_os_str()),
+        ("TMP", temp.path.as_os_str()),
+        ("NO_COLOR", OsStr::new("1")),
+        ("TERM", OsStr::new("xterm-256color")),
+    ]);
+    let mut conpty = ConPty::spawn_with(
+        OsStr::new(env!("CARGO_BIN_EXE_dext")),
+        &command,
+        &temp.path,
+        environment,
+    )
+    .expect("spawn dext --version in ConPTY");
+    let exit = conpty
+        .wait_for_exit(TIMEOUT)
+        .expect("wait for dext --version exit");
+    let output = conpty.text();
+    assert_eq!(
+        exit, 0,
+        "dext --version exited with {exit}; output:\n{output}"
+    );
+    assert!(
+        output.contains("dext"),
+        "dext --version produced no recognizable output:\n{output}"
+    );
+}
+
 struct TempDir {
     path: std::path::PathBuf,
 }
@@ -122,6 +179,30 @@ struct ConPty {
 
 impl ConPty {
     fn spawn(sandbox: &Path, dext_home: &Path, home: &Path) -> io::Result<Self> {
+        let executable = OsString::from(env!("CARGO_BIN_EXE_dext"));
+        let command = format!(
+            "\"{}\" --no-session --cd \"{}\"",
+            env!("CARGO_BIN_EXE_dext"),
+            sandbox.display()
+        );
+        let environment = environment_block([
+            ("DEXT_HOME", dext_home.as_os_str()),
+            ("HOME", home.as_os_str()),
+            ("USERPROFILE", home.as_os_str()),
+            ("TEMP", home.as_os_str()),
+            ("TMP", home.as_os_str()),
+            ("NO_COLOR", OsStr::new("1")),
+            ("TERM", OsStr::new("xterm-256color")),
+        ]);
+        Self::spawn_with(&executable, &command, sandbox, environment)
+    }
+
+    fn spawn_with(
+        executable: &OsStr,
+        command: &str,
+        current_dir: &Path,
+        mut environment: Vec<u16>,
+    ) -> io::Result<Self> {
         unsafe {
             let mut input_read = null_mut();
             let mut input_write = null_mut();
@@ -188,23 +269,9 @@ impl ConPty {
             let mut startup = STARTUPINFOEXW::default();
             startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
             startup.lpAttributeList = attribute_list;
-            let executable = wide_null(OsStr::new(env!("CARGO_BIN_EXE_dext")));
-            let command = format!(
-                "\"{}\" --no-session --cd \"{}\"",
-                env!("CARGO_BIN_EXE_dext"),
-                sandbox.display()
-            );
-            let mut command = wide_null(OsStr::new(&command));
-            let mut environment = environment_block([
-                ("DEXT_HOME", dext_home.as_os_str()),
-                ("HOME", home.as_os_str()),
-                ("USERPROFILE", home.as_os_str()),
-                ("TEMP", home.as_os_str()),
-                ("TMP", home.as_os_str()),
-                ("NO_COLOR", OsStr::new("1")),
-                ("TERM", OsStr::new("xterm-256color")),
-            ]);
-            let current_dir = wide_null(sandbox.as_os_str());
+            let executable = wide_null(executable);
+            let mut command = wide_null(OsStr::new(command));
+            let current_dir = wide_null(current_dir.as_os_str());
             let mut process = PROCESS_INFORMATION::default();
             let created = CreateProcessW(
                 executable.as_ptr(),
@@ -279,11 +346,24 @@ impl ConPty {
 
     fn wait_for(&self, needle: &str, timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        let mut exit_observed: Option<Instant> = None;
+        loop {
             if self.visible_text()?.contains(needle) {
                 return Ok(());
             }
-            if unsafe { WaitForSingleObject(self.process.0, 0) } == WAIT_OBJECT_0 {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            if exit_observed.is_none()
+                && unsafe { WaitForSingleObject(self.process.0, 0) } == WAIT_OBJECT_0
+            {
+                exit_observed = Some(now);
+            }
+            // After exit, keep draining briefly so late ConPTY output still counts.
+            if let Some(exited) = exit_observed
+                && now.duration_since(exited) > Duration::from_secs(1)
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -291,12 +371,30 @@ impl ConPty {
         Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "did not observe {needle:?}; visible output:\n{}\nraw output:\n{}",
+                "did not observe {needle:?}; child {}; visible output:\n{}\nraw output:\n{}",
+                self.child_status(),
                 self.visible_text()
                     .unwrap_or_else(|error| error.to_string()),
                 self.text()
             ),
         ))
+    }
+
+    fn child_status(&self) -> String {
+        unsafe {
+            if WaitForSingleObject(self.process.0, 0) == WAIT_OBJECT_0 {
+                let mut code = 0u32;
+                if GetExitCodeProcess(self.process.0, &mut code) == 0 {
+                    return format!(
+                        "exited (exit code unavailable: {})",
+                        io::Error::last_os_error()
+                    );
+                }
+                format!("exited with code {code} (0x{code:08x})")
+            } else {
+                "still running".to_string()
+            }
+        }
     }
 
     fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<u32> {
