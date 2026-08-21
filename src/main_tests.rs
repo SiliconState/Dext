@@ -10954,21 +10954,32 @@ async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
 #[tokio::test]
 async fn fast_bash_command_returns_without_100ms_poll_tail() {
     let root = temp_test_dir("bash-fastpath");
-    let start = std::time::Instant::now();
-    let out = execute_bash_async_with_timeout(
-        "true",
-        &root,
-        Arc::new(AtomicBool::new(false)),
-        std::time::Duration::from_secs(5),
-        SandboxProfile::WorkspaceWrite,
-    )
-    .await
-    .expect("expected success");
-    let elapsed = start.elapsed();
-    assert!(out.contains("exit: 0"), "{out}");
+    // One wall-clock sample is scheduler-noise-bound on shared CI runners; a
+    // structural 100ms poll tail would slow every attempt, so the fastest of
+    // three proves the fast path while absorbing transient runner stalls.
+    let mut samples = Vec::new();
+    for _ in 0..3 {
+        let start = std::time::Instant::now();
+        let out = execute_bash_async_with_timeout(
+            "true",
+            &root,
+            Arc::new(AtomicBool::new(false)),
+            std::time::Duration::from_secs(5),
+            SandboxProfile::WorkspaceWrite,
+        )
+        .await
+        .expect("expected success");
+        let elapsed = start.elapsed();
+        assert!(out.contains("exit: 0"), "{out}");
+        if elapsed < std::time::Duration::from_millis(90) {
+            samples.clear();
+            break;
+        }
+        samples.push(elapsed);
+    }
     assert!(
-        elapsed < std::time::Duration::from_millis(90),
-        "expected <90ms (old busy-poll capped at 100ms); got {elapsed:?}"
+        samples.is_empty(),
+        "expected one of three runs <90ms (old busy-poll capped at 100ms); got {samples:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
