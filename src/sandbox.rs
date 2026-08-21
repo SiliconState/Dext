@@ -299,7 +299,7 @@ pub(crate) fn std_command(
     std_command_inner(program.as_ref(), profile, root, false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn std_command_offline(
     program: impl AsRef<OsStr>,
     profile: SandboxProfile,
