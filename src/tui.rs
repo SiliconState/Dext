@@ -9062,10 +9062,17 @@ fn handle_key(
             state.history_idx = None;
             state.clear_input();
             state.clear_slash_completion_selection();
+            // The agent task also honors /quit and /exit, but it cannot reach
+            // back into TUI state, so quit must be mirrored here or the render
+            // loop keeps running after the agent loop breaks.
+            let quit_requested = matches!(text.trim(), "/quit" | "/exit");
             let _ = agent_input.send(FromTui::Submit {
                 text,
                 pane_width: state.transcript_area.width,
             });
+            if quit_requested {
+                state.quit = true;
+            }
         }
         (KeyCode::PageUp, _) => {
             let step = state.transcript_visible_lines.saturating_sub(2).max(1) as isize;
@@ -13764,6 +13771,43 @@ mod tests {
         assert!(submit_rx.try_recv().is_err());
         assert!(runtime_control_rx.try_recv().is_err());
         assert!(steering_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn submitted_quit_command_sets_quit_and_forwards_submit() {
+        for command in ["/quit", "/exit"] {
+            let mut state = TuiState::new(
+                "test-model".to_string(),
+                model_context_window("test-model"),
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (runtime_control_tx, _runtime_control_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (steering_tx, _steering_rx) = tokio::sync::mpsc::unbounded_channel();
+            let interrupt = Arc::new(AtomicBool::new(false));
+
+            state.input = command.to_string();
+            state.cursor = state.input.len();
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+                &submit_tx,
+                &runtime_control_tx,
+                &steering_tx,
+                &interrupt,
+            );
+
+            assert!(
+                state.quit,
+                "submitted {command} must stop the TUI render loop"
+            );
+            assert!(matches!(
+                submit_rx.try_recv(),
+                Ok(FromTui::Submit { text, .. }) if text == command
+            ));
+        }
     }
 
     #[test]
