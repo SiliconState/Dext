@@ -425,7 +425,14 @@ impl ConPty {
                 _ => return Err(io::Error::last_os_error()),
             }
         }
-        Err(io::Error::new(io::ErrorKind::TimedOut, "Dext did not exit"))
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "Dext did not exit; child {}; raw output:\n{}",
+                self.child_status(),
+                self.text()
+            ),
+        ))
     }
 
     fn close_console_and_join_output(&mut self) -> io::Result<()> {
