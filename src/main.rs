@@ -2811,7 +2811,7 @@ struct OaiRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OaiStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<String>,
     /// llama.cpp GBNF extension. Only ever set for the local llama.cpp
     /// provider (cloud OpenAI rejects unknown fields), and only when the
     /// user opts in — see `llama_tool_call_grammar`.
@@ -14061,6 +14061,28 @@ impl Agent {
         }
     }
 
+    /// Chat-completions `reasoning_effort`: declared per-model effort levels
+    /// win over the legacy model-name clamp so servers that reject unknown
+    /// levels (e.g. llama.cpp templates accepting only xhigh/medium/low) get
+    /// a value they understand.
+    fn oai_chat_reasoning_effort(&self, effort: ThinkingEffort) -> Option<String> {
+        let resolved_spec = self.resolved_model_spec();
+        resolved_spec
+            .as_ref()
+            .filter(|spec| !spec.effort_levels.is_empty())
+            .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, effort))
+            .or_else(|| {
+                (resolved_spec
+                    .as_ref()
+                    .is_none_or(|spec| spec.source == "legacy"))
+                .then(|| {
+                    provider_model_output_config_effort(&self.provider_id, &self.model, effort)
+                })
+                .flatten()
+            })
+            .or_else(|| openai_reasoning_effort(&self.model, effort).map(str::to_string))
+    }
+
     fn model_supports_image_input(&self) -> bool {
         self.resolved_model_spec()
             .is_some_and(|spec| spec.image_input)
@@ -16363,7 +16385,7 @@ impl Agent {
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
-                let reasoning_effort = openai_reasoning_effort(&self.model, effort);
+                let reasoning_effort = self.oai_chat_reasoning_effort(effort);
                 let stream_options = (!provider::is_local_llama_provider(
                     &self.provider_id,
                     self.route_api_provider(),

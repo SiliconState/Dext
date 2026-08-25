@@ -15964,6 +15964,67 @@ fn provider_effort_mapping_prefers_exact_levels_before_clamping() {
 }
 
 #[test]
+fn oai_chat_request_honors_declared_model_effort_levels() -> Result<()> {
+    let root = temp_test_dir("oai-chat-effort-levels");
+    let root = std::fs::canonicalize(root)?;
+    let model = "qwen3.8-27b-uncensored";
+    let make_profile = |specs: HashMap<String, ModelSpec>| ProviderProfile {
+        id: "test-oai-effort".to_string(),
+        builtin: None,
+        display_name: "Test OpenAI-compatible".to_string(),
+        api_provider: ApiProvider::OpenAi,
+        request_contract: Some(RequestContract::OpenAiChatCompletions),
+        base_url: "http://127.0.0.1:8084".to_string(),
+        default_model: model.to_string(),
+        models: vec![model.to_string()],
+        model_aliases: HashMap::new(),
+        model_defaults: ModelSpec::default(),
+        model_specs: specs,
+        env_vars: Vec::new(),
+        requires_api_key: false,
+        login_url: None,
+        oauth_flow: None,
+        notes: None,
+        context_window: None,
+        model_context_windows: HashMap::new(),
+        model_effort_levels: HashMap::new(),
+    };
+    let declared = HashMap::from([(
+        model.to_string(),
+        ModelSpec {
+            effort_levels: vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()],
+            ..Default::default()
+        },
+    )]);
+
+    let mut agent = test_agent(&root);
+    agent.provider_id = "test-oai-effort".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "http://127.0.0.1:8084".to_string();
+    agent.model = model.to_string();
+    agent.provider_profile = Some(make_profile(declared.clone()));
+    agent.thinking_effort = ThinkingEffort::XHigh;
+
+    let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["reasoning_effort"], "xhigh", "{body}");
+
+    agent.provider_profile = Some(make_profile(HashMap::new()));
+    let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["reasoning_effort"], "high", "{body}");
+
+    agent.provider_profile = Some(make_profile(declared));
+    agent.thinking_effort = ThinkingEffort::Off;
+    let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(body.get("reasoning_effort").is_none(), "{body}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
 fn compaction_evidence_includes_ledger_verification_provider_health_and_tool_refs() {
     let mut ledger = WorkLedger {
         objective: "fix session discovery".to_string(),
