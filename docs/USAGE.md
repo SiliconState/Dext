@@ -121,7 +121,7 @@ Inside the interactive session, the matching slash commands are:
 /models all
 /login chatgpt
 /logout chatgpt
-/model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
+/model Qwen3.8
 ```
 
 Credentials are stored in Dext state, not in the repository. Do not commit project `.env`, `.dext/`, exported sessions, or auth stores. Dext never auto-loads a project `.env` or searches parent directories; optional Dext dotenv settings belong in the user-owned `~/.dext/.env` (or `$DEXT_HOME/.env`).
@@ -129,6 +129,8 @@ Credentials are stored in Dext state, not in the repository. Do not commit proje
 ### Provider catalog metadata
 
 `~/.dext/providers.json` is auto-normalized to catalog v2 while continuing to accept v1 profiles. A provider may set `request_contract` to `anthropic-messages`, `openai-chat-completions`, `openai-responses`, or `chatgpt-responses`; this controls request and response routing independently of the provider id. Optional `model_aliases`, `model_defaults`, and per-model `model_specs` supply canonical ids, context/output limits, effort levels, reasoning modes, capabilities (`tools`, `reasoning`, `image_input`, and `prompt_cache`), and pricing. Explicit per-model metadata takes precedence; a selected effort uses an exact advertised level when available and otherwise clamps to the nearest supported level. Responses main turns and summaries both use the selected model's resolved levels; Off sends `none` only when advertised, otherwise the reasoning object is omitted. Context hints embedded in model names (such as `-128k` or `[1m]`) take precedence over provider-wide context defaults. Built-in metadata only fills omitted values. Legacy `context_window`, `model_context_windows`, and `model_effort_levels` fields remain accepted. `DEXT_PROMPT_CACHE=on|off` overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.
+
+The built-in GLM catalog includes `glm-5.3-flash` and the Coding Plan spelling `glm-5.3-flash[1m]`. Both declare a 1,000,000-token context window, a 131,072-token output limit, model-specific multimodal capability metadata, stable list pricing, and `low`/`high`/`max` reasoning metadata. Dext does not currently expose image attachments as conversation input; the image flag accurately distinguishes Flash from text-only GLM models for capability reporting. They remain on Dext's ZAI Anthropic-compatible route and always send enabled thinking: Dext Off/Minimal/Low map to `low`, Medium/High to `high`, and XHigh/Max to `max`. Compaction summaries use enabled low-effort thinking because this model rejects thinking-disabled requests. The GLM 5.2 variants retain their existing 1M context metadata and remain the default.
 
 The built-in ChatGPT and OpenAI API catalogs include `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; OpenAI also retains the official unsuffixed `gpt-5.6` Sol id, while ChatGPT normalizes it to `gpt-5.6-sol`. Shorthands are `gpt56`/`gpt56sol`, `gpt56terra`, and `gpt56luna`. Each variant declares a 1,050,000-token context window and 128,000-token output metadata.
 
@@ -148,8 +150,10 @@ Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `h
 
 ```bash
 dext auth provider local
-# or inside Dext, using the alias configured in llama-server:
-/model local/qwen3.6-35b-a3b-mtp-ud-q5_k_m
+# or inside Dext; the built-in alias keeps the exact llama.cpp server id on the wire:
+# built-in shorthand for the configured qwen3.8-27b-ud-q5_k_xl server id:
+/model Qwen3.8
+# explicit provider form: /model local/Qwen3.8
 /effort off
 ```
 

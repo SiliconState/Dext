@@ -2591,6 +2591,27 @@ fn map_effort_to_provider_levels(levels: &[String], effort: ThinkingEffort) -> O
     }
 }
 
+fn glm_forced_thinking_effort(
+    provider_id: &str,
+    model: &str,
+    effort: ThinkingEffort,
+) -> Option<String> {
+    let model = model.trim().to_ascii_lowercase();
+    if canonical_provider_id(provider_id) != "glm"
+        || model.trim_end_matches("[1m]") != "glm-5.3-flash"
+    {
+        return None;
+    }
+    Some(
+        match effort {
+            ThinkingEffort::Off | ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
+            ThinkingEffort::Medium | ThinkingEffort::High => "high",
+            ThinkingEffort::XHigh | ThinkingEffort::Max => "max",
+        }
+        .to_string(),
+    )
+}
+
 fn provider_model_output_config_effort(
     provider_id: &str,
     model: &str,
@@ -16423,23 +16444,29 @@ impl Agent {
             RequestContract::AnthropicMessages => {
                 let max_tokens = max_output_tokens;
                 let resolved_spec = self.resolved_model_spec();
-                let configured_effort = resolved_spec
-                    .as_ref()
-                    .filter(|spec| !spec.effort_levels.is_empty())
-                    .and_then(|spec| map_effort_to_provider_levels(&spec.effort_levels, effort))
-                    .or_else(|| {
-                        (resolved_spec
-                            .as_ref()
-                            .is_none_or(|spec| spec.source == "legacy"))
-                        .then(|| {
-                            provider_model_output_config_effort(
-                                &self.provider_id,
-                                &self.model,
-                                effort,
-                            )
+                let configured_effort =
+                    glm_forced_thinking_effort(&self.provider_id, &self.model, effort)
+                        .or_else(|| {
+                            resolved_spec
+                                .as_ref()
+                                .filter(|spec| !spec.effort_levels.is_empty())
+                                .and_then(|spec| {
+                                    map_effort_to_provider_levels(&spec.effort_levels, effort)
+                                })
                         })
-                        .flatten()
-                    });
+                        .or_else(|| {
+                            (resolved_spec
+                                .as_ref()
+                                .is_none_or(|spec| spec.source == "legacy"))
+                            .then(|| {
+                                provider_model_output_config_effort(
+                                    &self.provider_id,
+                                    &self.model,
+                                    effort,
+                                )
+                            })
+                            .flatten()
+                        });
                 let (thinking, output_config) = if let Some(effort) = configured_effort {
                     let kimi_adaptive = self.kimi_model_uses_adaptive_thinking();
                     (
@@ -17314,6 +17341,12 @@ impl Agent {
             text: COMPACT_SYSTEM,
             cache_control: None,
         }];
+        let effort = glm_forced_thinking_effort(&self.provider_id, model, ThinkingEffort::Low);
+        let thinking = effort.as_ref().map(|_| AnthropicThinking {
+            kind: "enabled",
+            budget_tokens: None,
+        });
+        let output_config = effort.map(|effort| AnthropicOutputConfig { effort });
         let body = Request {
             model,
             max_tokens,
@@ -17321,8 +17354,8 @@ impl Agent {
             messages: &messages,
             tools: &[],
             stream: false,
-            thinking: None,
-            output_config: None,
+            thinking,
+            output_config,
         };
         let bytes = serde_json::to_vec(&body).map_err(|error| anyhow::anyhow!(error))?;
         if self.anthropic_subscription_active() {
@@ -17406,7 +17439,9 @@ impl Agent {
         let summary_reasoning_effort = is_responses_summary
             .then(|| self.responses_reasoning_effort_for_model(&summary_model, ThinkingEffort::Low))
             .flatten();
-        let summary_reasoning_enabled = summary_reasoning_effort.is_some();
+        let summary_reasoning_enabled = summary_reasoning_effort.is_some()
+            || glm_forced_thinking_effort(&self.provider_id, &summary_model, ThinkingEffort::Low)
+                .is_some();
         let summary_max_tokens =
             compact_summary_max_tokens(self.thinking_effort, summary_reasoning_enabled);
         let summary_reasoning_mode = self.reasoning_mode_for_model(&summary_model);

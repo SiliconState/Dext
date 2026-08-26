@@ -18322,10 +18322,10 @@ fn builtin_chatgpt_profile_declares_codex_context_window() {
 }
 
 #[test]
-fn builtin_glm_profile_declares_5_2_context_and_effort_levels() -> Result<()> {
+fn builtin_glm_profile_declares_flash_and_5_2_metadata() -> Result<()> {
     let _guard = env_lock();
     clear_cached_local_llama_context_windows();
-    let root = temp_test_dir("glm-52-profile");
+    let root = temp_test_dir("glm-profile-metadata");
     let root = std::fs::canonicalize(&root)?;
     unsafe {
         std::env::set_var("DEXT_HOME", &root);
@@ -18337,12 +18337,42 @@ fn builtin_glm_profile_declares_5_2_context_and_effort_levels() -> Result<()> {
         let catalog = load_provider_catalog()?;
         let profile = find_provider_profile(&catalog, "glm").context("glm profile")?;
         assert_eq!(profile.default_model, "glm-5.2[1m]");
+        assert!(profile.models.iter().any(|model| model == "glm-5.3-flash"));
+        assert!(
+            profile
+                .models
+                .iter()
+                .any(|model| model == "glm-5.3-flash[1m]")
+        );
+        assert_eq!(model_context_window("glm-5.3-flash"), 1_000_000);
+        assert_eq!(model_context_window("glm-5.3-flash[1m]"), 1_000_000);
         assert_eq!(model_context_window("glm-5.2"), 1_000_000);
         assert_eq!(model_context_window("glm-5.2[1m]"), 1_000_000);
+        assert_eq!(
+            profile.model_effort_levels.get("glm-5.3-flash"),
+            Some(&vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string()
+            ])
+        );
         assert_eq!(
             profile.model_effort_levels.get("glm-5.2[1m]"),
             Some(&vec!["high".to_string(), "max".to_string()])
         );
+        let flash = resolve_model_spec(&profile, "glm-5.3-flash");
+        assert_eq!(flash.context_window, Some(1_000_000));
+        assert_eq!(flash.max_output_tokens, Some(131_072));
+        assert_eq!(flash.effort_levels, ["low", "high", "max"]);
+        assert!(flash.tools && flash.reasoning && flash.image_input);
+        let flash_pricing = flash.pricing.as_ref().expect("GLM Flash pricing");
+        assert_eq!(flash_pricing.input_usd_per_mtok, 0.15);
+        assert_eq!(flash_pricing.output_usd_per_mtok, 0.5);
+        assert_eq!(flash_pricing.cache_read_usd_per_mtok, 0.03);
+        assert_eq!(flash_pricing.cache_create_usd_per_mtok, 0.0);
+        let flash_1m = resolve_model_spec(&profile, "glm-5.3-flash[1m]");
+        assert_eq!(flash_1m, flash);
+        assert!(!resolve_model_spec(&profile, "glm-5.2").image_input);
         Ok(())
     })();
 
@@ -19997,6 +20027,26 @@ fn anthropic_wire_cost_is_repriced_for_supported_claude_models() {
         usage.estimated_cost_usd()
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn glm_flash_usage_pricing_matches_published_list_rates() {
+    for model in ["glm-5.3-flash", "glm-5.3-flash[1m]"] {
+        let pricing = usage_pricing_default_for(
+            "glm",
+            ApiProvider::Anthropic,
+            "https://api.z.ai/api/anthropic",
+            model,
+        );
+        let usage = Usage {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_create: 1_000_000,
+            cache_read: 1_000_000,
+            cost_usd: None,
+        };
+        assert!((pricing.estimate(usage) - 0.68).abs() < 1e-12, "{model}");
+    }
 }
 
 #[test]
@@ -22057,6 +22107,14 @@ fn resolve_provider_model_selection_prefers_authenticated_provider_matches() -> 
         assert_eq!(qwen_alias.provider_id, "local");
         assert_eq!(qwen_alias.model, DEFAULT_LOCAL_MODEL);
 
+        let qwen_3_8 = resolve_provider_model_selection(&catalog, &store, "glm", "Qwen3.8")?;
+        assert_eq!(qwen_3_8.provider_id, "local");
+        assert_eq!(qwen_3_8.model, "qwen3.8-27b-ud-q5_k_xl");
+        let explicit_qwen_3_8 =
+            resolve_provider_model_selection(&catalog, &store, "glm", "local/Qwen3.8")?;
+        assert_eq!(explicit_qwen_3_8.provider_id, "local");
+        assert_eq!(explicit_qwen_3_8.model, "qwen3.8-27b-ud-q5_k_xl");
+
         let explicit =
             resolve_provider_model_selection(&catalog, &store, "glm", "chatgpt/gpt-5-4")?;
         assert_eq!(explicit.provider_id, "chatgpt");
@@ -22129,6 +22187,15 @@ fn default_provider_catalog_includes_core_multi_provider_set() -> Result<()> {
         assert!(!local.requires_api_key);
         assert_eq!(local.default_model, DEFAULT_LOCAL_MODEL);
         assert_eq!(local.models, vec![DEFAULT_LOCAL_MODEL.to_string()]);
+        assert_eq!(
+            normalize_provider_model_value(local, "Qwen3.8"),
+            "qwen3.8-27b-ud-q5_k_xl"
+        );
+        let rendered = list_models_for_provider(&catalog, "local")?;
+        assert!(
+            rendered.contains("- qwen3.8 -> qwen3.8-27b-ud-q5_k_xl"),
+            "{rendered}"
+        );
         assert!(local.model_context_windows.is_empty());
         assert_eq!(local.context_window, None);
         assert_eq!(resolve_active_provider_id(&catalog), "glm");
@@ -22280,6 +22347,8 @@ fn list_models_for_available_providers_shows_authenticated_sections() -> Result<
             rendered.contains("provider 'chatgpt' models:"),
             "{rendered}"
         );
+        assert!(rendered.contains("- glm-5.3-flash"), "{rendered}");
+        assert!(rendered.contains("- glm-5.3-flash[1m]"), "{rendered}");
         assert!(rendered.contains("- glm-4.6"), "{rendered}");
         assert!(rendered.contains("- gpt-4o"), "{rendered}");
         Ok(())
@@ -23936,6 +24005,75 @@ fn implementation_model_fallback_ignores_codex_env_override() {
     unsafe {
         std::env::remove_var("DEXT_IMPL_FALLBACK_MODEL");
     }
+}
+
+#[test]
+fn glm_flash_streaming_request_maps_forced_thinking_effort() -> Result<()> {
+    let root = temp_test_dir("glm-flash-thinking");
+    let root = std::fs::canonicalize(&root)?;
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "glm")
+        .expect("glm profile");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "glm".to_string();
+    agent.api_provider = ApiProvider::Anthropic;
+    agent.model = "glm-5.3-flash".to_string();
+    agent.provider_profile = Some(profile);
+    agent.thinking_effort = ThinkingEffort::XHigh;
+    let sys_blocks = [SystemBlock {
+        kind: "text",
+        text: "sys",
+        cache_control: None,
+    }];
+
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["model"], "glm-5.3-flash");
+    assert_eq!(value["max_tokens"], 131_072);
+    assert_eq!(value["thinking"]["type"], "enabled");
+    assert!(value["thinking"].get("budget_tokens").is_none(), "{value}");
+    assert_eq!(value["output_config"]["effort"], "max");
+
+    for (effort, expected) in [
+        (ThinkingEffort::Off, "low"),
+        (ThinkingEffort::Minimal, "low"),
+        (ThinkingEffort::Low, "low"),
+        (ThinkingEffort::Medium, "high"),
+        (ThinkingEffort::High, "high"),
+        (ThinkingEffort::XHigh, "max"),
+        (ThinkingEffort::Max, "max"),
+    ] {
+        agent.thinking_effort = effort;
+        let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+        let value: Value = serde_json::from_slice(&body)?;
+        assert_eq!(value["thinking"]["type"], "enabled", "{effort:?}");
+        assert_eq!(value["output_config"]["effort"], expected, "{effort:?}");
+    }
+
+    agent.model = "glm-5.3-flash[1m]".to_string();
+    agent.thinking_effort = ThinkingEffort::Off;
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert_eq!(value["output_config"]["effort"], "low");
+
+    let summary = agent.build_anthropic_summary_request(
+        "glm-5.3-flash[1m]",
+        "Summarize this context",
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+    )?;
+    let summary: Value = serde_json::from_slice(&summary)?;
+    assert_eq!(summary["stream"], false);
+    assert_eq!(summary["thinking"]["type"], "enabled");
+    assert!(
+        summary["thinking"].get("budget_tokens").is_none(),
+        "{summary}"
+    );
+    assert_eq!(summary["output_config"]["effort"], "low");
+    assert_eq!(summary["max_tokens"], COMPACT_SUMMARY_MAX_TOKENS_THINKING);
+
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 #[test]

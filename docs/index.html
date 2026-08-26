@@ -733,7 +733,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Built-in Providers</h3>
 <table>
 <tr><th>ID</th><th>Display</th><th>API</th><th>Default Model</th><th>Auth</th></tr>
-<tr><td><code>glm</code></td><td>ZAI GLM</td><td>Anthropic</td><td>glm-5.2[1m]</td><td>API Key (<code>ZAI_API_KEY</code>)</td></tr>
+<tr><td><code>glm</code></td><td>ZAI GLM</td><td>Anthropic</td><td>glm-5.2[1m]</td><td>API Key (<code>ZAI_API_KEY</code>); catalog also includes glm-5.3-flash and glm-5.3-flash[1m] with 1M context, 131,072-token output, multimodal capability metadata, and low/high/max effort</td></tr>
 <tr><td><code>chatgpt</code></td><td>ChatGPT</td><td>ChatGPT Responses</td><td>gpt-5.4</td><td>OAuth (OpenAI auth)</td></tr>
 <tr><td><code>openai</code></td><td>OpenAI API</td><td>OpenAI</td><td>gpt-5</td><td>API Key (<code>OPENAI_API_KEY</code>)</td></tr>
 <tr><td><code>anthropic</code></td><td>Anthropic</td><td>Anthropic</td><td>Provider catalog default</td><td>Claude Pro/Max OAuth via <code>/login</code>; API key via <code>ANTHROPIC_API_KEY</code></td></tr>
@@ -1378,7 +1378,7 @@ credential-env: [SERVICE_TOKEN]
 <h3>GLM (ZAI)</h3>
 <ul>
 <li>Default built-in provider. Uses the Anthropic-compatible API at <code>api.z.ai/api/anthropic</code></li>
-<li>Catalog models: glm-5.2[1m] (default), glm-5.2, glm-5.1, glm-5.0, and glm-4.6. The 5.2 variants declare 1M context; the provider fallback is 200K.</li>
+<li>Catalog models: glm-5.3-flash, glm-5.3-flash[1m], glm-5.2[1m] (default), glm-5.2, glm-5.1, glm-5.0, and glm-4.6. Both Flash spellings declare a 1M-token context, 131,072-token output, model-specific image-input capability, stable list pricing ($0.15 input, $0.03 cached input, $0.50 output per MTok; cache storage is currently free), and native <code>low</code>/<code>high</code>/<code>max</code> effort. Flash always sends enabled thinking: Dext Off/Minimal/Low map to <code>low</code>, Medium/High to <code>high</code>, and XHigh/Max to <code>max</code>; compaction summaries use enabled low-effort thinking because Flash rejects thinking-disabled requests. The 5.2 variants also declare 1M context; the provider fallback is 200K. Image-input metadata describes the provider model capability; Dext's current persisted conversation blocks remain text/tool based.</li>
 <li>Auth: API key via <code>ZAI_API_KEY</code> or <code>dext auth login glm</code>, then paste at Dext's prompt</li>
 </ul>
 <h3>ChatGPT / Codex</h3>
@@ -1412,7 +1412,7 @@ credential-env: [SERVICE_TOKEN]
 </ul>
 <h3>Local (llama.cpp)</h3>
 <ul>
-<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — accepts the configured server model alias; local providers default to frugal context and probe llama.cpp for the live runtime context window without model-specific built-in context values. If the local server is offline, discovery falls back cleanly and the later provider request reports the ordinary connection error.</li>
+<li>OpenAI-compatible local server at <code>127.0.0.1:8080</code> — No API key required — accepts the configured server model alias; the built-in <code>Qwen3.8</code> shorthand selects <code>qwen3.8-27b-ud-q5_k_xl</code> while requests retain that exact server id. Local providers default to frugal context and probe llama.cpp for the live runtime context window without model-specific built-in context values. If the local server is offline, discovery falls back cleanly and the later provider request reports the ordinary connection error.</li>
 </ul>
 </div>
 </section>
@@ -1422,7 +1422,7 @@ credential-env: [SERVICE_TOKEN]
 <div class="collapsible-content">
 <p>Provider catalogs and auth stores are read through bounded non-symlink regular-file checks. On Unix, foreign ownership is rejected; group/world-writable provider catalogs are rejected; owner-owned auth files with loose mode are repaired to <code>0600</code> before parsing. <code>dext doctor</code> uses bounded, no-follow, inode-stable inspection and reports the same ownership/mode policy without repairing files.</p>
 <h3><code>providers.json</code> (~/.dext/providers.json)</h3>
-<p>Provider catalog with merged built-in + custom profiles. Editable via <code>/provider</code> and <code>/model</code> commands. Auto-normalized on load.</p>
+<p>Provider catalog with merged built-in + custom profiles. Editable via <code>/provider</code> and <code>/model</code> commands. Auto-normalized on load. The built-in local profile accepts <code>Qwen3.8</code> as a case-insensitive alias for <code>qwen3.8-27b-ud-q5_k_xl</code>; both <code>/model Qwen3.8</code> and <code>/model local/Qwen3.8</code> resolve from a clean catalog while requests retain the exact server id.</p>
 <p>Catalog v2 profiles may set <code>request_contract</code> to <code>anthropic-messages</code>, <code>openai-chat-completions</code>, <code>openai-responses</code>, or <code>chatgpt-responses</code>. Optional <code>model_aliases</code>, <code>model_defaults</code>, and <code>model_specs</code> provide canonical model ids, limits, effort levels, reasoning modes, capabilities, and pricing. Explicit per-model metadata wins; a selected effort uses an exact advertised level when available and otherwise clamps to the nearest supported level. Responses main turns and summaries both use this resolved effort metadata; Off sends <code>none</code> only when advertised, otherwise the reasoning object is omitted. Chat Completions main turns resolve <code>reasoning_effort</code> the same way: declared per-model effort levels win before the legacy model-name clamp, so servers that reject unadvertised levels (for example llama.cpp templates accepting only <code>xhigh</code>/<code>medium</code>/<code>low</code>) receive an advertised value. Context hints in model names such as <code>-128k</code> and <code>[1m]</code> win over provider-wide context defaults. Built-in metadata only fills omissions, and v1 profile fields remain accepted. The built-in official OpenAI profile selects <code>openai-responses</code> automatically only for GPT-5.6 at <code>api.openai.com</code>; custom profiles may select it explicitly without inheriting GPT-5.6-only Standard/Pro behavior. <code>DEXT_PROMPT_CACHE=on|off</code> overrides catalog prompt-cache capabilities for Anthropic-style requests; auto mode uses catalog metadata.</p>
 <h3><code>auth.json</code> (~/.dext/auth.json)</h3>
 <p>API-key entries may reference a parent environment variable by name or intentionally run a <code>!command</code> through <code>bash -lc</code>. Treat write access to this store as code-execution authority.</p>

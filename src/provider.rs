@@ -484,6 +484,9 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
     let model = model.to_ascii_lowercase();
     match canonical_provider_id(provider_id).as_str() {
         "local" | "kimi" => Some(model_pricing(0.0, 0.0, 0.0, 0.0)),
+        "glm" if model.trim_end_matches("[1m]") == "glm-5.3-flash" => {
+            Some(model_pricing(0.15, 0.5, 0.03, 0.0))
+        }
         "glm" => Some(model_pricing(1.0, 5.0, 0.1, 1.25)),
         "deepseek" if model.contains("reasoner") => Some(model_pricing(0.55, 2.19, 0.14, 0.55)),
         "deepseek" if model.contains("chat") => Some(model_pricing(0.27, 1.1, 0.07, 0.27)),
@@ -576,10 +579,17 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
                 "anthropic" | "openai" | "chatgpt" | "deepseek" | "local"
             )),
         };
+        if provider_id == "glm" {
+            profile.model_defaults.capabilities.image_input = Some(false);
+        }
         for model in profile.models.clone() {
             let normalized = model.to_ascii_lowercase();
             let mut spec = profile.model_specs.remove(&normalized).unwrap_or_default();
             spec.pricing = builtin_model_pricing(&provider_id, &normalized);
+            if provider_id == "glm" {
+                spec.capabilities.image_input =
+                    Some(normalized.trim_end_matches("[1m]") == "glm-5.3-flash");
+            }
             if matches!(provider_id.as_str(), "openai" | "chatgpt")
                 && (normalized.starts_with("gpt-4.1") || normalized.starts_with("gpt-4o"))
             {
@@ -594,6 +604,22 @@ fn hydrate_builtin_model_specs(profiles: &mut [ProviderProfile]) {
 }
 
 pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
+    let glm_flash_spec = ModelSpec {
+        context_window: Some(1_000_000),
+        max_output_tokens: Some(131_072),
+        effort_levels: ["low", "high", "max"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        reasoning_modes: Vec::new(),
+        capabilities: ModelCapabilities {
+            tools: Some(true),
+            reasoning: Some(true),
+            image_input: Some(true),
+            prompt_cache: None,
+        },
+        pricing: None,
+    };
     let mut profiles = vec![
         ProviderProfile {
             id: "glm".to_string(),
@@ -603,6 +629,8 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             base_url: "https://api.z.ai/api/anthropic".to_string(),
             default_model: "glm-5.2[1m]".to_string(),
             models: vec![
+                "glm-5.3-flash".to_string(),
+                "glm-5.3-flash[1m]".to_string(),
                 "glm-5.2[1m]".to_string(),
                 "glm-5.2".to_string(),
                 "glm-5.1".to_string(),
@@ -614,18 +642,28 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             login_url: Some("https://open.bigmodel.cn/usercenter/apikeys".to_string()),
             oauth_flow: None,
             notes: Some(
-                "Use your ZAI key. GLM model-name context hints such as [1m] are honored; if your key unlocks newer GLM models, set /model directly."
+                "Use your ZAI key. The catalog includes GLM-5.3-Flash with 1M context, 131,072-token output, and low/high/max effort; model-name context hints such as [1m] are honored, and other entitled models can be set directly with /model."
                     .to_string(),
             ),
             context_window: Some(200_000),
             model_context_windows: {
                 let mut m = HashMap::new();
+                m.insert("glm-5.3-flash".to_string(), 1_000_000);
+                m.insert("glm-5.3-flash[1m]".to_string(), 1_000_000);
                 m.insert("glm-5.2".to_string(), 1_000_000);
                 m.insert("glm-5.2[1m]".to_string(), 1_000_000);
                 m
             },
             model_effort_levels: {
                 let mut m = HashMap::new();
+                m.insert(
+                    "glm-5.3-flash".to_string(),
+                    vec!["low".to_string(), "high".to_string(), "max".to_string()],
+                );
+                m.insert(
+                    "glm-5.3-flash[1m]".to_string(),
+                    vec!["low".to_string(), "high".to_string(), "max".to_string()],
+                );
                 m.insert("glm-5.2".to_string(), vec!["high".to_string(), "max".to_string()]);
                 m.insert(
                     "glm-5.2[1m]".to_string(),
@@ -636,7 +674,10 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             request_contract: Some(RequestContract::AnthropicMessages),
             model_aliases: HashMap::new(),
             model_defaults: ModelSpec::default(),
-            model_specs: HashMap::new(),
+            model_specs: HashMap::from([
+                ("glm-5.3-flash".to_string(), glm_flash_spec.clone()),
+                ("glm-5.3-flash[1m]".to_string(), glm_flash_spec),
+            ]),
         },
         ProviderProfile {
             id: "chatgpt".to_string(),
@@ -885,12 +926,15 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             requires_api_key: false,
             login_url: None,
             oauth_flow: None,
-            notes: Some("Local OpenAI-compatible llama.cpp server. Start one server on 127.0.0.1:8080 and select its model alias; no cloud credentials are used. Dext probes llama.cpp for the live runtime context window.".to_string()),
+            notes: Some("Local OpenAI-compatible llama.cpp server. Start one server on 127.0.0.1:8080 and select its model alias; Qwen3.8 selects qwen3.8-27b-ud-q5_k_xl when that server id is configured. No cloud credentials are used. Dext probes llama.cpp for the live runtime context window.".to_string()),
             context_window: None,
             model_context_windows: HashMap::new(),
             model_effort_levels: HashMap::new(),
             request_contract: Some(RequestContract::OpenAiChatCompletions),
-            model_aliases: HashMap::new(),
+            model_aliases: HashMap::from([(
+                "qwen3.8".to_string(),
+                "qwen3.8-27b-ud-q5_k_xl".to_string(),
+            )]),
             model_defaults: ModelSpec::default(),
             model_specs: HashMap::new(),
         },
@@ -3125,9 +3169,12 @@ pub(crate) fn resolve_provider_model_selection(
         if normalized.is_empty() {
             continue;
         }
-        let matches_curated = curated_provider_models(profile)
-            .iter()
-            .any(|model| model.eq_ignore_ascii_case(&normalized));
+        let alias_key = normalize_model_alias_key(selector);
+        let matches_alias = profile.model_aliases.contains_key(&alias_key);
+        let matches_curated = matches_alias
+            || curated_provider_models(profile)
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case(&normalized));
         if !matches_curated {
             continue;
         }
@@ -5253,6 +5300,18 @@ fn render_provider_models(profile: &ProviderProfile) -> String {
                 .join("\n")
         )
     };
+    if !profile.model_aliases.is_empty() {
+        let mut aliases = profile.model_aliases.iter().collect::<Vec<_>>();
+        aliases.sort_by_key(|(alias, _)| *alias);
+        out.push_str("\naliases:\n");
+        out.push_str(
+            &aliases
+                .into_iter()
+                .map(|(alias, target)| format!("- {alias} -> {target}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
     if !profile.requires_api_key {
         out.push_str(
             "\nnote: no credentials required; the local/server endpoint must already be running.",
