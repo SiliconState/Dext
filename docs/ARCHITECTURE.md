@@ -15,7 +15,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 ## Core modules
 
 - `src/main.rs`
-  - Agent state and loop, including value-owned parsed-stream outcomes, bounded incomplete-response continuation, and preservation of every nonempty assistant response before any paired tool results are appended.
+  - Agent state and loop, including value-owned parsed-stream outcomes, bounded incomplete-response continuation, preservation of every nonempty assistant response before any paired tool results are appended, and local-only ingestion/replay of llama.cpp `reasoning_content` within the current tool turn.
   - CLI parsing, top-level command dispatch, and structured `dext doctor` rendering.
   - Slash commands.
   - Built-in tool implementations, including bounded, cancellation-aware native file reads and an 8 MiB `read_symbol` source-input ceiling.
@@ -28,8 +28,10 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Hidden checkpoint refs under `refs/dext/checkpoints/`.
   - Local checkpoint manifests and untracked-file sidecars under `.dext/checkpoints/`.
   - Strict current-row parsing plus full-grammar, integrity-checked retirement of recognized pre-JSON rows and their matched refs.
+  - Checkpoint manifests and operation locks use threat-specific validation: symlinks, hard links, foreign ownership, and group/world-write access remain integrity-fatal, while owner-owned read-only exposure is normalized to mode `0600` at startup and the mutation boundary.
+  - Invalid manifests can be quarantined byte-for-byte with checkpoint-free `dext checkpoint repair` or `/undo --repair`; a fresh empty private manifest restores availability while hidden refs remain until explicit prune.
   - Manifest-first retention compaction so failed ref cleanup leaves only harmless orphan refs instead of manifest entries naming deleted refs.
-  - Undo list/preview/apply/prune helpers used by `/undo` and `dext undo`.
+  - Undo list/preview/apply/prune/repair helpers used by `/undo`, `dext undo`, and `dext checkpoint repair`.
 
 - `src/mutation_preview.rs`
   - Capped in-memory previews for `write_file`, `edit_file`, and `multi_edit`.
@@ -42,7 +44,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 - `src/provider.rs`
   - Provider profile/catalog loading, normalization, and bounded side-effect-free catalog/auth inspection.
   - Connect, first-byte, stream/body-idle, and non-stream body-size limits for provider transport.
-  - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, Kimi Code, DeepSeek, and local OpenAI-compatible profiles.
+  - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, Kimi Code, DeepSeek, and local OpenAI-compatible profiles. Local llama.cpp Chat Completions explicitly control template thinking, capture streamed `reasoning_content` only on local routes, and leave cloud Chat Completions request/response handling unchanged.
   - Live llama.cpp runtime context probing for the local provider; unavailable local servers fall back cleanly without aborting startup.
   - API-key, ChatGPT OAuth, and Anthropic Claude Pro/Max OAuth login flows; runtime auth retains whether a resolved secret is an API key or OAuth token. OAuth callback binding is loopback-only, accepted connections use blocking I/O under one two-second complete-header deadline, result pages wait for exchange/storage completion, exchange/refresh transport is bounded and redirect-free, and active OAuth credentials are rechecked at user-turn boundaries.
   - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs. Public adaptive Anthropic models (Sonnet 4.6, Sonnet 5, Opus 4.6/4.7/4.8, Opus 5, and Fable 5) omit `thinking.display`; transformed OAuth and API-key request fixtures verify the same adaptive shape.
@@ -57,7 +59,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Capped SSE framing shared by the runtime and Criterion benchmark target.
 
 - `src/streaming.rs`
-  - Provider-specific event validation/assembly.
+  - Provider-specific event validation/assembly, including a 4 MiB aggregate bound for local llama.cpp streamed reasoning.
   - Provider-neutral streamed blocks and strict final tool-argument construction.
   - Anthropic implicit terminal handling completes open display blocks but never authorizes an unstopped tool call; explicitly stopped max-token calls are discarded only for EOF-shaped argument JSON, while malformed values remain errors.
 
@@ -187,7 +189,7 @@ Dext has three safety layers:
 Profiles:
 
 - Approval: `ask`, `auto-read`, `auto-write`, `never`, `always`. `auto-write` still prompts for Danger-class shell commands. Destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands are Danger. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is also Danger unless it uses explicit `git --no-pager` and matches a narrow helper-free metadata-inspection allowlist; commands such as `grep`, `diff-tree`, `ls-files`, `check-ignore`, and `check-attr` remain gated because they can invoke fsmonitor. Use hardened native Git tools for review operations. Recognized dynamic/wrapper command paths and inline/stdin interpreter code, including shell input redirections and heredocs, are Danger too; dynamic command words include variable/command, glob, brace, tilde, and attached-redirection expansion. Actual shell curl/wget/HTTPie/XH requests are gated because startup configuration and request bodies are not safely inferable; use the native `http` tool for reads. Interpreter matching covers attached/clustered flags and common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers; Windows `.exe`/`.com` command and wrapper matching is case-insensitive.
-- Sandbox: `read-only`, `workspace-write`, `danger-full-access`. `danger-full-access` is the default and preserves ambient authority and temp/cache configuration without probing or installing Dext confinement. On supported Linux/macOS hosts, optional confined profiles preserve every read available to the Dext process user. `workspace-write` permits writes only under the sandbox root, scratch/device roots, and common per-user toolchain caches; `read-only` retains only required scratch/device writes. macOS Seatbelt profiles authorize both canonical `/private/...` scratch paths and their `/var` or `/tmp` aliases so standard temp APIs remain confined but usable. Missing optional enforcement warns and falls back instead of blocking work.
+- Sandbox: `read-only`, `workspace-write`, `danger-full-access`. `danger-full-access` is the default and preserves ambient authority and temp/cache configuration without probing or installing Dext confinement. On supported Linux/macOS hosts, optional confined profiles preserve every read available to the Dext process user. `workspace-write` permits writes under the containing Git top-level when one exists (otherwise the selected sandbox root), plus scratch/device roots and common per-user toolchain caches; command cwd and project-context discovery remain anchored at the selected sandbox directory. `/sandbox` reports both cwd and effective write scope and changes them in-session. `read-only` retains only required scratch/device writes. macOS Seatbelt profiles authorize both canonical `/private/...` scratch paths and their `/var` or `/tmp` aliases so standard temp APIs remain confined but usable. Missing optional enforcement warns and falls back instead of blocking work.
 - Tool subprocesses remove credential-shaped environment variables by default. `DEXT_INHERIT_TOOL_CREDENTIALS=1` is an explicit high-trust opt-in for model-invoked bash/external tools that require the parent credential environment; hooks and Dext-owned subprocesses always scrub credentials. Pack-declared helper credentials are narrower still, and project-local declarations are ignored. Approved `pre_tool` and `post_tool` hooks receive privacy-redacted tool input; `post_tool` output is redacted too.
 
 Dext defaults to approval `always` and sandbox profile `danger-full-access`, so a no-argument run is equivalent to passing both flags explicitly. Full access adds no Dext kernel sandbox and uses the ambient authority granted by the current host, container, VM, namespace, WSL environment, CI worker, remote shell, or service account; Dext neither requires nor attempts to escape those boundaries. `ask`, `auto-read`, `auto-write`, `never`, `read-only`, and `workspace-write` remain independent opt-in controls. Invalid approval environment values warn and select `ask` unless a valid CLI choice or true `DEXT_TRUST` takes precedence; an invalid `DEXT_SANDBOX_PROFILE` fails normal startup unless a valid CLI sandbox override takes precedence. Current-run policy overrides session provenance and clears stale grants on resume.

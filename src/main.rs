@@ -60,7 +60,7 @@ use session::{
     atomic_write_secret, canonicalize_read_tool_path, dext_state_dir, expand_user_path,
     latest_session_path, list_session_records_for_root, named_session_path_for_root,
     named_sessions_dir_for_root, new_session_id, parse_session_header, project_key,
-    project_latest_session_path, project_state_dir, read_session_header_line,
+    project_latest_session_path, project_scope_root, project_state_dir, read_session_header_line,
     release_registered_locks, remove_stale_session_state_lock_under_guard, render_limited_csv,
     restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
     session_latest_session_path, session_state_lock_is_live, session_state_lock_path,
@@ -2340,6 +2340,7 @@ fn push_runtime_env_oai_message(msgs: &mut Vec<OaiMessage>, env: &str) {
     msgs.push(OaiMessage {
         role: "user".to_string(),
         content: Some(runtime_env_wire_text(env)),
+        reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
     });
@@ -2851,6 +2852,8 @@ struct OaiChatTemplateKwargs {
 struct OaiMessage {
     role: String,
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OaiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4837,7 +4840,7 @@ fn prepare_external_tool(
             Ok((bin, final_args, stdin))
         }
         "git_diff" => {
-            let mut args = safe_git_inspection_args("diff");
+            let mut args = safe_git_inspection_args(root, "diff")?;
             args.push("--no-ext-diff".to_string());
             args.push("--no-textconv".to_string());
             let stat = optional_git_bool(input, "git_diff", "stat", false)?;
@@ -4868,7 +4871,7 @@ fn prepare_external_tool(
                 Some(_) => return Err("git_log count must be an integer".to_string()),
             };
             let oneline = optional_git_bool(input, "git_log", "oneline", true)?;
-            let mut args = safe_git_inspection_args("log");
+            let mut args = safe_git_inspection_args(root, "log")?;
             if oneline {
                 args.push("--oneline".to_string());
             }
@@ -6533,7 +6536,8 @@ fn diagnostics_command(
     root: &Path,
     profile: SandboxProfile,
 ) -> std::result::Result<sandbox::SandboxedStdCommand, String> {
-    let mut command = sandbox::std_command(program, profile, root)
+    let write_scope = project_scope_root(root);
+    let mut command = sandbox::std_command(program, profile, &write_scope)
         .map_err(|error| format!("prepare diagnostics process: {error}"))?;
     if profile != SandboxProfile::DangerFullAccess {
         if let Some(scratch) = command.scratch_path().map(Path::to_path_buf) {
@@ -9079,18 +9083,19 @@ async fn execute_bash_async_prepared(
     } else {
         sandbox_profile
     };
+    let write_scope = project_scope_root(root);
     let mut command = if let Some(invocation) = pack_helper.as_ref() {
         let executable = invocation
             .executable
             .to_str()
             .ok_or_else(|| "pack helper path is not valid UTF-8".to_string())?;
-        let mut command = sandbox::tokio_command(executable, effective_profile, root)
+        let mut command = sandbox::tokio_command(executable, effective_profile, &write_scope)
             .map_err(|error| format!("prepare sandbox for pack helper: {error}"))?;
         command.args(&invocation.args);
         command
     } else {
         let bash = bash_executable_path();
-        let mut command = sandbox::tokio_command(&bash, effective_profile, root)
+        let mut command = sandbox::tokio_command(&bash, effective_profile, &write_scope)
             .map_err(|error| format!("prepare bash sandbox: {error}"))?;
         command.arg("-c").arg(&bash_cmd);
         command
@@ -9273,7 +9278,8 @@ async fn execute_external_async_status(
     } else {
         PathBuf::from(bin)
     };
-    let mut cmd = sandbox::tokio_command(&executable, policy.sandbox_profile, cwd)
+    let write_scope = project_scope_root(cwd);
+    let mut cmd = sandbox::tokio_command(&executable, policy.sandbox_profile, &write_scope)
         .map_err(|error| format!("prepare sandbox for {bin}: {error}"))?;
     cmd.args(args)
         .current_dir(cwd)
@@ -9489,11 +9495,21 @@ fn optional_git_string<'a>(
     }
 }
 
-fn safe_git_inspection_args(command: &str) -> Vec<String> {
-    vec![
+fn safe_git_inspection_args(root: &Path, command: &str) -> Result<Vec<String>, String> {
+    let working_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let repository_root = git_checkpoints::repo_root(&working_root)?;
+    let mut args = vec![
         "--no-pager".to_string(),
         "--no-optional-locks".to_string(),
         "--literal-pathspecs".to_string(),
+    ];
+    if let Some(repository_root) = repository_root.filter(|root| root != &working_root) {
+        args.extend([
+            "-C".to_string(),
+            repository_root.to_string_lossy().into_owned(),
+        ]);
+    }
+    args.extend([
         "-c".to_string(),
         "core.fsmonitor=false".to_string(),
         "-c".to_string(),
@@ -9501,7 +9517,8 @@ fn safe_git_inspection_args(command: &str) -> Vec<String> {
         "-c".to_string(),
         "protocol.allow=never".to_string(),
         command.to_string(),
-    ]
+    ]);
+    Ok(args)
 }
 
 fn validate_git_revision(revision: &str) -> std::result::Result<(), String> {
@@ -9529,31 +9546,43 @@ fn lexically_normalize_absolute_path(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
-fn git_tool_pathspec(root: &Path, tool: &str, path: &str) -> std::result::Result<String, String> {
+fn git_tool_context(root: &Path) -> std::result::Result<(PathBuf, PathBuf), String> {
+    let working_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("canonicalize active project {}: {error}", root.display()))?;
+    let repository_root =
+        git_checkpoints::repo_root(&working_root)?.unwrap_or_else(|| working_root.clone());
+    Ok((working_root, repository_root))
+}
+
+fn git_tool_pathspec_from_roots(
+    working_root: &Path,
+    repository_root: &Path,
+    tool: &str,
+    path: &str,
+) -> std::result::Result<String, String> {
     if path.trim().is_empty() || path.chars().any(char::is_control) {
         return Err(format!(
             "{tool} path must not be empty or contain control characters"
         ));
     }
-    let canonical_root = std::fs::canonicalize(root)
-        .map_err(|error| format!("canonicalize active project {}: {error}", root.display()))?;
     let expanded = expand_user_path(path);
     let candidate = if expanded.is_absolute() {
         expanded
     } else {
-        canonical_root.join(expanded)
+        working_root.join(expanded)
     };
     let normalized = lexically_normalize_absolute_path(&candidate)
         .ok_or_else(|| format!("{tool} path escapes the active project: {path}"))?;
-    let relative = normalized.strip_prefix(&canonical_root).map_err(|_| {
+    let relative = normalized.strip_prefix(repository_root).map_err(|_| {
         format!(
-            "{tool} path is outside the active project: {}",
+            "{tool} path is outside the active Git repository (write scope {}): {}. Use `/sandbox PATH` to change the active scope in-session",
+            repository_root.display(),
             normalized.display()
         )
     })?;
 
     let components = relative.components().collect::<Vec<_>>();
-    let mut ancestor = canonical_root;
+    let mut ancestor = repository_root.to_path_buf();
     for component in components.iter().take(components.len().saturating_sub(1)) {
         let Component::Normal(name) = component else {
             return Err(format!("{tool} path is not repository-relative: {path}"));
@@ -9584,10 +9613,19 @@ fn git_tool_pathspec(root: &Path, tool: &str, path: &str) -> std::result::Result
     }
 }
 
-fn git_commit_pathspecs(root: &Path, paths: &[String]) -> std::result::Result<Vec<String>, String> {
+fn git_tool_pathspec(root: &Path, tool: &str, path: &str) -> std::result::Result<String, String> {
+    let (working_root, repository_root) = git_tool_context(root)?;
+    git_tool_pathspec_from_roots(&working_root, &repository_root, tool, path)
+}
+
+fn git_commit_pathspecs(
+    working_root: &Path,
+    repository_root: &Path,
+    paths: &[String],
+) -> std::result::Result<Vec<String>, String> {
     paths
         .iter()
-        .map(|path| git_tool_pathspec(root, "git_commit", path))
+        .map(|path| git_tool_pathspec_from_roots(working_root, repository_root, "git_commit", path))
         .collect()
 }
 
@@ -9617,8 +9655,9 @@ async fn execute_git_commit_async(
         }
         Some(_) => return Err("git_commit paths must be an array".to_string()),
     };
-    let pathspecs = git_commit_pathspecs(root, &paths)?;
-    let filter_drivers = git_commit_filter_drivers(root)?;
+    let (working_root, repository_root) = git_tool_context(root)?;
+    let pathspecs = git_commit_pathspecs(&working_root, &repository_root, &paths)?;
+    let filter_drivers = git_commit_filter_drivers(&repository_root)?;
     let mut base_args = vec![
         "--no-pager".to_string(),
         "--no-optional-locks".to_string(),
@@ -9671,9 +9710,15 @@ async fn execute_git_commit_async(
         stdout_cap: PROCESS_STREAM_CAPTURE_CAP,
         stderr_cap: PROCESS_STREAM_CAPTURE_CAP,
     };
-    let (stage_stdout, stage_stderr, stage_code) =
-        execute_external_async_status("git", &stage_args, None, root, interrupt.clone(), policy)
-            .await?;
+    let (stage_stdout, stage_stderr, stage_code) = execute_external_async_status(
+        "git",
+        &stage_args,
+        None,
+        &repository_root,
+        interrupt.clone(),
+        policy,
+    )
+    .await?;
     if stage_code != 0 {
         return Err(format!(
             "git staging failed (exit {stage_code}):\n{}",
@@ -9683,8 +9728,15 @@ async fn execute_git_commit_async(
 
     let mut commit_args = base_args;
     commit_args.extend(["commit".to_string(), "-m".to_string(), message.to_string()]);
-    let (commit_stdout, commit_stderr, commit_code) =
-        execute_external_async_status("git", &commit_args, None, root, interrupt, policy).await?;
+    let (commit_stdout, commit_stderr, commit_code) = execute_external_async_status(
+        "git",
+        &commit_args,
+        None,
+        &repository_root,
+        interrupt,
+        policy,
+    )
+    .await?;
     if commit_code != 0 {
         return Err(format!(
             "git commit failed (exit {commit_code}):\n{}",
@@ -10968,7 +11020,8 @@ impl Hooks {
                 continue;
             }
             let bash = bash_executable_path();
-            let sandboxed = match sandbox::std_command(&bash, sandbox_profile, root) {
+            let write_scope = project_scope_root(root);
+            let sandboxed = match sandbox::std_command(&bash, sandbox_profile, &write_scope) {
                 Ok(command) => command,
                 Err(error) => {
                     out.push((format!("prepare hook sandbox: {error}"), -1));
@@ -11459,8 +11512,8 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("/session", "alias for /sessions"),
             ("/hooks [reload]", "show hook config or reload from disk"),
             (
-                "/undo [--apply|--list|<id>]",
-                "preview or restore latest checkpoint",
+                "/undo [--apply|--list|--repair|<id>]",
+                "preview, restore, or repair checkpoints",
             ),
             ("/version", "show dext version"),
         ],
@@ -13643,6 +13696,8 @@ impl Agent {
             PathBuf::from(std::env::var("DEXT_SANDBOX").unwrap_or_else(|_| ".".to_string()))
         }))
         .context("could not canonicalize sandbox root")?;
+        git_checkpoints::normalize_existing_checkpoint_storage(&sandbox_root)
+            .map_err(anyhow::Error::msg)?;
         let session_id = new_session_id();
         let claude_session_id = claude_subscription::random_uuid_v4()?;
         let claude_identity = (auth_kind == RuntimeAuthKind::OAuth
@@ -14018,6 +14073,16 @@ impl Agent {
         } else {
             self.thinking_effort
         }
+    }
+
+    fn local_llama_reasoning_enabled(&self) -> bool {
+        self.request_contract() == RequestContract::OpenAiChatCompletions
+            && provider::is_local_llama_provider(
+                &self.provider_id,
+                self.route_api_provider(),
+                &self.base_url,
+            )
+            && self.resolved_model_spec().is_none_or(|spec| spec.reasoning)
     }
 
     fn model_supports_tools(&self) -> bool {
@@ -14778,6 +14843,8 @@ impl Agent {
         } else {
             None
         };
+        git_checkpoints::normalize_existing_checkpoint_storage(&root)
+            .map_err(anyhow::Error::msg)?;
 
         let root_changed = self.sandbox_root != root;
         let project_changed = project_key(&self.sandbox_root) != project_key(&root);
@@ -16084,14 +16151,20 @@ impl Agent {
 
     fn history_to_oai_messages(&self, system_text: &str) -> Vec<OaiMessage> {
         let history = &self.history;
+        let current_turn_start = history
+            .iter()
+            .rposition(is_fresh_user_prompt_message)
+            .unwrap_or(0);
+        let preserve_local_reasoning = self.local_llama_reasoning_enabled();
         let valid_ids = Self::tool_use_ids_in_messages(history);
         let mut msgs = vec![OaiMessage {
             role: "system".to_string(),
             content: Some(system_text.to_string()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }];
-        for m in history {
+        for (message_index, m) in history.iter().enumerate() {
             match m.role.as_str() {
                 "user" => {
                     let texts: Vec<&str> = m
@@ -16123,6 +16196,7 @@ impl Agent {
                                 msgs.push(OaiMessage {
                                     role: "tool".to_string(),
                                     content: Some(content.clone()),
+                                    reasoning_content: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tool_use_id.clone()),
                                 });
@@ -16132,6 +16206,7 @@ impl Agent {
                         msgs.push(OaiMessage {
                             role: "user".to_string(),
                             content: Some(texts.join("\n")),
+                            reasoning_content: None,
                             tool_calls: None,
                             tool_call_id: None,
                         });
@@ -16177,21 +16252,33 @@ impl Agent {
                     } else {
                         None
                     };
+                    let reasoning_content = (preserve_local_reasoning
+                        && message_index >= current_turn_start)
+                        .then(|| {
+                            m.content
+                                .iter()
+                                .filter_map(|block| match block {
+                                    Block::Thinking { text, .. } if !text.is_empty() => {
+                                        Some(text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .filter(|reasoning| !reasoning.is_empty());
                     let content = if texts.is_empty() {
-                        None
+                        reasoning_content.as_ref().map(|_| String::new())
                     } else {
                         Some(texts.join("\n"))
                     };
-                    // An assistant message with neither text nor tool calls
-                    // (e.g. one that only carried thinking blocks, which this
-                    // path never sends) would serialize as content:null and
-                    // trip strict providers — skip it.
                     if content.is_none() && oai_tool_calls.is_none() {
                         continue;
                     }
                     msgs.push(OaiMessage {
                         role: "assistant".to_string(),
                         content,
+                        reasoning_content,
                         tool_calls: oai_tool_calls,
                         tool_call_id: None,
                     });
@@ -16407,12 +16494,12 @@ impl Agent {
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
                 let reasoning_effort = self.oai_chat_reasoning_effort(effort);
-                let stream_options = (!provider::is_local_llama_provider(
+                let local_llama = provider::is_local_llama_provider(
                     &self.provider_id,
                     self.route_api_provider(),
                     &self.base_url,
-                ))
-                .then_some(OaiStreamOptions {
+                );
+                let stream_options = (!local_llama).then_some(OaiStreamOptions {
                     include_usage: true,
                 });
                 let tool_names: Vec<&str> =
@@ -16436,7 +16523,9 @@ impl Agent {
                     stream_options,
                     reasoning_effort,
                     grammar,
-                    chat_template_kwargs: None,
+                    chat_template_kwargs: local_llama.then_some(OaiChatTemplateKwargs {
+                        enable_thinking: effort != ThinkingEffort::Off,
+                    }),
                 };
                 let bytes = serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!(e))?;
                 Ok((url, bytes))
@@ -17468,12 +17557,14 @@ impl Agent {
                 OaiMessage {
                     role: "system".to_string(),
                     content: Some(COMPACT_SYSTEM.to_string()),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
                 OaiMessage {
                     role: "user".to_string(),
                     content: Some(user_text.clone()),
+                    reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
@@ -18910,8 +19001,11 @@ impl Agent {
                 self.route_api_provider(),
                 &self.base_url,
             );
+        let local_reasoning_enabled = contract == RequestContract::OpenAiChatCompletions
+            && self.local_llama_reasoning_enabled();
         let mut decoder = streaming::SseDecoder::new(STREAM_EVENT_BUFFER_CAP);
-        let mut parser = streaming::ProviderStreamParser::new(contract, preserve_timing_cache);
+        let mut parser = streaming::ProviderStreamParser::new(contract, preserve_timing_cache)
+            .capture_openai_reasoning(local_reasoning_enabled);
         let mut stream = resp.bytes_stream();
         let idle_timeout = self.stream_idle_timeout();
 
@@ -18952,7 +19046,9 @@ impl Agent {
         if contract != RequestContract::AnthropicMessages && !self.quiet_stream_events {
             for block in &parsed.blocks {
                 match block {
-                    Block::Thinking { text, .. } if contract.is_responses() => {
+                    Block::Thinking { text, .. }
+                        if contract.is_responses() || local_reasoning_enabled =>
+                    {
                         self.sink
                             .emit(AgentEvent::ThinkingBlockComplete(text.clone()));
                     }
@@ -19845,6 +19941,16 @@ fn handle_undo_cli(args: &[String], root: &Path) -> i32 {
         }
         return 0;
     }
+    if args.iter().any(|a| a == "--repair" || a == "repair") {
+        match git_checkpoints::repair(root) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
     if args.iter().any(|a| a == "--prune" || a == "prune") {
         match git_checkpoints::prune(root, None, None) {
             Ok(msg) => println!("{msg}"),
@@ -19898,6 +20004,25 @@ fn handle_undo_cli(args: &[String], root: &Path) -> i32 {
         }
     }
     0
+}
+
+fn handle_checkpoint_cli(args: &[String], root: &Path) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("repair") if args.len() == 1 => match git_checkpoints::repair(root) {
+            Ok(message) => {
+                println!("{message}");
+                0
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                1
+            }
+        },
+        _ => {
+            eprintln!("usage: dext checkpoint repair");
+            2
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20578,6 +20703,16 @@ fn doctor_report_with_overrides(
     findings.push(DoctorFinding::info("session locks", session_lock_detail));
 
     if in_git {
+        match git_checkpoints::inspect_checkpoint_storage_mode(root) {
+            Ok(Some(detail)) => {
+                findings.push(DoctorFinding::warn("checkpoint permissions", detail))
+            }
+            Ok(None) => {}
+            Err(error) => findings.push(DoctorFinding::warn(
+                "checkpoint permissions",
+                format!("{error}; mutating tools remain blocked until corrected"),
+            )),
+        }
         match git_checkpoints::inspect_checkpoints(root, 64) {
             Ok(checkpoints) if checkpoints.is_empty() => findings.push(DoctorFinding::info(
                 "checkpoints",
@@ -20591,9 +20726,11 @@ fn doctor_report_with_overrides(
                     checkpoints[0].id
                 ),
             )),
-            Err(_) => findings.push(DoctorFinding::warn(
+            Err(error) => findings.push(DoctorFinding::warn(
                 "checkpoints",
-                "metadata or refs are invalid/unreadable",
+                format!(
+                    "{error}; mutating tools are blocked until the manifest is repaired. Run `dext checkpoint repair`"
+                ),
             )),
         }
     } else {
@@ -21731,6 +21868,11 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
         "sandbox" => {
             if arg.is_empty() {
                 let _ = writeln!(w, "sandbox: {}", agent.sandbox_root.display());
+                let _ = writeln!(
+                    w,
+                    "write scope: {}",
+                    project_scope_root(&agent.sandbox_root).display()
+                );
             } else {
                 match std::fs::canonicalize(arg) {
                     Ok(p) => match agent.set_sandbox_root(p) {
@@ -22413,6 +22555,15 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         let _ = writeln!(w, "error: {e}");
                     }
                 }
+            } else if first == "--repair" || first == "repair" {
+                match git_checkpoints::repair(&agent.sandbox_root) {
+                    Ok(msg) => {
+                        let _ = writeln!(w, "{msg}");
+                    }
+                    Err(e) => {
+                        let _ = writeln!(w, "error: {e}");
+                    }
+                }
             } else if first == "--prune" || first == "prune" {
                 match git_checkpoints::prune(&agent.sandbox_root, None, None) {
                     Ok(msg) => {
@@ -22905,7 +23056,8 @@ fn run_eval_shell_command(
     profile: SandboxProfile,
 ) -> std::result::Result<(i32, String, String), String> {
     let bash = bash_executable_path();
-    let mut sandboxed = sandbox::std_command(&bash, profile, root)
+    let write_scope = project_scope_root(root);
+    let mut sandboxed = sandbox::std_command(&bash, profile, &write_scope)
         .map_err(|error| format!("prepare eval process: {error}"))?;
     sandboxed
         .arg("--noprofile")
@@ -23986,6 +24138,15 @@ async fn main() -> Result<()> {
         release_registered_locks();
         std::process::exit(code);
     }
+    if argv.first().is_some_and(|a| a == "checkpoint") {
+        let root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let code = handle_checkpoint_cli(&argv[1..], &root);
+        release_registered_locks();
+        std::process::exit(code);
+    }
     if argv.first().is_some_and(|a| a == "undo") {
         let root = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -24066,7 +24227,9 @@ async fn main() -> Result<()> {
         println!("       dext --trust          select auto-approval for privileged tools");
         println!("       dext --no-trust       explicitly select the ask profile");
         println!("       dext auth ...         provider/model/auth management commands");
+        println!("       dext checkpoint repair  quarantine invalid checkpoint metadata safely");
         println!("       dext undo --list      list recent Dext checkpoints");
+        println!("       dext undo --repair    quarantine an invalid checkpoint manifest");
         println!("       dext undo --preview <id>  non-interactive preview");
         println!("       dext undo --apply <id>   non-interactive apply");
         println!("       dext                  interactive REPL (or reads stdin if piped)");
@@ -24248,6 +24411,14 @@ async fn main() -> Result<()> {
         }
         if agent.sandbox_profile() != SandboxProfile::DangerFullAccess {
             eprintln!("[sandbox] profile {}", agent.sandbox_profile().as_str());
+        }
+        let write_scope = project_scope_root(&agent.sandbox_root);
+        if write_scope != agent.sandbox_root {
+            eprintln!(
+                "[scope] cwd {} · write {}",
+                agent.sandbox_root.display(),
+                write_scope.display()
+            );
         }
         if agent.sandbox_profile() != SandboxProfile::DangerFullAccess && !sandbox::is_enforced() {
             eprintln!("[sandbox warning] {}", sandbox::describe());

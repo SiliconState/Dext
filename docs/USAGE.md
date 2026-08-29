@@ -146,7 +146,7 @@ The built-in Kimi Code catalog uses Anthropic Messages semantics at `https://api
 
 ## Local Qwen / llama.cpp
 
-Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Local providers use frugal context by default unless you explicitly select `standard`. On startup and provider/model switches, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) and uses the live runtime context window for whichever model alias the server exposes. You can select any local alias; no model-specific context value is built into the local provider. Start one server first, then select its alias:
+Dext includes a `local` provider for an OpenAI-compatible llama.cpp server at `http://127.0.0.1:8080`. Local providers use frugal context by default unless you explicitly select `standard`. On startup and provider/model switches, Dext probes llama.cpp (`/props`, `/slots`, then model endpoints) and uses the live runtime context window for whichever model alias the server exposes. You can select any local alias; no model-specific context value is built into the local provider. For reasoning-capable local profiles, Dext also consumes streamed `choices[].delta.reasoning_content` as thinking up to the 4 MiB aggregate stream bound, stores it in the session, and replays only current-turn reasoning to llama.cpp across tool-result rounds. Verbose TUI and `stream-json` expose this raw local model output; plain console and final JSON omit it. Local requests explicitly send `chat_template_kwargs.enable_thinking`; `/effort off` disables template thinking, while every non-Off effort enables it and continues to use any declared `reasoning_effort` level. These local-only fields are not added to cloud Chat Completions requests. Start one server first, then select its alias:
 
 ```bash
 dext auth provider local
@@ -169,7 +169,7 @@ cd /path/to/llama.cpp
   --host 127.0.0.1 --port 8080
 ```
 
-Use `--frugal --effort off` or `/context frugal` plus `/effort off` for the lowest local token/compute pressure.
+Use `--frugal --effort off` or `/context frugal` plus `/effort off` for the lowest local token/compute pressure. To preserve local reasoning across llama.cpp tool rounds, start a build/template that supports reasoning preservation (for current llama.cpp, `--reasoning-preserve`). Dext stores the returned reasoning but omits it from compaction transcripts and later fresh-user-turn requests.
 
 ## Interactive workflow
 
@@ -344,6 +344,9 @@ dext undo --list
 dext undo --preview <checkpoint-id>
 dext undo --apply <checkpoint-id>
 dext undo --prune
+dext undo --repair
+# equivalent explicit recovery command:
+dext checkpoint repair
 ```
 
 Interactive undo commands:
@@ -355,9 +358,12 @@ Interactive undo commands:
 /undo <id>
 /undo <id> --apply
 /undo --prune
+/undo --repair
 ```
 
 Normal undo restores checkpointed worktree paths with literal Git pathspecs and does not move `HEAD`. Sidecar files and symlinks are revalidated and atomically replaced on supported platforms.
+
+Checkpoint manifest/lock ownership, symlink, hardlink, and group/world-write defects remain fail-closed. Owner-owned files that are only group/world-readable are recoverable: startup and the pre-mutation checkpoint boundary normalize them to mode `0600` on Unix and report the repair. `dext checkpoint repair` or `/undo --repair` is checkpoint-free: it validates the storage path, quarantines an invalid manifest byte-for-byte as `manifest.txt.quarantine-<timestamp>-<nonce>`, creates a new empty private manifest, and leaves hidden refs intact until ordinary prune removes orphans. Doctor reports observed modes and whether mutating tools are blocked, with the repair command in the finding.
 Moving `HEAD` requires the CLI's explicit reset-head mode.
 
 Mutation previews are shown before permission prompts for `write_file`,
@@ -414,7 +420,7 @@ dext --sandbox-profile danger-full-access
 # --sandbox accepts the same profile names, or a directory as the sandbox root
 ```
 
-Dext starts with the `always` approval profile. Gated tools and host operations therefore proceed without a frontend prompt by default; select `ask`, `auto-read`, `auto-write`, or `never` when a task needs stricter approval behavior. Under prompting profiles, interactive frontends request confirmation while non-interactive and JSON runs deny calls that require a prompt instead of waiting for input. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `always`. `DEXT_TRUST=1` remains an alias for `approval=always`; false values leave the default unchanged. An invalid approval environment value warns and selects `ask` unless a valid higher-precedence choice or true `DEXT_TRUST` supplies a policy. An invalid `DEXT_SANDBOX_PROFILE` fails normal startup rather than falling through to full access; a valid CLI sandbox override takes precedence. Resuming a session never restores its saved trust grants over the current-run policy. Destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands remain gated. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is Danger unless it uses explicit `git --no-pager` and matches a narrow helper-free metadata-inspection allowlist; commands such as `grep`, `diff-tree`, `ls-files`, `check-ignore`, and `check-attr` remain gated because they can invoke fsmonitor. Prefer Dext’s hardened native Git tools for review operations. Recognized dynamic/wrapper command paths and inline/stdin code—including shell input redirections and heredocs—through common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers are Danger too. Dynamic command words include variable/command, glob, brace, tilde, and attached-redirection expansion forms. Actual shell curl/wget/HTTPie/XH requests are gated because startup configuration and request bodies are not safely inferable; use Dext’s native `http` tool for read requests. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access.
+Dext starts with the `always` approval profile. Gated tools and host operations therefore proceed without a frontend prompt by default; select `ask`, `auto-read`, `auto-write`, or `never` when a task needs stricter approval behavior. Under prompting profiles, interactive frontends request confirmation while non-interactive and JSON runs deny calls that require a prompt instead of waiting for input. Startup policy precedence is the last CLI safety flag (`--trust`, `--no-trust`, `--approval`, or `--approval-profile`), then a valid `DEXT_APPROVAL`, then true `DEXT_TRUST`, then `always`. `DEXT_TRUST=1` remains an alias for `approval=always`; false values leave the default unchanged. An invalid approval environment value warns and selects `ask` unless a valid higher-precedence choice or true `DEXT_TRUST` supplies a policy. An invalid `DEXT_SANDBOX_PROFILE` fails normal startup rather than falling through to full access; a valid CLI sandbox override takes precedence. Resuming a session never restores its saved trust grants over the current-run policy. Destructive Git worktree/ref/stash changes, per-command config overrides, and unknown aliases/subcommands remain gated. Because repository configuration can execute pagers, filters, fsmonitor, diff/textconv drivers, hooks, or aliases, shell Git is Danger unless it uses explicit `git --no-pager` and matches a narrow helper-free metadata-inspection allowlist; commands such as `grep`, `diff-tree`, `ls-files`, `check-ignore`, and `check-attr` remain gated because they can invoke fsmonitor. Prefer Dext’s hardened native Git tools for review operations. Recognized dynamic/wrapper command paths and inline/stdin code—including shell input redirections and heredocs—through common versioned Python/PyPy/Perl/Node/Ruby/PHP launchers are Danger too. Dynamic command words include variable/command, glob, brace, tilde, and attached-redirection expansion forms. Actual shell curl/wget/HTTPie/XH requests are gated because startup configuration and request bodies are not safely inferable; use Dext’s native `http` tool for read requests. Approval and filesystem sandboxing are independent, and filesystem sandboxing does not restrict outbound network access. Dext keeps the launch directory as command cwd and project-context root, while mutation path guards and workspace-write confinement use the containing Git top-level when one exists so file tools, native Git tools, and checkpoints agree on repository scope. `/sandbox` prints both cwd and effective write scope and can change them in-session; outside-scope denials include the active scope and that remedy.
 
 For durable sessions, approved side-effect-capable tool calls receive a bounded, redacted start/terminal journal under the private session state directory. On resume, pending transcript calls are reconciled without replay: absent starts are marked `not_started`, unresolved starts are `uncertain`, and terminal entries recover their status without claiming unavailable output. `--no-session` and `--fork` deliberately omit this journal, so side-effect crash recovery is unavailable in those modes.
 
@@ -425,7 +431,7 @@ dext doctor
 dext doctor --approval auto-write --sandbox read-only --cd /path/to/project
 ```
 
-Doctor reports `ok`, `info`, and `warn` findings for the effective approval profile and source, effective sandbox profile, kernel enforcement, provider catalog/auth integrity and versions, auth-file permissions, bounded latest session/todo/settings/tool-journal state, unresolved journal calls, and Git checkpoint support/latest metadata. It inspects only active/latest state and preserves the existing exit status 0 when warnings are present.
+Doctor reports `ok`, `info`, and `warn` findings for the effective approval profile and source, effective sandbox profile, kernel enforcement, provider catalog/auth integrity and versions, auth-file permissions, bounded latest session/todo/settings/tool-journal state, unresolved journal calls, and Git checkpoint support/latest metadata. Checkpoint findings name unsafe or recoverable modes, say when mutating tools are blocked, and point to `dext checkpoint repair` for invalid manifests. It inspects only active/latest state and preserves the existing exit status 0 when warnings are present.
 
 Doctor does not repair or rewrite state, resolve environment or `!command` credential references, invoke provider/local-model APIs, or print credential-bearing JSON. Use the explicit flags to inspect the posture that those startup choices would produce.
 

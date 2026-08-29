@@ -174,6 +174,7 @@ fn canonicalize_write_path(
     require_pack_marker: bool,
 ) -> std::result::Result<PathBuf, String> {
     let root = canonicalize_or_clone(root);
+    let write_scope = project_scope_root(&root);
     let expanded = expand_user_path(user_path);
     let candidate = if expanded.is_absolute() {
         expanded
@@ -181,14 +182,14 @@ fn canonicalize_write_path(
         root.join(expanded)
     };
     let canonical = canonicalize_with_missing_ancestors(&candidate)?;
-    if canonical.starts_with(&root)
+    if canonical.starts_with(&write_scope)
         || dext_global_pack_path_allowed(&canonical, minimum_pack_components, require_pack_marker)
     {
         Ok(canonical)
     } else {
         Err(format!(
-            "path outside sandbox or Dext global pack roots ({}): {}",
-            root.display(),
+            "path outside sandbox or Dext global pack roots (active write scope {}): {}. Use `/sandbox PATH` to change the active scope in-session",
+            write_scope.display(),
             canonical.display()
         ))
     }
@@ -221,7 +222,7 @@ fn git_toplevel(root: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(top).ok()
 }
 
-fn project_scope_root(root: &Path) -> PathBuf {
+pub(crate) fn project_scope_root(root: &Path) -> PathBuf {
     git_toplevel(root).unwrap_or_else(|| canonicalize_or_clone(root))
 }
 

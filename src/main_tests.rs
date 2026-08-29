@@ -829,6 +829,176 @@ fn checkpoint_rejects_group_writable_storage_parent() {
 
 #[cfg(unix)]
 #[test]
+fn checkpoint_readable_manifest_mode_auto_repairs_before_mutation() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("checkpoint-manifest-readable-mode-repair");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create initial checkpoint")
+        .expect("initial checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    let operation_lock = root.join(".dext/checkpoints/operation.lock");
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644))
+        .expect("make manifest readable");
+    std::fs::set_permissions(&operation_lock, std::fs::Permissions::from_mode(0o644))
+        .expect("make operation lock readable");
+    assert!(
+        git_checkpoints::inspect_checkpoint_storage_mode(&root)
+            .expect("inspect readable mode")
+            .is_some()
+    );
+    git_checkpoints::normalize_existing_checkpoint_storage(&root)
+        .expect("startup normalization should repair readable mode");
+    assert_eq!(
+        std::fs::metadata(&manifest)
+            .expect("manifest metadata after startup normalization")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&operation_lock)
+            .expect("operation lock metadata after startup normalization")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644))
+        .expect("restore readable mode for mutation-boundary repair");
+
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 2)
+        .expect("readable mode should auto-repair")
+        .expect("second checkpoint exists");
+    let mode = std::fs::metadata(&manifest)
+        .expect("manifest metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(
+        git_checkpoints::list_checkpoints(&root, usize::MAX)
+            .expect("list repaired checkpoints")
+            .len(),
+        2
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn checkpoint_mode_normalization_does_not_reopen_exclusively_locked_file() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let root = temp_test_dir("checkpoint-mode-normalization-exclusive-lock");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let operation_lock = root.join(".dext/checkpoints/operation.lock");
+    let _exclusive = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&operation_lock)
+        .expect("hold operation lock exclusively");
+
+    git_checkpoints::normalize_existing_checkpoint_storage(&root)
+        .expect("non-Unix normalization must not reopen private files");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn sandbox_switch_repairs_checkpoint_read_mode_before_committing_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("sandbox-switch-checkpoint-mode-repair");
+    let initial = temp_test_dir("sandbox-switch-checkpoint-mode-initial");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644))
+        .expect("make manifest readable");
+    let mut agent = test_agent(&initial);
+
+    agent
+        .set_sandbox_root(root.clone())
+        .expect("switch sandbox and normalize checkpoint storage");
+
+    assert_eq!(agent.sandbox_root, root);
+    assert_eq!(
+        std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(initial);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_writable_manifest_mode_stays_fatal_and_actionable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("checkpoint-manifest-writable-mode");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create initial checkpoint")
+        .expect("initial checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o666))
+        .expect("make manifest writable");
+
+    let error = git_checkpoints::create_checkpoint(&root, "bash", &[], 2)
+        .expect_err("writable manifest must remain fatal");
+    assert!(error.contains("mode 0666"), "{error}");
+    assert!(error.contains("expected 0600"), "{error}");
+    assert!(error.contains("dext checkpoint repair"), "{error}");
+    assert_eq!(
+        std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o666
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
 fn checkpoint_inspection_rejects_non_private_storage_without_repairing_it() {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -2731,6 +2901,165 @@ fn checkpoint_corrupt_manifest_fails_closed_without_leaking_new_ref() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn checkpoint_repair_quarantines_corrupt_manifest_and_preserves_bytes() {
+    use std::io::Write as _;
+
+    let root = temp_test_dir("checkpoint-manifest-repair-quarantine");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&manifest)
+        .expect("open manifest")
+        .write_all(b"corrupt manifest line\n")
+        .expect("corrupt manifest");
+    let original = std::fs::read(&manifest).expect("read corrupt manifest");
+
+    let result = git_checkpoints::repair(&root).expect("repair corrupt manifest");
+    assert!(
+        result.contains("quarantined invalid checkpoint manifest"),
+        "{result}"
+    );
+    assert_eq!(
+        std::fs::read(&manifest).expect("read replacement manifest"),
+        b""
+    );
+    let quarantines = std::fs::read_dir(root.join(".dext/checkpoints"))
+        .expect("list checkpoint storage")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("manifest.txt.quarantine-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(quarantines.len(), 1, "{quarantines:?}");
+    assert_eq!(
+        std::fs::read(&quarantines[0]).expect("read quarantined bytes"),
+        original
+    );
+    assert!(
+        git_checkpoints::list_checkpoints(&root, 10)
+            .expect("list repaired manifest")
+            .is_empty()
+    );
+    let refs = git_test_command(&root)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/dext/checkpoints/",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("list preserved refs");
+    assert_eq!(String::from_utf8_lossy(&refs.stdout).lines().count(), 1);
+    git_checkpoints::prune(&root, None, None).expect("prune orphan refs after repair");
+    assert!(
+        quarantines[0].exists(),
+        "forensic quarantine must survive prune"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_repair_quarantines_oversized_manifest_with_bytes_intact() {
+    let root = temp_test_dir("checkpoint-manifest-repair-oversized");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    let oversized = vec![b'x'; 16 * 1024 * 1024 + 1];
+    std::fs::write(&manifest, &oversized).expect("write oversized manifest");
+
+    let result = git_checkpoints::repair(&root).expect("repair oversized manifest");
+    assert!(
+        result.contains("quarantined invalid checkpoint manifest"),
+        "{result}"
+    );
+    assert_eq!(
+        std::fs::read(&manifest).expect("read replacement manifest"),
+        b""
+    );
+    let quarantine = std::fs::read_dir(root.join(".dext/checkpoints"))
+        .expect("list checkpoint storage")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("manifest.txt.quarantine-"))
+        })
+        .expect("oversized manifest quarantine");
+    assert_eq!(
+        std::fs::metadata(&quarantine)
+            .expect("quarantine metadata")
+            .len(),
+        oversized.len() as u64
+    );
+    assert_eq!(
+        std::fs::read(&quarantine).expect("read quarantined oversized bytes"),
+        oversized
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_repair_rejects_symlinked_manifest_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_test_dir("checkpoint-manifest-repair-symlink");
+    let outside = temp_test_dir("checkpoint-manifest-repair-symlink-target");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    let outside_manifest = outside.join("manifest.txt");
+    std::fs::write(&outside_manifest, "outside bytes\n").expect("write outside manifest");
+    std::fs::remove_file(&manifest).expect("remove real manifest");
+    symlink(&outside_manifest, &manifest).expect("symlink manifest");
+
+    let error = git_checkpoints::repair(&root).expect_err("symlinked manifest stays fatal");
+    assert!(error.contains("regular non-symlink file"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&outside_manifest).expect("read outside target"),
+        "outside bytes\n"
+    );
+    assert!(
+        std::fs::symlink_metadata(&manifest)
+            .expect("manifest symlink metadata")
+            .file_type()
+            .is_symlink()
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_dir_all(outside);
+}
+
 #[cfg(unix)]
 #[test]
 fn checkpoint_rejects_hardlinked_private_manifest() {
@@ -2755,7 +3084,7 @@ fn checkpoint_rejects_hardlinked_private_manifest() {
 
     let error = git_checkpoints::list_checkpoints(&root, usize::MAX)
         .expect_err("hardlinked manifest must be rejected");
-    assert!(error.contains("safe regular file"), "{error}");
+    assert!(error.contains("hard links"), "{error}");
     assert_eq!(
         std::fs::read(&outside_manifest).expect("read unchanged outside manifest"),
         outside_before
@@ -10259,6 +10588,51 @@ async fn external_runner_honors_interrupts() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_reports_checkpoint_permission_drift_without_repairing_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _guard = env_lock();
+    let root = temp_test_dir("doctor-checkpoint-permission-drift");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644))
+        .expect("make manifest readable");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("state"));
+    }
+
+    let (report, warnings) = doctor_report(&root);
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    assert!(warnings > 0, "{report}");
+    assert!(report.contains("checkpoint permissions"), "{report}");
+    assert!(report.contains("mode 0644"), "{report}");
+    assert!(report.contains("expected 0600"), "{report}");
+    assert!(report.contains("dext checkpoint repair"), "{report}");
+    assert_eq!(
+        std::fs::metadata(&manifest)
+            .expect("manifest metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "doctor must inspect without repairing"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn doctor_report_covers_core_checks() {
     let _guard = env_lock();
@@ -14216,6 +14590,70 @@ fn git_pathspec_preserves_final_symlink_and_rejects_symlinked_ancestors() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn repository_scope_allows_parent_paths_from_a_subdirectory_session() {
+    let root = temp_test_dir("repository-write-scope-from-subdir");
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).expect("create workspace subdirectory");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked file");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+
+    let prepared = mutation_preview::prepare_write_file(
+        &workspace,
+        "../.bendex.toml",
+        "scope = \"repository\"\n",
+    )
+    .expect("prepare parent path inside repository scope");
+    assert_eq!(prepared.path(), root.join(".bendex.toml"));
+    mutation_preview::apply_prepared_mutation(&workspace, &prepared)
+        .expect("apply parent path inside repository scope");
+    assert_eq!(
+        git_tool_pathspec(&workspace, "git_commit", "../.bendex.toml")
+            .expect("resolve repository-relative Git path"),
+        ".bendex.toml"
+    );
+    let (_, diff_args, _) =
+        prepare_external_tool("git_diff", &json!({"path": "../.bendex.toml"}), &workspace)
+            .expect("prepare repository-root diff from subdirectory");
+    let root_text = root.to_string_lossy();
+    assert!(
+        diff_args
+            .windows(2)
+            .any(|pair| pair == ["-C", root_text.as_ref()]),
+        "{diff_args:?}"
+    );
+    assert_eq!(diff_args.last().map(String::as_str), Some(".bendex.toml"));
+
+    execute_git_commit_async(
+        &json!({"message": "test: repository scope", "paths": ["../.bendex.toml"]}),
+        &workspace,
+        Arc::new(AtomicBool::new(false)),
+        SandboxProfile::WorkspaceWrite,
+        false,
+    )
+    .await
+    .expect("commit repository parent path from subdirectory session");
+    assert_eq!(
+        git_stdout(&root, &["show", "HEAD:.bendex.toml"]),
+        "scope = \"repository\""
+    );
+
+    let outside = root
+        .parent()
+        .expect("temp repository parent")
+        .join("outside-scope.txt");
+    let error = canonicalize_mutation_path(&workspace, &outside.to_string_lossy())
+        .expect_err("path outside repository write scope must remain rejected");
+    assert!(error.contains("active write scope"), "{error}");
+    assert!(error.contains("/sandbox PATH"), "{error}");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn git_commit_path_stages_the_tracked_symlink_not_its_referent() {
@@ -15454,6 +15892,91 @@ fn nontext_assistant_response_precedes_tool_results_on_every_wire_contract() {
 }
 
 #[test]
+fn local_llama_replays_only_current_turn_reasoning_and_cloud_chat_omits_it() {
+    let root = temp_test_dir("local-reasoning-history-roundtrip");
+    let mut agent = test_agent(&root);
+    agent.provider_id = "local".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "http://127.0.0.1:8080".to_string();
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Old question".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                Block::Thinking {
+                    text: "old private reasoning".to_string(),
+                    signature: None,
+                },
+                Block::Text {
+                    text: "Old answer".to_string(),
+                },
+            ],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Read the todo list".to_string(),
+            }],
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: vec![
+                Block::Thinking {
+                    text: "inspect current todos".to_string(),
+                    signature: None,
+                },
+                Block::ToolUse {
+                    id: "call_current".to_string(),
+                    name: "todo_read".to_string(),
+                    input: json!({}),
+                },
+            ],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![tool_result_block("call_current", "(no todos)", None)],
+        },
+    ];
+
+    let local = serde_json::to_value(agent.history_to_oai_messages("system"))
+        .expect("serialize local history");
+    let local = local.as_array().expect("local messages");
+    let old_answer = local
+        .iter()
+        .find(|message| message["content"] == "Old answer")
+        .expect("old answer message");
+    assert!(
+        old_answer.get("reasoning_content").is_none(),
+        "{old_answer}"
+    );
+    let current = local
+        .iter()
+        .find(|message| message["tool_calls"][0]["id"] == "call_current")
+        .expect("current assistant tool message");
+    assert_eq!(current["content"], "");
+    assert_eq!(current["reasoning_content"], "inspect current todos");
+
+    agent.provider_id = "deepseek".to_string();
+    agent.base_url = "https://api.deepseek.com".to_string();
+    let cloud = serde_json::to_value(agent.history_to_oai_messages("system"))
+        .expect("serialize cloud history");
+    assert!(
+        cloud.as_array().is_some_and(|messages| messages
+            .iter()
+            .all(|message| message.get("reasoning_content").is_none())),
+        "{cloud}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn parse_compact_slash_accepts_status_auto_and_percentage_override() {
     assert!(matches!(
         parse_compact_slash("/compact"),
@@ -15735,9 +16258,22 @@ fn reasoning_effort_off_omits_provider_reasoning_controls() -> Result<()> {
     let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
     let body_json: Value = serde_json::from_slice(&body)?;
     assert!(body_json.get("reasoning_effort").is_none(), "{body_json}");
+    assert_eq!(
+        body_json["chat_template_kwargs"]["enable_thinking"], false,
+        "{body_json}"
+    );
     assert!(body_json.get("stream_options").is_none(), "{body_json}");
     assert!(body_json.get("prompt_cache_key").is_none(), "{body_json}");
     assert_eq!(body_json["max_tokens"], 8192);
+
+    agent.provider_id = "deepseek".to_string();
+    agent.base_url = "https://api.deepseek.com".to_string();
+    let (_, cloud_body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
+    let cloud_body: Value = serde_json::from_slice(&cloud_body)?;
+    assert!(
+        cloud_body.get("chat_template_kwargs").is_none(),
+        "{cloud_body}"
+    );
 
     let chatgpt = build_chatgpt_request(
         "gpt-5.4",
@@ -16008,6 +16544,10 @@ fn oai_chat_request_honors_declared_model_effort_levels() -> Result<()> {
     let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
     let body: Value = serde_json::from_slice(&body)?;
     assert_eq!(body["reasoning_effort"], "xhigh", "{body}");
+    assert_eq!(
+        body["chat_template_kwargs"]["enable_thinking"], true,
+        "{body}"
+    );
 
     agent.provider_profile = Some(make_profile(HashMap::new()));
     let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
@@ -16019,6 +16559,10 @@ fn oai_chat_request_honors_declared_model_effort_levels() -> Result<()> {
     let (_url, body) = agent.build_streaming_request("sys", "env", &[], &[], "unused")?;
     let body: Value = serde_json::from_slice(&body)?;
     assert!(body.get("reasoning_effort").is_none(), "{body}");
+    assert_eq!(
+        body["chat_template_kwargs"]["enable_thinking"], false,
+        "{body}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -25735,6 +26279,80 @@ async fn anthropic_unfinished_tool_call_automatically_continues() {
     )));
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn local_llama_reasoning_content_reaches_sink_and_history_blocks() {
+    let root = temp_test_dir("local-reasoning-content-stream");
+    let root = std::fs::canonicalize(&root).expect("canonical temp dir");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("set request timeout");
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).expect("read request headers");
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&buf[..read]);
+        }
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect \"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"the files\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+    });
+
+    let mut agent = test_agent(&root);
+    agent.provider_id = "local".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = format!("http://{addr}");
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    let resp = reqwest::get(format!("http://{addr}/stream"))
+        .await
+        .expect("response");
+    let ParsedProviderStream { blocks, .. } =
+        agent.read_stream_oai(resp).await.expect("parse stream");
+
+    assert!(matches!(
+        blocks.as_slice(),
+        [
+            Block::Thinking { text, signature: None },
+            Block::Text { text: answer },
+        ] if text == "inspect the files" && answer == "answer"
+    ));
+    let events = drain_events(&mut rx);
+    let streamed = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ThinkingDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(streamed, "inspect the files");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ThinkingBlockComplete(text) if text == "inspect the files"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextBlockComplete(text) if text == "answer"
+    )));
+
+    server.join().expect("server thread");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
