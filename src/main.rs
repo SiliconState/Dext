@@ -12363,7 +12363,7 @@ fn openai_summary_text_from_response(json: &Value) -> Result<String> {
         text = extract_summary_from_reasoning(reasoning);
     }
     if text.trim().is_empty() {
-        anyhow::bail!("summary response had no text: {json}");
+        anyhow::bail!("summary response had no text");
     }
     Ok(text)
 }
@@ -17153,17 +17153,28 @@ impl Agent {
     }
 
     fn history_chars(&self) -> usize {
+        let current_turn_start = self
+            .history
+            .iter()
+            .rposition(is_fresh_user_prompt_message)
+            .unwrap_or(0);
+        let preserve_current_thinking = self.local_llama_reasoning_enabled();
         self.history
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(message_index, m)| {
                 m.content
                     .iter()
                     .map(|b| match b {
                         Block::Text { text } | Block::PartialStream { text } => text.len(),
-                        // Thinking is stripped from prior turns at serialization
-                        // time, so it must not count toward the compaction
-                        // trigger — otherwise stored reasoning would force
-                        // compaction of context that is never actually sent.
+                        Block::Thinking { text, .. }
+                            if preserve_current_thinking && message_index >= current_turn_start =>
+                        {
+                            text.len()
+                        }
+                        // Prior-turn thinking is stripped at serialization time,
+                        // so only local reasoning replayed in the active tool loop
+                        // contributes to request-size compaction.
                         Block::Thinking { .. } | Block::RedactedThinking { .. } => 0,
                         Block::ResponsesReasoning { item } => json_byte_len(item),
                         Block::ToolUse { input, .. } => json_byte_len(input),
@@ -17750,7 +17761,7 @@ impl Agent {
                     })
                     .unwrap_or_default();
                 if text.trim().is_empty() {
-                    anyhow::bail!("summary response had no text: {json}");
+                    anyhow::bail!("summary response had no text");
                 }
                 let mut usage = Usage::parse(&json["usage"]);
                 self.finalize_usage_metrics_for_model(&mut usage, &summary_model);
@@ -20714,22 +20725,44 @@ fn doctor_report_with_overrides(
             )),
         }
         match git_checkpoints::inspect_checkpoints(root, 64) {
-            Ok(checkpoints) if checkpoints.is_empty() => findings.push(DoctorFinding::info(
-                "checkpoints",
-                "supported; no Dext checkpoints",
-            )),
-            Ok(checkpoints) => findings.push(DoctorFinding::ok(
-                "checkpoints",
-                format!(
-                    "supported; {} recent checkpoint(s), latest {}",
-                    checkpoints.len(),
-                    checkpoints[0].id
-                ),
-            )),
+            Ok(git_checkpoints::CheckpointInspection::Checkpoints(checkpoints))
+                if checkpoints.is_empty() =>
+            {
+                findings.push(DoctorFinding::info(
+                    "checkpoints",
+                    "supported; no Dext checkpoints",
+                ))
+            }
+            Ok(git_checkpoints::CheckpointInspection::Checkpoints(checkpoints)) => {
+                findings.push(DoctorFinding::ok(
+                    "checkpoints",
+                    format!(
+                        "supported; {} recent checkpoint(s), latest {}",
+                        checkpoints.len(),
+                        checkpoints[0].id
+                    ),
+                ))
+            }
+            Ok(git_checkpoints::CheckpointInspection::ManifestTooLarge { bytes, limit }) => {
+                findings.push(DoctorFinding::warn(
+                    "checkpoints",
+                    format!(
+                        "checkpoint manifest is {bytes} bytes, above the {limit}-byte doctor inspection bound; runtime checkpoint operations still validate against the 16777216-byte manifest limit"
+                    ),
+                ))
+            }
+            Err(error) if git_checkpoints::repairable_manifest_validation_error(&error) => {
+                findings.push(DoctorFinding::warn(
+                    "checkpoints",
+                    format!(
+                        "{error}; mutating tools are blocked until the manifest is repaired. Run `dext checkpoint repair`"
+                    ),
+                ))
+            }
             Err(error) => findings.push(DoctorFinding::warn(
                 "checkpoints",
                 format!(
-                    "{error}; mutating tools are blocked until the manifest is repaired. Run `dext checkpoint repair`"
+                    "{error}; mutating tools are blocked until checkpoint storage integrity is corrected"
                 ),
             )),
         }

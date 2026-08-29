@@ -1016,8 +1016,9 @@ fn checkpoint_inspection_rejects_non_private_storage_without_repairing_it() {
     std::fs::set_permissions(&checkpoints, std::fs::Permissions::from_mode(0o755))
         .expect("make checkpoint storage non-private");
 
-    let inspect_error = git_checkpoints::inspect_checkpoints(&root, 10)
+    let inspection = git_checkpoints::inspect_checkpoints(&root, 10)
         .expect_err("doctor inspection must reject non-private checkpoint storage");
+    let inspect_error = inspection.to_string();
     assert!(inspect_error.contains("not owner-safe"), "{inspect_error}");
     let list_error = git_checkpoints::list_checkpoints(&root, 10)
         .expect_err("listing must reject non-private checkpoint storage");
@@ -10588,6 +10589,53 @@ async fn external_runner_honors_interrupts() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn doctor_reports_manifest_above_inspection_bound_without_calling_it_corrupt() {
+    let _guard = env_lock();
+    let root = temp_test_dir("doctor-checkpoint-inspection-limit");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("tracked.txt"), "base\n").expect("write tracked");
+    git_ok(&root, &["add", "tracked.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    git_checkpoints::create_checkpoint(&root, "bash", &[], 1)
+        .expect("create checkpoint")
+        .expect("checkpoint exists");
+    let manifest = root.join(".dext/checkpoints/manifest.txt");
+    let original = std::fs::read(&manifest).expect("read manifest");
+    let mut large = original.clone();
+    large.resize(256 * 1024 + 1, b'\n');
+    assert!(large.len() < 16 * 1024 * 1024);
+    std::fs::write(&manifest, &large).expect("write large valid manifest");
+    let old_dext_home = std::env::var_os("DEXT_HOME");
+    unsafe {
+        std::env::set_var("DEXT_HOME", root.join("state"));
+    }
+
+    let (report, _warnings) = doctor_report(&root);
+
+    restore_env_var("DEXT_HOME", old_dext_home);
+    assert!(report.contains("doctor inspection bound"), "{report}");
+    assert!(
+        report.contains("runtime checkpoint operations still validate"),
+        "{report}"
+    );
+    assert!(!report.contains("manifest is repaired"), "{report}");
+    assert_eq!(
+        std::fs::read(&manifest).expect("doctor preserves manifest"),
+        large
+    );
+    assert_eq!(
+        git_checkpoints::list_checkpoints(&root, 10)
+            .expect("runtime listing accepts manifest above doctor ceiling")
+            .len(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_reports_checkpoint_permission_drift_without_repairing_it() {
@@ -15944,6 +15992,8 @@ fn local_llama_replays_only_current_turn_reasoning_and_cloud_chat_omits_it() {
         },
     ];
 
+    let local_history_chars = agent.history_chars();
+
     let local = serde_json::to_value(agent.history_to_oai_messages("system"))
         .expect("serialize local history");
     let local = local.as_array().expect("local messages");
@@ -15964,6 +16014,11 @@ fn local_llama_replays_only_current_turn_reasoning_and_cloud_chat_omits_it() {
 
     agent.provider_id = "deepseek".to_string();
     agent.base_url = "https://api.deepseek.com".to_string();
+    let cloud_history_chars = agent.history_chars();
+    assert_eq!(
+        local_history_chars - cloud_history_chars,
+        "inspect current todos".len()
+    );
     let cloud = serde_json::to_value(agent.history_to_oai_messages("system"))
         .expect("serialize cloud history");
     assert!(
@@ -29078,12 +29133,19 @@ fn compact_summary_thinking_budget_and_reasoning_fallbacks() {
     let text = openai_summary_text_from_response(&json).expect("reasoning fallback");
     assert!(text.contains("Final draft"), "{text}");
 
-    let empty = json!({"choices":[{"finish_reason":"stop","message":{"content":""}}]});
+    let empty = json!({
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {
+                "content": "",
+                "reasoning_content": "private reasoning must not appear in errors",
+            }
+        }]
+    });
     let err = openai_summary_text_from_response(&empty).expect_err("empty summary should fail");
-    assert!(
-        err.to_string().contains("summary response had no text"),
-        "{err:#}"
-    );
+    let error = err.to_string();
+    assert!(error.contains("summary response had no text"), "{err:#}");
+    assert!(!error.contains("private reasoning"), "{error}");
 }
 
 #[tokio::test(flavor = "current_thread")]

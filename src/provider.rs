@@ -956,10 +956,19 @@ pub(crate) fn is_local_llama_provider(
     if api_provider != ApiProvider::OpenAi {
         return false;
     }
-    let lower = base_url.trim().to_ascii_lowercase();
-    canonical_provider_id(provider_id) == "local"
-        || lower.contains("127.0.0.1")
-        || lower.contains("localhost")
+    if canonical_provider_id(provider_id) == "local" {
+        return true;
+    }
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 fn local_llama_cache_key(base_url: &str, model: &str) -> String {
@@ -2432,9 +2441,11 @@ pub(crate) fn resolve_provider_model(profile: &ProviderProfile) -> String {
                 && request_contract_for_profile(profile).api_provider() == ApiProvider::OpenAi
                 && !profile.requires_api_key
             {
-                let looks_local = canonical_provider_id(&profile.id) == "local"
-                    || profile.base_url.contains("127.0.0.1")
-                    || profile.base_url.contains("localhost");
+                let looks_local = is_local_llama_provider(
+                    &profile.id,
+                    request_contract_for_profile(profile).api_provider(),
+                    &profile.base_url,
+                );
                 if looks_local {
                     return t;
                 }
@@ -5515,6 +5526,42 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp home");
         path
+    }
+
+    #[test]
+    fn local_llama_detection_uses_provider_identity_or_loopback_host() {
+        assert!(is_local_llama_provider(
+            "local",
+            ApiProvider::OpenAi,
+            "https://remote.example/v1"
+        ));
+        for base_url in [
+            "http://127.0.0.1:8080",
+            "http://127.42.7.9:8080/v1",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(
+                is_local_llama_provider("custom", ApiProvider::OpenAi, base_url),
+                "{base_url}"
+            );
+        }
+        for base_url in [
+            "https://localhost.evil.example/v1",
+            "https://evil.example/localhost/v1",
+            "https://evil.example/?next=http://127.0.0.1:8080",
+            "not a URL containing localhost",
+        ] {
+            assert!(
+                !is_local_llama_provider("custom", ApiProvider::OpenAi, base_url),
+                "{base_url}"
+            );
+        }
+        assert!(!is_local_llama_provider(
+            "local",
+            ApiProvider::Anthropic,
+            "http://127.0.0.1:8080"
+        ));
     }
 
     #[test]

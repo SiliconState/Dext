@@ -2367,21 +2367,44 @@ pub(crate) fn inspect_checkpoint_storage_mode(root: &Path) -> Result<Option<Stri
     Ok(None)
 }
 
-pub(crate) fn inspect_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
+#[derive(Debug)]
+pub(crate) enum CheckpointInspection {
+    Checkpoints(Vec<Checkpoint>),
+    ManifestTooLarge { bytes: u64, limit: u64 },
+}
+
+pub(crate) fn inspect_checkpoints(
+    root: &Path,
+    limit: usize,
+) -> Result<CheckpointInspection, String> {
     let Some(git_root) = repo_root(root)? else {
-        return Ok(Vec::new());
+        return Ok(CheckpointInspection::Checkpoints(Vec::new()));
     };
     if !checkpoint_storage_exists(&git_root)? {
-        return Ok(Vec::new());
+        return Ok(CheckpointInspection::Checkpoints(Vec::new()));
     }
+    const INSPECTION_MAX_BYTES: u64 = 256 * 1024;
     let manifest = checkpoints_manifest_dir(&git_root).join("manifest.txt");
-    if let Ok(metadata) = std::fs::symlink_metadata(&manifest)
-        && metadata.len() > 256 * 1024
-    {
-        return Err("checkpoint manifest exceeds the doctor inspection bound".to_string());
+    match std::fs::symlink_metadata(&manifest) {
+        Ok(metadata) => {
+            checkpoint_private_file_integrity(&metadata, "checkpoint manifest", &manifest)?;
+            if metadata.len() > CHECKPOINT_MANIFEST_MAX_BYTES {
+                return Err(format!(
+                    "checkpoint manifest exceeds the {CHECKPOINT_MANIFEST_MAX_BYTES}-byte runtime bound"
+                ));
+            }
+            if metadata.len() > INSPECTION_MAX_BYTES {
+                return Ok(CheckpointInspection::ManifestTooLarge {
+                    bytes: metadata.len(),
+                    limit: INSPECTION_MAX_BYTES,
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("checkpoint manifest metadata: {error}")),
     }
-    list_checkpoints_in_repo(&git_root, limit, false, Some(256 * 1024))
-        .map(|(checkpoints, _)| checkpoints)
+    list_checkpoints_in_repo(&git_root, limit, false, Some(INSPECTION_MAX_BYTES))
+        .map(|(checkpoints, _)| CheckpointInspection::Checkpoints(checkpoints))
 }
 
 pub(crate) fn list_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
@@ -4084,7 +4107,7 @@ pub(crate) fn repair(root: &Path) -> Result<String, String> {
     ))
 }
 
-fn repairable_manifest_validation_error(error: &str) -> bool {
+pub(crate) fn repairable_manifest_validation_error(error: &str) -> bool {
     [
         "checkpoint manifest has an incomplete final line",
         "invalid checkpoint manifest entry",
