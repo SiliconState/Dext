@@ -11376,12 +11376,23 @@ async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
 #[tokio::test]
 async fn fast_bash_command_returns_without_100ms_poll_tail() {
     let root = temp_test_dir("bash-fastpath");
-    // One wall-clock sample is scheduler-noise-bound on shared CI runners; a
-    // structural 100ms poll tail would slow every attempt, so the fastest of
-    // three proves the fast path while absorbing transient runner stalls.
-    let mut samples = Vec::new();
+    // Shell startup itself can exceed 100ms on shared macOS/Windows runners.
+    // Compare against the same resolved shell instead of treating startup time
+    // as Dext's wait-loop overhead.
+    let bash = bash_executable_path();
+    let mut overhead_samples = Vec::new();
     for _ in 0..3 {
-        let start = std::time::Instant::now();
+        let baseline_start = std::time::Instant::now();
+        let baseline = tokio::process::Command::new(&bash)
+            .arg("-c")
+            .arg("true")
+            .status()
+            .await
+            .expect("run baseline shell");
+        let baseline_elapsed = baseline_start.elapsed();
+        assert!(baseline.success(), "baseline shell failed: {baseline}");
+
+        let wrapped_start = std::time::Instant::now();
         let out = execute_bash_async_with_timeout(
             "true",
             &root,
@@ -11391,17 +11402,18 @@ async fn fast_bash_command_returns_without_100ms_poll_tail() {
         )
         .await
         .expect("expected success");
-        let elapsed = start.elapsed();
+        let wrapped_elapsed = wrapped_start.elapsed();
         assert!(out.contains("exit: 0"), "{out}");
-        if elapsed < std::time::Duration::from_millis(90) {
-            samples.clear();
-            break;
-        }
-        samples.push(elapsed);
+        overhead_samples.push(wrapped_elapsed.saturating_sub(baseline_elapsed));
     }
+    let fastest_overhead = overhead_samples
+        .iter()
+        .copied()
+        .min()
+        .expect("latency samples");
     assert!(
-        samples.is_empty(),
-        "expected one of three runs <90ms (old busy-poll capped at 100ms); got {samples:?}"
+        fastest_overhead < std::time::Duration::from_millis(90),
+        "expected one of three wrapper-overhead samples <90ms (old busy-poll capped at 100ms); got {overhead_samples:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
