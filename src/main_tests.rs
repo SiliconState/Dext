@@ -11373,28 +11373,32 @@ async fn sandbox_blocks_parent_environment_and_untrusted_cache_overrides() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+#[ignore]
+fn bash_exit_timestamp_helper() {
+    use std::io::Write as _;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_nanos();
+    println!("DEXT_EXIT_TIMESTAMP_NS={nanos}");
+    std::io::stdout().flush().expect("flush helper timestamp");
+    std::process::exit(0);
+}
+
 #[tokio::test]
 async fn fast_bash_command_returns_without_100ms_poll_tail() {
     let root = temp_test_dir("bash-fastpath");
-    // Shell startup itself can exceed 100ms on shared macOS/Windows runners.
-    // Compare against the same resolved shell instead of treating startup time
-    // as Dext's wait-loop overhead.
-    let bash = bash_executable_path();
-    let mut overhead_samples = Vec::new();
+    let current_exe = std::env::current_exe().expect("current test executable");
+    let command = format!(
+        "{} --exact main_tests::bash_exit_timestamp_helper --ignored --nocapture",
+        shell_single_quote(&normalized_path_text(&current_exe))
+    );
+    let mut samples = Vec::new();
     for _ in 0..3 {
-        let baseline_start = std::time::Instant::now();
-        let baseline = tokio::process::Command::new(&bash)
-            .arg("-c")
-            .arg("true")
-            .status()
-            .await
-            .expect("run baseline shell");
-        let baseline_elapsed = baseline_start.elapsed();
-        assert!(baseline.success(), "baseline shell failed: {baseline}");
-
-        let wrapped_start = std::time::Instant::now();
         let out = execute_bash_async_with_timeout(
-            "true",
+            &command,
             &root,
             Arc::new(AtomicBool::new(false)),
             std::time::Duration::from_secs(5),
@@ -11402,18 +11406,24 @@ async fn fast_bash_command_returns_without_100ms_poll_tail() {
         )
         .await
         .expect("expected success");
-        let wrapped_elapsed = wrapped_start.elapsed();
         assert!(out.contains("exit: 0"), "{out}");
-        overhead_samples.push(wrapped_elapsed.saturating_sub(baseline_elapsed));
+        let marker = out
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("DEXT_EXIT_TIMESTAMP_NS="))
+            .expect("helper timestamp marker");
+        let child_timestamp = marker.parse::<u128>().expect("timestamp nanoseconds");
+        let returned_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        samples.push(std::time::Duration::from_nanos(
+            returned_timestamp.saturating_sub(child_timestamp) as u64,
+        ));
     }
-    let fastest_overhead = overhead_samples
-        .iter()
-        .copied()
-        .min()
-        .expect("latency samples");
+    let fastest = samples.iter().copied().min().expect("latency samples");
     assert!(
-        fastest_overhead < std::time::Duration::from_millis(90),
-        "expected one of three wrapper-overhead samples <90ms (old busy-poll capped at 100ms); got {overhead_samples:?}"
+        fastest < std::time::Duration::from_millis(90),
+        "expected one of three post-child-exit samples <90ms (old busy-poll capped at 100ms); got {samples:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
