@@ -234,7 +234,17 @@ pub(crate) fn repo_root(root: &Path) -> Result<Option<PathBuf>, String> {
     let output = git_command(root, &["rev-parse", "--show-toplevel"])?;
     if output.success() {
         let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok((!trimmed.is_empty()).then(|| PathBuf::from(trimmed)));
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let reported = PathBuf::from(trimmed);
+        let canonical = std::fs::canonicalize(&reported).map_err(|error| {
+            format!(
+                "canonicalize Git repository root {}: {error}",
+                reported.display()
+            )
+        })?;
+        return Ok(Some(canonical));
     }
     Err(format!(
         "git rev-parse --show-toplevel: {}",
