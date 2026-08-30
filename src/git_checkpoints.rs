@@ -234,7 +234,17 @@ pub(crate) fn repo_root(root: &Path) -> Result<Option<PathBuf>, String> {
     let output = git_command(root, &["rev-parse", "--show-toplevel"])?;
     if output.success() {
         let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Ok((!trimmed.is_empty()).then(|| PathBuf::from(trimmed)));
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let reported = PathBuf::from(trimmed);
+        let canonical = std::fs::canonicalize(&reported).map_err(|error| {
+            format!(
+                "canonicalize Git repository root {}: {error}",
+                reported.display()
+            )
+        })?;
+        return Ok(Some(canonical));
     }
     Err(format!(
         "git rev-parse --show-toplevel: {}",
@@ -450,6 +460,12 @@ fn ensure_checkpoint_storage(git_root: &Path) -> Result<(), String> {
         }
     }
     ensure_private_dir(&checkpoints_manifest_dir(git_root))?;
+    let checkpoint_dir = checkpoints_manifest_dir(git_root);
+    normalize_checkpoint_file_mode(&checkpoint_dir.join("manifest.txt"), "checkpoint manifest")?;
+    normalize_checkpoint_file_mode(
+        &checkpoint_dir.join("operation.lock"),
+        "checkpoint operation lock",
+    )?;
     let tracked = run_git(git_root, &["ls-files", "--", CHECKPOINTS_DIR])?;
     if !tracked.trim().is_empty() {
         return Err(format!(
@@ -458,6 +474,38 @@ fn ensure_checkpoint_storage(git_root: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn normalize_existing_checkpoint_storage(root: &Path) -> Result<(), String> {
+    let Some(git_root) = repo_root(root)? else {
+        return Ok(());
+    };
+    let checkpoint_dir = checkpoints_manifest_dir(&git_root);
+    match std::fs::symlink_metadata(&checkpoint_dir) {
+        Ok(_) => {
+            let dext_dir = git_root.join(".dext");
+            let dext_metadata = std::fs::symlink_metadata(&dext_dir)
+                .map_err(|error| format!("checkpoint storage parent metadata: {error}"))?;
+            if !safe_checkpoint_storage_parent_metadata(&dext_metadata) {
+                return Err(format!(
+                    "checkpoint storage parent is not a safe current-user-owned directory: {}",
+                    dext_dir.display()
+                ));
+            }
+            ensure_private_dir(&checkpoint_dir)?;
+            normalize_checkpoint_file_mode(
+                &checkpoint_dir.join("manifest.txt"),
+                "checkpoint manifest",
+            )?;
+            normalize_checkpoint_file_mode(
+                &checkpoint_dir.join("operation.lock"),
+                "checkpoint operation lock",
+            )?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("checkpoint storage metadata: {error}")),
+    }
 }
 
 fn checkpoint_storage_exists(git_root: &Path) -> Result<bool, String> {
@@ -522,6 +570,101 @@ fn safe_private_file_metadata(metadata: &std::fs::Metadata) -> bool {
     true
 }
 
+fn checkpoint_private_file_integrity(
+    metadata: &std::fs::Metadata,
+    label: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{label} is not a regular non-symlink file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(format!(
+                "{label} is not owned by the current user: {}",
+                path.display()
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(format!(
+                "{label} has {} hard links; expected exactly one: {}",
+                metadata.nlink(),
+                path.display()
+            ));
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{label} has unsafe writable mode {mode:04o}; expected 0600. Remove group/world write bits, then run: dext checkpoint repair"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn same_checkpoint_file(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        before.dev() == after.dev() && before.ino() == after.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (before, after);
+        true
+    }
+}
+
+fn normalize_checkpoint_file_mode(path: &Path, label: &str) -> Result<bool, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (path, label);
+        Ok(false)
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let before = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("{label} metadata {}: {error}", path.display())),
+        };
+        checkpoint_private_file_integrity(&before, label, path)?;
+
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options
+            .open(path)
+            .map_err(|error| format!("open {label} {}: {error}", path.display()))?;
+        let opened = file
+            .metadata()
+            .map_err(|error| format!("{label} metadata {}: {error}", path.display()))?;
+        if !same_checkpoint_file(&before, &opened) {
+            return Err(format!("{label} changed while opening: {}", path.display()));
+        }
+        checkpoint_private_file_integrity(&opened, label, path)?;
+
+        let mode = opened.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("chmod {label} {}: {error}", path.display()))?;
+            eprintln!(
+                "[checkpoint] repaired {label} mode {mode:04o} -> 0600: {}",
+                path.display()
+            );
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
 fn safe_restore_destination_metadata(metadata: &std::fs::Metadata) -> bool {
     safe_single_link_file_metadata(metadata)
 }
@@ -544,13 +687,9 @@ impl CheckpointOperationLock {
         ensure_checkpoint_storage(git_root)?;
         let path = checkpoints_manifest_dir(git_root).join("operation.lock");
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if !safe_private_file_metadata(&metadata) => {
-                return Err(format!(
-                    "checkpoint operation lock is not a safe regular file: {}",
-                    path.display()
-                ));
+            Ok(metadata) => {
+                checkpoint_private_file_integrity(&metadata, "checkpoint operation lock", &path)?
             }
-            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("checkpoint operation lock metadata: {error}")),
         }
@@ -589,13 +728,13 @@ impl CheckpointOperationLock {
                 }
             }
         };
-        if !safe_private_file_metadata(
+        checkpoint_private_file_integrity(
             &file
                 .metadata()
                 .map_err(|error| format!("checkpoint operation lock metadata: {error}"))?,
-        ) {
-            return Err("checkpoint operation lock is not a safe regular file".to_string());
-        }
+            "checkpoint operation lock",
+            &path,
+        )?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd as _;
@@ -705,7 +844,15 @@ fn create_private_file(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
-fn read_private_file_with_limit(path: &Path, max_bytes: Option<u64>) -> Result<String, String> {
+fn read_checkpoint_file_bytes_with_limit(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("checkpoint file metadata {}: {error}", path.display()))?;
+    checkpoint_private_file_integrity(&before, "checkpoint manifest", path)?;
+    if before.len() > max_bytes {
+        return Err(format!(
+            "checkpoint manifest exceeds the {max_bytes}-byte inspection bound"
+        ));
+    }
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -713,61 +860,44 @@ fn read_private_file_with_limit(path: &Path, max_bytes: Option<u64>) -> Result<S
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options
+    let file = options
         .open(path)
-        .map_err(|error| format!("private file open {}: {error}", path.display()))?;
-    let metadata = file
+        .map_err(|error| format!("open checkpoint manifest {}: {error}", path.display()))?;
+    let opened = file
         .metadata()
-        .map_err(|error| format!("private file metadata {}: {error}", path.display()))?;
-    if !safe_private_file_metadata(&metadata) {
+        .map_err(|error| format!("checkpoint manifest metadata {}: {error}", path.display()))?;
+    if !same_checkpoint_file(&before, &opened) {
         return Err(format!(
-            "private file path is not a safe regular file: {}",
+            "checkpoint manifest changed while opening: {}",
             path.display()
         ));
     }
-    if let Some(max_bytes) = max_bytes
-        && metadata.len() > max_bytes
-    {
+    checkpoint_private_file_integrity(&opened, "checkpoint manifest", path)?;
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read checkpoint manifest {}: {error}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
         return Err(format!(
-            "private file exceeds the {max_bytes}-byte inspection bound: {}",
-            path.display()
+            "checkpoint manifest exceeds the {max_bytes}-byte inspection bound"
         ));
     }
-    let mut content = String::new();
-    match max_bytes {
-        Some(max_bytes) => {
-            file.take(max_bytes + 1)
-                .read_to_string(&mut content)
-                .map_err(|error| format!("private file read {}: {error}", path.display()))?;
-            if content.len() as u64 > max_bytes {
-                return Err(format!(
-                    "private file exceeds the {max_bytes}-byte inspection bound: {}",
-                    path.display()
-                ));
-            }
-        }
-        None => {
-            file.read_to_string(&mut content)
-                .map_err(|error| format!("private file read {}: {error}", path.display()))?;
-        }
-    }
-    Ok(content)
+    Ok(bytes)
 }
 
-fn write_private_file(path: &Path, content: &[u8]) -> Result<(), String> {
+fn read_checkpoint_file_with_limit(path: &Path, max_bytes: u64) -> Result<String, String> {
+    String::from_utf8(read_checkpoint_file_bytes_with_limit(path, max_bytes)?)
+        .map_err(|_| "checkpoint manifest is not valid UTF-8".to_string())
+}
+
+fn write_checkpoint_manifest_file(path: &Path, content: &[u8]) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if !safe_private_file_metadata(&metadata) => {
-            return Err(format!(
-                "private file path is not a safe regular file: {}",
-                path.display()
-            ));
-        }
-        Ok(_) => {}
+        Ok(metadata) => checkpoint_private_file_integrity(&metadata, "checkpoint manifest", path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("private file metadata {}: {error}", path.display())),
+        Err(error) => return Err(format!("checkpoint manifest metadata: {error}")),
     }
     crate::session::atomic_write_secret(path, content)
-        .map_err(|error| format!("private file write {}: {error}", path.display()))
+        .map_err(|error| format!("checkpoint manifest write {}: {error}", path.display()))
 }
 
 fn canonical_git_metadata_roots(git_root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -1774,13 +1904,7 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
     let dir = checkpoints_manifest_dir(git_root);
     let manifest_path = dir.join("manifest.txt");
     let mut content = match std::fs::symlink_metadata(&manifest_path) {
-        Ok(metadata) if !safe_private_file_metadata(&metadata) => {
-            return Err(format!(
-                "checkpoint manifest is not a safe regular file: {}",
-                manifest_path.display()
-            ));
-        }
-        Ok(_) => read_private_file_with_limit(&manifest_path, Some(CHECKPOINT_MANIFEST_MAX_BYTES))
+        Ok(_) => read_checkpoint_file_with_limit(&manifest_path, CHECKPOINT_MANIFEST_MAX_BYTES)
             .map_err(|error| format!("manifest read: {error}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("checkpoint manifest metadata: {error}")),
@@ -1827,7 +1951,7 @@ fn append_manifest(git_root: &Path, cp: &Checkpoint) -> Result<(), String> {
             "checkpoint manifest exceeds the {CHECKPOINT_MANIFEST_MAX_BYTES}-byte runtime bound"
         ));
     }
-    write_private_file(&manifest_path, content.as_bytes())
+    write_checkpoint_manifest_file(&manifest_path, content.as_bytes())
         .map_err(|error| format!("manifest write: {error}"))
 }
 
@@ -1885,7 +2009,7 @@ fn write_checkpoint_manifest(
             "checkpoint manifest exceeds the {CHECKPOINT_MANIFEST_MAX_BYTES}-byte runtime bound"
         ));
     }
-    write_private_file(&manifest_path, content.as_bytes())
+    write_checkpoint_manifest_file(&manifest_path, content.as_bytes())
         .map_err(|error| format!("manifest write: {error}"))
 }
 
@@ -2073,19 +2197,11 @@ fn list_checkpoints_in_repo(
 ) -> Result<(Vec<Checkpoint>, Vec<String>), String> {
     let manifest_path = checkpoints_manifest_dir(git_root).join("manifest.txt");
     let content = match std::fs::symlink_metadata(&manifest_path) {
-        Ok(metadata) if !safe_private_file_metadata(&metadata) => {
-            return Err(format!(
-                "checkpoint manifest is not a safe regular file: {}",
-                manifest_path.display()
-            ));
-        }
-        Ok(_) => read_private_file_with_limit(
+        Ok(_) => read_checkpoint_file_with_limit(
             &manifest_path,
-            Some(
-                manifest_max_bytes
-                    .unwrap_or(CHECKPOINT_MANIFEST_MAX_BYTES)
-                    .min(CHECKPOINT_MANIFEST_MAX_BYTES),
-            ),
+            manifest_max_bytes
+                .unwrap_or(CHECKPOINT_MANIFEST_MAX_BYTES)
+                .min(CHECKPOINT_MANIFEST_MAX_BYTES),
         )
         .map_err(|error| format!("read checkpoint manifest: {error}"))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -2229,21 +2345,76 @@ fn list_checkpoints_in_repo(
     Ok((cps, retired_refs))
 }
 
-pub(crate) fn inspect_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
+pub(crate) fn inspect_checkpoint_storage_mode(root: &Path) -> Result<Option<String>, String> {
     let Some(git_root) = repo_root(root)? else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if !checkpoint_storage_exists(&git_root)? {
-        return Ok(Vec::new());
+        return Ok(None);
     }
-    let manifest = checkpoints_manifest_dir(&git_root).join("manifest.txt");
-    if let Ok(metadata) = std::fs::symlink_metadata(&manifest)
-        && metadata.len() > 256 * 1024
+    #[cfg(unix)]
     {
-        return Err("checkpoint manifest exceeds the doctor inspection bound".to_string());
+        use std::os::unix::fs::PermissionsExt as _;
+        for (name, label) in [
+            ("manifest.txt", "checkpoint manifest"),
+            ("operation.lock", "checkpoint operation lock"),
+        ] {
+            let path = checkpoints_manifest_dir(&git_root).join(name);
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("{label} metadata: {error}")),
+            };
+            checkpoint_private_file_integrity(&metadata, label, &path)?;
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Ok(Some(format!(
+                    "{label} has recoverable mode {mode:04o}, expected 0600; mutating tools auto-repair it, or run `dext checkpoint repair`"
+                )));
+            }
+        }
     }
-    list_checkpoints_in_repo(&git_root, limit, false, Some(256 * 1024))
-        .map(|(checkpoints, _)| checkpoints)
+    Ok(None)
+}
+
+#[derive(Debug)]
+pub(crate) enum CheckpointInspection {
+    Checkpoints(Vec<Checkpoint>),
+    ManifestTooLarge { bytes: u64, limit: u64 },
+}
+
+pub(crate) fn inspect_checkpoints(
+    root: &Path,
+    limit: usize,
+) -> Result<CheckpointInspection, String> {
+    let Some(git_root) = repo_root(root)? else {
+        return Ok(CheckpointInspection::Checkpoints(Vec::new()));
+    };
+    if !checkpoint_storage_exists(&git_root)? {
+        return Ok(CheckpointInspection::Checkpoints(Vec::new()));
+    }
+    const INSPECTION_MAX_BYTES: u64 = 256 * 1024;
+    let manifest = checkpoints_manifest_dir(&git_root).join("manifest.txt");
+    match std::fs::symlink_metadata(&manifest) {
+        Ok(metadata) => {
+            checkpoint_private_file_integrity(&metadata, "checkpoint manifest", &manifest)?;
+            if metadata.len() > CHECKPOINT_MANIFEST_MAX_BYTES {
+                return Err(format!(
+                    "checkpoint manifest exceeds the {CHECKPOINT_MANIFEST_MAX_BYTES}-byte runtime bound"
+                ));
+            }
+            if metadata.len() > INSPECTION_MAX_BYTES {
+                return Ok(CheckpointInspection::ManifestTooLarge {
+                    bytes: metadata.len(),
+                    limit: INSPECTION_MAX_BYTES,
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("checkpoint manifest metadata: {error}")),
+    }
+    list_checkpoints_in_repo(&git_root, limit, false, Some(INSPECTION_MAX_BYTES))
+        .map(|(checkpoints, _)| CheckpointInspection::Checkpoints(checkpoints))
 }
 
 pub(crate) fn list_checkpoints(root: &Path, limit: usize) -> Result<Vec<Checkpoint>, String> {
@@ -3710,7 +3881,9 @@ fn prune_orphan_sidecars(
             );
             continue;
         };
-        if matches!(id, BLOBS_DIR | "manifest.txt" | "operation.lock") {
+        if matches!(id, BLOBS_DIR | "manifest.txt" | "operation.lock")
+            || id.starts_with("manifest.txt.quarantine-")
+        {
             continue;
         }
         let path = entry.path();
@@ -3868,6 +4041,95 @@ pub(crate) fn prune(
         }
     }
     Ok(result)
+}
+
+pub(crate) fn repair(root: &Path) -> Result<String, String> {
+    let Some(git_root) = repo_root(root)? else {
+        return Ok("not a git repository, no checkpoint metadata to repair".to_string());
+    };
+    let _operation_lock = CheckpointOperationLock::acquire(&git_root)?;
+    ensure_checkpoint_git_exclude(&git_root)?;
+    let manifest = checkpoints_manifest_dir(&git_root).join("manifest.txt");
+    match std::fs::symlink_metadata(&manifest) {
+        Ok(metadata) => {
+            checkpoint_private_file_integrity(&metadata, "checkpoint manifest", &manifest)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_checkpoint_manifest_file(&manifest, b"")?;
+            return Ok(format!(
+                "initialized empty checkpoint manifest: {}",
+                manifest.display()
+            ));
+        }
+        Err(error) => return Err(format!("checkpoint manifest metadata: {error}")),
+    }
+
+    match list_checkpoints_in_repo(&git_root, usize::MAX, false, None) {
+        Ok(_) => {
+            return Ok(format!(
+                "checkpoint manifest is healthy: {}",
+                manifest.display()
+            ));
+        }
+        Err(error) if !repairable_manifest_validation_error(&error) => return Err(error),
+        Err(_) => {}
+    }
+
+    let quarantine = loop {
+        let candidate = checkpoints_manifest_dir(&git_root).join(format!(
+            "manifest.txt.quarantine-{}-{}",
+            now_ms(),
+            random_checkpoint_nonce()?
+        ));
+        match std::fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break candidate,
+            Ok(_) => continue,
+            Err(error) => return Err(format!("quarantine path metadata: {error}")),
+        }
+    };
+    std::fs::rename(&manifest, &quarantine).map_err(|error| {
+        format!(
+            "quarantine checkpoint manifest {} -> {}: {error}",
+            manifest.display(),
+            quarantine.display()
+        )
+    })?;
+    let quarantine_metadata = std::fs::symlink_metadata(&quarantine)
+        .map_err(|error| format!("quarantined checkpoint manifest metadata: {error}"))?;
+    checkpoint_private_file_integrity(
+        &quarantine_metadata,
+        "quarantined checkpoint manifest",
+        &quarantine,
+    )?;
+    if let Err(error) = write_checkpoint_manifest_file(&manifest, b"") {
+        let rollback = std::fs::rename(&quarantine, &manifest);
+        return Err(match rollback {
+            Ok(()) => format!("recreate empty checkpoint manifest: {error}"),
+            Err(rollback_error) => format!(
+                "recreate empty checkpoint manifest: {error}; original bytes remain at {} but rollback failed: {rollback_error}",
+                quarantine.display()
+            ),
+        });
+    }
+    Ok(format!(
+        "quarantined invalid checkpoint manifest to {}; recreated an empty private manifest. Existing checkpoint refs were preserved; run `dext undo --prune` when ready to remove orphan refs",
+        quarantine.display()
+    ))
+}
+
+pub(crate) fn repairable_manifest_validation_error(error: &str) -> bool {
+    [
+        "checkpoint manifest has an incomplete final line",
+        "invalid checkpoint manifest entry",
+        "duplicate checkpoint id in manifest",
+        "duplicate checkpoint ref in manifest",
+        "checkpoint ref no longer matches manifest OID",
+        "checkpoint manifest references a missing ref",
+        "checkpoint manifest is not valid UTF-8",
+        "checkpoint manifest exceeds the ",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
 }
 
 pub(crate) fn find_checkpoint(root: &Path, id_or_ref: &str) -> Result<Option<Checkpoint>, String> {

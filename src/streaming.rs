@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use crate::sse::{SseDecoder, SseFrame};
 
 const TOOL_ARGUMENT_BUFFER_CAP: usize = 256_000;
+const OPENAI_REASONING_BUFFER_CAP: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StreamUpdate {
@@ -62,6 +63,8 @@ struct AnthropicBlock {
 #[derive(Default)]
 struct OpenAiState {
     text: String,
+    reasoning: String,
+    capture_reasoning: bool,
     tool_calls: BTreeMap<usize, ToolCallParts>,
     stop_reason: Option<String>,
     usage: Usage,
@@ -110,6 +113,13 @@ impl ProviderStreamParser {
             }
         };
         Self { contract, state }
+    }
+
+    pub(crate) fn capture_openai_reasoning(mut self, enabled: bool) -> Self {
+        if let ProviderState::OpenAi(state) = &mut self.state {
+            state.capture_reasoning = enabled;
+        }
+        self
     }
 
     pub(crate) fn push_frame(&mut self, frame: SseFrame) -> Result<Vec<StreamUpdate>> {
@@ -796,6 +806,27 @@ fn parse_openai_frame(
                 .get("delta")
                 .ok_or_else(|| protocol_error(contract, "chunk", "missing choice.delta"))?;
             let delta = object(contract, "chunk", delta, "choice.delta")?;
+            if state.capture_reasoning
+                && let Some(reasoning) = delta.get("reasoning_content")
+                && !reasoning.is_null()
+            {
+                let reasoning = string(contract, "chunk", reasoning, "delta.reasoning_content")?;
+                if !reasoning.is_empty() {
+                    if state.reasoning.len().saturating_add(reasoning.len())
+                        > OPENAI_REASONING_BUFFER_CAP
+                    {
+                        return Err(protocol_error(
+                            contract,
+                            "chunk",
+                            &format!(
+                                "delta.reasoning_content exceeded {OPENAI_REASONING_BUFFER_CAP} bytes"
+                            ),
+                        ));
+                    }
+                    state.reasoning.push_str(reasoning);
+                    updates.push(StreamUpdate::ThinkingDelta(reasoning.to_string()));
+                }
+            }
             if let Some(content) = delta.get("content")
                 && !content.is_null()
             {
@@ -861,6 +892,12 @@ fn parse_openai_frame(
 
 fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<ParsedStream> {
     let mut blocks = Vec::new();
+    if !state.reasoning.is_empty() {
+        blocks.push(Block::Thinking {
+            text: state.reasoning,
+            signature: None,
+        });
+    }
     if !state.text.is_empty() {
         blocks.push(Block::Text { text: state.text });
     }
@@ -1890,6 +1927,96 @@ mod tests {
             .unwrap();
         let error = parser.finish().unwrap_err().to_string();
         assert!(error.contains("arguments must be a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn openai_local_reasoning_streams_and_preserves_thinking_before_output() {
+        let contract = RequestContract::OpenAiChatCompletions;
+        let mut parser = ProviderStreamParser::new(contract, false).capture_openai_reasoning(true);
+        let mut updates = Vec::new();
+        for data in [
+            r#"{"choices":[{"delta":{"reasoning_content":"plan "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"then act","content":"answer","tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":null},"finish_reason":null}]}"#,
+        ] {
+            updates.extend(
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(data.to_string()),
+                    })
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            updates,
+            [
+                StreamUpdate::ThinkingDelta("plan ".to_string()),
+                StreamUpdate::ThinkingDelta("then act".to_string()),
+                StreamUpdate::TextDelta("answer".to_string()),
+            ]
+        );
+
+        let parsed = parser.finish().unwrap();
+        assert_eq!(parsed.stop_reason.as_deref(), Some("tool_calls"));
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [
+                Block::Thinking { text, signature: None },
+                Block::Text { text: answer },
+                Block::ToolUse { id, name, input },
+            ] if text == "plan then act"
+                && answer == "answer"
+                && id == "call_1"
+                && name == "read_file"
+                && input == &serde_json::json!({"path": "README.md"})
+        ));
+    }
+
+    #[test]
+    fn openai_reasoning_content_is_local_opt_in_and_strict_when_enabled() {
+        let contract = RequestContract::OpenAiChatCompletions;
+        let frame = || {
+            SseFrame {
+            event: None,
+            data: Some(
+                r#"{"choices":[{"delta":{"reasoning_content":{"secret":"not leaked"}},"finish_reason":"stop"}]}"#
+                    .to_string(),
+            ),
+        }
+        };
+
+        let mut ordinary = ProviderStreamParser::new(contract, false);
+        assert!(ordinary.push_frame(frame()).unwrap().is_empty());
+        assert!(ordinary.finish().unwrap().blocks.is_empty());
+
+        let mut local = ProviderStreamParser::new(contract, false).capture_openai_reasoning(true);
+        let error = local.push_frame(frame()).unwrap_err().to_string();
+        assert!(
+            error.contains("delta.reasoning_content must be a string"),
+            "{error}"
+        );
+        assert!(!error.contains("secret"), "{error}");
+
+        let mut oversized =
+            ProviderStreamParser::new(contract, false).capture_openai_reasoning(true);
+        let frame = SseFrame {
+            event: None,
+            data: Some(
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {"reasoning_content": "x".repeat(OPENAI_REASONING_BUFFER_CAP + 1)},
+                        "finish_reason": "stop",
+                    }]
+                })
+                .to_string(),
+            ),
+        };
+        let error = oversized.push_frame(frame).unwrap_err().to_string();
+        assert!(
+            error.contains("delta.reasoning_content exceeded 4194304 bytes"),
+            "{error}"
+        );
     }
 
     #[test]

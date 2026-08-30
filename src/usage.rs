@@ -418,6 +418,9 @@ pub(crate) fn openai_pricing(model: &str) -> Option<UsagePricing> {
 }
 
 pub(crate) fn anthropic_pricing(model: &str) -> Option<UsagePricing> {
+    if model.trim_end_matches("[1m]") == "glm-5.3-flash" {
+        return Some(UsagePricing::new(0.15, 0.5, 0.03, 0.0));
+    }
     if model.starts_with("glm-") {
         return Some(UsagePricing::default());
     }
