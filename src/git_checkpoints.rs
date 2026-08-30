@@ -614,7 +614,7 @@ fn normalize_checkpoint_file_mode(path: &Path, label: &str) -> Result<bool, Stri
     #[cfg(not(unix))]
     {
         let _ = (path, label);
-        return Ok(false);
+        Ok(false)
     }
 
     #[cfg(unix)]

@@ -337,7 +337,7 @@ fn git_status_summary_parses_branch_tracking_and_dirty_state() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn git_stdout(root: &Path, args: &[&str]) -> String {
     let output = git_test_command(root).args(args).output().expect("run git");
     assert!(
