@@ -12245,6 +12245,362 @@ fn read_symbol_line_mode_returns_enclosing_block_without_extra_allocations() {
 }
 
 #[test]
+fn read_symbol_rust_ignores_literals_comments_and_fake_declarations() {
+    let root = temp_test_dir("read-symbol-rust-lexing");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("lib.rs"),
+        r####"fn target<'a>(value: &'a str) {
+    let _ = "} fn fake_string() {";
+    let _ = r###"} { fn fake_raw()"###;
+    let _ = r##"
+        } fn fake_multiline_raw() {
+    "##;
+    let _ = b"}";
+    let _ = br#"{"#;
+    let _ = c"}";
+    let _ = cr#"{"#;
+    let _ = '}';
+    'label: loop { break 'label; }
+    // } fn fake_line() {
+    /* { fn fake_block() {
+       nested /* } */
+    */ let value = 1;
+
+    println!("{value}: {value}");
+}
+fn tail() {}
+"####,
+    )
+    .expect("write source");
+
+    let out = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "target", "context": 0}),
+        &root,
+    )
+    .expect("literal and comment braces must be ignored");
+    assert!(out.contains("println!"), "{out}");
+    assert!(out.lines().any(|line| line.ends_with("\t}")), "{out}");
+    assert!(!out.contains("fn tail"), "{out}");
+
+    let err = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "fake_block", "context": 0}),
+        &root,
+    )
+    .expect_err("comment declaration must not match");
+    assert!(err.contains("not found"), "{err}");
+    assert!(!err.contains("fake_block @"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_rust_includes_outer_attachments_only() {
+    let root = temp_test_dir("read-symbol-rust-attachments");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("lib.rs"),
+        "//! module docs\n#![allow(dead_code)]\n/*! inner block docs */\nfn plain() {}\n\n/// attached docs\n// kept separator\n#[cfg(any(\n    feature = \"}\",\n    feature = \"x\",\n))]\n/** attached\n * block docs\n */\nfn attached() {\n    println!(\"ok\");\n}\n",
+    )
+    .expect("write source");
+
+    let plain = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "plain", "context": 0}),
+        &root,
+    )
+    .expect("plain symbol");
+    assert!(plain.starts_with("4\tfn plain"), "{plain}");
+    assert!(!plain.contains("module docs"), "{plain}");
+    assert!(!plain.contains("inner block docs"), "{plain}");
+
+    let attached = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "attached", "context": 0}),
+        &root,
+    )
+    .expect("attached symbol");
+    assert!(attached.starts_with("6\t/// attached docs"), "{attached}");
+    assert!(attached.contains("12\t/** attached"), "{attached}");
+    assert!(attached.contains("17\t}"), "{attached}");
+
+    let by_line = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "line": 9, "context": 0}),
+        &root,
+    )
+    .expect("attachment line mode");
+    assert!(by_line.starts_with("6\t/// attached docs"), "{by_line}");
+    assert!(by_line.contains("17\t}"), "{by_line}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_rust_disambiguates_direct_impl_members() {
+    let root = temp_test_dir("read-symbol-rust-qualified");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("lib.rs"),
+        "struct First;\nstruct Second<T>(T);\ntrait Build {\n    fn new() -> Self;\n}\n\nimpl First {\n    fn new() -> Self { Self }\n    fn nested() {\n        fn new() {}\n    }\n}\n\nimpl<T: Decoy> crate::Second<T>\nwhere\n    T: Clone,\n{\n    fn new(value: T) -> Self { Self(value) }\n}\n\nunsafe impl Build for First {\n    fn new() -> Self { Self }\n}\n",
+    )
+    .expect("write source");
+
+    let err = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "new", "context": 0}),
+        &root,
+    )
+    .expect_err("unqualified duplicate must be rejected");
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(err.contains("line 8"), "{err}");
+    assert!(err.contains("line 18"), "{err}");
+
+    let second = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "Second.new", "context": 0}),
+        &root,
+    )
+    .expect("generic impl target should resolve");
+    assert!(second.contains("18\t    fn new(value: T)"), "{second}");
+    assert!(!second.contains("fn nested"), "{second}");
+
+    let first = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "First::new", "context": 0}),
+        &root,
+    )
+    .expect_err("inherent and trait members remain ambiguous");
+    assert!(first.contains("<First as Build>::new"), "{first}");
+
+    let trait_member = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "<First as Build>::new", "context": 0}),
+        &root,
+    )
+    .expect("UFCS selector should resolve");
+    assert!(trait_member.contains("22\t    fn new()"), "{trait_member}");
+    assert!(!trait_member.contains("8\t"), "{trait_member}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_rust_handles_inline_items_and_qualified_paths() {
+    let root = temp_test_dir("read-symbol-rust-inline");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("lib.rs"),
+        "mod a { pub struct Thing; }\nmod b { pub struct Thing; }\nimpl a::Thing { fn new() -> Self { Self } }\nimpl b::Thing { fn new() -> Self { Self } }\nmod c { impl<T> Thing<T> { fn new() -> Self { loop {} } } pub struct Thing<T>(T); }\n\n#[cfg(any(\n    feature = \"[}]\",\n))] pub fn attributed<T: Into<Vec<u8>>>() {}\n#[allow(dead_code)] #[inline] fn multi() {}\npub fn generic<T>() -> usize where T: Copy { 0 }\npub\nasync unsafe fn split_qualifiers() {}\nextern \"C\" { fn foreign(); }\nextern\n\"C\"\n{\n    fn split_foreign();\n}\nstatic mut COUNT: usize = 0;\nfn r#type() {}\nfn arrow() -> impl Iterator<Item = usize> { [1].into_iter() }\nfn outer() { fn hidden() {} }\nconst BLOCK: usize = { 1 };\ntype Array = [u8; { 2 }];\nmacro_rules! items { () => { fn macro_hidden() {} } }\n",
+    )
+    .expect("write source");
+    let content = std::fs::read_to_string(root.join("lib.rs")).expect("read source");
+    let starts = source_line_starts(&content);
+    let index = RustSourceIndex::new(&content, &starts);
+    let names = index
+        .items
+        .iter()
+        .filter_map(|item| index.item_name(&content, item))
+        .collect::<Vec<_>>();
+    assert!(
+        names.contains(&"split_foreign"),
+        "{names:?} {:#?}",
+        index.items
+    );
+
+    let first = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "a::Thing::new", "context": 0}),
+        &root,
+    )
+    .expect("qualified path should select the first inline impl member");
+    assert!(first.contains("3\timpl a::Thing"), "{first}");
+    assert!(!first.contains("4\timpl b::Thing"), "{first}");
+
+    let second = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "b::Thing::new", "context": 0}),
+        &root,
+    )
+    .expect("qualified path should select the second inline impl member");
+    assert!(second.contains("4\timpl b::Thing"), "{second}");
+
+    let module_impl = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "c::Thing::new", "context": 0}),
+        &root,
+    )
+    .expect("module-local impl target should be qualified");
+    assert!(module_impl.contains("5\tmod c"), "{module_impl}");
+
+    for symbol in [
+        "attributed",
+        "multi",
+        "generic",
+        "split_qualifiers",
+        "foreign",
+        "split_foreign",
+        "COUNT",
+        "type",
+        "arrow",
+        "BLOCK",
+        "Array",
+    ] {
+        execute_tool(
+            "read_symbol",
+            &json!({"path": "lib.rs", "symbol": symbol, "context": 0}),
+            &root,
+        )
+        .unwrap_or_else(|error| panic!("{symbol} should resolve: {error}"));
+    }
+
+    for hidden_symbol in ["hidden", "macro_hidden"] {
+        let hidden = execute_tool(
+            "read_symbol",
+            &json!({"path": "lib.rs", "symbol": hidden_symbol, "context": 0}),
+            &root,
+        )
+        .unwrap_err();
+        assert!(hidden.contains("not found"), "{hidden}");
+    }
+
+    let invalid = execute_tool(
+        "read_symbol",
+        &json!({"path": "lib.rs", "symbol": "::new", "context": 0}),
+        &root,
+    )
+    .expect_err("empty qualified target must be rejected");
+    assert!(
+        invalid.contains("invalid Rust symbol selector"),
+        "{invalid}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_rust_handles_shebang_bom_relative_paths_and_bad_chars() {
+    let root = temp_test_dir("read-symbol-rust-edge-syntax");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("script.RS"),
+        "\u{feff}#!/usr/bin/env rust-script\nmod outer { struct Thing; mod inner { impl super::Thing { fn build() {} } } }\nfn escaped() { let _ = \"\\u{7d}\\\"}\"; }\n",
+    )
+    .expect("write edge syntax");
+
+    let build = execute_tool(
+        "read_symbol",
+        &json!({"path": "script.RS", "symbol": "outer::Thing::build", "context": 0}),
+        &root,
+    )
+    .expect("super-qualified target should resolve through a nested module");
+    assert!(build.contains("2\tmod outer"), "{build}");
+    execute_tool(
+        "read_symbol",
+        &json!({"path": "script.RS", "symbol": "escaped", "context": 0}),
+        &root,
+    )
+    .expect("BOM, shebang, Unicode escapes, and uppercase extension should scan");
+
+    std::fs::write(root.join("bad-char.rs"), "fn broken() { let _ = 'ab'; }\n")
+        .expect("write bad char");
+    let bad_char = execute_tool(
+        "read_symbol",
+        &json!({"path": "bad-char.rs", "symbol": "broken", "context": 0}),
+        &root,
+    )
+    .expect_err("malformed character literal must fail closed");
+    assert!(bad_char.contains("character literal"), "{bad_char}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_rust_indexes_its_own_source() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sources = rust_files_for_diagnostics(root);
+    assert!(!sources.is_empty());
+    for (path, content) in sources {
+        let starts = source_line_starts(&content);
+        let index = RustSourceIndex::new(&content, &starts);
+        assert_eq!(index.malformed, None, "{}", path.display());
+        if path.ends_with("main.rs") {
+            assert!(
+                index
+                    .symbol_window(&content, &starts, "RustSourceIndex::new", 0)
+                    .expect("self-source selector should be safe")
+                    .is_some()
+            );
+        }
+    }
+}
+
+#[test]
+fn read_symbol_rust_reports_incomplete_and_malformed_items() {
+    let root = temp_test_dir("read-symbol-rust-malformed");
+    let root = std::fs::canonicalize(root).expect("canonical temp dir");
+    std::fs::write(
+        root.join("incomplete.rs"),
+        "fn incomplete() {\n    let value = 1;\n",
+    )
+    .expect("write incomplete source");
+    let incomplete = execute_tool(
+        "read_symbol",
+        &json!({"path": "incomplete.rs", "symbol": "incomplete", "context": 0}),
+        &root,
+    )
+    .expect("missing final brace should return EOF window");
+    assert!(incomplete.contains("incomplete Rust item"), "{incomplete}");
+    let incomplete_by_line = execute_tool(
+        "read_symbol",
+        &json!({"path": "incomplete.rs", "line": 2, "context": 0}),
+        &root,
+    )
+    .expect("line mode should identify an incomplete item");
+    assert!(
+        incomplete_by_line.contains("incomplete Rust item"),
+        "{incomplete_by_line}"
+    );
+
+    std::fs::write(
+        root.join("malformed.rs"),
+        "fn malformed() {\n    let value = \"unterminated;\n}\n",
+    )
+    .expect("write malformed source");
+    let malformed = execute_tool(
+        "read_symbol",
+        &json!({"path": "malformed.rs", "symbol": "malformed", "context": 0}),
+        &root,
+    )
+    .expect_err("unterminated string must fail closed");
+    assert!(
+        malformed.contains("string starting at line 2"),
+        "{malformed}"
+    );
+
+    std::fs::write(root.join("stray.rs"), "fn target() {} */\n").expect("write stray close");
+    let stray = execute_tool(
+        "read_symbol",
+        &json!({"path": "stray.rs", "symbol": "target", "context": 0}),
+        &root,
+    )
+    .expect_err("stray block-comment terminator must fail closed");
+    assert!(stray.contains("block comment terminator"), "{stray}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_supports_func_and_visibility_qualifiers() {
+    for qualifier in ["public", "private", "protected"] {
+        let declaration = format!("{qualifier} func build() {{}}");
+        assert_eq!(declaration_candidate(&declaration), Some(("build", "func")));
+    }
+}
+
+#[test]
 fn read_symbol_not_found_suggests_nearby_symbols() {
     let root = temp_test_dir("read-symbol-suggestions");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
@@ -12285,6 +12641,8 @@ fn read_symbol_requires_exactly_one_selector() {
     for input in [
         json!({"path": "lib.rs", "line": 0}),
         json!({"path": "lib.rs", "line": "12"}),
+        json!({"path": "lib.rs", "symbol": "target\nnext"}),
+        json!({"path": "lib.rs", "symbol": "x".repeat(READ_SYMBOL_SELECTOR_MAX_BYTES + 1)}),
         json!({"path": "lib.rs", "symbol": 12}),
         json!({"path": "lib.rs", "line": 12, "context": 51}),
     ] {
@@ -26729,8 +27087,8 @@ fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
         .find(|tool| tool.name == "read_symbol")
         .expect("read_symbol tool");
     let wired = tools::wire_tools(&[read_symbol], ToolProfile::Lean);
-    assert!(wired[0].description.contains("enclosing line block"));
-    assert!(wired[0].description.contains("exclusive"));
+    assert!(wired[0].description.contains("enclosing block"));
+    assert!(wired[0].description.contains("Rust selectors disambiguate"));
 
     let write_file = provider_tool_definitions()
         .into_iter()

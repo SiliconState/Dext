@@ -97,12 +97,18 @@ const FRUGAL_TEXT_TOOL_CAPTURE_CAP: usize = 6_000;
 const READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 16_000;
 const FRUGAL_READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 10_000;
 const READ_SYMBOL_INPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const READ_SYMBOL_SELECTOR_MAX_BYTES: usize = 1024;
+const READ_SYMBOL_LINE_MAX: usize = 1_000_000;
 pub(crate) const PROMPT_CONTEXT_FILE_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const TODO_STATE_MAX_BYTES: usize = 256 * 1024;
 const PROCESS_STREAM_CAPTURE_CAP: usize = 6_000;
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const LIVE_OUTPUT_EVENT_QUEUE_CAP: usize = 256;
 const READ_SYMBOL_SUGGESTION_LIMIT: usize = 5;
+const FUZZY_SYMBOL_MAX_BYTES: usize = 256;
+const RUST_SCAN_TOKEN_MAX: usize = 262_144;
+const RUST_ITEM_MAX: usize = 16_384;
+const RUST_IMPL_HEADER_MAX_BYTES: usize = 64 * 1024;
 const CARGO_DIAGNOSTIC_SUMMARY_LIMIT: usize = 20;
 const LSP_DIAGNOSTIC_FILE_LIMIT: usize = 64;
 const LSP_DIAGNOSTIC_DIRECTORY_LIMIT: usize = 1_024;
@@ -7173,13 +7179,16 @@ fn keyword_rest<'a>(trimmed: &'a str, keyword: &str) -> Option<&'a str> {
 fn strip_decl_qualifiers(mut text: &str) -> &str {
     loop {
         let trimmed = text.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("pub ") {
-            text = rest;
-        } else if let Some(rest) = trimmed.strip_prefix("export ") {
+        if let Some(rest) = ["pub ", "public ", "private ", "protected ", "export "]
+            .into_iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
+        {
             text = rest;
         } else if let Some(rest) = trimmed.strip_prefix("default ") {
             text = rest;
         } else if let Some(rest) = trimmed.strip_prefix("async ") {
+            text = rest;
+        } else if let Some(rest) = trimmed.strip_prefix("auto ") {
             text = rest;
         } else if let Some(rest) = trimmed.strip_prefix("unsafe ") {
             text = rest;
@@ -7204,68 +7213,48 @@ fn strip_decl_qualifiers(mut text: &str) -> &str {
     }
 }
 
+fn declaration_candidate(line: &str) -> Option<(&str, &'static str)> {
+    let trimmed = strip_decl_qualifiers(line);
+    if let Some(rest) = keyword_rest(trimmed, "const") {
+        return keyword_rest(strip_decl_qualifiers(rest), "fn")
+            .and_then(identifier_prefix)
+            .map(|name| (name, "fn"))
+            .or_else(|| identifier_prefix(rest).map(|name| (name, "const")));
+    }
+    if let Some(rest) = keyword_rest(trimmed, "static") {
+        return identifier_prefix(keyword_rest(rest, "mut").unwrap_or(rest))
+            .map(|name| (name, "static"));
+    }
+    for (keyword, kind) in [
+        ("fn", "fn"),
+        ("struct", "struct"),
+        ("enum", "enum"),
+        ("union", "union"),
+        ("trait", "trait"),
+        ("type", "type"),
+        ("mod", "mod"),
+        ("class", "class"),
+        ("def", "def"),
+        ("func", "func"),
+        ("function", "function"),
+        ("interface", "interface"),
+    ] {
+        if let Some(name) = keyword_rest(trimmed, keyword).and_then(identifier_prefix) {
+            return Some((name, kind));
+        }
+    }
+    None
+}
+
 fn item_signature_line_match(line: &str) -> bool {
     let trimmed = strip_decl_qualifiers(line);
-    if keyword_rest(trimmed, "const")
-        .and_then(|rest| keyword_rest(rest, "fn"))
-        .is_some()
-    {
-        return true;
-    }
-    [
-        "fn",
-        "struct",
-        "enum",
-        "trait",
-        "impl",
-        "type",
-        "mod",
-        "class",
-        "def",
-        "function",
-        "interface",
-    ]
-    .iter()
-    .any(|keyword| keyword_rest(trimmed, keyword).is_some())
+    declaration_candidate(trimmed).is_some() || keyword_rest(trimmed, "impl").is_some()
 }
 
 fn symbol_line_match(line: &str, symbol: &str) -> bool {
     let trimmed = strip_decl_qualifiers(line);
-    for keyword in [
-        "fn",
-        "struct",
-        "enum",
-        "trait",
-        "type",
-        "mod",
-        "class",
-        "def",
-        "function",
-        "interface",
-    ] {
-        if let Some(rest) = keyword_rest(trimmed, keyword)
-            && symbol_token_at_start(rest, symbol)
-        {
-            return true;
-        }
-    }
-    if let Some(rest) = keyword_rest(trimmed, "impl")
-        && contains_symbol_token(rest, symbol)
-    {
-        return true;
-    }
-    if let Some(rest) = keyword_rest(trimmed, "const") {
-        if symbol_token_at_start(rest, symbol) {
-            return true;
-        }
-        if let Some(fn_rest) = keyword_rest(rest, "fn") {
-            return symbol_token_at_start(fn_rest, symbol);
-        }
-    }
-    if let Some(rest) = keyword_rest(trimmed, "static") {
-        return symbol_token_at_start(rest, symbol);
-    }
-    false
+    declaration_candidate(trimmed).is_some_and(|(name, _)| symbol_token_at_start(name, symbol))
+        || keyword_rest(trimmed, "impl").is_some_and(|rest| contains_symbol_token(rest, symbol))
 }
 
 fn source_line_starts(content: &str) -> Vec<usize> {
@@ -7278,6 +7267,9 @@ fn source_line_starts(content: &str) -> Vec<usize> {
     for (idx, byte) in bytes.iter().enumerate() {
         if *byte == b'\n' && idx + 1 < bytes.len() {
             starts.push(idx + 1);
+            if starts.len() > READ_SYMBOL_LINE_MAX {
+                break;
+            }
         }
     }
     starts
@@ -7289,6 +7281,1318 @@ fn source_line_at<'a>(content: &'a str, starts: &[usize], idx: usize) -> Option<
     let line = &content[start..end];
     let line = line.strip_suffix('\n').unwrap_or(line);
     Some(line.strip_suffix('\r').unwrap_or(line))
+}
+
+fn rust_escape_end(line: &str, slash: usize) -> usize {
+    let bytes = line.as_bytes();
+    let next = slash + 1;
+    match bytes.get(next) {
+        Some(b'x') => (next + 3).min(bytes.len()),
+        Some(b'u') if bytes.get(next + 1) == Some(&b'{') => bytes[next + 2..]
+            .iter()
+            .position(|byte| *byte == b'}')
+            .map_or(bytes.len(), |end| next + end + 3),
+        Some(_) => line
+            .get(next..)
+            .and_then(|text| text.chars().next())
+            .map_or(next, |ch| next + ch.len_utf8()),
+        None => next,
+    }
+}
+
+#[derive(Default)]
+struct RustScan {
+    block_depth: usize,
+    block_line: usize,
+    string: bool,
+    string_line: usize,
+    raw_hashes: Option<usize>,
+    raw_match: usize,
+    malformed: Option<(usize, &'static str)>,
+}
+
+impl RustScan {
+    fn line(
+        &mut self,
+        line: &str,
+        line_idx: usize,
+        code: &mut Vec<u8>,
+        tokens: &mut Vec<(u8, usize)>,
+    ) {
+        code.clear();
+        code.extend_from_slice(line.as_bytes());
+        tokens.clear();
+        let bytes = line.as_bytes();
+        if self.raw_hashes.is_some() {
+            self.raw_match = 0;
+        }
+        let mut i = 0;
+        while i < bytes.len() {
+            if self.block_depth > 0 {
+                code[i] = b' ';
+                if bytes[i..].starts_with(b"/*") {
+                    if i + 1 < code.len() {
+                        code[i + 1] = b' ';
+                    }
+                    self.block_depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    if i + 1 < code.len() {
+                        code[i + 1] = b' ';
+                    }
+                    self.block_depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if let Some(hashes) = self.raw_hashes {
+                code[i] = b' ';
+                if bytes[i] == b'"' {
+                    if hashes == 0 {
+                        self.raw_hashes = None;
+                    } else {
+                        self.raw_match = 1;
+                    }
+                } else if self.raw_match > 0 && bytes[i] == b'#' {
+                    self.raw_match += 1;
+                    if self.raw_match == hashes + 1 {
+                        self.raw_hashes = None;
+                        self.raw_match = 0;
+                    }
+                } else {
+                    self.raw_match = 0;
+                }
+                i += 1;
+                continue;
+            }
+            if self.string {
+                code[i] = b' ';
+                if bytes[i] == b'\\' {
+                    let end = rust_escape_end(line, i);
+                    code[i..end].fill(b' ');
+                    i = end;
+                } else {
+                    if bytes[i] == b'"' {
+                        self.string = false;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i..].starts_with(b"*/") {
+                code[i..i + 2].fill(b' ');
+                self.malformed
+                    .get_or_insert((line_idx, "block comment terminator"));
+                i += 2;
+                continue;
+            }
+            if bytes[i..].starts_with(b"//") {
+                code[i..].fill(b' ');
+                break;
+            }
+            if bytes[i..].starts_with(b"/*") {
+                code[i..i + 2].fill(b' ');
+                self.block_depth = 1;
+                self.block_line = line_idx;
+                i += 2;
+                continue;
+            }
+            if let Some((end, hashes)) = rust_raw_string_start(line, i) {
+                code[i..end].fill(b' ');
+                if hashes > 255 {
+                    self.malformed
+                        .get_or_insert((line_idx, "raw string delimiter"));
+                }
+                self.raw_hashes = Some(hashes);
+                self.raw_match = 0;
+                self.string_line = line_idx;
+                i = end;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                code[i] = b' ';
+                self.string = true;
+                self.string_line = line_idx;
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'\'' {
+                if rust_lifetime_at(line, i) {
+                    i += 1;
+                    continue;
+                }
+                if let Some(end) = rust_char_literal_end(line, i) {
+                    code[i..end].fill(b' ');
+                    i = end;
+                    continue;
+                }
+                self.malformed
+                    .get_or_insert((line_idx, "character literal"));
+                code[i..].fill(b' ');
+                break;
+            }
+            if matches!(
+                bytes[i],
+                b'{' | b'}' | b'(' | b')' | b'[' | b']' | b'<' | b'>' | b';'
+            ) {
+                if tokens.len() == RUST_SCAN_TOKEN_MAX {
+                    self.malformed.get_or_insert((line_idx, "delimiter count"));
+                } else if tokens.len() < RUST_SCAN_TOKEN_MAX {
+                    tokens.push((bytes[i], i));
+                }
+            }
+            i += 1;
+        }
+    }
+
+    fn unfinished(&self) -> Option<(usize, &'static str)> {
+        if self.malformed.is_some() {
+            self.malformed
+        } else if self.block_depth > 0 {
+            Some((self.block_line, "block comment"))
+        } else if self.raw_hashes.is_some() {
+            Some((self.string_line, "raw string"))
+        } else if self.string {
+            Some((self.string_line, "string"))
+        } else {
+            None
+        }
+    }
+}
+
+fn rust_raw_string_start(line: &str, i: usize) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let r = match bytes.get(i..) {
+        Some([b'r', ..]) => i,
+        Some([b'b' | b'c', b'r', ..]) => i + 1,
+        _ => return None,
+    };
+    if line
+        .get(..i)
+        .and_then(|text| text.chars().next_back())
+        .is_some_and(is_ident_continue)
+    {
+        return None;
+    }
+    let mut quote = r + 1;
+    while bytes.get(quote) == Some(&b'#') {
+        quote += 1;
+    }
+    (bytes.get(quote) == Some(&b'"')).then_some((quote + 1, quote - r - 1))
+}
+
+fn rust_lifetime_at(line: &str, quote: usize) -> bool {
+    let Some(rest) = line.get(quote + 1..) else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '_' && !first.is_alphabetic() {
+        return false;
+    }
+    chars.find(|ch| !is_ident_continue(*ch)) != Some('\'')
+}
+
+fn rust_char_literal_end(line: &str, quote: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = quote + 1;
+    if bytes.get(i) == Some(&b'\\') {
+        i += 1;
+        match bytes.get(i)? {
+            b'x' => i += 3,
+            b'u' if bytes.get(i + 1) == Some(&b'{') => {
+                i += 2;
+                while bytes.get(i).is_some_and(|byte| *byte != b'}') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    } else {
+        let ch = line.get(i..)?.chars().next()?;
+        i += ch.len_utf8();
+    }
+    (bytes.get(i) == Some(&b'\'')).then_some(i + 1)
+}
+
+fn strip_rust_attributes(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim_start();
+        if !trimmed.starts_with("#[") && !trimmed.starts_with("#![") {
+            return trimmed;
+        }
+        let mut depth = 0usize;
+        let mut end = None;
+        for (idx, byte) in trimmed.bytes().enumerate().skip(1) {
+            match byte {
+                b'[' => depth += 1,
+                b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(idx + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            return trimmed;
+        };
+        text = &trimmed[end..];
+    }
+}
+
+fn rust_declaration_prefix_only(text: &str) -> bool {
+    let trimmed = strip_rust_attributes(text).trim();
+    if trimmed.starts_with("pub(") && trimmed.ends_with(')') {
+        return true;
+    }
+    !trimmed.is_empty()
+        && trimmed.split_whitespace().all(|part| {
+            matches!(
+                part,
+                "pub"
+                    | "public"
+                    | "private"
+                    | "protected"
+                    | "export"
+                    | "default"
+                    | "async"
+                    | "auto"
+                    | "unsafe"
+                    | "extern"
+                    | "const"
+            ) || part.starts_with("pub(") && part.ends_with(')')
+                || part.starts_with('"') && part.ends_with('"')
+        })
+}
+
+fn push_rust_impl_header(header: &mut String, part: &str) -> bool {
+    let separator = usize::from(!header.is_empty() && !part.is_empty());
+    if header
+        .len()
+        .saturating_add(separator)
+        .saturating_add(part.len())
+        > RUST_IMPL_HEADER_MAX_BYTES
+    {
+        return false;
+    }
+    if separator > 0 {
+        header.push(' ');
+    }
+    header.push_str(part);
+    true
+}
+
+#[derive(Debug)]
+struct RustItem {
+    name: Option<std::ops::Range<usize>>,
+    kind: &'static str,
+    line: usize,
+    start: usize,
+    end: usize,
+    depth: usize,
+    delimiter_depth: usize,
+    container: Option<usize>,
+    target: Option<String>,
+    trait_name: Option<String>,
+    complete: bool,
+}
+
+type RustPending = (usize, usize, usize, usize, Option<String>);
+
+struct RustItemStart<'a> {
+    code: &'a str,
+    line: usize,
+    at: usize,
+    start: usize,
+    brace_depth: usize,
+    delimiter_depth: usize,
+    container: Option<usize>,
+}
+
+fn start_rust_item(
+    content: &str,
+    starts: &[usize],
+    start: RustItemStart<'_>,
+    items: &mut Vec<RustItem>,
+    known_targets: &mut HashSet<String>,
+) -> Option<RustPending> {
+    let RustItemStart {
+        code,
+        line,
+        at,
+        start,
+        brace_depth,
+        delimiter_depth,
+        container,
+    } = start;
+    let declaration = &code[at..];
+    let raw = strip_rust_attributes(declaration);
+    let trimmed = strip_decl_qualifiers(raw);
+    let item = keyword_rest(trimmed, "const")
+        .map(strip_decl_qualifiers)
+        .filter(|rest| {
+            keyword_rest(rest, "impl").is_some() || keyword_rest(rest, "trait").is_some()
+        })
+        .unwrap_or(trimmed);
+    let candidate = declaration_candidate(item);
+    let is_impl = keyword_rest(item, "impl").is_some();
+    let is_extern = trimmed.starts_with('{')
+        && raw
+            .split_once('{')
+            .map_or(raw, |(header, _)| header)
+            .split_whitespace()
+            .any(|word| word == "extern");
+    if candidate.is_none() && !is_impl && !is_extern {
+        return None;
+    }
+
+    let (name, kind) = candidate.map_or(
+        (None, if is_impl { "impl" } else { "extern" }),
+        |(name, kind)| {
+            let offset = name.as_ptr() as usize - code.as_ptr() as usize;
+            let start = starts[line] + offset;
+            (Some(start..start + name.len()), kind)
+        },
+    );
+    let named_target = matches!(kind, "struct" | "enum" | "union" | "trait" | "type" | "mod")
+        .then(|| {
+            let name = name
+                .as_ref()
+                .and_then(|range| normalize_rust_path(&content[range.clone()]))?;
+            let parent = container
+                .and_then(|idx| items.get(idx))
+                .and_then(|item| item.target.as_deref());
+            let target = parent.map_or(name.clone(), |parent| format!("{parent}::{name}"));
+            (target.len() <= READ_SYMBOL_SELECTOR_MAX_BYTES).then_some(target)
+        })
+        .flatten();
+    let item_idx = items.len();
+    let addressable = container.map_or(brace_depth == 0 && delimiter_depth == 0, |idx| {
+        items.get(idx).is_some_and(|parent| {
+            brace_depth == parent.depth + 1
+                && delimiter_depth == parent.delimiter_depth + 1
+                && matches!(parent.kind, "impl" | "trait" | "mod" | "extern")
+        })
+    });
+    if !addressable {
+        return None;
+    }
+    if let Some(target) = named_target.as_ref() {
+        known_targets.insert(target.clone());
+    }
+    let target = matches!(kind, "trait" | "mod")
+        .then(|| named_target)
+        .flatten();
+    items.push(RustItem {
+        name,
+        kind,
+        line,
+        start,
+        end: starts.len().saturating_sub(1),
+        depth: brace_depth,
+        delimiter_depth,
+        container,
+        target,
+        trait_name: None,
+        complete: false,
+    });
+    Some((
+        item_idx,
+        delimiter_depth,
+        0,
+        trimmed.as_ptr() as usize - code.as_ptr() as usize,
+        (kind == "impl").then(String::new),
+    ))
+}
+
+fn rust_position_before(
+    tokens: &[(u8, usize)],
+    at: usize,
+    delimiters: &[(u8, usize, Option<usize>)],
+    mut brace_depth: usize,
+) -> (usize, usize, Option<usize>) {
+    let mut remaining = delimiters.len();
+    let mut extra = 0usize;
+    for (token, _) in tokens.iter().take_while(|(_, token_at)| *token_at < at) {
+        match token {
+            b'{' | b'(' | b'[' => {
+                extra += 1;
+                brace_depth += usize::from(*token == b'{');
+            }
+            b'}' | b')' | b']' => {
+                if extra > 0 {
+                    extra -= 1;
+                } else {
+                    remaining = remaining.saturating_sub(1);
+                }
+                brace_depth = brace_depth.saturating_sub(usize::from(*token == b'}'));
+            }
+            _ => {}
+        }
+    }
+    (
+        remaining + extra,
+        brace_depth,
+        delimiters[..remaining]
+            .iter()
+            .rev()
+            .find_map(|(_, _, item)| *item),
+    )
+}
+
+fn rust_angle_open_at(code: &str, at: usize) -> bool {
+    let bytes = code.as_bytes();
+    !matches!(bytes.get(at.wrapping_sub(1)), None | Some(b'<' | b'='))
+        && !matches!(bytes.get(at + 1), None | Some(b'<' | b'='))
+}
+
+fn rust_item_has_brace_body(kind: &str) -> bool {
+    !matches!(kind, "const" | "static" | "type")
+}
+
+fn qualify_rust_target(
+    items: &[RustItem],
+    item_idx: usize,
+    known_targets: &HashSet<String>,
+    target: String,
+) -> String {
+    let module = items[item_idx]
+        .container
+        .and_then(|idx| items.get(idx))
+        .filter(|item| item.kind == "mod")
+        .and_then(|item| item.target.as_deref());
+    if let Some(module) = module {
+        if let Some(rest) = target.strip_prefix("self::") {
+            return format!("{module}::{rest}");
+        }
+        if target.starts_with("super::") {
+            let mut parent = module;
+            let mut rest = target.as_str();
+            while let Some(next) = rest.strip_prefix("super::") {
+                rest = next;
+                parent = parent.rsplit_once("::").map_or("", |(parent, _)| parent);
+            }
+            return if parent.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{parent}::{rest}")
+            };
+        }
+    }
+    if target.contains("::") || target.starts_with('<') || target == "Self" {
+        return target;
+    }
+    let Some(module) = module else {
+        return target;
+    };
+    let candidate = format!("{module}::{target}");
+    if candidate.len() > READ_SYMBOL_SELECTOR_MAX_BYTES {
+        return target;
+    }
+    let base = candidate
+        .find('<')
+        .map_or(candidate.as_str(), |generic| &candidate[..generic]);
+    if known_targets.contains(&candidate) || known_targets.contains(base) {
+        candidate
+    } else {
+        target
+    }
+}
+
+struct RustSourceIndex {
+    items: Vec<RustItem>,
+    malformed: Option<(usize, &'static str)>,
+}
+
+impl RustSourceIndex {
+    fn new(content: &str, starts: &[usize]) -> Self {
+        let mut scan = RustScan::default();
+        let mut code = Vec::new();
+        let mut tokens = Vec::new();
+        let mut items: Vec<RustItem> = Vec::new();
+        let mut known_targets = HashSet::new();
+        let mut delimiters: Vec<(u8, usize, Option<usize>)> = Vec::new();
+        let mut pending: Option<(usize, usize, usize, usize, Option<String>)> = None;
+        let mut brace_depth = 0usize;
+        let mut current_item = None;
+        let mut prefix_start = None;
+        let mut prefix_extern = false;
+        let mut attachment_start = None;
+        let mut attribute_depth = 0usize;
+        let mut outer_block_doc = false;
+        let mut malformed = None;
+
+        for line_idx in 0..starts.len() {
+            let line = source_line_at(content, starts, line_idx).unwrap_or("");
+            let visible = if line_idx == 0 {
+                line.strip_prefix('\u{feff}').unwrap_or(line)
+            } else {
+                line
+            };
+            if line_idx == 0 && visible.starts_with("#!") && !visible.starts_with("#![") {
+                continue;
+            }
+            let original = visible.trim_start();
+            let line_starts_in_code =
+                scan.block_depth == 0 && scan.raw_hashes.is_none() && !scan.string;
+            let continuing_attribute = attribute_depth > 0;
+            let continuing_attachment = continuing_attribute || outer_block_doc;
+            let rust_attribute =
+                line_starts_in_code && (original.starts_with("#[") || original.starts_with("#!["));
+            let outer_attribute = rust_attribute && !original.starts_with("#![");
+            let outer_doc = line_starts_in_code
+                && ((original.starts_with("///") && !original.starts_with("////"))
+                    || (original.starts_with("/**")
+                        && !original.starts_with("/***")
+                        && !original.starts_with("/*!")));
+            let inner_attachment = line_starts_in_code
+                && (original.starts_with("#![")
+                    || original.starts_with("//!")
+                    || original.starts_with("/*!"));
+            if inner_attachment {
+                attachment_start = None;
+            } else if attachment_start.is_none() && (outer_attribute || outer_doc) {
+                attachment_start = Some(line_idx);
+            }
+            scan.line(line, line_idx, &mut code, &mut tokens);
+            let mut attribute_end = None;
+            if continuing_attribute || rust_attribute {
+                for (token, token_at) in tokens.iter().copied() {
+                    match token {
+                        b'[' => attribute_depth += 1,
+                        b']' => {
+                            attribute_depth = attribute_depth.saturating_sub(1);
+                            if attribute_depth == 0 {
+                                let rest = code[token_at + 1..].trim_ascii_start();
+                                if !rest.starts_with(b"#[") {
+                                    attribute_end = Some(token_at + 1);
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            outer_block_doc = (outer_block_doc
+                || (line_starts_in_code
+                    && original.starts_with("/**")
+                    && !original.starts_with("/***")
+                    && !original.starts_with("/*!")))
+                && scan.block_depth > 0;
+            let code = std::str::from_utf8(&code).expect("source remains UTF-8");
+            let declaration_text = attribute_end.map_or_else(
+                || {
+                    if line_idx == 0 {
+                        code.strip_prefix('\u{feff}').unwrap_or(code)
+                    } else {
+                        code
+                    }
+                },
+                |end| &code[end..],
+            );
+            if pending.is_none() {
+                let declaration_at = declaration_text.as_ptr() as usize - code.as_ptr() as usize;
+                let (delimiter_depth, declaration_brace_depth, container) =
+                    rust_position_before(&tokens, declaration_at, &delimiters, brace_depth);
+                let item = if items.len() > RUST_ITEM_MAX {
+                    None
+                } else if prefix_extern && declaration_text.trim_start().starts_with('{') {
+                    start_rust_item(
+                        content,
+                        starts,
+                        RustItemStart {
+                            code: "extern {",
+                            line: line_idx,
+                            at: 0,
+                            start: prefix_start.unwrap_or(line_idx),
+                            brace_depth: declaration_brace_depth,
+                            delimiter_depth,
+                            container,
+                        },
+                        &mut items,
+                        &mut known_targets,
+                    )
+                    .map(|(item, depth, angle, _, header)| {
+                        (item, depth, angle, declaration_at, header)
+                    })
+                } else {
+                    start_rust_item(
+                        content,
+                        starts,
+                        RustItemStart {
+                            code,
+                            line: line_idx,
+                            at: declaration_at,
+                            start: attachment_start
+                                .iter()
+                                .chain(prefix_start.iter())
+                                .copied()
+                                .min()
+                                .unwrap_or(line_idx),
+                            brace_depth: declaration_brace_depth,
+                            delimiter_depth,
+                            container,
+                        },
+                        &mut items,
+                        &mut known_targets,
+                    )
+                };
+                if let Some(item) = item {
+                    attachment_start = None;
+                    prefix_start = None;
+                    prefix_extern = false;
+                    pending = Some(item);
+                } else {
+                    if rust_declaration_prefix_only(declaration_text) {
+                        prefix_start.get_or_insert(line_idx);
+                        prefix_extern |= declaration_text
+                            .split_whitespace()
+                            .any(|part| part == "extern");
+                    } else if !declaration_text.trim().is_empty()
+                        && !continuing_attachment
+                        && !outer_attribute
+                        && !outer_doc
+                    {
+                        prefix_start = None;
+                        prefix_extern = false;
+                    }
+                    if attachment_start.is_some()
+                        && (inner_attachment
+                            || (!continuing_attachment
+                                && !outer_attribute
+                                && !outer_doc
+                                && !declaration_text.trim().is_empty()
+                                && prefix_start.is_none()))
+                    {
+                        attachment_start = None;
+                    }
+                }
+            }
+
+            for (token, token_at) in tokens.iter().copied() {
+                if let Some((item_idx, depth, angle_depth, declaration_at, _)) = pending.as_mut()
+                    && token_at
+                        >= if items[*item_idx].line == line_idx {
+                            *declaration_at
+                        } else {
+                            0
+                        }
+                    && *depth == delimiters.len()
+                {
+                    match token {
+                        b'<' if rust_item_has_brace_body(items[*item_idx].kind)
+                            && rust_angle_open_at(code, token_at) =>
+                        {
+                            *angle_depth += 1;
+                        }
+                        b'>' if rust_item_has_brace_body(items[*item_idx].kind)
+                            && code.as_bytes().get(token_at.wrapping_sub(1)) != Some(&b'-') =>
+                        {
+                            *angle_depth = angle_depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                }
+                match token {
+                    b'{' | b'(' | b'[' => {
+                        if delimiters.len() == RUST_SCAN_TOKEN_MAX {
+                            malformed.get_or_insert((line_idx, "delimiter count"));
+                            continue;
+                        }
+                        let item = pending
+                            .as_ref()
+                            .filter(|(item_idx, depth, angle_depth, declaration_at, _)| {
+                                token_at
+                                    >= if items[*item_idx].line == line_idx {
+                                        *declaration_at
+                                    } else {
+                                        0
+                                    }
+                                    && *depth == delimiters.len()
+                                    && *angle_depth == 0
+                                    && token == b'{'
+                                    && rust_item_has_brace_body(items[*item_idx].kind)
+                            })
+                            .map(|(item, _, _, _, _)| *item);
+                        delimiters.push((token, line_idx, item));
+                        brace_depth += usize::from(token == b'{');
+                        if let Some(item_idx) = item {
+                            if items[item_idx].kind == "impl" {
+                                if let Some((_, _, _, declaration_at, Some(header))) =
+                                    pending.as_mut()
+                                {
+                                    let start = if items[item_idx].line == line_idx {
+                                        *declaration_at
+                                    } else {
+                                        0
+                                    };
+                                    if !push_rust_impl_header(header, code[start..=token_at].trim())
+                                    {
+                                        malformed.get_or_insert((line_idx, "impl header"));
+                                    }
+                                }
+                                if let Some((target, trait_name)) =
+                                    pending.as_ref().and_then(|(_, _, _, _, header)| {
+                                        parse_impl_targets(header.as_ref()?)
+                                    })
+                                {
+                                    items[item_idx].target = Some(target);
+                                    items[item_idx].trait_name = trait_name;
+                                }
+                            }
+                            current_item = Some(item_idx);
+                            pending = None;
+                        }
+                    }
+                    b'}' | b')' | b']' => {
+                        let expected = match token {
+                            b'}' => b'{',
+                            b')' => b'(',
+                            _ => b'[',
+                        };
+                        if delimiters
+                            .last()
+                            .is_none_or(|(open, _, _)| *open != expected)
+                        {
+                            malformed.get_or_insert((line_idx, "closing delimiter"));
+                            continue;
+                        }
+                        let (_, _, item) = delimiters.pop().expect("checked delimiter");
+                        brace_depth = brace_depth.saturating_sub(usize::from(token == b'}'));
+                        if let Some(item_idx) = item {
+                            items[item_idx].end = line_idx;
+                            items[item_idx].complete = true;
+                            current_item = items[item_idx].container;
+                        }
+                    }
+                    b';' => {
+                        if let Some((item_idx, depth, angle_depth, declaration_at, _)) =
+                            pending.as_ref()
+                            && token_at
+                                >= if items[*item_idx].line == line_idx {
+                                    *declaration_at
+                                } else {
+                                    0
+                                }
+                            && *depth == delimiters.len()
+                        {
+                            if *angle_depth > 0 {
+                                malformed.get_or_insert((line_idx, "generic delimiter"));
+                            }
+                            items[*item_idx].end = line_idx;
+                            items[*item_idx].complete = true;
+                            pending = None;
+                        }
+                    }
+                    _ => {}
+                }
+                if pending.is_none()
+                    && matches!(token, b'{' | b'}' | b';')
+                    && token_at + 1 < code.len()
+                {
+                    let raw_suffix = line[token_at + 1..].trim_start();
+                    let suffix = code[token_at + 1..].trim_ascii_start();
+                    if raw_suffix.starts_with("#[") {
+                        let mut depth = 0usize;
+                        for (delimiter, _) in tokens.iter().skip_while(|(_, at)| *at < token_at + 1)
+                        {
+                            match delimiter {
+                                b'[' => depth += 1,
+                                b']' => depth = depth.saturating_sub(1),
+                                _ => {}
+                            }
+                        }
+                        if depth > 0 {
+                            attribute_depth = depth;
+                            attachment_start.get_or_insert(line_idx);
+                            continue;
+                        }
+                    }
+                    if raw_suffix.starts_with("///") && !raw_suffix.starts_with("////") {
+                        attachment_start.get_or_insert(line_idx);
+                        continue;
+                    }
+                    if raw_suffix.starts_with("/**")
+                        && !raw_suffix.starts_with("/***")
+                        && !raw_suffix.starts_with("/*!")
+                        && scan.block_depth > 0
+                    {
+                        outer_block_doc = true;
+                        attachment_start.get_or_insert(line_idx);
+                        continue;
+                    }
+                    if !suffix
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| *byte == b'#' || byte.is_ascii_alphabetic())
+                    {
+                        continue;
+                    }
+                    let at = suffix.as_ptr() as usize - code.as_ptr() as usize;
+                    let item = if items.len() > RUST_ITEM_MAX {
+                        None
+                    } else {
+                        start_rust_item(
+                            content,
+                            starts,
+                            RustItemStart {
+                                code,
+                                line: line_idx,
+                                at,
+                                start: line_idx,
+                                brace_depth,
+                                delimiter_depth: delimiters.len(),
+                                container: current_item,
+                            },
+                            &mut items,
+                            &mut known_targets,
+                        )
+                    };
+                    pending = item;
+                }
+            }
+            if let Some((item_idx, _, _, declaration_at, Some(header))) = pending.as_mut() {
+                let start = if items[*item_idx].line == line_idx {
+                    *declaration_at
+                } else {
+                    0
+                };
+                let part = code[start..].trim();
+                if !push_rust_impl_header(header, part) {
+                    malformed.get_or_insert((line_idx, "impl header"));
+                }
+            }
+        }
+        if items.len() > RUST_ITEM_MAX {
+            malformed.get_or_insert((items[RUST_ITEM_MAX].line, "item count"));
+        }
+        for item_idx in 0..items.len() {
+            if items[item_idx].kind != "impl" {
+                continue;
+            }
+            if let Some(target) = items[item_idx].target.take() {
+                items[item_idx].target = Some(qualify_rust_target(
+                    &items,
+                    item_idx,
+                    &known_targets,
+                    target,
+                ));
+            }
+            if let Some(trait_name) = items[item_idx].trait_name.take() {
+                items[item_idx].trait_name = Some(qualify_rust_target(
+                    &items,
+                    item_idx,
+                    &known_targets,
+                    trait_name,
+                ));
+            }
+        }
+        if malformed.is_none()
+            && let Some((item_idx, _, angle_depth, _, _)) = pending.as_ref()
+            && *angle_depth > 0
+        {
+            malformed = Some((items[*item_idx].line, "generic delimiter"));
+        }
+        malformed = malformed.or_else(|| scan.unfinished());
+        if malformed.is_none() {
+            let mut inside_item = pending.is_some();
+            for (open, line, item) in &delimiters {
+                if *open != b'{' || item.is_none() && !inside_item {
+                    malformed = Some((*line, "opening delimiter"));
+                    break;
+                }
+                inside_item |= item.is_some();
+            }
+        }
+        Self { items, malformed }
+    }
+
+    fn malformed_error(&self, selector: &str) -> Option<String> {
+        self.malformed.map(|(line, kind)| {
+            format!(
+                "cannot safely resolve {selector}: unterminated or mismatched {kind} starting at line {}; use rg or repair the source",
+                line + 1
+            )
+        })
+    }
+
+    fn item_name<'a>(&self, content: &'a str, item: &RustItem) -> Option<&'a str> {
+        item.name
+            .as_ref()
+            .map(|range| &content[range.clone()])
+            .map(|name| name.strip_prefix("r#").unwrap_or(name))
+    }
+
+    fn line_window(
+        &self,
+        target: usize,
+        context: usize,
+        line_count: usize,
+    ) -> std::result::Result<Option<(usize, usize, bool)>, String> {
+        if let Some(error) = self.malformed_error(&format!("line {}", target + 1)) {
+            return Err(error);
+        }
+        let item = self
+            .items
+            .iter()
+            .filter(|item| {
+                (item.line <= target && target <= item.end)
+                    || (item.start <= target && target < item.line)
+            })
+            .max_by_key(|item| item.depth);
+        Ok(item.map(|item| {
+            (
+                item.start.saturating_sub(context),
+                item.end
+                    .saturating_add(context)
+                    .min(line_count.saturating_sub(1)),
+                !item.complete,
+            )
+        }))
+    }
+
+    fn symbol_window(
+        &self,
+        content: &str,
+        starts: &[usize],
+        symbol: &str,
+        context: usize,
+    ) -> std::result::Result<Option<(usize, usize, bool)>, String> {
+        use std::fmt::Write as _;
+
+        let explicit_impl = symbol.strip_prefix("impl ").and_then(normalize_rust_path);
+        let (container, trait_name, name) = parse_rust_selector(symbol);
+        if let Some(error) = self.malformed_error(&format!("symbol '{symbol}'")) {
+            return Err(error);
+        }
+        let named_match = explicit_impl.is_none()
+            && self
+                .items
+                .iter()
+                .any(|item| self.item_name(content, item) == Some(name));
+        let mut matches = self
+            .items
+            .iter()
+            .filter(|item| {
+                explicit_impl.as_deref().is_some_and(|target| {
+                    item.kind == "impl"
+                        && item
+                            .target
+                            .as_deref()
+                            .is_some_and(|indexed| rust_target_matches(indexed, target))
+                }) || (explicit_impl.is_none()
+                    && (self.item_name(content, item) == Some(name)
+                        || (!named_match
+                            && container.is_none()
+                            && item.kind == "impl"
+                            && item
+                                .target
+                                .as_deref()
+                                .is_some_and(|target| rust_target_matches(target, name)))))
+            })
+            .filter(|item| {
+                let Some(container) = container.as_deref() else {
+                    return true;
+                };
+                if explicit_impl.is_some() {
+                    return true;
+                }
+                let Some(parent) = item.container.and_then(|idx| self.items.get(idx)) else {
+                    return false;
+                };
+                item.depth == parent.depth + 1
+                    && parent
+                        .target
+                        .as_deref()
+                        .is_some_and(|target| rust_target_matches(target, container))
+                    && trait_name.as_deref().is_none_or(|name| {
+                        parent
+                            .trait_name
+                            .as_deref()
+                            .is_some_and(|trait_name| rust_target_matches(trait_name, name))
+                    })
+            });
+        let Some(item) = matches.next() else {
+            if name.is_empty()
+                || container.as_deref() == Some("")
+                || trait_name.as_deref() == Some("")
+            {
+                return Err(format!(
+                    "invalid Rust symbol selector '{symbol}'; use name, Type::name, Type.name, or <Type as Trait>::name"
+                ));
+            }
+            return Ok(None);
+        };
+        if let Some(second) = matches.next() {
+            let mut message = format!("symbol '{symbol}' is ambiguous; candidates:\n");
+            for item in [item, second]
+                .into_iter()
+                .chain(matches)
+                .take(READ_SYMBOL_SUGGESTION_LIMIT)
+            {
+                let _ = writeln!(
+                    message,
+                    "- {} at line {} — {}",
+                    self.qualified_name(content, item),
+                    item.line + 1,
+                    summarize_inline(
+                        source_line_at(content, starts, item.line).unwrap_or(""),
+                        100
+                    )
+                );
+            }
+            return Err(message);
+        }
+        Ok(Some((
+            item.start.saturating_sub(context),
+            item.end
+                .saturating_add(context)
+                .min(starts.len().saturating_sub(1)),
+            !item.complete,
+        )))
+    }
+
+    fn qualified_name(&self, content: &str, item: &RustItem) -> String {
+        if item.kind == "impl" {
+            return match (item.target.as_deref(), item.trait_name.as_deref()) {
+                (Some(target), Some(trait_name)) => format!("<{target} as {trait_name}>"),
+                (Some(target), None) => format!("impl {target}"),
+                _ => "impl ?".to_string(),
+            };
+        }
+        let name = self.item_name(content, item).unwrap_or("?");
+        let Some(parent) = item.container.and_then(|idx| self.items.get(idx)) else {
+            return name.to_string();
+        };
+        match (parent.target.as_deref(), parent.trait_name.as_deref()) {
+            (Some(target), Some(trait_name)) => format!("<{target} as {trait_name}>::{name}"),
+            (Some(target), None) => format!("{target}::{name}"),
+            _ => name.to_string(),
+        }
+    }
+}
+
+fn rust_selector_name(name: &str) -> &str {
+    let name = name.trim();
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+fn parse_rust_selector(symbol: &str) -> (Option<String>, Option<String>, &str) {
+    if let Some(selector) = symbol.strip_prefix('<')
+        && let Some((qualification, name)) = selector.rsplit_once(">::")
+        && let Some((target, trait_name)) = qualification.split_once(" as ")
+    {
+        return (
+            Some(normalize_rust_path(target).unwrap_or_default()),
+            Some(normalize_rust_path(trait_name).unwrap_or_default()),
+            rust_selector_name(name),
+        );
+    }
+    let path = symbol.rfind("::").map(|at| (at, 2));
+    let dot = symbol.rfind('.').map(|at| (at, 1));
+    if let Some((at, separator_len)) = match (path, dot) {
+        (Some(path), Some(dot)) => Some(path.max(dot)),
+        (path, dot) => path.or(dot),
+    } {
+        let (target, name) = symbol.split_at(at);
+        return (
+            Some(normalize_rust_path(target).unwrap_or_default()),
+            None,
+            rust_selector_name(&name[separator_len..]),
+        );
+    }
+    (None, None, rust_selector_name(symbol))
+}
+
+fn parse_impl_targets(header: &str) -> Option<(String, Option<String>)> {
+    let header = header.trim_start();
+    let rest = keyword_rest(header, "const").unwrap_or(header);
+    let rest = keyword_rest(strip_decl_qualifiers(rest), "impl")?;
+    let rest = strip_leading_generics(rest).trim_start();
+    let body = top_level_token(rest, "{").unwrap_or(rest.len());
+    let rest = &rest[..body];
+    let where_at = top_level_token(rest, "where").unwrap_or(rest.len());
+    let clause = rest[..where_at].trim();
+    let mut search = 0usize;
+    let mut for_at = None;
+    while let Some(at) = top_level_token(&clause[search..], "for") {
+        for_at = Some(search + at);
+        search += at + 3;
+    }
+    let (trait_name, target) = if let Some(for_at) = for_at {
+        let trait_text = clause[..for_at]
+            .trim()
+            .trim_start_matches("const ")
+            .trim_start_matches(['!', '?']);
+        (normalize_rust_path(trait_text), &clause[for_at + 3..])
+    } else {
+        (None, clause)
+    };
+    Some((normalize_rust_path(target)?, trait_name))
+}
+
+fn strip_leading_generics(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return text;
+    }
+    let (mut angle, mut round, mut square, mut curly) = (0usize, 0usize, 0usize, 0usize);
+    for (idx, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'<' if round == 0 && square == 0 && curly == 0 => angle += 1,
+            b'>' if round == 0 && square == 0 && curly == 0 && bytes[idx - 1] != b'-' => {
+                angle = angle.saturating_sub(1);
+                if angle == 0 {
+                    let rest = &text[idx + 1..];
+                    return if rest.trim_start().starts_with("::") {
+                        text
+                    } else {
+                        rest
+                    };
+                }
+            }
+            b'(' => round += 1,
+            b')' => round = round.saturating_sub(1),
+            b'[' => square += 1,
+            b']' => square = square.saturating_sub(1),
+            b'{' => curly += 1,
+            b'}' => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+    }
+    text
+}
+
+fn rust_keyword_at(text: &str, at: usize, keyword: &str) -> bool {
+    let end = at + keyword.len();
+    if text.as_bytes().get(at.saturating_sub(2)..at) == Some(b"r#") {
+        return false;
+    }
+    text[..at]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !is_ident_continue(ch))
+        && text[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_ident_continue(ch))
+}
+
+fn top_level_token(text: &str, needle: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let needle = needle.as_bytes();
+    let (mut angle, mut round, mut square, mut curly) = (0usize, 0usize, 0usize, 0usize);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if angle == 0
+            && round == 0
+            && square == 0
+            && curly == 0
+            && bytes[i..].starts_with(needle)
+            && (needle == b"{"
+                || !needle[0].is_ascii_alphabetic()
+                || rust_keyword_at(text, i, std::str::from_utf8(needle).ok()?))
+        {
+            return Some(i);
+        }
+        match bytes[i] {
+            b'<' if round == 0 && square == 0 && curly == 0 => angle += 1,
+            b'>' if round == 0 && square == 0 && curly == 0 && (i == 0 || bytes[i - 1] != b'-') => {
+                angle = angle.saturating_sub(1);
+            }
+            b'(' => round += 1,
+            b')' => round = round.saturating_sub(1),
+            b'[' => square += 1,
+            b']' => square = square.saturating_sub(1),
+            b'{' => curly += 1,
+            b'}' => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn canonical_rust_target(target: &str) -> &str {
+    target
+        .strip_prefix("crate::")
+        .or_else(|| target.strip_prefix("self::"))
+        .or_else(|| target.strip_prefix("::"))
+        .unwrap_or(target)
+}
+
+fn rust_target_matches(indexed: &str, selector: &str) -> bool {
+    let indexed = canonical_rust_target(indexed);
+    let selector = canonical_rust_target(selector);
+    let matches = |target: &str| {
+        target == selector
+            || (!selector.contains("::")
+                && target
+                    .strip_suffix(selector)
+                    .is_some_and(|prefix| prefix.ends_with("::")))
+    };
+    matches(indexed)
+        || (!selector.contains('<')
+            && indexed
+                .find('<')
+                .is_some_and(|generics| matches(&indexed[..generics])))
+}
+
+fn normalize_rust_path(text: &str) -> Option<String> {
+    let path = text.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    let (mut angle, mut round, mut square, mut curly, mut segment) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' if round == 0 && square == 0 && curly == 0 => angle += 1,
+            b'>' if round == 0 && square == 0 && curly == 0 && (i == 0 || bytes[i - 1] != b'-') => {
+                angle = angle.saturating_sub(1);
+            }
+            b':' if angle == 0
+                && round == 0
+                && square == 0
+                && curly == 0
+                && bytes.get(i + 1) == Some(&b':') =>
+            {
+                segment = i + 2;
+                i += 1;
+            }
+            b'(' => round += 1,
+            b')' => round = round.saturating_sub(1),
+            b'[' => square += 1,
+            b']' => square = square.saturating_sub(1),
+            b'{' => curly += 1,
+            b'}' => curly = curly.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    let segment = path[segment..].trim();
+    let ident = identifier_prefix(segment)?;
+    let rest = segment[ident.len()..].trim_start();
+    if !rest.is_empty() && !rest.starts_with('<') && !rest.starts_with('(') {
+        return None;
+    }
+    let compact = path
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .replace("r#", "");
+    (!compact.is_empty() && compact.len() <= READ_SYMBOL_SELECTOR_MAX_BYTES).then_some(compact)
 }
 
 fn normalized_path_text(path: &Path) -> String {
@@ -7344,49 +8648,6 @@ fn identifier_prefix(text: &str) -> Option<&str> {
     (end > 0).then(|| &trimmed[..end])
 }
 
-fn symbol_candidates_for_line(line: &str) -> Vec<(String, &'static str)> {
-    let trimmed = strip_decl_qualifiers(line);
-    let mut out = Vec::new();
-    if let Some(rest) = keyword_rest(trimmed, "const") {
-        if let Some(fn_rest) = keyword_rest(rest, "fn") {
-            if let Some(name) = identifier_prefix(fn_rest) {
-                out.push((name.to_string(), "fn"));
-            }
-            return out;
-        }
-        if let Some(name) = identifier_prefix(rest) {
-            out.push((name.to_string(), "const"));
-        }
-        return out;
-    }
-    if let Some(rest) = keyword_rest(trimmed, "static") {
-        if let Some(name) = identifier_prefix(rest) {
-            out.push((name.to_string(), "static"));
-        }
-        return out;
-    }
-    for (keyword, kind) in [
-        ("fn", "fn"),
-        ("struct", "struct"),
-        ("enum", "enum"),
-        ("trait", "trait"),
-        ("type", "type"),
-        ("mod", "mod"),
-        ("class", "class"),
-        ("def", "def"),
-        ("function", "function"),
-        ("interface", "interface"),
-    ] {
-        if let Some(rest) = keyword_rest(trimmed, keyword) {
-            if let Some(name) = identifier_prefix(rest) {
-                out.push((name.to_string(), kind));
-            }
-            return out;
-        }
-    }
-    out
-}
-
 #[derive(Debug)]
 struct SymbolSuggestion {
     name: String,
@@ -7422,8 +8683,13 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 }
 
 fn fuzzy_symbol_score(query: &str, candidate: &str) -> Option<usize> {
-    let query = query.trim().to_ascii_lowercase();
-    let candidate = candidate.trim().to_ascii_lowercase();
+    let query = query.trim();
+    let candidate = candidate.trim();
+    if query.len() > FUZZY_SYMBOL_MAX_BYTES || candidate.len() > FUZZY_SYMBOL_MAX_BYTES {
+        return (query == candidate).then_some(0);
+    }
+    let query = query.to_ascii_lowercase();
+    let candidate = candidate.to_ascii_lowercase();
     if query.is_empty() || candidate.is_empty() {
         return None;
     }
@@ -7461,22 +8727,51 @@ fn render_symbol_not_found_suggestions(
     content: &str,
     starts: &[usize],
     symbol: &str,
+    rust_index: Option<&RustSourceIndex>,
 ) -> Option<String> {
     use std::fmt::Write as _;
 
     let display = display_path_relative(path, root);
     let mut suggestions = Vec::new();
-    for idx in 0..starts.len() {
-        let line = source_line_at(content, starts, idx)?;
-        for (name, kind) in symbol_candidates_for_line(line) {
-            if let Some(score) = fuzzy_symbol_score(symbol, &name) {
-                suggestions.push(SymbolSuggestion {
-                    name,
-                    kind,
-                    line: idx + 1,
-                    preview: summarize_inline(line.trim(), 100),
-                    score,
+    let query = rust_index
+        .map(|_| parse_rust_selector(symbol).2)
+        .unwrap_or(symbol);
+    let mut add = |name: &str, kind, line, preview: &str| {
+        if let Some(score) = fuzzy_symbol_score(query, name) {
+            suggestions.push(SymbolSuggestion {
+                name: name.to_string(),
+                kind,
+                line: line + 1,
+                preview: summarize_inline(preview.trim(), 100),
+                score,
+            });
+            if suggestions.len() > READ_SYMBOL_SUGGESTION_LIMIT * 4 {
+                suggestions.sort_by(|a, b| {
+                    a.score
+                        .cmp(&b.score)
+                        .then_with(|| a.line.cmp(&b.line))
+                        .then_with(|| a.name.cmp(&b.name))
                 });
+                suggestions.truncate(READ_SYMBOL_SUGGESTION_LIMIT * 2);
+            }
+        }
+    };
+    if let Some(index) = rust_index {
+        for item in &index.items {
+            if let Some(name) = index.item_name(content, item) {
+                add(
+                    name,
+                    item.kind,
+                    item.line,
+                    source_line_at(content, starts, item.line).unwrap_or(""),
+                );
+            }
+        }
+    } else {
+        for idx in 0..starts.len() {
+            let line = source_line_at(content, starts, idx)?;
+            if let Some((name, kind)) = declaration_candidate(line) {
+                add(name, kind, idx, line);
             }
         }
     }
@@ -7986,6 +9281,14 @@ fn execute_tool_with_cache_for_context(
                 .as_str()
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
+            if symbol.is_some_and(|symbol| symbol.chars().any(char::is_control)) {
+                return Err("symbol must not contain control characters".to_string());
+            }
+            if symbol.is_some_and(|symbol| symbol.len() > READ_SYMBOL_SELECTOR_MAX_BYTES) {
+                return Err(format!(
+                    "symbol exceeds the {READ_SYMBOL_SELECTOR_MAX_BYTES} byte limit"
+                ));
+            }
             let line_no = match input["line"].as_u64() {
                 Some(value) => Some(
                     usize::try_from(value)
@@ -8021,26 +9324,72 @@ fn execute_tool_with_cache_for_context(
                 }
             })?;
             let starts = source_line_starts(&content);
+            if starts.len() > READ_SYMBOL_LINE_MAX {
+                return Err(format!(
+                    "{} exceeds the {READ_SYMBOL_LINE_MAX} line limit",
+                    path.display()
+                ));
+            }
             if starts.is_empty() {
                 return Err(format!("{} is empty", path.display()));
             }
+            let rust_index = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                .then(|| RustSourceIndex::new(&content, &starts));
+            let mut incomplete = false;
             let (start, end) = if let Some(line_no) = line_no {
-                let Some(window) = find_line_window(&content, &starts, line_no, context) else {
+                if line_no > starts.len() {
                     return Err(format!(
                         "line {line_no} is outside {} ({} lines)",
                         path.display(),
                         starts.len()
                     ));
-                };
-                window
+                }
+                if let Some(index) = rust_index.as_ref() {
+                    if let Some((start, end, item_incomplete)) =
+                        index.line_window(line_no - 1, context, starts.len())?
+                    {
+                        incomplete = item_incomplete;
+                        (start, end)
+                    } else {
+                        let (start, end) = paragraph_line_window(&content, &starts, line_no - 1);
+                        (
+                            start.saturating_sub(context),
+                            end.saturating_add(context)
+                                .min(starts.len().saturating_sub(1)),
+                        )
+                    }
+                } else {
+                    find_line_window(&content, &starts, line_no, context)
+                        .expect("line range checked")
+                }
             } else {
                 let symbol = symbol.expect("selector count checked");
-                let Some(window) = find_symbol_window(&content, &starts, symbol, context) else {
+                let window = if let Some(index) = rust_index.as_ref() {
+                    match index.symbol_window(&content, &starts, symbol, context)? {
+                        Some((start, end, item_incomplete)) => {
+                            incomplete = item_incomplete;
+                            Some((start, end))
+                        }
+                        None => None,
+                    }
+                } else {
+                    find_symbol_window(&content, &starts, symbol, context)
+                };
+                let Some(window) = window else {
                     let hint = tool_policy::tool_input_advisory("read_symbol", input)
                         .unwrap_or_else(|| format!("Search first with rg -n '{symbol}' {}, then retry read_symbol with an exact symbol or line.", path.display()));
-                    let suggestions =
-                        render_symbol_not_found_suggestions(&path, root, &content, &starts, symbol)
-                            .unwrap_or_default();
+                    let suggestions = render_symbol_not_found_suggestions(
+                        &path,
+                        root,
+                        &content,
+                        &starts,
+                        symbol,
+                        rust_index.as_ref(),
+                    )
+                    .unwrap_or_default();
                     return Err(format!(
                         "symbol '{symbol}' not found in {}\n{suggestions}{hint}",
                         path.display()
@@ -8048,13 +9397,17 @@ fn execute_tool_with_cache_for_context(
                 };
                 window
             };
-            Ok(render_line_window(
+            let mut rendered = render_line_window(
                 &content,
                 &starts,
                 start,
                 end,
                 READ_FILE_EXPLICIT_CAPTURE_CAP,
-            ))
+            );
+            if incomplete {
+                rendered.push_str("\n[incomplete Rust item: terminator not found before EOF]\n");
+            }
+            Ok(rendered)
         }
         "write_file" => {
             let prepared = prepared_mutation

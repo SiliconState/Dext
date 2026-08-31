@@ -87,12 +87,12 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "read_symbol",
-            description: "Read a source symbol by name, or the enclosing block around a 1-indexed line number. Returns a line-numbered block plus context. May inspect absolute paths outside the sandbox read-only; writes remain confined. Source input is capped at 8 MiB and observes cancellation while loading. Lightweight fast text/range heuristic; use rg first for exact symbols or line hits.",
+            description: "Read a source symbol by name, or the enclosing block around a 1-indexed line number. Rust lookup uses one delimiter-aware lexical pass, includes outer attributes/docs, rejects ambiguous unqualified names with line candidates, and accepts Type::name, Type.name, or <Type as Trait>::name. Returns a line-numbered block plus context. May inspect absolute paths outside the sandbox read-only; writes remain confined. Source input is capped at 8 MiB/1M lines, symbol selectors at 1 KiB, and loading observes cancellation; non-Rust languages use a lightweight text/range heuristic.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Absolute or relative source file path"},
-                    "symbol": {"type": "string", "description": "Function/type/impl/constant name to locate. Mutually exclusive with line."},
+                    "symbol": {"type": "string", "description": "Unique function/type/impl/constant name to locate (max 1 KiB); Rust also accepts Type::name, Type.name, and <Type as Trait>::name. Mutually exclusive with line."},
                     "line": {"type": "integer", "minimum": 1, "description": "1-indexed line number; returns the enclosing block or paragraph. Mutually exclusive with symbol."},
                     "context": {"type": "integer", "minimum": 0, "maximum": 50, "description": "lines of context before/after the block (default 5, max 50)"}
                 },
@@ -441,7 +441,7 @@ fn lean_description(name: &str, fallback: &str) -> String {
     match name {
         "read_file" => "Read capped line-numbered file window; absolute paths read-only.",
         "read_symbol" => {
-            "Read symbol/enclosing line block; selectors exclusive; absolute paths read-only."
+            "Read symbol/enclosing block; Rust selectors disambiguate; absolute paths read-only."
         }
         "write_file" => "Create/overwrite file.",
         "edit_file" => "Replace one unique exact string.",
