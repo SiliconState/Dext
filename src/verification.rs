@@ -7,6 +7,8 @@ use std::path::{Component, Path, PathBuf};
 const FINGERPRINT_PATH_MAX: usize = 4096;
 const FINGERPRINT_TOTAL_BYTES_MAX: u64 = 128 * 1024 * 1024;
 
+pub(crate) const EVIDENCE_VERSION: u32 = 1;
+
 pub(crate) const REQUIRED_GATES: &[&str] = &[
     "fmt",
     "clippy",
@@ -21,6 +23,7 @@ pub(crate) const REQUIRED_GATES: &[&str] = &[
 pub(crate) struct CommandSpec {
     pub(crate) key: String,
     pub(crate) scopes: Vec<&'static str>,
+    working_directory: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -86,6 +89,8 @@ impl CodeLoopState {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub(crate) struct VerificationRecord {
+    pub(crate) evidence_version: u32,
+    pub(crate) gate_eligible: bool,
     pub(crate) name: String,
     pub(crate) command: String,
     pub(crate) command_key: String,
@@ -107,6 +112,16 @@ impl CommandSpec {
     pub(crate) fn is_install(&self) -> bool {
         self.scopes.contains(&"install")
     }
+
+    pub(crate) fn effective_directory(&self, root: &Path) -> Option<PathBuf> {
+        let candidate = match self.working_directory.as_deref() {
+            Some(path) if path.is_absolute() => path.to_path_buf(),
+            Some(path) => root.join(path),
+            None => root.to_path_buf(),
+        };
+        let canonical = std::fs::canonicalize(candidate).ok()?;
+        canonical.is_dir().then_some(canonical)
+    }
 }
 
 pub(crate) fn classify(command: &str) -> Option<CommandSpec> {
@@ -121,73 +136,120 @@ pub(crate) fn classify(command: &str) -> Option<CommandSpec> {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>();
-    if lines.len() > 1 {
-        let setup = lines[0].split("&&").map(str::trim).collect::<Vec<_>>();
-        if setup.last().copied() != Some("set -euo pipefail")
-            || setup[..setup.len().saturating_sub(1)]
-                .iter()
-                .any(|segment| !is_cd_segment(segment))
-        {
-            return None;
+    let multiline = lines.len() > 1;
+    if multiline && !valid_multiline_setup(lines[0]) {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    for line in lines {
+        for segment in line.split("&&") {
+            let segment = segment.trim();
+            if segment.is_empty() || segment.contains('&') {
+                return None;
+            }
+            segments.push(segment);
         }
     }
 
-    let normalized = command.replace('\n', " && ");
+    let mut index = 0usize;
+    let mut working_directory = None;
+    if let Some(segment) = segments.first()
+        && let Some(path) = cd_path(segment)
+    {
+        working_directory = Some(PathBuf::from(path));
+        index += 1;
+    }
+    let fail_fast = segments.get(index).copied() == Some("set -euo pipefail");
+    if fail_fast {
+        index += 1;
+    } else if multiline {
+        return None;
+    }
+
     let mut commands = Vec::new();
     let mut scopes = Vec::new();
-    for segment in normalized.split("&&") {
-        if segment.contains('&') {
-            return None;
-        }
+    for segment in &segments[index..] {
         let words = segment.split_whitespace().collect::<Vec<_>>();
-        if words.is_empty() || words[0] == "#" {
-            continue;
-        }
-        if words[0] == "set" {
-            if words.as_slice() != ["set", "-euo", "pipefail"] {
-                return None;
-            }
-            continue;
-        }
-        if words[0] == "cd" {
-            if !is_cd_segment(segment) {
-                return None;
-            }
-            continue;
-        }
         let scope = verification_scope(&words)?;
         if !scopes.contains(&scope) {
             scopes.push(scope);
         }
-        commands.push(words.join(" ").to_ascii_lowercase());
+        commands.push(words.join(" "));
     }
-    (!commands.is_empty()).then(|| CommandSpec {
-        key: commands.join(" && "),
+    if commands.is_empty() {
+        return None;
+    }
+    if scopes.contains(&"install") && commands.len() != 1 {
+        return None;
+    }
+    let key = working_directory
+        .as_ref()
+        .map(|path| format!("cd {} && ", path.display()))
+        .unwrap_or_default()
+        + &commands.join(" && ");
+    Some(CommandSpec {
+        key,
         scopes,
+        working_directory,
     })
 }
 
-fn is_cd_segment(segment: &str) -> bool {
+fn valid_multiline_setup(first_line: &str) -> bool {
+    let setup = first_line.split("&&").map(str::trim).collect::<Vec<_>>();
+    match setup.as_slice() {
+        ["set -euo pipefail"] => true,
+        [cd, "set -euo pipefail"] => cd_path(cd).is_some(),
+        _ => false,
+    }
+}
+
+fn cd_path(segment: &str) -> Option<&str> {
     let words = segment.split_whitespace().collect::<Vec<_>>();
-    words.len() == 2 && words[0] == "cd"
+    let ["cd", path] = words.as_slice() else {
+        return None;
+    };
+    (!path.is_empty()
+        && *path != "-"
+        && !path
+            .chars()
+            .any(|ch| matches!(ch, '~' | '*' | '?' | '[' | ']' | '{' | '}' | '!')))
+    .then_some(*path)
 }
 
 fn verification_scope(words: &[&str]) -> Option<&'static str> {
+    if words.iter().any(|word| {
+        matches!(
+            *word,
+            "-h" | "--help" | "-V" | "--version" | "--list" | "--no-run"
+        )
+    }) {
+        return None;
+    }
     match words {
-        ["cargo", "fmt", rest @ ..] if rest.contains(&"--check") => Some("fmt"),
-        ["cargo", "clippy", ..] => Some("clippy"),
-        ["cargo", "audit", ..] => Some("audit"),
-        ["cargo", "deny", "check", ..] => Some("deny"),
-        ["cargo", "test", rest @ ..]
-            if rest.windows(2).any(|pair| pair == ["-p", "ratatui-core"]) =>
-        {
-            Some("ratatui")
-        }
-        ["cargo", "build", rest @ ..] if rest.contains(&"--release") => Some("build-release"),
-        ["cargo", "test", rest @ ..] if rest.contains(&"--release") => Some("test-release"),
+        ["cargo", "fmt", "--all", "--", "--check"] => Some("fmt"),
+        [
+            "cargo",
+            "clippy",
+            "-p",
+            "dext",
+            "--all-targets",
+            "--all-features",
+            "--locked",
+            "--no-deps",
+            "--",
+            "-D",
+            "warnings",
+        ] => Some("clippy"),
+        ["cargo", "audit", "--deny", "warnings"] => Some("audit"),
+        ["cargo", "deny", "check", "licenses"] => Some("deny"),
+        ["cargo", "test", "-p", "ratatui-core", "--lib", "--locked"] => Some("ratatui"),
+        ["cargo", "build", "--release", "--locked"] => Some("build-release"),
+        ["cargo", "test", "--release", "--locked"] => Some("test-release"),
+        ["cargo", "install", "--path", ".", "--force", "--locked"] => Some("install"),
         ["cargo", "test", ..] | ["cargo", "nextest", ..] => Some("focused"),
-        ["cargo", "check", ..] => Some("check"),
-        ["cargo", "install", ..] => Some("install"),
+        ["cargo", "check", ..] | ["cargo", "clippy", ..] | ["cargo", "build", ..] => Some("check"),
+        ["cargo", "audit", ..] | ["cargo", "deny", "check", ..] => Some("focused"),
         ["npm" | "pnpm" | "yarn", "test", ..]
         | ["pytest", ..]
         | ["go" | "mix", "test", ..]
@@ -215,11 +277,7 @@ pub(crate) fn evidence_status(
 }
 
 pub(crate) fn workspace_fingerprint(root: &Path) -> Option<String> {
-    let top = crate::run_internal_git_command(root, &["rev-parse", "--show-toplevel"]).ok()?;
-    if !top.success() {
-        return None;
-    }
-    let top = PathBuf::from(std::str::from_utf8(&top.stdout).ok()?.trim());
+    let top = git_toplevel(root)?;
     let head = crate::run_internal_git_command(&top, &["rev-parse", "--verify", "HEAD"]).ok()?;
     if !head.success() {
         return None;
@@ -246,7 +304,9 @@ pub(crate) fn workspace_fingerprint(root: &Path) -> Option<String> {
 
     let mut total_bytes = 0u64;
     let mut hash = Sha256::new();
-    hash.update(b"dext-workspace-v1\0");
+    hash.update(b"dext-workspace-v2\0");
+    hash_path_identity(&mut hash, &top);
+    hash.update([0]);
     hash.update(head.stdout);
     hash.update(raw.stdout);
     for relative in paths {
@@ -291,19 +351,135 @@ pub(crate) fn workspace_fingerprint(root: &Path) -> Option<String> {
     Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-pub(crate) fn is_dext_checkout(root: &Path) -> bool {
-    let Ok(top) = crate::run_internal_git_command(root, &["rev-parse", "--show-toplevel"]) else {
-        return false;
-    };
-    if !top.success() {
-        return false;
+fn hash_path_identity(hash: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hash.update(path.as_os_str().as_bytes());
     }
-    let Ok(top) = std::str::from_utf8(&top.stdout) else {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in path.as_os_str().encode_wide() {
+            hash.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hash.update(path.to_string_lossy().as_bytes());
+}
+
+pub(crate) fn is_git_toplevel(root: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
         return false;
     };
-    std::fs::read_to_string(Path::new(top.trim()).join("Cargo.toml"))
-        .ok()
-        .is_some_and(|text| text.lines().any(|line| line.trim() == "name = \"dext\""))
+    git_toplevel(&root).is_some_and(|top| top == root)
+}
+
+pub(crate) fn is_dext_package(root: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return false;
+    };
+    let mut in_package = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+        } else if in_package
+            && let Some((key, value)) = trimmed.split_once('=')
+            && key.trim() == "name"
+            && toml_string(value).is_some_and(|name| name == "dext")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn toml_string(raw: &str) -> Option<&str> {
+    let raw = raw.trim_start();
+    let quote = raw.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, ch) in raw.char_indices().skip(1) {
+        if quote == '"' && escaped {
+            escaped = false;
+        } else if quote == '"' && ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return raw.get(1..index);
+        }
+    }
+    None
+}
+
+pub(crate) fn install_working_directory(command: &str, root: &Path) -> Option<PathBuf> {
+    if command
+        .chars()
+        .any(|ch| matches!(ch, ';' | '|' | '<' | '>' | '`' | '$' | '\\' | '\'' | '"'))
+    {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for line in command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        for segment in line.split("&&") {
+            let segment = segment.trim();
+            if segment.is_empty() || segment.contains('&') {
+                return None;
+            }
+            segments.push(segment);
+        }
+    }
+    let mut index = 0usize;
+    let working_directory = if let Some(path) = segments.first().and_then(|line| cd_path(line)) {
+        index += 1;
+        Some(path)
+    } else {
+        None
+    };
+    if segments.get(index).copied() == Some("set -euo pipefail") {
+        index += 1;
+    }
+    if segments[index..]
+        .iter()
+        .any(|segment| segment.split_whitespace().next() == Some("cd"))
+    {
+        return None;
+    }
+    let candidate = working_directory.map_or_else(
+        || root.to_path_buf(),
+        |path| {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            }
+        },
+    );
+    let canonical = std::fs::canonicalize(candidate).ok()?;
+    canonical.is_dir().then_some(canonical)
+}
+
+pub(crate) fn is_dext_checkout(root: &Path) -> bool {
+    git_toplevel(root).is_some_and(|top| is_dext_package(&top))
+}
+
+fn git_toplevel(root: &Path) -> Option<PathBuf> {
+    let top = crate::run_internal_git_command(root, &["rev-parse", "--show-toplevel"]).ok()?;
+    if !top.success() {
+        return None;
+    }
+    let path = PathBuf::from(std::str::from_utf8(&top.stdout).ok()?.trim());
+    std::fs::canonicalize(path).ok()
 }
 
 fn nul_paths(bytes: &[u8]) -> Option<Vec<PathBuf>> {
@@ -343,7 +519,7 @@ mod tests {
     #[test]
     fn classifies_only_explicit_verification_commands() {
         let spec = classify(
-            "set -euo pipefail\ncargo fmt --all -- --check\ncargo clippy -p dext -- -D warnings\ncargo audit --deny warnings",
+            "set -euo pipefail\ncargo fmt --all -- --check\ncargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings\ncargo audit --deny warnings",
         )
         .unwrap();
         assert_eq!(spec.scopes, ["fmt", "clippy", "audit"]);
@@ -363,9 +539,111 @@ mod tests {
             "cargo test && touch src/main.rs",
             "./verify-release.sh",
             "printf 'cargo audit'",
+            "cd - && cargo test",
+            "cd ~/repo && cargo test",
+            "cd repo && cd nested && cargo test",
         ] {
             assert!(classify(command).is_none(), "{command}");
         }
+    }
+
+    #[test]
+    fn required_gate_scopes_require_canonical_commands() {
+        let canonical = [
+            ("cargo fmt --all -- --check", "fmt"),
+            (
+                "cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings",
+                "clippy",
+            ),
+            ("cargo audit --deny warnings", "audit"),
+            ("cargo deny check licenses", "deny"),
+            ("cargo test -p ratatui-core --lib --locked", "ratatui"),
+            ("cargo build --release --locked", "build-release"),
+            ("cargo test --release --locked", "test-release"),
+        ];
+        for (command, scope) in canonical {
+            assert_eq!(classify(command).unwrap().scopes, [scope], "{command}");
+        }
+
+        let lookalikes = [
+            ("cargo fmt --all --check", "fmt"),
+            (
+                "cargo clippy -p dext --all-targets --all-features --no-deps -- -D warnings",
+                "clippy",
+            ),
+            ("cargo audit --help", "audit"),
+            ("cargo deny check", "deny"),
+            (
+                "cargo test -p ratatui-core --lib --locked one_test",
+                "ratatui",
+            ),
+            ("cargo build --release", "build-release"),
+            (
+                "cargo test --release --locked nonexistent_filter",
+                "test-release",
+            ),
+        ];
+        for (command, forbidden_scope) in lookalikes {
+            assert!(
+                classify(command).is_none_or(|spec| !spec.scopes.contains(&forbidden_scope)),
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo test --help",
+            "cargo test --version",
+            "cargo test -- --list",
+            "cargo test --no-run",
+            "cargo check --help",
+            "cargo build -V",
+        ] {
+            assert!(classify(command).is_none(), "{command}");
+        }
+        assert!(classify("cargo install --path . --force").is_none());
+        assert!(
+            classify("cargo install --path . --force --locked && cargo test --release --locked")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn verification_keys_preserve_case_and_bind_the_effective_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "dext-verification-directory-{}-{}",
+            std::process::id(),
+            crate::unix_timestamp_secs()
+        ));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        for (path, content) in [(&first, "first\n"), (&second, "second\n")] {
+            git(path, &["init", "-q"]);
+            git(path, &["config", "user.email", "test@example.invalid"]);
+            git(path, &["config", "user.name", "Test"]);
+            std::fs::write(path.join("tracked.txt"), content).unwrap();
+            git(path, &["add", "tracked.txt"]);
+            git(path, &["commit", "-q", "-m", "base"]);
+        }
+
+        let upper = classify("cd first && cargo test ParserCase").unwrap();
+        let lower = classify("cd first && cargo test parsercase").unwrap();
+        let other = classify("cd second && cargo test ParserCase").unwrap();
+        assert_ne!(upper.key, lower.key);
+        assert_ne!(upper.key, other.key);
+        let upper_root = upper.effective_directory(&root).unwrap();
+        let other_root = other.effective_directory(&root).unwrap();
+        assert_eq!(upper_root, std::fs::canonicalize(&first).unwrap());
+        assert_eq!(other_root, std::fs::canonicalize(&second).unwrap());
+        assert_eq!(
+            workspace_fingerprint(&upper_root),
+            workspace_fingerprint(&first)
+        );
+        assert_ne!(
+            workspace_fingerprint(&upper_root),
+            workspace_fingerprint(&other_root)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -407,7 +685,53 @@ mod tests {
     }
 
     #[test]
-    fn dext_checkout_detection_resolves_the_git_toplevel_from_subdirectories() {
+    fn workspace_fingerprints_are_bound_to_the_checkout_path() {
+        let parent = std::env::temp_dir().join(format!(
+            "dext-verification-clones-{}-{}",
+            std::process::id(),
+            crate::unix_timestamp_secs()
+        ));
+        let first = parent.join("first");
+        let second = parent.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        git(&first, &["init", "-q"]);
+        git(&first, &["config", "user.email", "test@example.invalid"]);
+        git(&first, &["config", "user.name", "Test"]);
+        std::fs::write(first.join("tracked.txt"), "same\n").unwrap();
+        git(&first, &["add", "tracked.txt"]);
+        git(&first, &["commit", "-q", "-m", "base"]);
+        let output = Command::new("git")
+            .current_dir(&parent)
+            .args([
+                "clone",
+                "-q",
+                first.to_str().unwrap(),
+                second.to_str().unwrap(),
+            ])
+            .output()
+            .expect("clone fixture repository");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            crate::run_internal_git_command(&first, &["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout,
+            crate::run_internal_git_command(&second, &["rev-parse", "HEAD"])
+                .unwrap()
+                .stdout
+        );
+        assert_ne!(
+            workspace_fingerprint(&first),
+            workspace_fingerprint(&second)
+        );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn dext_package_and_git_toplevel_detection_are_independent() {
         let root = std::env::temp_dir().join(format!(
             "dext-verification-checkout-{}-{}",
             std::process::id(),
@@ -420,10 +744,12 @@ mod tests {
             "[package]\nname = \"dext\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        assert!(is_dext_checkout(&root));
-        assert!(is_dext_checkout(&root.join("nested")));
+        assert!(is_git_toplevel(&root));
+        assert!(!is_git_toplevel(&root.join("nested")));
+        assert!(is_dext_package(&root));
+        assert!(!is_dext_package(&root.join("nested")));
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"other\"\n").unwrap();
-        assert!(!is_dext_checkout(&root.join("nested")));
+        assert!(!is_dext_package(&root));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

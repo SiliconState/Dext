@@ -24,6 +24,7 @@ pub(crate) struct PlannedCall {
     pub(crate) bash_similarity_key: Option<String>,
     pub(crate) verification_spec: Option<verification::CommandSpec>,
     pub(crate) verification_fingerprint: Option<String>,
+    pub(crate) verification_post_fingerprint: Option<String>,
     pub(crate) prepared_mutation: Option<mutation_preview::PreparedMutation>,
     pub(crate) journal_record_id: Option<String>,
     pub(crate) plan: Plan,
@@ -46,6 +47,37 @@ pub(crate) struct ToolRoundOutcome {
     pub(crate) denied_signatures: HashSet<String>,
     pub(crate) hooks_approval_decided: bool,
     pub(crate) hooks_approved: bool,
+}
+
+pub(crate) fn command_installs_dext(command: &str, root: &Path) -> bool {
+    if !tool_policy::command_invokes_cargo_install(command) {
+        return false;
+    }
+    let paths = tool_policy::cargo_install_path_args(command);
+    if paths.is_empty() {
+        return false;
+    }
+    let working_directory = if tool_policy::command_has_wrapper_directory_change(command) {
+        None
+    } else {
+        verification::install_working_directory(command, root).or_else(|| {
+            (!tool_policy::command_changes_directory(command))
+                .then(|| std::fs::canonicalize(root).ok())
+                .flatten()
+        })
+    };
+    paths.iter().any(|path| {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            return verification::is_dext_package(path);
+        }
+        working_directory
+            .as_deref()
+            .is_some_and(|cwd| verification::is_dext_package(&cwd.join(path)))
+            || working_directory.is_none()
+                && tool_policy::command_changes_directory(command)
+                && verification::is_dext_checkout(root)
+    })
 }
 
 impl Agent {
@@ -98,6 +130,35 @@ impl Agent {
         }
 
         let batch_id = format!("batch-{iterations}");
+        let classified_verifications = tool_calls
+            .iter()
+            .filter(|(_, name, input)| {
+                name == "bash"
+                    && input["command"]
+                        .as_str()
+                        .and_then(verification::classify)
+                        .is_some()
+            })
+            .count();
+        let batch_has_dext_install = tool_calls.iter().any(|(_, name, input)| {
+            name == "bash"
+                && input["command"]
+                    .as_str()
+                    .is_some_and(|command| command_installs_dext(command, &self.sandbox_root))
+        });
+        let multi_verification_batch =
+            classified_verifications > 1 && classified_verifications == tool_calls.len();
+        let mixed_verification_batch = (classified_verifications > 0
+            && classified_verifications != tool_calls.len())
+            || (batch_has_dext_install && tool_calls.len() != 1)
+            || (multi_verification_batch && hooks_approved && !self.hooks.is_empty());
+        let verification_cache_allowed =
+            tool_calls.len() == 1 && (!hooks_approved || self.hooks.is_empty());
+        let batch_policy_error = mixed_verification_batch.then(|| {
+            "verification batch blocked: verification commands may be batched only with other verification commands and without active project hooks; Dext cargo install must be a standalone call"
+                .to_string()
+        });
+        let dext_checkout = batch_has_dext_install;
         let mut plans: Vec<PlannedCall> = Vec::new();
         let mut journal_terminal_errors: Vec<String> = Vec::new();
         for (ordinal, (id, name, input)) in tool_calls.into_iter().enumerate() {
@@ -128,20 +189,54 @@ impl Agent {
             let verification_spec = (name == "bash")
                 .then(|| input["command"].as_str().and_then(verification::classify))
                 .flatten();
-            let verification_fingerprint = verification_spec
+            let verification_directory = verification_spec
                 .as_ref()
-                .and_then(|_| verification::workspace_fingerprint(&self.sandbox_root));
+                .and_then(|spec| spec.effective_directory(&self.sandbox_root));
+            let verification_fingerprint = verification_directory
+                .as_deref()
+                .and_then(verification::workspace_fingerprint);
+            let verification_gate_eligible = verification_directory
+                .as_deref()
+                .is_some_and(verification::is_git_toplevel);
+            let noncanonical_dext_install = name == "bash"
+                && dext_checkout
+                && input["command"]
+                    .as_str()
+                    .is_some_and(|command| command_installs_dext(command, &self.sandbox_root))
+                && !verification_spec
+                    .as_ref()
+                    .is_some_and(verification::CommandSpec::is_install);
 
-            let mut plan: Option<Plan> = None;
+            let mut plan: Option<Plan> =
+                batch_policy_error.as_ref().map(|content| Plan::Immediate {
+                    content: content.clone(),
+                    is_error: Some(true),
+                });
             let mut local_sudo_auth_needed = false;
             let mut prepared_mutation: Option<mutation_preview::PreparedMutation> = None;
             let journal_record_id: Option<String> = None;
 
+            if plan.is_none() && noncanonical_dext_install {
+                plan = Some(Plan::Immediate {
+                    content: "installation blocked: installing Dext requires the standalone canonical command `cargo install --path . --force --locked` from the checkout directory"
+                        .to_string(),
+                    is_error: Some(true),
+                });
+            }
+
             if plan.is_none()
                 && let Some(spec) = verification_spec.as_ref()
             {
-                if spec.is_install()
-                    && verification::is_dext_checkout(&self.sandbox_root)
+                if spec.is_install() && dext_checkout && !verification_gate_eligible {
+                    plan = Some(Plan::Immediate {
+                        content: "installation blocked: Dext must be installed from the Git checkout top-level"
+                            .to_string(),
+                        is_error: Some(true),
+                    });
+                }
+                if plan.is_none()
+                    && spec.is_install()
+                    && dext_checkout
                     && verification_fingerprint.is_none()
                 {
                     plan = Some(Plan::Immediate {
@@ -153,16 +248,15 @@ impl Agent {
                     && let Some(fingerprint) = verification_fingerprint.as_deref()
                 {
                     let full_ready = self.work_ledger.required_gates_passed(fingerprint);
-                    if spec.is_install()
-                        && verification::is_dext_checkout(&self.sandbox_root)
-                        && !full_ready
-                    {
+                    if spec.is_install() && dext_checkout && !full_ready {
                         plan = Some(Plan::Immediate {
                             content: "installation blocked: the required Dext verification gates have not all passed for the current workspace fingerprint".to_string(),
                             is_error: Some(true),
                         });
-                    } else if let Some(record) =
-                        self.work_ledger.cached_verification(spec, fingerprint)
+                    } else if verification_cache_allowed
+                        && !spec.is_install()
+                        && let Some(record) =
+                            self.work_ledger.cached_verification(spec, fingerprint)
                     {
                         plan = Some(Plan::Immediate {
                             content: format!(
@@ -441,6 +535,7 @@ impl Agent {
                 bash_similarity_key,
                 verification_spec,
                 verification_fingerprint,
+                verification_post_fingerprint: None,
                 prepared_mutation,
                 journal_record_id,
                 plan,
@@ -644,6 +739,43 @@ impl Agent {
                 let summary = plans[idx].summary.clone();
                 let session_id = self.session_id.clone();
                 let local_sudo_auth_needed = plans[idx].local_sudo_auth_needed;
+                if let Some(spec) = plans[idx].verification_spec.clone() {
+                    let directory = spec.effective_directory(&root);
+                    let fingerprint = directory
+                        .as_deref()
+                        .and_then(verification::workspace_fingerprint);
+                    plans[idx].verification_fingerprint = fingerprint.clone();
+                    let install_error = spec
+                        .is_install()
+                        .then(|| {
+                            if command_installs_dext(
+                                inp["command"].as_str().unwrap_or(""),
+                                &root,
+                            ) {
+                                if !directory
+                                    .as_deref()
+                                    .is_some_and(verification::is_git_toplevel)
+                                {
+                                    return Some(
+                                        "installation blocked: Dext must be installed from the Git checkout top-level"
+                                            .to_string(),
+                                    );
+                                }
+                                match fingerprint.as_deref() {
+                                    None => Some("installation blocked: current workspace fingerprint is unavailable; inspect repository state and retry before installing Dext".to_string()),
+                                    Some(value) if !self.work_ledger.required_gates_passed(value) => Some("installation blocked: the required Dext verification gates have not all passed for the current workspace fingerprint".to_string()),
+                                    Some(_) => None,
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .flatten();
+                    if let Some(message) = install_error {
+                        builtin_outputs.insert(idx, Err(message));
+                        continue;
+                    }
+                }
                 if !journal_terminal_errors.is_empty() {
                     builtin_outputs.insert(
                         idx,
@@ -797,6 +929,14 @@ impl Agent {
                     )
                     .await
                 };
+                if multi_verification_batch
+                    && let Some(spec) = plans[idx].verification_spec.as_ref()
+                {
+                    plans[idx].verification_post_fingerprint = spec
+                        .effective_directory(&root)
+                        .as_deref()
+                        .and_then(verification::workspace_fingerprint);
+                }
                 if let Some(error) = persist_tool_journal_terminal(
                     &root,
                     &session_id,
@@ -833,6 +973,7 @@ impl Agent {
                 bash_similarity_key,
                 verification_spec,
                 verification_fingerprint,
+                verification_post_fingerprint,
                 prepared_mutation: _prepared_mutation,
                 journal_record_id: _journal_record_id,
                 plan,
@@ -1007,7 +1148,13 @@ impl Agent {
             if is_verification_result {
                 let command = verification_command.clone().unwrap_or_default();
                 let spec = verification_spec.as_ref().expect("verification classified");
-                let post_fingerprint = verification::workspace_fingerprint(&self.sandbox_root);
+                let post_fingerprint = if multi_verification_batch {
+                    verification_post_fingerprint
+                } else {
+                    spec.effective_directory(&self.sandbox_root)
+                        .as_deref()
+                        .and_then(verification::workspace_fingerprint)
+                };
                 let fingerprint = verification_fingerprint.clone().unwrap_or_default();
                 let duration = started_at
                     .map(|t| t.elapsed())
@@ -1045,6 +1192,15 @@ impl Agent {
                     },
                 );
                 self.work_ledger.verification.push(VerificationRecord {
+                    evidence_version: verification::EVIDENCE_VERSION,
+                    gate_eligible: spec
+                        .scopes
+                        .iter()
+                        .any(|scope| verification::REQUIRED_GATES.contains(scope))
+                        && spec
+                            .effective_directory(&self.sandbox_root)
+                            .as_deref()
+                            .is_some_and(verification::is_git_toplevel),
                     name: ui_summary.clone(),
                     command: command.clone(),
                     command_key: spec.key.clone(),

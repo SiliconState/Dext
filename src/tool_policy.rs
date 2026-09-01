@@ -432,6 +432,189 @@ pub(crate) fn command_invokes_sudo(command: &str) -> bool {
         .any(|words| words.first().is_some_and(|word| is_sudo_command_word(word)))
 }
 
+pub(crate) fn command_invokes_cargo_install(command: &str) -> bool {
+    shell_command_invocations(command)
+        .iter()
+        .any(|words| cargo_install_arg_start(words).is_some())
+}
+
+pub(crate) fn command_changes_directory(command: &str) -> bool {
+    if shell_command_invocations(command).iter().any(|words| {
+        words
+            .first()
+            .is_some_and(|word| shell_command_basename(word).eq_ignore_ascii_case("cd"))
+    }) {
+        return true;
+    }
+    command_has_wrapper_directory_change(command)
+}
+
+pub(crate) fn command_has_wrapper_directory_change(command: &str) -> bool {
+    command_segments(command)
+        .iter()
+        .any(|segment| wrapper_changes_directory(segment))
+        || embedded_shell_commands(command)
+            .iter()
+            .any(|nested| command_has_wrapper_directory_change(nested))
+}
+
+fn wrapper_changes_directory(segment: &str) -> bool {
+    let words = shell_words(segment);
+    let mut index = 0usize;
+    while index < words.len()
+        && (shell_assignment_word(&words[index]) || shell_command_keyword(&words[index]))
+    {
+        index += 1;
+    }
+    let wrapper = words
+        .get(index)
+        .map(|word| shell_command_basename(word).to_ascii_lowercase());
+    let Some(wrapper) = wrapper else {
+        return false;
+    };
+    words[index + 1..].iter().any(|arg| match wrapper.as_str() {
+        "env" => {
+            matches!(arg.as_str(), "-C" | "--chdir")
+                || arg.starts_with("--chdir=")
+                || arg.starts_with("-C") && arg.len() > 2
+        }
+        "sudo" => {
+            matches!(arg.as_str(), "-D" | "--chdir")
+                || arg.starts_with("--chdir=")
+                || arg.starts_with("-D") && arg.len() > 2
+        }
+        _ => false,
+    })
+}
+
+pub(crate) fn cargo_install_path_args(command: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for words in shell_command_invocations(command) {
+        let Some(start) = cargo_install_arg_start(&words) else {
+            continue;
+        };
+        let mut idx = start;
+        while let Some(arg) = words.get(idx) {
+            if arg == "--" {
+                break;
+            }
+            if arg == "--path" {
+                if let Some(path) = words.get(idx + 1) {
+                    paths.push(path.clone());
+                }
+                idx += 2;
+                continue;
+            }
+            if let Some(path) = arg.strip_prefix("--path=")
+                && !path.is_empty()
+            {
+                paths.push(path.to_string());
+            }
+            idx += 1;
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn cargo_install_arg_start(words: &[String]) -> Option<usize> {
+    let command_idx = privilege_wrapped_command_index(words).unwrap_or(0);
+    let command = words
+        .get(command_idx)
+        .map(|word| shell_command_basename(word))?;
+    if !(command.eq_ignore_ascii_case("cargo") || command.eq_ignore_ascii_case("cargo.exe")) {
+        return None;
+    }
+    let mut idx = command_idx + 1;
+    if words
+        .get(idx)
+        .is_some_and(|arg| arg.starts_with('+') && arg.len() > 1)
+    {
+        idx += 1;
+    }
+    loop {
+        let arg = words.get(idx)?;
+        if arg == "install" {
+            return Some(idx + 1);
+        }
+        if matches!(
+            arg.as_str(),
+            "-V" | "--version" | "--list" | "-h" | "--help"
+        ) {
+            return None;
+        }
+        if matches!(
+            arg.as_str(),
+            "-v" | "--verbose" | "-q" | "--quiet" | "--frozen" | "--locked" | "--offline"
+        ) || arg.starts_with("-Z") && arg.len() > 2
+            || arg.starts_with("--color=")
+            || arg.starts_with("--config=")
+        {
+            idx += 1;
+            continue;
+        }
+        if matches!(arg.as_str(), "--color" | "--config" | "-Z") {
+            idx = idx.checked_add(2)?;
+            continue;
+        }
+        return None;
+    }
+}
+
+fn privilege_wrapped_command_index(words: &[String]) -> Option<usize> {
+    let wrapper = words
+        .first()
+        .map(|word| shell_command_basename(word).to_ascii_lowercase())?;
+    if !matches!(wrapper.as_str(), "sudo" | "doas" | "pkexec") {
+        return None;
+    }
+    let mut idx = 1usize;
+    while let Some(arg) = words.get(idx).map(String::as_str) {
+        if arg == "--" {
+            return (idx + 1 < words.len()).then_some(idx + 1);
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            return Some(idx);
+        }
+        let consumes_next = match wrapper.as_str() {
+            "sudo" => matches!(
+                arg,
+                "-C" | "--close-from"
+                    | "-D"
+                    | "--chdir"
+                    | "-g"
+                    | "--group"
+                    | "-h"
+                    | "--host"
+                    | "-p"
+                    | "--prompt"
+                    | "-R"
+                    | "--chroot"
+                    | "-r"
+                    | "--role"
+                    | "-T"
+                    | "--command-timeout"
+                    | "-t"
+                    | "--type"
+                    | "-U"
+                    | "--other-user"
+                    | "-u"
+                    | "--user"
+            ),
+            "doas" => matches!(arg, "-a" | "-C" | "-u"),
+            "pkexec" => arg == "--user",
+            _ => false,
+        };
+        if consumes_next {
+            idx = idx.checked_add(2)?;
+        } else {
+            idx += 1;
+        }
+    }
+    None
+}
+
 fn shell_command_invocations(command: &str) -> Vec<Vec<String>> {
     let mut invocations = Vec::new();
     collect_shell_command_invocations(command, 0, &mut invocations);
@@ -3884,6 +4067,45 @@ mod tests {
         assert!(!command_invokes_sudo("grep sudo README.md"));
         assert!(!command_invokes_sudo("echo 'sudo apt update'"));
         assert!(!command_invokes_sudo("printf '%s' sudo"));
+        for command in [
+            "cargo install --path .",
+            "/usr/bin/cargo install --path .",
+            "env FOO=bar cargo install --path .",
+            "command -- cargo install --path .",
+            "bash -c 'cargo install --path .'",
+            "sudo cargo install --path .",
+            "sudo -n -u root cargo install --path .",
+            "sudo --user=root -- cargo install --path .",
+            "doas /usr/bin/cargo install --path .",
+            "doas -u root /usr/bin/cargo install --path .",
+            "pkexec cargo install --path .",
+            "pkexec --user root cargo install --path .",
+        ] {
+            assert!(command_invokes_cargo_install(command), "{command}");
+        }
+        for (command, expected) in [
+            ("cargo install --path .", vec!["."]),
+            ("cargo install --path=./crate", vec!["./crate"]),
+            (
+                "cargo install ripgrep && cargo install --path other",
+                vec!["other"],
+            ),
+            ("cargo install ripgrep", Vec::new()),
+        ] {
+            assert_eq!(cargo_install_path_args(command), expected, "{command}");
+        }
+        for command in [
+            "cargo test",
+            "command -v cargo",
+            "echo 'cargo install --path .'",
+            "printf '%s' cargo install",
+            "sudo cargo test",
+            "sudo echo cargo install",
+            "sudo -u root echo cargo install",
+            "pkexec echo cargo install",
+        ] {
+            assert!(!command_invokes_cargo_install(command), "{command}");
+        }
         assert_eq!(
             classify_command_risk("bash", &json!({"command": "sed -n '1,10p' src/main.rs"})),
             CommandRisk::Read
