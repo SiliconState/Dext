@@ -6,8 +6,11 @@ use std::path::{Component, Path, PathBuf};
 
 const FINGERPRINT_PATH_MAX: usize = 4096;
 const FINGERPRINT_TOTAL_BYTES_MAX: u64 = 128 * 1024 * 1024;
+const FINGERPRINT_EXTERNAL_INPUT_BYTES_MAX: u64 = 4 * 1024 * 1024;
+const DEXT_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 
-pub(crate) const EVIDENCE_VERSION: u32 = 1;
+pub(crate) const EVIDENCE_VERSION: u32 = 2;
+pub(crate) const EVIDENCE_MAX_AGE_SECS: u64 = 6 * 60 * 60;
 
 pub(crate) const REQUIRED_GATES: &[&str] = &[
     "fmt",
@@ -86,15 +89,20 @@ impl CodeLoopState {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub(crate) struct VerificationRecord {
     pub(crate) evidence_version: u32,
     pub(crate) gate_eligible: bool,
+    #[serde(skip, default)]
+    pub(crate) reusable: bool,
     pub(crate) name: String,
     pub(crate) command: String,
     pub(crate) command_key: String,
     pub(crate) workspace_fingerprint: String,
+    #[serde(skip, default = "empty_runtime_id")]
+    pub(crate) runtime_id: String,
+    pub(crate) completed_at_secs: u64,
     pub(crate) mutation_sequence: u64,
     pub(crate) scope: String,
     pub(crate) status: String,
@@ -102,6 +110,33 @@ pub(crate) struct VerificationRecord {
     pub(crate) duration_ms: u64,
     pub(crate) artifact: Option<String>,
     pub(crate) validates: Vec<String>,
+}
+
+fn empty_runtime_id() -> String {
+    String::new()
+}
+
+impl Default for VerificationRecord {
+    fn default() -> Self {
+        Self {
+            evidence_version: 0,
+            gate_eligible: false,
+            reusable: true,
+            name: String::new(),
+            command: String::new(),
+            command_key: String::new(),
+            workspace_fingerprint: String::new(),
+            runtime_id: runtime_id().to_string(),
+            completed_at_secs: crate::unix_timestamp_secs(),
+            mutation_sequence: 0,
+            scope: String::new(),
+            status: String::new(),
+            exit_code: None,
+            duration_ms: 0,
+            artifact: None,
+            validates: Vec::new(),
+        }
+    }
 }
 
 impl CommandSpec {
@@ -276,26 +311,76 @@ pub(crate) fn evidence_status(
     }
 }
 
+pub(crate) fn evidence_is_fresh(completed_at_secs: u64, now_secs: u64) -> bool {
+    completed_at_secs <= now_secs
+        && now_secs.saturating_sub(completed_at_secs) <= EVIDENCE_MAX_AGE_SECS
+}
+
+pub(crate) fn runtime_id() -> &'static str {
+    "current-process"
+}
+
+#[cfg(test)]
 pub(crate) fn workspace_fingerprint(root: &Path) -> Option<String> {
-    let top = git_toplevel(root)?;
-    let head = crate::run_internal_git_command(&top, &["rev-parse", "--verify", "HEAD"]).ok()?;
-    if !head.success() {
+    workspace_fingerprint_for_tool(root, &[], "danger-full-access")
+}
+
+pub(crate) fn workspace_fingerprint_for_tool(
+    root: &Path,
+    extra_env: &[(String, String)],
+    execution_profile: &str,
+) -> Option<String> {
+    let command_root = std::fs::canonicalize(root).ok()?;
+    if !command_root.is_dir() {
         return None;
     }
+    let top = git_toplevel(&command_root)?;
+    let head = crate::run_internal_git_command(&top, &["rev-parse", "--verify", "HEAD"]).ok()?;
     let raw = crate::run_internal_git_command(&top, &["diff", "--raw", "-z", "HEAD", "--"]).ok()?;
-    let changed =
-        crate::run_internal_git_command(&top, &["diff", "--name-only", "-z", "HEAD", "--"]).ok()?;
+    let tracked = crate::run_internal_git_command(&top, &["ls-files", "-z"]).ok()?;
+    let index = crate::run_internal_git_command(&top, &["ls-files", "--stage", "-z"]).ok()?;
     let untracked = crate::run_internal_git_command(
         &top,
         &["ls-files", "--others", "--exclude-standard", "-z"],
     )
     .ok()?;
-    if !raw.success() || !changed.success() || !untracked.success() {
+    let ignored_build_inputs = if is_dext_package(&top) {
+        crate::run_internal_git_command(
+            &top,
+            &[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ".",
+                ":(exclude)target/**",
+                ":(exclude).dext/**",
+                ":(exclude).auto/**",
+            ],
+        )
+        .ok()
+    } else {
+        None
+    };
+    if !head.success()
+        || !raw.success()
+        || !tracked.success()
+        || !index.success()
+        || !untracked.success()
+        || ignored_build_inputs
+            .as_ref()
+            .is_some_and(|output| !output.success())
+    {
         return None;
     }
 
-    let mut paths = nul_paths(&changed.stdout)?;
+    let mut paths = nul_paths(&tracked.stdout)?;
     paths.extend(nul_paths(&untracked.stdout)?);
+    if let Some(ignored) = ignored_build_inputs {
+        paths.extend(nul_paths(&ignored.stdout)?);
+    }
     paths.sort();
     paths.dedup();
     if paths.len() > FINGERPRINT_PATH_MAX {
@@ -304,11 +389,18 @@ pub(crate) fn workspace_fingerprint(root: &Path) -> Option<String> {
 
     let mut total_bytes = 0u64;
     let mut hash = Sha256::new();
-    hash.update(b"dext-workspace-v2\0");
+    hash.update(b"dext-workspace-v3\0");
     hash_path_identity(&mut hash, &top);
+    hash.update([0]);
+    hash_path_identity(&mut hash, &command_root);
+    hash.update([0]);
+    hash.update(execution_profile.as_bytes());
     hash.update([0]);
     hash.update(head.stdout);
     hash.update(raw.stdout);
+    hash.update(index.stdout);
+    hash_environment(&mut hash, extra_env)?;
+    hash_external_build_inputs(&mut hash, &command_root)?;
     for relative in paths {
         if !safe_relative(&relative) {
             return None;
@@ -325,30 +417,141 @@ pub(crate) fn workspace_fingerprint(root: &Path) -> Option<String> {
             Err(_) => return None,
         };
         hash.update(metadata.len().to_le_bytes());
+        hash_file_mode(&mut hash, &metadata);
         total_bytes = total_bytes.checked_add(metadata.len())?;
         if total_bytes > FINGERPRINT_TOTAL_BYTES_MAX {
             return None;
         }
         if metadata.file_type().is_symlink() {
             hash.update(b"symlink\0");
-            hash.update(std::fs::read_link(path).ok()?.to_string_lossy().as_bytes());
+            hash.update(std::fs::read_link(&path).ok()?.to_string_lossy().as_bytes());
+            let target = std::fs::metadata(&path).ok()?;
+            if !target.is_file() {
+                return None;
+            }
+            hash.update(target.len().to_le_bytes());
+            hash_file_mode(&mut hash, &target);
+            total_bytes = total_bytes.checked_add(target.len())?;
+            if total_bytes > FINGERPRINT_TOTAL_BYTES_MAX {
+                return None;
+            }
+            hash_file(&mut hash, &path)?;
         } else if metadata.is_file() {
             hash.update(b"file\0");
-            let mut file = File::open(path).ok()?;
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let read = file.read(&mut buffer).ok()?;
-                if read == 0 {
-                    break;
-                }
-                hash.update(&buffer[..read]);
-            }
+            hash_file(&mut hash, &path)?;
         } else {
-            hash.update(b"other\0");
+            return None;
         }
     }
     let digest = hash.finalize();
     Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn hash_file(hash: &mut Sha256, path: &Path) -> Option<()> {
+    let mut file = File::open(path).ok()?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            return Some(());
+        }
+        hash.update(&buffer[..read]);
+    }
+}
+
+fn hash_file_mode(hash: &mut Sha256, metadata: &std::fs::Metadata) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        hash.update(metadata.permissions().mode().to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    hash.update([u8::from(metadata.permissions().readonly())]);
+}
+
+fn hash_environment(hash: &mut Sha256, extra_env: &[(String, String)]) -> Option<()> {
+    if crate::tool_children_inherit_credentials() {
+        return None;
+    }
+    let mut environment = std::env::vars_os().collect::<std::collections::BTreeMap<_, _>>();
+    for key in environment.keys().cloned().collect::<Vec<_>>() {
+        let key_text = key.to_string_lossy();
+        if crate::INTERNAL_STARTUP_ENV_VARS
+            .iter()
+            .any(|blocked| key_text.eq_ignore_ascii_case(blocked))
+            || key_text.starts_with("BASH_FUNC_") && key_text.ends_with("%%")
+            || crate::tool_credential_env_key(&key_text)
+        {
+            environment.remove(&key);
+        }
+    }
+    for (key, value) in extra_env {
+        if !crate::tool_credential_env_key(key) {
+            environment.insert(key.into(), value.into());
+        }
+    }
+    for (key, value) in environment {
+        hash_path_identity(hash, Path::new(&key));
+        hash.update([0]);
+        hash_path_identity(hash, Path::new(&value));
+        hash.update([0]);
+    }
+    Some(())
+}
+
+fn hash_external_build_inputs(hash: &mut Sha256, command_root: &Path) -> Option<()> {
+    let mut paths = Vec::new();
+    for ancestor in command_root.ancestors() {
+        paths.push(ancestor.join(".cargo/config"));
+        paths.push(ancestor.join(".cargo/config.toml"));
+        paths.push(ancestor.join("rust-toolchain"));
+        paths.push(ancestor.join("rust-toolchain.toml"));
+    }
+    if let Some(mut cargo_home) = std::env::var_os("CARGO_HOME").map(PathBuf::from) {
+        if cargo_home.is_relative() {
+            cargo_home = command_root.join(cargo_home);
+        }
+        paths.push(cargo_home.join("config"));
+        paths.push(cargo_home.join("config.toml"));
+    } else {
+        let cargo_home = crate::session::user_home_dir().join(".cargo");
+        paths.push(cargo_home.join("config"));
+        paths.push(cargo_home.join("config.toml"));
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut total_bytes = 0u64;
+    for path in paths {
+        hash_path_identity(hash, &path);
+        hash.update([0]);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hash.update(b"missing\0");
+                continue;
+            }
+            Err(_) => return None,
+        };
+        if metadata.file_type().is_symlink() {
+            hash.update(b"symlink\0");
+            hash.update(std::fs::read_link(&path).ok()?.to_string_lossy().as_bytes());
+        } else if !metadata.is_file() {
+            return None;
+        }
+        let target = std::fs::metadata(&path).ok()?;
+        if !target.is_file() {
+            return None;
+        }
+        total_bytes = total_bytes.checked_add(target.len())?;
+        if total_bytes > FINGERPRINT_EXTERNAL_INPUT_BYTES_MAX {
+            return None;
+        }
+        hash.update(target.len().to_le_bytes());
+        hash_file_mode(hash, &target);
+        hash_file(hash, &path)?;
+    }
+    Some(())
 }
 
 fn hash_path_identity(hash: &mut Sha256, path: &Path) {
@@ -375,46 +578,25 @@ pub(crate) fn is_git_toplevel(root: &Path) -> bool {
     git_toplevel(&root).is_some_and(|top| top == root)
 }
 
-pub(crate) fn is_dext_package(root: &Path) -> bool {
-    let Ok(root) = std::fs::canonicalize(root) else {
-        return false;
-    };
-    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
-        return false;
-    };
-    let mut in_package = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]";
-        } else if in_package
-            && let Some((key, value)) = trimmed.split_once('=')
-            && key.trim() == "name"
-            && toml_string(value).is_some_and(|name| name == "dext")
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn toml_string(raw: &str) -> Option<&str> {
-    let raw = raw.trim_start();
-    let quote = raw.chars().next()?;
-    if !matches!(quote, '\'' | '"') {
+pub(crate) fn dext_package_status(root: &Path) -> Option<bool> {
+    let root = std::fs::canonicalize(root).ok()?;
+    let manifest_path = root.join("Cargo.toml");
+    let metadata = std::fs::metadata(&manifest_path).ok()?;
+    if !metadata.is_file() || metadata.len() > DEXT_MANIFEST_MAX_BYTES {
         return None;
     }
-    let mut escaped = false;
-    for (index, ch) in raw.char_indices().skip(1) {
-        if quote == '"' && escaped {
-            escaped = false;
-        } else if quote == '"' && ch == '\\' {
-            escaped = true;
-        } else if ch == quote {
-            return raw.get(1..index);
-        }
-    }
-    None
+    let text = std::fs::read_to_string(manifest_path).ok()?;
+    text.parse::<toml_edit::Document<String>>()
+        .ok()
+        .and_then(|manifest| {
+            manifest["package"]["name"]
+                .as_str()
+                .map(|name| name == "dext")
+        })
+}
+
+pub(crate) fn is_dext_package(root: &Path) -> bool {
+    dext_package_status(root) == Some(true)
 }
 
 pub(crate) fn install_working_directory(command: &str, root: &Path) -> Option<PathBuf> {
@@ -438,6 +620,9 @@ pub(crate) fn install_working_directory(command: &str, root: &Path) -> Option<Pa
             segments.push(segment);
         }
     }
+    if crate::tool_policy::command_has_wrapper_directory_change(command) {
+        return None;
+    }
     let mut index = 0usize;
     let working_directory = if let Some(path) = segments.first().and_then(|line| cd_path(line)) {
         index += 1;
@@ -448,10 +633,12 @@ pub(crate) fn install_working_directory(command: &str, root: &Path) -> Option<Pa
     if segments.get(index).copied() == Some("set -euo pipefail") {
         index += 1;
     }
-    if segments[index..]
-        .iter()
-        .any(|segment| segment.split_whitespace().next() == Some("cd"))
-    {
+    if segments[index..].iter().any(|segment| {
+        segment
+            .split_whitespace()
+            .next()
+            .is_some_and(|command| matches!(command, "cd" | "pushd" | "popd" | "source" | "."))
+    }) {
         return None;
     }
     let candidate = working_directory.map_or_else(
@@ -608,6 +795,7 @@ mod tests {
 
     #[test]
     fn verification_keys_preserve_case_and_bind_the_effective_directory() {
+        let _guard = crate::test_env_lock();
         let root = std::env::temp_dir().join(format!(
             "dext-verification-directory-{}-{}",
             std::process::id(),
@@ -662,6 +850,7 @@ mod tests {
 
     #[test]
     fn workspace_fingerprint_changes_with_tracked_and_untracked_content() {
+        let _guard = crate::test_env_lock();
         let root = std::env::temp_dir().join(format!(
             "dext-verification-fingerprint-{}-{}",
             std::process::id(),
@@ -685,7 +874,122 @@ mod tests {
     }
 
     #[test]
+    fn workspace_fingerprint_hashes_tracked_files_hidden_by_index_flags() {
+        let _guard = crate::test_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "dext-verification-index-flags-{}-{}",
+            std::process::id(),
+            crate::unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "test@example.invalid"]);
+        git(&root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git(&root, &["add", "tracked.txt"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        let clean = workspace_fingerprint(&root).unwrap();
+
+        git(
+            &root,
+            &["update-index", "--assume-unchanged", "tracked.txt"],
+        );
+        std::fs::write(root.join("tracked.txt"), "assume changed\n").unwrap();
+        assert_ne!(clean, workspace_fingerprint(&root).unwrap());
+        git(
+            &root,
+            &["update-index", "--no-assume-unchanged", "tracked.txt"],
+        );
+
+        std::fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git(&root, &["update-index", "--skip-worktree", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "skip changed\n").unwrap();
+        assert_ne!(clean, workspace_fingerprint(&root).unwrap());
+        git(
+            &root,
+            &["update-index", "--no-skip-worktree", "tracked.txt"],
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_fingerprint_changes_with_hidden_cargo_config_and_executable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = crate::test_env_lock();
+
+        let root = std::env::temp_dir().join(format!(
+            "dext-verification-hidden-inputs-{}-{}",
+            std::process::id(),
+            crate::unix_timestamp_secs()
+        ));
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "test@example.invalid"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["config", "core.filemode", "false"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            ".cargo/config.toml\nignored-build-input.txt\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"dext\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("tracked.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        git(&root, &["add", ".gitignore", "Cargo.toml", "tracked.sh"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        let clean = workspace_fingerprint(&root).unwrap();
+
+        let mut permissions = std::fs::metadata(root.join("tracked.sh"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(root.join("tracked.sh"), permissions).unwrap();
+        let executable = workspace_fingerprint(&root).unwrap();
+        assert_ne!(clean, executable);
+
+        std::fs::write(
+            root.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"--cfg\", \"hidden_config\"]\n",
+        )
+        .unwrap();
+        let hidden_config = workspace_fingerprint(&root).unwrap();
+        assert_ne!(executable, hidden_config);
+
+        std::fs::write(root.join("ignored-build-input.txt"), "first\n").unwrap();
+        let ignored = workspace_fingerprint(&root).unwrap();
+        assert_ne!(hidden_config, ignored);
+
+        let first_env = workspace_fingerprint_for_tool(
+            &root,
+            &[("DEXT_FINGERPRINT_TEST".to_string(), "first".to_string())],
+            "danger-full-access",
+        )
+        .unwrap();
+        let second_env = workspace_fingerprint_for_tool(
+            &root,
+            &[("DEXT_FINGERPRINT_TEST".to_string(), "second".to_string())],
+            "danger-full-access",
+        )
+        .unwrap();
+        let confined = workspace_fingerprint_for_tool(
+            &root,
+            &[("DEXT_FINGERPRINT_TEST".to_string(), "second".to_string())],
+            "workspace-write",
+        )
+        .unwrap();
+        assert_ne!(first_env, second_env);
+        assert_ne!(second_env, confined);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn workspace_fingerprints_are_bound_to_the_checkout_path() {
+        let _guard = crate::test_env_lock();
         let parent = std::env::temp_dir().join(format!(
             "dext-verification-clones-{}-{}",
             std::process::id(),
@@ -747,7 +1051,14 @@ mod tests {
         assert!(is_git_toplevel(&root));
         assert!(!is_git_toplevel(&root.join("nested")));
         assert!(is_dext_package(&root));
+        assert!(is_dext_checkout(&root));
         assert!(!is_dext_package(&root.join("nested")));
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"dex\\u0074\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert!(is_dext_package(&root));
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"other\"\n").unwrap();
         assert!(!is_dext_package(&root));
         std::fs::remove_dir_all(root).unwrap();

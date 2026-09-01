@@ -513,6 +513,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "toml_edit",
  "tui-markdown",
  "unicode-width",
  "windows-sys 0.61.2",

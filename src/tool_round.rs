@@ -50,34 +50,41 @@ pub(crate) struct ToolRoundOutcome {
 }
 
 pub(crate) fn command_installs_dext(command: &str, root: &Path) -> bool {
+    command_install_target_status(command, root).is_some_and(|status| status != Some(false))
+}
+
+fn command_install_target_status(command: &str, root: &Path) -> Option<Option<bool>> {
     if !tool_policy::command_invokes_cargo_install(command) {
-        return false;
+        return None;
     }
     let paths = tool_policy::cargo_install_path_args(command);
     if paths.is_empty() {
-        return false;
+        return None;
     }
     let working_directory = if tool_policy::command_has_wrapper_directory_change(command) {
         None
     } else {
-        verification::install_working_directory(command, root).or_else(|| {
-            (!tool_policy::command_changes_directory(command))
-                .then(|| std::fs::canonicalize(root).ok())
-                .flatten()
-        })
+        verification::install_working_directory(command, root)
     };
-    paths.iter().any(|path| {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            return verification::is_dext_package(path);
+    let mut status = Some(false);
+    for path in paths {
+        let path = Path::new(&path);
+        let package = if path.is_absolute() {
+            verification::dext_package_status(path)
+        } else if let Some(cwd) = working_directory.as_deref() {
+            verification::dext_package_status(&cwd.join(path))
+        } else if verification::is_dext_checkout(root) {
+            None
+        } else {
+            Some(false)
+        };
+        match package {
+            Some(true) => return Some(Some(true)),
+            None => status = None,
+            Some(false) => {}
         }
-        working_directory
-            .as_deref()
-            .is_some_and(|cwd| verification::is_dext_package(&cwd.join(path)))
-            || working_directory.is_none()
-                && tool_policy::command_changes_directory(command)
-                && verification::is_dext_checkout(root)
-    })
+    }
+    Some(status)
 }
 
 impl Agent {
@@ -142,9 +149,10 @@ impl Agent {
             .count();
         let batch_has_dext_install = tool_calls.iter().any(|(_, name, input)| {
             name == "bash"
-                && input["command"]
-                    .as_str()
-                    .is_some_and(|command| command_installs_dext(command, &self.sandbox_root))
+                && input["command"].as_str().is_some_and(|command| {
+                    command_installs_dext(command, &self.sandbox_root)
+                        || tool_policy::command_has_ambiguous_cargo_install(command)
+                })
         });
         let multi_verification_batch =
             classified_verifications > 1 && classified_verifications == tool_calls.len();
@@ -192,17 +200,23 @@ impl Agent {
             let verification_directory = verification_spec
                 .as_ref()
                 .and_then(|spec| spec.effective_directory(&self.sandbox_root));
-            let verification_fingerprint = verification_directory
-                .as_deref()
-                .and_then(verification::workspace_fingerprint);
+            let verification_fingerprint =
+                verification_directory.as_deref().and_then(|directory| {
+                    verification::workspace_fingerprint_for_tool(
+                        directory,
+                        &self.pack_hook_env,
+                        self.sandbox_profile.as_str(),
+                    )
+                });
             let verification_gate_eligible = verification_directory
                 .as_deref()
                 .is_some_and(verification::is_git_toplevel);
             let noncanonical_dext_install = name == "bash"
                 && dext_checkout
-                && input["command"]
-                    .as_str()
-                    .is_some_and(|command| command_installs_dext(command, &self.sandbox_root))
+                && input["command"].as_str().is_some_and(|command| {
+                    command_installs_dext(command, &self.sandbox_root)
+                        || tool_policy::command_has_ambiguous_cargo_install(command)
+                })
                 && !verification_spec
                     .as_ref()
                     .is_some_and(verification::CommandSpec::is_install);
@@ -741,9 +755,13 @@ impl Agent {
                 let local_sudo_auth_needed = plans[idx].local_sudo_auth_needed;
                 if let Some(spec) = plans[idx].verification_spec.clone() {
                     let directory = spec.effective_directory(&root);
-                    let fingerprint = directory
-                        .as_deref()
-                        .and_then(verification::workspace_fingerprint);
+                    let fingerprint = directory.as_deref().and_then(|directory| {
+                        verification::workspace_fingerprint_for_tool(
+                            directory,
+                            &self.pack_hook_env,
+                            self.sandbox_profile.as_str(),
+                        )
+                    });
                     plans[idx].verification_fingerprint = fingerprint.clone();
                     let install_error = spec
                         .is_install()
@@ -935,7 +953,13 @@ impl Agent {
                     plans[idx].verification_post_fingerprint = spec
                         .effective_directory(&root)
                         .as_deref()
-                        .and_then(verification::workspace_fingerprint);
+                        .and_then(|directory| {
+                            verification::workspace_fingerprint_for_tool(
+                                directory,
+                                &self.pack_hook_env,
+                                self.sandbox_profile.as_str(),
+                            )
+                        });
                 }
                 if let Some(error) = persist_tool_journal_terminal(
                     &root,
@@ -1153,7 +1177,13 @@ impl Agent {
                 } else {
                     spec.effective_directory(&self.sandbox_root)
                         .as_deref()
-                        .and_then(verification::workspace_fingerprint)
+                        .and_then(|directory| {
+                            verification::workspace_fingerprint_for_tool(
+                                directory,
+                                &self.pack_hook_env,
+                                self.sandbox_profile.as_str(),
+                            )
+                        })
                 };
                 let fingerprint = verification_fingerprint.clone().unwrap_or_default();
                 let duration = started_at
@@ -1165,16 +1195,21 @@ impl Agent {
                     verification_fingerprint.as_deref(),
                     post_fingerprint.as_deref(),
                 );
+                let command_cwd = spec
+                    .effective_directory(&self.sandbox_root)
+                    .unwrap_or_else(|| self.sandbox_root.clone());
                 let artifact = write_verification_artifact(
                     &self.sandbox_root,
                     &self.session_id,
                     VerificationArtifactSpec {
                         name: &ui_summary,
                         command: &command,
+                        command_cwd: &command_cwd,
                         output: &content,
                         exit_code,
                         duration,
                         status,
+                        privacy: &self.privacy,
                     },
                 );
                 artifact_display = artifact.as_ref().map(|p| p.display().to_string());
@@ -1193,6 +1228,7 @@ impl Agent {
                 );
                 self.work_ledger.verification.push(VerificationRecord {
                     evidence_version: verification::EVIDENCE_VERSION,
+                    reusable: true,
                     gate_eligible: spec
                         .scopes
                         .iter()
@@ -1205,6 +1241,8 @@ impl Agent {
                     command: command.clone(),
                     command_key: spec.key.clone(),
                     workspace_fingerprint: fingerprint.clone(),
+                    runtime_id: verification::runtime_id().to_string(),
+                    completed_at_secs: unix_timestamp_secs(),
                     mutation_sequence: self.work_ledger.code_loop.mutation_sequence,
                     scope,
                     status: status.to_string(),
