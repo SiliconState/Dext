@@ -10,6 +10,7 @@ mod packs;
 mod privacy;
 mod process_tree;
 mod provider;
+mod read_symbol;
 mod sandbox;
 mod seats;
 mod secret_redactor;
@@ -23,6 +24,7 @@ mod tool_round;
 mod tools;
 mod tui;
 mod usage;
+mod verification;
 
 #[cfg(test)]
 mod main_tests;
@@ -71,6 +73,7 @@ use tools::{
     Tool, ToolProfile, is_external_process_tool, is_side_effect_capable_tool, needs_permission,
     provider_tool_definitions, should_parallelize_builtin_tools,
 };
+use verification::{CodeLoopState, VerificationRecord};
 
 #[cfg(test)]
 use provider::{
@@ -96,13 +99,11 @@ const TEXT_TOOL_CAPTURE_CAP: usize = 10_000;
 const FRUGAL_TEXT_TOOL_CAPTURE_CAP: usize = 6_000;
 const READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 16_000;
 const FRUGAL_READ_FILE_EXPLICIT_CAPTURE_CAP: usize = 10_000;
-const READ_SYMBOL_INPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const PROMPT_CONTEXT_FILE_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const TODO_STATE_MAX_BYTES: usize = 256 * 1024;
 const PROCESS_STREAM_CAPTURE_CAP: usize = 6_000;
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const LIVE_OUTPUT_EVENT_QUEUE_CAP: usize = 256;
-const READ_SYMBOL_SUGGESTION_LIMIT: usize = 5;
 const CARGO_DIAGNOSTIC_SUMMARY_LIMIT: usize = 20;
 const LSP_DIAGNOSTIC_FILE_LIMIT: usize = 64;
 const LSP_DIAGNOSTIC_DIRECTORY_LIMIT: usize = 1_024;
@@ -150,7 +151,7 @@ const GIT_AUTH_GUIDANCE: &str = "git needs credentials for an HTTPS remote. Ente
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
 pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "DEXT_ALLOW_BREAK_SYSTEM_PACKAGES";
 const AUTH_CIRCUIT_BREAKER_THRESHOLD: usize = 2;
-const TOOL_CATALOG_VERSION: u32 = 5;
+const TOOL_CATALOG_VERSION: u32 = 6;
 const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     ".git",
     ".hg",
@@ -6154,31 +6155,6 @@ fn parse_tool_exit_code(name: &str, ok: bool, content: &str) -> Option<i32> {
     }
 }
 
-fn looks_like_verification_command(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    [
-        "cargo test",
-        "cargo nextest",
-        "cargo build",
-        "cargo check",
-        "cargo clippy",
-        "cargo install",
-        "npm test",
-        "pnpm test",
-        "yarn test",
-        "pytest",
-        "go test",
-        "mix test",
-        "zig build test",
-        "swift test",
-        "dotnet test",
-        "mvn test",
-        "gradle test",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 fn artifact_safe_name(raw: &str) -> String {
     let mut out = String::new();
     for ch in raw.chars() {
@@ -7136,161 +7112,6 @@ fn run_workflow_diagnostics(root: &Path, profile: SandboxProfile) -> WorkflowDia
         .unwrap_or_else(|| run_cargo_check_diagnostics(root, profile))
 }
 
-fn is_ident_continue(ch: char) -> bool {
-    ch == '_' || ch.is_alphanumeric()
-}
-
-fn symbol_token_at_start(text: &str, symbol: &str) -> bool {
-    let Some(after) = text.strip_prefix(symbol) else {
-        return false;
-    };
-    after.chars().next().is_none_or(|ch| !is_ident_continue(ch))
-}
-
-fn contains_symbol_token(text: &str, symbol: &str) -> bool {
-    text.match_indices(symbol).any(|(idx, _)| {
-        let before_ok = text[..idx]
-            .chars()
-            .next_back()
-            .is_none_or(|ch| !is_ident_continue(ch));
-        let after_idx = idx + symbol.len();
-        let after_ok = text[after_idx..]
-            .chars()
-            .next()
-            .is_none_or(|ch| !is_ident_continue(ch));
-        before_ok && after_ok
-    })
-}
-
-fn keyword_rest<'a>(trimmed: &'a str, keyword: &str) -> Option<&'a str> {
-    let rest = trimmed.strip_prefix(keyword)?;
-    if rest.chars().next().is_some_and(is_ident_continue) {
-        return None;
-    }
-    Some(rest.trim_start())
-}
-
-fn strip_decl_qualifiers(mut text: &str) -> &str {
-    loop {
-        let trimmed = text.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("pub ") {
-            text = rest;
-        } else if let Some(rest) = trimmed.strip_prefix("export ") {
-            text = rest;
-        } else if let Some(rest) = trimmed.strip_prefix("default ") {
-            text = rest;
-        } else if let Some(rest) = trimmed.strip_prefix("async ") {
-            text = rest;
-        } else if let Some(rest) = trimmed.strip_prefix("unsafe ") {
-            text = rest;
-        } else if let Some(rest) = trimmed.strip_prefix("extern ") {
-            let rest = rest.trim_start();
-            if let Some(abi) = rest.strip_prefix('"')
-                && let Some(end) = abi.find('"')
-            {
-                text = &abi[end + 1..];
-            } else {
-                text = rest;
-            }
-        } else if let Some(rest) = trimmed.strip_prefix("pub(") {
-            if let Some(end) = rest.find(')') {
-                text = &rest[end + 1..];
-            } else {
-                return trimmed;
-            }
-        } else {
-            return trimmed;
-        }
-    }
-}
-
-fn item_signature_line_match(line: &str) -> bool {
-    let trimmed = strip_decl_qualifiers(line);
-    if keyword_rest(trimmed, "const")
-        .and_then(|rest| keyword_rest(rest, "fn"))
-        .is_some()
-    {
-        return true;
-    }
-    [
-        "fn",
-        "struct",
-        "enum",
-        "trait",
-        "impl",
-        "type",
-        "mod",
-        "class",
-        "def",
-        "function",
-        "interface",
-    ]
-    .iter()
-    .any(|keyword| keyword_rest(trimmed, keyword).is_some())
-}
-
-fn symbol_line_match(line: &str, symbol: &str) -> bool {
-    let trimmed = strip_decl_qualifiers(line);
-    for keyword in [
-        "fn",
-        "struct",
-        "enum",
-        "trait",
-        "type",
-        "mod",
-        "class",
-        "def",
-        "function",
-        "interface",
-    ] {
-        if let Some(rest) = keyword_rest(trimmed, keyword)
-            && symbol_token_at_start(rest, symbol)
-        {
-            return true;
-        }
-    }
-    if let Some(rest) = keyword_rest(trimmed, "impl")
-        && contains_symbol_token(rest, symbol)
-    {
-        return true;
-    }
-    if let Some(rest) = keyword_rest(trimmed, "const") {
-        if symbol_token_at_start(rest, symbol) {
-            return true;
-        }
-        if let Some(fn_rest) = keyword_rest(rest, "fn") {
-            return symbol_token_at_start(fn_rest, symbol);
-        }
-    }
-    if let Some(rest) = keyword_rest(trimmed, "static") {
-        return symbol_token_at_start(rest, symbol);
-    }
-    false
-}
-
-fn source_line_starts(content: &str) -> Vec<usize> {
-    if content.is_empty() {
-        return Vec::new();
-    }
-    let bytes = content.as_bytes();
-    let mut starts = Vec::with_capacity((bytes.len() / 48).max(1));
-    starts.push(0);
-    for (idx, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' && idx + 1 < bytes.len() {
-            starts.push(idx + 1);
-        }
-    }
-    starts
-}
-
-fn source_line_at<'a>(content: &'a str, starts: &[usize], idx: usize) -> Option<&'a str> {
-    let start = *starts.get(idx)?;
-    let end = starts.get(idx + 1).copied().unwrap_or(content.len());
-    let line = &content[start..end];
-    let line = line.strip_suffix('\n').unwrap_or(line);
-    Some(line.strip_suffix('\r').unwrap_or(line))
-}
-
 fn normalized_path_text(path: &Path) -> String {
     let raw = path.to_string_lossy();
     if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
@@ -7317,371 +7138,6 @@ fn portable_path_is_absolute(path: &str) -> bool {
     Path::new(path).is_absolute()
         || matches!(bytes.first(), Some(b'/') | Some(b'\\'))
         || matches!(bytes, [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic())
-}
-
-fn identifier_prefix(text: &str) -> Option<&str> {
-    let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("r#") {
-        let mut end = 0usize;
-        for (idx, ch) in rest.char_indices() {
-            if is_ident_continue(ch) {
-                end = idx + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        return (end > 0).then(|| &trimmed[..2 + end]);
-    }
-
-    let mut end = 0usize;
-    for (idx, ch) in trimmed.char_indices() {
-        if is_ident_continue(ch) {
-            end = idx + ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    (end > 0).then(|| &trimmed[..end])
-}
-
-fn symbol_candidates_for_line(line: &str) -> Vec<(String, &'static str)> {
-    let trimmed = strip_decl_qualifiers(line);
-    let mut out = Vec::new();
-    if let Some(rest) = keyword_rest(trimmed, "const") {
-        if let Some(fn_rest) = keyword_rest(rest, "fn") {
-            if let Some(name) = identifier_prefix(fn_rest) {
-                out.push((name.to_string(), "fn"));
-            }
-            return out;
-        }
-        if let Some(name) = identifier_prefix(rest) {
-            out.push((name.to_string(), "const"));
-        }
-        return out;
-    }
-    if let Some(rest) = keyword_rest(trimmed, "static") {
-        if let Some(name) = identifier_prefix(rest) {
-            out.push((name.to_string(), "static"));
-        }
-        return out;
-    }
-    for (keyword, kind) in [
-        ("fn", "fn"),
-        ("struct", "struct"),
-        ("enum", "enum"),
-        ("trait", "trait"),
-        ("type", "type"),
-        ("mod", "mod"),
-        ("class", "class"),
-        ("def", "def"),
-        ("function", "function"),
-        ("interface", "interface"),
-    ] {
-        if let Some(rest) = keyword_rest(trimmed, keyword) {
-            if let Some(name) = identifier_prefix(rest) {
-                out.push((name.to_string(), kind));
-            }
-            return out;
-        }
-    }
-    out
-}
-
-#[derive(Debug)]
-struct SymbolSuggestion {
-    name: String,
-    kind: &'static str,
-    line: usize,
-    preview: String,
-    score: usize,
-}
-
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut curr = vec![0usize; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[b.len()]
-}
-
-fn is_subsequence(query: &str, candidate: &str) -> bool {
-    let mut chars = candidate.chars();
-    query.chars().all(|q| chars.by_ref().any(|c| c == q))
-}
-
-fn common_prefix_len(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(a, b)| a == b).count()
-}
-
-fn fuzzy_symbol_score(query: &str, candidate: &str) -> Option<usize> {
-    let query = query.trim().to_ascii_lowercase();
-    let candidate = candidate.trim().to_ascii_lowercase();
-    if query.is_empty() || candidate.is_empty() {
-        return None;
-    }
-    if query == candidate {
-        return Some(0);
-    }
-    if candidate.starts_with(&query) {
-        return Some(10 + candidate.len().saturating_sub(query.len()));
-    }
-    if candidate.contains(&query) {
-        return Some(30 + candidate.len().saturating_sub(query.len()));
-    }
-    let distance = levenshtein_distance(&query, &candidate);
-    let max_len = query.chars().count().max(candidate.chars().count());
-    if distance <= (max_len / 3).max(2) {
-        return Some(50 + distance * 4 + candidate.len().abs_diff(query.len()));
-    }
-    if is_subsequence(&query, &candidate) {
-        return Some(90 + candidate.len().saturating_sub(query.len()));
-    }
-    let prefix = common_prefix_len(&query, &candidate);
-    if prefix >= 3 || prefix * 2 >= query.chars().count().min(candidate.chars().count()) {
-        return Some(
-            120usize
-                .saturating_sub(prefix)
-                .saturating_add(candidate.len().abs_diff(query.len())),
-        );
-    }
-    None
-}
-
-fn render_symbol_not_found_suggestions(
-    path: &Path,
-    root: &Path,
-    content: &str,
-    starts: &[usize],
-    symbol: &str,
-) -> Option<String> {
-    use std::fmt::Write as _;
-
-    let display = display_path_relative(path, root);
-    let mut suggestions = Vec::new();
-    for idx in 0..starts.len() {
-        let line = source_line_at(content, starts, idx)?;
-        for (name, kind) in symbol_candidates_for_line(line) {
-            if let Some(score) = fuzzy_symbol_score(symbol, &name) {
-                suggestions.push(SymbolSuggestion {
-                    name,
-                    kind,
-                    line: idx + 1,
-                    preview: summarize_inline(line.trim(), 100),
-                    score,
-                });
-            }
-        }
-    }
-    suggestions.sort_by(|a, b| {
-        a.score
-            .cmp(&b.score)
-            .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    let mut seen = HashSet::new();
-    suggestions.retain(|s| seen.insert((s.name.clone(), s.line)));
-    if suggestions.is_empty() {
-        return None;
-    }
-
-    let mut out = String::from("Did you mean:\n");
-    for suggestion in suggestions.into_iter().take(READ_SYMBOL_SUGGESTION_LIMIT) {
-        let _ = writeln!(
-            out,
-            "- {} @ {display}:{} ({}) — {}",
-            suggestion.name, suggestion.line, suggestion.kind, suggestion.preview
-        );
-    }
-    Some(out)
-}
-
-fn item_start_for_open_brace(content: &str, starts: &[usize], open_line: usize) -> Option<usize> {
-    let line = source_line_at(content, starts, open_line)?;
-    let before_open = line
-        .split_once('{')
-        .map(|(before, _)| before)
-        .unwrap_or(line)
-        .trim();
-    if item_signature_line_match(before_open) {
-        return Some(open_line);
-    }
-    if !before_open.is_empty()
-        && !before_open.starts_with(')')
-        && !before_open.starts_with("where ")
-    {
-        return None;
-    }
-    let min = open_line.saturating_sub(12);
-    let mut idx = open_line.saturating_sub(1);
-    loop {
-        let line = source_line_at(content, starts, idx)?;
-        let trimmed = line.trim();
-        if item_signature_line_match(trimmed) {
-            return Some(idx);
-        }
-        if idx == 0 || idx == min || trimmed.is_empty() {
-            return None;
-        }
-        idx -= 1;
-    }
-}
-
-fn find_enclosing_source_block(
-    content: &str,
-    starts: &[usize],
-    target: usize,
-) -> Option<(usize, usize)> {
-    let mut stack: Vec<(usize, bool)> = Vec::new();
-    let mut first_any = None;
-    for idx in 0..starts.len() {
-        let line = source_line_at(content, starts, idx)?;
-        for byte in line.bytes() {
-            match byte {
-                b'{' => {
-                    let item_start = item_start_for_open_brace(content, starts, idx);
-                    stack.push((item_start.unwrap_or(idx), item_start.is_some()));
-                }
-                b'}' => {
-                    if let Some((start, item_like)) = stack.pop()
-                        && start <= target
-                        && target <= idx
-                    {
-                        if item_like {
-                            return Some((start, idx));
-                        }
-                        if first_any.is_none() {
-                            first_any = Some((start, idx));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if let Some((start, _)) = stack
-        .iter()
-        .rev()
-        .find(|(start, item_like)| *item_like && *start <= target)
-    {
-        return Some((*start, starts.len().saturating_sub(1)));
-    }
-    if first_any.is_some() {
-        return first_any;
-    }
-    stack
-        .iter()
-        .rev()
-        .find(|(start, _)| *start <= target)
-        .map(|(start, _)| (*start, starts.len().saturating_sub(1)))
-}
-
-fn paragraph_line_window(content: &str, starts: &[usize], target: usize) -> (usize, usize) {
-    let mut start = target;
-    while start > 0 {
-        let prev = source_line_at(content, starts, start - 1).unwrap_or("");
-        if prev.trim().is_empty() {
-            break;
-        }
-        start -= 1;
-    }
-    let mut end = target;
-    while end + 1 < starts.len() {
-        let next = source_line_at(content, starts, end + 1).unwrap_or("");
-        if next.trim().is_empty() {
-            break;
-        }
-        end += 1;
-    }
-    (start, end)
-}
-
-fn find_line_window(
-    content: &str,
-    starts: &[usize],
-    line_no: usize,
-    context: usize,
-) -> Option<(usize, usize)> {
-    if line_no == 0 || line_no > starts.len() {
-        return None;
-    }
-    let target = line_no - 1;
-    let (start, end) = find_enclosing_source_block(content, starts, target)
-        .unwrap_or_else(|| paragraph_line_window(content, starts, target));
-    Some((
-        start.saturating_sub(context),
-        end.saturating_add(context)
-            .min(starts.len().saturating_sub(1)),
-    ))
-}
-
-fn find_symbol_window(
-    content: &str,
-    starts: &[usize],
-    symbol: &str,
-    context: usize,
-) -> Option<(usize, usize)> {
-    let idx = (0..starts.len()).find(|idx| {
-        source_line_at(content, starts, *idx).is_some_and(|line| symbol_line_match(line, symbol))
-    })?;
-    let mut end = idx;
-    let mut brace_depth = 0i32;
-    let mut seen_open = false;
-    for i in idx..starts.len() {
-        let line = source_line_at(content, starts, i)?;
-        for byte in line.bytes() {
-            match byte {
-                b'{' => {
-                    brace_depth += 1;
-                    seen_open = true;
-                }
-                b'}' => brace_depth -= 1,
-                _ => {}
-            }
-        }
-        end = i;
-        if seen_open && brace_depth <= 0 {
-            break;
-        }
-        if !seen_open && i > idx && line.trim().is_empty() {
-            end = i.saturating_sub(1);
-            break;
-        }
-    }
-    Some((
-        idx.saturating_sub(context),
-        end.saturating_add(context)
-            .min(starts.len().saturating_sub(1)),
-    ))
-}
-
-fn render_line_window(
-    content: &str,
-    starts: &[usize],
-    start: usize,
-    end: usize,
-    cap: usize,
-) -> String {
-    let mut capture = LimitedTextCapture::new(cap);
-    for idx in start..=end {
-        if let Some(line) = source_line_at(content, starts, idx) {
-            let rendered = format!("{}\t{}\n", idx + 1, line);
-            if !capture.try_push_unit(&rendered) {
-                return capture.finish(&format!(
-                    "Pass a smaller context or use read_file offset={} to continue.",
-                    idx + 1
-                ));
-            }
-        }
-    }
-    capture.finish("")
 }
 
 fn text_tool_capture_cap(context_mode: ContextMode) -> usize {
@@ -7985,8 +7441,17 @@ fn execute_tool_with_cache_for_context(
             let symbol = input["symbol"]
                 .as_str()
                 .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let line_no = match input["line"].as_u64() {
+                .filter(|symbol| !symbol.is_empty());
+            if symbol.is_some_and(|symbol| symbol.chars().any(char::is_control)) {
+                return Err("symbol must not contain control characters".to_string());
+            }
+            if symbol.is_some_and(|symbol| symbol.len() > read_symbol::SELECTOR_MAX_BYTES) {
+                return Err(format!(
+                    "symbol exceeds the {} byte limit",
+                    read_symbol::SELECTOR_MAX_BYTES
+                ));
+            }
+            let line = match input["line"].as_u64() {
                 Some(value) => Some(
                     usize::try_from(value)
                         .ok()
@@ -7996,8 +7461,7 @@ fn execute_tool_with_cache_for_context(
                 None if input["line"].is_null() => None,
                 None => return Err("line must be a positive integer".to_string()),
             };
-            let selector_count = (symbol.is_some() as usize) + (line_no.is_some() as usize);
-            if selector_count != 1 {
+            if (symbol.is_some() as usize) + (line.is_some() as usize) != 1 {
                 return Err("provide exactly one of symbol or line".to_string());
             }
             let context = match input["context"].as_u64() {
@@ -8009,7 +7473,7 @@ fn execute_tool_with_cache_for_context(
             let path = canonical_read_path(root, path_str)?;
             let content = read_utf8_file_with_limit(
                 &path,
-                READ_SYMBOL_INPUT_MAX_BYTES,
+                read_symbol::INPUT_MAX_BYTES,
                 interrupt,
                 "read_symbol",
             )
@@ -8020,41 +7484,22 @@ fn execute_tool_with_cache_for_context(
                     error
                 }
             })?;
-            let starts = source_line_starts(&content);
-            if starts.is_empty() {
-                return Err(format!("{} is empty", path.display()));
-            }
-            let (start, end) = if let Some(line_no) = line_no {
-                let Some(window) = find_line_window(&content, &starts, line_no, context) else {
-                    return Err(format!(
-                        "line {line_no} is outside {} ({} lines)",
-                        path.display(),
-                        starts.len()
-                    ));
-                };
-                window
-            } else {
-                let symbol = symbol.expect("selector count checked");
-                let Some(window) = find_symbol_window(&content, &starts, symbol, context) else {
-                    let hint = tool_policy::tool_input_advisory("read_symbol", input)
-                        .unwrap_or_else(|| format!("Search first with rg -n '{symbol}' {}, then retry read_symbol with an exact symbol or line.", path.display()));
-                    let suggestions =
-                        render_symbol_not_found_suggestions(&path, root, &content, &starts, symbol)
-                            .unwrap_or_default();
-                    return Err(format!(
-                        "symbol '{symbol}' not found in {}\n{suggestions}{hint}",
-                        path.display()
-                    ));
-                };
-                window
-            };
-            Ok(render_line_window(
+            let selector = symbol.map_or_else(
+                || read_symbol::Selector::Line(line.expect("selector checked")),
+                read_symbol::Selector::Symbol,
+            );
+            let rust = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"));
+            read_symbol::read(
                 &content,
-                &starts,
-                start,
-                end,
-                READ_FILE_EXPLICIT_CAPTURE_CAP,
-            ))
+                &display_path_relative(&path, root),
+                rust,
+                selector,
+                context,
+                read_file_explicit_capture_cap(context_mode),
+            )
         }
         "write_file" => {
             let prepared = prepared_mutation
@@ -11587,6 +11032,29 @@ struct WorkLedger {
     verification: Vec<VerificationRecord>,
     diagnostics: Vec<WorkflowDiagnosticRecord>,
     next_actions: Vec<String>,
+    code_loop: CodeLoopState,
+}
+
+impl WorkLedger {
+    fn cached_verification(
+        &self,
+        spec: &verification::CommandSpec,
+        fingerprint: &str,
+    ) -> Option<&VerificationRecord> {
+        self.verification.iter().rev().find(|record| {
+            record.command_key == spec.key && record.workspace_fingerprint == fingerprint
+        })
+    }
+
+    fn required_gates_passed(&self, fingerprint: &str) -> bool {
+        verification::REQUIRED_GATES.iter().all(|scope| {
+            self.verification.iter().any(|record| {
+                record.status == "passed"
+                    && record.workspace_fingerprint == fingerprint
+                    && record.scope.split('+').any(|value| value == *scope)
+            })
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -11597,31 +11065,6 @@ struct WorkflowDiagnosticRecord {
     errors: usize,
     warnings: usize,
     duration_ms: u64,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct VerificationRecord {
-    name: String,
-    command: String,
-    status: String,
-    exit_code: Option<i32>,
-    duration_ms: u64,
-    artifact: Option<String>,
-    validates: Vec<String>,
-}
-
-impl Default for VerificationRecord {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            command: String::new(),
-            status: "unknown".to_string(),
-            exit_code: None,
-            duration_ms: 0,
-            artifact: None,
-            validates: Vec::new(),
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -11812,9 +11255,11 @@ fn render_work_ledger_prompt(ledger: &WorkLedger) -> String {
         out.push_str("verification:\n");
         for record in ledger.verification.iter().rev().take(6).rev() {
             out.push_str(&format!(
-                "- {}: {} ({}ms){}\n",
+                "- {}: {} scope={} fingerprint={} ({}ms){}\n",
                 summarize_inline(&record.name, 160),
                 summarize_inline(&record.status, 40),
+                summarize_inline(&record.scope, 24),
+                summarize_inline(&record.workspace_fingerprint, 16),
                 record.duration_ms,
                 record
                     .artifact

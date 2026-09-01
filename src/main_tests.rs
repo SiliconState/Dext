@@ -6900,9 +6900,15 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
             .work_ledger
             .files_changed
             .push("/tmp/scratch.py".to_string());
+        saved.work_ledger.code_loop.note_mutation();
+        saved.work_ledger.code_loop.note_verification("focused");
         saved.work_ledger.verification.push(VerificationRecord {
             name: "cargo test focused".to_string(),
             command: "cargo test focused".to_string(),
+            command_key: "cargo test focused".to_string(),
+            workspace_fingerprint: "fingerprint-1".to_string(),
+            mutation_sequence: 1,
+            scope: "focused".to_string(),
             status: "passed".to_string(),
             exit_code: Some(0),
             duration_ms: 123,
@@ -7040,6 +7046,11 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         assert!(!loaded.allowed.contains("write_file"));
         assert_eq!(loaded.work_ledger.objective, "preserve session metadata");
         assert_eq!(loaded.work_ledger.verification[0].status, "passed");
+        assert_eq!(
+            loaded.work_ledger.verification[0].workspace_fingerprint,
+            "fingerprint-1"
+        );
+        assert_eq!(loaded.work_ledger.code_loop.mutation_sequence, 1);
         assert!(
             loaded
                 .work_ledger
@@ -11879,11 +11890,54 @@ fn sync_runner_reaps_background_children_after_shell_exit() {
 }
 
 #[test]
+fn code_loop_and_verification_guards_persist_strategy_state() {
+    let mut state = CodeLoopState::default();
+    for _ in 0..2 {
+        state.note_mutation();
+        state.note_verification("focused");
+    }
+    state.note_mutation();
+    let blocked = state
+        .guard("V")
+        .expect("third edit/verify cycle must pivot");
+    assert!(blocked.contains("PIVOT REQUIRED"), "{blocked}");
+    state.note_review();
+    assert!(state.guard("V").is_none());
+
+    let spec = verification::classify("cargo test -p dext parser").unwrap();
+    let all_scopes = verification::REQUIRED_GATES.join("+");
+    let mut ledger = WorkLedger::default();
+    ledger.verification.push(VerificationRecord {
+        name: "required gates".to_string(),
+        command_key: spec.key.clone(),
+        workspace_fingerprint: "abc".to_string(),
+        scope: all_scopes,
+        status: "passed".to_string(),
+        ..Default::default()
+    });
+    assert!(ledger.required_gates_passed("abc"));
+    assert!(ledger.cached_verification(&spec, "abc").is_some());
+    assert!(!ledger.required_gates_passed("stale"));
+
+    let all_scopes = verification::REQUIRED_GATES.join("+");
+    let mut changed = WorkLedger::default();
+    changed.verification.push(VerificationRecord {
+        name: "workspace-changing gates".to_string(),
+        command_key: "cargo test --release".to_string(),
+        workspace_fingerprint: "abc".to_string(),
+        scope: all_scopes,
+        status: "workspace-changed".to_string(),
+        ..Default::default()
+    });
+    assert!(!changed.required_gates_passed("abc"));
+}
+
+#[test]
 fn tool_result_metadata_parses_status_and_artifact_hints() {
     let failed = "exit: 101\n--- stdout ---\n--- stderr ---\ncompile failed";
     assert_eq!(parse_tool_exit_code("bash", false, failed), Some(101));
     assert_eq!(parse_tool_exit_code("rg", true, "match\n"), None);
-    assert!(looks_like_verification_command("cargo nextest run ui"));
+    assert!(verification::classify("cargo nextest run ui").is_some());
 
     // SIGPIPE truncation (`… | head` under pipefail): complete stdout is
     // success; empty stdout or any other nonzero exit stays a failure.
@@ -12182,7 +12236,7 @@ fn read_symbol_honors_interrupt_and_input_bound() {
 
     let oversized = root.join("oversized.rs");
     let file = std::fs::File::create(&oversized).expect("create oversized fixture");
-    file.set_len(READ_SYMBOL_INPUT_MAX_BYTES as u64 + 1)
+    file.set_len(read_symbol::INPUT_MAX_BYTES as u64 + 1)
         .expect("size oversized fixture");
     let error = execute_tool(
         "read_symbol",
@@ -12261,9 +12315,28 @@ fn read_symbol_not_found_suggests_nearby_symbols() {
     )
     .expect_err("missing symbol should suggest neighbors");
     assert!(err.contains("Did you mean:"), "{err}");
-    assert!(err.contains("load_provider_catalog @ lib.rs:1"), "{err}");
+    assert!(err.contains("load_provider_catalog at line 1"), "{err}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_symbol_parser_accepts_repository_rust_sources() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sources = rust_files_for_diagnostics(root);
+    assert!(!sources.is_empty());
+    for (path, content) in sources {
+        let display = path.display().to_string();
+        read_symbol::read(
+            &content,
+            &display,
+            true,
+            read_symbol::Selector::Line(1),
+            0,
+            READ_FILE_EXPLICIT_CAPTURE_CAP,
+        )
+        .unwrap_or_else(|error| panic!("{display}: {error}"));
+    }
 }
 
 #[test]
@@ -12285,6 +12358,8 @@ fn read_symbol_requires_exactly_one_selector() {
     for input in [
         json!({"path": "lib.rs", "line": 0}),
         json!({"path": "lib.rs", "line": "12"}),
+        json!({"path": "lib.rs", "symbol": "target\nnext"}),
+        json!({"path": "lib.rs", "symbol": "x".repeat(read_symbol::SELECTOR_MAX_BYTES + 1)}),
         json!({"path": "lib.rs", "symbol": 12}),
         json!({"path": "lib.rs", "line": 12, "context": 51}),
     ] {
@@ -16660,6 +16735,7 @@ fn compaction_evidence_includes_ledger_verification_provider_health_and_tool_ref
         duration_ms: 42,
         artifact: Some(".dext/artifacts/verify.json".to_string()),
         validates: vec!["session discovery".to_string()],
+        ..Default::default()
     });
     let mut health = ProviderHealthLedger::default();
     health.providers.insert(
@@ -16861,6 +16937,7 @@ fn session_analysis_surfaces_provenance_and_verification() {
                 duration_ms: 10,
                 artifact: Some("artifact.json".to_string()),
                 validates: Vec::new(),
+                ..Default::default()
             }],
             ..Default::default()
         },
@@ -17755,6 +17832,7 @@ fn session_brief_renders_distilled_continuation_packet() {
         duration_ms: 12,
         artifact: None,
         validates: Vec::new(),
+        ..Default::default()
     });
 
     let history = vec![
@@ -26729,8 +26807,8 @@ fn lean_tool_profile_keeps_descriptions_useful_and_schemas_slim() {
         .find(|tool| tool.name == "read_symbol")
         .expect("read_symbol tool");
     let wired = tools::wire_tools(&[read_symbol], ToolProfile::Lean);
-    assert!(wired[0].description.contains("enclosing line block"));
-    assert!(wired[0].description.contains("exclusive"));
+    assert!(wired[0].description.contains("enclosing block"));
+    assert!(wired[0].description.contains("Rust AST selectors"));
 
     let write_file = provider_tool_definitions()
         .into_iter()
