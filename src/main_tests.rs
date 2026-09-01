@@ -281,6 +281,17 @@ fn last_tool_result(history: &[Message]) -> Option<(&str, &str)> {
     })
 }
 
+const CANONICAL_REQUIRED_GATES_COMMAND: &str = concat!(
+    "set -euo pipefail\n",
+    "cargo fmt --all -- --check\n",
+    "cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings\n",
+    "cargo audit --deny warnings\n",
+    "cargo deny check licenses\n",
+    "cargo test -p ratatui-core --lib --locked\n",
+    "cargo build --release --locked\n",
+    "cargo test --release --locked",
+);
+
 fn drain_events(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
@@ -315,6 +326,37 @@ fn git_ok(root: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn init_verification_fixture(root: &Path, package_dir: &str) {
+    let package = root.join(package_dir);
+    std::fs::create_dir_all(package.join("src")).expect("create fixture source directory");
+    std::fs::write(root.join(".gitignore"), "target/\n").expect("write fixture ignore");
+    std::fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname = \"verification-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write fixture manifest");
+    std::fs::write(
+        package.join("src/lib.rs"),
+        "pub fn answer() -> u8 { 42 }\n\n#[test]\nfn answer_is_stable() { assert_eq!(answer(), 42); }\n",
+    )
+    .expect("write fixture source");
+    let lock = Command::new("cargo")
+        .current_dir(&package)
+        .args(["generate-lockfile"])
+        .output()
+        .expect("generate fixture lockfile");
+    assert!(
+        lock.status.success(),
+        "cargo generate-lockfile failed: {}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    git_ok(root, &["init", "-q"]);
+    git_ok(root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(root, &["config", "user.name", "Test"]);
+    git_ok(root, &["add", "."]);
+    git_ok(root, &["commit", "-q", "-m", "base"]);
 }
 
 #[test]
@@ -6903,6 +6945,8 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         saved.work_ledger.code_loop.note_mutation();
         saved.work_ledger.code_loop.note_verification("focused");
         saved.work_ledger.verification.push(VerificationRecord {
+            evidence_version: verification::EVIDENCE_VERSION,
+            gate_eligible: false,
             name: "cargo test focused".to_string(),
             command: "cargo test focused".to_string(),
             command_key: "cargo test focused".to_string(),
@@ -9689,6 +9733,458 @@ fn tool_round_records_only_successful_file_mutations_in_work_ledger() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn dext_install_detection_follows_the_local_path_target() {
+    let root = temp_test_dir("dext-install-target-detection");
+    let sibling = root.join("sibling");
+    std::fs::create_dir_all(&sibling).expect("create sibling package");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = 'dext' # self package\nversion = '0.0.0'\n",
+    )
+    .expect("write Dext manifest");
+    std::fs::write(
+        sibling.join("Cargo.toml"),
+        "[package]\nname = \"sibling\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write sibling manifest");
+    git_ok(&root, &["init", "-q"]);
+
+    assert!(tool_round::command_installs_dext(
+        "cargo install --path . --force --locked",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "cd sibling && cargo install --path .. --force --locked",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "cargo install --path='.' --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "cd 'sibling' && cargo install --path .. --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "env -C sibling cargo install --path .. --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "sudo -D sibling cargo install --path .. --force",
+        &root
+    ));
+    assert!(!tool_round::command_installs_dext(
+        "cargo install ripgrep",
+        &root
+    ));
+    assert!(!tool_round::command_installs_dext(
+        "cargo install --path sibling --force",
+        &root
+    ));
+    assert!(!tool_round::command_installs_dext(
+        "cargo install ripgrep && cargo install --path sibling",
+        &root
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn approved_project_hooks_disable_verification_cache_reuse() {
+    let root = temp_test_dir("verification-hook-cache-bypass");
+    init_verification_fixture(&root, "fixture");
+    let command = "cd fixture && cargo test --locked";
+    let spec = verification::classify(command).expect("classify verification");
+    let fingerprint = verification::workspace_fingerprint(&root).expect("fingerprint repository");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    agent.hooks.pre_tool.push(Hook {
+        tool_match: Some("bash".to_string()),
+        command: "printf hook-ran; exit 42".to_string(),
+    });
+    agent.work_ledger.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        name: "cached pass".to_string(),
+        command: command.to_string(),
+        command_key: spec.key,
+        workspace_fingerprint: fingerprint,
+        scope: "focused".to_string(),
+        status: "passed".to_string(),
+        ..Default::default()
+    });
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-hook-cache-bypass".to_string(),
+                "bash".to_string(),
+                json!({"command": command}),
+            )],
+            iterations: 1,
+            turn_id: "turn-hook-cache-bypass".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: true,
+        }))
+        .expect("execute uncached verification planning");
+
+    let (content, status) = last_tool_result(&agent.history).expect("verification result");
+    assert!(content.contains("pre_tool hook blocked"), "{content}");
+    assert!(content.contains("hook-ran"), "{content}");
+    assert!(!content.contains("verification cache hit"), "{content}");
+    assert_eq!(status, "error");
+    assert_eq!(agent.work_ledger.verification.len(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tool_round_retries_failed_verification_in_its_effective_directory() {
+    let root = temp_test_dir("verification-retry-directory");
+    init_verification_fixture(&root, "nested");
+
+    let command = "cd nested && cargo test --locked";
+    let spec = verification::classify(command).expect("classify focused verification");
+    let fingerprint = verification::workspace_fingerprint(&root).expect("fingerprint repository");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    agent.work_ledger.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        name: "prior failure".to_string(),
+        command: command.to_string(),
+        command_key: spec.key.clone(),
+        workspace_fingerprint: fingerprint.clone(),
+        scope: "focused".to_string(),
+        status: "failed".to_string(),
+        ..Default::default()
+    });
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-retry-verification".to_string(),
+                "bash".to_string(),
+                json!({"command": command}),
+            )],
+            iterations: 1,
+            turn_id: "turn-retry-verification".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute verification retry");
+
+    assert_eq!(agent.work_ledger.verification.len(), 2);
+    let latest = agent.work_ledger.verification.last().unwrap();
+    assert_eq!(latest.command_key, spec.key);
+    assert_eq!(latest.workspace_fingerprint, fingerprint);
+    assert_eq!(latest.status, "passed");
+    let (content, status) = last_tool_result(&agent.history).expect("verification result");
+    assert!(!content.contains("verification cache hit"), "{content}");
+    assert_eq!(status, "passed");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tool_round_rejects_mixed_verification_batches_before_execution() {
+    let root = temp_test_dir("mixed-verification-batch");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let outcome = runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![
+                (
+                    "call-blocked-write".to_string(),
+                    "write_file".to_string(),
+                    json!({"path": "blocked.txt", "content": "should not exist\n"}),
+                ),
+                (
+                    "call-blocked-verification".to_string(),
+                    "bash".to_string(),
+                    json!({"command": "cargo test --locked"}),
+                ),
+            ],
+            iterations: 1,
+            turn_id: "turn-mixed-verification-batch".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("reject mixed batch");
+
+    assert!(!outcome.mutation_succeeded);
+    assert!(!root.join("blocked.txt").exists());
+    assert!(agent.work_ledger.verification.is_empty());
+    let results = agent
+        .history
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            Block::ToolResult {
+                content, is_error, ..
+            } => Some((content, is_error)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|(content, is_error)| {
+        content.contains("verification batch blocked") && **is_error == Some(true)
+    }));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn tool_round_allows_verification_only_batches_without_cache_shortcuts() {
+    let root = temp_test_dir("verification-only-batch");
+    init_verification_fixture(&root, "fixture");
+    let fingerprint = verification::workspace_fingerprint(&root).expect("fingerprint repository");
+
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    let cached = verification::classify("cd fixture && cargo test --locked").unwrap();
+    agent.work_ledger.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        name: "cached pass".to_string(),
+        command: "cd fixture && cargo test --locked".to_string(),
+        command_key: cached.key,
+        workspace_fingerprint: fingerprint.clone(),
+        scope: "focused".to_string(),
+        status: "passed".to_string(),
+        ..Default::default()
+    });
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![
+                (
+                    "call-batched-test".to_string(),
+                    "bash".to_string(),
+                    json!({"command": "cd fixture && cargo test --locked"}),
+                ),
+                (
+                    "call-batched-check".to_string(),
+                    "bash".to_string(),
+                    json!({"command": "cd fixture && cargo check --locked"}),
+                ),
+            ],
+            iterations: 1,
+            turn_id: "turn-verification-only-batch".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("execute verification-only batch");
+
+    assert_eq!(agent.work_ledger.verification.len(), 3);
+    for record in &agent.work_ledger.verification[1..] {
+        assert_eq!(record.status, "passed");
+        assert_eq!(record.workspace_fingerprint, fingerprint);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn canonical_install_is_gated_but_never_reused_from_cache() {
+    let root = temp_test_dir("install-not-cached");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"dext\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write manifest");
+    git_ok(&root, &["add", "Cargo.toml"]);
+    git_ok(&root, &["commit", "-q", "-m", "base"]);
+    let fingerprint = verification::workspace_fingerprint(&root).expect("fingerprint repository");
+    let command = "cargo install --path . --force --locked";
+    let spec = verification::classify(command).expect("classify install");
+
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    agent.hooks.pre_tool.push(Hook {
+        tool_match: Some("bash".to_string()),
+        command: "printf reached-hook; exit 42".to_string(),
+    });
+    let all_gates = verification::classify(CANONICAL_REQUIRED_GATES_COMMAND).unwrap();
+    agent.work_ledger.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        gate_eligible: true,
+        name: "all gates".to_string(),
+        command: CANONICAL_REQUIRED_GATES_COMMAND.to_string(),
+        command_key: all_gates.key,
+        workspace_fingerprint: fingerprint.clone(),
+        scope: verification::REQUIRED_GATES.join("+"),
+        status: "passed".to_string(),
+        ..Default::default()
+    });
+    agent.work_ledger.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        name: "prior install".to_string(),
+        command: command.to_string(),
+        command_key: spec.key,
+        workspace_fingerprint: fingerprint,
+        scope: "install".to_string(),
+        status: "passed".to_string(),
+        ..Default::default()
+    });
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-install-not-cached".to_string(),
+                "bash".to_string(),
+                json!({"command": command}),
+            )],
+            iterations: 1,
+            turn_id: "turn-install-not-cached".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: true,
+        }))
+        .expect("plan uncached install");
+
+    let (content, status) = last_tool_result(&agent.history).expect("install result");
+    assert!(content.contains("pre_tool hook blocked"), "{content}");
+    assert!(content.contains("reached-hook"), "{content}");
+    assert!(!content.contains("verification cache hit"), "{content}");
+    assert_eq!(status, "error");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn noncanonical_dext_install_is_blocked_before_execution() {
+    let root = temp_test_dir("noncanonical-install-blocked");
+    git_ok(&root, &["init", "-q"]);
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"dext\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write manifest");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-noncanonical-install".to_string(),
+                "bash".to_string(),
+                json!({"command": "env cargo install --path . --force"}),
+            )],
+            iterations: 1,
+            turn_id: "turn-noncanonical-install".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("block noncanonical install");
+
+    let (content, status) = last_tool_result(&agent.history).expect("install result");
+    assert!(
+        content.contains("standalone canonical command"),
+        "{content}"
+    );
+    assert_eq!(status, "error");
+    assert!(agent.work_ledger.verification.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn canonical_dext_install_from_nested_directory_is_blocked() {
+    let root = temp_test_dir("nested-install-blocked");
+    std::fs::create_dir_all(root.join("nested")).expect("create nested directory");
+    git_ok(&root, &["init", "-q"]);
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"host\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write host manifest");
+    std::fs::write(
+        root.join("nested/Cargo.toml"),
+        "[package]\nname = \"dext\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write nested Dext manifest");
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    runtime
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-nested-install".to_string(),
+                "bash".to_string(),
+                json!({"command": "cd nested && cargo install --path . --force --locked"}),
+            )],
+            iterations: 1,
+            turn_id: "turn-nested-install".to_string(),
+            objective_apply_fixes_allowed: true,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("block nested install");
+
+    let (content, status) = last_tool_result(&agent.history).expect("install result");
+    assert!(content.contains("Git checkout top-level"), "{content}");
+    assert_eq!(status, "error");
+    assert!(agent.work_ledger.verification.is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn pre_tool_hooks_receive_privacy_redacted_inputs() {
     let root = temp_test_dir("pre-tool-hook-input-redaction");
@@ -11904,32 +12400,95 @@ fn code_loop_and_verification_guards_persist_strategy_state() {
     state.note_review();
     assert!(state.guard("V").is_none());
 
-    let spec = verification::classify("cargo test -p dext parser").unwrap();
-    let all_scopes = verification::REQUIRED_GATES.join("+");
+    let all_gates = verification::classify(CANONICAL_REQUIRED_GATES_COMMAND).unwrap();
+    let release_gate = verification::classify("cargo test --release --locked").unwrap();
     let mut ledger = WorkLedger::default();
     ledger.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        gate_eligible: true,
         name: "required gates".to_string(),
-        command_key: spec.key.clone(),
+        command: CANONICAL_REQUIRED_GATES_COMMAND.to_string(),
+        command_key: all_gates.key.clone(),
         workspace_fingerprint: "abc".to_string(),
-        scope: all_scopes,
+        scope: all_gates.scope_label(),
         status: "passed".to_string(),
         ..Default::default()
     });
     assert!(ledger.required_gates_passed("abc"));
-    assert!(ledger.cached_verification(&spec, "abc").is_some());
+    assert!(ledger.cached_verification(&all_gates, "abc").is_some());
     assert!(!ledger.required_gates_passed("stale"));
 
-    let all_scopes = verification::REQUIRED_GATES.join("+");
+    ledger.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        gate_eligible: true,
+        name: "newer failed release gate".to_string(),
+        command: "cargo test --release --locked".to_string(),
+        command_key: release_gate.key.clone(),
+        workspace_fingerprint: "abc".to_string(),
+        scope: release_gate.scope_label(),
+        status: "failed".to_string(),
+        ..Default::default()
+    });
+    assert!(!ledger.required_gates_passed("abc"));
+    assert!(ledger.cached_verification(&all_gates, "abc").is_none());
+    assert!(ledger.cached_verification(&release_gate, "abc").is_none());
+
+    ledger.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        gate_eligible: true,
+        name: "newest passing release gate".to_string(),
+        command: "cargo test --release --locked".to_string(),
+        command_key: release_gate.key.clone(),
+        workspace_fingerprint: "abc".to_string(),
+        scope: release_gate.scope_label(),
+        status: "passed".to_string(),
+        ..Default::default()
+    });
+    assert!(ledger.required_gates_passed("abc"));
+    assert!(ledger.cached_verification(&all_gates, "abc").is_some());
+    assert!(ledger.cached_verification(&release_gate, "abc").is_some());
+
     let mut changed = WorkLedger::default();
     changed.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        gate_eligible: true,
         name: "workspace-changing gates".to_string(),
-        command_key: "cargo test --release".to_string(),
+        command: CANONICAL_REQUIRED_GATES_COMMAND.to_string(),
+        command_key: all_gates.key.clone(),
         workspace_fingerprint: "abc".to_string(),
-        scope: all_scopes,
+        scope: all_gates.scope_label(),
         status: "workspace-changed".to_string(),
         ..Default::default()
     });
     assert!(!changed.required_gates_passed("abc"));
+    assert!(changed.cached_verification(&all_gates, "abc").is_none());
+
+    let mut ineligible = WorkLedger::default();
+    ineligible.verification.push(VerificationRecord {
+        evidence_version: verification::EVIDENCE_VERSION,
+        gate_eligible: false,
+        name: "nested required gates".to_string(),
+        command: CANONICAL_REQUIRED_GATES_COMMAND.to_string(),
+        command_key: all_gates.key.clone(),
+        workspace_fingerprint: "abc".to_string(),
+        scope: all_gates.scope_label(),
+        status: "passed".to_string(),
+        ..Default::default()
+    });
+    assert!(!ineligible.required_gates_passed("abc"));
+    assert!(ineligible.cached_verification(&all_gates, "abc").is_none());
+
+    let mut legacy = WorkLedger::default();
+    legacy.verification.push(VerificationRecord {
+        name: "legacy unversioned gates".to_string(),
+        command: CANONICAL_REQUIRED_GATES_COMMAND.to_string(),
+        command_key: all_gates.key.clone(),
+        workspace_fingerprint: "abc".to_string(),
+        scope: all_gates.scope_label(),
+        status: "passed".to_string(),
+        ..Default::default()
+    });
+    assert!(!legacy.required_gates_passed("abc"));
 }
 
 #[test]
@@ -20197,6 +20756,7 @@ async fn side_effect_tool_does_not_execute_when_journal_start_fence_fails() -> R
 
 #[test]
 fn applying_current_policy_after_resume_clears_saved_privileged_grants() -> Result<()> {
+    let _guard = env_lock();
     let root = temp_test_dir("resume-policy");
     let mut source = test_agent(&root);
     source.set_resolved_approval_profile(ApprovalProfile::Always, ApprovalPolicySource::Cli);

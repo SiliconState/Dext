@@ -68,13 +68,14 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Rust source is capped at 8 MiB/1M lines and selectors at 1 KiB; grammar maintenance stays upstream instead of in a Dext-owned lexer.
 
 - `src/verification.rs`
-  - Verification command/scope classification and bounded content fingerprints over HEAD plus tracked and untracked workspace state.
-  - Only explicit shell-operator-free commands classify; wrappers, quoted text, and compound shell constructs never produce gate evidence.
-  - Reuse keys for identical verification, current-fingerprint required-gate evidence for Dext installation, and persistent edit/verification cycle accounting. Passing evidence requires identical pre/post-run fingerprints; a workspace-changing run records `workspace-changed` instead.
+  - Strict verification command/scope classification and bounded, canonical-checkout-path-bound content fingerprints over HEAD plus tracked and untracked workspace state.
+  - Only explicit shell-operator-free commands classify. One safe leading `cd` is bound into the case-sensitive reuse key and selects the fingerprinted checkout; wrappers, quoted text, shell expansion, later directory changes, and help/version/list/no-run probes never produce evidence.
+  - Required Dext gates use exact canonical command shapes. Versioned gate evidence is eligible only when executed from the Git top-level, and passing evidence requires identical pre/post-run fingerprints; legacy, stale, unavailable, or workspace-changing records cannot authorize installation.
 
 - `src/tool_round.rs`
   - Tool-call planning, approval inputs, checkpoint/journal boundaries, dispatch, and result normalization.
-  - Identical verification commands reuse prior current-fingerprint evidence; stale or workspace-changing results never satisfy Dext's install gate, and repeated edit/verification cycles require a meaningful (non-stat, nonempty) diff-review pivot.
+  - A single identical verification command reuses only its latest passing current-fingerprint evidence; a newer failure invalidates an older pass, and approved project hooks disable reuse so hook effects are not skipped. Verification-only batches run without cache shortcuts and snapshot each command at its execution boundary, while mixed verification/non-verification batches and multi-verification batches with active project hooks fail closed.
+  - A local `cargo install --path …` that resolves to the Dext package is never cache-reused, must use the standalone canonical locked command from the checkout top-level, and is rechecked immediately before execution against all latest gate results for the same path-bound fingerprint. Registry installs and precisely resolved local paths to other packages remain outside Dext's self-install gate; ambiguous directory-changing local installs inside a Dext checkout fail closed. Repeated edit/verification cycles require a meaningful non-stat, nonempty `git_diff` review pivot.
   - Interrupt-aware parallel read execution that returns one result for every provider tool-call ID even when queued tasks are aborted; native blocking reads observe the shared cancellation flag between bounded chunks.
   - Post-mutation invalidation of cached pack discovery before the next provider request.
   - Narrow runtime context supplied by `Agent`, which remains the facade.

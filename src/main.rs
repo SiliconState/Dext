@@ -11036,23 +11036,49 @@ struct WorkLedger {
 }
 
 impl WorkLedger {
+    fn latest_verification_for_scope(
+        &self,
+        scope: &str,
+        fingerprint: &str,
+    ) -> Option<&VerificationRecord> {
+        self.verification.iter().rev().find(|record| {
+            record.evidence_version == verification::EVIDENCE_VERSION
+                && record.gate_eligible
+                && record.workspace_fingerprint == fingerprint
+                && verification::classify(&record.command).is_some_and(|spec| {
+                    spec.key == record.command_key && spec.scopes.contains(&scope)
+                })
+        })
+    }
+
     fn cached_verification(
         &self,
         spec: &verification::CommandSpec,
         fingerprint: &str,
     ) -> Option<&VerificationRecord> {
-        self.verification.iter().rev().find(|record| {
-            record.command_key == spec.key && record.workspace_fingerprint == fingerprint
-        })
+        let record = self.verification.iter().rev().find(|record| {
+            record.evidence_version == verification::EVIDENCE_VERSION
+                && record.command_key == spec.key
+                && record.workspace_fingerprint == fingerprint
+                && verification::classify(&record.command)
+                    .is_some_and(|classified| classified.key == record.command_key)
+        })?;
+        (record.status == "passed"
+            && spec
+                .scopes
+                .iter()
+                .filter(|scope| verification::REQUIRED_GATES.contains(scope))
+                .all(|scope| {
+                    self.latest_verification_for_scope(scope, fingerprint)
+                        .is_some_and(|latest| latest.status == "passed")
+                }))
+        .then_some(record)
     }
 
     fn required_gates_passed(&self, fingerprint: &str) -> bool {
         verification::REQUIRED_GATES.iter().all(|scope| {
-            self.verification.iter().any(|record| {
-                record.status == "passed"
-                    && record.workspace_fingerprint == fingerprint
-                    && record.scope.split('+').any(|value| value == *scope)
-            })
+            self.latest_verification_for_scope(scope, fingerprint)
+                .is_some_and(|record| record.status == "passed")
         })
     }
 }
