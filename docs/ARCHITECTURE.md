@@ -60,7 +60,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 
 - `src/streaming.rs`
   - Provider-specific event validation/assembly, including a 4 MiB aggregate bound for local llama.cpp streamed reasoning.
-  - Provider-neutral streamed blocks and strict final tool-argument construction.
+  - Provider-neutral streamed blocks and strict final tool-argument construction. Anthropic `input_json_delta` events with empty or whitespace-only fragments preserve the start event's `{}` input, so valid no-argument calls reach ordinary tool validation instead of failing stream finalization; later nonempty fragments still replace that placeholder and assemble normally.
   - Anthropic implicit terminal handling completes open display blocks but never authorizes an unstopped tool call; explicitly stopped max-token calls are discarded only for EOF-shaped argument JSON, while malformed values remain errors.
 
 - `src/read_symbol.rs`

@@ -17717,6 +17717,22 @@ fn render_limited_csv_truncates_with_notice() {
 }
 
 #[test]
+fn empty_argument_detection_excludes_valid_no_argument_tools() {
+    let root = temp_test_dir("empty-argument-detection");
+    let agent = test_agent(&root);
+
+    assert!(!agent.tool_call_has_invalid_empty_arguments("todo_read", &json!({})));
+    assert!(agent.tool_call_has_invalid_empty_arguments("todo_read", &Value::Null));
+    assert!(agent.tool_call_has_invalid_empty_arguments("read_file", &json!({})));
+    assert!(agent.tool_call_has_invalid_empty_arguments("read_file", &Value::Null));
+    assert!(
+        !agent.tool_call_has_invalid_empty_arguments("read_file", &json!({"path": "README.md"}))
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn summarize_call_bash_collapses_newlines() {
     let summary = summarize_call("bash", &json!({"command": "echo one\n&& echo two"}));
     assert!(!summary.contains('\n'), "{summary}");
