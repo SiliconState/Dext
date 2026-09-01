@@ -14899,6 +14899,12 @@ impl Agent {
         }
     }
 
+    fn tool_call_has_invalid_empty_arguments(&self, name: &str, input: &Value) -> bool {
+        input.is_null()
+            || (input.as_object().is_some_and(|fields| fields.is_empty())
+                && self.validate_active_tool_input(name, input).is_err())
+    }
+
     fn tool_auto_approved(&self, name: &str, input: &Value) -> bool {
         if self.allowed.contains(name) {
             return true;
@@ -18134,9 +18140,7 @@ impl Agent {
 
             let empty_call_count = tool_calls
                 .iter()
-                .filter(|(_, _, input)| {
-                    input.as_object().is_some_and(|m| m.is_empty()) || input.is_null()
-                })
+                .filter(|(_, name, input)| self.tool_call_has_invalid_empty_arguments(name, input))
                 .count();
             turn_state.record_empty_tool_calls(empty_call_count);
             let empty_tool_call_loop_note = turn_state.empty_tool_call_loop_note();

@@ -548,6 +548,9 @@ fn parse_anthropic_frame(
                     )?;
                     let target = block.input_json.get_or_insert_default();
                     if target.trim() == "{}" {
+                        if fragment.trim().is_empty() {
+                            return Ok(updates);
+                        }
                         target.clear();
                     }
                     append_capped(contract, event, "tool arguments", target, fragment)?;
@@ -1678,6 +1681,104 @@ mod tests {
         }
         let error = parser.finish().unwrap_err().to_string();
         assert!(error.contains("arguments must be a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn anthropic_empty_input_deltas_preserve_empty_object_arguments() {
+        let contract = RequestContract::AnthropicMessages;
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_1","name":"todo_read","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"   "}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":1}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::ToolUse { id, name, input }]
+                if id == "call_1" && name == "todo_read" && input == &serde_json::json!({})
+        ));
+        assert_eq!(parsed.unfinished_tool_calls, 0);
+    }
+
+    #[test]
+    fn anthropic_empty_input_deltas_do_not_block_later_argument_json() {
+        let contract = RequestContract::AnthropicMessages;
+        let mut parser = ProviderStreamParser::new(contract, false);
+        for (event, data) in [
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"read_file","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"  "}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"README.md\"}"}}"#,
+            ),
+            (
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ] {
+            parser
+                .push_frame(SseFrame {
+                    event: Some(event.to_string()),
+                    data: Some(data.to_string()),
+                })
+                .unwrap();
+        }
+
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::ToolUse { input, .. }] if input == &serde_json::json!({"path": "README.md"})
+        ));
     }
 
     #[test]
