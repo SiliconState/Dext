@@ -19858,7 +19858,12 @@ fn model_context_window_uses_builtin_anthropic_profile_when_catalog_isolated() -
     }
 
     let result = {
-        for model in ["claude-sonnet-5", "claude-opus-5", "claude-fable-5"] {
+        for model in [
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-fable-5-1",
+            "claude-fable-5",
+        ] {
             assert_eq!(model_context_window(model), 1_000_000, "{model}");
         }
         assert_eq!(model_context_window("claude-sonnet-4-6"), 200_000);
@@ -21419,6 +21424,7 @@ fn anthropic_generation_pricing_matches_published_rates() {
         ("claude-opus-4-5-20251101", 5.0, 25.0, 0.5, 6.25),
         ("claude-opus-4-1", 15.0, 75.0, 1.5, 18.75),
         ("claude-sonnet-4-6", 3.0, 15.0, 0.3, 3.75),
+        ("claude-fable-5-1", 10.0, 50.0, 1.0, 12.5),
         ("claude-fable-5", 10.0, 50.0, 1.0, 12.5),
     ] {
         let pricing = for_model(model);
@@ -21442,7 +21448,7 @@ fn anthropic_wire_cost_is_repriced_for_supported_claude_models() {
     let mut agent = test_agent(&root);
     agent.provider_id = "anthropic".to_string();
     agent.api_provider = ApiProvider::Anthropic;
-    agent.model = "claude-fable-5".to_string();
+    agent.model = "claude-fable-5-1".to_string();
     let mut usage = Usage {
         input: 267_523,
         output: 7_024,
@@ -24195,7 +24201,7 @@ fn anthropic_subscription_headers_use_bearer_and_api_keys_do_not() -> Result<()>
     assert!(
         subscription.headers()["user-agent"]
             .to_str()?
-            .starts_with("claude-cli/2.1.224")
+            .starts_with("claude-cli/2.1.251")
     );
 
     let second = apply_provider_headers(
@@ -24455,7 +24461,7 @@ fn anthropic_subscription_body_is_scoped_and_preserves_adaptive_fields() -> Resu
     assert!(
         body["system"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("cc_version=2.1.224.f97"))
+            .is_some_and(|text| text.contains("cc_version=2.1.251.3e7"))
     );
     assert_eq!(
         body["system"][1]["text"],
@@ -25875,6 +25881,7 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
         ("claude-opus-4-8", ThinkingEffort::XHigh, "xhigh"),
         ("claude-opus-5", ThinkingEffort::XHigh, "xhigh"),
         ("claude-opus-5", ThinkingEffort::Max, "max"),
+        ("claude-fable-5-1", ThinkingEffort::Max, "max"),
         ("claude-fable-5", ThinkingEffort::Max, "max"),
     ] {
         agent.model = model.to_string();
@@ -25911,7 +25918,12 @@ fn anthropic_builtin_catalog_lists_generation_5_models() {
         .find(|profile| profile.id == "anthropic")
         .expect("anthropic profile");
     assert_eq!(profile.default_model, "claude-sonnet-4-6");
-    for model in ["claude-sonnet-5", "claude-opus-5", "claude-fable-5"] {
+    for model in [
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-fable-5-1",
+        "claude-fable-5",
+    ] {
         assert!(
             profile.models.iter().any(|entry| entry == model),
             "{model} missing from builtin catalog"

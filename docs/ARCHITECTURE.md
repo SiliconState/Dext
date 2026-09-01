@@ -47,7 +47,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Built-in GLM, ChatGPT/Codex, OpenAI, Anthropic, Kimi Code, DeepSeek, and local OpenAI-compatible profiles. Local llama.cpp Chat Completions explicitly control template thinking, capture streamed `reasoning_content` only for the built-in local identity or parsed loopback URL hosts, and leave cloud Chat Completions request/response handling unchanged.
   - Live llama.cpp runtime context probing for the local provider; unavailable local servers fall back cleanly without aborting startup.
   - API-key, ChatGPT OAuth, and Anthropic Claude Pro/Max OAuth login flows; runtime auth retains whether a resolved secret is an API key or OAuth token. OAuth callback binding is loopback-only, accepted connections use blocking I/O under one two-second complete-header deadline, result pages wait for exchange/storage completion, exchange/refresh transport is bounded and redirect-free, and active OAuth credentials are rechecked at user-turn boundaries.
-  - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs. Public adaptive Anthropic models (Sonnet 4.6, Sonnet 5, Opus 4.6/4.7/4.8, Opus 5, and Fable 5) omit `thinking.display`; transformed OAuth and API-key request fixtures verify the same adaptive shape.
+  - Request builders for Anthropic, OpenAI-compatible, and ChatGPT/Codex response APIs. Public adaptive Anthropic models (Sonnet 4.6, Sonnet 5, Opus 4.6/4.7/4.8, Opus 5, Fable 5.1, and Fable 5) omit `thinking.display`; transformed OAuth and API-key request fixtures verify the same adaptive shape.
   - Model alias normalization and provider/model switching helpers.
 
 - `src/claude_subscription.rs`

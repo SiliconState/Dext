@@ -803,6 +803,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 "claude-opus-4-8".to_string(),
                 "claude-opus-4-7".to_string(),
                 "claude-opus-4-6".to_string(),
+                "claude-fable-5-1".to_string(),
                 "claude-fable-5".to_string(),
                 "claude-sonnet-4-5".to_string(),
                 "claude-opus-4-1".to_string(),
@@ -828,6 +829,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             model_context_windows: HashMap::from([
                 ("claude-sonnet-5".to_string(), 1_000_000),
                 ("claude-opus-5".to_string(), 1_000_000),
+                ("claude-fable-5-1".to_string(), 1_000_000),
                 ("claude-fable-5".to_string(), 1_000_000),
             ]),
             model_effort_levels: HashMap::new(),
