@@ -5,6 +5,10 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use dext::sse::SseDecoder;
 use serde_json::json;
 
+#[allow(dead_code)]
+#[path = "../src/read_symbol.rs"]
+mod read_symbol;
+
 fn build_sse_buffer(event_count: usize) -> Vec<u8> {
     let mut buffer = String::with_capacity(event_count * 220);
     for index in 0..event_count {
@@ -57,5 +61,33 @@ fn bench_sse_decode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sse_decode);
+fn bench_read_symbol(c: &mut Criterion) {
+    let mut source = String::with_capacity(512 * 1024);
+    for index in 0..4_000 {
+        source.push_str(&format!(
+            "impl Type{index} {{ fn build() {{ let text = r#\"{{}}\"#; }} }}\n"
+        ));
+    }
+    let bytes = source.len() as u64;
+    let mut group = c.benchmark_group("read_symbol_rust_ast");
+    group.throughput(Throughput::Bytes(bytes));
+    group.measurement_time(Duration::from_secs(6));
+    group.bench_function("qualified_last_item", |b| {
+        b.iter(|| {
+            let output = read_symbol::read(
+                black_box(&source),
+                "fixture.rs",
+                true,
+                read_symbol::Selector::Symbol("Type3999::build"),
+                0,
+                16_000,
+            )
+            .expect("benchmark symbol lookup");
+            black_box(output)
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_sse_decode, bench_read_symbol);
 criterion_main!(benches);

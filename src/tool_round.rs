@@ -22,6 +22,8 @@ pub(crate) struct PlannedCall {
     pub(crate) local_sudo_auth_needed: bool,
     pub(crate) cache_key: Option<String>,
     pub(crate) bash_similarity_key: Option<String>,
+    pub(crate) verification_spec: Option<verification::CommandSpec>,
+    pub(crate) verification_fingerprint: Option<String>,
     pub(crate) prepared_mutation: Option<mutation_preview::PreparedMutation>,
     pub(crate) journal_record_id: Option<String>,
     pub(crate) plan: Plan,
@@ -119,10 +121,87 @@ impl Agent {
                 None
             };
 
+            let bash_mutates = name == "bash"
+                && input["command"]
+                    .as_str()
+                    .is_some_and(orchestrator::bash_command_likely_mutates_files);
+            let verification_spec = (name == "bash")
+                .then(|| input["command"].as_str().and_then(verification::classify))
+                .flatten();
+            let verification_fingerprint = verification_spec
+                .as_ref()
+                .and_then(|_| verification::workspace_fingerprint(&self.sandbox_root));
+
             let mut plan: Option<Plan> = None;
             let mut local_sudo_auth_needed = false;
             let mut prepared_mutation: Option<mutation_preview::PreparedMutation> = None;
             let journal_record_id: Option<String> = None;
+
+            if plan.is_none()
+                && let Some(spec) = verification_spec.as_ref()
+            {
+                if spec.is_install()
+                    && verification::is_dext_checkout(&self.sandbox_root)
+                    && verification_fingerprint.is_none()
+                {
+                    plan = Some(Plan::Immediate {
+                        content: "installation blocked: current workspace fingerprint is unavailable; inspect repository state and retry before installing Dext".to_string(),
+                        is_error: Some(true),
+                    });
+                }
+                if plan.is_none()
+                    && let Some(fingerprint) = verification_fingerprint.as_deref()
+                {
+                    let full_ready = self.work_ledger.required_gates_passed(fingerprint);
+                    if spec.is_install()
+                        && verification::is_dext_checkout(&self.sandbox_root)
+                        && !full_ready
+                    {
+                        plan = Some(Plan::Immediate {
+                            content: "installation blocked: the required Dext verification gates have not all passed for the current workspace fingerprint".to_string(),
+                            is_error: Some(true),
+                        });
+                    } else if let Some(record) =
+                        self.work_ledger.cached_verification(spec, fingerprint)
+                    {
+                        plan = Some(Plan::Immediate {
+                            content: format!(
+                                "verification cache hit: {} already {} for workspace {}{}",
+                                record.name,
+                                record.status,
+                                &fingerprint[..12.min(fingerprint.len())],
+                                record
+                                    .artifact
+                                    .as_ref()
+                                    .map(|path| format!("; artifact={path}"))
+                                    .unwrap_or_default()
+                            ),
+                            is_error: Some(record.status != "passed"),
+                        });
+                    }
+                }
+                if plan.is_none()
+                    && let Some(message) = self.work_ledger.code_loop.guard("V")
+                {
+                    plan = Some(Plan::Immediate {
+                        content: message,
+                        is_error: Some(true),
+                    });
+                }
+            }
+
+            let planned_mutation =
+                matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
+                    || bash_mutates && verification_spec.is_none();
+            if plan.is_none()
+                && planned_mutation
+                && let Some(message) = self.work_ledger.code_loop.guard("M")
+            {
+                plan = Some(Plan::Immediate {
+                    content: message,
+                    is_error: Some(true),
+                });
+            }
 
             if let Err(msg) = self.validate_active_tool_input(&name, &input) {
                 if let Some(budget_msg) = turn_state.tool_retry_guard(&name, &msg) {
@@ -151,10 +230,7 @@ impl Agent {
             }
 
             if plan.is_none()
-                && let Some(msg) = turn_state.bash_similarity_guard(
-                    bash_similarity_key.as_deref(),
-                    input["command"].as_str(),
-                )
+                && let Some(msg) = turn_state.bash_similarity_guard(bash_similarity_key.as_deref())
             {
                 emit_external_telemetry(self.sink.as_mut(), turn_state);
                 plan = Some(Plan::Immediate {
@@ -363,6 +439,8 @@ impl Agent {
                 local_sudo_auth_needed,
                 cache_key,
                 bash_similarity_key,
+                verification_spec,
+                verification_fingerprint,
                 prepared_mutation,
                 journal_record_id,
                 plan,
@@ -753,6 +831,8 @@ impl Agent {
                 local_sudo_auth_needed: _local_sudo_auth_needed,
                 cache_key,
                 bash_similarity_key,
+                verification_spec,
+                verification_fingerprint,
                 prepared_mutation: _prepared_mutation,
                 journal_record_id: _journal_record_id,
                 plan,
@@ -838,6 +918,14 @@ impl Agent {
                 // reporting its error.
                 extension_state_may_have_changed = true;
             }
+            if ok
+                && ran_tool
+                && name == "git_diff"
+                && input["stat"].as_bool() != Some(true)
+                && !content.trim().is_empty()
+            {
+                self.work_ledger.code_loop.note_review();
+            }
             if ok && ran_tool && matches!(name.as_str(), "write_file" | "edit_file" | "multi_edit")
             {
                 self.work_ledger_note_file_change(&input);
@@ -853,6 +941,7 @@ impl Agent {
             {
                 mutation_succeeded = true;
                 turn_state.mark_mutation_succeeded();
+                self.work_ledger.code_loop.note_mutation();
             }
             let privacy_redaction = self.privacy.apply_tool_output(&name, &input, content);
             content = privacy_redaction.text;
@@ -912,22 +1001,23 @@ impl Agent {
             } else {
                 None
             };
-            let is_verification_result = verification_command
-                .as_deref()
-                .is_some_and(looks_like_verification_command);
+            let is_verification_result = ran_tool && verification_spec.is_some();
             let mut artifact_display: Option<String> = None;
             let mut verification_status: Option<String> = None;
             if is_verification_result {
                 let command = verification_command.clone().unwrap_or_default();
+                let spec = verification_spec.as_ref().expect("verification classified");
+                let post_fingerprint = verification::workspace_fingerprint(&self.sandbox_root);
+                let fingerprint = verification_fingerprint.clone().unwrap_or_default();
                 let duration = started_at
                     .map(|t| t.elapsed())
                     .unwrap_or_else(|| std::time::Duration::from_millis(0));
                 let exit_code = parse_tool_exit_code(&name, ok, &content);
-                let status = if ok && exit_code.unwrap_or(0) == 0 {
-                    "passed"
-                } else {
-                    "failed"
-                };
+                let status = verification::evidence_status(
+                    ok && exit_code.unwrap_or(0) == 0,
+                    verification_fingerprint.as_deref(),
+                    post_fingerprint.as_deref(),
+                );
                 let artifact = write_verification_artifact(
                     &self.sandbox_root,
                     &self.session_id,
@@ -942,9 +1032,25 @@ impl Agent {
                 );
                 artifact_display = artifact.as_ref().map(|p| p.display().to_string());
                 verification_status = Some(status.to_string());
+                let scope = spec.scope_label();
+                self.work_ledger.code_loop.note_verification(
+                    if spec
+                        .scopes
+                        .iter()
+                        .any(|scope| verification::REQUIRED_GATES.contains(scope))
+                    {
+                        "full"
+                    } else {
+                        "focused"
+                    },
+                );
                 self.work_ledger.verification.push(VerificationRecord {
                     name: ui_summary.clone(),
                     command: command.clone(),
+                    command_key: spec.key.clone(),
+                    workspace_fingerprint: fingerprint.clone(),
+                    mutation_sequence: self.work_ledger.code_loop.mutation_sequence,
+                    scope,
                     status: status.to_string(),
                     exit_code,
                     duration_ms: millis_u64(duration),
@@ -958,7 +1064,10 @@ impl Agent {
                 if let Some(path) = artifact_display.as_deref() {
                     self.append_latest_log(
                         "verification",
-                        &format!("{status} {ui_summary} artifact={path}"),
+                        &format!(
+                            "{status} {ui_summary} fingerprint={} artifact={path}",
+                            &fingerprint[..12.min(fingerprint.len())]
+                        ),
                     );
                 }
             }

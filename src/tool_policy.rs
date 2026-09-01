@@ -347,6 +347,23 @@ pub(crate) fn tool_input_issue(name: &str, input: &Value) -> Option<String> {
             if !input["symbol"].is_null() && !input["symbol"].is_string() {
                 return Some("symbol must be a string".to_string());
             }
+            if input["symbol"]
+                .as_str()
+                .map(str::trim)
+                .is_some_and(|symbol| symbol.chars().any(char::is_control))
+            {
+                return Some("symbol must not contain control characters".to_string());
+            }
+            if input["symbol"]
+                .as_str()
+                .map(str::trim)
+                .is_some_and(|symbol| symbol.len() > crate::read_symbol::SELECTOR_MAX_BYTES)
+            {
+                return Some(format!(
+                    "symbol exceeds the {} byte limit",
+                    crate::read_symbol::SELECTOR_MAX_BYTES
+                ));
+            }
             if !input["line"].is_null()
                 && !input["line"]
                     .as_u64()

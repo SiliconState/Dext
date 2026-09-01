@@ -165,17 +165,8 @@ impl TurnRuntimeState {
         self.mutation_epoch = self.mutation_epoch.saturating_add(1);
     }
 
-    pub(crate) fn bash_similarity_guard(
-        &mut self,
-        similarity_key: Option<&str>,
-        command: Option<&str>,
-    ) -> Option<String> {
+    pub(crate) fn bash_similarity_guard(&mut self, similarity_key: Option<&str>) -> Option<String> {
         let sim_key = similarity_key?;
-        if let Some(cmd) = command
-            && is_safe_repeated_validation_command(cmd)
-        {
-            return None;
-        }
         let is_file_tool = sim_key.contains("write_file:") || sim_key.contains("edit_file:");
         let similar_unproductive = self
             .bash_attempt_history
@@ -2551,7 +2542,7 @@ mod tests {
         });
 
         let similarity = state
-            .bash_similarity_guard(Some("curl <url>"), Some("curl https://api.example.com"))
+            .bash_similarity_guard(Some("curl <url>"))
             .expect("similarity guard should trigger after repeated unproductive attempts");
         assert!(similarity.contains("pivot strategy"), "{similarity}");
     }
@@ -2614,7 +2605,7 @@ mod tests {
 
         assert!(
             validation_state
-                .bash_similarity_guard(Some("git diff --check"), Some("git diff --check"))
+                .bash_similarity_guard(Some("git diff --check"))
                 .is_none(),
             "safe validation reruns should not trigger similarity guard"
         );
@@ -2634,20 +2625,14 @@ mod tests {
         }
         assert!(
             stale_failure_state
-                .bash_similarity_guard(
-                    Some("set -euo pipefail cargo test --release"),
-                    Some("./verify-release.sh")
-                )
+                .bash_similarity_guard(Some("set -euo pipefail cargo test --release"))
                 .is_some(),
             "repeated stale failures are blocked before edits"
         );
         stale_failure_state.mark_mutation_succeeded();
         assert!(
             stale_failure_state
-                .bash_similarity_guard(
-                    Some("set -euo pipefail cargo test --release"),
-                    Some("./verify-release.sh")
-                )
+                .bash_similarity_guard(Some("set -euo pipefail cargo test --release"))
                 .is_none(),
             "file mutations should reset stale failed cargo-test similarity history"
         );

@@ -18,7 +18,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Agent state and loop, including value-owned parsed-stream outcomes, bounded incomplete-response continuation, preservation of every nonempty assistant response before any paired tool results are appended, and local-only ingestion/replay of llama.cpp `reasoning_content` within the current tool turn.
   - CLI parsing, top-level command dispatch, and structured `dext doctor` rendering.
   - Slash commands.
-  - Built-in tool implementations, including bounded, cancellation-aware native file reads and an 8 MiB `read_symbol` source-input ceiling.
+  - Built-in tool adapters; Rust-aware `read_symbol` parsing and verification fingerprinting are isolated in focused modules.
   - Eval harness.
   - Prompt/context assembly and compaction; Responses-based summaries reject incomplete terminals, retry within the bounded summary stream budget, and carry parsed usage across retries. Local llama.cpp current-turn reasoning replay participates in active context-pressure accounting while prior-turn thinking remains excluded. The standard built-in agent prompt is compact and invariant-driven, leaving tool-specific syntax in lean schemas rather than duplicating it in universal prose. Turn-stable guidance/pack/shelf prompt sections are cached separately from the volatile per-round environment tail. Context-file cache identity includes size/time metadata plus file identity/change metadata where the platform exposes it, so same-size atomic replacements invalidate within a turn. That tail omits toolset/schema labels already represented by provider definitions and host-only compaction thresholds, while retaining actionable runtime policy/model state; variable cwd/Git/provider/model values are byte-bounded and JSON-quoted when needed to remain one line, and persisted ledger/provider-health strings are collapsed and bounded before prompt rendering. Context strategy budgets omit all-zero rows before the first tool action, then remain explicit after actions to preserve reset/warning/pivot state. Each ancestor guidance/recall file is bounded at 1 MiB; provenance paths and raw-file hashes come from the same bounded reads actually included in the composed prompt. Aggregate project-context and per-section caps include headings or truncation markers as applicable, and wholly omitted files are excluded from prompt provenance.
   - Event emission through the sinks it owns.
@@ -63,8 +63,18 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Provider-neutral streamed blocks and strict final tool-argument construction.
   - Anthropic implicit terminal handling completes open display blocks but never authorizes an unstopped tool call; explicitly stopped max-token calls are discarded only for EOF-shaped argument JSON, while malformed values remain errors.
 
+- `src/read_symbol.rs`
+  - Error-tolerant Rust symbol and line lookup over rust-analyzer's full-fidelity syntax tree, including exact item ranges, direct impl/trait members, outer attributes/docs, ambiguity diagnostics, malformed-source rejection, and a bounded generic-language fallback.
+  - Rust source is capped at 8 MiB/1M lines and selectors at 1 KiB; grammar maintenance stays upstream instead of in a Dext-owned lexer.
+
+- `src/verification.rs`
+  - Verification command/scope classification and bounded content fingerprints over HEAD plus tracked and untracked workspace state.
+  - Only explicit shell-operator-free commands classify; wrappers, quoted text, and compound shell constructs never produce gate evidence.
+  - Reuse keys for identical verification, current-fingerprint required-gate evidence for Dext installation, and persistent edit/verification cycle accounting. Passing evidence requires identical pre/post-run fingerprints; a workspace-changing run records `workspace-changed` instead.
+
 - `src/tool_round.rs`
   - Tool-call planning, approval inputs, checkpoint/journal boundaries, dispatch, and result normalization.
+  - Identical verification commands reuse prior current-fingerprint evidence; stale or workspace-changing results never satisfy Dext's install gate, and repeated edit/verification cycles require a meaningful (non-stat, nonempty) diff-review pivot.
   - Interrupt-aware parallel read execution that returns one result for every provider tool-call ID even when queued tasks are aborted; native blocking reads observe the shared cancellation flag between bounded chunks.
   - Post-mutation invalidation of cached pack discovery before the next provider request.
   - Narrow runtime context supplied by `Agent`, which remains the facade.
