@@ -24,6 +24,7 @@ Never commit real credentials. The following must remain local/private:
 
 - `.env`
 - `.dext/`
+- `~/.dext/projects/*/sessions/*/artifacts/` verification/eval artifacts
 - `.dext/checkpoints/` recovery manifests, sidecars, blobs, and forensic manifest quarantines
 - repository-local `.auto/` experiment state
 - `~/.dext/auth.json`

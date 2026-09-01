@@ -5430,6 +5430,22 @@ fn provider_secret_commands_are_bounded_cached_and_credential_isolated() -> Resu
     result
 }
 
+#[test]
+fn hardened_subprocesses_remove_exported_bash_functions() {
+    let _guard = env_lock();
+    let name = "BASH_FUNC_dext_test%%";
+    let old = std::env::var_os(name);
+    unsafe { std::env::set_var(name, "() { printf hostile; }") };
+    let mut command = Command::new(bash_executable_path());
+    harden_internal_command_env(&mut command);
+    assert!(
+        command
+            .get_envs()
+            .any(|(key, value)| { key == std::ffi::OsStr::new(name) && value.is_none() })
+    );
+    restore_env_var(name, old);
+}
+
 #[cfg(unix)]
 #[test]
 fn internal_commands_ignore_tool_credential_opt_in_and_use_private_temp() -> Result<()> {
@@ -6946,11 +6962,14 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         saved.work_ledger.code_loop.note_verification("focused");
         saved.work_ledger.verification.push(VerificationRecord {
             evidence_version: verification::EVIDENCE_VERSION,
+            reusable: true,
+            runtime_id: "stale-runtime".to_string(),
             gate_eligible: false,
             name: "cargo test focused".to_string(),
             command: "cargo test focused".to_string(),
             command_key: "cargo test focused".to_string(),
             workspace_fingerprint: "fingerprint-1".to_string(),
+            completed_at_secs: unix_timestamp_secs(),
             mutation_sequence: 1,
             scope: "focused".to_string(),
             status: "passed".to_string(),
@@ -7093,6 +7112,16 @@ fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
         assert_eq!(
             loaded.work_ledger.verification[0].workspace_fingerprint,
             "fingerprint-1"
+        );
+        assert!(
+            loaded
+                .work_ledger
+                .cached_verification(
+                    &verification::classify("cargo test focused").unwrap(),
+                    "fingerprint-1"
+                )
+                .is_none(),
+            "resumed evidence from another runtime must remain review-only"
         );
         assert_eq!(loaded.work_ledger.code_loop.mutation_sequence, 1);
         assert!(
@@ -9771,6 +9800,65 @@ fn dext_install_detection_follows_the_local_path_target() {
         &root
     ));
     assert!(tool_round::command_installs_dext(
+        "sudo env cargo install --path . --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "sudo nice cargo install --path . --force --locked",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "env sudo command cargo install --path . --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "sudo env -C sibling cargo install --path .. --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "env sudo -D sibling cargo install --path .. --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "pushd sibling && cargo install --path .. --force",
+        &root
+    ));
+    std::fs::write(root.join("move.sh"), "cd sibling\n").expect("write cwd script");
+    assert!(tool_round::command_installs_dext(
+        ". ./move.sh && cargo install --path .. --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "$CARGO install --path . --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "cargo dextreview --path . --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "cargo self-install --path . --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "cargo-install --path . --force",
+        &root
+    ));
+    std::fs::create_dir_all(root.join("broken")).expect("create unresolved package");
+    std::fs::write(
+        root.join("broken/Cargo.toml"),
+        "[package\nname = \"dext\"\n",
+    )
+    .expect("write malformed manifest");
+    assert!(tool_round::command_installs_dext(
+        "cargo install --path broken --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
+        "doas /usr/bin/cargo install --path . --force",
+        &root
+    ));
+    assert!(tool_round::command_installs_dext(
         "sudo -D sibling cargo install --path .. --force",
         &root
     ));
@@ -9791,6 +9879,7 @@ fn dext_install_detection_follows_the_local_path_target() {
 
 #[test]
 fn approved_project_hooks_disable_verification_cache_reuse() {
+    let _guard = env_lock();
     let root = temp_test_dir("verification-hook-cache-bypass");
     init_verification_fixture(&root, "fixture");
     let command = "cd fixture && cargo test --locked";
@@ -9847,16 +9936,22 @@ fn approved_project_hooks_disable_verification_cache_reuse() {
 
 #[test]
 fn tool_round_retries_failed_verification_in_its_effective_directory() {
+    let _guard = env_lock();
     let root = temp_test_dir("verification-retry-directory");
     init_verification_fixture(&root, "nested");
 
     let command = "cd nested && cargo test --locked";
     let spec = verification::classify(command).expect("classify focused verification");
-    let fingerprint = verification::workspace_fingerprint(&root).expect("fingerprint repository");
     let mut agent = test_agent(&root);
     agent.session_enabled = false;
     agent.set_approval_profile(ApprovalProfile::Always);
     agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
+    let fingerprint = verification::workspace_fingerprint_for_tool(
+        &spec.effective_directory(&root).unwrap(),
+        &agent.pack_hook_env,
+        agent.sandbox_profile.as_str(),
+    )
+    .expect("fingerprint effective repository");
     agent.work_ledger.verification.push(VerificationRecord {
         evidence_version: verification::EVIDENCE_VERSION,
         name: "prior failure".to_string(),
@@ -9959,15 +10054,20 @@ fn tool_round_rejects_mixed_verification_batches_before_execution() {
 
 #[test]
 fn tool_round_allows_verification_only_batches_without_cache_shortcuts() {
+    let _guard = env_lock();
     let root = temp_test_dir("verification-only-batch");
     init_verification_fixture(&root, "fixture");
-    let fingerprint = verification::workspace_fingerprint(&root).expect("fingerprint repository");
-
     let mut agent = test_agent(&root);
     agent.session_enabled = false;
     agent.set_approval_profile(ApprovalProfile::Always);
     agent.set_sandbox_profile(SandboxProfile::DangerFullAccess);
     let cached = verification::classify("cd fixture && cargo test --locked").unwrap();
+    let fingerprint = verification::workspace_fingerprint_for_tool(
+        &cached.effective_directory(&root).unwrap(),
+        &agent.pack_hook_env,
+        agent.sandbox_profile.as_str(),
+    )
+    .expect("fingerprint effective repository");
     agent.work_ledger.verification.push(VerificationRecord {
         evidence_version: verification::EVIDENCE_VERSION,
         name: "cached pass".to_string(),
@@ -10017,6 +10117,7 @@ fn tool_round_allows_verification_only_batches_without_cache_shortcuts() {
 
 #[test]
 fn canonical_install_is_gated_but_never_reused_from_cache() {
+    let _guard = env_lock();
     let root = temp_test_dir("install-not-cached");
     git_ok(&root, &["init", "-q"]);
     git_ok(&root, &["config", "user.email", "test@example.invalid"]);
@@ -12418,6 +12519,11 @@ fn code_loop_and_verification_guards_persist_strategy_state() {
     assert!(ledger.cached_verification(&all_gates, "abc").is_some());
     assert!(!ledger.required_gates_passed("stale"));
 
+    ledger.verification[0].completed_at_secs =
+        unix_timestamp_secs().saturating_sub(verification::EVIDENCE_MAX_AGE_SECS + 1);
+    assert!(!ledger.required_gates_passed("abc"));
+    ledger.verification[0].completed_at_secs = unix_timestamp_secs();
+
     ledger.verification.push(VerificationRecord {
         evidence_version: verification::EVIDENCE_VERSION,
         gate_eligible: true,
@@ -12489,6 +12595,73 @@ fn code_loop_and_verification_guards_persist_strategy_state() {
         ..Default::default()
     });
     assert!(!legacy.required_gates_passed("abc"));
+}
+
+#[test]
+fn verification_artifacts_bind_metadata_to_the_effective_directory() {
+    let _guard = env_lock();
+    let old_sessions = std::env::var_os("DEXT_SESSIONS_DIR");
+    let root = temp_test_dir("verification-artifact-cwd");
+    let nested = root.join("nested");
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(&nested).expect("create nested checkout");
+    git_ok(&root, &["init", "-q"]);
+    git_ok(&root, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("outer.txt"), "outer\n").expect("write outer fixture");
+    git_ok(&root, &["add", "outer.txt"]);
+    git_ok(&root, &["commit", "-q", "-m", "outer"]);
+    git_ok(&root, &["branch", "-M", "outer-branch"]);
+    git_ok(&nested, &["init", "-q"]);
+    git_ok(&nested, &["config", "user.email", "test@example.invalid"]);
+    git_ok(&nested, &["config", "user.name", "Test"]);
+    std::fs::write(nested.join("inner.txt"), "inner\n").expect("write inner fixture");
+    git_ok(&nested, &["add", "inner.txt"]);
+    git_ok(&nested, &["commit", "-q", "-m", "inner"]);
+    git_ok(&nested, &["branch", "-M", "inner-branch"]);
+    unsafe { std::env::set_var("DEXT_SESSIONS_DIR", &sessions) };
+
+    let path = write_verification_artifact(
+        &root,
+        "artifact-cwd-session",
+        VerificationArtifactSpec {
+            name: "nested verification",
+            command: "cd nested && cargo test --locked",
+            command_cwd: &nested,
+            output: "API_KEY=artifact-secret-value",
+            exit_code: Some(0),
+            duration: std::time::Duration::from_millis(7),
+            status: "passed",
+            privacy: &PrivacyPolicy::default(),
+        },
+    )
+    .expect("write verification artifact");
+    let body: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read verification artifact"))
+            .expect("parse verification artifact");
+
+    restore_env_var("DEXT_SESSIONS_DIR", old_sessions);
+    assert_eq!(body["cwd"], nested.display().to_string());
+    assert_eq!(body["sandbox_root"], root.display().to_string());
+    assert_eq!(body["git"], "inner-branch");
+    assert!(
+        body["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("[REDACTED_SECRET]")),
+        "{body}"
+    );
+    assert!(!body.to_string().contains("artifact-secret-value"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path)
+            .expect("verification artifact metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

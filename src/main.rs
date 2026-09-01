@@ -3670,6 +3670,19 @@ fn scrub_startup_env_from_std_command(cmd: &mut Command) {
     for name in INTERNAL_STARTUP_ENV_VARS {
         cmd.env_remove(name);
     }
+    let mut function_exports = std::env::vars_os()
+        .map(|(key, _)| key)
+        .chain(cmd.get_envs().map(|(key, _)| key.to_os_string()))
+        .filter(|key| {
+            key.to_str()
+                .is_some_and(|name| name.starts_with("BASH_FUNC_") && name.ends_with("%%"))
+        })
+        .collect::<Vec<_>>();
+    function_exports.sort();
+    function_exports.dedup();
+    for key in function_exports {
+        cmd.env_remove(key);
+    }
 }
 
 pub(crate) fn harden_internal_command_env(cmd: &mut Command) {
@@ -6180,10 +6193,12 @@ fn artifact_safe_name(raw: &str) -> String {
 struct VerificationArtifactSpec<'a> {
     name: &'a str,
     command: &'a str,
+    command_cwd: &'a Path,
     output: &'a str,
     exit_code: Option<i32>,
     duration: std::time::Duration,
     status: &'a str,
+    privacy: &'a PrivacyPolicy,
 }
 
 fn write_verification_artifact(
@@ -6191,28 +6206,46 @@ fn write_verification_artifact(
     session_id: &str,
     spec: VerificationArtifactSpec<'_>,
 ) -> Option<PathBuf> {
-    let hash = sha256_hex_str(&format!("{}\n{}", spec.command, spec.output));
+    let name = spec.privacy.redact_text(spec.name).text;
+    let command = spec.privacy.redact_text(spec.command).text;
+    let output = spec.privacy.redact_text(spec.output).text;
+    let identity = format!(
+        "{}\0{}\0{}\0{:?}\0{}",
+        command,
+        output,
+        spec.command_cwd.display(),
+        spec.exit_code,
+        spec.status
+    );
+    let hash = sha256_hex_str(&identity);
     let short_hash = &hash[..12.min(hash.len())];
+    let mut nonce = [0u8; 6];
+    getrandom::fill(&mut nonce).ok()?;
+    let nonce = nonce
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let dir = session_artifacts_dir(root, session_id);
     let path = dir.join(format!(
-        "verify-{}-{}-{short_hash}.json",
+        "verify-{}-{}-{short_hash}-{nonce}.json",
         unix_timestamp_secs(),
-        artifact_safe_name(spec.name)
+        artifact_safe_name(&name)
     ));
     let body = json!({
         "type": "verification",
-        "name": spec.name,
-        "command": spec.command,
-        "cwd": root.display().to_string(),
+        "name": name,
+        "command": command,
+        "cwd": spec.command_cwd.display().to_string(),
+        "sandbox_root": root.display().to_string(),
         "status": spec.status,
         "exit_code": spec.exit_code,
         "duration_ms": millis_u64(spec.duration),
-        "output_tail": byte_suffix_at_char_boundary(spec.output, VERIFICATION_ARTIFACT_TAIL_CAP),
-        "output": spec.output,
-        "git": git_summary(root),
+        "output_tail": byte_suffix_at_char_boundary(&output, VERIFICATION_ARTIFACT_TAIL_CAP),
+        "output": output,
+        "git": git_summary(spec.command_cwd),
     });
     let bytes = serde_json::to_vec_pretty(&body).ok()?;
-    atomic_write_bytes(&path, &bytes).ok()?;
+    atomic_write_secret(&path, &bytes).ok()?;
     Some(path)
 }
 
@@ -11043,6 +11076,8 @@ impl WorkLedger {
     ) -> Option<&VerificationRecord> {
         self.verification.iter().rev().find(|record| {
             record.evidence_version == verification::EVIDENCE_VERSION
+                && record.reusable
+                && record.runtime_id == verification::runtime_id()
                 && record.gate_eligible
                 && record.workspace_fingerprint == fingerprint
                 && verification::classify(&record.command).is_some_and(|spec| {
@@ -11058,12 +11093,15 @@ impl WorkLedger {
     ) -> Option<&VerificationRecord> {
         let record = self.verification.iter().rev().find(|record| {
             record.evidence_version == verification::EVIDENCE_VERSION
+                && record.reusable
+                && record.runtime_id == verification::runtime_id()
                 && record.command_key == spec.key
                 && record.workspace_fingerprint == fingerprint
                 && verification::classify(&record.command)
                     .is_some_and(|classified| classified.key == record.command_key)
         })?;
         (record.status == "passed"
+            && verification::evidence_is_fresh(record.completed_at_secs, unix_timestamp_secs())
             && spec
                 .scopes
                 .iter()
@@ -11078,7 +11116,13 @@ impl WorkLedger {
     fn required_gates_passed(&self, fingerprint: &str) -> bool {
         verification::REQUIRED_GATES.iter().all(|scope| {
             self.latest_verification_for_scope(scope, fingerprint)
-                .is_some_and(|record| record.status == "passed")
+                .is_some_and(|record| {
+                    record.status == "passed"
+                        && verification::evidence_is_fresh(
+                            record.completed_at_secs,
+                            unix_timestamp_secs(),
+                        )
+                })
         })
     }
 }
@@ -22584,16 +22628,19 @@ fn run_eval_shell_command(
     let stdout = stdout.render("stdout");
     let stderr = stderr.render("stderr");
     let combined = format!("--- stdout ---\n{stdout}--- stderr ---\n{stderr}");
+    let privacy = PrivacyPolicy::from_env();
     let _ = write_verification_artifact(
         root,
         "eval",
         VerificationArtifactSpec {
             name: "eval-command",
             command,
+            command_cwd: root,
             output: &combined,
             exit_code: Some(code),
             duration,
             status: if code == 0 { "passed" } else { "failed" },
+            privacy: &privacy,
         },
     );
     Ok((code, stdout, stderr))

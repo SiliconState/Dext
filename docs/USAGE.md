@@ -462,6 +462,8 @@ dext session prune --days=7 --apply  # remove stale locks and stale lock-only pr
 
 Session commands can surface prompts, tool output, work-ledger entries, failure details, local paths, and credentials accidentally pasted by a user. Briefs omit the raw transcript but can still contain sensitive distilled data. Treat all session command output and exports as private unless reviewed.
 
+Verification command records and structured artifacts are session-private evidence. Cache/self-install authorization is limited to the current Dext process and expires after six hours; resumed records remain visible to `verify-log` but cannot satisfy gates. Artifacts use nonce-unique names, apply the active privacy policy to command/output text, use mode `0600` on Unix, and record the effective command directory plus selected sandbox root. Treat them as private despite redaction because local paths and non-secret output remain. A local Cargo `--path` install targeting Dext must be the standalone `cargo install --path . --force --locked` command from the checkout top level after all required gates pass in the same process; dynamic/aliased/wrapped/directory-changing or unresolved local targets fail closed, while a precisely resolved non-Dext package remains outside this self-install fence.
+
 ## Environment variables
 
 Provider/model:
