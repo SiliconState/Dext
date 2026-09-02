@@ -997,6 +997,7 @@ fn checkpoint_satisfied(checkpoint: &str, evidence: &ObjectiveEvidence) -> bool 
                         | "awk"
                         | "http"
                         | "git_diff"
+                        | "git_status"
                         | "git_log"
                         | "csvkit"
                 )
