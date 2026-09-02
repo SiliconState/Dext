@@ -604,7 +604,7 @@ fn current_pid() -> u32 {
 }
 
 #[cfg(unix)]
-fn process_is_running(pid: u32) -> bool {
+pub(crate) fn process_is_running(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -615,8 +615,38 @@ fn process_is_running(pid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
-fn process_is_running(pid: u32) -> bool {
+#[cfg(windows)]
+pub(crate) fn process_is_running(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        // Only a nonexistent pid fails with ERROR_INVALID_PARAMETER. Any other
+        // failure (ERROR_ACCESS_DENIED for another user's or a protected
+        // process) means something owns that pid, so mirror the Unix EPERM
+        // rule and keep the lock.
+        return std::io::Error::last_os_error().raw_os_error()
+            != Some(ERROR_INVALID_PARAMETER as i32);
+    }
+    let mut exit_code = 0u32;
+    let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) };
+    unsafe {
+        CloseHandle(process);
+    }
+    // An exited process whose handle someone still holds is openable but
+    // reports its real exit code. Windows reserves 259 (STILL_ACTIVE) for
+    // this query, so a process that exits with 259 reads as live.
+    queried == 0 || exit_code == STILL_ACTIVE as u32
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn process_is_running(pid: u32) -> bool {
     pid != 0
 }
 
