@@ -10786,6 +10786,54 @@ assert api_key == expected"#;
 }
 
 #[test]
+fn privacy_ignores_code_identifier_assignments_but_keeps_literal_secrets() {
+    let mut policy = PrivacyPolicy::default();
+    let code = r#"if let Some(token) = strip_bearer_token(trimmed) {
+auth.password = Some(password);
+counts.api_key = counts.api_key.saturating_add(1);
+let token = raw.trim_matches(|c: char| {
+token: format!("{}-{:x}", current_pid(), unix_timestamp_nanos()),
+token: record.token,
+let password = auth.password.take()?;
+if let Some(auth) = local_sudo_auth.as_ref() {
+let token = trimmed
+let mut token = trimmed;
+const TOKEN = other_value;
+password = Self::DEFAULT_PASSWORD;
+self.api_key = self.api_key.saturating_add(other.api_key);"#;
+
+    let redacted = policy.apply_tool_output("read_file", &json!({}), code.to_string());
+
+    assert_eq!(redacted.text, code);
+    assert_eq!(redacted.counts.total(), 0);
+    assert_eq!(policy.findings.total(), 0);
+
+    let literal_api_key = ["abcdef", "123456"].concat();
+    let literal_password = ["sunshine", "12"].concat();
+    let google_token = ["ya29.a0AfH6SMB", &"x".repeat(40)].concat();
+    let jwt = [
+        "eyJhbGciOiJIUzI1NiJ9",
+        "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    ]
+    .join(".");
+    let quoted_password = ["my(pa", "ss)"].concat();
+    let literals = format!(
+        "API_KEY={literal_api_key}\nexport TOKEN={literal_api_key}\npassword: {literal_password}\ndb.password={literal_password}\naccess_token={google_token}\ntoken={jwt}\npassword = \"{quoted_password}\""
+    );
+
+    let redacted = policy.apply_tool_output("read_file", &json!({}), literals);
+
+    assert_eq!(redacted.counts.api_key, 7, "{}", redacted.text);
+    assert_eq!(redacted.text.matches("[REDACTED_SECRET]").count(), 7);
+    assert!(!redacted.text.contains(&literal_api_key));
+    assert!(!redacted.text.contains(&literal_password));
+    assert!(!redacted.text.contains(&google_token));
+    assert!(!redacted.text.contains(&jwt));
+    assert!(!redacted.text.contains(&quoted_password));
+}
+
+#[test]
 fn slash_privacy_toggles_runtime_policy() {
     let root = temp_test_dir("privacy-slash");
     let mut agent = test_agent(&root);

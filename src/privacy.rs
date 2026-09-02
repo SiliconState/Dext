@@ -660,11 +660,59 @@ pub(crate) fn secret_assignment_value_spans(line: &str) -> Vec<(usize, usize)> {
             continue;
         };
         scan_from = end.max(scan_from);
-        if secret_assignment_value_looks_real(&line[start..end]) {
-            spans.push((start, end));
+        let value = &line[start..end];
+        if !secret_assignment_value_looks_real(value) {
+            continue;
         }
+        let quoted = line[..start].ends_with(['"', '\'', '`']);
+        if !quoted && unquoted_assignment_value_is_code(prefix, value) {
+            continue;
+        }
+        spans.push((start, end));
     }
     spans
+}
+
+/// Unquoted right-hand sides that can only be source code rather than literal
+/// secrets: calls/indexing/blocks/paths, member-access chains, and bare
+/// identifiers in `let`/`const`/`var`-style declarations. Quoted values are
+/// never treated as code, so `password = "my(pass)"` still redacts.
+pub(crate) fn unquoted_assignment_value_is_code(prefix: &str, value: &str) -> bool {
+    if value.contains(['(', '[', '{']) || value.contains("::") {
+        return true;
+    }
+    if is_member_access_chain(value) {
+        return true;
+    }
+    is_identifier(value) && declaration_keyword_precedes_key(prefix)
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+// JWT and OAuth tokens also contain dots, but at least one of their segments
+// (a base64 payload or signature) is longer than any plausible identifier.
+const MEMBER_ACCESS_SEGMENT_MAX_BYTES: usize = 32;
+
+fn is_member_access_chain(value: &str) -> bool {
+    value.contains('.')
+        && value.split('.').all(|segment| {
+            is_identifier(segment) && segment.len() <= MEMBER_ACCESS_SEGMENT_MAX_BYTES
+        })
+}
+
+fn declaration_keyword_precedes_key(prefix: &str) -> bool {
+    let words = prefix.split_whitespace().collect::<Vec<_>>();
+    words.len() >= 2
+        && matches!(
+            words[words.len() - 2],
+            "let" | "mut" | "const" | "var" | "val" | "static"
+        )
 }
 
 pub(crate) fn secret_assignment_candidate_span(
