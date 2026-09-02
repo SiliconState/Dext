@@ -16707,11 +16707,24 @@ fn stream_recovery_reason_is_contract_scoped() {
         None
     );
     assert_eq!(
-        stream_recovery_reason(RequestContract::OpenAiChatCompletions, None, 1),
+        stream_recovery_reason(RequestContract::OpenAiChatCompletions, Some("length"), 1)
+            .as_deref(),
+        Some("unfinished_tool_call")
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::OpenAiChatCompletions, None, 1).as_deref(),
+        Some("unfinished_tool_call")
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::OpenAiChatCompletions, Some("length"), 0),
         None
     );
     assert_eq!(
         stream_recovery_reason(RequestContract::ChatGptResponses, Some("completed"), 1),
+        None
+    );
+    assert_eq!(
+        stream_recovery_reason(RequestContract::OpenAiResponses, Some("completed"), 1),
         None
     );
 }
@@ -27306,6 +27319,127 @@ async fn anthropic_unfinished_tool_call_automatically_continues() {
         event,
         AgentEvent::Warn(message)
             if message.contains("Dropped 1 unfinished tool call") && message.contains("continuing the turn")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnDiagnostics {
+            last_retry_reason: Some(reason),
+            ..
+        } if reason == "incomplete response (unfinished_tool_call)"
+    )));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn openai_chat_length_truncated_tool_call_automatically_continues() {
+    let root = temp_test_dir("openai-chat-length-tool-recovery");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    let server = std::thread::spawn(move || {
+        fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set read timeout");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read request");
+                assert!(read > 0, "client closed before request completed");
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read request body");
+                assert!(read > 0, "client closed before request body completed");
+                request.extend_from_slice(&buf[..read]);
+            }
+            request[header_end..header_end + content_length].to_vec()
+        }
+
+        let responses = [
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"README\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Recovered.\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        ];
+        let mut bodies = Vec::new();
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            bodies.push(read_request_body(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+        bodies
+    });
+
+    let mut agent = test_agent(&root);
+    agent.provider_id = "local".to_string();
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.provider_requires_api_key = false;
+    agent.api_key.clear();
+    agent.base_url = format!("http://{addr}");
+    agent.model = DEFAULT_LOCAL_MODEL.to_string();
+    agent.max_iterations = Some(1);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+
+    agent
+        .chat("Continue the existing work.".to_string())
+        .await
+        .expect("length-truncated OpenAI tool call should recover");
+    let bodies = server.join().expect("server thread");
+    assert_eq!(
+        bodies.len(),
+        2,
+        "truncation must trigger exactly one recovery request"
+    );
+    let retry = String::from_utf8_lossy(&bodies[1]);
+    assert!(retry.contains("recovery 1/3"), "{retry}");
+    assert!(agent.history.iter().any(|message| {
+        message.role == "assistant"
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == "Recovered."))
+    }));
+    assert!(
+        !agent.history.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::ToolUse { name, .. } if name == "write_file"))
+        }),
+        "the truncated call must never reach history as executable"
+    );
+    let events = drain_events(&mut rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Warn(message)
+            if message.contains("Dropped 1 unfinished tool call")
+                && message.contains("stop_reason=length")
+                && message.contains("continuing the turn")
     )));
     assert!(events.iter().any(|event| matches!(
         event,

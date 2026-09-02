@@ -366,7 +366,12 @@ fn stream_recovery_reason(
     chatgpt_incomplete_reason(contract, stop_reason)
         .map(str::to_string)
         .or_else(|| {
-            (contract == RequestContract::AnthropicMessages && unfinished_tool_calls > 0)
+            // Anthropic (max_tokens) and OpenAI Chat Completions (length)
+            // both report output-limit truncation through dropped tool calls.
+            (matches!(
+                contract,
+                RequestContract::AnthropicMessages | RequestContract::OpenAiChatCompletions
+            ) && unfinished_tool_calls > 0)
                 .then(|| "unfinished_tool_call".to_string())
         })
 }
