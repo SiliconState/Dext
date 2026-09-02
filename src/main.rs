@@ -4875,6 +4875,16 @@ fn prepare_external_tool(
             }
             Ok(("git".to_string(), args, None))
         }
+        "git_status" => {
+            let mut args = safe_git_inspection_args(root, "status")?;
+            args.push("--porcelain=v1".to_string());
+            args.push("--branch".to_string());
+            if let Some(path) = optional_git_string(input, "git_status", "path")? {
+                args.push("--".to_string());
+                args.push(git_tool_pathspec(root, "git_status", path)?);
+            }
+            Ok(("git".to_string(), args, None))
+        }
         "git_log" => {
             let count = match input.get("count") {
                 None | Some(Value::Null) => 10,
@@ -6153,7 +6163,7 @@ fn bash_sigpipe_with_output(content: &str) -> bool {
 fn parse_tool_exit_code(name: &str, ok: bool, content: &str) -> Option<i32> {
     match name {
         "bash" => parse_bash_exit_code(content),
-        "fd" | "rg" | "jq" | "fzf" | "awk" | "csvkit" | "git_diff" | "git_log" => {
+        "fd" | "rg" | "jq" | "fzf" | "awk" | "csvkit" | "git_diff" | "git_status" | "git_log" => {
             if ok {
                 None
             } else {
@@ -11514,6 +11524,7 @@ fn command_looks_like_binary_hunt(command: &str) -> bool {
 fn context_strategy_for_tool(name: &str, input: &Value) -> Option<ContextStrategy> {
     match name {
         "git_diff" if input["stat"].as_bool().unwrap_or(false) => Some(ContextStrategy::GitStatus),
+        "git_status" => Some(ContextStrategy::GitStatus),
         "http" => Some(ContextStrategy::HttpUrlHunt),
         "bash" => {
             let command = input["command"].as_str().unwrap_or("");

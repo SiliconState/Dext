@@ -431,7 +431,14 @@ impl PrivacyPolicy {
             && self.strict_paths
             && matches!(
                 tool_name,
-                "read_file" | "read_symbol" | "fd" | "rg" | "jq" | "git_diff" | "git_log"
+                "read_file"
+                    | "read_symbol"
+                    | "fd"
+                    | "rg"
+                    | "jq"
+                    | "git_diff"
+                    | "git_status"
+                    | "git_log"
             ))
         {
             return None;

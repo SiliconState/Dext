@@ -248,6 +248,16 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "git_status",
+            description: "Show working-tree status through hardened git (porcelain v1 with a branch header): staged, unstaged, untracked, renamed, and conflicted paths plus ahead/behind tracking. Optional path narrows the scope. Read-only: pagers, hooks, fsmonitor, and credential helpers are disabled and the index is never refreshed. Output is capped.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional file or directory to scope the status. Defaults to entire repo."}
+                }
+            }),
+        },
+        Tool {
             name: "git_log",
             description: "Show recent git log entries. Returns oneline format by default. Useful for understanding recent changes.",
             input_schema: json!({
@@ -375,6 +385,11 @@ const TOOL_SPECS: &[ToolSpec] = &[
         &[],
         PARALLEL_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
     ),
+    tool(
+        "git_status",
+        &[],
+        PARALLEL_SAFE | EXTERNAL_PROCESS | DEFAULT_PROFILE,
+    ),
     tool("git_log", &[], PARALLEL_SAFE | EXTERNAL_PROCESS),
     tool(
         "git_commit",
@@ -456,6 +471,7 @@ fn lean_description(name: &str, fallback: &str) -> String {
         "http" => "HTTPie-style request; response capped.",
         "awk" => "Run awk with optional stdin.",
         "git_diff" => "Read capped Git diff/stat; use stat first when broad.",
+        "git_status" => "Read hardened git status (porcelain v1 + branch); optional path scope.",
         "git_log" => "Show recent git log.",
         "git_commit" => "Stage and commit files.",
         "todo_read" => "Read project todos.",

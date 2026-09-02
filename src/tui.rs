@@ -3067,7 +3067,11 @@ fn turn_tool_summary(counts: &HashMap<String, usize>) -> Option<(usize, String)>
         (&["edit_file", "multi_edit"], "edit", "edits"),
         (&["bash"], "command", "commands"),
         (&["write_file"], "write", "writes"),
-        (&["git_diff", "git_log", "git_commit"], "git op", "git ops"),
+        (
+            &["git_diff", "git_status", "git_log", "git_commit"],
+            "git op",
+            "git ops",
+        ),
         (&["todo_read", "todo_write"], "todo op", "todo ops"),
         (&["jq", "awk", "csvkit"], "data op", "data ops"),
         (&["http"], "request", "requests"),
@@ -11539,6 +11543,7 @@ mod tests {
             ("bash".to_string(), 20),
             ("write_file".to_string(), 1),
             ("git_diff".to_string(), 6),
+            ("git_status".to_string(), 1),
             ("git_log".to_string(), 2),
             ("git_commit".to_string(), 1),
             ("todo_read".to_string(), 2),
@@ -11550,14 +11555,14 @@ mod tests {
 
         let (total, summary) = turn_tool_summary(&counts).expect("summary");
 
-        assert_eq!(total, 115);
+        assert_eq!(total, 116);
         assert!(summary.contains("43 reads"), "{summary}");
         assert!(summary.contains("20 searches"), "{summary}");
         assert!(summary.contains("4 finds"), "{summary}");
         assert!(summary.contains("9 edits"), "{summary}");
         assert!(summary.contains("20 commands"), "{summary}");
         assert!(summary.contains("1 write"), "{summary}");
-        assert!(summary.contains("9 git ops"), "{summary}");
+        assert!(summary.contains("10 git ops"), "{summary}");
         assert!(summary.contains("5 todo ops"), "{summary}");
         assert!(summary.contains("1 data op"), "{summary}");
         assert!(summary.contains("2 requests"), "{summary}");
@@ -11584,6 +11589,7 @@ mod tests {
             "bash",
             "write_file",
             "git_diff",
+            "git_status",
             "git_log",
             "git_commit",
             "todo_read",
@@ -11616,15 +11622,15 @@ mod tests {
             .iter()
             .rev()
             .find_map(|line| match line {
-                Line_::Info(msg) if msg.starts_with("18 tools · ") => Some(msg.as_str()),
+                Line_::Info(msg) if msg.starts_with("19 tools · ") => Some(msg.as_str()),
                 _ => None,
             })
             .expect("turn summary");
-        assert!(summary.starts_with("18 tools · "), "{summary}");
+        assert!(summary.starts_with("19 tools · "), "{summary}");
         assert!(summary.contains("1 search"), "{summary}");
         assert!(summary.contains("1 find"), "{summary}");
         assert!(summary.contains("1 write"), "{summary}");
-        assert!(summary.contains("3 git ops"), "{summary}");
+        assert!(summary.contains("4 git ops"), "{summary}");
         assert!(summary.contains("2 todo ops"), "{summary}");
         assert!(summary.contains("3 data ops"), "{summary}");
         assert!(summary.contains("1 request"), "{summary}");

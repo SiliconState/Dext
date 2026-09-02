@@ -8623,6 +8623,7 @@ fn side_effect_capability_covers_every_permission_required_tool() {
         "jq",
         "fzf",
         "git_diff",
+        "git_status",
         "git_log",
         "todo_read",
     ] {
@@ -10928,6 +10929,7 @@ fn default_and_frugal_toolsets_keep_core_capabilities() {
         "rg",
         "http",
         "git_diff",
+        "git_status",
         "git_commit",
         "todo_read",
         "todo_write",
@@ -14806,6 +14808,41 @@ fn git_log_builds_separate_flag_and_count_args() {
 }
 
 #[test]
+fn git_status_builds_hardened_porcelain_args() {
+    let root = temp_test_dir("git-status-argv");
+    let root = std::fs::canonicalize(&root).unwrap();
+    let hardened_prefix = [
+        "--no-pager",
+        "--no-optional-locks",
+        "--literal-pathspecs",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "protocol.allow=never",
+        "status",
+        "--porcelain=v1",
+        "--branch",
+    ];
+
+    let (bin, args, stdin) =
+        prepare_external_tool("git_status", &json!({}), &root).expect("prepare git_status");
+    assert_eq!(bin, "git");
+    assert!(stdin.is_none());
+    assert_eq!(args, hardened_prefix);
+
+    let (_, args_with_path, _) =
+        prepare_external_tool("git_status", &json!({"path": "src/main.rs"}), &root)
+            .expect("prepare git_status with path");
+    let mut expected = hardened_prefix.to_vec();
+    expected.extend(["--", "src/main.rs"]);
+    assert_eq!(args_with_path, expected);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn fd_rejects_empty_pattern_early() {
     let root = temp_test_dir("fd-empty-pattern");
     let root = std::fs::canonicalize(&root).unwrap();
@@ -15472,8 +15509,16 @@ fn git_tools_reject_option_injection_malformed_fields_and_outside_paths() {
         prepare_external_tool("git_log", &input, &root)
             .expect_err("malformed git_log field must fail closed");
     }
+    for input in [
+        json!({"path": false}),
+        json!({"path": 3}),
+        json!({"path": ""}),
+    ] {
+        prepare_external_tool("git_status", &input, &root)
+            .expect_err("malformed git_status field must fail closed");
+    }
 
-    for tool in ["git_diff", "git_log"] {
+    for tool in ["git_diff", "git_status", "git_log"] {
         let error = prepare_external_tool(tool, &json!({"path": outside.to_string_lossy()}), &root)
             .expect_err("outside Git path must be rejected");
         assert!(error.contains("outside"), "{tool}: {error}");
@@ -18908,7 +18953,7 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
     let openai_responses = agent.wire_tools_openai_responses();
     let chatgpt_responses = agent.wire_tools_chatgpt();
 
-    assert_eq!(neutral_tools.len(), 13, "default capability count drifted");
+    assert_eq!(neutral_tools.len(), 14, "default capability count drifted");
     for (index, neutral) in neutral_tools.iter().enumerate() {
         let anthropic = &anthropic_cache_on[index];
         assert_eq!(anthropic.name, neutral.name);
@@ -21812,6 +21857,7 @@ fn provider_runtime_and_slash_registries_are_split() {
         .map(|tool| tool.name)
         .collect();
     assert!(default_names.contains("read_file"));
+    assert!(default_names.contains("git_status"));
     assert!(!default_names.contains("jq"));
     assert!(!default_names.contains("csvkit"));
     assert!(!default_names.contains("git_log"));
@@ -22521,6 +22567,7 @@ fn api_provider_detects_openai_base_url() {
 #[test]
 fn git_tools_are_parallel_safe_and_read_only() {
     assert!(is_parallel_safe_tool("git_diff"));
+    assert!(is_parallel_safe_tool("git_status"));
     assert!(is_parallel_safe_tool("git_log"));
     assert!(is_parallel_safe_tool("todo_read"));
     assert!(!is_parallel_safe_tool("git_commit"));
@@ -22532,6 +22579,7 @@ fn new_tools_in_correct_permission_category() {
     assert!(needs_permission("git_commit"));
     assert!(needs_permission("todo_write"));
     assert!(!needs_permission("git_diff"));
+    assert!(!needs_permission("git_status"));
     assert!(!needs_permission("git_log"));
     assert!(!needs_permission("todo_read"));
 }
@@ -27760,7 +27808,11 @@ fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
     let openai_chat = agent.wire_tools_oai();
     let openai_responses = agent.wire_tools_openai_responses();
     let chatgpt_responses = agent.wire_tools_chatgpt();
-    assert_eq!(neutral.len(), 14);
+    assert_eq!(
+        neutral.len(),
+        15,
+        "14 default static tools plus one dynamic runtime tool"
+    );
     assert_eq!(anthropic.len(), neutral.len());
     assert_eq!(openai_chat.len(), neutral.len());
     assert_eq!(openai_responses.len(), neutral.len());

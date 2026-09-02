@@ -1643,6 +1643,9 @@ fn avoidable_shell_segment_replacement(segment: &str) -> Option<(String, &'stati
             "diff" if git_diff_args_have_native_equivalent(&words[subcommand_idx + 1..]) => {
                 Some(("git diff".to_string(), "git_diff"))
             }
+            "status" if git_status_args_have_native_equivalent(&words[subcommand_idx + 1..]) => {
+                Some(("git status".to_string(), "git_status"))
+            }
             _ => None,
         };
     }
@@ -1722,6 +1725,27 @@ fn git_diff_args_have_native_equivalent(args: &[String]) -> bool {
                     return false;
                 }
             }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn git_status_args_have_native_equivalent(args: &[String]) -> bool {
+    let mut after_pathspec_separator = false;
+    let mut pathspecs = 0usize;
+    for arg in args {
+        if after_pathspec_separator || !arg.starts_with('-') {
+            pathspecs = pathspecs.saturating_add(1);
+            if pathspecs > 1 {
+                return false;
+            }
+            continue;
+        }
+        match arg.as_str() {
+            "--" => after_pathspec_separator = true,
+            "-s" | "--short" | "-b" | "--branch" | "-sb" | "-bs" | "--porcelain"
+            | "--porcelain=v1" => {}
             _ => return false,
         }
     }
@@ -2208,8 +2232,8 @@ pub(crate) fn classify_command_risk(name: &str, input: &Value) -> CommandRisk {
         "git_commit" => CommandRisk::Danger,
         "write_file" | "edit_file" | "multi_edit" | "todo_write" => CommandRisk::Write,
         "fd" | "rg" if search_tool_input_exec_escape(name, input) => CommandRisk::Danger,
-        "read_file" | "read_symbol" | "fd" | "rg" | "jq" | "fzf" | "git_diff" | "git_log"
-        | "todo_read" => CommandRisk::Read,
+        "read_file" | "read_symbol" | "fd" | "rg" | "jq" | "fzf" | "git_diff" | "git_status"
+        | "git_log" | "todo_read" => CommandRisk::Read,
         "awk" => {
             let Some(raw_args) = input["args"].as_array() else {
                 return CommandRisk::Danger;
@@ -3662,6 +3686,26 @@ mod tests {
             "multi-path git diff is not exactly representable by git_diff"
         );
 
+        let git_status = tool_input_advisory("bash", &json!({"command": "git status --short"}))
+            .expect("native git_status should be preferred");
+        assert!(git_status.contains("git_status"), "{git_status}");
+        let scoped_status = tool_input_advisory(
+            "bash",
+            &json!({"command": "git -C . status -sb -- src/main.rs"}),
+        )
+        .expect("single-pathspec git status is representable by git_status");
+        assert!(scoped_status.contains("git_status"), "{scoped_status}");
+        for command in [
+            "git status --ignored",
+            "git status -uall",
+            "git status -- src/main.rs src/tools.rs",
+        ] {
+            assert!(
+                tool_input_advisory("bash", &json!({"command": command})).is_none(),
+                "{command} is not exactly representable by git_status"
+            );
+        }
+
         let curl = tool_input_advisory("bash", &json!({"command": "curl https://example.com"}))
             .expect("curl should prefer native http when exposed");
         assert!(curl.contains("avoidable shell usage"), "{curl}");
@@ -4362,6 +4406,14 @@ mod tests {
         );
         assert_eq!(
             classify_command_risk("git_diff", &json!({"stat": true})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("git_status", &json!({})),
+            CommandRisk::Read
+        );
+        assert_eq!(
+            classify_command_risk("git_status", &json!({"path": "src"})),
             CommandRisk::Read
         );
         assert_eq!(
