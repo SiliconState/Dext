@@ -904,6 +904,8 @@ fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<Parsed
     if !state.text.is_empty() {
         blocks.push(Block::Text { text: state.text });
     }
+    let output_truncated = state.stop_reason.as_deref() == Some("length");
+    let mut unfinished_tool_calls = 0usize;
     for (idx, call) in state.tool_calls {
         if call.id.trim().is_empty() {
             return Err(protocol_error(
@@ -919,19 +921,27 @@ fn finish_openai(contract: RequestContract, state: OpenAiState) -> Result<Parsed
                 &format!("tool call {idx} has no name"),
             ));
         }
-        let input = parse_tool_arguments(contract, "finalize", &idx.to_string(), &call.arguments)?;
-        blocks.push(Block::ToolUse {
-            id: call.id,
-            name: call.name,
-            input,
-        });
+        match parse_tool_arguments(contract, "finalize", &idx.to_string(), &call.arguments) {
+            Ok(input) => blocks.push(Block::ToolUse {
+                id: call.id,
+                name: call.name,
+                input,
+            }),
+            // finish_reason=length cuts a call mid-JSON exactly like Anthropic's
+            // max_tokens; the same EOF-only rule keeps malformed non-EOF JSON
+            // and complete non-object arguments fatal.
+            Err(_) if output_truncated && tool_arguments_json_is_incomplete(&call.arguments) => {
+                unfinished_tool_calls += 1;
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(ParsedStream {
         blocks,
         stop_reason: state.stop_reason,
         usage: state.usage,
         unknown_events: state.unknown_events,
-        unfinished_tool_calls: 0,
+        unfinished_tool_calls,
     })
 }
 
@@ -2028,6 +2038,94 @@ mod tests {
             .unwrap();
         let error = parser.finish().unwrap_err().to_string();
         assert!(error.contains("arguments must be a JSON object"), "{error}");
+    }
+
+    #[test]
+    fn openai_length_truncated_tool_call_is_dropped_not_fatal() {
+        let contract = RequestContract::OpenAiChatCompletions;
+        let push_all = |parser: &mut ProviderStreamParser, chunks: &[&str]| {
+            for data in chunks {
+                parser
+                    .push_frame(SseFrame {
+                        event: None,
+                        data: Some(data.to_string()),
+                    })
+                    .unwrap();
+            }
+        };
+        let cut_call = r#"{"choices":[{"delta":{"content":"working","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"big.txt\",\"content\":\"trunc"}}]},"finish_reason":null}]}"#;
+
+        // Case 1: finish_reason=length with EOF-cut JSON drops the call, keeps
+        // the text, and reports the drop instead of failing the turn.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        push_all(
+            &mut parser,
+            &[
+                cut_call,
+                r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+                "[DONE]",
+            ],
+        );
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::Text { text }] if text == "working"
+        ));
+        assert_eq!(parsed.unfinished_tool_calls, 1);
+        assert_eq!(parsed.stop_reason.as_deref(), Some("length"));
+
+        // Case 2: the same cut JSON under any other finish_reason stays fatal.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        push_all(
+            &mut parser,
+            &[
+                cut_call,
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ],
+        );
+        let error = parser.finish().unwrap_err().to_string();
+        assert!(error.contains("has malformed arguments"), "{error}");
+
+        // Case 3: malformed non-EOF JSON remains fatal even at length.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        push_all(
+            &mut parser,
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\"path\":]"}}]},"finish_reason":"length"}]}"#,
+            ],
+        );
+        let error = parser.finish().unwrap_err().to_string();
+        assert!(error.contains("has malformed arguments"), "{error}");
+
+        // Case 4: a complete non-object was not cut off; it stays a protocol error.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        push_all(
+            &mut parser,
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"[]"}}]},"finish_reason":"length"}]}"#,
+            ],
+        );
+        let error = parser.finish().unwrap_err().to_string();
+        assert!(error.contains("arguments must be a JSON object"), "{error}");
+
+        // Case 5: length after a complete call still executes that call; only
+        // the call that was actually cut is dropped.
+        let mut parser = ProviderStreamParser::new(contract, false);
+        push_all(
+            &mut parser,
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":null}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"write_file","arguments":"{\"path\":\"big"}}]},"finish_reason":"length"}]}"#,
+                "[DONE]",
+            ],
+        );
+        let parsed = parser.finish().unwrap();
+        assert!(matches!(
+            parsed.blocks.as_slice(),
+            [Block::ToolUse { id, name, input }]
+                if id == "call_1" && name == "read_file" && input["path"] == "README.md"
+        ));
+        assert_eq!(parsed.unfinished_tool_calls, 1);
     }
 
     #[test]

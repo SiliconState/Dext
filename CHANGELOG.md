@@ -215,6 +215,7 @@
 
 ### Fixed
 
+- OpenAI Chat Completions streams that hit `finish_reason=length` mid-tool-call no longer fail the turn with a `stream protocol error … has malformed arguments`. The parser now applies the same EOF-only carve-out as Anthropic's `max_tokens`: the cut call is discarded and reported as unfinished, completed calls in the same response still execute, and `stream_recovery_reason` issues the bounded automatic continuation for this contract too. Other finish reasons, malformed non-EOF JSON, and complete non-object arguments remain fatal. This is the common failure for local llama.cpp servers with a small `n_predict`.
 - Windows session-lock liveness now asks the OS instead of assuming every nonzero PID is alive: `process_is_running` uses `OpenProcess`/`GetExitCodeProcess`, treating only `ERROR_INVALID_PARAMETER` or a non-`STILL_ACTIVE` exit code as dead and keeping the lock on access-denied or query failures. A crashed Windows session's `session.lock.json` is therefore reclaimed on the next open and by `dext session prune`, matching the Unix `kill(pid, 0)` behavior; other platforms still never auto-reclaim.
 - Pricing override tests now exercise pure override/default composition without
   mutating process-global pricing environment variables, preventing parallel
