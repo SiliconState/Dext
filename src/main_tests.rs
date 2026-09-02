@@ -8,8 +8,8 @@ use crate::provider::{
 };
 use crate::session::{
     append_log_line, canonicalize_mutation_path, canonicalize_read_tool_path,
-    cap_latest_log_buffer, latest_log_path, remove_stale_session_state_lock_if_matches,
-    render_limited_lines, validate_session_name,
+    cap_latest_log_buffer, latest_log_path, process_is_running,
+    remove_stale_session_state_lock_if_matches, render_limited_lines, validate_session_name,
 };
 use crate::tools::{self, is_parallel_safe_tool};
 use serde_json::json;
@@ -8066,6 +8066,31 @@ fn stale_session_lock_is_reaped_on_acquire() -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&root);
     result
+}
+
+#[test]
+fn process_liveness_detects_exited_children_and_the_current_process() {
+    assert!(process_is_running(std::process::id()));
+    assert!(!process_is_running(0));
+
+    #[cfg(windows)]
+    let mut child = Command::new("cmd")
+        .args(["/C", "exit 0"])
+        .spawn()
+        .expect("spawn child");
+    #[cfg(not(windows))]
+    let mut child = Command::new("true").spawn().expect("spawn child");
+    let pid = child.id();
+    let status = child.wait().expect("wait for child");
+    assert!(status.success(), "{status}");
+    // `child` is intentionally still alive here: on Windows its open process
+    // handle pins the pid against reuse, so this exercises the
+    // exited-but-still-openable branch instead of racing the allocator.
+    assert!(
+        !process_is_running(pid),
+        "reaped child {pid} must not read as running"
+    );
+    drop(child);
 }
 
 #[test]

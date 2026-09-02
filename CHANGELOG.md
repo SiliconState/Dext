@@ -2,10 +2,6 @@
 
 ## Unreleased
 
-### Added
-
-- Native `git_status` tool in the default profile. It runs `git status --porcelain=v1 --branch` through the same hardened read-only Git wrapper as `git_diff` (no pager, no optional locks, literal pathspecs, fsmonitor/credential helpers/foreign protocols disabled, `GIT_*` and credential environment scrubbed, sandboxed), accepts an optional repository-relative `path`, is parallel-safe and journal-free, counts toward the existing `git_status` strategy budget, and is advised over shell `git status` when the shell form is exactly representable. Shell `git status` remains Danger-class because repository configuration can execute helpers. The default lean catalog grows from 13 to 14 descriptors and stays under its 6,000-byte fixture budget.
-
 ### Changed
 
 - Privacy redaction no longer replaces code-shaped right-hand sides of unquoted secret-named assignments (calls, indexing, blocks, `::` paths, member-access chains, and bare identifiers in `let`/`const`/`var` declarations), so source containing `token`/`password`/`api_key` identifiers stays legible during code review. Quoted values, env-style `KEY=value` lines, and dotted tokens with a long segment (JWT, OAuth) still redact.
@@ -130,6 +126,7 @@
 
 ### Added
 
+- Native `git_status` tool in the default profile. It runs `git status --porcelain=v1 --branch` through the same hardened read-only Git wrapper as `git_diff` (no pager, no optional locks, literal pathspecs, fsmonitor/credential helpers/foreign protocols disabled, `GIT_*` and credential environment scrubbed, sandboxed), accepts an optional repository-relative `path`, is parallel-safe and journal-free, counts toward the existing `git_status` strategy budget, and is advised over shell `git status` when the shell form is exactly representable. Shell `git status` remains Danger-class because repository configuration can execute helpers. The default lean catalog grows from 13 to 14 descriptors and stays under its 6,000-byte fixture budget.
 - Added Pack Runtime Protocol v1. Reviewed packs may declare a bounded `runtime.json` one-shot native helper that exposes dynamic tools while active and returns bounded state, steering, delayed continuation, and Markdown views. Runtime activation validates executable identity and follows the selected approval profile; every lifecycle/tool call uses the selected sandbox profile with credentials scrubbed; declared write/danger tools retain durable side-effect journaling and fail-closed Git checkpoints. Session restore re-resolves the pack and requires exact source/manifest-hash identity.
 
 - Added project-scoped Seats as durable agent identities across disposable sessions. `--seat NAME` starts a seated session, `--seat NAME --resume` resumes its latest incarnation, `dext seat list|show` inspects records, and `dext seat set` maintains bounded labels/summaries. Portable ids, owner-safe/private state paths, atomic metadata updates, deferred record creation, 256 KiB session-header bounds, transactional reset pointer handling, and cross-Seat/cross-project/provenance checks fail closed. Plain unseated writes retain v3 compatibility and Seat-only writes use v4; runtime-bearing writes use v5, while transitional v3 Seat headers remain validated and loadable. No-session/forked runs do not advance Seat state. Crew supplies direct or deterministic fallback role identities while pinning one absolute Dext state root across captured, detached, and pane workers.
@@ -218,6 +215,7 @@
 
 ### Fixed
 
+- Windows session-lock liveness now asks the OS instead of assuming every nonzero PID is alive: `process_is_running` uses `OpenProcess`/`GetExitCodeProcess`, treating only `ERROR_INVALID_PARAMETER` or a non-`STILL_ACTIVE` exit code as dead and keeping the lock on access-denied or query failures. A crashed Windows session's `session.lock.json` is therefore reclaimed on the next open and by `dext session prune`, matching the Unix `kill(pid, 0)` behavior; other platforms still never auto-reclaim.
 - Pricing override tests now exercise pure override/default composition without
   mutating process-global pricing environment variables, preventing parallel
   local-provider and cloud-pricing tests from observing transient prices.
