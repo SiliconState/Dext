@@ -27517,6 +27517,11 @@ async fn local_llama_reasoning_content_reaches_sink_and_history_blocks() {
         event,
         AgentEvent::ThinkingBlockComplete(text) if text == "inspect the files"
     )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ThinkingPreviewCommitted))
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::TextBlockComplete(text) if text == "answer"
@@ -27571,6 +27576,11 @@ async fn anthropic_stream_visible_thinking_reaches_sink_and_preserves_signed_rou
         event,
         AgentEvent::ThinkingBlockComplete(text) if text == "visible reasoning"
     )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ThinkingPreviewCommitted))
+    );
     assert!(
         matches!(
             blocks.first(),
@@ -27660,6 +27670,11 @@ async fn chatgpt_stream_reasoning_summary_is_rendered_and_stored_as_thinking() {
         AgentEvent::ThinkingBlockComplete(text)
             if text == "**Planning removal**\n\n**Planning masked login input**\n\n**Verifying restored history**"
     )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ThinkingPreviewCommitted))
+    );
     assert!(!events.iter().any(|event| matches!(
         event,
         AgentEvent::ThinkingBlockComplete(text) if text.contains("<!--")

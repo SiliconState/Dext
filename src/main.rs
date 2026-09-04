@@ -542,7 +542,7 @@ pub(crate) fn pseudo_tool_redaction_marker() -> &'static str {
     "[tool call redacted; waiting for structured tool event]"
 }
 
-fn text_line_looks_like_pseudo_tool_payload(line: &str) -> bool {
+pub(crate) fn text_line_looks_like_pseudo_tool_payload(line: &str) -> bool {
     let trimmed = line.trim_start();
     let lower = trimmed.to_ascii_lowercase();
     trimmed.starts_with('{')
@@ -559,7 +559,7 @@ fn text_line_looks_like_pseudo_tool_payload(line: &str) -> bool {
         || lower.starts_with("type")
 }
 
-fn pseudo_tool_line_opens_payload_block(line: &str) -> bool {
+pub(crate) fn pseudo_tool_line_opens_payload_block(line: &str) -> bool {
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
     if lower.contains("<tool_call") {
@@ -1841,6 +1841,7 @@ impl EventSink for ConsoleSink {
             AgentEvent::Interrupted => eprintln!("[interrupted]"),
             AgentEvent::ThinkingDelta(_) => {}
             AgentEvent::ThinkingBlockComplete(_) => {}
+            AgentEvent::ThinkingPreviewDiscarded | AgentEvent::ThinkingPreviewCommitted => {}
             AgentEvent::SteeringReceived { messages, preview } => {
                 let noun = if messages == 1 { "update" } else { "updates" };
                 eprintln!(
@@ -1918,7 +1919,12 @@ impl EventSink for JsonSink {
                     } => self.stream.text.clear(),
                     _ => {}
                 }
-                if matches!(&event, AgentEvent::ToolOutputDelta { .. }) {
+                if matches!(
+                    &event,
+                    AgentEvent::ToolOutputDelta { .. }
+                        | AgentEvent::ThinkingPreviewDiscarded
+                        | AgentEvent::ThinkingPreviewCommitted
+                ) {
                     return;
                 }
                 if let Ok(value) = serde_json::to_value(&event) {
@@ -17712,6 +17718,9 @@ impl Agent {
                     request_effort_override,
                 )?;
                 stream_attempt += 1;
+                if stream_attempt > 1 {
+                    self.sink.emit(AgentEvent::ThinkingPreviewDiscarded);
+                }
                 let mut attempt: u32 = 0;
                 let resp = loop {
                     attempt += 1;
@@ -18621,6 +18630,9 @@ impl Agent {
                 });
             }
         }
+        if !self.quiet_stream_events {
+            self.sink.emit(AgentEvent::ThinkingPreviewCommitted);
+        }
         self.partial_stream_text = None;
         Ok(ParsedProviderStream {
             blocks: parsed.blocks,
@@ -18650,6 +18662,9 @@ impl Agent {
                 }
                 streaming::StreamUpdate::ThinkingBlockComplete(text) => {
                     self.sink.emit(AgentEvent::ThinkingBlockComplete(text));
+                }
+                streaming::StreamUpdate::ThinkingPreviewDiscarded => {
+                    self.sink.emit(AgentEvent::ThinkingPreviewDiscarded);
                 }
             }
         }

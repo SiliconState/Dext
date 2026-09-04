@@ -22,6 +22,8 @@ pub(crate) enum AgentEvent {
     TextBlockComplete(String),
     ThinkingDelta(String),
     ThinkingBlockComplete(String),
+    ThinkingPreviewDiscarded,
+    ThinkingPreviewCommitted,
     ToolCallPreview {
         call_id: String,
         name: String,

@@ -61,7 +61,7 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
     // and one rendered slash-result row. The streaming prompt contributes the
     // same separator/card rows before the resize begins.
     const ROWS_PER_SUBMITTED_COMMAND: usize = 5;
-    const STREAMING_PROMPT_ROWS: usize = 4;
+    const STREAMING_PROMPT_ROWS: usize = 8;
     const BANNER_ROW_BUDGET: usize = 12;
     for expected in 1..=TRANSCRIPT_BLOCKS {
         let command = format!("/compact {expected}%\r");
@@ -80,6 +80,12 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
 
     pty.write_all_retry(b"Answer exactly: streaming-first streaming-last\r")
         .expect("start streaming fixture");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "thinking-stream-first",
+        Duration::from_secs(5),
+    );
     assert_visible(
         &mut pty,
         &mut child,
@@ -197,6 +203,12 @@ fn tui_resize_keeps_inline_session_responsive_and_dsr_bounded() {
         &mut pty,
         &mut child,
         "streaming-final",
+        Duration::from_secs(10),
+    );
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "thinking-stream-last",
         Duration::from_secs(10),
     );
     pty.pump_for(&mut child, Duration::from_millis(800))
@@ -397,6 +409,14 @@ fn serve_mock_openai_request(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
         )
         .expect("write mock response headers");
+    let thinking_frame = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":{}}},\"finish_reason\":null}}]}}\n\n",
+        serde_json::to_string("thinking-stream-first\nthinking stream open\n")
+            .expect("encode mock thinking delta")
+    );
+    stream
+        .write_all(thinking_frame.as_bytes())
+        .expect("write first thinking delta");
     let first_frame = format!(
         "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\n",
         serde_json::to_string("streaming-first").expect("encode mock delta")
@@ -410,9 +430,9 @@ fn serve_mock_openai_request(
         .expect("test did not release mock stream");
     stream
         .write_all(
-            b"data: {\"choices\":[{\"delta\":{\"content\":\" streaming-last streaming-final verified output remains responsive after the populated-history resize burst and preserves editable input\"},\"finish_reason\":null}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking-stream-second continues\\n\\nthinking-stream-last\",\"content\":\" streaming-last streaming-final verified output remains responsive after the populated-history resize burst and preserves editable input\"},\"finish_reason\":null}]}\n\n",
         )
-        .expect("write delayed stream delta");
+        .expect("write delayed thinking and text delta");
     stream
         .write_all(
             b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
