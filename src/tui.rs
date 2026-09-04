@@ -56,6 +56,7 @@ const TRUST_INPUT_BORDER: Color = Color::Indexed(66);
 const THINKING_DETAIL_MAX_ROWS: usize = 4;
 const THINKING_LINE_DISPLAY_BYTES: usize = 8 * 1024;
 const THINKING_UNIT_DISPLAY_CAP: usize = 4096;
+const THINKING_UNITS_OMITTED: &str = "[additional thinking lines omitted from display]";
 
 #[derive(Clone, Copy)]
 struct TuiTheme {
@@ -906,6 +907,9 @@ struct BoundedThinkingLine {
     chars: usize,
     truncated: bool,
     has_non_whitespace: bool,
+    xml_tag: String,
+    xml_open_at_end: Option<bool>,
+    has_escape: bool,
 }
 
 impl BoundedThinkingLine {
@@ -913,6 +917,30 @@ impl BoundedThinkingLine {
         self.bytes = self.bytes.saturating_add(ch.len_utf8());
         self.chars = self.chars.saturating_add(1);
         self.has_non_whitespace |= !ch.is_whitespace();
+        self.has_escape |= ch == '\u{001b}';
+        if (!ch.is_control() || ch == '\t') && !is_bidi_format_control(ch) {
+            if !ch.is_whitespace() && self.xml_open_at_end == Some(false) {
+                self.xml_open_at_end = None;
+            }
+            if ch == '<' {
+                self.xml_tag.clear();
+                self.xml_tag.push(ch);
+            } else if !self.xml_tag.is_empty() {
+                self.xml_tag.push(ch.to_ascii_lowercase());
+                match self.xml_tag.as_str() {
+                    "<tool_call" => {
+                        self.xml_open_at_end = Some(true);
+                        self.xml_tag.clear();
+                    }
+                    "</tool_call>" => {
+                        self.xml_open_at_end = Some(false);
+                        self.xml_tag.clear();
+                    }
+                    tag if "<tool_call".starts_with(tag) || "</tool_call>".starts_with(tag) => {}
+                    _ => self.xml_tag.clear(),
+                }
+            }
+        }
         if !self.truncated
             && self.visible.len().saturating_add(ch.len_utf8()) <= THINKING_LINE_DISPLAY_BYTES
         {
@@ -946,11 +974,10 @@ struct ThinkingLineDecoder {
 }
 
 impl ThinkingLineDecoder {
-    fn push(&mut self, text: &str) -> Vec<BoundedThinkingLine> {
-        let mut completed = Vec::new();
+    fn push(&mut self, text: &str, mut complete: impl FnMut(BoundedThinkingLine)) {
         for ch in text.chars() {
             if self.pending_cr {
-                completed.push(std::mem::take(&mut self.line));
+                complete(std::mem::take(&mut self.line));
                 self.pending_cr = false;
                 if ch == '\n' {
                     continue;
@@ -959,12 +986,11 @@ impl ThinkingLineDecoder {
             match ch {
                 '\r' => self.pending_cr = true,
                 '\n' | '\u{2028}' | '\u{2029}' => {
-                    completed.push(std::mem::take(&mut self.line));
+                    complete(std::mem::take(&mut self.line));
                 }
                 _ => self.line.push(ch),
             }
         }
-        completed
     }
 
     fn finish(&mut self) -> Vec<BoundedThinkingLine> {
@@ -1019,50 +1045,61 @@ impl StreamingPseudoToolFilter {
 
         let mut output = Vec::new();
         let lower = line.to_ascii_lowercase();
-        if line.trim().is_empty() && !self.redacting_xml {
-            self.redacting_payload = false;
-            self.redacting_until_blank = false;
-            self.last_was_marker = false;
-            return output;
-        }
-        if self.redacting_until_blank {
-            return output;
-        }
-        if self.redacting_xml {
-            if let Some(end) = lower.find("</tool_call>") {
-                self.redacting_xml = false;
-                let tail = line[end + "</tool_call>".len()..].trim();
-                self.push_output(&mut output, tail.to_string());
-            }
-            return output;
-        }
-        if let Some(start) = lower.find("<tool_call") {
-            let prefix = line[..start].trim_end();
-            self.push_output(&mut output, prefix.to_string());
-            self.push_marker(&mut output);
-            self.redacting_xml = !lower[start..].contains("</tool_call>");
-            return output;
-        }
-        if self.redacting_payload {
-            if line.trim().is_empty() {
+        let mut remainder = line.as_str();
+        loop {
+            let lower = &lower[line.len() - remainder.len()..];
+            if remainder.trim().is_empty() && !self.redacting_xml {
                 self.redacting_payload = false;
+                self.redacting_until_blank = false;
                 self.last_was_marker = false;
                 return output;
             }
-            if text_line_looks_like_pseudo_tool_payload(&line) {
+            if self.redacting_until_blank {
                 return output;
             }
-            self.redacting_payload = false;
+            if self.redacting_xml {
+                let Some(end) = lower.find("</tool_call>") else {
+                    return output;
+                };
+                self.redacting_xml = false;
+                remainder = remainder[end + "</tool_call>".len()..].trim_start();
+                if remainder.is_empty() {
+                    return output;
+                }
+                continue;
+            }
+            if let Some(start) = lower.find("<tool_call") {
+                let prefix = remainder[..start].trim_end();
+                self.push_output(&mut output, prefix.to_string());
+                self.push_marker(&mut output);
+                let xml = &remainder[start..];
+                let xml_lower = &lower[start..];
+                let Some(end) = xml_lower.find("</tool_call>") else {
+                    self.redacting_xml = true;
+                    return output;
+                };
+                remainder = xml[end + "</tool_call>".len()..].trim_start();
+                if remainder.is_empty() {
+                    return output;
+                }
+                continue;
+            }
+            if self.redacting_payload {
+                if text_line_looks_like_pseudo_tool_payload(remainder) {
+                    return output;
+                }
+                self.redacting_payload = false;
+            }
+            if text_line_looks_like_pseudo_tool_syntax(remainder)
+                || text_line_looks_like_pseudo_tool_start(remainder)
+            {
+                self.push_marker(&mut output);
+                self.redacting_payload = pseudo_tool_line_opens_payload_block(remainder);
+            } else {
+                self.push_output(&mut output, remainder.to_string());
+            }
+            return output;
         }
-        if text_line_looks_like_pseudo_tool_syntax(&line)
-            || text_line_looks_like_pseudo_tool_start(&line)
-        {
-            self.push_marker(&mut output);
-            self.redacting_payload = pseudo_tool_line_opens_payload_block(&line);
-        } else {
-            self.push_output(&mut output, line);
-        }
-        output
     }
 }
 
@@ -1108,7 +1145,7 @@ impl ActiveThinking {
             });
         } else {
             self.units.push(ThinkingDisplayUnit {
-                text: "[additional thinking lines omitted from display]".to_string(),
+                text: THINKING_UNITS_OMITTED.to_string(),
                 section_start,
             });
             self.display_exhausted = true;
@@ -1126,22 +1163,39 @@ impl ActiveThinking {
 
         let section_start = !self.section_has_content;
         let truncated = line.truncated;
-        let visible = self
-            .filter
-            .process_line(&line.display_text(), self.context_mode);
+        let display_text = line.display_text();
+        let sanitized_empty = sanitize_display_text(&display_text).trim().is_empty();
+        let visible = self.filter.process_line(&display_text, self.context_mode);
+        let emitted = !visible.is_empty();
         for (index, text) in visible.into_iter().enumerate() {
             self.push_unit(text, section_start && index == 0);
         }
         if truncated && self.context_mode.is_frugal() {
-            self.filter.redacting_until_blank = true;
+            // Keep only XML boundaries, never the omitted payload. Escape-bearing
+            // lines cannot safely re-establish state without the full sanitizer.
+            if let Some(open) = line.xml_open_at_end.filter(|_| !line.has_escape) {
+                self.filter.redacting_xml = open;
+                self.filter.redacting_payload = false;
+                self.filter.redacting_until_blank = false;
+            } else if !self.filter.redacting_xml {
+                self.filter.redacting_until_blank = true;
+            }
         }
-        self.section_has_content = true;
+        if emitted {
+            self.section_has_content = true;
+        } else if sanitized_empty
+            && !self.filter.redacting_payload
+            && !self.filter.redacting_xml
+            && !self.filter.redacting_until_blank
+        {
+            self.section_has_content = false;
+        }
     }
 
     fn push(&mut self, text: &str) {
-        for line in self.decoder.push(text) {
-            self.process_completed_line(line);
-        }
+        let mut decoder = std::mem::take(&mut self.decoder);
+        decoder.push(text, |line| self.process_completed_line(line));
+        self.decoder = decoder;
     }
 
     fn finish(&mut self) {
@@ -1151,7 +1205,7 @@ impl ActiveThinking {
     }
 
     fn open_units(&self) -> Vec<ThinkingDisplayUnit> {
-        if self.display_exhausted {
+        if self.display_exhausted || !self.decoder.line.has_non_whitespace {
             return Vec::new();
         }
         let Some(open) = self.decoder.open_display_text() else {
@@ -1159,15 +1213,20 @@ impl ActiveThinking {
         };
         let mut preview = self.filter.clone();
         let section_start = !self.section_has_content;
-        preview
-            .process_line(&open, self.context_mode)
+        let visible = preview.process_line(&open, self.context_mode);
+        let remaining = THINKING_UNIT_DISPLAY_CAP.saturating_sub(self.units.len());
+        visible
             .into_iter()
+            .filter(|text| !text.trim().is_empty())
+            .take(remaining + 1)
             .enumerate()
-            .filter_map(|(index, text)| {
-                (!text.trim().is_empty()).then_some(ThinkingDisplayUnit {
-                    text,
-                    section_start: section_start && index == 0,
-                })
+            .map(|(index, text)| ThinkingDisplayUnit {
+                text: if index == remaining {
+                    THINKING_UNITS_OMITTED.to_string()
+                } else {
+                    text
+                },
+                section_start: section_start && index == 0,
             })
             .collect()
     }
@@ -6088,24 +6147,27 @@ fn render_thinking_unit(text: &str, section_start: bool, width: u16) -> Vec<Line
     let marker_style = Style::default()
         .fg(theme.thinking_marker)
         .bg(theme.thinking_bg);
-    let body_width = (width.max(1) as usize)
-        .saturating_sub(text_width("• "))
-        .max(1);
+    let max_width = width.max(1) as usize;
+    let prefix_width = (max_width > text_width("• ")).then_some(text_width("• "));
+    let body_width = max_width.saturating_sub(prefix_width.unwrap_or(0)).max(1);
     let cleaned = strip_markdown_markers(&sanitized);
     wrap_plain_words_visual(&cleaned, body_width)
         .into_iter()
         .enumerate()
         .map(|(index, row)| {
-            let prefix = if section_start && index == 0 {
-                "• "
-            } else {
-                "  "
-            };
-            Line::from(vec![
-                Span::styled(prefix.to_string(), marker_style),
-                Span::styled(row, thinking_style),
-            ])
-            .style(Style::default().bg(theme.thinking_bg))
+            let prefix = prefix_width.map(|_| {
+                if section_start && index == 0 {
+                    "• "
+                } else {
+                    "  "
+                }
+            });
+            let mut spans = Vec::with_capacity(2);
+            if let Some(prefix) = prefix {
+                spans.push(Span::styled(prefix.to_string(), marker_style));
+            }
+            spans.push(Span::styled(row, thinking_style));
+            Line::from(spans).style(Style::default().bg(theme.thinking_bg))
         })
         .collect()
 }
@@ -8144,10 +8206,8 @@ fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
         ]));
     }
     if let Some(active) = &state.active_thinking {
-        let mut units = active.units.iter().collect::<Vec<_>>();
         let open = active.open_units();
-        units.extend(open.iter());
-        if !units.is_empty() {
+        if !active.units.is_empty() || !open.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Thinking",
@@ -8156,16 +8216,19 @@ fn inspector_lines(state: &TuiState, width: u16, height: u16) -> Text<'static> {
                     .add_modifier(Modifier::BOLD),
             )));
             let mut thinking_rows = Vec::new();
-            for unit in units {
-                thinking_rows.extend(render_thinking_unit(
+            for unit in active.units.iter().chain(open.iter()).rev() {
+                let rows = render_thinking_unit(
                     &unit.text,
                     unit.section_start,
                     inner.min(u16::MAX as usize) as u16,
-                ));
+                );
+                let remaining = THINKING_DETAIL_MAX_ROWS.saturating_sub(thinking_rows.len());
+                thinking_rows.extend(rows.into_iter().rev().take(remaining));
+                if thinking_rows.len() == THINKING_DETAIL_MAX_ROWS {
+                    break;
+                }
             }
-            if thinking_rows.len() > THINKING_DETAIL_MAX_ROWS {
-                thinking_rows.drain(..thinking_rows.len() - THINKING_DETAIL_MAX_ROWS);
-            }
+            thinking_rows.reverse();
             lines.extend(thinking_rows);
         }
     }
@@ -10399,8 +10462,9 @@ mod tests {
     #[test]
     fn thinking_decoder_waits_for_terminated_lines_and_normalizes_split_crlf() {
         let mut decoder = ThinkingLineDecoder::default();
-        assert!(decoder.push("alpha\r").is_empty());
-        let first = decoder.push("\nbeta\n ").into_iter().collect::<Vec<_>>();
+        decoder.push("alpha\r", |_| panic!("unterminated CR"));
+        let mut first = Vec::new();
+        decoder.push("\nbeta\n ", |line| first.push(line));
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].display_text(), "alpha");
         assert_eq!(first[1].display_text(), "beta");
@@ -10452,6 +10516,140 @@ mod tests {
                 }
             ]
         ));
+    }
+
+    #[test]
+    fn sanitized_empty_thinking_line_starts_a_new_section() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "first\n\u{0007}\nsecond\n".to_string(),
+        ));
+
+        let units = thinking_units(&state);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].text, "first");
+        assert!(units[0].section_start);
+        assert_eq!(units[1].text, "second");
+        assert!(units[1].section_start);
+    }
+
+    #[test]
+    fn sanitized_blank_ends_payload_thinking_section() {
+        let mut active = ActiveThinking::new(1, ContextMode::Frugal);
+        active.push("to=functions.bash\n{\n\u{0007}\nafter\n");
+        assert_eq!(active.units.len(), 2);
+        assert_eq!(active.units[1].text, "after");
+        assert!(active.units[1].section_start);
+    }
+
+    #[test]
+    fn overlong_blank_thinking_line_has_no_live_omission() {
+        let mut active = ActiveThinking::new(1, ContextMode::Standard);
+        active.push(&" ".repeat(THINKING_LINE_DISPLAY_BYTES + 1));
+        assert!(active.open_units().is_empty());
+        active.finish();
+        assert!(active.units.is_empty());
+    }
+
+    #[test]
+    fn thinking_unit_cap_also_bounds_the_open_preview() {
+        let mut active = ActiveThinking::new(1, ContextMode::Standard);
+        active.push(&"line\n".repeat(THINKING_UNIT_DISPLAY_CAP));
+        active.push("not another displayed line");
+        let open = active.open_units();
+        assert_eq!(open.len(), 1);
+        assert_eq!(
+            open[0].text,
+            "[additional thinking lines omitted from display]"
+        );
+        active.push("\nmore\n");
+        assert_eq!(active.units.len(), THINKING_UNIT_DISPLAY_CAP + 1);
+        assert_eq!(active.units.last().unwrap().text, open[0].text);
+        assert!(active.open_units().is_empty());
+    }
+
+    #[test]
+    fn overlong_xml_close_restores_following_thinking_lines() {
+        for prefix in ["<tool_call>", "<tool_call>\n"] {
+            let raw = format!(
+                "{prefix}{}</tool_call>\nafter\n",
+                "x".repeat(THINKING_LINE_DISPLAY_BYTES)
+            );
+            let mut active = ActiveThinking::new(1, ContextMode::Frugal);
+            active.push(&raw);
+            assert!(active.units.iter().any(|unit| unit.text == "after"));
+            assert!(!active.units.iter().any(|unit| unit.text.contains("xxxx")));
+        }
+    }
+
+    #[test]
+    fn overlong_xml_thinking_keeps_payload_hidden_until_a_trusted_close() {
+        for suffix in [
+            "",
+            "</tool_call><tool_call>",
+            "\u{001b}]0;</tool_call>\u{0007}",
+        ] {
+            let mut active = ActiveThinking::new(1, ContextMode::Frugal);
+            active.push(&format!(
+                "<tool_call>\n<tool_call>{}{suffix}\nprivate payload\n</tool_call>\nafter\n",
+                "x".repeat(THINKING_LINE_DISPLAY_BYTES)
+            ));
+            assert!(active.units.iter().any(|unit| unit.text == "after"));
+            assert!(
+                !active
+                    .units
+                    .iter()
+                    .any(|unit| unit.text.contains("private"))
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_open_xml_units_obey_the_remaining_display_budget() {
+        let mut active = ActiveThinking::new(1, ContextMode::Frugal);
+        active.push(&"line\n".repeat(THINKING_UNIT_DISPLAY_CAP - 1));
+        active.push("before <tool_call>private</tool_call> after");
+        let preview = active.open_units();
+        assert_eq!(preview.len(), 2);
+        assert_eq!(preview[0].text, "before");
+        assert_eq!(preview[1].text, THINKING_UNITS_OMITTED);
+        active.finish();
+        assert_eq!(&active.units[THINKING_UNIT_DISPLAY_CAP - 1..], preview);
+    }
+
+    #[test]
+    fn thinking_decoder_handles_newline_flood_without_accumulating_lines() {
+        let mut decoder = ThinkingLineDecoder::default();
+        let mut completed = 0;
+        decoder.push(&"\n".repeat(1024 * 1024), |line| {
+            assert!(line.is_empty());
+            completed += 1;
+        });
+        assert_eq!(completed, 1024 * 1024);
+        assert!(decoder.open_display_text().is_none());
+    }
+
+    #[test]
+    fn thinking_display_is_independent_of_delta_boundaries() {
+        for mode in [ContextMode::Standard, ContextMode::Frugal] {
+            let raw = "α\r\nβ\rγ\u{2028}\n\u{0007}\nstart <tool_call>\nprivate\n</tool_call> after <tool_call>hidden</tool_call> end\nopen";
+            let mut expected = ActiveThinking::new(1, mode);
+            expected.push(raw);
+            expected.finish();
+            for split in raw.char_indices().map(|(index, _)| index) {
+                let mut actual = ActiveThinking::new(1, mode);
+                actual.push(&raw[..split]);
+                actual.push(&raw[split..]);
+                actual.finish();
+                assert_eq!(actual.units, expected.units, "split {split}");
+            }
+        }
     }
 
     #[test]
@@ -10624,6 +10822,55 @@ mod tests {
     }
 
     #[test]
+    fn thinking_rollback_rebuilds_backend_history_without_stale_units() {
+        use ratatui::backend::TestBackend;
+        use ratatui::{TerminalOptions, Viewport};
+
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 12),
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .unwrap();
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.queue(Line_::Assistant {
+            text: "surviving-before".to_string(),
+            dim_prefix: false,
+        });
+        state.apply_thinking_delta("discarded-thinking\n".repeat(30));
+        let width = current_transcript_pane_width(&mut terminal, &state).unwrap();
+        flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+        assert!(terminal.backend().scrollback().area.height > 0);
+        state.apply_event(AgentEvent::ThinkingPreviewDiscarded);
+        assert!(transcript_requires_rebuild(&state, width));
+        state.queue(Line_::Assistant {
+            text: "surviving-after".to_string(),
+            dim_prefix: false,
+        });
+        terminal.backend_mut().purge_scrollback();
+        rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
+        flush_pending_insert(&mut terminal, &mut state, width).unwrap();
+        let rendered = terminal
+            .backend()
+            .scrollback()
+            .content
+            .iter()
+            .chain(terminal.backend().buffer().content.iter())
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("discarded-thinking"), "{rendered}");
+        assert_eq!(rendered.matches("surviving-before").count(), 1);
+        assert_eq!(rendered.matches("surviving-after").count(), 1);
+    }
+
+    #[test]
     fn rollback_repairs_spacing_between_surviving_history_blocks() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -10691,6 +10938,99 @@ mod tests {
         assert_eq!(sealed, vec![pseudo_tool_redaction_marker()]);
         assert!(!sealed.iter().any(|line| line.contains("cargo test")));
         assert_eq!(active.open_units()[0].text, "safe tail");
+    }
+
+    #[test]
+    fn frugal_thinking_redaction_preserves_same_line_xml_surrounding_text() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.context_mode = ContextMode::Frugal;
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "before <tool_call>secret payload</tool_call> after\n".to_string(),
+        ));
+
+        let sealed = thinking_units(&state)
+            .into_iter()
+            .map(|unit| unit.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sealed,
+            vec!["before", pseudo_tool_redaction_marker(), "after"]
+        );
+        assert!(!sealed.iter().any(|line| line.contains("secret payload")));
+
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "<tool_call>second secret</tool_call>\n".to_string(),
+        ));
+        let sealed = thinking_units(&state)
+            .into_iter()
+            .map(|unit| unit.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sealed,
+            vec![
+                "before",
+                pseudo_tool_redaction_marker(),
+                "after",
+                pseudo_tool_redaction_marker()
+            ]
+        );
+        assert!(!sealed.iter().any(|line| line.contains("second secret")));
+    }
+
+    #[test]
+    fn multiline_xml_close_does_not_create_a_false_thinking_section() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.context_mode = ContextMode::Frugal;
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "before <tool_call>\nsecret\n</tool_call>\nafter\n".to_string(),
+        ));
+
+        let units = thinking_units(&state);
+        assert_eq!(units.len(), 3);
+        assert_eq!(units[0].text, "before");
+        assert!(units[0].section_start);
+        assert_eq!(units[1].text, pseudo_tool_redaction_marker());
+        assert!(!units[1].section_start);
+        assert_eq!(units[2].text, "after");
+        assert!(!units[2].section_start);
+    }
+
+    #[test]
+    fn overlong_xml_payload_does_not_hide_text_after_the_close() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.context_mode = ContextMode::Frugal;
+        state.apply_event(AgentEvent::ThinkingDelta(format!(
+            "before <tool_call>\n{}\n</tool_call> after\n",
+            "x".repeat(THINKING_LINE_DISPLAY_BYTES * 2)
+        )));
+
+        let sealed = thinking_units(&state)
+            .into_iter()
+            .map(|unit| unit.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sealed,
+            vec!["before", pseudo_tool_redaction_marker(), "after"]
+        );
+        assert!(!sealed.iter().any(|line| line.contains('x')));
     }
 
     #[test]
@@ -12296,6 +12636,40 @@ mod tests {
     }
 
     #[test]
+    fn inspector_thinking_tail_matches_full_render_at_all_widths() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_thinking_delta("old thinking line\n".repeat(100));
+        state.apply_thinking_delta(
+            "\nlast sealed line with 界 and wrapping\nopen tail with several words".to_string(),
+        );
+        let active = state.active_thinking.as_ref().unwrap();
+        let open = active.open_units();
+        for width in [8u16, 20, 80] {
+            let mut expected = active
+                .units
+                .iter()
+                .chain(open.iter())
+                .flat_map(|unit| render_thinking_unit(&unit.text, unit.section_start, width - 2))
+                .collect::<Vec<_>>();
+            expected.drain(..expected.len().saturating_sub(THINKING_DETAIL_MAX_ROWS));
+            let actual = inspector_lines(&state, width, 30);
+            let start = actual
+                .lines
+                .iter()
+                .position(|line| line.to_string() == "Thinking")
+                .unwrap()
+                + 1;
+            assert_eq!(&actual.lines[start..start + expected.len()], expected);
+        }
+    }
+
+    #[test]
     fn inspector_thinking_uses_bullets_without_an_inner_lane() {
         let mut state = TuiState::new(
             "test-model".to_string(),
@@ -13081,6 +13455,21 @@ mod tests {
                 "• Reviewing CMake dist handling and UI polling",
             ]
         );
+    }
+
+    #[test]
+    fn thinking_rows_fit_tiny_widths() {
+        for width in 1..=8 {
+            let text = line_to_text(&thinking_line("界 abcdefghij"), width);
+            let lines = flatten_lines(&text);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| unicode_width::UnicodeWidthStr::width(line.as_str())
+                        <= width as usize),
+                "width {width}: {lines:?}"
+            );
+        }
     }
 
     #[test]

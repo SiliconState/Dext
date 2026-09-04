@@ -106,7 +106,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
   - Terminal restore helpers used by crash/panic paths.
 
 - `src/tui.rs`
-  - Inline Ratatui UI in the regular terminal buffer.
+  - Inline Ratatui UI in the regular terminal buffer; transactional thinking history uses per-line decoding without newline-proportional temporary batches, bounded open/sealed display units, and suffix-only inspector rendering.
   - Transcript rendering, input box, status/live areas, permission prompts, slash completions, and the read-only `Ctrl+L` todo modal; todo state loading shares the 256 KiB runtime bound.
   - See [`TUI.md`](TUI.md) for the renderer contract, exact dependency stack, compatibility patch, and PTY gate.
 
@@ -268,7 +268,7 @@ Checkpoint helpers no-op outside Git repositories. Recovery and preview behavior
 - `standard`: normal caps and lean tool schemas by default; this remains the default for frontier/cloud providers.
 - `frugal`: the automatic local-provider default; lower prompt/history/tool-result and native-read capture caps plus bounded LLM-backed compaction, without removing core tool capabilities or overriding an explicit toolset/schema selection. `/context` applies it immediately to later tool rounds, and an explicit selection remains pinned across provider switches and session restoration.
 
-The former `tiny` mode and `--tiny` alias are retired and rejected rather than silently mapped to `frugal`. Frugal also owns the stricter pseudo-tool-protocol sanitizer: partial-stream recovery and TUI transcript/inspector paths replace serialized or multiline tool-call-like assistant payloads with a redaction marker while retaining surrounding prose; standard keeps the narrower legacy line detector.
+The former `tiny` mode and `--tiny` alias are retired and rejected rather than silently mapped to `frugal`. Frugal also owns the stricter pseudo-tool-protocol sanitizer: partial-stream recovery and TUI transcript/inspector paths replace serialized or multiline tool-call-like assistant payloads with a redaction marker while retaining surrounding prose, including suffixes and prose between repeated inline XML calls in both streaming and completed content; standard keeps the narrower legacy line detector.
 
 Frugal mode uses a compact task-graph discipline for nontrivial work: steps have required inputs and observable outputs, independent reads can run in parallel, verified results are reused, and recovery repairs only the affected step. Dext intentionally does not maintain a graph runtime or impose local-only action locks, round ceilings, output suppression, or forced finalization.
 

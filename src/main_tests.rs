@@ -17,6 +17,27 @@ use std::net::TcpListener;
 use std::process::Command;
 use std::sync::OnceLock;
 
+#[test]
+fn pseudo_tool_xml_redaction_preserves_suffixes_and_filters_repeated_calls() {
+    for raw in [
+        "before <tool_call>private</tool_call> middle <tool_call>hidden</tool_call> after\n",
+        "before <tool_call>\nprivate\n</tool_call> middle <tool_call>hidden</tool_call> after\n",
+    ] {
+        let rendered = redact_pseudo_tool_protocol_text(raw);
+        assert_eq!(
+            rendered,
+            format!(
+                "before\n{}\nmiddle\n{}\nafter\n",
+                pseudo_tool_redaction_marker(),
+                pseudo_tool_redaction_marker()
+            )
+        );
+        assert_eq!(redact_pseudo_tool_protocol_text(&rendered), rendered);
+    }
+    let prose = "unmodified prose\n\n  indentation\n";
+    assert_eq!(redact_pseudo_tool_protocol_text(prose), prose);
+}
+
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     crate::test_env_lock()
 }
