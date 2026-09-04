@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use crate::sse::{SseDecoder, SseFrame};
 
 const TOOL_ARGUMENT_BUFFER_CAP: usize = 256_000;
-const OPENAI_REASONING_BUFFER_CAP: usize = 4 * 1024 * 1024;
+const REASONING_BUFFER_CAP: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StreamUpdate {
@@ -15,6 +15,7 @@ pub(crate) enum StreamUpdate {
     TextBlockComplete(String),
     ThinkingDelta(String),
     ThinkingBlockComplete(String),
+    ThinkingPreviewDiscarded,
 }
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ struct AnthropicState {
     message_started: bool,
     message_stopped: bool,
     unknown_events: usize,
+    thinking_bytes: usize,
 }
 
 #[derive(Default)]
@@ -280,6 +282,24 @@ fn append_capped(
     Ok(())
 }
 
+fn append_reasoning_capped(
+    contract: RequestContract,
+    event: &str,
+    field: &str,
+    target: &mut String,
+    fragment: &str,
+) -> Result<()> {
+    if target.len().saturating_add(fragment.len()) > REASONING_BUFFER_CAP {
+        return Err(protocol_error(
+            contract,
+            event,
+            &format!("{field} exceeded {REASONING_BUFFER_CAP} bytes"),
+        ));
+    }
+    target.push_str(fragment);
+    Ok(())
+}
+
 fn tool_arguments_json_is_incomplete(raw: &str) -> bool {
     raw.trim().is_empty() || serde_json::from_str::<Value>(raw).is_err_and(|error| error.is_eof())
 }
@@ -407,6 +427,17 @@ fn parse_anthropic_frame(
                         "content_block.thinking",
                     )?
                     .to_string();
+                    if state.thinking_bytes.saturating_add(block.text.len()) > REASONING_BUFFER_CAP
+                    {
+                        return Err(protocol_error(
+                            contract,
+                            event,
+                            &format!(
+                                "content_block.thinking exceeded {REASONING_BUFFER_CAP} bytes"
+                            ),
+                        ));
+                    }
+                    state.thinking_bytes = state.thinking_bytes.saturating_add(block.text.len());
                     block.thinking_signature = optional_string(
                         contract,
                         event,
@@ -452,7 +483,12 @@ fn parse_anthropic_frame(
                 }
                 _ => {}
             }
+            let initial_thinking =
+                (block.kind == "thinking" && !block.text.is_empty()).then(|| block.text.clone());
             state.blocks.insert(idx, block);
+            if let Some(text) = initial_thinking {
+                return Ok(vec![StreamUpdate::ThinkingDelta(text)]);
+            }
         }
         "content_block_delta" => {
             require_anthropic_message_open(contract, state, event)?;
@@ -507,7 +543,15 @@ fn parse_anthropic_frame(
                         })?,
                         "delta.thinking",
                     )?;
+                    if state.thinking_bytes.saturating_add(text.len()) > REASONING_BUFFER_CAP {
+                        return Err(protocol_error(
+                            contract,
+                            event,
+                            &format!("delta.thinking exceeded {REASONING_BUFFER_CAP} bytes"),
+                        ));
+                    }
                     block.text.push_str(text);
+                    state.thinking_bytes = state.thinking_bytes.saturating_add(text.len());
                     updates.push(StreamUpdate::ThinkingDelta(text.to_string()));
                 }
                 "signature_delta" => {
@@ -815,18 +859,13 @@ fn parse_openai_frame(
             {
                 let reasoning = string(contract, "chunk", reasoning, "delta.reasoning_content")?;
                 if !reasoning.is_empty() {
-                    if state.reasoning.len().saturating_add(reasoning.len())
-                        > OPENAI_REASONING_BUFFER_CAP
-                    {
-                        return Err(protocol_error(
-                            contract,
-                            "chunk",
-                            &format!(
-                                "delta.reasoning_content exceeded {OPENAI_REASONING_BUFFER_CAP} bytes"
-                            ),
-                        ));
-                    }
-                    state.reasoning.push_str(reasoning);
+                    append_reasoning_capped(
+                        contract,
+                        "chunk",
+                        "delta.reasoning_content",
+                        &mut state.reasoning,
+                        reasoning,
+                    )?;
                     updates.push(StreamUpdate::ThinkingDelta(reasoning.to_string()));
                 }
             }
@@ -1052,7 +1091,7 @@ fn parse_chatgpt_frame(
                     .ok_or_else(|| protocol_error(contract, event, "missing delta"))?,
                 "delta",
             )?;
-            state.reasoning.push_str(delta);
+            append_reasoning_capped(contract, event, "delta", &mut state.reasoning, delta)?;
             state.reasoning_in_progress = true;
             if let Some(visible) =
                 reasoning_summary_stream_delta(&state.reasoning, &mut state.reasoning_emitted)
@@ -1070,7 +1109,7 @@ fn parse_chatgpt_frame(
                         .ok_or_else(|| protocol_error(contract, event, "missing text"))?,
                     "text",
                 )?;
-                state.reasoning.push_str(text);
+                append_reasoning_capped(contract, event, "text", &mut state.reasoning, text)?;
                 if let Some(visible) =
                     reasoning_summary_stream_delta(&state.reasoning, &mut state.reasoning_emitted)
                 {
@@ -1451,13 +1490,14 @@ fn parse_chatgpt_frame(
                     state.text_in_progress = false;
                     updates.push(StreamUpdate::TextBlockComplete(String::new()));
                 }
-                if state.reasoning_in_progress
-                    || (discard_all_response_content && !state.reasoning.is_empty())
-                {
+                let discard_thinking_preview = state.reasoning_in_progress
+                    || (discard_all_response_content && !state.reasoning.is_empty());
+                if discard_thinking_preview {
                     state.reasoning.clear();
                     state.reasoning_emitted.clear();
                     state.reasoning_in_progress = false;
                     updates.push(StreamUpdate::ThinkingBlockComplete(String::new()));
+                    updates.push(StreamUpdate::ThinkingPreviewDiscarded);
                 }
             }
             // Completed responses must reconcile every unfinished streamed call
@@ -1605,6 +1645,84 @@ fn finish_chatgpt(contract: RequestContract, mut state: ChatGptState) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_accumulation_uses_one_uniform_cap() {
+        for contract in [
+            RequestContract::AnthropicMessages,
+            RequestContract::OpenAiChatCompletions,
+            RequestContract::OpenAiResponses,
+            RequestContract::ChatGptResponses,
+        ] {
+            let mut reasoning = "x".repeat(REASONING_BUFFER_CAP);
+            let error = append_reasoning_capped(contract, "test", "reasoning", &mut reasoning, "y")
+                .expect_err("reasoning over the cap must fail")
+                .to_string();
+            assert!(error.contains("exceeded 4194304 bytes"), "{error}");
+            assert_eq!(reasoning.len(), REASONING_BUFFER_CAP);
+        }
+    }
+
+    #[test]
+    fn incomplete_responses_explicitly_discard_reasoning_preview() {
+        let contract = RequestContract::ChatGptResponses;
+        let mut parser = ProviderStreamParser::new(contract, false);
+        let mut updates = parser
+            .push_frame(SseFrame {
+                event: None,
+                data: Some(
+                    r#"{"type":"response.reasoning_summary_text.delta","delta":"discard me"}"#
+                        .to_string(),
+                ),
+            })
+            .unwrap();
+        updates.extend(
+            parser
+                .push_frame(SseFrame {
+                    event: None,
+                    data: Some(
+                        r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}"#
+                            .to_string(),
+                    ),
+                })
+                .unwrap(),
+        );
+
+        assert_eq!(
+            updates,
+            vec![
+                StreamUpdate::ThinkingDelta("discard me".to_string()),
+                StreamUpdate::ThinkingBlockComplete(String::new()),
+                StreamUpdate::ThinkingPreviewDiscarded,
+            ]
+        );
+        assert!(parser.finish().unwrap().blocks.is_empty());
+    }
+
+    #[test]
+    fn anthropic_nonempty_thinking_start_emits_initial_delta() {
+        let contract = RequestContract::AnthropicMessages;
+        let mut parser = ProviderStreamParser::new(contract, false);
+        parser
+            .push_frame(SseFrame {
+                event: Some("message_start".to_string()),
+                data: Some(r#"{"type":"message_start","message":{"usage":{}}}"#.to_string()),
+            })
+            .unwrap();
+        let updates = parser
+            .push_frame(SseFrame {
+                event: Some("content_block_start".to_string()),
+                data: Some(
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"initial reasoning","signature":""}}"#
+                        .to_string(),
+                ),
+            })
+            .unwrap();
+        assert_eq!(
+            updates,
+            vec![StreamUpdate::ThinkingDelta("initial reasoning".to_string())]
+        );
+    }
 
     #[test]
     fn anthropic_validates_order_identity_and_object_arguments() {
@@ -2204,7 +2322,7 @@ mod tests {
             data: Some(
                 serde_json::json!({
                     "choices": [{
-                        "delta": {"reasoning_content": "x".repeat(OPENAI_REASONING_BUFFER_CAP + 1)},
+                        "delta": {"reasoning_content": "x".repeat(REASONING_BUFFER_CAP + 1)},
                         "finish_reason": "stop",
                     }]
                 })
