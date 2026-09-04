@@ -1664,6 +1664,83 @@ mod tests {
     }
 
     #[test]
+    fn provider_parsers_enforce_reasoning_byte_caps_at_event_boundaries() {
+        fn frame(data: Value) -> SseFrame {
+            SseFrame {
+                event: None,
+                data: Some(data.to_string()),
+            }
+        }
+        let mut anthropic = ProviderStreamParser::new(RequestContract::AnthropicMessages, false);
+        anthropic
+            .push_frame(frame(
+                serde_json::json!({"type":"message_start","message":{"usage":{}}}),
+            ))
+            .unwrap();
+        anthropic
+            .push_frame(frame(serde_json::json!({
+                "type":"content_block_start", "index":0,
+                "content_block":{"type":"thinking","thinking":"x".repeat(REASONING_BUFFER_CAP - 2)}
+            })))
+            .unwrap();
+        anthropic
+            .push_frame(frame(serde_json::json!({
+                "type":"content_block_delta", "index":0,
+                "delta":{"type":"thinking_delta","thinking":"é"}
+            })))
+            .unwrap();
+        anthropic
+            .push_frame(frame(
+                serde_json::json!({"type":"content_block_stop","index":0}),
+            ))
+            .unwrap();
+        let error = anthropic
+            .push_frame(frame(serde_json::json!({
+                "type":"content_block_start", "index":1,
+                "content_block":{"type":"thinking","thinking":"y"}
+            })))
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded 4194304 bytes"));
+        let ProviderState::Anthropic(state) = &anthropic.state else {
+            unreachable!()
+        };
+        assert_eq!(state.thinking_bytes, REASONING_BUFFER_CAP);
+        assert_eq!(state.blocks.len(), 1);
+
+        for contract in [
+            RequestContract::OpenAiResponses,
+            RequestContract::ChatGptResponses,
+        ] {
+            for event in [
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+            ] {
+                let mut parser = ProviderStreamParser::new(contract, false);
+                let field = if event.ends_with(".done") {
+                    "text"
+                } else {
+                    "delta"
+                };
+                parser
+                    .push_frame(frame(
+                        serde_json::json!({"type":event, field:"x".repeat(REASONING_BUFFER_CAP)}),
+                    ))
+                    .unwrap();
+                let error = parser
+                    .push_frame(frame(serde_json::json!({
+                        "type":"response.reasoning_summary_text.delta", "delta":"é"
+                    })))
+                    .unwrap_err();
+                assert!(error.to_string().contains("exceeded 4194304 bytes"));
+                let ProviderState::ChatGpt(state) = &parser.state else {
+                    unreachable!()
+                };
+                assert_eq!(state.reasoning.len(), REASONING_BUFFER_CAP);
+            }
+        }
+    }
+
+    #[test]
     fn incomplete_responses_explicitly_discard_reasoning_preview() {
         let contract = RequestContract::ChatGptResponses;
         let mut parser = ProviderStreamParser::new(contract, false);

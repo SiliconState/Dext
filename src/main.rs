@@ -593,55 +593,62 @@ pub(crate) fn redact_pseudo_tool_protocol_text(text: &str) -> String {
     let marker = pseudo_tool_redaction_marker();
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
-        if redacting_xml {
-            if let Some(end) = lower.find("</tool_call>") {
+        let mut remainder = line;
+        loop {
+            let lower = &lower[line.len() - remainder.len()..];
+            if redacting_xml {
+                let Some(end) = lower.find("</tool_call>") else {
+                    break;
+                };
                 redacting_xml = false;
-                let tail = line[end + "</tool_call>".len()..].trim();
-                if !tail.is_empty() {
-                    lines.push(tail.to_string());
+                remainder = remainder[end + "</tool_call>".len()..].trim_start();
+                if remainder.is_empty() {
+                    break;
                 }
+                continue;
             }
-            continue;
-        }
-        if let Some(start) = lower.find("<tool_call") {
-            redacted = true;
-            let prefix = line[..start].trim_end();
-            if !prefix.is_empty() {
-                lines.push(prefix.to_string());
+            if let Some(start) = lower.find("<tool_call") {
+                redacted = true;
+                let prefix = remainder[..start].trim_end();
+                if !prefix.is_empty() {
+                    lines.push(prefix.to_string());
+                }
+                if lines.last().is_none_or(|previous| previous != marker) {
+                    lines.push(marker.to_string());
+                }
+                redacting_xml = true;
+                remainder = &remainder[start..];
+                continue;
             }
-            if lines.last().is_none_or(|previous| previous != marker) {
-                lines.push(marker.to_string());
-            }
-            redacting_xml = !lower[start..].contains("</tool_call>");
-            continue;
-        }
-        if redacting_payload {
-            if line.trim().is_empty() {
+            if redacting_payload {
+                if remainder.trim().is_empty() {
+                    redacting_payload = false;
+                    lines.push(remainder.to_string());
+                    break;
+                }
+                if text_line_looks_like_pseudo_tool_payload(remainder) {
+                    break;
+                }
                 redacting_payload = false;
-                lines.push(line.to_string());
-                continue;
             }
-            if text_line_looks_like_pseudo_tool_payload(line) {
-                continue;
-            }
-            redacting_payload = false;
-        }
-        if text_line_looks_like_pseudo_tool_syntax(line)
-            || text_line_looks_like_pseudo_tool_start(line)
-        {
-            redacted = true;
-            while lines
-                .last()
-                .is_some_and(|previous| matches!(previous.trim(), "{" | "["))
+            if text_line_looks_like_pseudo_tool_syntax(remainder)
+                || text_line_looks_like_pseudo_tool_start(remainder)
             {
-                lines.pop();
+                redacted = true;
+                while lines
+                    .last()
+                    .is_some_and(|previous| matches!(previous.trim(), "{" | "["))
+                {
+                    lines.pop();
+                }
+                if lines.last().is_none_or(|previous| previous != marker) {
+                    lines.push(marker.to_string());
+                }
+                redacting_payload = pseudo_tool_line_opens_payload_block(remainder);
+            } else {
+                lines.push(remainder.to_string());
             }
-            if lines.last().is_none_or(|previous| previous != marker) {
-                lines.push(marker.to_string());
-            }
-            redacting_payload = pseudo_tool_line_opens_payload_block(line);
-        } else {
-            lines.push(line.to_string());
+            break;
         }
     }
     if !redacted {
