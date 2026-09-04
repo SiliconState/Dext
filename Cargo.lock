@@ -1540,7 +1540,7 @@ dependencies = [
  "document-features",
  "hashbrown 0.17.0",
  "indoc",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "kasuari",
  "lru",
  "palette",
