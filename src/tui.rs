@@ -1826,18 +1826,22 @@ impl TuiState {
             .or_else(|| self.transcript.last())
     }
 
+    // Gaps adjacent to thinking history are tagged with that block so rolling
+    // the block back also removes its spacing instead of leaving a stray blank.
+    fn history_separator(last: &Line_, next: &Line_) -> Line_ {
+        Self::thinking_block_id(next)
+            .or_else(|| Self::thinking_block_id(last))
+            .map_or(Line_::Blank, |block_id| Line_::ThinkingGap { block_id })
+    }
+
     fn queue(&mut self, line: Line_) {
-        let is_transcript_block = Self::line_needs_history_spacing(&line);
         let needs_trailing_blank =
             matches!(line, Line_::PermissionResult { .. } | Line_::Steering(_));
-        if is_transcript_block
-            && self.last_line_needs_history_spacing()
-            && !self.pending_insert.ends_with(&[Line_::Blank])
+        if let Some(separator) = self
+            .last_history_line()
+            .filter(|last| Self::spacing_needed_between(last, &line))
+            .map(|last| Self::history_separator(last, &line))
         {
-            let separator = self
-                .last_history_line()
-                .and_then(Self::thinking_block_id)
-                .map_or(Line_::Blank, |block_id| Line_::ThinkingGap { block_id });
             self.pending_insert.push(separator);
         }
         self.pending_insert.push(line);
@@ -1850,17 +1854,8 @@ impl TuiState {
         if !self.verbose || active.queued_units >= active.units.len() {
             return;
         }
-        if self.last_line_needs_history_spacing()
-            && self
-                .last_history_line()
-                .is_none_or(|last| !Self::thinking_line_belongs_to(last, active.block_id))
-        {
-            self.pending_insert.push(Line_::ThinkingGap {
-                block_id: active.block_id,
-            });
-        }
         for unit in &active.units[active.queued_units..] {
-            self.pending_insert.push(Line_::ThinkingUnit {
+            self.queue(Line_::ThinkingUnit {
                 block_id: active.block_id,
                 text: unit.text.clone(),
                 section_start: unit.section_start,
@@ -1881,11 +1876,6 @@ impl TuiState {
             .active_thinking
             .take()
             .unwrap_or_else(|| self.start_active_thinking());
-        if active.context_mode != self.context_mode {
-            self.rollback_active_thinking_display(&mut active);
-            active = ActiveThinking::new(active.block_id, self.context_mode);
-            active.push(&self.streaming_thinking);
-        }
         self.streaming_thinking.push_str(&text);
         active.push(&text);
         self.queue_active_thinking_units(&mut active);
@@ -1901,24 +1891,24 @@ impl TuiState {
         }
     }
 
-    fn thinking_line_belongs_to(line: &Line_, block_id: u64) -> bool {
-        Self::thinking_block_id(line) == Some(block_id)
-    }
-
-    fn remove_thinking_block_from(items: &mut Vec<Line_>, block_id: u64) -> bool {
+    fn retain_without_thinking_blocks(items: &mut Vec<Line_>, discarded: &HashSet<u64>) -> bool {
         let before = items.len();
-        items.retain(|line| !Self::thinking_line_belongs_to(line, block_id));
+        items.retain(|line| {
+            Self::thinking_block_id(line).is_none_or(|block_id| !discarded.contains(&block_id))
+        });
         items.len() != before
     }
 
-    fn rollback_active_thinking_display(&mut self, active: &mut ActiveThinking) {
+    fn rollback_thinking_blocks(&mut self, discarded: &HashSet<u64>) {
+        if discarded.is_empty() {
+            return;
+        }
         let pending_removed =
-            Self::remove_thinking_block_from(&mut self.pending_insert, active.block_id);
+            Self::retain_without_thinking_blocks(&mut self.pending_insert, discarded);
         let retry_removed =
-            Self::remove_thinking_block_from(&mut self.prepared_insert_retry, active.block_id);
+            Self::retain_without_thinking_blocks(&mut self.prepared_insert_retry, discarded);
         let transcript_removed =
-            Self::remove_thinking_block_from(&mut self.transcript, active.block_id);
-        active.queued_units = 0;
+            Self::retain_without_thinking_blocks(&mut self.transcript, discarded);
         if retry_removed || transcript_removed {
             self.transcript_needs_rebuild = true;
         }
@@ -1928,98 +1918,78 @@ impl TuiState {
         }
     }
 
-    fn discard_current_thinking(&mut self) {
+    fn rollback_active_thinking_display(&mut self, active: &mut ActiveThinking) {
+        self.rollback_thinking_blocks(&HashSet::from([active.block_id]));
+        active.queued_units = 0;
+    }
+
+    fn replay_active_thinking(
+        &mut self,
+        mut previous: ActiveThinking,
+        raw: &str,
+    ) -> ActiveThinking {
+        self.rollback_active_thinking_display(&mut previous);
+        let mut active = ActiveThinking::new(previous.block_id, self.context_mode);
+        active.push(raw);
+        active
+    }
+
+    fn discard_open_thinking_block(&mut self) {
         if let Some(mut active) = self.active_thinking.take() {
             self.rollback_active_thinking_display(&mut active);
         }
         self.streaming_thinking.clear();
     }
 
-    fn discard_active_thinking(&mut self) {
-        let mut block_ids = self
+    fn discard_uncommitted_thinking(&mut self) {
+        let discarded = self
             .provisional_thinking
-            .iter()
+            .drain(..)
+            .chain(self.active_thinking.take())
             .map(|thinking| thinking.block_id)
             .collect::<HashSet<_>>();
-        if let Some(active) = self.active_thinking.take() {
-            block_ids.insert(active.block_id);
-        }
-        self.provisional_thinking.clear();
         self.streaming_thinking.clear();
-        if block_ids.is_empty() {
-            return;
-        }
-
-        let pending_before = self.pending_insert.len();
-        self.pending_insert
-            .retain(|line| Self::thinking_block_id(line).is_none_or(|id| !block_ids.contains(&id)));
-        let retry_before = self.prepared_insert_retry.len();
-        self.prepared_insert_retry
-            .retain(|line| Self::thinking_block_id(line).is_none_or(|id| !block_ids.contains(&id)));
-        let transcript_before = self.transcript.len();
-        self.transcript
-            .retain(|line| Self::thinking_block_id(line).is_none_or(|id| !block_ids.contains(&id)));
-        let pending_removed = pending_before != self.pending_insert.len();
-        let retry_removed = retry_before != self.prepared_insert_retry.len();
-        let transcript_removed = transcript_before != self.transcript.len();
-        if retry_removed || transcript_removed {
-            self.transcript_needs_rebuild = true;
-        }
-        if pending_removed || retry_removed || transcript_removed {
-            self.repair_history_spacing();
-            self.thinking_visual_transaction_pending = true;
-        }
+        self.rollback_thinking_blocks(&discarded);
     }
 
     fn commit_thinking_preview(&mut self) {
         self.provisional_thinking.clear();
     }
 
-    fn rebuild_active_thinking_display(&mut self) {
-        let Some(mut previous) = self.active_thinking.take() else {
+    // Nothing re-streams after a turn boundary, so sealed thinking history stays
+    // put even when the turn failed; only the never-sealed open tail is dropped.
+    fn commit_turn_thinking(&mut self) {
+        self.provisional_thinking.clear();
+        self.active_thinking = None;
+        self.streaming_thinking.clear();
+    }
+
+    fn sync_active_thinking_visibility(&mut self) {
+        let Some(previous) = self.active_thinking.take() else {
             return;
         };
-        let raw = self.streaming_thinking.clone();
-        self.rollback_active_thinking_display(&mut previous);
-        let mut active = ActiveThinking::new(previous.block_id, self.context_mode);
-        active.push(&raw);
+        let raw = std::mem::take(&mut self.streaming_thinking);
+        let mut active = self.replay_active_thinking(previous, &raw);
+        self.streaming_thinking = raw;
         self.queue_active_thinking_units(&mut active);
         self.active_thinking = Some(active);
     }
 
-    fn sync_active_thinking_visibility(&mut self) {
-        let Some(mut active) = self.active_thinking.take() else {
-            return;
-        };
-        if self.verbose {
-            let raw = self.streaming_thinking.clone();
-            self.rollback_active_thinking_display(&mut active);
-            active = ActiveThinking::new(active.block_id, self.context_mode);
-            active.push(&raw);
-            self.queue_active_thinking_units(&mut active);
-        } else {
-            self.rollback_active_thinking_display(&mut active);
-        }
-        self.active_thinking = Some(active);
-    }
-
     fn complete_thinking(&mut self, full: String) {
-        let streamed = self.streaming_thinking.clone();
         if full.is_empty() {
-            self.discard_current_thinking();
+            self.discard_open_thinking_block();
             return;
         }
 
+        let streamed = std::mem::take(&mut self.streaming_thinking);
         let mut active = self
             .active_thinking
             .take()
             .unwrap_or_else(|| self.start_active_thinking());
-        if let Some(extra) = full.strip_prefix(&streamed) {
+        if let Some(extra) = full.strip_prefix(streamed.as_str()) {
             active.push(extra);
         } else {
-            self.rollback_active_thinking_display(&mut active);
-            active = ActiveThinking::new(active.block_id, self.context_mode);
-            active.push(&full);
+            active = self.replay_active_thinking(active, &full);
             self.thinking_reconcile_mismatches =
                 self.thinking_reconcile_mismatches.saturating_add(1);
             self.push_debug_event(format!(
@@ -2029,7 +1999,6 @@ impl TuiState {
         }
         active.finish();
         self.queue_active_thinking_units(&mut active);
-        self.streaming_thinking.clear();
         self.provisional_thinking.push(active);
     }
 
@@ -2396,7 +2365,7 @@ impl TuiState {
         self.compacting = false;
         self.compacting_resume_busy = false;
         self.streaming_text.clear();
-        self.discard_current_thinking();
+        self.discard_open_thinking_block();
         self.stream_started_at = None;
         self.stream_chars = 0;
         self.live_tools.clear();
@@ -2412,7 +2381,7 @@ impl TuiState {
     fn apply_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::TurnStart => {
-                self.discard_current_thinking();
+                self.commit_turn_thinking();
                 self.push_debug_event("turn start");
                 self.compacting = false;
                 self.compacting_resume_busy = false;
@@ -2497,7 +2466,7 @@ impl TuiState {
             }
             AgentEvent::ThinkingPreviewDiscarded => {
                 self.push_debug_event("thinking preview discarded before retry");
-                self.discard_active_thinking();
+                self.discard_uncommitted_thinking();
             }
             AgentEvent::ThinkingPreviewCommitted => {
                 self.commit_thinking_preview();
@@ -2730,7 +2699,7 @@ impl TuiState {
                 wait_secs,
                 reason,
             } => {
-                self.discard_active_thinking();
+                self.discard_uncommitted_thinking();
                 self.push_debug_event(format!(
                     "http retry · attempt {attempt}/4 · wait {wait_secs}s · {reason}"
                 ));
@@ -2771,7 +2740,7 @@ impl TuiState {
                     && self.context_mode != context_mode
                 {
                     self.context_mode = context_mode;
-                    self.rebuild_active_thinking_display();
+                    self.sync_active_thinking_visibility();
                 }
                 self.workaround_fired = workaround_fired;
             }
@@ -2803,7 +2772,7 @@ impl TuiState {
                 if stream_aborted {
                     self.history_chars = self.history_chars.saturating_sub(self.stream_chars);
                     self.streaming_text.clear();
-                    self.discard_active_thinking();
+                    self.discard_uncommitted_thinking();
                     self.stream_started_at = None;
                     self.stream_chars = 0;
                 }
@@ -2867,7 +2836,7 @@ impl TuiState {
                 self.stream_started_at = None;
                 self.stream_chars = 0;
                 self.streaming_text.clear();
-                self.discard_active_thinking();
+                self.commit_turn_thinking();
                 self.live_tools.clear();
             }
             AgentEvent::CompactStart => {
@@ -2932,7 +2901,7 @@ impl TuiState {
                 self.stream_started_at = None;
                 self.stream_chars = 0;
                 self.streaming_text.clear();
-                self.discard_active_thinking();
+                self.discard_uncommitted_thinking();
                 self.live_tools.clear();
             }
             AgentEvent::SteeringReceived { messages, preview } => {
@@ -10471,6 +10440,10 @@ mod tests {
         assert_eq!(decoder.open_display_text().as_deref(), Some(" "));
     }
 
+    fn thinking_line_belongs_to(line: &Line_, block_id: u64) -> bool {
+        TuiState::thinking_block_id(line) == Some(block_id)
+    }
+
     #[test]
     fn thinking_stream_seals_newlines_and_keeps_open_tail_live() {
         let mut state = TuiState::new(
@@ -10742,19 +10715,19 @@ mod tests {
             !state
                 .pending_insert
                 .iter()
-                .any(|line| TuiState::thinking_line_belongs_to(line, block_id))
+                .any(|line| thinking_line_belongs_to(line, block_id))
         );
         assert!(
             !state
                 .prepared_insert_retry
                 .iter()
-                .any(|line| TuiState::thinking_line_belongs_to(line, block_id))
+                .any(|line| thinking_line_belongs_to(line, block_id))
         );
         assert!(
             !state
                 .transcript
                 .iter()
-                .any(|line| TuiState::thinking_line_belongs_to(line, block_id))
+                .any(|line| thinking_line_belongs_to(line, block_id))
         );
         assert!(state.transcript_needs_rebuild);
         assert!(state.thinking_visual_transaction_pending);
@@ -10790,6 +10763,52 @@ mod tests {
                 .iter()
                 .any(|line| matches!(line, Line_::ThinkingUnit { .. } | Line_::ThinkingGap { .. }))
         );
+    }
+
+    #[test]
+    fn failed_turn_end_commits_sealed_thinking_instead_of_rolling_back() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.apply_event(AgentEvent::ThinkingDelta("completed block".to_string()));
+        state.apply_event(AgentEvent::ThinkingBlockComplete(
+            "completed block".to_string(),
+        ));
+        state.apply_event(AgentEvent::ThinkingDelta(
+            "sealed line\nopen tail".to_string(),
+        ));
+        state.transcript_needs_rebuild = false;
+        let sealed_units = |state: &TuiState| {
+            state
+                .pending_insert
+                .iter()
+                .filter_map(|line| match line {
+                    Line_::ThinkingUnit { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sealed_units(&state), ["completed block", "sealed line"]);
+
+        state.apply_event(AgentEvent::TurnEnd {
+            usage: Usage::default(),
+            failed: true,
+        });
+
+        assert!(state.provisional_thinking.is_empty());
+        assert!(state.active_thinking.is_none());
+        assert!(state.streaming_thinking.is_empty());
+        assert!(!state.transcript_needs_rebuild);
+        assert_eq!(sealed_units(&state), ["completed block", "sealed line"]);
+
+        state.apply_event(AgentEvent::TurnStart);
+        state.apply_event(AgentEvent::ThinkingPreviewDiscarded);
+        assert!(!state.transcript_needs_rebuild);
+        assert_eq!(sealed_units(&state), ["completed block", "sealed line"]);
     }
 
     #[test]
@@ -13061,7 +13080,7 @@ mod tests {
             [
                 Line_::Info(_),
                 Line_::Info(_),
-                Line_::Blank,
+                Line_::ThinkingGap { .. },
                 Line_::ThinkingUnit { .. }
             ]
         ));
@@ -13085,7 +13104,11 @@ mod tests {
 
         assert!(matches!(
             state.pending_insert.as_slice(),
-            [Line_::Info(_), Line_::Blank, Line_::ThinkingUnit { .. }]
+            [
+                Line_::Info(_),
+                Line_::ThinkingGap { .. },
+                Line_::ThinkingUnit { .. }
+            ]
         ));
     }
 
@@ -13204,7 +13227,11 @@ mod tests {
             assert_eq!(state.pending_insert.len(), 3);
             assert!(matches!(
                 state.pending_insert.as_slice(),
-                [Line_::SteeringDelivered { .. }, Line_::Blank, _]
+                [
+                    Line_::SteeringDelivered { .. },
+                    Line_::Blank | Line_::ThinkingGap { .. },
+                    _
+                ]
             ));
         }
     }
@@ -13293,7 +13320,7 @@ mod tests {
                 [
                     Line_::Tool { name, .. },
                     Line_::Warn(advisory),
-                    Line_::Blank,
+                    Line_::Blank | Line_::ThinkingGap { .. },
                     _
                 ] if name == "read_symbol" && advisory.starts_with("read_symbol expects")
             ));
@@ -13334,7 +13361,7 @@ mod tests {
             [
                 Line_::Warn(first),
                 Line_::Warn(second),
-                Line_::Blank,
+                Line_::ThinkingGap { .. },
                 Line_::ThinkingUnit { .. }
             ] if first == "first warning" && second == "second warning"
         ));
@@ -13356,8 +13383,11 @@ mod tests {
 
         assert!(matches!(
             state.pending_insert.as_slice(),
-            [Line_::Warn(advisory), Line_::Blank, Line_::ThinkingUnit { .. }]
-                if advisory.starts_with("[runtime control]")
+            [
+                Line_::Warn(advisory),
+                Line_::ThinkingGap { .. },
+                Line_::ThinkingUnit { .. }
+            ] if advisory.starts_with("[runtime control]")
         ));
     }
 

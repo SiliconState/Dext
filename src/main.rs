@@ -17725,7 +17725,7 @@ impl Agent {
                     request_effort_override,
                 )?;
                 stream_attempt += 1;
-                if stream_attempt > 1 {
+                if stream_attempt > 1 && !self.quiet_stream_events {
                     self.sink.emit(AgentEvent::ThinkingPreviewDiscarded);
                 }
                 let mut attempt: u32 = 0;
