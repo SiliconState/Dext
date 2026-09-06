@@ -51,6 +51,43 @@ fn restore_env_var(name: &str, old_value: Option<std::ffi::OsString>) {
     }
 }
 
+struct PackEnvGuard {
+    old_home: Option<std::ffi::OsString>,
+    old_shelves: Option<std::ffi::OsString>,
+    old_no_pack: Option<std::ffi::OsString>,
+}
+
+impl PackEnvGuard {
+    fn new(home: &Path) -> Self {
+        let guard = Self {
+            old_home: std::env::var_os("DEXT_HOME"),
+            old_shelves: std::env::var_os("DEXT_SHELVES_DIR"),
+            old_no_pack: std::env::var_os("DEXT_NO_PACK"),
+        };
+        unsafe {
+            std::env::set_var("DEXT_HOME", home);
+            std::env::remove_var("DEXT_SHELVES_DIR");
+            std::env::remove_var("DEXT_NO_PACK");
+        }
+        guard
+    }
+}
+
+impl Drop for PackEnvGuard {
+    fn drop(&mut self) {
+        restore_env_var("DEXT_HOME", self.old_home.take());
+        restore_env_var("DEXT_SHELVES_DIR", self.old_shelves.take());
+        restore_env_var("DEXT_NO_PACK", self.old_no_pack.take());
+    }
+}
+
+fn write_user_pack(home: &Path, shelf: &str, name: &str, workflow: &str) -> Result<PathBuf> {
+    let path = home.join(format!("shelves/{shelf}/packs/{name}"));
+    std::fs::create_dir_all(&path)?;
+    std::fs::write(path.join("PACK.md"), workflow)?;
+    Ok(path)
+}
+
 struct RemoveDirOnDrop(PathBuf);
 
 impl Drop for RemoveDirOnDrop {
@@ -16163,6 +16200,7 @@ fn pack_runtime_default_always_profile_does_not_prompt() {
         runtime_path: Some(root.join("runtime.json")),
         credential_env: Vec::new(),
         credential_env_ignored: false,
+        ui: None,
         source: "user:test".to_string(),
         shelf: Some("test".to_string()),
     };
@@ -16203,6 +16241,7 @@ fn pack_runtime_always_approval_is_exact_identity_scoped() {
         runtime_path: Some(root.join("runtime.json")),
         credential_env: Vec::new(),
         credential_env_ignored: false,
+        ui: None,
         source: "user:test".to_string(),
         shelf: Some("test".to_string()),
     };
@@ -16246,6 +16285,7 @@ fn pack_runtime_rejects_host_approval_operation_names() -> Result<()> {
         runtime_path: Some(root.join(pack_runtime::RUNTIME_MANIFEST_NAME)),
         credential_env: Vec::new(),
         credential_env_ignored: false,
+        ui: None,
         source: "user:test".to_string(),
         shelf: Some("test".to_string()),
     };
@@ -16506,12 +16546,7 @@ fn pack_runtime_restore_uses_exact_saved_source_despite_name_shadowing() -> Resu
         Ok(())
     };
     write_pack(&user_pack, "user")?;
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
-    unsafe {
-        std::env::set_var("DEXT_HOME", &home);
-        std::env::remove_var("DEXT_SHELVES_DIR");
-    }
+    let _pack_env = PackEnvGuard::new(&home);
 
     let pack = packs::find_pack(&root, "shadow-runtime")?;
     assert_eq!(pack.path, user_pack);
@@ -16539,8 +16574,6 @@ fn pack_runtime_restore_uses_exact_saved_source_despite_name_shadowing() -> Resu
     assert_eq!(restored.pack_source, user_source);
     assert_eq!(restored.executable, user_pack.join("runtime.sh"));
 
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
     let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
@@ -28656,6 +28689,81 @@ fn packs_discover_user_global_pack_from_dext_home() -> Result<()> {
 }
 
 #[test]
+fn packs_parse_ui_metadata_and_render_json() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-ui-json");
+    let demo_dir = root.join(".dext/shelves/test/packs/demo");
+    let basic_dir = root.join(".dext/shelves/test/packs/basic");
+    std::fs::create_dir_all(&demo_dir)?;
+    std::fs::create_dir_all(&basic_dir)?;
+    std::fs::write(
+        demo_dir.join("PACK.md"),
+        "---\nNAME: demo\ndescription: UI demo\nui_starter_prompt: \"Run\u{0007} it\"\nUI-ARTIFACT: HTML\nui-time-to-first-artifact: 12.6\nui-requires: [approval:auto-write, chrom\u{202e}ium]\nui_gallery: yes\nui-tags: research, summary\nui-icon: rep\u{0007}ort\n---\n# Demo\n",
+    )?;
+    std::fs::write(
+        basic_dir.join("PACK.md"),
+        "---\nname: basic\ndescription: Basic workflow\nui-artifact: invalid\nui-gallery: maybe\n---\n# Basic\n",
+    )?;
+    let _pack_env = PackEnvGuard::new(&root.join("home"));
+
+    let pack = packs::find_pack(&root, "demo")?;
+    assert_eq!(
+        pack.ui,
+        Some(packs::PackUi {
+            starter_prompt: Some("Run it".to_string()),
+            artifact: Some("html".to_string()),
+            time_to_first_artifact: Some(13),
+            requires: Some(vec![
+                "approval:auto-write".to_string(),
+                "chromium".to_string(),
+            ]),
+            gallery: Some(true),
+            tags: Some(vec!["research".to_string(), "summary".to_string()]),
+            icon: Some("report".to_string()),
+        })
+    );
+    assert!(packs::find_pack(&root, "basic")?.ui.is_none());
+
+    let inspect = packs::render_pack_inspect(&root, "demo")?;
+    assert!(
+        inspect.contains("ui: {\n    \"starter_prompt\": \"Run it\""),
+        "{inspect}"
+    );
+    assert!(inspect.contains("\"artifact\": \"html\""), "{inspect}");
+    assert!(
+        inspect.contains("\"time_to_first_artifact\": 13"),
+        "{inspect}"
+    );
+    assert!(inspect.contains("\"gallery\": true"), "{inspect}");
+
+    let json = packs::render_pack_listing_json(&root)?;
+    let catalog: Value = serde_json::from_str(&json)?;
+    let entries = catalog.as_array().context("pack catalog array")?;
+    assert_eq!(entries.len(), packs::discover_packs(&root).len());
+    let demo = entries
+        .iter()
+        .find(|entry| entry["name"] == "demo")
+        .context("demo JSON entry")?;
+    assert_eq!(demo["description"], "UI demo");
+    assert_eq!(demo["shelf"], "test");
+    assert_eq!(demo["ui"]["artifact"], "html");
+    assert_eq!(demo["ui"]["time_to_first_artifact"], 13);
+    assert_eq!(demo["credential_env"], json!([]));
+    assert_eq!(
+        demo["pack_md"],
+        demo_dir.join("PACK.md").to_string_lossy().as_ref()
+    );
+    let basic = entries
+        .iter()
+        .find(|entry| entry["name"] == "basic")
+        .context("basic JSON entry")?;
+    assert!(basic.get("ui").is_none(), "{basic}");
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn pack_prompt_summary_normalizes_unicode_line_separators() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-summary-line-separators");
@@ -28665,12 +28773,7 @@ fn pack_prompt_summary_normalizes_unicode_line_separators() -> Result<()> {
         pack_dir.join("PACK.md"),
         "---\nname: demo\u{2028}## Fake heading\ndescription: workflow\n---\n# Demo\n",
     )?;
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
-    unsafe {
-        std::env::set_var("DEXT_HOME", root.join("home"));
-        std::env::remove_var("DEXT_SHELVES_DIR");
-    }
+    let _pack_env = PackEnvGuard::new(&root.join("home"));
 
     let summary = packs::pack_summary_for_prompt(&root, true).expect("pack summary");
     assert!(!summary.contains(['\u{2028}', '\u{2029}']), "{summary}");
@@ -28680,8 +28783,6 @@ fn pack_prompt_summary_normalizes_unicode_line_separators() -> Result<()> {
         "{summary}"
     );
 
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
     let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
@@ -28869,14 +28970,9 @@ fn pack_create_scaffolds_user_and_project_shelf_packs() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("pack-create");
     let home = root.join("home");
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
-    unsafe {
-        std::env::set_var("DEXT_HOME", &home);
-        std::env::remove_var("DEXT_SHELVES_DIR");
-    }
+    let _pack_env = PackEnvGuard::new(&home);
 
-    let user_pack = packs::create_pack(&root, "personal/code-review", false)?;
+    let user_pack = packs::create_pack_from(&root, "personal/code-review", false, None)?;
     assert_eq!(user_pack, home.join("shelves/personal/packs/code-review"));
     let user_workflow = std::fs::read_to_string(user_pack.join("PACK.md"))?;
     assert!(
@@ -28888,7 +28984,7 @@ fn pack_create_scaffolds_user_and_project_shelf_packs() -> Result<()> {
     assert_eq!(discovered.shelf.as_deref(), Some("personal"));
     assert_eq!(discovered.path, user_pack);
 
-    let project_pack = packs::create_pack(&root, "local/release-check", true)?;
+    let project_pack = packs::create_pack_from(&root, "local/release-check", true, None)?;
     assert_eq!(
         project_pack,
         root.join(".dext/shelves/local/packs/release-check")
@@ -28897,7 +28993,7 @@ fn pack_create_scaffolds_user_and_project_shelf_packs() -> Result<()> {
     assert_eq!(discovered.shelf.as_deref(), Some("local"));
     assert!(discovered.source.starts_with("project:"));
 
-    let overwrite = packs::create_pack(&root, "personal/code-review", false)
+    let overwrite = packs::create_pack_from(&root, "personal/code-review", false, None)
         .expect_err("existing pack must not be overwritten");
     assert!(
         overwrite.to_string().contains("already exists"),
@@ -28905,14 +29001,100 @@ fn pack_create_scaffolds_user_and_project_shelf_packs() -> Result<()> {
     );
     for invalid in ["missing-shelf", "Bad/name", "shelf/name/extra", "../escape"] {
         assert!(
-            packs::create_pack(&root, invalid, false).is_err(),
+            packs::create_pack_from(&root, invalid, false, None).is_err(),
             "invalid location accepted: {invalid}"
         );
     }
 
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
     let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+#[test]
+fn pack_create_forks_regular_files_and_skips_sensitive_paths() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-create-from");
+    let home = root.join("home");
+    let source = home.join("shelves/research/packs/report");
+    std::fs::create_dir_all(source.join("bin"))?;
+    std::fs::create_dir_all(source.join("secrets"))?;
+    let original_workflow =
+        "---\nname: report\ndescription: Original\n---\n# Report\n\nKeep this workflow.\n";
+    std::fs::write(source.join("PACK.md"), original_workflow)?;
+    std::fs::write(source.join("bin/helper"), "helper bytes\n")?;
+    std::fs::write(source.join("README.md"), "docs\n")?;
+    std::fs::write(source.join("private.txt"), "password = \"fixture-value\"\n")?;
+    std::fs::write(source.join(".env.local"), "SERVICE_TOKEN=private\n")?;
+    std::fs::write(source.join("secrets/value.txt"), "private\n")?;
+    std::fs::write(source.join("private.key"), "private\n")?;
+    let _pack_env = PackEnvGuard::new(&home);
+
+    let fork = packs::create_pack_from(&root, "mine/report-mine", false, Some("report"))?;
+    let workflow = std::fs::read_to_string(fork.join("PACK.md"))?;
+    assert!(workflow.contains("name: report-mine"), "{workflow}");
+    assert!(workflow.contains("Keep this workflow."), "{workflow}");
+    assert_eq!(
+        std::fs::read_to_string(fork.join("bin/helper"))?,
+        "helper bytes\n"
+    );
+    assert_eq!(std::fs::read_to_string(fork.join("README.md"))?, "docs\n");
+    assert!(!fork.join("private.txt").exists());
+    assert!(!fork.join(".env.local").exists());
+    assert!(!fork.join("secrets").exists());
+    assert!(!fork.join("private.key").exists());
+    assert_eq!(
+        std::fs::read_to_string(source.join("PACK.md"))?,
+        original_workflow
+    );
+    let discovered = packs::find_pack(&root, "report-mine")?;
+    assert_eq!(discovered.path, fork);
+
+    let nested = packs::create_pack_from(&source, "research/nested", true, Some("report"))
+        .expect_err("fork target must not recurse inside its source pack");
+    assert!(nested.to_string().contains("cannot be inside source pack"));
+    assert!(!source.join(".dext/shelves/research/packs/nested").exists());
+
+    write_user_pack(
+        &home,
+        "research",
+        "sensitive",
+        "---\nname: sensitive\n---\npassword = \"fixture-value\"\n",
+    )?;
+    let sensitive = packs::create_pack_from(&root, "mine/sensitive", false, Some("sensitive"))
+        .expect_err("fork must not omit its required workflow");
+    assert!(
+        sensitive
+            .to_string()
+            .contains("matched by privacy redaction")
+    );
+    assert!(!home.join("shelves/mine/packs/sensitive").exists());
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_create_from_refuses_symlinks_and_removes_partial_target() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-create-from-symlink");
+    let home = root.join("home");
+    let source = home.join("shelves/research/packs/report");
+    std::fs::create_dir_all(&source)?;
+    std::fs::write(source.join("PACK.md"), "---\nname: report\n---\n# Report\n")?;
+    std::fs::write(source.join("a-regular"), "copied before refusal\n")?;
+    std::os::unix::fs::symlink(source.join("PACK.md"), source.join("z-link"))?;
+    let _pack_env = PackEnvGuard::new(&home);
+
+    let error = packs::create_pack_from(&root, "mine/fork", false, Some("report"))
+        .expect_err("fork must refuse source symlinks");
+    assert!(
+        error.to_string().contains("contains a symlink"),
+        "{error:#}"
+    );
+    assert!(!home.join("shelves/mine/packs/fork").exists());
+
+    let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
 
@@ -28937,13 +29119,10 @@ fn direct_pack_roots_and_overrides_are_not_discovered() -> Result<()> {
             format!("---\nname: direct-{index}\n---\n# Direct\n"),
         )?;
     }
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
     let old_packs = std::env::var_os("DEXT_PACKS_DIR");
     let old_direct = std::env::var_os("DEXT_PACK_DIRECT_4_DIR");
+    let _pack_env = PackEnvGuard::new(&home);
     unsafe {
-        std::env::set_var("DEXT_HOME", &home);
-        std::env::remove_var("DEXT_SHELVES_DIR");
         std::env::set_var("DEXT_PACKS_DIR", &env_root);
         std::env::set_var("DEXT_PACK_DIRECT_4_DIR", &direct_override);
     }
@@ -28956,8 +29135,6 @@ fn direct_pack_roots_and_overrides_are_not_discovered() -> Result<()> {
         "{discovered:?}"
     );
 
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
     restore_env_var("DEXT_PACKS_DIR", old_packs);
     restore_env_var("DEXT_PACK_DIRECT_4_DIR", old_direct);
     let _ = std::fs::remove_dir_all(&root);
@@ -29115,12 +29292,7 @@ fn slash_pack_create_scaffolds_project_pack() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("slash-pack-create");
     let home = root.join("home");
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
-    unsafe {
-        std::env::set_var("DEXT_HOME", &home);
-        std::env::remove_var("DEXT_SHELVES_DIR");
-    }
+    let _pack_env = PackEnvGuard::new(&home);
     let mut agent = test_agent(&root);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     agent.set_sink(Box::new(ChannelSink { tx }));
@@ -29141,8 +29313,6 @@ fn slash_pack_create_scaffolds_project_pack() -> Result<()> {
     assert_eq!(pack.shelf.as_deref(), Some("local"));
     assert!(pack.path.join("PACK.md").is_file());
 
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
@@ -29661,12 +29831,7 @@ fn pack_discovery_rejects_oversized_workflows() -> Result<()> {
     std::fs::create_dir_all(&pack_dir)?;
     let workflow = std::fs::File::create(pack_dir.join("PACK.md"))?;
     workflow.set_len(1024 * 1024 + 1)?;
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
-    unsafe {
-        std::env::set_var("DEXT_HOME", root.join("home"));
-        std::env::remove_var("DEXT_SHELVES_DIR");
-    }
+    let _pack_env = PackEnvGuard::new(&root.join("home"));
 
     assert!(packs::discover_packs(&root).is_empty());
     assert!(packs::pack_summary_for_prompt(&root, true).is_none());
@@ -29675,8 +29840,6 @@ fn pack_discovery_rejects_oversized_workflows() -> Result<()> {
         "run demo now"
     ));
 
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
     let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
@@ -29694,12 +29857,7 @@ fn pack_discovery_rejects_symlinked_workflows() -> Result<()> {
     let outside_workflow = outside.join("PACK.md");
     std::fs::write(&outside_workflow, "---\nname: demo\n---\n# Outside\n")?;
     symlink(&outside_workflow, pack_dir.join("PACK.md"))?;
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
-    unsafe {
-        std::env::set_var("DEXT_HOME", root.join("home"));
-        std::env::remove_var("DEXT_SHELVES_DIR");
-    }
+    let _pack_env = PackEnvGuard::new(&root.join("home"));
 
     assert!(packs::discover_packs(&root).is_empty());
     assert!(!packs::project_pack_invocation_requested(
@@ -29707,8 +29865,6 @@ fn pack_discovery_rejects_symlinked_workflows() -> Result<()> {
         "run demo now"
     ));
 
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(outside);
     Ok(())
@@ -29768,6 +29924,7 @@ fn pack_auto_invocation_disabled_by_env_globs_and_specific_names() {
         runtime_path: None,
         credential_env: Vec::new(),
         credential_env_ignored: false,
+        ui: None,
         source: "test".to_string(),
         shelf: Some("orchestration".to_string()),
     };
@@ -29826,6 +29983,149 @@ fn pack_auto_invocation_disabled_by_env_globs_and_specific_names() {
     unsafe {
         std::env::remove_var("DEXT_NO_PACK");
     }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn pack_start_precedes_provider_work_and_explicit_stdin_task_is_wrapped() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("pack-start-explicit");
+    let home = root.join("home");
+    let pack_dir = home.join("shelves/test/packs/demo");
+    std::fs::create_dir_all(&pack_dir)?;
+    std::fs::write(
+        pack_dir.join("PACK.md"),
+        "---\nname: demo\ndescription: Explicit demo\n---\n# Demo workflow\n",
+    )?;
+    let _pack_env = PackEnvGuard::new(&home);
+
+    let opts = parse_cli_options(vec![
+        "-p".to_string(),
+        "--output".to_string(),
+        "stream-json".to_string(),
+        "--pack".to_string(),
+        "demo".to_string(),
+    ])?;
+    let task = read_one_shot_task(&opts, &mut std::io::Cursor::new("line one\nline two\n"))?
+        .context("stdin task")?;
+    assert_eq!(task, "line one\nline two");
+
+    let mut agent = test_agent(&root);
+    agent.max_iterations = Some(0);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.set_sink(Box::new(ChannelSink { tx }));
+    agent
+        .run_pack(opts.pack.as_deref().context("pack selector")?, &task)
+        .await?;
+
+    let events = drain_events(&mut rx);
+    let turn_start = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::TurnStart))
+        .context("turn_start event")?;
+    let pack_start = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::PackStart { name, task_preview }
+                    if name == "demo" && task_preview == "line one\nline two"
+            )
+        })
+        .context("pack_start event")?;
+    assert!(turn_start < pack_start, "{turn_start} !< {pack_start}");
+    let slash = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Slash(text) if text.contains("▶ pack: demo")))
+        .context("explicit pack notice")?;
+    assert!(slash < turn_start, "{slash} !< {turn_start}");
+    assert!(turn_start < pack_start, "{turn_start} !< {pack_start}");
+    assert!(
+        !events[..pack_start]
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta(_)))
+    );
+    let pack_event = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::PackStart { .. }))
+        .context("serialized pack event")?;
+    assert_eq!(
+        serde_json::to_value(pack_event)?,
+        json!({
+            "event": "pack_start",
+            "data": {"name": "demo", "task_preview": "line one\nline two"}
+        })
+    );
+    let prompt = agent.history.first().context("pack prompt history")?;
+    assert!(matches!(
+        prompt.content.first(),
+        Some(Block::Text { text })
+            if text.contains("# Demo workflow")
+                && text.contains("User task for this pack:\nline one\nline two")
+    ));
+
+    let mut inferred = test_agent(&root);
+    inferred.max_iterations = Some(0);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    inferred.set_sink(Box::new(ChannelSink { tx }));
+    inferred
+        .chat("run demo on faster tests".to_string())
+        .await?;
+    assert!(drain_events(&mut rx).iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::PackStart { name, task_preview }
+                if name == "demo" && task_preview == "run demo on faster tests"
+        )
+    }));
+
+    unsafe {
+        std::env::set_var("DEXT_NO_PACK", "demo");
+    }
+    let mut suppressed = test_agent(&root);
+    suppressed.max_iterations = Some(0);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    suppressed.set_sink(Box::new(ChannelSink { tx }));
+    suppressed
+        .chat("run demo on faster tests".to_string())
+        .await?;
+    assert!(
+        !drain_events(&mut rx)
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PackStart { .. }))
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
+fn parse_pack_create_options_is_strict() -> Result<()> {
+    assert_eq!(
+        parse_pack_create_options(&[
+            "--from".to_string(),
+            "report".to_string(),
+            "--project".to_string(),
+        ])?,
+        (true, Some("report".to_string()))
+    );
+    assert_eq!(
+        parse_pack_create_options(&["--from=report".to_string()])?,
+        (false, Some("report".to_string()))
+    );
+    for args in [
+        vec!["--from".to_string()],
+        vec!["--bogus".to_string()],
+        vec!["--project".to_string(), "--project".to_string()],
+        vec![
+            "--from=a".to_string(),
+            "--from".to_string(),
+            "b".to_string(),
+        ],
+    ] {
+        assert!(parse_pack_create_options(&args).is_err(), "{args:?}");
+    }
+    Ok(())
 }
 
 #[test]
@@ -30515,12 +30815,7 @@ fn prompt_scan_cache_is_invalidated_by_tool_created_extensions() -> Result<()> {
     let root = std::fs::canonicalize(&root)?;
     let pack_dir = root.join(".dext/shelves/local/packs/demo");
     std::fs::create_dir_all(&pack_dir)?;
-    let old_home = std::env::var_os("DEXT_HOME");
-    let old_shelves = std::env::var_os("DEXT_SHELVES_DIR");
-    unsafe {
-        std::env::set_var("DEXT_HOME", root.join("home"));
-        std::env::remove_var("DEXT_SHELVES_DIR");
-    }
+    let _pack_env = PackEnvGuard::new(&root.join("home"));
 
     let result = (|| -> Result<()> {
         let mut agent = test_agent(&root);
@@ -30578,8 +30873,6 @@ fn prompt_scan_cache_is_invalidated_by_tool_created_extensions() -> Result<()> {
         Ok(())
     })();
 
-    restore_env_var("DEXT_HOME", old_home);
-    restore_env_var("DEXT_SHELVES_DIR", old_shelves);
     let _ = std::fs::remove_dir_all(&root);
     result
 }

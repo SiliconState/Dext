@@ -57,11 +57,18 @@ This creates:
 .dext/shelves/local/packs/release-check/PACK.md
 ```
 
-The command validates lowercase shelf and pack identifiers, creates a small editable workflow, and refuses to overwrite an existing path. The interactive equivalent is:
+The command validates lowercase shelf and pack identifiers, creates a small editable workflow, and refuses to overwrite an existing path. To fork an existing resolved pack into a new name, add `--from`:
+
+```bash
+dext pack create engineering/refactor-helper-mine --from refactor-helper
+```
+
+Forking recursively copies regular files and directories (16 MiB per-file, 256 MiB aggregate, 4,096-entry, and 32-level depth caps), rejects any symlink or other non-regular entry, skips `.env*`, other privacy-sensitive paths, and non-workflow files whose contents trigger the privacy redactor, rewrites the copied `PACK.md` `name:` field, and removes a partial destination if copying fails. A `PACK.md` whose contents trigger redaction fails the fork rather than creating a pack without its required workflow. A target nested inside its resolved source is rejected before creation. The source is never modified. `--project` may be combined with `--from` to select the project shelf root. The interactive equivalents are:
 
 ```text
 /pack create engineering/refactor-helper
 /pack create local/release-check --project
+/pack create engineering/refactor-helper-mine --from refactor-helper
 ```
 
 For a dedicated shelf repository whose root contains multiple shelves, run Dext with that repository as the sandbox and ask it to create or maintain `<shelf>/packs/<name>`. Then validate against that root:
@@ -82,6 +89,13 @@ Keep external shelf repositories separate from Dext. Review and audit them indep
 name: refactor-helper
 description: Guide a bounded refactor with tests and verification.
 credential-env: [SERVICE_TOKEN]
+ui-starter-prompt: Refactor the parser without changing behavior.
+ui-artifact: markdown
+ui-time-to-first-artifact: 30
+ui-requires: [approval:auto-write]
+ui-gallery: true
+ui-tags: [engineering, refactor]
+ui-icon: refactor
 ---
 
 # Refactor Helper
@@ -105,6 +119,15 @@ Front matter:
 | `name` | No | Pack identifier; defaults to the directory name. |
 | `description` | No | Short text shown in listings and prompt summaries. |
 | `credential-env` | No | Exact credential-shaped environment names required by the pack's own direct native helper. |
+| `ui-starter-prompt` | No | Gallery/composer starter text, capped at 400 characters. |
+| `ui-artifact` | No | Expected result: `html`, `chart`, `table`, `markdown`, `file`, or `none`. |
+| `ui-time-to-first-artifact` | No | Non-negative seconds, rounded to an integer. |
+| `ui-requires` | No | Up to 16 opaque host requirements, as `[a, b]` or `a, b`. |
+| `ui-gallery` | No | Gallery eligibility; accepts true/false, yes/no, or 1/0. |
+| `ui-tags` | No | Up to 16 UI tags. |
+| `ui-icon` | No | Host icon hint, capped at 32 characters. |
+
+Front-matter keys are case-insensitive and treat `_` and `-` alike. Invalid optional UI values are omitted rather than failing pack discovery. UI free-text fields are normalized through the existing terminal-safe metadata path, which removes escape, control, line-separator, and bidirectional-format hazards before inspection or JSON output. Packs without UI fields behave as before and have no `ui` object in machine-readable output.
 
 Credential declarations are honored only for packs from user or `DEXT_SHELVES_DIR` shelves. Project-local declarations are ignored so repository content cannot opt into inherited credentials. Provider credential names are always excluded.
 
@@ -112,10 +135,14 @@ Credential declarations are honored only for packs from user or `DEXT_SHELVES_DI
 
 ```bash
 dext pack list
+dext pack list --json
 dext pack inspect refactor-helper
 dext pack run refactor-helper "refactor the parser"
 dext --pack refactor-helper "refactor the parser"
+printf '%s\n' 'refactor the parser' | dext -p --pack refactor-helper
 ```
+
+`dext pack list --json` emits one stable-key-order JSON array with absolute `path` and `pack_md` paths, optional `runtime` and `ui` fields, and an empty array when no packs are installed. `--json` is accepted before or after `list`; unrecognized list-flag combinations retain the human-readable form. In one-shot print mode, `-p --pack <name>` reads the task from stdin and wraps that task with the selected workflow exactly like a positional pack task.
 
 Interactive equivalents:
 
@@ -127,7 +154,7 @@ Interactive equivalents:
 
 A clear conversational request can also invoke a known pack, for example: `run refactor-helper on the parser`. Under approval `always`, conversational project-pack activation and project `shelf.json` metadata proceed automatically. Prompting profiles request one repository-scoped first-use confirmation. Explicit `/pack` or `dext pack` invocation confirms only the selected project workflow; unrelated project shelf metadata remains unapproved. Choosing prompt-level `Always` stores a bounded owner-private, single-link project-scoped approval marker on Unix; unsafe/permissive markers are ignored, and `/project-extensions reset` refuses unsafe marker shapes while removing a safe marker or clearing a session denial. Until approval under a prompting profile, project metadata cannot shadow a same-named user or run-shelf pack.
 
-When selected, Dext reads `PACK.md` only when it is a regular non-symlink file no larger than 1 MiB, then caps invocation context to 32 KiB and keeps the pack active for the session. `shelf.json` manifests use the same 1 MiB regular-file/no-follow load boundary. Pack hooks and environment are activated only after workflow and optional runtime activation succeed. Dext exports `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` calls and pack hook processes. Changing the sandbox root clears active pack state.
+When selected, Dext reads `PACK.md` only when it is a regular non-symlink file no larger than 1 MiB, then caps invocation context to 32 KiB and keeps the pack active for the session. `shelf.json` manifests use the same 1 MiB regular-file/no-follow load boundary. Pack hooks and environment are activated only after workflow and optional runtime activation succeed. Dext exports `DEXT_PACK_DIR` and `DEXT_PACK_<NAME>_DIR` to subsequent `bash` calls and pack hook processes. Changing the sandbox root clears active pack state. For both explicit and inferred activation, `--output stream-json` emits `pack_start` after `turn_start` and before provider text, with the resolved pack `name` and the privacy-redacted first 80 characters of the task; `DEXT_NO_PACK`-suppressed inference emits no `pack_start`.
 
 ## Optional executable runtime protocol
 

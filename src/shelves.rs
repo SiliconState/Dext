@@ -4,8 +4,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 const SHELF_MANIFEST_CAP: u64 = 1024 * 1024;
@@ -595,48 +593,18 @@ impl StaticShelf {
     }
 
     pub(crate) fn from_json_file(path: &Path) -> Result<Self> {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("inspecting shelf manifest {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!("shelf manifest is not a regular file: {}", path.display());
-        }
-        if metadata.len() > SHELF_MANIFEST_CAP {
-            bail!(
-                "shelf manifest exceeds the {} byte limit: {}",
-                SHELF_MANIFEST_CAP,
-                path.display()
-            );
-        }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options
-            .open(path)
-            .with_context(|| format!("opening shelf manifest {}", path.display()))?;
-        let opened = file
-            .metadata()
-            .with_context(|| format!("inspecting open shelf manifest {}", path.display()))?;
-        if !opened.is_file() || opened.len() > SHELF_MANIFEST_CAP {
-            bail!(
-                "shelf manifest changed or exceeds its byte limit: {}",
-                path.display()
-            );
-        }
-        let mut text = String::new();
-        file.take(SHELF_MANIFEST_CAP + 1)
-            .read_to_string(&mut text)
-            .with_context(|| format!("reading shelf manifest {}", path.display()))?;
-        if text.len() as u64 > SHELF_MANIFEST_CAP {
-            bail!(
-                "shelf manifest exceeds the {} byte limit: {}",
-                SHELF_MANIFEST_CAP,
-                path.display()
-            );
-        }
+        let text = crate::session::read_regular_file_bytes_with_limit(
+            path,
+            SHELF_MANIFEST_CAP as usize,
+            None,
+            "shelf manifest",
+        )
+        .map(|(bytes, _)| bytes)
+        .map_err(anyhow::Error::msg)
+        .and_then(|bytes| {
+            String::from_utf8(bytes)
+                .with_context(|| format!("shelf manifest is not valid UTF-8: {}", path.display()))
+        })?;
         let mut manifest: ShelfManifest = serde_json::from_str(&text)
             .with_context(|| format!("parsing shelf manifest {}", path.display()))?;
         manifest

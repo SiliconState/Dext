@@ -123,7 +123,7 @@ fn is_bidi_format_control(ch: char) -> bool {
     )
 }
 
-fn terminal_safe_text(text: &str) -> String {
+pub(crate) fn terminal_safe_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0usize;
     while i < text.len() {

@@ -2630,6 +2630,7 @@ impl TuiState {
                     markdown,
                 });
             }
+            AgentEvent::PackStart { .. } => {}
             AgentEvent::ToolOutputDelta {
                 call_id,
                 name,

@@ -1210,63 +1210,11 @@ fn canonical_read_path(root: &Path, user_path: &str) -> std::result::Result<Path
 }
 
 fn regular_file_metadata(path: &Path) -> std::result::Result<std::fs::Metadata, String> {
-    let metadata = std::fs::metadata(path).map_err(|e| format!("{e}"))?;
+    let metadata = std::fs::metadata(path).map_err(|error| format!("{error}"))?;
     if !metadata.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
     Ok(metadata)
-}
-
-pub(crate) fn read_utf8_file_with_limit(
-    path: &Path,
-    max_bytes: usize,
-    interrupt: Option<&AtomicBool>,
-    label: &str,
-) -> std::result::Result<String, String> {
-    let metadata = regular_file_metadata(path)?;
-    if metadata.len() > max_bytes as u64 {
-        return Err(format!(
-            "{} exceeds the {label} {} byte input limit",
-            path.display(),
-            max_bytes
-        ));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path).map_err(|error| format!("{error}"))?;
-    let opened = file.metadata().map_err(|error| format!("{error}"))?;
-    if !opened.is_file() || opened.len() > max_bytes as u64 {
-        return Err(format!(
-            "{} changed or exceeds the {label} {} byte input limit",
-            path.display(),
-            max_bytes
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    let mut chunk = [0u8; 16 * 1024];
-    loop {
-        if interrupt.is_some_and(|interrupt| interrupt.load(Ordering::Relaxed)) {
-            return Err(format!("{label} interrupted by user"));
-        }
-        let read = file.read(&mut chunk).map_err(|error| format!("{error}"))?;
-        if read == 0 {
-            break;
-        }
-        if bytes.len().saturating_add(read) > max_bytes {
-            return Err(format!(
-                "{} grew beyond the {label} {} byte input limit",
-                path.display(),
-                max_bytes
-            ));
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-    }
-    String::from_utf8(bytes).map_err(|error| format!("{error}"))
 }
 
 pub(crate) fn read_utf8_regular_file_with_limit(
@@ -1275,14 +1223,9 @@ pub(crate) fn read_utf8_regular_file_with_limit(
     interrupt: Option<&AtomicBool>,
     label: &str,
 ) -> std::result::Result<String, String> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| format!("{error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "{} is not a regular non-symlink file",
-            path.display()
-        ));
-    }
-    read_utf8_file_with_limit(path, max_bytes, interrupt, label)
+    let (bytes, _) =
+        session::read_regular_file_bytes_with_limit(path, max_bytes, interrupt, label)?;
+    String::from_utf8(bytes).map_err(|error| format!("{error}"))
 }
 
 fn read_bounded_utf8_line<R: BufRead>(
@@ -1791,6 +1734,7 @@ impl EventSink for ConsoleSink {
                 title,
                 markdown,
             } => println!("[{pack}: {title}]\n{markdown}"),
+            AgentEvent::PackStart { .. } => {}
             AgentEvent::ToolOutputDelta { .. } => {}
             AgentEvent::LocalAuthPrompt { .. } => {}
             AgentEvent::LoginInputMode { .. } => {}
@@ -7532,7 +7476,7 @@ fn execute_tool_with_cache_for_context(
                 None => return Err("context must be an integer from 0 through 50".to_string()),
             };
             let path = canonical_read_path(root, path_str)?;
-            let content = read_utf8_file_with_limit(
+            let content = read_utf8_regular_file_with_limit(
                 &path,
                 read_symbol::INPUT_MAX_BYTES,
                 interrupt,
@@ -14778,15 +14722,30 @@ impl Agent {
         true
     }
 
-    async fn run_pack(&mut self, selector: &str, task: &str) -> Result<()> {
-        let pack = packs::find_pack(&self.sandbox_root, selector)?;
-        let mut prompt = packs::pack_prompt(&pack, task)?;
-        let runtime_context = self.activate_pack_runtime(&pack).await?;
-        self.activate_pack_hooks(&pack);
+    fn emit_pack_start(&mut self, pack: &packs::PackInfo, task: &str) {
+        let task = self.privacy.redact_text(task).text;
+        self.sink.emit(AgentEvent::PackStart {
+            name: pack.name.clone(),
+            task_preview: task.chars().take(80).collect(),
+        });
+    }
+
+    async fn activated_pack_prompt(
+        &mut self,
+        invocation: &packs::PackInvocation,
+    ) -> Result<String> {
+        self.emit_pack_start(&invocation.pack, &invocation.task);
+        let mut prompt = packs::pack_prompt(&invocation.pack, &invocation.task)?;
+        let runtime_context = self.activate_pack_runtime(&invocation.pack).await?;
+        self.activate_pack_hooks(&invocation.pack);
         if !runtime_context.trim().is_empty() {
             prompt.push_str("\n\n[pack runtime activation]\n");
             prompt.push_str(&runtime_context);
         }
+        Ok(prompt)
+    }
+
+    fn emit_pack_notice(&mut self, pack: &packs::PackInfo, task: &str) {
         self.sink.emit(AgentEvent::Slash(format!(
             "▶ pack: {} · {}\nworkflow: {}",
             pack.name,
@@ -14797,7 +14756,17 @@ impl Agent {
             },
             pack.pack_md_path.display()
         )));
-        self.chat_with_pack_activation(prompt, true).await
+    }
+
+    async fn run_pack(&mut self, selector: &str, task: &str) -> Result<()> {
+        let pack = packs::find_pack(&self.sandbox_root, selector)?;
+        let invocation = packs::PackInvocation {
+            pack: pack.clone(),
+            task: task.to_string(),
+        };
+        self.emit_pack_notice(&pack, task);
+        self.chat_with_pack_activation(task.to_string(), Some(invocation))
+            .await
     }
 
     fn maybe_create_tool_checkpoint(&mut self, name: &str, input: &Value) -> Result<(), String> {
@@ -17451,21 +17420,19 @@ impl Agent {
     }
 
     async fn chat(&mut self, user_input: String) -> Result<()> {
-        self.chat_with_pack_activation(user_input, false).await
+        self.chat_with_pack_activation(user_input, None).await
     }
 
     async fn chat_with_pack_activation(
         &mut self,
         user_input: String,
-        suppress_pack_activation_for_turn: bool,
+        explicit_pack: Option<packs::PackInvocation>,
     ) -> Result<()> {
         self.interrupt.store(false, Ordering::SeqCst);
         self.begin_provider_turn();
         self.sink.emit(AgentEvent::TurnStart);
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
-        let result = self
-            .chat_inner(user_input, suppress_pack_activation_for_turn)
-            .await;
+        let result = self.chat_inner(user_input, explicit_pack).await;
         if result.is_err() {
             let interrupted = self.interrupt.load(Ordering::SeqCst);
             if interrupted {
@@ -17482,7 +17449,7 @@ impl Agent {
     async fn chat_inner(
         &mut self,
         mut user_input: String,
-        suppress_pack_activation_for_turn: bool,
+        explicit_pack: Option<packs::PackInvocation>,
     ) -> Result<()> {
         self.refresh_runtime_provider_auth().await?;
         let mut compacted_this_turn = false;
@@ -17491,8 +17458,7 @@ impl Agent {
         self.prompt_scan_epoch = self.prompt_scan_epoch.wrapping_add(1);
         let turn_id = format!("turn-{}-{}", unix_timestamp_secs(), self.prompt_scan_epoch);
         self.git_context = git_summary(&self.sandbox_root);
-        let suppress_pack_activation =
-            self.suppress_pack_activation || suppress_pack_activation_for_turn;
+        let suppress_pack_activation = self.suppress_pack_activation || explicit_pack.is_some();
         let project_pack_requested = !suppress_pack_activation
             && packs::project_pack_invocation_requested(&self.sandbox_root, &user_input);
         let project_context_requested =
@@ -17501,6 +17467,9 @@ impl Agent {
             && self.project_extensions_approved.is_none()
         {
             approve_project_extensions(self);
+        }
+        if let Some(invocation) = explicit_pack.as_ref() {
+            user_input = self.activated_pack_prompt(invocation).await?;
         }
         let inferred_pack = if suppress_pack_activation {
             None
@@ -17524,18 +17493,12 @@ impl Agent {
                     invocation.pack.name
                 )));
             } else {
-                let prompt = packs::pack_prompt(&invocation.pack, &invocation.task)?;
-                let runtime_context = self.activate_pack_runtime(&invocation.pack).await?;
-                self.activate_pack_hooks(&invocation.pack);
+                let prompt = self.activated_pack_prompt(&invocation).await?;
                 self.sink.emit(AgentEvent::Info(format!(
                     "[pack:{}] inferred conversational invocation",
                     invocation.pack.name
                 )));
-                user_input = if runtime_context.trim().is_empty() {
-                    prompt
-                } else {
-                    format!("{prompt}\n\n[pack runtime activation]\n{runtime_context}")
-                };
+                user_input = prompt;
             }
         }
         let mut hooks_approval_decided = !self.hooks.is_empty();
@@ -21103,10 +21066,25 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         let selector = parts.next().unwrap_or("").trim();
                         let flags = parts.next().unwrap_or("");
                         if selector.is_empty() {
-                            let _ = writeln!(w, "usage: /pack create <shelf>/<name> [--project]");
+                            let _ = writeln!(
+                                w,
+                                "usage: /pack create <shelf>/<name> [--project] [--from <pack>]"
+                            );
                         } else {
-                            let project = flags.split_whitespace().any(|flag| flag == "--project");
-                            match packs::create_pack(&agent.sandbox_root, selector, project) {
+                            let flag_args = flags
+                                .split_whitespace()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>();
+                            match parse_pack_create_options(&flag_args).and_then(
+                                |(project, source)| {
+                                    packs::create_pack_from(
+                                        &agent.sandbox_root,
+                                        selector,
+                                        project,
+                                        source.as_deref(),
+                                    )
+                                },
+                            ) {
                                 Ok(path) => {
                                     let _ = writeln!(w, "created pack: {}", path.display());
                                     let _ = writeln!(w, "next: edit {}/PACK.md", path.display());
@@ -21134,7 +21112,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                     _ => {
                         let _ = writeln!(
                             w,
-                            "usage: /pack [<name> <task>|list|inspect <name>|create <shelf>/<name> [--project]]"
+                            "usage: /pack [<name> <task>|list|inspect <name>|create <shelf>/<name> [--project] [--from <pack>]]"
                         );
                     }
                 }
@@ -23481,6 +23459,55 @@ fn parse_pack_cli_invocation(argv: &[String], sub_idx: usize) -> Option<(String,
         .map(|(selector, task)| (selector.to_string(), task.to_string()))
 }
 
+fn parse_pack_create_options(args: &[String]) -> Result<(bool, Option<String>)> {
+    let mut project = false;
+    let mut source = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--project" if !project => project = true,
+            "--project" => anyhow::bail!("--project specified more than once"),
+            "--from" => {
+                if source.is_some() {
+                    anyhow::bail!("--from specified more than once");
+                }
+                index += 1;
+                let value = args
+                    .get(index)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("--from requires a pack name"))?;
+                source = Some(value.clone());
+            }
+            option if option.starts_with("--from=") => {
+                if source.is_some() {
+                    anyhow::bail!("--from specified more than once");
+                }
+                let value = option.trim_start_matches("--from=").trim();
+                if value.is_empty() {
+                    anyhow::bail!("--from requires a pack name");
+                }
+                source = Some(value.to_string());
+            }
+            option => anyhow::bail!("unknown pack create option '{option}'"),
+        }
+        index += 1;
+    }
+    Ok((project, source))
+}
+
+fn read_one_shot_task(opts: &CliOptions, input: &mut impl Read) -> Result<Option<String>> {
+    if !opts.positional.is_empty() {
+        return Ok(Some(opts.positional.join(" ")));
+    }
+    if !opts.print {
+        return Ok(None);
+    }
+    let mut task = String::new();
+    input.read_to_string(&mut task)?;
+    let task = task.trim().to_string();
+    Ok((!task.is_empty()).then_some(task))
+}
+
 fn read_seat_summary_source(source: &str) -> Result<String> {
     if source == "-" {
         let mut bytes = Vec::new();
@@ -23644,22 +23671,32 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| PathBuf::from("."));
         let mut sub_idx = 1usize;
         let mut leading_verbose = false;
-        while argv
-            .get(sub_idx)
-            .is_some_and(|a| matches!(a.as_str(), "--verbose" | "-v" | "--paths"))
-        {
-            leading_verbose = true;
+        let mut leading_json = false;
+        while let Some(arg) = argv.get(sub_idx) {
+            match arg.as_str() {
+                "--verbose" | "-v" | "--paths" => leading_verbose = true,
+                "--json" => leading_json = true,
+                _ => break,
+            }
             sub_idx += 1;
         }
         let sub = argv.get(sub_idx).map(String::as_str).unwrap_or("list");
         match sub {
             "" | "list" | "ls" => {
+                let trailing = argv.iter().skip(sub_idx + 1);
+                let known_flags = trailing
+                    .clone()
+                    .all(|arg| matches!(arg.as_str(), "--verbose" | "-v" | "--paths" | "--json"));
                 let verbose = leading_verbose
-                    || argv
-                        .iter()
-                        .skip(sub_idx + 1)
+                    || trailing
+                        .clone()
                         .any(|a| a == "--verbose" || a == "-v" || a == "--paths");
-                println!("{}", packs::render_pack_listing_opts(&root, verbose));
+                let json = known_flags && (leading_json || trailing.clone().any(|a| a == "--json"));
+                if json {
+                    println!("{}", packs::render_pack_listing_json(&root)?);
+                } else {
+                    println!("{}", packs::render_pack_listing_opts(&root, verbose));
+                }
                 return Ok(());
             }
             "inspect" | "info" | "show" => {
@@ -23673,12 +23710,12 @@ async fn main() -> Result<()> {
             }
             "create" | "new" => {
                 let Some(selector) = argv.get(sub_idx + 1) else {
-                    eprintln!("usage: dext pack create <shelf>/<name> [--project]");
+                    eprintln!("usage: dext pack create <shelf>/<name> [--project] [--from <pack>]");
                     release_registered_locks();
                     std::process::exit(2);
                 };
-                let project = argv.iter().skip(sub_idx + 2).any(|arg| arg == "--project");
-                let path = packs::create_pack(&root, selector, project)?;
+                let (project, source) = parse_pack_create_options(&argv[(sub_idx + 2)..])?;
+                let path = packs::create_pack_from(&root, selector, project, source.as_deref())?;
                 println!("created pack: {}", path.display());
                 println!("next: edit {}/PACK.md", path.display());
                 return Ok(());
@@ -23700,7 +23737,7 @@ async fn main() -> Result<()> {
             }
             _ => {
                 eprintln!(
-                    "usage: dext pack [<name> <task>|list|inspect <name>|create <shelf>/<name> [--project]]"
+                    "usage: dext pack [<name> <task>|list [--json]|inspect <name>|create <shelf>/<name> [--project] [--from <pack>]]"
                 );
                 release_registered_locks();
                 std::process::exit(2);
@@ -23776,13 +23813,15 @@ async fn main() -> Result<()> {
         println!("       dext session export [latest|NAME|PATH] [html|jsonl] [OUT]");
         println!("       dext doctor [--approval PROFILE] [--sandbox PROFILE] [--cd DIR]");
         println!("                           inspect effective safety policy and local state");
-        println!("       dext pack create <shelf>/<name> [--project]");
-        println!("                                       scaffold a shelf-contained pack");
+        println!("       dext pack list [--json]       list packs as text or JSON");
+        println!("       dext pack create <shelf>/<name> [--project] [--from <pack>]");
+        println!("                                       scaffold or fork a shelf-contained pack");
         println!("       dext pack <name> <task>        invoke a Dext pack (`run` optional)");
         println!(
             "       dext shelves                      list typed shelf manifests and ability metadata"
         );
         println!("       dext --pack NAME TASK  invoke a pack in one-shot mode");
+        println!("       dext -p --pack NAME    read a pack task from stdin in one-shot mode");
         println!("       dext session analyze|grep|failures|verify-log|decisions [session]");
         println!(
             "       dext session prune [--days=N] [--apply]  prune stale locks/lock-only project dirs"
@@ -23848,20 +23887,7 @@ async fn main() -> Result<()> {
         eprintln!("[approval warning] {warning}");
     }
 
-    let one_shot_task: Option<String> = if !opts.positional.is_empty() {
-        Some(opts.positional.join(" "))
-    } else if opts.print {
-        let mut s = String::new();
-        io::stdin().read_to_string(&mut s)?;
-        let trimmed = s.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    } else {
-        None
-    };
+    let one_shot_task = read_one_shot_task(&opts, &mut io::stdin())?;
 
     let will_use_tui = opts.pack.is_none()
         && !opts.print

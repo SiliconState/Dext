@@ -640,7 +640,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>WorkLedger</code></td><td>main.rs</td><td>Objective, phase, decisions, pending/done/blocked items</td></tr>
 <tr><td><code>SessionHeader</code></td><td>main.rs</td><td>Persisted session metadata with full provenance</td></tr>
 <tr><td><code>Message / Block</code></td><td>main.rs</td><td>Conversation history: Text, Thinking, ToolUse, ToolResult</td></tr>
-<tr><td><code>AgentEvent</code></td><td>events.rs</td><td>Event stream: TurnStart, TextDelta, ToolCallResult, etc.</td></tr>
+<tr><td><code>AgentEvent</code></td><td>events.rs</td><td>Event stream: TurnStart, PackStart, TextDelta, ToolCallResult, etc.</td></tr>
 </table>
 
 <section class="collapsible-section">
@@ -683,7 +683,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <section class="collapsible-section">
 <h2 id="session-rs" class="collapsible-header">Session.rs — Session &amp; State <span class="badge badge-rs">.rs</span></h2>
 <div class="collapsible-content">
-<p>Manages all persistent state for Dext sessions, logs, and project-scoped data.</p>
+<p>Manages persistent state for Dext sessions, logs, and project-scoped data. Its bounded regular/non-symlink reader is also the common file-integrity seam for pack workflows, shelf and runtime manifests, and pack-fork file copies.</p>
 <h3>State Directories</h3>
 <pre><code>~/.dext/                         # DEXT_HOME (overridable)
 ├── providers.json               # Provider catalog
@@ -713,7 +713,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <p>Each project gets a stable key derived from its canonical path: <code>&lt;slug&gt;-&lt;FNV-1a-hash&gt;</code>. This ensures isolated state per project even with identical directory names.</p>
 <p>Each project may contain bounded Seat records under <code>seats/&lt;seat-id&gt;/seat.json</code>. A Seat is a durable agent identity; a session is one transcript/crash-recovery incarnation. Portable lowercase ids are validated before path construction; trailing dots and Windows device names are rejected. Unix ancestors must be owner-safe, managed directories owner-private, and record files regular, private, single-link, and no-follow. Selecting <code>--seat NAME</code> does not create an empty record; the first successful durable save or explicit <code>dext seat set</code> persists it. Use <code>dext seat set NAME --label TEXT</code>, <code>--summary-file PATH|-</code>, <code>--clear-label</code>, or <code>--clear-summary</code> to maintain bounded context. <code>--seat NAME --resume</code> follows that Seat's latest-session pointer. Cross-Seat, same-name cross-project, malformed, oversized, and unprovenanced restoration fails before saved state mutation. <code>--no-session --seat NAME</code> is contextual only. Prompt-visible context is privacy-redacted JSON marked as user-authored data, not instructions, and the complete rendered Seat section is capped at 1,000 bytes in both context modes; persistent labels retain their independent 128-character validation cap. Project changes clear active identity. <code>/reset</code> serializes pointer update and transcript removal and attempts pointer rollback on deletion failure. Crew directly maps portable role names to <code>crew.&lt;agent&gt;</code> and assigns deterministic <code>crew.agent-&lt;hash&gt;</code> ids to other valid custom names; captured, detached, and pane workers pin one absolute Dext state root. Same-user replacement is outside Dext's isolation boundary; validation and atomic replacement remain correctness controls.</p>
 <h3>Atomic Writes</h3>
-<p>Sensitive state writes use a temp-file-and-replace helper. On Windows the replacement uses <code>MoveFileExW</code>; on Unix it uses <code>fs::rename</code>. Session logs normally use private append writes while they remain below the cap.</p>
+<p>Sensitive state writes use a temp-file-and-replace helper. On Windows the replacement uses <code>MoveFileExW</code>; on Unix it uses <code>fs::rename</code>. The same atomic path can apply reviewed source permissions to the temporary file before replacing a copied pack file. Session logs normally use private append writes while they remain below the cap.</p>
 <h3>Session State Lock</h3>
 <p>Each active session directory has a <code>session.lock.json</code> record containing PID, token, project, sandbox, and session identity. Session open, stale reclamation, cleanup, and prune operations are serialized by the owner-private <code>session-locks.operation.lock</code> file under <code>DEXT_HOME</code>. Stale removal revalidates the token and PID while holding that lock, so a replaced live lock is preserved. PID liveness uses <code>kill(pid, 0)</code> on Unix (an <code>EPERM</code> answer counts as live) and <code>OpenProcess</code>/<code>GetExitCodeProcess</code> on Windows (only <code>ERROR_INVALID_PARAMETER</code> or a non-<code>STILL_ACTIVE</code> exit code counts as dead; access-denied and query failures keep the lock); other platforms never auto-reclaim. Matching locks are released through a cleanup registry. <code>dext session prune</code> runs as a dry run unless <code>--apply</code> is supplied; it preserves every project directory containing session or other project state and removes only stale locks plus stale lock-only directory trees.</p>
 <h3>Log Rotation</h3>
@@ -961,7 +961,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <h3>Pack Object Model (<code>PackInfo</code>)</h3>
 <p><code>packs.rs</code> normalizes each discovered pack into <code>PackInfo</code> with:</p>
 <ul>
-<li><code>name</code>, <code>description</code>, declared <code>credential_env</code> names (from front matter or directory defaults)</li>
+<li><code>name</code>, <code>description</code>, declared <code>credential_env</code> names, and optional validated <code>ui</code> metadata from front matter</li>
 <li><code>path</code>, <code>pack_md_path</code>, optional <code>phooks_path</code>, optional <code>runtime_path</code></li>
 <li><code>source</code> label (project/env/user) and shelf ownership</li>
 </ul>
@@ -973,7 +973,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <li>Explicit shelf roots: <code>DEXT_SHELVES_DIR</code></li>
 <li>User shelves: <code>~/.dext/shelves/*/packs</code></li>
 </ol>
-<p>Create reusable packs with <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>; add <code>--project</code> only for an explicitly project-local pack. The scaffold creates a minimal <code>PACK.md</code>, refuses overwrite, and is immediately available to normal inspection and explicit invocation. Direct <code>packs/</code>, <code>.dext/packs</code>, <code>~/.dext/packs</code>, <code>DEXT_PACKS_DIR</code>, and per-pack override roots are not discovery inputs.</p>
+<p>Create reusable packs with <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>; add <code>--project</code> only for an explicitly project-local pack. The scaffold creates a minimal <code>PACK.md</code>, refuses overwrite, and is immediately available to normal inspection and explicit invocation. <code>--from &lt;pack&gt;</code> instead forks an existing resolved pack: it recursively copies regular files/directories within 16 MiB per-file, 256 MiB aggregate, 4,096-entry, and 32-level depth caps; refuses symlinks and other non-regular entries; skips <code>.env*</code>, privacy-sensitive paths, and non-workflow text files whose contents trigger redaction; rewrites the copied <code>PACK.md</code> name; removes a partial destination on failure; and never modifies the source. A workflow whose contents trigger redaction fails closed rather than creating a pack without <code>PACK.md</code>, and a destination inside its resolved source is rejected before creation. Direct <code>packs/</code>, <code>.dext/packs</code>, <code>~/.dext/packs</code>, <code>DEXT_PACKS_DIR</code>, and per-pack override roots are not discovery inputs.</p>
 <p>Project-local <code>PACK.md</code> content has a repository trust boundary. An explicit <code>/pack</code> or <code>dext pack</code> invocation confirms only that selected project workflow; it does not approve unrelated project shelf metadata. Conversational auto-invocation prompts once per active repository before loading project workflow text. Choosing <code>Always</code> stores a bounded owner-private, single-link project-scoped approval marker on Unix; unsafe or permissive markers are ignored, and <code>/project-extensions reset</code> refuses unsafe marker shapes while removing a safe marker or clearing a session denial. Denied project pack metadata stays out of the model prompt and cannot shadow a same-named user or run-shelf pack. Project-local credential declarations remain ignored.</p>
 <p>The resolver deduplicates by canonicalized path and normalized pack name. Name collisions are resolved by precedence order, not random filesystem order.</p>
 
@@ -988,6 +988,13 @@ dext --frugal --effort off    # low-token mode</code></pre>
 name: my-pack
 description: One-line workflow summary
 credential-env: [SERVICE_TOKEN]
+ui-starter-prompt: Run my-pack on this workspace.
+ui-artifact: markdown
+ui-time-to-first-artifact: 30
+ui-requires: [approval:auto-write]
+ui-gallery: true
+ui-tags: [engineering]
+ui-icon: report
 ---
 
 # Workflow
@@ -997,7 +1004,8 @@ credential-env: [SERVICE_TOKEN]
 4) Verify
 5) Deliver
 </code></pre>
-<p>Only <code>PACK.md</code> is required. Front matter stays minimal: identity/description plus an optional inline <code>credential-env</code> list of exact credential-shaped names required by the pack's own helper. That field is honored only for user and <code>DEXT_SHELVES_DIR</code> packs; project-local declarations are ignored.</p>
+<p>Only <code>PACK.md</code> is required. Front matter carries identity/description plus an optional inline <code>credential-env</code> list of exact credential-shaped names required by the pack's own helper. It may also carry flat optional <code>ui-*</code> hints: starter prompt (400 characters), artifact enum (<code>html|chart|table|markdown|file|none</code>), rounded non-negative time to first artifact, up to 16 opaque requirements, gallery boolean, up to 16 tags, and a 32-character icon hint. Keys are case-insensitive with <code>_</code>/<code>-</code> equivalence; invalid optional UI values are omitted, and free-text UI values reuse the terminal-safe metadata path to remove escape, control, line-separator, and bidirectional-format hazards. Packs without valid UI fields retain their prior behavior. Credential declarations are honored only for user and <code>DEXT_SHELVES_DIR</code> packs; project-local declarations are ignored.</p>
+<p><code>dext pack list --json</code> emits a stable-key-order JSON array over the full resolved catalog, including absolute pack/workflow paths, optional runtime/UI fields, and an empty array when no packs exist. The flag is accepted before or after <code>list</code>; unknown list-flag combinations retain human-readable output.</p>
 
 <h3>Prompt Injection Model</h3>
 <p><code>pack_prompt()</code> builds a bounded invocation prompt (cap: <code>PACK_PROMPT_CAP = 32_000</code> bytes) containing:</p>
@@ -1009,7 +1017,7 @@ credential-env: [SERVICE_TOKEN]
 <li>capped <code>PACK.md</code> workflow body</li>
 <li>explicit user task text</li>
 </ul>
-<p>This gives the model procedural guidance without changing core runtime policy unless the selected pack declares an approved runtime. Workflow loading and optional runtime activation must succeed before pack hooks or environment are activated. Once active, <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own ordinary native <code>bin/</code> helper, never runtime helpers, hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state.</p>
+<p>This gives the model procedural guidance without changing core runtime policy unless the selected pack declares an approved runtime. Workflow loading and optional runtime activation must succeed before pack hooks or environment are activated. Once active, <code>phooks.json</code> entries are added to the hook set, and pack-scoped environment variables are passed to subsequent <code>bash</code> tool commands and hook processes. Declared credential values are narrower: for user and <code>DEXT_SHELVES_DIR</code> packs, they reach only a simple direct invocation of the active pack's own ordinary native <code>bin/</code> helper, never runtime helpers, hooks, arbitrary bash, pipelines/redirections, prompts, logs, or sessions; provider-auth names remain excluded. Project-local declarations are ignored. Changing the sandbox root clears active pack state. Explicit and inferred activations emit a <code>pack_start</code> stream event after <code>turn_start</code> and before provider text, carrying the resolved name and the privacy-redacted first 80 task characters; inference suppressed by <code>DEXT_NO_PACK</code> emits no activation event.</p>
 <p>Compact pack/shelf metadata is byte-bounded and normalized to one safe line before entering the stable prompt. Shelf Context bodies may retain ordinary newlines and tabs, but terminal controls and Unicode line separators are normalized before injection.</p>
 <h3>Pack Runtime Protocol v1</h3>
 <p><code>src/pack_runtime.rs</code> loads <code>runtime.json</code> only as a regular non-symlink file capped at 256 KiB. The manifest declares version 1, a relative regular executable no larger than 256 MiB inside the canonical pack root, optional bounded arguments, a 1–604800-second timeout, a continuation budget, and at most 32 dynamic tools. Tool names must be provider-safe and collision-free across the full native catalog, active dynamic tools, and host approval pseudo-operations. Recursive schemas require an explicit supported type at every node and accept only <code>type</code>, <code>properties</code>, <code>required</code>, boolean <code>additionalProperties</code>, <code>items</code>, <code>enum</code>, and bounded <code>description</code>; schema annotations follow the session's lean/full tool profile on provider wires. Every tool declares <code>read</code>, <code>write</code>, or <code>danger</code> risk, defaulting to write.</p>
@@ -1019,7 +1027,8 @@ credential-env: [SERVICE_TOKEN]
 
 <h3>Execution Paths</h3>
 <ul>
-<li>CLI: <code>dext pack create &lt;shelf&gt;/&lt;name&gt;</code>, <code>list</code>, <code>inspect</code>, and <code>run</code></li>
+<li>CLI: <code>dext pack create &lt;shelf&gt;/&lt;name&gt; [--from &lt;pack&gt;]</code>, <code>list [--json]</code>, <code>inspect</code>, and <code>run</code></li>
+<li>One-shot stdin: <code>dext -p --pack &lt;name&gt;</code> reads the task from stdin and wraps it with the selected workflow</li>
 <li>Interactive: <code>/pack create</code>, <code>list</code>, <code>inspect</code>, and <code>run</code></li>
 <li>Conversational detection: <code>invoke &lt;name&gt;</code> / <code>run &lt;name&gt; on ...</code> patterns mapped by selector inference</li>
 </ul>
@@ -1172,7 +1181,8 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>dext shelves</code></td><td>List typed shelf manifests and ability metadata</td></tr>
 <tr><td><code>dext --cd &lt;dir&gt;</code></td><td>Change command cwd/project context; in Git repositories, mutation/Git/checkpoint write scope is the containing top-level</td></tr>
 <tr><td><code>dext --no-session</code></td><td>Don't save session</td></tr>
-<tr><td><code>dext --pack &lt;name&gt; "task"</code></td><td>Invoke a pack in one-shot mode</td></tr>
+<tr><td><code>dext --pack &lt;name&gt; "task"</code></td><td>Invoke a pack with a positional one-shot task</td></tr>
+<tr><td><code>dext -p --pack &lt;name&gt;</code></td><td>Read a pack task from stdin and invoke it in one-shot mode</td></tr>
 <tr><td><code>dext --frugal</code></td><td>Select the reduced-context mode</td></tr>
 <tr><td><code>dext --context-mode standard|frugal</code></td><td>Choose context/cap mode</td></tr>
 <tr><td><code>dext --toolset default|full</code></td><td>Choose provider-visible tool count profile</td></tr>
@@ -1205,7 +1215,8 @@ credential-env: [SERVICE_TOKEN]
 <tr><td><code>dext checkpoint repair</code></td><td>Quarantine an invalid checkpoint manifest byte-for-byte and recreate an empty private manifest</td></tr>
 <tr><td><code>dext undo --repair</code></td><td>Alias for checkpoint manifest repair</td></tr>
 <tr><td><code>dext undo --prune</code></td><td>Remove expired and excess checkpoints plus orphan refs/artifacts</td></tr>
-<tr><td><code>dext pack list</code></td><td>List available packs</td></tr>
+<tr><td><code>dext pack list [--json]</code></td><td>List available packs as human text or a JSON array</td></tr>
+<tr><td><code>dext pack create &lt;shelf&gt;/&lt;name&gt; [--project] [--from &lt;pack&gt;]</code></td><td>Scaffold a pack or fork an existing resolved pack</td></tr>
 <tr><td><code>dext pack inspect &lt;name&gt;</code></td><td>Show pack details</td></tr>
 <tr><td><code>dext pack run &lt;name&gt; "task"</code></td><td>Run a pack</td></tr>
 <tr><td><code>dext shelves</code></td><td>List shelf manifests and abilities</td></tr>
