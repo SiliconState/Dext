@@ -46,6 +46,10 @@ pub(crate) enum AgentEvent {
         title: String,
         markdown: String,
     },
+    PackStart {
+        name: String,
+        task_preview: String,
+    },
     ToolOutputDelta {
         call_id: String,
         name: String,

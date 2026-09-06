@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead as _, Write};
+use std::io::{self, BufRead as _, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -193,6 +193,70 @@ fn canonicalize_write_path(
             canonical.display()
         ))
     }
+}
+
+fn read_file_bytes_with_limit(
+    path: &Path,
+    max_bytes: usize,
+    interrupt: Option<&AtomicBool>,
+    label: &str,
+) -> std::result::Result<(Vec<u8>, std::fs::Metadata), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| format!("{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "{} is not a regular file; expected a regular non-symlink file",
+            path.display()
+        ));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(format!(
+            "{} exceeds the {label} {max_bytes} byte limit (input limit)",
+            path.display()
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|error| format!("{error}"))?;
+    let opened = file.metadata().map_err(|error| format!("{error}"))?;
+    if !opened.is_file() || opened.len() > max_bytes as u64 {
+        return Err(format!(
+            "{} changed or exceeds the {label} {max_bytes} byte limit (input limit)",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if interrupt.is_some_and(|interrupt| interrupt.load(Ordering::Relaxed)) {
+            return Err(format!("{label} interrupted by user"));
+        }
+        let read = file.read(&mut chunk).map_err(|error| format!("{error}"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > max_bytes {
+            return Err(format!(
+                "{} grew beyond the {label} {max_bytes} byte limit (input limit)",
+                path.display()
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    Ok((bytes, opened))
+}
+
+pub(crate) fn read_regular_file_bytes_with_limit(
+    path: &Path,
+    max_bytes: usize,
+    interrupt: Option<&AtomicBool>,
+    label: &str,
+) -> std::result::Result<(Vec<u8>, std::fs::Metadata), String> {
+    read_file_bytes_with_limit(path, max_bytes, interrupt, label)
 }
 
 pub(crate) fn named_sessions_dir_for_root(root: &Path) -> PathBuf {
@@ -407,7 +471,12 @@ pub(crate) fn replace_file_atomically(from: &Path, to: &Path) -> io::Result<()> 
     std::fs::rename(from, to)
 }
 
-fn atomic_write_bytes_with_mode(path: &Path, data: &[u8], secret: bool) -> io::Result<()> {
+fn atomic_write_bytes_with_mode(
+    path: &Path,
+    data: &[u8],
+    secret: bool,
+    permissions: Option<&std::fs::Permissions>,
+) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -434,6 +503,9 @@ fn atomic_write_bytes_with_mode(path: &Path, data: &[u8], secret: bool) -> io::R
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         file.write_all(data)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions.clone())?;
+        }
         file.sync_all()?;
         drop(file);
         replace_file_atomically(&tmp, path)
@@ -445,11 +517,19 @@ fn atomic_write_bytes_with_mode(path: &Path, data: &[u8], secret: bool) -> io::R
 }
 
 pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> io::Result<()> {
-    atomic_write_bytes_with_mode(path, data, false)
+    atomic_write_bytes_with_mode(path, data, false, None)
+}
+
+pub(crate) fn atomic_write_bytes_with_permissions(
+    path: &Path,
+    data: &[u8],
+    permissions: &std::fs::Permissions,
+) -> io::Result<()> {
+    atomic_write_bytes_with_mode(path, data, false, Some(permissions))
 }
 
 pub(crate) fn atomic_write_secret(path: &Path, data: &[u8]) -> io::Result<()> {
-    atomic_write_bytes_with_mode(path, data, true)
+    atomic_write_bytes_with_mode(path, data, true, None)
 }
 
 fn log_detail(s: &str) -> String {

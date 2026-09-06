@@ -193,44 +193,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn read_regular_bounded(path: &Path, cap: u64, label: &str) -> Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("inspecting {label} {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "{label} is not a regular non-symlink file: {}",
-            path.display()
-        );
-    }
-    if metadata.len() > cap {
-        bail!("{label} exceeds the {cap} byte limit: {}", path.display());
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
-        .with_context(|| format!("opening {label} {}", path.display()))?;
-    let opened = file
-        .metadata()
-        .with_context(|| format!("inspecting open {label} {}", path.display()))?;
-    if !opened.is_file() || opened.len() > cap {
-        bail!(
-            "{label} changed or exceeds its byte limit: {}",
-            path.display()
-        );
-    }
-    let mut bytes = Vec::new();
-    file.take(cap + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading {label} {}", path.display()))?;
-    if bytes.len() as u64 > cap {
-        bail!("{label} exceeds the {cap} byte limit: {}", path.display());
-    }
-    Ok(bytes)
+    let cap = usize::try_from(cap).context("pack runtime file limit does not fit usize")?;
+    crate::session::read_regular_file_bytes_with_limit(path, cap, None, label)
+        .map(|(bytes, _)| bytes)
+        .map_err(anyhow::Error::msg)
 }
 
 fn sha256_regular_bounded(path: &Path, cap: u64, label: &str) -> Result<String> {
@@ -1033,6 +999,7 @@ mod tests {
             runtime_path: Some(manifest_path),
             credential_env: Vec::new(),
             credential_env_ignored: false,
+            ui: None,
             source: "test".to_string(),
             shelf: Some("shelf".to_string()),
         };
