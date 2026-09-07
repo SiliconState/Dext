@@ -34,9 +34,22 @@ fn spawn(root: &std::path::Path, extra: &[&str]) -> Child {
 /// Every stdout line must be one JSON object; returns them parsed.
 fn drain_json(child: &mut Child) -> Vec<serde_json::Value> {
     let out = child.stdout.take().expect("stdout");
-    BufReader::new(out)
-        .lines()
-        .map(|l| l.expect("read stdout"))
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let lines = BufReader::new(out).lines().collect::<Result<Vec<_>, _>>();
+        let _ = tx.send(lines);
+    });
+    let lines = rx
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("stdout did not close within deadline: {error}");
+        })
+        .expect("read stdout");
+    reader.join().expect("stdout reader");
+    lines
+        .into_iter()
         .filter(|l| !l.is_empty() || panic!("blank line on stdout breaks NDJSON"))
         .map(|l| {
             serde_json::from_str(&l).unwrap_or_else(|e| panic!("non-JSON stdout line {l:?}: {e}"))
@@ -50,10 +63,11 @@ fn wait_within(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
         if let Some(status) = child.try_wait().expect("try_wait") {
             return status;
         }
-        assert!(
-            start.elapsed() < limit,
-            "dext did not exit within {limit:?}"
-        );
+        if start.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("dext did not exit within {limit:?}");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -83,6 +97,35 @@ fn ready_first_then_close_terminates_with_pure_json_stdout() {
     assert_eq!(acks[0]["data"]["seq"], 7);
     assert_eq!(acks[1]["data"]["route"], "close");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn incompatible_flags_fail_without_reading_stdin() {
+    for extra in [&["-p"][..], &["--pack", "missing-pack"][..]] {
+        let root = temp_root(if extra[0] == "-p" { "print" } else { "pack" });
+        let mut child = spawn(&root, extra);
+        assert!(!wait_within(&mut child, Duration::from_secs(20)).success());
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn fork_slash_and_close_keep_stdout_json() {
+    let root = temp_root("fork");
+    std::fs::write(
+        root.join("resume.jsonl"),
+        "{\"version\":4,\"model\":\"test-model\",\"system\":\"test\"}\n",
+    )
+    .unwrap();
+    let mut child = spawn(&root, &["--fork", "--resume=resume.jsonl"]);
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, r#"{{"type":"control","command":"/effort status"}}"#).unwrap();
+    writeln!(stdin, r#"{{"type":"close"}}"#).unwrap();
+    let events = drain_json(&mut child);
+    assert!(wait_within(&mut child, Duration::from_secs(20)).success());
+    assert!(events.iter().any(|event| event["event"] == "ready"));
+    assert!(events.iter().any(|event| event["event"] == "info"));
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]

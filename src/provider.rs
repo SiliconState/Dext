@@ -5526,7 +5526,7 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             let catalog = load_provider_catalog()?;
             let store = load_auth_store()?;
             let active = resolve_active_provider_id(&catalog);
-            if args.iter().any(|a| *a == "--json") {
+            if args.contains(&"--json") {
                 println!("{}", auth_status_json(&catalog, &store, &active));
                 return Ok(Some(0));
             }
@@ -5555,7 +5555,7 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             let catalog = load_provider_catalog()?;
             let store = load_auth_store()?;
             let active = resolve_active_provider_id(&catalog);
-            let json = args.iter().any(|a| *a == "--json");
+            let json = args.contains(&"--json");
             let args: Vec<&str> = args.iter().copied().filter(|a| *a != "--json").collect();
             if json {
                 let selected = match args.first().copied() {

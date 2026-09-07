@@ -4,7 +4,7 @@
 
 ### Added
 
-- `dext --input ndjson --output stream-json`: a long-lived host protocol over stdin/stdout (`user`/`steer`/`control`/`interrupt`/`permission`/`close` frames, `ready` first, one `input_ack` per frame, per-action `permission_request`/`permission_resolved`, stdout pure JSON). Bounded: 256 KiB per frame, 32 queued prompts, 8 in-flight permission replies; EOF or `close` ends the process. Spec in `docs/HOST_PROTOCOL.md`.
+- `dext --input ndjson --output stream-json`: a long-lived host protocol over stdin/stdout (`user`/`steer`/`control`/`interrupt`/`permission`/`close` frames, `ready` before input processing, one `input_ack` per frame, per-action `permission_request`/`permission_resolved`, stdout pure JSON). Bounded: 256 KiB per frame, 32 shared pending prompt/steering/control slots, 8 in-flight permission replies; EOF or `close` drains accepted prompts and ends the process. Startup approvals fail closed before the reader is available; incompatible one-shot flags fail without reading stdin. Spec in `docs/HOST_PROTOCOL.md`.
 - `--resume` restores the saved `session_id`, so session-scoped state (todos, git-auth, logs) survives process restarts for one-shot hosts.
 - `dext auth login <provider>` reads the credential from stdin when it is not a TTY (keeps secrets off argv); `dext auth status|providers|models --json`.
 - `stream-json` now emits `thinking_preview_discarded` / `thinking_preview_committed`, so consumers can roll back streamed reasoning on a provider retry like the TUI does.

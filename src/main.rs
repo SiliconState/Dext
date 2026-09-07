@@ -89,7 +89,7 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1658,12 +1658,28 @@ struct ConsoleSink {
 }
 
 /// `--input ndjson` limits: one frame per line, bounded so a runaway host
-/// cannot grow memory; at most NDJSON_MAX_PENDING prompts wait for the loop.
+/// cannot grow ingress queues; prompts, steering, and controls share one budget.
 const NDJSON_MAX_FRAME_BYTES: usize = 256 * 1024;
 const NDJSON_MAX_PENDING: usize = 32;
 
-/// What the ndjson stdin thread feeds. `pending` counts prompts handed to the
-/// loop and not yet taken; the loop decrements it on receipt.
+fn reserve_ndjson_pending(pending: &AtomicUsize, slots: usize) -> bool {
+    pending
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            count
+                .checked_add(slots)
+                .filter(|next| *next <= NDJSON_MAX_PENDING)
+        })
+        .is_ok()
+}
+
+fn release_ndjson_pending(pending: &AtomicUsize) {
+    let _ = pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+        Some(count.saturating_sub(1))
+    });
+}
+
+/// Reservations precede publication and are released by the actual consumer.
+/// Control sequences reserve one slot per command, atomically before sending.
 struct NdjsonChannels {
     input_tx: tokio::sync::mpsc::UnboundedSender<String>,
     runtime_control_tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -1678,8 +1694,8 @@ struct NdjsonChannels {
 ///   {"type":"user"|"steer","text":…,"confirm_secret"?:bool}  prompt; steer while busy
 ///   {"type":"control","command":"/effort high"}              slash; runtime control while busy
 ///   {"type":"interrupt"}  {"type":"permission","id":…,"choice":"once|always|deny"}  {"type":"close"}
-/// Text frames go through the text-mode router, so busy/secret/slash rules
-/// are one code path; `confirm_secret` is its "repeat the line" confirmation.
+/// Idle input shares text-mode confirmation; busy input reserves the entire
+/// destination batch before publishing, without blocking interrupt/permission input.
 fn ndjson_route(frame: &Value, ch: &NdjsonChannels) -> (&'static str, Option<String>) {
     let kind = frame["type"].as_str().unwrap_or("");
     let field = |key: &str| {
@@ -1703,7 +1719,41 @@ fn ndjson_route(frame: &Value, ch: &NdjsonChannels) -> (&'static str, Option<Str
                 );
             }
             let busy = ch.busy.load(Ordering::SeqCst);
-            if !busy && ch.pending.load(Ordering::SeqCst) >= NDJSON_MAX_PENDING {
+            if busy {
+                let text = normalize_user_input_path(&text);
+                let (messages, tx, route) =
+                    if let Some(commands) = parse_active_runtime_control_sequence(&text) {
+                        (commands, &ch.runtime_control_tx, "runtime_control_queued")
+                    } else if text_is_potential_local_secret(&text) {
+                        return (
+                            "withheld",
+                            Some("looks like a credential; use the local auth prompt".to_string()),
+                        );
+                    } else if is_slash_command(&text) {
+                        return ("unsupported_busy_slash", None);
+                    } else {
+                        (vec![text], &ch.steering_tx, "steering_queued")
+                    };
+                if !reserve_ndjson_pending(&ch.pending, messages.len()) {
+                    return (
+                        "invalid",
+                        Some(format!("input queue full ({NDJSON_MAX_PENDING})")),
+                    );
+                }
+                let mut failed = false;
+                for message in messages {
+                    if tx.send(message).is_err() {
+                        release_ndjson_pending(&ch.pending);
+                        failed = true;
+                    }
+                }
+                return if failed {
+                    ("invalid", Some("input channel closed".to_string()))
+                } else {
+                    (route, None)
+                };
+            }
+            if !reserve_ndjson_pending(&ch.pending, 1) {
                 return (
                     "invalid",
                     Some(format!("input queue full ({NDJSON_MAX_PENDING})")),
@@ -1713,28 +1763,24 @@ fn ndjson_route(frame: &Value, ch: &NdjsonChannels) -> (&'static str, Option<Str
                 .then(|| normalize_user_input_path(&text));
             match route_interactive_input_line(
                 text,
-                &ch.busy,
+                &AtomicBool::new(false),
                 &ch.input_tx,
                 &ch.runtime_control_tx,
                 &ch.steering_tx,
                 &mut confirmed,
             ) {
-                InteractiveInputRoute::Submitted => {
-                    ch.pending.fetch_add(1, Ordering::SeqCst);
-                    ("submitted", None)
+                InteractiveInputRoute::Submitted => ("submitted", None),
+                InteractiveInputRoute::SecretWithheld => {
+                    release_ndjson_pending(&ch.pending);
+                    (
+                        "withheld",
+                        Some("looks like a credential; resend with confirm_secret=true or use the local auth prompt".to_string()),
+                    )
                 }
-                InteractiveInputRoute::SteeringQueued => ("steering_queued", None),
-                InteractiveInputRoute::RuntimeControlQueued => ("runtime_control_queued", None),
-                InteractiveInputRoute::UnsupportedBusySlash(_) => ("unsupported_busy_slash", None),
-                InteractiveInputRoute::SecretWithheld => (
-                    "withheld",
-                    Some("looks like a credential; resend with confirm_secret=true or use the local auth prompt".to_string()),
-                ),
-                InteractiveInputRoute::Dropped if busy => (
-                    "withheld",
-                    Some("looks like a credential; use the local auth prompt".to_string()),
-                ),
-                InteractiveInputRoute::Dropped => ("invalid", Some("input channel closed".to_string())),
+                _ => {
+                    release_ndjson_pending(&ch.pending);
+                    ("invalid", Some("input channel closed".to_string()))
+                }
             }
         }
         "interrupt" => {
@@ -1971,6 +2017,7 @@ struct PermissionBridge {
     rx: std::sync::Mutex<std::sync::mpsc::Receiver<PermissionReply>>,
     interrupt: Arc<AtomicBool>,
     next_id: u64,
+    ready: Arc<AtomicBool>,
 }
 
 impl PermissionBridge {
@@ -1979,10 +2026,15 @@ impl PermissionBridge {
             rx: std::sync::Mutex::new(rx),
             interrupt,
             next_id: 0,
+            ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
     fn wait(&self, id: &str) -> Choice {
+        // Resume can request approval before the stdin reader exists.
+        if !self.ready.load(Ordering::SeqCst) {
+            return Choice::Deny;
+        }
         let deadline = std::time::Instant::now() + PERMISSION_BRIDGE_TIMEOUT;
         let Ok(rx) = self.rx.lock() else {
             return Choice::Deny;
@@ -12519,6 +12571,9 @@ fn apply_runtime_control_for_stream(
 ) -> AppliedRuntimeControls {
     let mut messages = Vec::new();
     if let Some(first) = first {
+        if let Some(pending) = &agent.ndjson_pending {
+            release_ndjson_pending(pending);
+        }
         messages.push(first);
     }
     messages.extend(agent.drain_runtime_controls());
@@ -13294,6 +13349,7 @@ struct Agent {
     // Default 8; override via DEXT_MAX_CONCURRENT_BUILTINS=N.
     builtin_semaphore: Arc<tokio::sync::Semaphore>,
     sink: Box<dyn EventSink>,
+    ndjson_pending: Option<Arc<AtomicUsize>>,
     runtime_control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     runtime_control_tx: tokio::sync::mpsc::UnboundedSender<String>,
     steering_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
@@ -13497,6 +13553,7 @@ impl Agent {
             budget_exhausted: false,
             builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
             sink: Box::new(ConsoleSink::new(pretty, false)),
+            ndjson_pending: None,
             runtime_control_rx: None,
             runtime_control_tx: Self::noop_text_tx(),
             steering_rx: None,
@@ -13642,6 +13699,11 @@ impl Agent {
                 commands.push(cmd);
             }
         }
+        if let Some(pending) = &self.ndjson_pending {
+            for _ in &commands {
+                release_ndjson_pending(pending);
+            }
+        }
         commands
     }
 
@@ -13650,6 +13712,11 @@ impl Agent {
         if let Some(rx) = &mut self.steering_rx {
             while let Ok(msg) = rx.try_recv() {
                 messages.push(msg);
+            }
+        }
+        if let Some(pending) = &self.ndjson_pending {
+            for _ in &messages {
+                release_ndjson_pending(pending);
             }
         }
         messages
@@ -24136,19 +24203,20 @@ async fn main() -> Result<()> {
         eprintln!("[approval warning] {warning}");
     }
 
-    let one_shot_task = read_one_shot_task(&opts, &mut io::stdin())?;
     if opts.ndjson {
-        if opts.print || one_shot_task.is_some() {
+        if opts.print || !opts.positional.is_empty() || opts.pack.is_some() {
             anyhow::bail!(
-                "--input ndjson drives the interactive loop over stdin; drop -p and positional prompts"
+                "--input ndjson drives the interactive loop over stdin; drop -p, --pack, and positional prompts"
             );
         }
         if opts.output != OutputMode::StreamJson {
             anyhow::bail!("--input ndjson requires --output stream-json");
         }
     }
+    let one_shot_task = read_one_shot_task(&opts, &mut io::stdin())?;
     // Handed to the ndjson stdin reader once the loop starts (ndjson only).
     let mut permission_tx: Option<std::sync::mpsc::SyncSender<PermissionReply>> = None;
+    let mut ndjson_permissions_ready = None;
 
     let will_use_tui = opts.pack.is_none()
         && !opts.print
@@ -24204,7 +24272,10 @@ async fn main() -> Result<()> {
         let mut sink = JsonSink::new(opts.output, false, false);
         if opts.ndjson {
             let (tx, rx) = std::sync::mpsc::sync_channel::<PermissionReply>(8);
-            sink = sink.with_permission_bridge(PermissionBridge::new(rx, agent.interrupt.clone()));
+            let bridge = PermissionBridge::new(rx, agent.interrupt.clone());
+            bridge.ready.store(false, Ordering::SeqCst);
+            ndjson_permissions_ready = Some(bridge.ready.clone());
+            sink = sink.with_permission_bridge(bridge);
             permission_tx = Some(tx);
         }
         agent.set_sink(Box::new(sink));
@@ -24395,7 +24466,11 @@ async fn main() -> Result<()> {
     let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Both readers own `input_tx`: stdin EOF (or a `close` frame) drops it and
     // the loop's recv returns None, so the process ends instead of hanging.
+    let mut ndjson_reader_start = None;
     if quiet {
+        agent.ndjson_pending = Some(pending.clone());
+        let (start_tx, start_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        ndjson_reader_start = Some(start_tx);
         let ch = NdjsonChannels {
             input_tx,
             runtime_control_tx: runtime_control_tx.clone(),
@@ -24408,6 +24483,9 @@ async fn main() -> Result<()> {
             pending: pending.clone(),
         };
         std::thread::spawn(move || {
+            if start_rx.recv().is_err() {
+                return;
+            }
             let mut stdin = io::stdin().lock();
             loop {
                 let mut line = String::new();
@@ -24505,6 +24583,12 @@ async fn main() -> Result<()> {
                 "frames": ["user", "steer", "control", "interrupt", "permission", "close"],
             }
         }));
+        if let Some(ready) = ndjson_permissions_ready {
+            ready.store(true, Ordering::SeqCst);
+        }
+        if let Some(start) = ndjson_reader_start.take() {
+            let _ = start.send(());
+        }
     } else {
         println!("dext — chat loop with tools. /help for commands, empty line or Ctrl+D to exit.");
         println!("sandbox: {}", agent.sandbox_root.display());
@@ -24533,7 +24617,7 @@ async fn main() -> Result<()> {
             }
         };
         if quiet {
-            pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            release_ndjson_pending(&pending);
         }
 
         if input.is_empty() {
