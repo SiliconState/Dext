@@ -7974,65 +7974,74 @@ fn latest_state_defaults_are_project_scoped_with_session_overlays() -> Result<()
 
 #[test]
 fn ndjson_router_routes_by_type_and_busy_state() {
-    let busy = AtomicBool::new(false);
-    let interrupt = AtomicBool::new(false);
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (perm_tx, perm_rx) = std::sync::mpsc::channel::<PermissionReply>();
-    let route = |line: &str, busy: &AtomicBool| {
-        route_ndjson_input_line(
-            line,
-            busy,
-            &input_tx,
-            &control_tx,
-            &steer_tx,
-            &perm_tx,
-            &interrupt,
+    let (runtime_control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (steering_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (permission_tx, perm_rx) = std::sync::mpsc::sync_channel::<PermissionReply>(1);
+    let ch = NdjsonChannels {
+        input_tx,
+        runtime_control_tx,
+        steering_tx,
+        permission_tx,
+        busy: Arc::new(AtomicBool::new(false)),
+        interrupt: Arc::new(AtomicBool::new(false)),
+        pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let route = |line: &str| {
+        ndjson_route(
+            &serde_json::from_str::<Value>(line).unwrap_or(Value::Null),
+            &ch,
         )
+        .0
     };
 
-    // Idle: user/steer/control all become prompts for the loop.
+    // Idle: user/steer/control all become prompts; each counts as pending.
     assert_eq!(
-        route(r#"{"type":"user","text":"hello\nworld"}"#, &busy),
-        NdjsonRoute::Submitted
+        route(r#"{"type":"user","text":"hello world"}"#),
+        "submitted"
     );
-    assert_eq!(input_rx.try_recv().unwrap(), "hello\nworld");
     assert_eq!(
-        route(r#"{"type":"steer","text":"idle steer"}"#, &busy),
-        NdjsonRoute::Submitted
+        route(r#"{"type":"steer","text":"idle steer"}"#),
+        "submitted"
     );
+    assert_eq!(
+        route(r#"{"type":"control","command":"/effort high"}"#),
+        "submitted"
+    );
+    assert_eq!(input_rx.try_recv().unwrap(), "hello world");
     assert_eq!(input_rx.try_recv().unwrap(), "idle steer");
-    assert_eq!(
-        route(r#"{"type":"control","command":"/effort high"}"#, &busy),
-        NdjsonRoute::Submitted
-    );
     assert_eq!(input_rx.try_recv().unwrap(), "/effort high");
+    assert_eq!(ch.pending.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        route(r#"{"type":"control","command":"not a slash"}"#),
+        "invalid"
+    );
 
     // Busy: user text steers; runtime controls queue; other slashes are refused.
-    busy.store(true, Ordering::SeqCst);
+    ch.busy.store(true, Ordering::SeqCst);
     assert_eq!(
-        route(r#"{"type":"user","text":"focus on tests"}"#, &busy),
-        NdjsonRoute::SteeringQueued
+        route(r#"{"type":"user","text":"focus on tests"}"#),
+        "steering_queued"
     );
     assert_eq!(steer_rx.try_recv().unwrap(), "focus on tests");
     assert_eq!(
-        route(r#"{"type":"control","command":"/effort low"}"#, &busy),
-        NdjsonRoute::RuntimeControlQueued
+        route(r#"{"type":"control","command":"/effort low"}"#),
+        "runtime_control_queued"
     );
     assert_eq!(control_rx.try_recv().unwrap(), "/effort low");
     assert_eq!(
-        route(r#"{"type":"user","text":"/help"}"#, &busy),
-        NdjsonRoute::UnsupportedBusySlash
+        route(r#"{"type":"user","text":"/help"}"#),
+        "unsupported_busy_slash"
     );
 
-    // Permission replies land on the bridge channel; bad choices are rejected.
+    // Permission replies land on the bounded bridge channel; bad or excess ones are refused.
     assert_eq!(
-        route(
-            r#"{"type":"permission","id":"perm-1","choice":"always"}"#,
-            &busy
-        ),
-        NdjsonRoute::PermissionForwarded
+        route(r#"{"type":"permission","id":"perm-1","choice":"always"}"#),
+        "permission_forwarded"
+    );
+    assert_eq!(
+        route(r#"{"type":"permission","id":"perm-2","choice":"once"}"#),
+        "invalid"
     );
     assert_eq!(
         perm_rx.try_recv().unwrap(),
@@ -8041,39 +8050,31 @@ fn ndjson_router_routes_by_type_and_busy_state() {
             choice: Choice::Always
         }
     );
-    assert!(matches!(
-        route(
-            r#"{"type":"permission","id":"perm-1","choice":"maybe"}"#,
-            &busy
-        ),
-        NdjsonRoute::Invalid(_)
-    ));
-
     assert_eq!(
-        route(r#"{"type":"interrupt"}"#, &busy),
-        NdjsonRoute::Interrupted
+        route(r#"{"type":"permission","id":"perm-1","choice":"maybe"}"#),
+        "invalid"
     );
-    assert!(interrupt.load(Ordering::SeqCst));
-    assert_eq!(route(r#"{"type":"close"}"#, &busy), NdjsonRoute::Close);
-    assert!(matches!(route("not json", &busy), NdjsonRoute::Invalid(_)));
-    assert!(matches!(
-        route(r#"{"type":"bogus"}"#, &busy),
-        NdjsonRoute::Invalid(_)
-    ));
 
-    // Credential-looking text is withheld unless the host confirms.
-    busy.store(false, Ordering::SeqCst);
-    let secret =
-        r#"{"type":"user","text":"export OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789"}"#;
-    assert!(matches!(route(secret, &busy), NdjsonRoute::Withheld(_)));
-    let confirmed = r#"{"type":"user","text":"export OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789","confirm_secret":true}"#;
-    assert_eq!(route(confirmed, &busy), NdjsonRoute::Submitted);
+    assert_eq!(route(r#"{"type":"interrupt"}"#), "interrupted");
+    assert!(ch.interrupt.load(Ordering::SeqCst));
+    assert_eq!(route(r#"{"type":"close"}"#), "close");
+    assert_eq!(route("not json"), "invalid");
+    assert_eq!(route(r#"{"type":"bogus"}"#), "invalid");
+
+    // Credential-looking text is withheld unless the host confirms; the queue is bounded.
+    ch.busy.store(false, Ordering::SeqCst);
+    let secret = r#"{"type":"user","text":"export OPENAI_API_KEY=sk-live-1234567890abcdef"}"#;
+    assert_eq!(route(secret), "withheld");
+    let confirmed = r#"{"type":"user","text":"export OPENAI_API_KEY=sk-live-1234567890abcdef","confirm_secret":true}"#;
+    assert_eq!(route(confirmed), "submitted");
+    ch.pending.store(NDJSON_MAX_PENDING, Ordering::SeqCst);
+    assert_eq!(route(r#"{"type":"user","text":"one too many"}"#), "invalid");
 }
 
 #[test]
 fn permission_bridge_matches_ids_and_denies_on_interrupt_or_eof() {
     let interrupt = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel::<PermissionReply>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<PermissionReply>(8);
     let bridge = PermissionBridge::new(rx, interrupt.clone());
     // Stale reply is skipped; matching reply wins.
     tx.send(PermissionReply {

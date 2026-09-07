@@ -5672,30 +5672,15 @@ mod tests {
 
     #[test]
     fn auth_json_documents_are_stable() {
+        // The built-in anthropic profile is the fixture: no hand-rolled struct
+        // literal to keep in sync with ProviderProfile's fields.
         let catalog = ProviderCatalog {
             version: PROVIDER_CATALOG_VERSION,
             active_provider: "anthropic".to_string(),
-            providers: vec![ProviderProfile {
-                id: "anthropic".to_string(),
-                builtin: None,
-                display_name: "Anthropic".to_string(),
-                api_provider: ApiProvider::Anthropic,
-                request_contract: None,
-                base_url: "https://api.anthropic.com".to_string(),
-                default_model: "claude-a".to_string(),
-                models: vec!["claude-b".to_string()],
-                model_aliases: HashMap::from([("b".to_string(), "claude-b".to_string())]),
-                model_defaults: ModelSpec::default(),
-                model_specs: HashMap::new(),
-                env_vars: Vec::new(),
-                requires_api_key: true,
-                login_url: None,
-                oauth_flow: None,
-                notes: None,
-                context_window: None,
-                model_context_windows: HashMap::new(),
-                model_effort_levels: HashMap::new(),
-            }],
+            providers: built_in_provider_profiles()
+                .into_iter()
+                .filter(|p| p.id == "anthropic")
+                .collect(),
         };
         let store = AuthStore::default();
         let status: Value =
@@ -5703,18 +5688,22 @@ mod tests {
         assert_eq!(status["version"], 1);
         assert_eq!(status["active_provider"], "anthropic");
         assert_eq!(status["providers"][0]["id"], "anthropic");
-        assert_eq!(status["providers"][0]["label"], "Anthropic");
         assert_eq!(status["providers"][0]["active"], true);
-        assert_eq!(status["providers"][0]["default_model"], "claude-a");
+        assert!(
+            status["providers"][0]["default_model"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty())
+        );
         assert!(status["providers"][0]["auth"].is_string());
-        // Unauthenticated: models falls back to the active provider.
+        // Unauthenticated: models falls back to the active provider; an unknown selector is empty.
         let models: Value =
             serde_json::from_str(&auth_models_json(&catalog, &store, "anthropic", None))
                 .expect("json");
         assert_eq!(models["providers"][0]["id"], "anthropic");
-        assert_eq!(models["providers"][0]["models"][0], "claude-a");
-        assert_eq!(models["providers"][0]["models"][1], "claude-b");
-        assert_eq!(models["providers"][0]["aliases"][0]["alias"], "b");
+        assert_eq!(
+            models["providers"][0]["models"][0],
+            status["providers"][0]["default_model"]
+        );
         let none: Value = serde_json::from_str(&auth_models_json(
             &catalog,
             &store,

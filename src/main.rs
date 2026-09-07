@@ -1563,27 +1563,6 @@ impl OutputMode {
     }
 }
 
-/// How stdin is interpreted in the interactive loop. `Ndjson` is the host
-/// protocol: one JSON object per line (`{"type":"user"|"steer"|"control"|
-/// "interrupt"|"permission"|"close", ...}`), no banner or prompt on stdout,
-/// and per-action permission requests answered over the same pipe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum InputMode {
-    #[default]
-    Text,
-    Ndjson,
-}
-
-impl InputMode {
-    pub(crate) fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "text" => Some(Self::Text),
-            "ndjson" | "jsonl" | "stream-json" => Some(Self::Ndjson),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlashPresentation {
     Faded,
@@ -1678,178 +1657,130 @@ struct ConsoleSink {
     text_accum: String,
 }
 
-/// Where a `--input ndjson` line went. Echoed back to the host as
-/// `input_ack` so it can tell a live steer from a queued prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NdjsonRoute {
-    Submitted,
-    SteeringQueued,
-    RuntimeControlQueued,
-    UnsupportedBusySlash,
-    PermissionForwarded,
-    Interrupted,
-    Close,
-    Withheld(&'static str),
-    Invalid(String),
+/// `--input ndjson` limits: one frame per line, bounded so a runaway host
+/// cannot grow memory; at most NDJSON_MAX_PENDING prompts wait for the loop.
+const NDJSON_MAX_FRAME_BYTES: usize = 256 * 1024;
+const NDJSON_MAX_PENDING: usize = 32;
+
+/// What the ndjson stdin thread feeds. `pending` counts prompts handed to the
+/// loop and not yet taken; the loop decrements it on receipt.
+struct NdjsonChannels {
+    input_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    runtime_control_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    steering_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    permission_tx: std::sync::mpsc::SyncSender<PermissionReply>,
+    busy: Arc<AtomicBool>,
+    interrupt: Arc<AtomicBool>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl NdjsonRoute {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Submitted => "submitted",
-            Self::SteeringQueued => "steering_queued",
-            Self::RuntimeControlQueued => "runtime_control_queued",
-            Self::UnsupportedBusySlash => "unsupported_busy_slash",
-            Self::PermissionForwarded => "permission_forwarded",
-            Self::Interrupted => "interrupted",
-            Self::Close => "close",
-            Self::Withheld(_) => "withheld",
-            Self::Invalid(_) => "invalid",
-        }
-    }
-}
-
-/// `{"type":"user","text":…,"confirm_secret":bool}`   prompt (steer when busy)
-/// `{"type":"steer","text":…}`                        steer when busy, else prompt
-/// `{"type":"control","command":"/effort high"}`      runtime control when busy, else slash
-/// `{"type":"interrupt"}`                             stop the running turn
-/// `{"type":"permission","id":…,"choice":"once|always|deny"}`
-/// `{"type":"close"}`                                 end the loop
-fn route_ndjson_input_line(
-    line: &str,
-    agent_busy: &AtomicBool,
-    input_tx: &tokio::sync::mpsc::UnboundedSender<String>,
-    runtime_control_tx: &tokio::sync::mpsc::UnboundedSender<String>,
-    steering_tx: &tokio::sync::mpsc::UnboundedSender<String>,
-    permission_tx: &std::sync::mpsc::Sender<PermissionReply>,
-    interrupt: &AtomicBool,
-) -> NdjsonRoute {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return NdjsonRoute::Invalid("empty line".to_string());
-    }
-    let frame: Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(e) => return NdjsonRoute::Invalid(format!("not JSON: {e}")),
-    };
+/// Route one parsed stdin frame; returns the `input_ack` route and detail.
+///   {"type":"user"|"steer","text":…,"confirm_secret"?:bool}  prompt; steer while busy
+///   {"type":"control","command":"/effort high"}              slash; runtime control while busy
+///   {"type":"interrupt"}  {"type":"permission","id":…,"choice":"once|always|deny"}  {"type":"close"}
+/// Text frames go through the text-mode router, so busy/secret/slash rules
+/// are one code path; `confirm_secret` is its "repeat the line" confirmation.
+fn ndjson_route(frame: &Value, ch: &NdjsonChannels) -> (&'static str, Option<String>) {
     let kind = frame["type"].as_str().unwrap_or("");
-    let busy = agent_busy.load(Ordering::SeqCst);
-    let text_field = |key: &str| -> Option<String> {
+    let field = |key: &str| {
         frame[key]
             .as_str()
-            .map(|t| normalize_user_input_path(t.trim()))
+            .map(str::trim)
             .filter(|t| !t.is_empty())
+            .map(str::to_string)
     };
     match kind {
-        "user" | "steer" => {
-            let Some(text) = text_field("text") else {
-                return NdjsonRoute::Invalid(format!("{kind}: missing text"));
+        _ if !frame.is_object() => ("invalid", Some("not a JSON object".to_string())),
+        "user" | "steer" | "control" => {
+            let key = if kind == "control" { "command" } else { "text" };
+            let Some(text) = field(key) else {
+                return ("invalid", Some(format!("{kind}: missing {key}")));
             };
-            if text_is_potential_local_secret(&text) && frame["confirm_secret"] != Value::Bool(true)
-            {
-                return NdjsonRoute::Withheld(
-                    "looks like a credential; resend with confirm_secret=true or use the local auth prompt",
+            if kind == "control" && !is_slash_command(&text) {
+                return (
+                    "invalid",
+                    Some("control: command must start with /".to_string()),
                 );
             }
-            if busy {
-                if is_active_runtime_control_command(&text) {
-                    for command in parse_active_runtime_control_sequence(&text)
-                        .unwrap_or_else(|| vec![text.clone()])
-                    {
-                        let _ = runtime_control_tx.send(command);
-                    }
-                    return NdjsonRoute::RuntimeControlQueued;
-                }
-                if is_slash_command(&text) {
-                    return NdjsonRoute::UnsupportedBusySlash;
-                }
-                return if steering_tx.send(text).is_ok() {
-                    NdjsonRoute::SteeringQueued
-                } else {
-                    NdjsonRoute::Invalid("steering channel closed".to_string())
-                };
+            let busy = ch.busy.load(Ordering::SeqCst);
+            if !busy && ch.pending.load(Ordering::SeqCst) >= NDJSON_MAX_PENDING {
+                return (
+                    "invalid",
+                    Some(format!("input queue full ({NDJSON_MAX_PENDING})")),
+                );
             }
-            if input_tx.send(text).is_ok() {
-                NdjsonRoute::Submitted
-            } else {
-                NdjsonRoute::Invalid("input channel closed".to_string())
-            }
-        }
-        "control" => {
-            let Some(command) = text_field("command") else {
-                return NdjsonRoute::Invalid("control: missing command".to_string());
-            };
-            if busy {
-                if !is_active_runtime_control_command(&command) {
-                    return NdjsonRoute::UnsupportedBusySlash;
+            let mut confirmed = (frame["confirm_secret"] == Value::Bool(true))
+                .then(|| normalize_user_input_path(&text));
+            match route_interactive_input_line(
+                text,
+                &ch.busy,
+                &ch.input_tx,
+                &ch.runtime_control_tx,
+                &ch.steering_tx,
+                &mut confirmed,
+            ) {
+                InteractiveInputRoute::Submitted => {
+                    ch.pending.fetch_add(1, Ordering::SeqCst);
+                    ("submitted", None)
                 }
-                for part in parse_active_runtime_control_sequence(&command)
-                    .unwrap_or_else(|| vec![command.clone()])
-                {
-                    let _ = runtime_control_tx.send(part);
-                }
-                NdjsonRoute::RuntimeControlQueued
-            } else if input_tx.send(command).is_ok() {
-                NdjsonRoute::Submitted
-            } else {
-                NdjsonRoute::Invalid("input channel closed".to_string())
+                InteractiveInputRoute::SteeringQueued => ("steering_queued", None),
+                InteractiveInputRoute::RuntimeControlQueued => ("runtime_control_queued", None),
+                InteractiveInputRoute::UnsupportedBusySlash(_) => ("unsupported_busy_slash", None),
+                InteractiveInputRoute::SecretWithheld => (
+                    "withheld",
+                    Some("looks like a credential; resend with confirm_secret=true or use the local auth prompt".to_string()),
+                ),
+                InteractiveInputRoute::Dropped if busy => (
+                    "withheld",
+                    Some("looks like a credential; use the local auth prompt".to_string()),
+                ),
+                InteractiveInputRoute::Dropped => ("invalid", Some("input channel closed".to_string())),
             }
         }
         "interrupt" => {
-            interrupt.store(true, Ordering::SeqCst);
-            NdjsonRoute::Interrupted
+            ch.interrupt.store(true, Ordering::SeqCst);
+            ("interrupted", None)
         }
-        "permission" => {
-            let id = frame["id"].as_str().unwrap_or("").trim().to_string();
-            let Some(choice) = frame["choice"]
-                .as_str()
-                .and_then(PermissionReply::parse_choice)
-            else {
-                return NdjsonRoute::Invalid(
-                    "permission: choice must be once|always|deny".to_string(),
-                );
-            };
-            if id.is_empty() {
-                return NdjsonRoute::Invalid("permission: missing id".to_string());
+        "permission" => match (
+            field("id"),
+            match frame["choice"].as_str() {
+                Some("once") => Some(Choice::Once),
+                Some("always") => Some(Choice::Always),
+                Some("deny") => Some(Choice::Deny),
+                _ => None,
+            },
+        ) {
+            (Some(id), Some(choice)) => {
+                match ch.permission_tx.try_send(PermissionReply { id, choice }) {
+                    Ok(()) => ("permission_forwarded", None),
+                    Err(_) => (
+                        "invalid",
+                        Some("permission queue full or closed".to_string()),
+                    ),
+                }
             }
-            let _ = permission_tx.send(PermissionReply { id, choice });
-            NdjsonRoute::PermissionForwarded
-        }
-        "close" => NdjsonRoute::Close,
-        other => NdjsonRoute::Invalid(format!("unknown type '{other}'")),
+            _ => (
+                "invalid",
+                Some("permission: needs id and choice once|always|deny".to_string()),
+            ),
+        },
+        "close" => ("close", None),
+        other => ("invalid", Some(format!("unknown type '{other}'"))),
     }
 }
 
-/// One `input_ack` line per stdin frame. `seq` echoes the host's optional
-/// correlation field; `detail` carries the withhold/invalid reason.
-fn emit_ndjson_input_ack(line: &str, route: &NdjsonRoute) {
-    let seq = serde_json::from_str::<Value>(line.trim())
-        .ok()
-        .and_then(|v| v.get("seq").cloned())
-        .unwrap_or(Value::Null);
-    let detail = match route {
-        NdjsonRoute::Withheld(reason) => Value::String((*reason).to_string()),
-        NdjsonRoute::Invalid(reason) => Value::String(reason.clone()),
-        _ => Value::Null,
-    };
-    let kind = serde_json::from_str::<Value>(line.trim())
-        .ok()
-        .and_then(|v| v["type"].as_str().map(String::from))
-        .unwrap_or_default();
+/// One `input_ack` per stdin frame; `seq` echoes the host's correlation field.
+fn emit_ndjson_ack(frame: &Value, route: &str, detail: Option<String>) {
     JsonSink::emit_json_line(&json!({
         "event": "input_ack",
-        "data": { "type": kind, "route": route.as_str(), "seq": seq, "detail": detail }
+        "data": { "type": frame["type"].as_str().unwrap_or(""), "route": route, "seq": frame.get("seq").cloned().unwrap_or(Value::Null), "detail": detail }
     }));
 }
 
-/// Loop chatter (`[queued …]`, compact status, login prompts) goes to the
-/// sink as `info` under ndjson so stdout stays pure event lines.
-fn loop_note(agent: &mut Agent, quiet: bool, message: String) {
-    if quiet {
-        agent.sink.emit(AgentEvent::Info(message));
-    } else {
-        println!("{message}");
-    }
+/// Loop chatter goes through the sink: stdout in text mode, an `info` event
+/// under ndjson so stdout stays pure event lines.
+fn note(agent: &mut Agent, message: String) {
+    agent.sink.emit(AgentEvent::Info(message));
 }
 
 impl ConsoleSink {
@@ -2022,77 +1953,48 @@ struct OutputStreamState {
     text: String,
 }
 
-/// A host's answer to a `permission_request` event, read off the ndjson
-/// stdin thread. Replies for other ids are stale and ignored.
+/// A host's answer to a `permission_request`; replies for other ids are stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PermissionReply {
     id: String,
     choice: Choice,
 }
 
-impl PermissionReply {
-    fn parse_choice(raw: &str) -> Option<Choice> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "once" | "allow" | "allow_once" | "yes" => Some(Choice::Once),
-            "always" | "allow_always" | "session" => Some(Choice::Always),
-            "deny" | "no" | "reject" => Some(Choice::Deny),
-            _ => None,
-        }
-    }
-}
+/// Hosts get this long to answer before the action is denied (a human may be
+/// on the other end); interrupt or a closed stdin denies at once.
+const PERMISSION_BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Per-action approvals over the stdin/stdout pipe. `request_permission` is a
-/// blocking sink call (the console sink blocks on a TTY the same way), so the
-/// bridge polls its channel with a short timeout and also gives up on
-/// interrupt or when the host closes stdin.
+/// Per-action approvals over the pipe. `request_permission` is a blocking sink
+/// call (the console sink blocks on a TTY the same way).
 struct PermissionBridge {
     // Mutex only for `Sync`: the sink is single-consumer, never contended.
     rx: std::sync::Mutex<std::sync::mpsc::Receiver<PermissionReply>>,
     interrupt: Arc<AtomicBool>,
     next_id: u64,
-    timeout: std::time::Duration,
 }
-
-/// Hosts get this long to answer before the action is denied. Long because a
-/// human is on the other end; the loop still exits early on interrupt/EOF.
-const PERMISSION_BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 impl PermissionBridge {
     fn new(rx: std::sync::mpsc::Receiver<PermissionReply>, interrupt: Arc<AtomicBool>) -> Self {
         Self {
             rx: std::sync::Mutex::new(rx),
             interrupt,
-            next_id: 1,
-            timeout: PERMISSION_BRIDGE_TIMEOUT,
+            next_id: 0,
         }
-    }
-
-    fn allocate_id(&mut self) -> String {
-        let id = format!("perm-{}-{}", std::process::id(), self.next_id);
-        self.next_id += 1;
-        id
     }
 
     fn wait(&self, id: &str) -> Choice {
-        let deadline = std::time::Instant::now() + self.timeout;
+        let deadline = std::time::Instant::now() + PERMISSION_BRIDGE_TIMEOUT;
         let Ok(rx) = self.rx.lock() else {
             return Choice::Deny;
         };
-        loop {
-            if self.interrupt.load(Ordering::SeqCst) {
-                return Choice::Deny;
-            }
+        while !self.interrupt.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             match rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(reply) if reply.id == id => return reply.choice,
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Choice::Deny;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Choice::Deny,
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        Choice::Deny
     }
 }
 
@@ -2146,12 +2048,7 @@ impl EventSink for JsonSink {
                     } => self.stream.text.clear(),
                     _ => {}
                 }
-                if matches!(
-                    &event,
-                    AgentEvent::ToolOutputDelta { .. }
-                        | AgentEvent::ThinkingPreviewDiscarded
-                        | AgentEvent::ThinkingPreviewCommitted
-                ) {
+                if matches!(&event, AgentEvent::ToolOutputDelta { .. }) {
                     return;
                 }
                 if let Ok(value) = serde_json::to_value(&event) {
@@ -2187,13 +2084,14 @@ impl EventSink for JsonSink {
     }
 
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice {
-        let Some(bridge) = self.permissions.as_mut() else {
-            return Choice::Deny;
-        };
         if self.mode != OutputMode::StreamJson {
             return Choice::Deny;
         }
-        let id = bridge.allocate_id();
+        let Some(bridge) = self.permissions.as_mut() else {
+            return Choice::Deny;
+        };
+        bridge.next_id += 1;
+        let id = format!("perm-{}-{}", std::process::id(), bridge.next_id);
         Self::emit_json_line(&json!({
             "event": "permission_request",
             "data": {
@@ -23358,7 +23256,8 @@ pub(crate) struct CliOptions {
     pub(crate) eval_filter: Option<String>,
     pub(crate) approval_policy_override: Option<ApprovalProfile>,
     pub(crate) output: OutputMode,
-    pub(crate) input: InputMode,
+    /// `--input ndjson`: the host protocol (docs/HOST_PROTOCOL.md).
+    pub(crate) ndjson: bool,
     pub(crate) cd: Option<PathBuf>,
     pub(crate) fork: bool,
     pub(crate) budget_cap: Option<BudgetCap>,
@@ -23376,7 +23275,7 @@ pub(crate) struct CliOptions {
 pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut positional = Vec::new();
     let mut print = false;
-    let mut input = InputMode::Text;
+    let mut ndjson = false;
     let mut resume_latest = false;
     let mut resume_selector: Option<String> = None;
     let mut no_session = false;
@@ -23560,12 +23459,11 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
             }
             "--input" => {
                 i += 1;
-                let value = argv
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--input requires text or ndjson"))?;
-                input = InputMode::parse(value).ok_or_else(|| {
-                    anyhow::anyhow!("invalid --input '{value}' (expected text or ndjson)")
-                })?;
+                ndjson = match argv.get(i).map(String::as_str) {
+                    Some("ndjson") => true,
+                    Some("text") => false,
+                    _ => anyhow::bail!("--input expects text or ndjson"),
+                };
             }
             "--cd" => {
                 i += 1;
@@ -23735,7 +23633,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         eval_filter,
         approval_policy_override,
         output,
-        input,
+        ndjson,
         cd,
         fork,
         budget_cap,
@@ -24239,7 +24137,7 @@ async fn main() -> Result<()> {
     }
 
     let one_shot_task = read_one_shot_task(&opts, &mut io::stdin())?;
-    if opts.input == InputMode::Ndjson {
+    if opts.ndjson {
         if opts.print || one_shot_task.is_some() {
             anyhow::bail!(
                 "--input ndjson drives the interactive loop over stdin; drop -p and positional prompts"
@@ -24250,7 +24148,7 @@ async fn main() -> Result<()> {
         }
     }
     // Handed to the ndjson stdin reader once the loop starts (ndjson only).
-    let mut permission_tx: Option<std::sync::mpsc::Sender<PermissionReply>> = None;
+    let mut permission_tx: Option<std::sync::mpsc::SyncSender<PermissionReply>> = None;
 
     let will_use_tui = opts.pack.is_none()
         && !opts.print
@@ -24304,8 +24202,8 @@ async fn main() -> Result<()> {
     if opts.output.is_json() {
         agent.pretty = false;
         let mut sink = JsonSink::new(opts.output, false, false);
-        if opts.input == InputMode::Ndjson {
-            let (tx, rx) = std::sync::mpsc::channel::<PermissionReply>();
+        if opts.ndjson {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PermissionReply>(8);
             sink = sink.with_permission_bridge(PermissionBridge::new(rx, agent.interrupt.clone()));
             permission_tx = Some(tx);
         }
@@ -24492,40 +24390,50 @@ async fn main() -> Result<()> {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     agent.install_runtime_controls(runtime_control_rx, runtime_control_tx.clone());
     agent.install_steering(steer_rx, steer_tx.clone());
-    if opts.fork {
-        println!(
-            "fork: autosave and side-effect crash recovery disabled; use /save <name> or /export [path] to keep this branch."
-        );
-    }
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let quiet = opts.input == InputMode::Ndjson;
+    let quiet = opts.ndjson;
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Both readers own `input_tx`: stdin EOF (or a `close` frame) drops it and
+    // the loop's recv returns None, so the process ends instead of hanging.
     if quiet {
-        let input_tx = input_tx.clone();
-        let runtime_control_tx = runtime_control_tx.clone();
-        let steering_tx = steer_tx.clone();
-        let busy = agent_busy_flag.clone();
-        let interrupt = agent.interrupt.clone();
-        let permission_tx = permission_tx
-            .take()
-            .expect("ndjson input always installs a permission bridge");
+        let ch = NdjsonChannels {
+            input_tx,
+            runtime_control_tx: runtime_control_tx.clone(),
+            steering_tx: steer_tx.clone(),
+            permission_tx: permission_tx
+                .take()
+                .expect("ndjson input always installs a permission bridge"),
+            busy: agent_busy_flag.clone(),
+            interrupt: agent.interrupt.clone(),
+            pending: pending.clone(),
+        };
         std::thread::spawn(move || {
-            let stdin = io::stdin();
+            let mut stdin = io::stdin().lock();
             loop {
                 let mut line = String::new();
-                match stdin.lock().read_line(&mut line) {
+                // Bounded read: an overlong frame is refused and the bridge
+                // closes, since the rest of that line cannot be resynchronised.
+                match (&mut stdin)
+                    .take(NDJSON_MAX_FRAME_BYTES as u64 + 1)
+                    .read_line(&mut line)
+                {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let route = route_ndjson_input_line(
-                            &line,
-                            &busy,
-                            &input_tx,
-                            &runtime_control_tx,
-                            &steering_tx,
-                            &permission_tx,
-                            &interrupt,
+                    Ok(_) if line.len() > NDJSON_MAX_FRAME_BYTES => {
+                        emit_ndjson_ack(
+                            &Value::Null,
+                            "invalid",
+                            Some(format!(
+                                "frame exceeds {NDJSON_MAX_FRAME_BYTES} bytes; closing"
+                            )),
                         );
-                        emit_ndjson_input_ack(&line, &route);
-                        if route == NdjsonRoute::Close {
+                        break;
+                    }
+                    Ok(_) => {
+                        let frame =
+                            serde_json::from_str::<Value>(line.trim()).unwrap_or(Value::Null);
+                        let (route, detail) = ndjson_route(&frame, &ch);
+                        emit_ndjson_ack(&frame, route, detail);
+                        if route == "close" {
                             break;
                         }
                     }
@@ -24533,7 +24441,6 @@ async fn main() -> Result<()> {
             }
         });
     } else {
-        let input_tx = input_tx.clone();
         let runtime_control_tx = runtime_control_tx.clone();
         let steering_tx = steer_tx.clone();
         let busy = agent_busy_flag.clone();
@@ -24603,6 +24510,12 @@ async fn main() -> Result<()> {
         println!("sandbox: {}", agent.sandbox_root.display());
         println!("{}", agent.provider_status_line());
     }
+    if opts.fork {
+        note(
+            &mut agent,
+            "fork: autosave and side-effect crash recovery disabled; use /save <name> or /export [path] to keep this branch.".to_string(),
+        );
+    }
 
     loop {
         if !quiet {
@@ -24613,10 +24526,15 @@ async fn main() -> Result<()> {
         let input = match input_rx.recv().await {
             Some(line) => line,
             None => {
-                println!();
+                if !quiet {
+                    println!();
+                }
                 break;
             }
         };
+        if quiet {
+            pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
 
         if input.is_empty() {
             break;
@@ -24629,22 +24547,26 @@ async fn main() -> Result<()> {
                 {
                     let _ = agent.runtime_control_sender().send(command);
                 }
-                println!("[runtime control queued]");
+                note(&mut agent, "[runtime control queued]".to_string());
                 autosave_latest(&mut agent);
                 continue;
             }
             if text_is_potential_local_secret(&input) {
-                eprintln!("[input withheld: use the local auth prompt for sudo/auth secrets]");
+                agent.sink.emit(AgentEvent::Warn(
+                    "[input withheld: use the local auth prompt for sudo/auth secrets]".to_string(),
+                ));
                 autosave_latest(&mut agent);
                 continue;
             }
             if is_slash_command(&input) {
-                eprintln!("{}", unsupported_busy_slash_message(&input));
+                agent
+                    .sink
+                    .emit(AgentEvent::Warn(unsupported_busy_slash_message(&input)));
                 autosave_latest(&mut agent);
                 continue;
             }
             let _ = agent.steering_sender().send(input.clone());
-            loop_note(&mut agent, quiet, "[queued for next response]".to_string());
+            note(&mut agent, "[queued for next response]".to_string());
             autosave_latest(&mut agent);
             continue;
         }
@@ -24653,7 +24575,9 @@ async fn main() -> Result<()> {
             match parsed {
                 Ok(CompactSlash::RunNow) => {
                     if let Err(e) = agent.compact().await {
-                        eprintln!("[compact error] {e:#}");
+                        agent
+                            .sink
+                            .emit(AgentEvent::Error(format!("[compact error] {e:#}")));
                     }
                 }
                 Ok(CompactSlash::Status) => {
@@ -24667,9 +24591,8 @@ async fn main() -> Result<()> {
                     );
                     match agent.compact_threshold_override_percent() {
                         Some(percent) => {
-                            loop_note(
+                            note(
                                 &mut agent,
-                                quiet,
                                 format!(
                                     "compact threshold: {current} chars ({percent}% of model context window; active-run trigger {active}; auto baseline {base})"
                                 ),
@@ -24677,9 +24600,8 @@ async fn main() -> Result<()> {
                         }
                         None => {
                             let mode = agent.context_mode.as_str();
-                            loop_note(
+                            note(
                                 &mut agent,
-                                quiet,
                                 format!(
                                     "compact threshold: {current} chars (auto: {mode} mode; active-run trigger {active})"
                                 ),
@@ -24694,17 +24616,16 @@ async fn main() -> Result<()> {
                         agent.context_mode.as_str(),
                         agent.compact_threshold_chars()
                     );
-                    loop_note(&mut agent, quiet, msg);
+                    note(&mut agent, msg);
                 }
                 Ok(CompactSlash::SetPercent(percent)) => {
                     let chars = agent.set_compact_threshold_percent(percent);
-                    loop_note(
+                    note(
                         &mut agent,
-                        quiet,
                         format!("compact threshold set to {percent}% -> {chars} chars"),
                     );
                 }
-                Err(msg) => loop_note(&mut agent, quiet, msg.to_string()),
+                Err(msg) => note(&mut agent, msg.to_string()),
             }
             autosave_latest(&mut agent);
             continue;
@@ -24722,7 +24643,9 @@ async fn main() -> Result<()> {
             if let Some((selector, task)) = packs::pack_invocation_args(raw) {
                 agent_busy_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 if let Err(e) = agent.run_pack(selector, task).await {
-                    eprintln!("[pack error] {e:#}");
+                    agent
+                        .sink
+                        .emit(AgentEvent::Error(format!("[pack error] {e:#}")));
                 }
                 agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                 autosave_latest(&mut agent);
@@ -24740,13 +24663,15 @@ async fn main() -> Result<()> {
 
         match agent.try_consume_pending_login_input(&input) {
             Ok(Some(msg)) => {
-                loop_note(&mut agent, quiet, msg);
+                note(&mut agent, msg);
                 autosave_latest(&mut agent);
                 continue;
             }
             Ok(None) => {}
             Err(e) => {
-                eprintln!("[login error] {e:#}\n");
+                agent
+                    .sink
+                    .emit(AgentEvent::Error(format!("[login error] {e:#}\n")));
                 autosave_latest(&mut agent);
                 continue;
             }
@@ -24757,7 +24682,9 @@ async fn main() -> Result<()> {
         agent_busy_flag.store(false, std::sync::atomic::Ordering::SeqCst);
 
         if let Err(e) = chat_result {
-            eprintln!("[error] {e:#}\n");
+            agent
+                .sink
+                .emit(AgentEvent::Error(format!("[error] {e:#}\n")));
         } else if !quiet {
             println!();
         }
