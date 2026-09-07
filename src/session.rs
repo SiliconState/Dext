@@ -742,6 +742,16 @@ pub(crate) fn new_session_id() -> String {
     format!("{}-{}-{random}", unix_timestamp_secs(), current_pid())
 }
 
+/// A session id read back from a session header must be a plain directory
+/// name in the `new_session_id` alphabet: no separators, dots, or traversal.
+pub(crate) fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 const SESSION_LOCK_OPERATION_FILE: &str = "session-locks.operation.lock";
 const SESSION_LOCK_OPERATION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1285,6 +1295,8 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
                 header.context_mode_explicit = true;
             }
             header.version = SESSION_FORMAT_VERSION;
+            // A hostile or corrupt id must never become a state-dir name.
+            header.session_id = header.session_id.filter(|id| is_valid_session_id(id));
             validate_session_header_accounting(&header)?;
             return Ok(header);
         }
@@ -1406,6 +1418,10 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
         provider_health: serde_json::from_value(meta["provider_health"].clone())
             .unwrap_or_default(),
         privacy: serde_json::from_value(meta["privacy"].clone()).unwrap_or_default(),
+        session_id: meta["session_id"]
+            .as_str()
+            .filter(|id| is_valid_session_id(id))
+            .map(String::from),
     };
     validate_session_header_accounting(&header)?;
     Ok(header)

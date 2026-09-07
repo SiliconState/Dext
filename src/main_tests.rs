@@ -7973,6 +7973,29 @@ fn latest_state_defaults_are_project_scoped_with_session_overlays() -> Result<()
 }
 
 #[test]
+fn session_header_round_trips_session_id() -> Result<()> {
+    let mut header = SessionHeader::default();
+    header.session_id = Some("1700000000-4242-abcdef012345".to_string());
+    let line = serde_json::to_string(&header)?;
+    let parsed = parse_session_header(&line)?;
+    assert_eq!(
+        parsed.session_id.as_deref(),
+        Some("1700000000-4242-abcdef012345")
+    );
+    // Legacy headers (no field) and hostile ids both restore as None.
+    let mut legacy: serde_json::Value = serde_json::from_str(&line)?;
+    legacy.as_object_mut().unwrap().remove("session_id");
+    assert_eq!(parse_session_header(&legacy.to_string())?.session_id, None);
+    legacy["session_id"] = serde_json::Value::String("../escape".to_string());
+    assert_eq!(parse_session_header(&legacy.to_string())?.session_id, None);
+    assert!(is_valid_session_id("1700000000-4242-abcdef012345"));
+    assert!(!is_valid_session_id(""));
+    assert!(!is_valid_session_id("a/b"));
+    assert!(!is_valid_session_id("a.b"));
+    Ok(())
+}
+
+#[test]
 fn session_state_dirs_are_session_scoped_and_concurrent() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("session-scoped-state");
