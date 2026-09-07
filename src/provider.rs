@@ -5390,6 +5390,100 @@ pub(crate) fn list_models_for_available_providers(
 
 const AUTH_LOGIN_ARGUMENTS: &str = "[credential|web|import]";
 
+const STDIN_CREDENTIAL_MAX_BYTES: usize = 64 * 1024;
+
+/// First line of a piped stdin, trimmed; `None` when stdin is empty. Bounded so
+/// a runaway pipe cannot grow memory; a JSON blob (service-account style) is
+/// accepted on one line only.
+pub(crate) fn read_credential_from_stdin(input: &mut impl io::BufRead) -> Result<Option<String>> {
+    use io::BufRead as _;
+    let mut line = String::new();
+    let mut limited = input.take(STDIN_CREDENTIAL_MAX_BYTES as u64 + 1);
+    limited.read_line(&mut line)?;
+    if line.len() > STDIN_CREDENTIAL_MAX_BYTES {
+        anyhow::bail!("credential on stdin exceeds the {STDIN_CREDENTIAL_MAX_BYTES} byte limit");
+    }
+    let trimmed = line.trim();
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+}
+
+fn provider_json(profile: &ProviderProfile, store: &AuthStore, active: &str) -> Value {
+    let contract = request_contract_for_profile(profile);
+    json!({
+        "id": profile.id,
+        "label": if profile.display_name.trim().is_empty() { profile.id.clone() } else { profile.display_name.clone() },
+        "active": canonical_provider_id(&profile.id) == canonical_provider_id(active),
+        "default_model": profile.default_model,
+        "auth": provider_auth_status(profile, store),
+        "available": provider_has_available_credentials(profile, store),
+        "contract": contract.as_str(),
+        "api": contract.api_provider().as_str(),
+        "base_url": profile.base_url,
+        "requires_api_key": profile.requires_api_key,
+    })
+}
+
+/// `dext auth status --json`: stable document for hosts; prose output stays
+/// free to change without breaking them.
+pub(crate) fn auth_status_json(catalog: &ProviderCatalog, store: &AuthStore, active: &str) -> String {
+    let doc = json!({
+        "version": 1,
+        "active_provider": active,
+        "providers": catalog.providers.iter().map(|p| provider_json(p, store, active)).collect::<Vec<_>>(),
+        "provider_catalog": provider_catalog_path().display().to_string(),
+        "auth_store": auth_store_path().display().to_string(),
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// `dext auth models [provider] --json`: curated models per provider. Without a
+/// selector, mirrors the prose command: providers with credentials, falling
+/// back to the active provider when none are authenticated.
+pub(crate) fn auth_models_json(
+    catalog: &ProviderCatalog,
+    store: &AuthStore,
+    active: &str,
+    selected: Option<&str>,
+) -> String {
+    let mut providers: Vec<&ProviderProfile> = match selected {
+        Some(id) => catalog
+            .providers
+            .iter()
+            .filter(|p| canonical_provider_id(&p.id) == canonical_provider_id(id))
+            .collect(),
+        None => catalog
+            .providers
+            .iter()
+            .filter(|p| provider_has_available_credentials(p, store))
+            .collect(),
+    };
+    if providers.is_empty() && selected.is_none() {
+        providers = catalog
+            .providers
+            .iter()
+            .filter(|p| canonical_provider_id(&p.id) == canonical_provider_id(active))
+            .collect();
+    }
+    let doc = json!({
+        "version": 1,
+        "active_provider": active,
+        "providers": providers.iter().map(|p| {
+            let mut aliases = p.model_aliases.iter().collect::<Vec<_>>();
+            aliases.sort_by_key(|(alias, _)| *alias);
+            json!({
+                "id": p.id,
+                "active": canonical_provider_id(&p.id) == canonical_provider_id(active),
+                "default_model": p.default_model,
+                "models": curated_provider_models(p),
+                "aliases": aliases.into_iter().map(|(a, t)| json!({"alias": a, "model": t})).collect::<Vec<_>>(),
+                "auth": provider_auth_status(p, store),
+                "available": provider_has_available_credentials(p, store),
+            })
+        }).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+}
+
 fn auth_retry_guidance(provider_id: &str) -> String {
     format!(
         "login for provider '{provider_id}' remains incomplete. retry `dext auth login {provider_id}`; to paste a credential or manual OAuth callback without putting it in shell arguments, open Dext and use `/login {provider_id}`. shell history and process listings may retain command-line secrets"
@@ -5417,13 +5511,21 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             println!(
                 "      omit the credential to paste at Dext's prompt; shell arguments may be retained"
             );
+            println!(
+                "      with stdin piped (not a TTY), the credential is read from stdin (first line) and never touches argv"
+            );
             println!("  dext auth logout [provider|index] remove stored credential");
+            println!("  --json on status/providers/models prints a machine-readable document");
             Ok(Some(0))
         }
         "status" | "providers" | "list" => {
             let catalog = load_provider_catalog()?;
             let store = load_auth_store()?;
             let active = resolve_active_provider_id(&catalog);
+            if args.iter().any(|a| *a == "--json") {
+                println!("{}", auth_status_json(&catalog, &store, &active));
+                return Ok(Some(0));
+            }
             println!(
                 "active provider: {}\n{}\n\nprovider catalog: {}\nauth store: {}",
                 active,
@@ -5449,6 +5551,19 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             let catalog = load_provider_catalog()?;
             let store = load_auth_store()?;
             let active = resolve_active_provider_id(&catalog);
+            let json = args.iter().any(|a| *a == "--json");
+            let args: Vec<&str> = args.iter().copied().filter(|a| *a != "--json").collect();
+            if json {
+                let selected = match args.first().copied() {
+                    None | Some("all") => None,
+                    Some(sel) => Some(provider_id_from_selector(&catalog, sel)?),
+                };
+                println!(
+                    "{}",
+                    auth_models_json(&catalog, &store, &active, selected.as_deref())
+                );
+                return Ok(Some(0));
+            }
             let list = match args.first().copied() {
                 None | Some("all") => {
                     list_models_for_available_providers(&catalog, &store, &active)
@@ -5487,12 +5602,17 @@ pub(crate) fn handle_auth_cli(argv: &[String]) -> Result<Option<i32>> {
             }
 
             let provider = args.first().copied();
-            let key_buf = if args.len() > 1 {
+            let mut key_buf = if args.len() > 1 {
                 Some(args[1..].join(" "))
             } else {
                 None
             };
             let allow_prompt = io::stdin().is_terminal();
+            // Non-TTY callers (hosts, scripts) pipe the credential instead of
+            // placing it on argv, where it is visible in /proc/<pid>/cmdline.
+            if key_buf.is_none() && !allow_prompt {
+                key_buf = read_credential_from_stdin(&mut io::stdin().lock())?;
+            }
             let login = login_provider(provider, key_buf.as_deref(), allow_prompt)?;
             println!("{}", login.message);
             if login.awaiting_credentials {
@@ -5528,6 +5648,73 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("create temp home");
         path
+    }
+
+    #[test]
+    fn stdin_credential_takes_first_line_trimmed() {
+        let mut input = io::Cursor::new("  sk-test-123  \nsecond line\n");
+        assert_eq!(
+            read_credential_from_stdin(&mut input).expect("read"),
+            Some("sk-test-123".to_string())
+        );
+        let mut empty = io::Cursor::new("\n");
+        assert_eq!(read_credential_from_stdin(&mut empty).expect("read"), None);
+        let mut eof = io::Cursor::new("");
+        assert_eq!(read_credential_from_stdin(&mut eof).expect("read"), None);
+        let oversized = "x".repeat(STDIN_CREDENTIAL_MAX_BYTES + 1);
+        let mut big = io::Cursor::new(oversized);
+        assert!(read_credential_from_stdin(&mut big).is_err());
+    }
+
+    #[test]
+    fn auth_json_documents_are_stable() {
+        let catalog = ProviderCatalog {
+            version: PROVIDER_CATALOG_VERSION,
+            active_provider: "anthropic".to_string(),
+            providers: vec![ProviderProfile {
+                id: "anthropic".to_string(),
+                builtin: None,
+                display_name: "Anthropic".to_string(),
+                api_provider: ApiProvider::Anthropic,
+                request_contract: None,
+                base_url: "https://api.anthropic.com".to_string(),
+                default_model: "claude-a".to_string(),
+                models: vec!["claude-b".to_string()],
+                model_aliases: HashMap::from([("b".to_string(), "claude-b".to_string())]),
+                model_defaults: ModelSpec::default(),
+                model_specs: HashMap::new(),
+                env_vars: Vec::new(),
+                requires_api_key: true,
+                login_url: None,
+                oauth_flow: None,
+                notes: None,
+                context_window: None,
+                model_context_windows: HashMap::new(),
+                model_effort_levels: HashMap::new(),
+            }],
+        };
+        let store = AuthStore::default();
+        let status: Value =
+            serde_json::from_str(&auth_status_json(&catalog, &store, "anthropic")).expect("json");
+        assert_eq!(status["version"], 1);
+        assert_eq!(status["active_provider"], "anthropic");
+        assert_eq!(status["providers"][0]["id"], "anthropic");
+        assert_eq!(status["providers"][0]["label"], "Anthropic");
+        assert_eq!(status["providers"][0]["active"], true);
+        assert_eq!(status["providers"][0]["default_model"], "claude-a");
+        assert!(status["providers"][0]["auth"].is_string());
+        // Unauthenticated: models falls back to the active provider.
+        let models: Value =
+            serde_json::from_str(&auth_models_json(&catalog, &store, "anthropic", None))
+                .expect("json");
+        assert_eq!(models["providers"][0]["id"], "anthropic");
+        assert_eq!(models["providers"][0]["models"][0], "claude-a");
+        assert_eq!(models["providers"][0]["models"][1], "claude-b");
+        assert_eq!(models["providers"][0]["aliases"][0]["alias"], "b");
+        let none: Value =
+            serde_json::from_str(&auth_models_json(&catalog, &store, "anthropic", Some("nope")))
+                .expect("json");
+        assert_eq!(none["providers"].as_array().map(Vec::len), Some(0));
     }
 
     #[test]
