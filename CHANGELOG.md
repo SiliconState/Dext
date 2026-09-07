@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `dext --input ndjson --output stream-json`: a long-lived host protocol over stdin/stdout (`user`/`steer`/`control`/`interrupt`/`permission`/`close` frames, `ready` first, one `input_ack` per frame, per-action `permission_request`/`permission_resolved`, stdout pure JSON). Bounded: 256 KiB per frame, 32 queued prompts, 8 in-flight permission replies; EOF or `close` ends the process. Spec in `docs/HOST_PROTOCOL.md`.
+- `--resume` restores the saved `session_id`, so session-scoped state (todos, git-auth, logs) survives process restarts for one-shot hosts.
+- `dext auth login <provider>` reads the credential from stdin when it is not a TTY (keeps secrets off argv); `dext auth status|providers|models --json`.
+- `stream-json` now emits `thinking_preview_discarded` / `thinking_preview_committed`, so consumers can roll back streamed reasoning on a provider retry like the TUI does.
+
 ### Changed
 
 - Privacy redaction no longer replaces code-shaped right-hand sides of unquoted secret-named assignments (calls, indexing, blocks, `::` paths, member-access chains, and bare identifiers in `let`/`const`/`var` declarations), so source containing `token`/`password`/`api_key` identifiers stays legible during code review. Quoted values, env-style `KEY=value` lines, and dotted tokens with a long segment (JWT, OAuth) still redact.
