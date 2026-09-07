@@ -60,13 +60,13 @@ use session::session_sudo_dir;
 use session::{
     SessionLockOperationGuard, SessionStateLock, append_log_event, atomic_write_bytes,
     atomic_write_secret, canonicalize_read_tool_path, dext_state_dir, expand_user_path,
-    latest_session_path, list_session_records_for_root, named_session_path_for_root,
-    named_sessions_dir_for_root, new_session_id, parse_session_header, project_key,
-    project_latest_session_path, project_scope_root, project_state_dir, read_session_header_line,
-    release_registered_locks, remove_stale_session_state_lock_under_guard, render_limited_csv,
-    restore_terminal_if_tui, session_artifacts_dir, session_latest_log_path,
-    session_latest_session_path, session_state_lock_is_live, session_state_lock_path,
-    session_todo_path, unix_timestamp_secs,
+    is_valid_session_id, latest_session_path, list_session_records_for_root,
+    named_session_path_for_root, named_sessions_dir_for_root, new_session_id, parse_session_header,
+    project_key, project_latest_session_path, project_scope_root, project_state_dir,
+    read_session_header_line, release_registered_locks,
+    remove_stale_session_state_lock_under_guard, render_limited_csv, restore_terminal_if_tui,
+    session_artifacts_dir, session_latest_log_path, session_latest_session_path,
+    session_state_lock_is_live, session_state_lock_path, session_todo_path, unix_timestamp_secs,
 };
 use tool_round::{ToolRoundContext, ToolRoundOutcome};
 use tools::{
@@ -11228,6 +11228,10 @@ struct SessionHeader {
     provider_health: ProviderHealthLedger,
     #[serde(default)]
     privacy: PrivacyPolicy,
+    /// Session-scoped state id (todos, git-auth, logs live under it). Restored
+    /// on `--resume` so state survives process restarts; `--fork` mints anew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
 }
 
 impl Default for SessionHeader {
@@ -11261,6 +11265,7 @@ impl Default for SessionHeader {
             active_pack_runtimes: Vec::new(),
             provider_health: ProviderHealthLedger::default(),
             privacy: PrivacyPolicy::default(),
+            session_id: None,
         }
     }
 }
@@ -14309,6 +14314,19 @@ impl Agent {
         }
     }
 
+    /// Switch this process to a saved session id: take that session's state
+    /// lock (fails if another live process owns it), then repoint the latest
+    /// session/log paths. The previous id's lock is released on drop.
+    fn adopt_session_id(&mut self, session_id: String) -> Result<()> {
+        let lock = SessionStateLock::acquire(&self.sandbox_root, &session_id)
+            .with_context(|| format!("resuming session state '{session_id}'"))?;
+        self.session_id = session_id;
+        self.state_lock = Some(Arc::new(lock));
+        self.refresh_state_paths();
+        record_crash_session_id(&self.latest_session_path);
+        Ok(())
+    }
+
     fn set_sandbox_root(&mut self, root: PathBuf) -> Result<()> {
         let root = std::fs::canonicalize(&root)
             .with_context(|| format!("canonicalizing sandbox root {}", root.display()))?;
@@ -16238,6 +16256,7 @@ impl Agent {
                 .unwrap_or_default(),
             provider_health: self.provider_health.clone(),
             privacy: self.privacy.clone(),
+            session_id: Some(self.session_id.clone()),
         }
     }
 
@@ -16419,6 +16438,7 @@ impl Agent {
             mut provider_health,
             privacy,
             provenance,
+            session_id: saved_session_id,
             ..
         } = parse_session_header(header.trim_end())?;
         if active_pack_runtimes.len() > 1 {
@@ -16540,6 +16560,16 @@ impl Agent {
 
         if let Some(restored) = restored_sandbox {
             self.set_sandbox_root(restored)?;
+        }
+        // Continue the saved session's state dir (todos, git-auth, logs) rather
+        // than starting a fresh one per process. Forks disable session state
+        // and keep their fresh id.
+        if self.session_enabled
+            && let Some(saved) = saved_session_id
+            && saved != self.session_id
+            && is_valid_session_id(&saved)
+        {
+            self.adopt_session_id(saved)?;
         }
 
         self.model = model;

@@ -5425,7 +5425,11 @@ fn provider_json(profile: &ProviderProfile, store: &AuthStore, active: &str) -> 
 
 /// `dext auth status --json`: stable document for hosts; prose output stays
 /// free to change without breaking them.
-pub(crate) fn auth_status_json(catalog: &ProviderCatalog, store: &AuthStore, active: &str) -> String {
+pub(crate) fn auth_status_json(
+    catalog: &ProviderCatalog,
+    store: &AuthStore,
+    active: &str,
+) -> String {
     let doc = json!({
         "version": 1,
         "active_provider": active,
@@ -5711,9 +5715,13 @@ mod tests {
         assert_eq!(models["providers"][0]["models"][0], "claude-a");
         assert_eq!(models["providers"][0]["models"][1], "claude-b");
         assert_eq!(models["providers"][0]["aliases"][0]["alias"], "b");
-        let none: Value =
-            serde_json::from_str(&auth_models_json(&catalog, &store, "anthropic", Some("nope")))
-                .expect("json");
+        let none: Value = serde_json::from_str(&auth_models_json(
+            &catalog,
+            &store,
+            "anthropic",
+            Some("nope"),
+        ))
+        .expect("json");
         assert_eq!(none["providers"].as_array().map(Vec::len), Some(0));
     }
 
