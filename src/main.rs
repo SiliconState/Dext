@@ -1563,6 +1563,27 @@ impl OutputMode {
     }
 }
 
+/// How stdin is interpreted in the interactive loop. `Ndjson` is the host
+/// protocol: one JSON object per line (`{"type":"user"|"steer"|"control"|
+/// "interrupt"|"permission"|"close", ...}`), no banner or prompt on stdout,
+/// and per-action permission requests answered over the same pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum InputMode {
+    #[default]
+    Text,
+    Ndjson,
+}
+
+impl InputMode {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "text" => Some(Self::Text),
+            "ndjson" | "jsonl" | "stream-json" => Some(Self::Ndjson),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlashPresentation {
     Faded,
@@ -1655,6 +1676,180 @@ struct ConsoleSink {
     printed_any_text_this_block: bool,
     printed_prefix: bool,
     text_accum: String,
+}
+
+/// Where a `--input ndjson` line went. Echoed back to the host as
+/// `input_ack` so it can tell a live steer from a queued prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NdjsonRoute {
+    Submitted,
+    SteeringQueued,
+    RuntimeControlQueued,
+    UnsupportedBusySlash,
+    PermissionForwarded,
+    Interrupted,
+    Close,
+    Withheld(&'static str),
+    Invalid(String),
+}
+
+impl NdjsonRoute {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::SteeringQueued => "steering_queued",
+            Self::RuntimeControlQueued => "runtime_control_queued",
+            Self::UnsupportedBusySlash => "unsupported_busy_slash",
+            Self::PermissionForwarded => "permission_forwarded",
+            Self::Interrupted => "interrupted",
+            Self::Close => "close",
+            Self::Withheld(_) => "withheld",
+            Self::Invalid(_) => "invalid",
+        }
+    }
+}
+
+/// `{"type":"user","text":…,"confirm_secret":bool}`   prompt (steer when busy)
+/// `{"type":"steer","text":…}`                        steer when busy, else prompt
+/// `{"type":"control","command":"/effort high"}`      runtime control when busy, else slash
+/// `{"type":"interrupt"}`                             stop the running turn
+/// `{"type":"permission","id":…,"choice":"once|always|deny"}`
+/// `{"type":"close"}`                                 end the loop
+fn route_ndjson_input_line(
+    line: &str,
+    agent_busy: &AtomicBool,
+    input_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    runtime_control_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    steering_tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    permission_tx: &std::sync::mpsc::Sender<PermissionReply>,
+    interrupt: &AtomicBool,
+) -> NdjsonRoute {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return NdjsonRoute::Invalid("empty line".to_string());
+    }
+    let frame: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(e) => return NdjsonRoute::Invalid(format!("not JSON: {e}")),
+    };
+    let kind = frame["type"].as_str().unwrap_or("");
+    let busy = agent_busy.load(Ordering::SeqCst);
+    let text_field = |key: &str| -> Option<String> {
+        frame[key]
+            .as_str()
+            .map(|t| normalize_user_input_path(t.trim()))
+            .filter(|t| !t.is_empty())
+    };
+    match kind {
+        "user" | "steer" => {
+            let Some(text) = text_field("text") else {
+                return NdjsonRoute::Invalid(format!("{kind}: missing text"));
+            };
+            if text_is_potential_local_secret(&text) && frame["confirm_secret"] != Value::Bool(true)
+            {
+                return NdjsonRoute::Withheld(
+                    "looks like a credential; resend with confirm_secret=true or use the local auth prompt",
+                );
+            }
+            if busy {
+                if is_active_runtime_control_command(&text) {
+                    for command in parse_active_runtime_control_sequence(&text)
+                        .unwrap_or_else(|| vec![text.clone()])
+                    {
+                        let _ = runtime_control_tx.send(command);
+                    }
+                    return NdjsonRoute::RuntimeControlQueued;
+                }
+                if is_slash_command(&text) {
+                    return NdjsonRoute::UnsupportedBusySlash;
+                }
+                return if steering_tx.send(text).is_ok() {
+                    NdjsonRoute::SteeringQueued
+                } else {
+                    NdjsonRoute::Invalid("steering channel closed".to_string())
+                };
+            }
+            if input_tx.send(text).is_ok() {
+                NdjsonRoute::Submitted
+            } else {
+                NdjsonRoute::Invalid("input channel closed".to_string())
+            }
+        }
+        "control" => {
+            let Some(command) = text_field("command") else {
+                return NdjsonRoute::Invalid("control: missing command".to_string());
+            };
+            if busy {
+                if !is_active_runtime_control_command(&command) {
+                    return NdjsonRoute::UnsupportedBusySlash;
+                }
+                for part in parse_active_runtime_control_sequence(&command)
+                    .unwrap_or_else(|| vec![command.clone()])
+                {
+                    let _ = runtime_control_tx.send(part);
+                }
+                NdjsonRoute::RuntimeControlQueued
+            } else if input_tx.send(command).is_ok() {
+                NdjsonRoute::Submitted
+            } else {
+                NdjsonRoute::Invalid("input channel closed".to_string())
+            }
+        }
+        "interrupt" => {
+            interrupt.store(true, Ordering::SeqCst);
+            NdjsonRoute::Interrupted
+        }
+        "permission" => {
+            let id = frame["id"].as_str().unwrap_or("").trim().to_string();
+            let Some(choice) = frame["choice"]
+                .as_str()
+                .and_then(PermissionReply::parse_choice)
+            else {
+                return NdjsonRoute::Invalid(
+                    "permission: choice must be once|always|deny".to_string(),
+                );
+            };
+            if id.is_empty() {
+                return NdjsonRoute::Invalid("permission: missing id".to_string());
+            }
+            let _ = permission_tx.send(PermissionReply { id, choice });
+            NdjsonRoute::PermissionForwarded
+        }
+        "close" => NdjsonRoute::Close,
+        other => NdjsonRoute::Invalid(format!("unknown type '{other}'")),
+    }
+}
+
+/// One `input_ack` line per stdin frame. `seq` echoes the host's optional
+/// correlation field; `detail` carries the withhold/invalid reason.
+fn emit_ndjson_input_ack(line: &str, route: &NdjsonRoute) {
+    let seq = serde_json::from_str::<Value>(line.trim())
+        .ok()
+        .and_then(|v| v.get("seq").cloned())
+        .unwrap_or(Value::Null);
+    let detail = match route {
+        NdjsonRoute::Withheld(reason) => Value::String((*reason).to_string()),
+        NdjsonRoute::Invalid(reason) => Value::String(reason.clone()),
+        _ => Value::Null,
+    };
+    let kind = serde_json::from_str::<Value>(line.trim())
+        .ok()
+        .and_then(|v| v["type"].as_str().map(String::from))
+        .unwrap_or_default();
+    JsonSink::emit_json_line(&json!({
+        "event": "input_ack",
+        "data": { "type": kind, "route": route.as_str(), "seq": seq, "detail": detail }
+    }));
+}
+
+/// Loop chatter (`[queued …]`, compact status, login prompts) goes to the
+/// sink as `info` under ndjson so stdout stays pure event lines.
+fn loop_note(agent: &mut Agent, quiet: bool, message: String) {
+    if quiet {
+        agent.sink.emit(AgentEvent::Info(message));
+    } else {
+        println!("{message}");
+    }
 }
 
 impl ConsoleSink {
@@ -1827,10 +2022,85 @@ struct OutputStreamState {
     text: String,
 }
 
+/// A host's answer to a `permission_request` event, read off the ndjson
+/// stdin thread. Replies for other ids are stale and ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionReply {
+    id: String,
+    choice: Choice,
+}
+
+impl PermissionReply {
+    fn parse_choice(raw: &str) -> Option<Choice> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "once" | "allow" | "allow_once" | "yes" => Some(Choice::Once),
+            "always" | "allow_always" | "session" => Some(Choice::Always),
+            "deny" | "no" | "reject" => Some(Choice::Deny),
+            _ => None,
+        }
+    }
+}
+
+/// Per-action approvals over the stdin/stdout pipe. `request_permission` is a
+/// blocking sink call (the console sink blocks on a TTY the same way), so the
+/// bridge polls its channel with a short timeout and also gives up on
+/// interrupt or when the host closes stdin.
+struct PermissionBridge {
+    // Mutex only for `Sync`: the sink is single-consumer, never contended.
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<PermissionReply>>,
+    interrupt: Arc<AtomicBool>,
+    next_id: u64,
+    timeout: std::time::Duration,
+}
+
+/// Hosts get this long to answer before the action is denied. Long because a
+/// human is on the other end; the loop still exits early on interrupt/EOF.
+const PERMISSION_BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+impl PermissionBridge {
+    fn new(rx: std::sync::mpsc::Receiver<PermissionReply>, interrupt: Arc<AtomicBool>) -> Self {
+        Self {
+            rx: std::sync::Mutex::new(rx),
+            interrupt,
+            next_id: 1,
+            timeout: PERMISSION_BRIDGE_TIMEOUT,
+        }
+    }
+
+    fn allocate_id(&mut self) -> String {
+        let id = format!("perm-{}-{}", std::process::id(), self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    fn wait(&self, id: &str) -> Choice {
+        let deadline = std::time::Instant::now() + self.timeout;
+        let Ok(rx) = self.rx.lock() else {
+            return Choice::Deny;
+        };
+        loop {
+            if self.interrupt.load(Ordering::SeqCst) {
+                return Choice::Deny;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(reply) if reply.id == id => return reply.choice,
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Choice::Deny;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Choice::Deny,
+            }
+        }
+    }
+}
+
 struct JsonSink {
     mode: OutputMode,
     inner: ConsoleSink,
     stream: OutputStreamState,
+    permissions: Option<PermissionBridge>,
 }
 
 impl JsonSink {
@@ -1839,7 +2109,13 @@ impl JsonSink {
             mode,
             inner: ConsoleSink::new(pretty, silent),
             stream: OutputStreamState::default(),
+            permissions: None,
         }
+    }
+
+    fn with_permission_bridge(mut self, bridge: PermissionBridge) -> Self {
+        self.permissions = Some(bridge);
+        self
     }
 
     fn records_crash_events_directly(&self) -> bool {
@@ -1910,8 +2186,38 @@ impl EventSink for JsonSink {
         }
     }
 
-    fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
-        Choice::Deny
+    fn request_permission(&mut self, name: &str, input: &Value) -> Choice {
+        let Some(bridge) = self.permissions.as_mut() else {
+            return Choice::Deny;
+        };
+        if self.mode != OutputMode::StreamJson {
+            return Choice::Deny;
+        }
+        let id = bridge.allocate_id();
+        Self::emit_json_line(&json!({
+            "event": "permission_request",
+            "data": {
+                "id": id,
+                "tool": name,
+                "input": input,
+                "summary": summarize_inline(&input.to_string(), 200),
+                "choices": ["once", "always", "deny"],
+            }
+        }));
+        let choice = bridge.wait(&id);
+        Self::emit_json_line(&json!({
+            "event": "permission_resolved",
+            "data": {
+                "id": id,
+                "tool": name,
+                "choice": match choice {
+                    Choice::Once => "once",
+                    Choice::Always => "always",
+                    Choice::Deny => "deny",
+                },
+            }
+        }));
+        choice
     }
 
     fn local_auth_prompt(&mut self, tool: &str, message: &str) {
@@ -9395,7 +9701,7 @@ async fn execute_builtin_call(
     .await
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Choice {
     Once,
     Always,
@@ -23052,6 +23358,7 @@ pub(crate) struct CliOptions {
     pub(crate) eval_filter: Option<String>,
     pub(crate) approval_policy_override: Option<ApprovalProfile>,
     pub(crate) output: OutputMode,
+    pub(crate) input: InputMode,
     pub(crate) cd: Option<PathBuf>,
     pub(crate) fork: bool,
     pub(crate) budget_cap: Option<BudgetCap>,
@@ -23069,6 +23376,7 @@ pub(crate) struct CliOptions {
 pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
     let mut positional = Vec::new();
     let mut print = false;
+    let mut input = InputMode::Text;
     let mut resume_latest = false;
     let mut resume_selector: Option<String> = None;
     let mut no_session = false;
@@ -23250,6 +23558,15 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
                     anyhow::anyhow!("invalid --output '{value}' (expected json or stream-json)")
                 })?;
             }
+            "--input" => {
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--input requires text or ndjson"))?;
+                input = InputMode::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("invalid --input '{value}' (expected text or ndjson)")
+                })?;
+            }
             "--cd" => {
                 i += 1;
                 let value = argv
@@ -23418,6 +23735,7 @@ pub(crate) fn parse_cli_options(argv: Vec<String>) -> Result<CliOptions> {
         eval_filter,
         approval_policy_override,
         output,
+        input,
         cd,
         fork,
         budget_cap,
@@ -23865,6 +24183,9 @@ async fn main() -> Result<()> {
         println!("       dext --cd DIR         use DIR as sandbox/cwd");
         println!("       dext --output json|stream-json  emit machine-readable output");
         println!(
+            "       dext --input ndjson   host protocol: stdin frames (user|steer|control|interrupt|permission|close), per-action permission_request events; needs --output stream-json"
+        );
+        println!(
             "       dext --budget CAP     stop before more model calls once CAP is reached ($ or tokens)"
         );
         println!("       dext --approval ask|auto-read|auto-write|never|always");
@@ -23918,6 +24239,18 @@ async fn main() -> Result<()> {
     }
 
     let one_shot_task = read_one_shot_task(&opts, &mut io::stdin())?;
+    if opts.input == InputMode::Ndjson {
+        if opts.print || one_shot_task.is_some() {
+            anyhow::bail!(
+                "--input ndjson drives the interactive loop over stdin; drop -p and positional prompts"
+            );
+        }
+        if opts.output != OutputMode::StreamJson {
+            anyhow::bail!("--input ndjson requires --output stream-json");
+        }
+    }
+    // Handed to the ndjson stdin reader once the loop starts (ndjson only).
+    let mut permission_tx: Option<std::sync::mpsc::Sender<PermissionReply>> = None;
 
     let will_use_tui = opts.pack.is_none()
         && !opts.print
@@ -23970,7 +24303,13 @@ async fn main() -> Result<()> {
     }
     if opts.output.is_json() {
         agent.pretty = false;
-        agent.set_sink(Box::new(JsonSink::new(opts.output, false, false)));
+        let mut sink = JsonSink::new(opts.output, false, false);
+        if opts.input == InputMode::Ndjson {
+            let (tx, rx) = std::sync::mpsc::channel::<PermissionReply>();
+            sink = sink.with_permission_bridge(PermissionBridge::new(rx, agent.interrupt.clone()));
+            permission_tx = Some(tx);
+        }
+        agent.set_sink(Box::new(sink));
     }
     if opts.resume_latest || opts.fork {
         let loaded = if let Some(selector) = opts.resume_selector.as_deref() {
@@ -24159,7 +24498,41 @@ async fn main() -> Result<()> {
         );
     }
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    {
+    let quiet = opts.input == InputMode::Ndjson;
+    if quiet {
+        let input_tx = input_tx.clone();
+        let runtime_control_tx = runtime_control_tx.clone();
+        let steering_tx = steer_tx.clone();
+        let busy = agent_busy_flag.clone();
+        let interrupt = agent.interrupt.clone();
+        let permission_tx = permission_tx
+            .take()
+            .expect("ndjson input always installs a permission bridge");
+        std::thread::spawn(move || {
+            let stdin = io::stdin();
+            loop {
+                let mut line = String::new();
+                match stdin.lock().read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let route = route_ndjson_input_line(
+                            &line,
+                            &busy,
+                            &input_tx,
+                            &runtime_control_tx,
+                            &steering_tx,
+                            &permission_tx,
+                            &interrupt,
+                        );
+                        emit_ndjson_input_ack(&line, &route);
+                        if route == NdjsonRoute::Close {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    } else {
         let input_tx = input_tx.clone();
         let runtime_control_tx = runtime_control_tx.clone();
         let steering_tx = steer_tx.clone();
@@ -24209,13 +24582,33 @@ async fn main() -> Result<()> {
 
     let mut stdout = io::stdout();
 
-    println!("dext — chat loop with tools. /help for commands, empty line or Ctrl+D to exit.");
-    println!("sandbox: {}", agent.sandbox_root.display());
-    println!("{}", agent.provider_status_line());
+    if quiet {
+        // Hosts wait for this before sending the first frame.
+        JsonSink::emit_json_line(&json!({
+            "event": "ready",
+            "data": {
+                "input": "ndjson",
+                "pid": std::process::id(),
+                "session_id": agent.session_id,
+                "provider": agent.provider_id,
+                "model": agent.model,
+                "sandbox": agent.sandbox_root.display().to_string(),
+                "thinking_effort": agent.thinking_effort,
+                "approval": agent.approval_profile,
+                "frames": ["user", "steer", "control", "interrupt", "permission", "close"],
+            }
+        }));
+    } else {
+        println!("dext — chat loop with tools. /help for commands, empty line or Ctrl+D to exit.");
+        println!("sandbox: {}", agent.sandbox_root.display());
+        println!("{}", agent.provider_status_line());
+    }
 
     loop {
-        print!("you> ");
-        stdout.flush()?;
+        if !quiet {
+            print!("you> ");
+            stdout.flush()?;
+        }
 
         let input = match input_rx.recv().await {
             Some(line) => line,
@@ -24251,7 +24644,7 @@ async fn main() -> Result<()> {
                 continue;
             }
             let _ = agent.steering_sender().send(input.clone());
-            println!("[queued for next response]");
+            loop_note(&mut agent, quiet, "[queued for next response]".to_string());
             autosave_latest(&mut agent);
             continue;
         }
@@ -24274,31 +24667,44 @@ async fn main() -> Result<()> {
                     );
                     match agent.compact_threshold_override_percent() {
                         Some(percent) => {
-                            println!(
-                                "compact threshold: {current} chars ({percent}% of model context window; active-run trigger {active}; auto baseline {base})"
+                            loop_note(
+                                &mut agent,
+                                quiet,
+                                format!(
+                                    "compact threshold: {current} chars ({percent}% of model context window; active-run trigger {active}; auto baseline {base})"
+                                ),
                             );
                         }
                         None => {
-                            println!(
-                                "compact threshold: {current} chars (auto: {} mode; active-run trigger {active})",
-                                agent.context_mode.as_str()
+                            let mode = agent.context_mode.as_str();
+                            loop_note(
+                                &mut agent,
+                                quiet,
+                                format!(
+                                    "compact threshold: {current} chars (auto: {mode} mode; active-run trigger {active})"
+                                ),
                             );
                         }
                     }
                 }
                 Ok(CompactSlash::Auto) => {
                     agent.set_compact_threshold_auto();
-                    println!(
+                    let msg = format!(
                         "compact threshold reset to auto {} ({})",
                         agent.context_mode.as_str(),
                         agent.compact_threshold_chars()
                     );
+                    loop_note(&mut agent, quiet, msg);
                 }
                 Ok(CompactSlash::SetPercent(percent)) => {
                     let chars = agent.set_compact_threshold_percent(percent);
-                    println!("compact threshold set to {percent}% -> {chars} chars");
+                    loop_note(
+                        &mut agent,
+                        quiet,
+                        format!("compact threshold set to {percent}% -> {chars} chars"),
+                    );
                 }
-                Err(msg) => println!("{msg}"),
+                Err(msg) => loop_note(&mut agent, quiet, msg.to_string()),
             }
             autosave_latest(&mut agent);
             continue;
@@ -24334,7 +24740,7 @@ async fn main() -> Result<()> {
 
         match agent.try_consume_pending_login_input(&input) {
             Ok(Some(msg)) => {
-                println!("{msg}");
+                loop_note(&mut agent, quiet, msg);
                 autosave_latest(&mut agent);
                 continue;
             }
@@ -24352,7 +24758,7 @@ async fn main() -> Result<()> {
 
         if let Err(e) = chat_result {
             eprintln!("[error] {e:#}\n");
-        } else {
+        } else if !quiet {
             println!();
         }
         autosave_latest(&mut agent);
