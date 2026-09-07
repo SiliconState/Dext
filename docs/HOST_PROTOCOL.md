@@ -2,7 +2,8 @@
 
 Version 1. For hosts (DextUI's agentlinkd, editors, scripts) that keep one
 long-lived dext process per seat instead of one `-p` process per prompt.
-Requires `--output stream-json`; `-p` and positional prompts are rejected.
+Requires `--output stream-json`; `-p`, `--pack`, and positional prompts are
+rejected before reading stdin. Invoke packs with a `/pack run …` control frame.
 
 ## stdout / stderr contract
 
@@ -10,7 +11,11 @@ Requires `--output stream-json`; `-p` and positional prompts are rejected.
   chatter is `{"event":"info","data":…}`, refusals `warn`, failures `error`.
   No banner, prompt, or blank line — including under `--fork`.
 - stderr is free text and may be discarded.
-- The first stdout line is always `ready`; send nothing before it.
+- Wait for `ready` before sending input. Resume diagnostics and startup approval
+  events can precede it; startup failure can exit without `ready`. Startup
+  permission requests resolve to deny immediately because replies cannot yet
+  be consumed; retry the protected action after `ready`. The stdin
+  reader starts only after `ready` has been written.
 - Unknown events and unknown fields must be ignored by hosts; new ones may be
   added in a minor version.
 
@@ -24,8 +29,9 @@ Requires `--output stream-json`; `-p` and positional prompts are rejected.
 | `permission_resolved` | `id, tool, choice` |
 | `thinking_preview_discarded` / `thinking_preview_committed` | none — a provider retry discards the thinking deltas streamed so far; commit seals them |
 
-`route` values: `submitted` (prompt taken), `steering_queued` (folded into the
-running turn), `runtime_control_queued` (`/effort`… applied mid-turn),
+`route` values: `submitted` (prompt queued, not necessarily started),
+`steering_queued` (accepted for a running turn),
+`runtime_control_queued` (`/effort`… queued for mid-turn application),
 `unsupported_busy_slash`, `withheld` (credential-looking text; see below),
 `permission_forwarded`, `interrupted`, `close`, `invalid` (`detail` says why).
 
@@ -41,13 +47,19 @@ running turn), `runtime_control_queued` (`/effort`… applied mid-turn),
 | `{"type":"close"}` | end the loop: acked, then the process exits once the current turn finishes |
 
 `seq` is echoed verbatim in the ack. Text that looks like a credential is
-`withheld` unless `confirm_secret` is true — the same double-confirm the TUI
-applies; prefer the local auth prompt for sudo/auth secrets.
+`withheld` unless the agent is idle and `confirm_secret` is true. Busy input
+never accepts credential confirmation. This mirrors the TUI's double-confirm;
+prefer the local auth prompt for sudo/auth secrets.
+
+Acknowledgements preserve stdin order, but turn events may precede the
+corresponding acknowledgement. An acknowledgement confirms routing, not
+completion; observe turn and steering events for execution.
 
 ## Lifecycle
 
 - stdin EOF ends the loop exactly like `close`. Neither interrupts a running
-  turn; send `interrupt` first to abort it.
+  turn; accepted queued prompts drain before exit. Send `interrupt` first to
+  abort the active turn; interrupt does not cancel queued prompts.
 - A pending `permission_request` is denied on interrupt, on host EOF, or after
   30 minutes without a reply.
 
@@ -55,7 +67,10 @@ applies; prefer the local auth prompt for sudo/auth secrets.
 
 - Frame: 256 KiB per line. A longer line gets an `invalid` ack and closes the
   bridge (the remainder cannot be resynchronised).
-- Prompts queued while idle: 32; further frames get `invalid` ("input queue
-  full"). Steering while busy is folded per turn; hosts should cap their own
-  steering queue.
+- Prompts, busy steering, and runtime controls share 32 pending slots. Each
+  command in a busy comma-separated control sequence uses one slot; a sequence
+  that does not fit is refused before any command is queued. Slots are reserved
+  before publication and released by the consumer. Excess input gets `invalid`
+  ("input queue full"); interrupt, close, and permission replies bypass this budget.
+  This bounds ingress, not accumulated conversation history.
 - Permission replies: 8 in flight; excess get `invalid`.

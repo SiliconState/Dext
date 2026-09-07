@@ -198,6 +198,7 @@ fn test_agent(root: &Path) -> Agent {
         budget_exhausted: false,
         builtin_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent_builtins())),
         sink: Box::new(NullSink),
+        ndjson_pending: None,
         runtime_control_rx: None,
         runtime_control_tx: Agent::noop_text_tx(),
         steering_rx: None,
@@ -8072,10 +8073,83 @@ fn ndjson_router_routes_by_type_and_busy_state() {
 }
 
 #[test]
+fn ndjson_budget_bounds_busy_batches_and_releases_on_consumption() {
+    let root = temp_test_dir("ndjson-budget");
+    let mut agent = test_agent(&root);
+    let pending = Arc::new(AtomicUsize::new(0));
+    agent.ndjson_pending = Some(pending.clone());
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (runtime_control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (steering_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+    agent.install_runtime_controls(control_rx, runtime_control_tx.clone());
+    agent.install_steering(steer_rx, steering_tx.clone());
+    let (permission_tx, _permission_rx) = std::sync::mpsc::sync_channel(8);
+    let ch = NdjsonChannels {
+        input_tx,
+        runtime_control_tx,
+        steering_tx,
+        permission_tx,
+        busy: Arc::new(AtomicBool::new(false)),
+        interrupt: Arc::new(AtomicBool::new(false)),
+        pending: pending.clone(),
+    };
+    let prompt = json!({"type":"user", "text":"hello world"});
+    assert_eq!(ndjson_route(&prompt, &ch).0, "submitted");
+    assert_eq!(pending.load(Ordering::SeqCst), 1);
+    input_rx.try_recv().unwrap();
+    release_ndjson_pending(&pending);
+    ch.busy.store(true, Ordering::SeqCst);
+    for _ in 0..NDJSON_MAX_PENDING - 1 {
+        assert_eq!(ndjson_route(&prompt, &ch).0, "steering_queued");
+    }
+    let controls = json!({"type":"control", "command":"/effort low, /effort high"});
+    assert_eq!(ndjson_route(&controls, &ch).0, "invalid");
+    assert!(agent.drain_runtime_controls().is_empty());
+    assert_eq!(pending.load(Ordering::SeqCst), NDJSON_MAX_PENDING - 1);
+    assert_eq!(ndjson_route(&prompt, &ch).0, "steering_queued");
+    assert_eq!(ndjson_route(&prompt, &ch).0, "invalid");
+    assert_eq!(
+        ndjson_route(&json!({"type":"interrupt"}), &ch).0,
+        "interrupted"
+    );
+    assert_eq!(ndjson_route(&json!({"type":"close"}), &ch).0, "close");
+    assert_eq!(
+        ndjson_route(
+            &json!({"type":"permission", "id":"test", "choice":"deny"}),
+            &ch
+        )
+        .0,
+        "permission_forwarded"
+    );
+    assert_eq!(agent.drain_steering().len(), NDJSON_MAX_PENDING);
+    assert_eq!(pending.load(Ordering::SeqCst), 0);
+    assert_eq!(ndjson_route(&controls, &ch).0, "runtime_control_queued");
+    assert_eq!(pending.load(Ordering::SeqCst), 2);
+    let first = agent
+        .runtime_control_rx
+        .as_mut()
+        .unwrap()
+        .try_recv()
+        .unwrap();
+    let applied = apply_runtime_control_for_stream(&mut agent, Some(first));
+    assert_eq!(applied.commands, 2);
+    assert_eq!(pending.load(Ordering::SeqCst), 0);
+    agent.steering_rx = None;
+    assert_eq!(ndjson_route(&prompt, &ch).0, "invalid");
+    assert_eq!(pending.load(Ordering::SeqCst), 0);
+    assert!(!reserve_ndjson_pending(&pending, usize::MAX));
+    drop(agent);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn permission_bridge_matches_ids_and_denies_on_interrupt_or_eof() {
     let interrupt = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::sync_channel::<PermissionReply>(8);
     let bridge = PermissionBridge::new(rx, interrupt.clone());
+    bridge.ready.store(false, Ordering::SeqCst);
+    assert_eq!(bridge.wait("startup"), Choice::Deny);
+    bridge.ready.store(true, Ordering::SeqCst);
     // Stale reply is skipped; matching reply wins.
     tx.send(PermissionReply {
         id: "old".into(),
@@ -8099,8 +8173,10 @@ fn permission_bridge_matches_ids_and_denies_on_interrupt_or_eof() {
 
 #[test]
 fn session_header_round_trips_session_id() -> Result<()> {
-    let mut header = SessionHeader::default();
-    header.session_id = Some("1700000000-4242-abcdef012345".to_string());
+    let header = SessionHeader {
+        session_id: Some("1700000000-4242-abcdef012345".to_string()),
+        ..SessionHeader::default()
+    };
     let line = serde_json::to_string(&header)?;
     let parsed = parse_session_header(&line)?;
     assert_eq!(
