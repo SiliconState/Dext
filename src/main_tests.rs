@@ -5288,7 +5288,7 @@ async fn declared_pack_credentials_reach_direct_helper_but_not_arbitrary_bash() 
     let live = LiveToolOutput {
         call_id: "credential-helper".to_string(),
         name: "bash".to_string(),
-        tx: live_tx,
+        tx: Some(live_tx),
     };
     let guarded_helper = tool_policy::apply_bash_guardrails(
         "$DEXT_PACK_DIR/bin/credential-probe 'literal argument with spaces'",
@@ -12416,7 +12416,7 @@ async fn bash_runner_emits_live_output_deltas() {
     let live = LiveToolOutput {
         call_id: "call_live".to_string(),
         name: "bash".to_string(),
-        tx,
+        tx: Some(tx),
     };
     let out = execute_bash_async_prepared(
         "printf 'out\\n'; printf 'err\\n' >&2",

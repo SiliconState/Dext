@@ -16,6 +16,11 @@ rejected before reading stdin. Invoke packs with a `/pack run …` control frame
   permission requests resolve to deny immediately because replies cannot yet
   be consumed; retry the protected action after `ready`. The stdin
   reader starts only after `ready` has been written.
+- `tool_output_delta` carries live bash `{call_id, name, stream, text}` before
+  the final tool result, including split-read UTF-8 decoding. It is emitted in
+  one-shot stream-json mode too. Hosts must drain stdout and bound retained output.
+  Credential-bearing runtime helpers still suppress live output; ordinary bash
+  chunks may contain sensitive data and are not a secret-scrubbing boundary.
 - Unknown events and unknown fields must be ignored by hosts; new ones may be
   added in a minor version.
 
