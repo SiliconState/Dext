@@ -150,6 +150,9 @@ pub(crate) trait EventSink: Send + Sync {
     fn emit(&mut self, event: AgentEvent);
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice;
     fn local_auth_prompt(&mut self, tool: &str, message: &str);
+    fn machine_live_output(&self) -> bool {
+        false
+    }
     fn live_output_sender(&self) -> Option<tokio::sync::mpsc::Sender<AgentEvent>> {
         None
     }

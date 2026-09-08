@@ -2084,6 +2084,10 @@ impl JsonSink {
 }
 
 impl EventSink for JsonSink {
+    fn machine_live_output(&self) -> bool {
+        self.mode == OutputMode::StreamJson
+    }
+
     fn emit(&mut self, event: AgentEvent) {
         if self.records_crash_events_directly() {
             record_crash_event(&event);
@@ -2099,9 +2103,6 @@ impl EventSink for JsonSink {
                         ..
                     } => self.stream.text.clear(),
                     _ => {}
-                }
-                if matches!(&event, AgentEvent::ToolOutputDelta { .. }) {
-                    return;
                 }
                 if let Ok(value) = serde_json::to_value(&event) {
                     Self::emit_json_line(&value);
@@ -3358,7 +3359,7 @@ enum ProcInputOutcome {
 struct LiveToolOutput {
     call_id: String,
     name: String,
-    tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    tx: Option<tokio::sync::mpsc::Sender<AgentEvent>>,
 }
 
 impl LiveToolOutput {
@@ -3366,12 +3367,17 @@ impl LiveToolOutput {
         if text.is_empty() {
             return;
         }
-        let _ = self.tx.try_send(AgentEvent::ToolOutputDelta {
+        let event = AgentEvent::ToolOutputDelta {
             call_id: self.call_id.clone(),
             name: self.name.clone(),
             stream: stream.to_string(),
             text,
-        });
+        };
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(event);
+        } else if let Ok(value) = serde_json::to_value(event) {
+            JsonSink::emit_json_line(&value);
+        }
     }
 }
 
@@ -9482,7 +9488,8 @@ fn live_output_for_tool(
     if name != "bash" {
         return None;
     }
-    sink.live_output_sender().map(|tx| LiveToolOutput {
+    let tx = sink.live_output_sender();
+    (tx.is_some() || sink.machine_live_output()).then(|| LiveToolOutput {
         call_id: call_id.to_string(),
         name: name.to_string(),
         tx,
