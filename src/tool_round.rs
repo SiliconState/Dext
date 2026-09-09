@@ -26,6 +26,7 @@ pub(crate) struct PlannedCall {
     pub(crate) verification_fingerprint: Option<String>,
     pub(crate) verification_post_fingerprint: Option<String>,
     pub(crate) prepared_mutation: Option<mutation_preview::PreparedMutation>,
+    pub(crate) image_disclosure_target: Option<String>,
     pub(crate) journal_record_id: Option<String>,
     pub(crate) plan: Plan,
 }
@@ -169,7 +170,7 @@ impl Agent {
         let dext_checkout = batch_has_dext_install;
         let mut plans: Vec<PlannedCall> = Vec::new();
         let mut journal_terminal_errors: Vec<String> = Vec::new();
-        for (ordinal, (id, name, input)) in tool_calls.into_iter().enumerate() {
+        for (ordinal, (id, name, mut input)) in tool_calls.into_iter().enumerate() {
             let mut journal_input = input.clone();
             self.privacy
                 .redact_recall_tool_input(&name, &mut journal_input, &self.sandbox_root);
@@ -228,6 +229,7 @@ impl Agent {
                 });
             let mut local_sudo_auth_needed = false;
             let mut prepared_mutation: Option<mutation_preview::PreparedMutation> = None;
+            let mut image_disclosure_target: Option<String> = None;
             let journal_record_id: Option<String> = None;
 
             if plan.is_none() && noncanonical_dext_install {
@@ -326,6 +328,23 @@ impl Agent {
                 }
             }
 
+            if plan.is_none() && name == "read_image" && !self.model_supports_image_input() {
+                plan = Some(Plan::Immediate {
+                    content: format!(
+                        "the active model '{}' does not advertise image input; switch to a vision-capable model or use explicit OCR/conversion",
+                        self.model
+                    ),
+                    is_error: Some(true),
+                });
+            }
+
+            if plan.is_none() && name == "read_image" && self.successful_images_this_turn >= 2 {
+                plan = Some(Plan::Immediate {
+                    content: "read_image allows at most two successful images per user turn; ask the user to start another turn for additional images".to_string(),
+                    is_error: Some(true),
+                });
+            }
+
             if plan.is_none()
                 && let Some((cached_content, cached_error)) =
                     turn_state.dedupe_guard(cache_key.as_deref())
@@ -421,6 +440,16 @@ impl Agent {
                 }
             }
 
+            if plan.is_none()
+                && name == "read_image"
+                && let Err(content) = image::validate_workspace_path(&self.sandbox_root, &input)
+            {
+                plan = Some(Plan::Immediate {
+                    content,
+                    is_error: Some(true),
+                });
+            }
+
             if plan.is_none() {
                 let approved = if self.deny_tools.contains(&name)
                     || denied_signatures.contains(&call_sig)
@@ -462,47 +491,75 @@ impl Agent {
                         is_error: Some(true),
                     });
                 } else {
-                    let input_redacted = self.privacy.redact_text(&input_str).text;
-                    let pre_env = [
-                        ("DEXT_TOOL_NAME", name.as_str()),
-                        ("DEXT_TOOL_INPUT", input_redacted.as_str()),
-                    ];
-                    let mut blocked: Option<String> = None;
-                    if hooks_approved {
-                        for (out, code) in self.hooks.fire(
-                            "pre_tool",
-                            &name,
-                            &pre_env,
-                            &self.pack_hook_env,
-                            &self.sandbox_root,
-                            self.sandbox_profile(),
-                        ) {
-                            if code != 0 {
-                                blocked = Some(format!(
-                                    "pre_tool hook blocked (exit {code}):\n{}",
-                                    out.trim()
-                                ));
-                                break;
+                    if name == "read_image" {
+                        image_disclosure_target = Some(self.image_disclosure_target());
+                        match image::approval_digest(&self.sandbox_root, &input) {
+                            Ok(digest) => {
+                                if let Some(fields) = input.as_object_mut() {
+                                    fields.insert(
+                                        image::APPROVED_SOURCE_SHA256_FIELD.to_string(),
+                                        Value::String(digest),
+                                    );
+                                } else {
+                                    plan = Some(Plan::Immediate {
+                                        content:
+                                            "invalid tool args for read_image: expected an object"
+                                                .to_string(),
+                                        is_error: Some(true),
+                                    });
+                                }
+                            }
+                            Err(content) => {
+                                plan = Some(Plan::Immediate {
+                                    content,
+                                    is_error: Some(true),
+                                });
                             }
                         }
                     }
-                    plan = Some(match blocked {
-                        Some(msg) => Plan::Immediate {
-                            content: msg,
-                            is_error: Some(true),
-                        },
-                        None => {
-                            local_sudo_auth_needed = name == "bash"
-                                && tool_policy::command_invokes_sudo(
-                                    input["command"].as_str().unwrap_or(""),
-                                );
-                            if self.active_runtime_tool(&name).is_some() {
-                                Plan::Runtime
-                            } else {
-                                Plan::Builtin
+                    if plan.is_none() {
+                        let input_redacted = self.privacy.redact_text(&input_str).text;
+                        let pre_env = [
+                            ("DEXT_TOOL_NAME", name.as_str()),
+                            ("DEXT_TOOL_INPUT", input_redacted.as_str()),
+                        ];
+                        let mut blocked: Option<String> = None;
+                        if hooks_approved {
+                            for (out, code) in self.hooks.fire(
+                                "pre_tool",
+                                &name,
+                                &pre_env,
+                                &self.pack_hook_env,
+                                &self.sandbox_root,
+                                self.sandbox_profile(),
+                            ) {
+                                if code != 0 {
+                                    blocked = Some(format!(
+                                        "pre_tool hook blocked (exit {code}):\n{}",
+                                        out.trim()
+                                    ));
+                                    break;
+                                }
                             }
                         }
-                    });
+                        plan = Some(match blocked {
+                            Some(msg) => Plan::Immediate {
+                                content: msg,
+                                is_error: Some(true),
+                            },
+                            None => {
+                                local_sudo_auth_needed = name == "bash"
+                                    && tool_policy::command_invokes_sudo(
+                                        input["command"].as_str().unwrap_or(""),
+                                    );
+                                if self.active_runtime_tool(&name).is_some() {
+                                    Plan::Runtime
+                                } else {
+                                    Plan::Builtin
+                                }
+                            }
+                        });
+                    }
                 }
             }
 
@@ -551,6 +608,7 @@ impl Agent {
                 verification_fingerprint,
                 verification_post_fingerprint: None,
                 prepared_mutation,
+                image_disclosure_target,
                 journal_record_id,
                 plan,
             });
@@ -841,6 +899,23 @@ impl Agent {
                         }
                     }
                 }
+                if n == "read_image"
+                    && plans[idx].image_disclosure_target.as_deref()
+                        != Some(self.image_disclosure_target().as_str())
+                {
+                    builtin_outputs.insert(
+                        idx,
+                        Err("the workspace, provider, endpoint, contract, or model changed after read_image approval; call read_image again".to_string()),
+                    );
+                    continue;
+                }
+                if n == "read_image" && self.successful_images_this_turn >= 2 {
+                    builtin_outputs.insert(
+                        idx,
+                        Err("read_image allows at most two successful images per user turn; ask the user to start another turn for additional images".to_string()),
+                    );
+                    continue;
+                }
                 self.sink.emit(AgentEvent::ToolCallStart {
                     call_id: plans[idx].event_call_id.clone(),
                     name: n.clone(),
@@ -947,6 +1022,14 @@ impl Agent {
                     )
                     .await
                 };
+                if n == "read_image"
+                    && r.as_ref().is_ok_and(|content| {
+                        serde_json::from_str::<image::ImageReference>(content).is_ok()
+                    })
+                {
+                    self.successful_images_this_turn =
+                        self.successful_images_this_turn.saturating_add(1);
+                }
                 if multi_verification_batch
                     && let Some(spec) = plans[idx].verification_spec.as_ref()
                 {
@@ -999,6 +1082,7 @@ impl Agent {
                 verification_fingerprint,
                 verification_post_fingerprint,
                 prepared_mutation: _prepared_mutation,
+                image_disclosure_target,
                 journal_record_id: _journal_record_id,
                 plan,
             } = p;
@@ -1014,7 +1098,7 @@ impl Agent {
                 provider_runtime_notes.push(advisory);
             }
 
-            let (mut content, is_error) = match plan {
+            let (mut content, mut is_error) = match plan {
                 Plan::Immediate { content, is_error } => (content, is_error),
                 Plan::Builtin | Plan::Runtime => match builtin_outputs.remove(&idx).unwrap_or_else(|| {
                     Err(format!(
@@ -1033,6 +1117,30 @@ impl Agent {
                     Err(e) => (e, Some(true)),
                 },
             };
+            let mut image_reference = None;
+            if !is_error.unwrap_or(false) && ran_tool && name == "read_image" {
+                match (
+                    serde_json::from_str::<image::ImageReference>(&content),
+                    image_disclosure_target,
+                ) {
+                    (Ok(reference), Some(disclosure_target)) => {
+                        content = format!(
+                            "approved image ({}x{}, sanitized as {}); pixels are available to the model only in this turn",
+                            reference.width, reference.height, reference.media_type
+                        );
+                        image_reference = Some(image_reference_block(reference, disclosure_target));
+                    }
+                    (Ok(_), None) => {
+                        content = "missing internal image disclosure target".to_string();
+                        is_error = Some(true);
+                    }
+                    (Err(error), _) => {
+                        content = format!("invalid internal image reference: {error}");
+                        is_error = Some(true);
+                    }
+                }
+            }
+            let ok = !is_error.unwrap_or(false);
 
             if name == "bash" && output_indicates_git_credential_failure(&content) {
                 let ran_with_credential = builtin_git_cred_used.contains(&idx);
@@ -1065,7 +1173,6 @@ impl Agent {
                 }
             }
 
-            let ok = !is_error.unwrap_or(false);
             if ran_tool
                 && (ran_runtime && self.tool_is_side_effect_capable(&name)
                     || matches!(
@@ -1305,6 +1412,9 @@ impl Agent {
                     artifact: result_artifact,
                 },
             });
+            if let Some(reference) = image_reference {
+                results.push(reference);
+            }
         }
 
         if runnable_indices.len() > 1 {

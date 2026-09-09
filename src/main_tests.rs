@@ -216,6 +216,7 @@ fn test_agent(root: &Path) -> Agent {
         checkpoint_ordinal: 0,
         prompt_scan_cache: Mutex::new(None),
         prompt_scan_epoch: 0,
+        successful_images_this_turn: 0,
         last_checkpoint_signature: None,
     }
 }
@@ -4428,7 +4429,23 @@ fn block_contains_marker(block: &Block, marker: &str) -> bool {
             name.contains(marker) || input.to_string().contains(marker)
         }
         Block::ToolResult { content, .. } => content.contains(marker),
+        Block::ImageReference { path, .. } => path.contains(marker),
     }
+}
+
+fn write_test_png(path: &Path, color: [u8; 4]) {
+    ::image::ImageBuffer::from_pixel(4, 3, ::image::Rgba(color))
+        .save_with_format(path, ::image::ImageFormat::Png)
+        .expect("write PNG fixture");
+}
+
+fn image_reference_for_test(path: &Path, disclosure_target: &str) -> Block {
+    image_reference_block(
+        image::prepare(path.to_path_buf())
+            .expect("prepare test image")
+            .reference,
+        disclosure_target.to_string(),
+    )
 }
 
 fn tool_result_block(tool_use_id: &str, content: &str, is_error: Option<bool>) -> Block {
@@ -8912,9 +8929,16 @@ fn tool_registry_covers_every_catalog_entry_and_schema_requirement() {
 }
 
 #[test]
+fn sensitive_reads_require_permission_without_becoming_side_effect_capable() {
+    assert!(needs_permission("read_image"));
+    assert!(is_sensitive_read_tool("read_image"));
+    assert!(!is_side_effect_capable_tool("read_image"));
+}
+
+#[test]
 fn side_effect_capability_covers_every_permission_required_tool() {
     for tool in provider_tool_definitions() {
-        if needs_permission(tool.name) {
+        if needs_permission(tool.name) && !is_sensitive_read_tool(tool.name) {
             assert!(
                 is_side_effect_capable_tool(tool.name),
                 "permission-required tool {} must remain journaled",
@@ -8924,6 +8948,7 @@ fn side_effect_capability_covers_every_permission_required_tool() {
     }
     for read_only in [
         "read_file",
+        "read_image",
         "read_symbol",
         "fd",
         "rg",
@@ -10873,6 +10898,13 @@ fn privacy_redacts_sensitive_tool_output_and_strict_mode_blocks_secret_paths() {
     assert!(privacy_sensitive_path("config/providers.json"));
     assert!(privacy_sensitive_path("config/.env.local"));
     assert!(privacy_sensitive_path("private.key"));
+    assert!(
+        agent
+            .privacy
+            .path_denial("read_image", &json!({"path": "private.key"}), &root)
+            .is_some(),
+        "strict mode must block sensitive image paths"
+    );
     assert!(!privacy_sensitive_search_glob("!.env"));
     assert!(privacy_sensitive_search_glob("*.env"));
     assert!(privacy_sensitive_search_glob("**/id_*"));
@@ -11171,6 +11203,403 @@ fn slash_privacy_toggles_runtime_policy() {
 }
 
 #[test]
+fn read_image_is_sensitive_under_auto_profiles_and_read_only_sandbox_allows_it() {
+    let root = temp_test_dir("read-image-policy");
+    let mut agent = test_agent(&root);
+    let input = json!({"path": "image.png"});
+
+    for profile in [
+        ApprovalProfile::Ask,
+        ApprovalProfile::AutoRead,
+        ApprovalProfile::AutoWrite,
+        ApprovalProfile::Never,
+    ] {
+        agent.set_approval_profile(profile);
+        assert!(
+            !agent.tool_auto_approved("read_image", &input),
+            "{profile:?}"
+        );
+    }
+    agent.set_approval_profile(ApprovalProfile::Always);
+    assert!(agent.tool_auto_approved("read_image", &input));
+    agent.set_approval_profile(ApprovalProfile::AutoRead);
+    agent.allowed.insert("read_image".to_string());
+    assert!(agent.tool_auto_approved("read_image", &input));
+    agent.set_sandbox_profile(SandboxProfile::ReadOnly);
+    assert!(agent.sandbox_policy_denial("read_image", &input).is_none());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_capability_gate_precedes_approval() {
+    let root = temp_test_dir("read-image-capability");
+    let png = root.join("sample.png");
+    write_test_png(&png, [12, 34, 56, 255]);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(agent.execute_tool_round(ToolRoundContext {
+            tool_calls: vec![(
+                "call-image-text-only".to_string(),
+                "read_image".to_string(),
+                json!({"path": png}),
+            )],
+            iterations: 1,
+            turn_id: "turn-image-capability".to_string(),
+            objective_apply_fixes_allowed: false,
+            turn_state: &mut turn_state,
+            denied_signatures: HashSet::new(),
+            hooks_approval_decided: true,
+            hooks_approved: false,
+        }))
+        .expect("capability rejection round");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(
+        last_tool_result(&agent.history)
+            .unwrap()
+            .0
+            .contains("does not advertise image input")
+    );
+    assert!(
+        !agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|block| matches!(block, Block::ImageReference { .. }))
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_enforces_two_successes_per_turn() {
+    let root = temp_test_dir("read-image-turn-limit");
+    for index in 0..3 {
+        write_test_png(
+            &root.join(format!("sample-{index}.png")),
+            [index as u8, 34, 56, 255],
+        );
+    }
+    let mut agent = test_agent(&root);
+    agent.session_enabled = false;
+    agent.set_approval_profile(ApprovalProfile::Always);
+    let profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "glm")
+        .expect("GLM profile");
+    agent.provider_profile = Some(profile);
+    agent.provider_id = "glm".to_string();
+    agent.model = "glm-5.3-flash".to_string();
+    let mut turn_state = orchestrator::TurnRuntimeState::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(
+            agent.execute_tool_round(ToolRoundContext {
+                tool_calls: (0..3)
+                    .map(|index| {
+                        (
+                            format!("call-image-{index}"),
+                            "read_image".to_string(),
+                            json!({"path": format!("sample-{index}.png")}),
+                        )
+                    })
+                    .collect(),
+                iterations: 1,
+                turn_id: "turn-image-limit".to_string(),
+                objective_apply_fixes_allowed: false,
+                turn_state: &mut turn_state,
+                denied_signatures: HashSet::new(),
+                hooks_approval_decided: true,
+                hooks_approved: false,
+            }),
+        )
+        .expect("image limit round");
+    assert_eq!(agent.successful_images_this_turn, 2);
+    assert_eq!(
+        agent
+            .history
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|block| matches!(block, Block::ImageReference { .. }))
+            .count(),
+        2
+    );
+    assert!(
+        last_tool_result(&agent.history)
+            .unwrap()
+            .0
+            .contains("at most two successful images")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_wire_contracts_are_current_turn_only_and_sessions_are_path_only() {
+    let root = temp_test_dir("read-image-wire");
+    let png = root.join("sample.png");
+    write_test_png(&png, [12, 34, 56, 255]);
+    let mut agent = test_agent(&root);
+    let disclosure_target = agent.image_disclosure_target();
+    agent.history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Inspect the old image".to_string(),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![image_reference_for_test(&png, &disclosure_target)],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Inspect it again".to_string(),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![image_reference_for_test(&png, &disclosure_target)],
+        },
+    ];
+
+    let anthropic =
+        anthropic_wire_messages(&agent.history, false, &disclosure_target).expect("Anthropic wire");
+    assert_eq!(anthropic[1]["content"][0]["type"], "text");
+    assert_eq!(anthropic[3]["content"][0]["type"], "image");
+    assert_eq!(
+        anthropic[3]["content"][0]["source"]["media_type"],
+        "image/jpeg"
+    );
+    let cached = anthropic_wire_messages(&agent.history, true, &disclosure_target)
+        .expect("Anthropic cached wire");
+    assert!(
+        cached
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .filter(|block| block["type"] == "image")
+            .all(|block| block.get("cache_control").is_none())
+    );
+
+    let switched_target = format!("{disclosure_target}-different");
+    let switched = anthropic_wire_messages(&agent.history, false, &switched_target)
+        .expect("switched target wire");
+    assert!(switched.iter().all(|message| {
+        !message["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+    }));
+    assert!(switched.iter().any(|message| {
+        message["content"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["text"].as_str().is_some_and(|text| {
+                    text.contains("provider, endpoint, contract, or model changed")
+                })
+            })
+        })
+    }));
+
+    agent.model = "different-model".to_string();
+    let switched_chat = serde_json::to_value(agent.history_to_oai_messages("system")).unwrap();
+    assert!(
+        !switched_chat
+            .to_string()
+            .contains("data:image/jpeg;base64,")
+    );
+    assert!(
+        agent
+            .history_to_openai_responses_input()
+            .iter()
+            .all(|item| item["content"][0]["type"] != "input_image")
+    );
+    assert!(
+        agent
+            .history_to_chatgpt_input()
+            .iter()
+            .all(|item| item["content"][0]["type"] != "input_image")
+    );
+    agent.model = "test-model".to_string();
+
+    agent.prompt_scan_epoch = agent.prompt_scan_epoch.wrapping_add(1);
+    let next_turn_target = agent.image_disclosure_target();
+    let next_turn =
+        anthropic_wire_messages(&agent.history, false, &next_turn_target).expect("next-turn wire");
+    assert!(next_turn.iter().all(|message| {
+        !message["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+    }));
+    agent.prompt_scan_epoch = agent.prompt_scan_epoch.wrapping_sub(1);
+
+    let chat = serde_json::to_value(agent.history_to_oai_messages("system")).unwrap();
+    assert!(chat.to_string().contains("image_url"));
+    assert_eq!(
+        chat.as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message.to_string().contains("data:image/jpeg;base64,"))
+            .count(),
+        1
+    );
+
+    let responses = agent.history_to_openai_responses_input();
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|item| item["content"][0]["type"] == "input_image")
+            .count(),
+        1
+    );
+    assert_eq!(
+        agent
+            .history_to_chatgpt_input()
+            .iter()
+            .filter(|item| item["content"][0]["type"] == "input_image")
+            .count(),
+        1
+    );
+
+    let session = root.join("session.jsonl");
+    agent.save_session_to_path(&session).expect("save session");
+    let bytes = std::fs::read(&session).expect("read session");
+    let text = String::from_utf8(bytes).expect("session UTF-8");
+    let header: Value = serde_json::from_str(text.lines().next().expect("session header"))
+        .expect("parse session header");
+    assert_eq!(header["version"], IMAGE_REFERENCE_FORMAT_VERSION);
+    assert!(text.contains("image_reference"));
+    assert!(!text.contains("base64"));
+    assert!(!text.contains("active"));
+
+    let mut restored = test_agent(&root);
+    restored
+        .load_session_from_path(&session)
+        .expect("restore session");
+    let restored_target = restored.image_disclosure_target();
+    let restored_wire =
+        anthropic_wire_messages(&restored.history, false, &restored_target).expect("restored wire");
+    assert!(restored_wire.iter().all(|message| {
+        !message["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+    }));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_image_changed_file_falls_back_to_placeholder() {
+    let root = temp_test_dir("read-image-changed-wire");
+    let png = root.join("changed.png");
+    write_test_png(&png, [0, 0, 0, 255]);
+    let disclosure_target = "test|anthropic-messages|http://127.0.0.1|test-model";
+    let reference = image_reference_for_test(&png, disclosure_target);
+    write_test_png(&png, [255, 255, 255, 255]);
+    let history = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "Inspect image".to_string(),
+            }],
+        },
+        Message {
+            role: "user".to_string(),
+            content: vec![reference],
+        },
+    ];
+    let wire = anthropic_wire_messages(&history, false, disclosure_target).expect("wire");
+    assert_eq!(wire[1]["content"][0]["type"], "text");
+    assert!(
+        wire[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("source changed")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn persisted_image_references_require_v6_and_valid_metadata() -> Result<()> {
+    let root = temp_test_dir("persisted-image-validation");
+    let png = root.join("sample.png");
+    write_test_png(&png, [12, 34, 56, 255]);
+    let mut live = test_agent(&root);
+    live.model = "live-model".to_string();
+    live.history.push(Message {
+        role: "user".to_string(),
+        content: vec![Block::Text {
+            text: "live history".to_string(),
+        }],
+    });
+
+    let reference = image::prepare(png).map_err(anyhow::Error::msg)?.reference;
+    let persisted = |reference: &image::ImageReference| Message {
+        role: "user".to_string(),
+        content: vec![image_reference_block(
+            reference.clone(),
+            "discarded".to_string(),
+        )],
+    };
+    let mut header = serde_json::to_value(live.session_header())?;
+    header["sandbox"] = json!(root.display().to_string());
+    let session = root.join("image-session.jsonl");
+
+    header["version"] = json!(PACK_RUNTIME_FORMAT_VERSION);
+    std::fs::write(
+        &session,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header)?,
+            serde_json::to_string(&persisted(&reference))?
+        ),
+    )?;
+    let error = live
+        .load_session_from_path(&session)
+        .expect_err("pre-v6 image reference must fail");
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("image references are unsupported before format version 6"),
+        "{detail}"
+    );
+
+    header["version"] = json!(IMAGE_REFERENCE_FORMAT_VERSION);
+    let mut malformed = reference.clone();
+    malformed.source_sha256 = "not-a-digest".to_string();
+    std::fs::write(
+        &session,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header)?,
+            serde_json::to_string(&persisted(&malformed))?
+        ),
+    )?;
+    let error = live
+        .load_session_from_path(&session)
+        .expect_err("malformed image reference must fail");
+    let detail = format!("{error:#}");
+    assert!(detail.contains("digest is invalid"), "{detail}");
+
+    assert_eq!(live.model, "live-model");
+    assert!(matches!(
+        &live.history[0].content[0],
+        Block::Text { text } if text == "live history"
+    ));
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[test]
 fn approval_and_sandbox_profiles_enforce_policy() {
     let root = temp_test_dir("approval-sandbox-profiles");
     let mut agent = test_agent(&root);
@@ -11227,6 +11656,7 @@ fn default_and_frugal_toolsets_keep_core_capabilities() {
 
     for name in [
         "read_file",
+        "read_image",
         "read_symbol",
         "write_file",
         "edit_file",
@@ -17140,6 +17570,7 @@ fn nontext_assistant_response_precedes_tool_results_on_every_wire_contract() {
     let anthropic = anthropic_wire_messages(
         &sanitize_anthropic_messages(&agent.history, false, false),
         false,
+        &agent.image_disclosure_target(),
     )
     .expect("Anthropic wire history");
     assert_eq!(
@@ -19198,7 +19629,7 @@ fn compose_system_parts_quotes_unsafe_environment_values() {
 }
 
 #[test]
-fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
+fn canonical_provider_neutral_prompt_fixture_stays_under_sixty_two_hundred_bytes() {
     let root = temp_test_dir("clean-provider-neutral-prompt-budget");
     let root = std::fs::canonicalize(root).expect("canonical temp dir");
     let mut agent = test_agent(&root);
@@ -19269,7 +19700,7 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
     let openai_responses = agent.wire_tools_openai_responses();
     let chatgpt_responses = agent.wire_tools_chatgpt();
 
-    assert_eq!(neutral_tools.len(), 14, "default capability count drifted");
+    assert_eq!(neutral_tools.len(), 15, "default capability count drifted");
     for (index, neutral) in neutral_tools.iter().enumerate() {
         let anthropic = &anthropic_cache_on[index];
         assert_eq!(anthropic.name, neutral.name);
@@ -19336,7 +19767,7 @@ fn canonical_provider_neutral_prompt_fixture_stays_under_six_thousand_bytes() {
         "{canonical_env}"
     );
     assert!(
-        total_bytes < 6_000,
+        total_bytes < 6_200,
         "provider-neutral clean standard/default/lean prompt exceeded budget: total={total_bytes} system={} normalized_tools={normalized_tool_bytes} env={}",
         parts.stable.len(),
         canonical_env.len()
@@ -19733,7 +20164,7 @@ fn session_state_fixtures_migrate_v1_v2_and_preserve_v3_semantics() -> Result<()
         .expect("future session fixture must fail")
         .to_string();
     assert!(
-        error.contains("unsupported session format version 6"),
+        error.contains("unsupported session format version 7"),
         "{error}"
     );
     assert_eq!(std::fs::read(&future_path)?, future_before);
@@ -19791,12 +20222,18 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
     .expect("parse v5 runtime-capable session header");
     assert_eq!(runtime_v5.version, SESSION_FORMAT_VERSION);
 
-    let error = parse_session_header(r#"{"version":6,"model":"future","system":"system"}"#)
+    let image_v6 = parse_session_header(
+        r#"{"version":6,"model":"v6","system":"system","active_pack_runtimes":[]}"#,
+    )
+    .expect("parse v6 image-reference-capable session header");
+    assert_eq!(image_v6.version, SESSION_FORMAT_VERSION);
+
+    let error = parse_session_header(r#"{"version":7,"model":"future","system":"system"}"#)
         .err()
         .expect("future session format must fail")
         .to_string();
     assert!(
-        error.contains("unsupported session format version 6"),
+        error.contains("unsupported session format version 7"),
         "{error}"
     );
     assert!(parse_session_header(r#"{"version":"3"}"#).is_err());
@@ -22162,6 +22599,7 @@ fn provider_runtime_and_slash_registries_are_split() {
         .collect();
     assert!(!provider_names.contains("nonexistent_tool"));
     assert!(provider_names.contains("read_file"));
+    assert!(provider_names.contains("read_image"));
     assert!(provider_names.contains("jq"));
     assert!(provider_names.contains("csvkit"));
     assert!(!provider_names.contains("browser"));
@@ -22173,6 +22611,7 @@ fn provider_runtime_and_slash_registries_are_split() {
         .map(|tool| tool.name)
         .collect();
     assert!(default_names.contains("read_file"));
+    assert!(default_names.contains("read_image"));
     assert!(default_names.contains("git_status"));
     assert!(!default_names.contains("jq"));
     assert!(!default_names.contains("csvkit"));
@@ -26122,7 +26561,7 @@ fn sliding_breakpoint_skips_thinking_blocks_and_cache_gate_env_works() {
             },
         ],
     }];
-    let wire = anthropic_wire_messages(&messages, true).expect("wire");
+    let wire = anthropic_wire_messages(&messages, true, "test-target").expect("wire");
     assert!(wire[0]["content"][1].get("cache_control").is_none());
     assert_eq!(wire[0]["content"][0]["cache_control"]["type"], "ephemeral");
 
@@ -28262,8 +28701,8 @@ fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
     let chatgpt_responses = agent.wire_tools_chatgpt();
     assert_eq!(
         neutral.len(),
-        15,
-        "14 default static tools plus one dynamic runtime tool"
+        16,
+        "15 default static tools plus one dynamic runtime tool"
     );
     assert_eq!(anthropic.len(), neutral.len());
     assert_eq!(openai_chat.len(), neutral.len());
@@ -31132,7 +31571,7 @@ fn wire_messages_drop_content_emptied_by_sanitization() {
         sanitized[1].content.is_empty(),
         "prior-turn thinking-only message should sanitize to empty"
     );
-    let wire = anthropic_wire_messages(&sanitized, true).expect("wire");
+    let wire = anthropic_wire_messages(&sanitized, true, "test-target").expect("wire");
     assert_eq!(wire.len(), 2, "{wire:?}");
     assert!(
         wire.iter()

@@ -432,6 +432,7 @@ impl PrivacyPolicy {
             && matches!(
                 tool_name,
                 "read_file"
+                    | "read_image"
                     | "read_symbol"
                     | "fd"
                     | "rg"
