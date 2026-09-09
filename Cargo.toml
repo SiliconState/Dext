@@ -29,6 +29,7 @@ ratatui-core = "=0.1.2"
 tui-markdown = { version = "=0.3.8", default-features = false }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ra_ap_syntax = "=0.0.348"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

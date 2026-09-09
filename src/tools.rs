@@ -86,6 +86,17 @@ pub(crate) fn provider_tool_definitions() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "read_image",
+            description: "Inspect a PNG, JPEG, or WebP image with the active vision-capable model. This sensitive read can disclose pixels to the provider, requires explicit approval except under approval=always or /allow read_image, and is limited to two successful images per user turn. Dext bounds decoding, resizes to 1568 px, composites transparency, strips metadata, and re-encodes before transmission.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative path to a PNG, JPEG, or WebP file"}
+                },
+                "required": ["path"]
+            }),
+        },
+        Tool {
             name: "read_symbol",
             description: "Read a source symbol by name, or the enclosing block around a 1-indexed line number. Rust files use the error-tolerant rust-analyzer syntax parser, preserve outer attributes/docs, reject ambiguous bare names, and accept Type::name, Type.name, or <Type as Trait>::name. Returns a line-numbered block plus context. May inspect absolute paths outside the sandbox read-only; writes remain confined. Source input is capped at 8 MiB/1M lines, symbol selectors at 1 KiB, and loading observes cancellation; non-Rust languages use a lightweight text/range heuristic.",
             input_schema: json!({
@@ -338,6 +349,7 @@ const PERMISSION_REQUIRED: u8 = 1;
 const PARALLEL_SAFE: u8 = 1 << 1;
 const EXTERNAL_PROCESS: u8 = 1 << 2;
 const DEFAULT_PROFILE: u8 = 1 << 3;
+const SENSITIVE_READ: u8 = 1 << 4;
 
 const fn tool(name: &'static str, required_fields: &'static [&'static str], flags: u8) -> ToolSpec {
     ToolSpec {
@@ -349,6 +361,11 @@ const fn tool(name: &'static str, required_fields: &'static [&'static str], flag
 
 const TOOL_SPECS: &[ToolSpec] = &[
     tool("read_file", &["path"], PARALLEL_SAFE | DEFAULT_PROFILE),
+    tool(
+        "read_image",
+        &["path"],
+        PERMISSION_REQUIRED | SENSITIVE_READ | DEFAULT_PROFILE,
+    ),
     tool("read_symbol", &["path"], PARALLEL_SAFE | DEFAULT_PROFILE),
     tool(
         "write_file",
@@ -436,8 +453,12 @@ pub(crate) fn needs_permission(name: &str) -> bool {
     tool_spec(name).is_some_and(|spec| spec.flags & PERMISSION_REQUIRED != 0)
 }
 
+pub(crate) fn is_sensitive_read_tool(name: &str) -> bool {
+    tool_spec(name).is_some_and(|spec| spec.flags & SENSITIVE_READ != 0)
+}
+
 pub(crate) fn is_side_effect_capable_tool(name: &str) -> bool {
-    needs_permission(name)
+    needs_permission(name) && !is_sensitive_read_tool(name)
 }
 
 pub(crate) fn is_external_process_tool(name: &str) -> bool {
@@ -455,6 +476,7 @@ pub(crate) fn should_parallelize_builtin_tools(names: &[&str]) -> bool {
 fn lean_description(name: &str, fallback: &str) -> String {
     match name {
         "read_file" => "Read capped line-numbered file window; absolute paths read-only.",
+        "read_image" => "Inspect workspace PNG/JPEG/WebP after approval.",
         "read_symbol" => {
             "Read symbol/enclosing block; Rust AST selectors disambiguate; absolute paths read-only."
         }

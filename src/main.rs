@@ -2,6 +2,7 @@ mod claude_subscription;
 mod crash;
 mod events;
 mod git_checkpoints;
+mod image;
 mod list_render;
 mod mutation_preview;
 mod orchestrator;
@@ -39,6 +40,7 @@ pub(crate) use secret_redactor::*;
 pub(crate) use usage::*;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use provider::{
     ApiProvider, OpenAiResponsesReasoning, ProviderProfile, RequestContract, ResolvedModelSpec,
     ResolvedProviderConfig, RuntimeAuthKind, apply_provider_headers, auth_store_path,
@@ -70,8 +72,9 @@ use session::{
 };
 use tool_round::{ToolRoundContext, ToolRoundOutcome};
 use tools::{
-    Tool, ToolProfile, is_external_process_tool, is_side_effect_capable_tool, needs_permission,
-    provider_tool_definitions, should_parallelize_builtin_tools,
+    Tool, ToolProfile, is_external_process_tool, is_sensitive_read_tool,
+    is_side_effect_capable_tool, needs_permission, provider_tool_definitions,
+    should_parallelize_builtin_tools,
 };
 use verification::{CodeLoopState, VerificationRecord};
 
@@ -151,7 +154,7 @@ const GIT_AUTH_GUIDANCE: &str = "git needs credentials for an HTTPS remote. Ente
 const VERIFICATION_ARTIFACT_TAIL_CAP: usize = 2_000;
 pub(crate) const BASH_UNSAFE_FLAG_OVERRIDE_ENV: &str = "DEXT_ALLOW_BREAK_SYSTEM_PACKAGES";
 const AUTH_CIRCUIT_BREAKER_THRESHOLD: usize = 2;
-const TOOL_CATALOG_VERSION: u32 = 6;
+const TOOL_CATALOG_VERSION: u32 = 7;
 const DEFAULT_DISCOVERY_EXCLUDES: &[&str] = &[
     ".git",
     ".hg",
@@ -2368,6 +2371,15 @@ enum Block {
         )]
         metadata: ToolResultMetadata,
     },
+    ImageReference {
+        path: String,
+        media_type: String,
+        width: u32,
+        height: u32,
+        source_sha256: String,
+        #[serde(skip)]
+        disclosure_target: Option<String>,
+    },
     PartialStream {
         text: String,
     },
@@ -2479,23 +2491,90 @@ fn sanitize_anthropic_messages(
 /// reused across tool rounds instead of being re-billed as fresh input on
 /// every request. Tools and the stable system block hold the other two
 /// breakpoints (3 of the 4 allowed).
-fn anthropic_wire_messages(messages: &[Message], cache_enabled: bool) -> Result<Vec<Value>> {
-    let mut wire: Vec<Value> = messages
+fn inactive_image_detail(
+    disclosure_target: Option<&str>,
+    current_target: &str,
+    message_index: usize,
+    current_turn_start: usize,
+) -> &'static str {
+    if message_index < current_turn_start {
+        "approval belonged to an older turn"
+    } else if disclosure_target.is_none() {
+        "the session was restored after approval"
+    } else if disclosure_target != Some(current_target) {
+        "the provider, endpoint, contract, or model changed after approval"
+    } else {
+        "the approval is no longer active"
+    }
+}
+
+fn image_reference_is_active(
+    disclosure_target: Option<&str>,
+    current_target: &str,
+    message_index: usize,
+    current_turn_start: usize,
+) -> bool {
+    message_index >= current_turn_start && disclosure_target == Some(current_target)
+}
+
+fn anthropic_wire_messages(
+    messages: &[Message],
+    cache_enabled: bool,
+    current_target: &str,
+) -> Result<Vec<Value>> {
+    let current_turn_start = messages
         .iter()
-        .map(serde_json::to_value)
-        .collect::<std::result::Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("serialize messages: {e}"))?;
-    // Sanitization can empty a message out entirely — e.g. an assistant
-    // message that carried only thinking blocks once prior-turn thinking is
-    // stripped, or a session resumed with thinking disabled. The API rejects
-    // empty content arrays, so drop such messages from the wire (they carry no
-    // tool pairing, history keeps the full record).
-    wire.retain(|message| {
-        message
-            .get("content")
-            .and_then(Value::as_array)
-            .is_none_or(|blocks| !blocks.is_empty())
-    });
+        .rposition(is_fresh_user_prompt_message)
+        .unwrap_or(0);
+    let mut wire = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        let mut content = Vec::new();
+        let mut image_messages = Vec::new();
+        for block in &message.content {
+            let Some((reference, disclosure_target)) = block_image_reference(block) else {
+                content.push(
+                    serde_json::to_value(block)
+                        .map_err(|e| anyhow::anyhow!("serialize message block: {e}"))?,
+                );
+                continue;
+            };
+            let image_block = if image_reference_is_active(
+                disclosure_target,
+                current_target,
+                message_index,
+                current_turn_start,
+            ) {
+                match active_image_wire(&reference) {
+                    Ok((media_type, data)) => json!({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data}
+                    }),
+                    Err(error) => json!({
+                        "type": "text",
+                        "text": image_placeholder(&reference, &error)
+                    }),
+                }
+            } else {
+                json!({
+                    "type": "text",
+                    "text": image_placeholder(
+                        &reference,
+                        inactive_image_detail(
+                            disclosure_target,
+                            current_target,
+                            message_index,
+                            current_turn_start,
+                        ),
+                    )
+                })
+            };
+            image_messages.push(json!({"role": "user", "content": [image_block]}));
+        }
+        if !content.is_empty() {
+            wire.push(json!({"role": message.role, "content": content}));
+        }
+        wire.extend(image_messages);
+    }
     if cache_enabled {
         set_sliding_message_cache_breakpoint(&mut wire);
     }
@@ -2514,9 +2593,11 @@ fn set_sliding_message_cache_breakpoint(wire: &mut [Value]) {
             let Some(obj) = block.as_object_mut() else {
                 continue;
             };
-            // Thinking blocks cannot carry cache_control breakpoints.
+            // Thinking blocks and sensitive image pixels cannot carry cache
+            // breakpoints. Image bytes are current-turn disclosures and must not
+            // be explicitly retained through Anthropic prompt caching.
             let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-            if matches!(kind, "thinking" | "redacted_thinking") {
+            if matches!(kind, "thinking" | "redacted_thinking" | "image") {
                 continue;
             }
             obj.insert("cache_control".to_string(), cache_control);
@@ -2559,7 +2640,7 @@ fn push_runtime_env_oai_message(msgs: &mut Vec<OaiMessage>, env: &str) {
     }
     msgs.push(OaiMessage {
         role: "user".to_string(),
-        content: Some(runtime_env_wire_text(env)),
+        content: Some(Value::String(runtime_env_wire_text(env))),
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
@@ -2594,6 +2675,7 @@ fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
             Block::ResponsesReasoning { item } => json_byte_len(item),
             Block::ToolUse { input, .. } => json_byte_len(input),
             Block::ToolResult { content, .. } => content.len(),
+            Block::ImageReference { path, .. } => path.len() + 96,
         })
         .sum::<usize>() as u64;
     if chars == 0 {
@@ -2605,6 +2687,56 @@ fn blocks_approx_tokens(blocks: &[Block]) -> u64 {
 
 fn message_approx_tokens(message: &Message) -> u64 {
     blocks_approx_tokens(&message.content).max(1)
+}
+
+fn image_reference_block(reference: image::ImageReference, disclosure_target: String) -> Block {
+    Block::ImageReference {
+        path: reference.path,
+        media_type: reference.media_type,
+        width: reference.width,
+        height: reference.height,
+        source_sha256: reference.source_sha256,
+        disclosure_target: Some(disclosure_target),
+    }
+}
+
+fn block_image_reference(block: &Block) -> Option<(image::ImageReference, Option<&str>)> {
+    let Block::ImageReference {
+        path,
+        media_type,
+        width,
+        height,
+        source_sha256,
+        disclosure_target,
+    } = block
+    else {
+        return None;
+    };
+    Some((
+        image::ImageReference {
+            path: path.clone(),
+            media_type: media_type.clone(),
+            width: *width,
+            height: *height,
+            source_sha256: source_sha256.clone(),
+        },
+        disclosure_target.as_deref(),
+    ))
+}
+
+fn image_placeholder(reference: &image::ImageReference, detail: &str) -> String {
+    format!(
+        "[previously approved image ({}x{}, {}) not retransmitted: {detail}; call read_image again to inspect it]",
+        reference.width, reference.height, reference.media_type
+    )
+}
+
+fn active_image_wire(
+    reference: &image::ImageReference,
+) -> std::result::Result<(String, String), String> {
+    let prepared = image::prepare_if_unchanged(reference)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(prepared.bytes);
+    Ok((prepared.reference.media_type, encoded))
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -3071,7 +3203,7 @@ struct OaiChatTemplateKwargs {
 #[derive(Serialize)]
 struct OaiMessage {
     role: String,
-    content: Option<String>,
+    content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7575,6 +7707,7 @@ fn execute_tool_with_cache_for_context(
     context_mode: ContextMode,
 ) -> std::result::Result<String, String> {
     match name {
+        "read_image" => image::read_tool(root, input),
         "read_file" => {
             let path = input["path"].as_str().ok_or("missing path")?;
             let path = canonical_read_path(root, path)?;
@@ -9923,6 +10056,10 @@ fn summarize_call(name: &str, input: &Value) -> String {
                 format!("read_file: {path} ({})", opts.join(", "))
             }
         }
+        "read_image" => {
+            let path = summarize_inline(input["path"].as_str().unwrap_or("?"), 90);
+            format!("read_image: {path} (pixels will be sent to the model provider)")
+        }
         "read_symbol" => {
             let path = summarize_inline(input["path"].as_str().unwrap_or("?"), 70);
             if let Some(symbol) = input["symbol"].as_str() {
@@ -10835,7 +10972,8 @@ const LATEST_SESSION_NAME: &str = "_latest";
 const SEAT_TRANSITIONAL_FORMAT_VERSION: u32 = 3;
 const SEAT_FORMAT_VERSION: u32 = 4;
 const PACK_RUNTIME_FORMAT_VERSION: u32 = 5;
-const SESSION_FORMAT_VERSION: u32 = 5;
+const IMAGE_REFERENCE_FORMAT_VERSION: u32 = 6;
+const SESSION_FORMAT_VERSION: u32 = 6;
 
 fn default_context_mode_for_provider(
     provider_id: &str,
@@ -12854,6 +12992,14 @@ fn render_transcript_for_summary(msgs: &[Message], context_mode: ContextMode) ->
                 Block::Thinking { .. }
                 | Block::RedactedThinking { .. }
                 | Block::ResponsesReasoning { .. } => {}
+                Block::ImageReference { .. } => {
+                    let (reference, _) = block_image_reference(b).expect("matched image reference");
+                    out.push_str(&format!(
+                        "[{}→image] {}\n",
+                        m.role,
+                        image_placeholder(&reference, "path-only transcript reference")
+                    ));
+                }
                 Block::ToolUse { name, input, .. } => {
                     let s = input.to_string();
                     let truncated: String = s.chars().take(tool_use_cap).collect();
@@ -13376,6 +13522,7 @@ struct Agent {
     checkpoint_ordinal: usize,
     prompt_scan_cache: Mutex<Option<PromptScanCache>>,
     prompt_scan_epoch: u64,
+    successful_images_this_turn: usize,
     // (history len, history chars) at the last session autosave; lets
     // non-critical checkpoints skip rewriting an unchanged transcript.
     last_checkpoint_signature: Option<(usize, usize)>,
@@ -13578,6 +13725,7 @@ impl Agent {
             checkpoint_ordinal: 0,
             prompt_scan_cache: Mutex::new(None),
             prompt_scan_epoch: 0,
+            successful_images_this_turn: 0,
             last_checkpoint_signature: None,
         })
     }
@@ -13948,6 +14096,19 @@ impl Agent {
     fn model_spec_source(&self) -> &'static str {
         self.resolved_model_spec()
             .map_or("legacy", |spec| spec.source)
+    }
+
+    fn image_disclosure_target(&self) -> String {
+        let identity = json!([
+            self.provider_id,
+            self.request_contract().as_str(),
+            self.base_url.trim().trim_end_matches('/'),
+            self.model.trim(),
+            self.model_supports_image_input(),
+            self.sandbox_root,
+            self.prompt_scan_epoch,
+        ]);
+        sha256_hex_bytes(identity.to_string().as_bytes())
     }
 
     fn provider_health_key(&self) -> String {
@@ -15182,7 +15343,9 @@ impl Agent {
     }
 
     fn tool_is_side_effect_capable(&self, name: &str) -> bool {
-        self.tool_needs_permission(name) || is_side_effect_capable_tool(name)
+        self.active_runtime_tool(name)
+            .is_some_and(|tool| tool.risk != pack_runtime::RuntimeRisk::Read)
+            || is_side_effect_capable_tool(name)
     }
 
     fn validate_active_tool_input(&self, name: &str, input: &Value) -> Result<(), String> {
@@ -15202,6 +15365,9 @@ impl Agent {
     fn tool_auto_approved(&self, name: &str, input: &Value) -> bool {
         if self.allowed.contains(name) {
             return true;
+        }
+        if is_sensitive_read_tool(name) {
+            return self.approval_profile == ApprovalProfile::Always;
         }
         match self.approval_profile {
             ApprovalProfile::Always => true,
@@ -15972,9 +16138,10 @@ impl Agent {
             .unwrap_or(0);
         let preserve_local_reasoning = self.local_llama_reasoning_enabled();
         let valid_ids = Self::tool_use_ids_in_messages(history);
+        let current_image_target = self.image_disclosure_target();
         let mut msgs = vec![OaiMessage {
             role: "system".to_string(),
-            content: Some(system_text.to_string()),
+            content: Some(Value::String(system_text.to_string())),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -16010,7 +16177,7 @@ impl Agent {
                                 }
                                 msgs.push(OaiMessage {
                                     role: "tool".to_string(),
-                                    content: Some(content.clone()),
+                                    content: Some(Value::String(content.clone())),
                                     reasoning_content: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tool_use_id.clone()),
@@ -16020,7 +16187,44 @@ impl Agent {
                     } else if !texts.is_empty() {
                         msgs.push(OaiMessage {
                             role: "user".to_string(),
-                            content: Some(texts.join("\n")),
+                            content: Some(Value::String(texts.join("\n"))),
+                            reasoning_content: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                    }
+                    for block in &m.content {
+                        let Some((reference, disclosure_target)) = block_image_reference(block)
+                        else {
+                            continue;
+                        };
+                        let content = if image_reference_is_active(
+                            disclosure_target,
+                            &current_image_target,
+                            message_index,
+                            current_turn_start,
+                        ) {
+                            match active_image_wire(&reference) {
+                                Ok((media_type, data)) => json!([
+                                    {"type": "text", "text": "Approved workspace image"},
+                                    {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}}
+                                ]),
+                                Err(error) => Value::String(image_placeholder(&reference, &error)),
+                            }
+                        } else {
+                            Value::String(image_placeholder(
+                                &reference,
+                                inactive_image_detail(
+                                    disclosure_target,
+                                    &current_image_target,
+                                    message_index,
+                                    current_turn_start,
+                                ),
+                            ))
+                        };
+                        msgs.push(OaiMessage {
+                            role: "user".to_string(),
+                            content: Some(content),
                             reasoning_content: None,
                             tool_calls: None,
                             tool_call_id: None,
@@ -16083,9 +16287,11 @@ impl Agent {
                         })
                         .filter(|reasoning| !reasoning.is_empty());
                     let content = if texts.is_empty() {
-                        reasoning_content.as_ref().map(|_| String::new())
+                        reasoning_content
+                            .as_ref()
+                            .map(|_| Value::String(String::new()))
                     } else {
-                        Some(texts.join("\n"))
+                        Some(Value::String(texts.join("\n")))
                     };
                     if content.is_none() && oai_tool_calls.is_none() {
                         continue;
@@ -16131,11 +16337,21 @@ impl Agent {
             .rposition(is_fresh_user_prompt_message)
             .unwrap_or(0);
         let valid_ids = Self::tool_use_ids_in_messages(history);
+        let current_image_target = self.image_disclosure_target();
         let mut items = Vec::new();
         let mut msg_counter = 0usize;
 
         for (message_index, msg) in history.iter().enumerate() {
-            for block in &msg.content {
+            for block in msg
+                .content
+                .iter()
+                .filter(|block| !matches!(block, Block::ImageReference { .. }))
+                .chain(
+                    msg.content
+                        .iter()
+                        .filter(|block| matches!(block, Block::ImageReference { .. })),
+                )
+            {
                 match block {
                     Block::Text { text } if text.trim().is_empty() => continue,
                     Block::Text { text } => {
@@ -16180,6 +16396,47 @@ impl Agent {
                             "call_id": tool_use_id,
                             "output": content,
                         }));
+                    }
+                    Block::ImageReference { .. } => {
+                        let (reference, disclosure_target) =
+                            block_image_reference(block).expect("matched image reference");
+                        let content = if image_reference_is_active(
+                            disclosure_target,
+                            &current_image_target,
+                            message_index,
+                            current_turn_start,
+                        ) {
+                            match active_image_wire(&reference) {
+                                Ok((media_type, data)) => json!([{
+                                    "type": "input_image",
+                                    "image_url": format!("data:{media_type};base64,{data}"),
+                                }]),
+                                Err(error) => json!([{
+                                    "type": "input_text",
+                                    "text": image_placeholder(&reference, &error),
+                                }]),
+                            }
+                        } else {
+                            json!([{
+                                "type": "input_text",
+                                "text": image_placeholder(
+                                    &reference,
+                                    inactive_image_detail(
+                                        disclosure_target,
+                                        &current_image_target,
+                                        message_index,
+                                        current_turn_start,
+                                    ),
+                                ),
+                            }])
+                        };
+                        items.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": content,
+                            "id": format!("msg_{msg_counter}"),
+                        }));
+                        msg_counter += 1;
                     }
                     Block::ResponsesReasoning { item }
                         if preserve_reasoning_items
@@ -16410,7 +16667,11 @@ impl Agent {
                     self.kimi_model_allows_empty_thinking_signature(),
                 );
                 let prompt_cache_enabled = self.model_supports_prompt_cache();
-                let mut messages = anthropic_wire_messages(&messages, prompt_cache_enabled)?;
+                let mut messages = anthropic_wire_messages(
+                    &messages,
+                    prompt_cache_enabled,
+                    &self.image_disclosure_target(),
+                )?;
                 append_runtime_env_block(&mut messages, sys_env);
                 let system = system_blocks_with_cache_control(sys_blocks, prompt_cache_enabled);
                 let tools = wire_tools_with_cache_control(wire_tools, prompt_cache_enabled);
@@ -16496,7 +16757,14 @@ impl Agent {
             .collect();
         auto_approved_tools.sort();
         SessionHeader {
-            version: if self.active_pack_runtime.is_some() {
+            version: if self
+                .history
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, Block::ImageReference { .. }))
+            {
+                IMAGE_REFERENCE_FORMAT_VERSION
+            } else if self.active_pack_runtime.is_some() {
                 PACK_RUNTIME_FORMAT_VERSION
             } else if self.seat.is_some() {
                 SEAT_FORMAT_VERSION
@@ -16689,6 +16957,7 @@ impl Agent {
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut reader = io::BufReader::new(file);
         let header = read_session_header_line(&mut reader, path)?;
+        let source_version = persisted_session_source_version(header.trim_end())?;
         let current_approval_profile = self.approval_profile;
         let current_approval_policy_source = self.approval_policy_source;
         let current_sandbox_profile = self.sandbox_profile;
@@ -16766,6 +17035,8 @@ impl Agent {
                     .with_context(|| format!("bad message on line {}", i + 2))?,
             );
         }
+        validate_persisted_image_references(&hist, source_version)
+            .context("validating persisted image references")?;
         if provenance.api_provider == ApiProvider::ChatGpt
             || (provenance.api_provider == ApiProvider::OpenAi
                 && canonical_provider_id(&provenance.provider) == "openai"
@@ -17006,6 +17277,7 @@ impl Agent {
                         Block::ResponsesReasoning { item } => json_byte_len(item),
                         Block::ToolUse { input, .. } => json_byte_len(input),
                         Block::ToolResult { content, .. } => content.len(),
+                        Block::ImageReference { path, .. } => path.len() + 96,
                     })
                     .sum::<usize>()
             })
@@ -17112,6 +17384,7 @@ impl Agent {
                         is_error,
                         ..
                     } => tool_use_id.len() + content.len() + usize::from(is_error.is_some()),
+                    Block::ImageReference { path, .. } => path.len() + 96,
                 })
                 .sum::<usize>()
     }
@@ -17238,7 +17511,8 @@ impl Agent {
                     }),
                     Block::Thinking { .. }
                     | Block::RedactedThinking { .. }
-                    | Block::ResponsesReasoning { .. } => None,
+                    | Block::ResponsesReasoning { .. }
+                    | Block::ImageReference { .. } => None,
                 })
                 .collect();
 
@@ -17394,14 +17668,14 @@ impl Agent {
             let messages = vec![
                 OaiMessage {
                     role: "system".to_string(),
-                    content: Some(COMPACT_SYSTEM.to_string()),
+                    content: Some(Value::String(COMPACT_SYSTEM.to_string())),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
                 },
                 OaiMessage {
                     role: "user".to_string(),
-                    content: Some(user_text.clone()),
+                    content: Some(Value::String(user_text.clone())),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -17737,6 +18011,7 @@ impl Agent {
         explicit_pack: Option<packs::PackInvocation>,
     ) -> Result<()> {
         self.interrupt.store(false, Ordering::SeqCst);
+        self.successful_images_this_turn = 0;
         self.begin_provider_turn();
         self.sink.emit(AgentEvent::TurnStart);
         self.append_latest_log("chat_start", &format!("chars={}", user_input.len()));
@@ -19089,11 +19364,39 @@ fn system_time_unix_secs(time: std::time::SystemTime) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+fn persisted_session_source_version(line: &str) -> Result<u32> {
+    let value: Value = serde_json::from_str(line).context("bad session header")?;
+    match value.get("version") {
+        None => Ok(1),
+        Some(version) => version
+            .as_u64()
+            .and_then(|version| u32::try_from(version).ok())
+            .filter(|version| *version > 0)
+            .context("session header version must be a positive integer"),
+    }
+}
+
+fn validate_persisted_image_references(history: &[Message], source_version: u32) -> Result<()> {
+    for block in history.iter().flat_map(|message| &message.content) {
+        let Some((reference, _)) = block_image_reference(block) else {
+            continue;
+        };
+        if source_version < IMAGE_REFERENCE_FORMAT_VERSION {
+            anyhow::bail!(
+                "session image references are unsupported before format version {IMAGE_REFERENCE_FORMAT_VERSION}"
+            );
+        }
+        image::validate_reference(&reference).map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
 fn read_session_jsonl(path: &Path) -> Result<(SessionHeader, Vec<Message>)> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut reader = io::BufReader::new(file);
-    let header = read_session_header_line(&mut reader, path)?;
-    let header = parse_session_header(header.trim_end())?;
+    let header_line = read_session_header_line(&mut reader, path)?;
+    let source_version = persisted_session_source_version(header_line.trim_end())?;
+    let header = parse_session_header(header_line.trim_end())?;
     let mut history = Vec::new();
     for (i, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading line {} in {}", i + 2, path.display()))?;
@@ -19105,6 +19408,8 @@ fn read_session_jsonl(path: &Path) -> Result<(SessionHeader, Vec<Message>)> {
                 .with_context(|| format!("bad message on line {} in {}", i + 2, path.display()))?,
         );
     }
+    validate_persisted_image_references(&history, source_version)
+        .context("validating persisted image references")?;
     Ok((header, history))
 }
 
@@ -19335,6 +19640,25 @@ fn render_session_block_html(out: &mut String, block: &Block) {
             );
         }
         Block::ResponsesReasoning { .. } => {}
+        Block::ImageReference {
+            path,
+            media_type,
+            width,
+            height,
+            source_sha256,
+            ..
+        } => {
+            let digest = &source_sha256[..12.min(source_sha256.len())];
+            let _ = write!(
+                out,
+                "<div class=\"block\"><em>image reference</em> <code>{}</code> ({}x{}, {}, sha256 {})</div>",
+                html_escape(path),
+                width,
+                height,
+                html_escape(media_type),
+                html_escape(digest)
+            );
+        }
         Block::ToolUse { id, name, input } => {
             let input = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
             let _ = write!(
@@ -19526,7 +19850,8 @@ fn analyze_session_history(header: &SessionHeader, history: &[Message]) -> Sessi
                 }
                 Block::Thinking { .. }
                 | Block::RedactedThinking { .. }
-                | Block::ResponsesReasoning { .. } => {}
+                | Block::ResponsesReasoning { .. }
+                | Block::ImageReference { .. } => {}
             }
         }
     }
@@ -19657,6 +19982,16 @@ fn grep_session_history(history: &[Message], needle: &str) -> Vec<String> {
                     }
                 }
                 Block::ResponsesReasoning { .. } => {}
+                Block::ImageReference { path, .. } => {
+                    if path.to_ascii_lowercase().contains(&needle_lower) {
+                        hits.push(format!(
+                            "#{} {} image_reference: {}",
+                            idx + 1,
+                            msg.role,
+                            summarize_inline(path, 220)
+                        ));
+                    }
+                }
                 Block::ToolUse { name, input, .. } => {
                     let haystack = format!("{name} {input}");
                     if haystack.to_ascii_lowercase().contains(&needle_lower) {
@@ -21497,6 +21832,7 @@ fn handle_slash(line: &str, agent: &mut Agent) -> Option<bool> {
                         Block::ResponsesReasoning { .. } => "responses_reasoning",
                         Block::ToolUse { .. } => "tool_use",
                         Block::ToolResult { .. } => "tool_result",
+                        Block::ImageReference { .. } => "image_reference",
                         Block::PartialStream { .. } => "partial_stream",
                     })
                     .collect();
@@ -22592,6 +22928,7 @@ fn approx_tokens_for_message(m: &Message) -> usize {
             Block::ResponsesReasoning { item } => json_byte_len(item),
             Block::ToolUse { input, name, .. } => json_byte_len(input) + name.len(),
             Block::ToolResult { content, .. } => content.len(),
+            Block::ImageReference { path, .. } => path.len() + 96,
         })
         .sum();
     bytes.div_ceil(BYTES_PER_TOKEN_APPROX)
@@ -22627,6 +22964,7 @@ fn render_tokens_report(history: &[Message]) -> String {
                 Block::ResponsesReasoning { .. } => "responses_reasoning",
                 Block::ToolUse { .. } => "tool_use",
                 Block::ToolResult { .. } => "tool_result",
+                Block::ImageReference { .. } => "image_reference",
                 Block::PartialStream { .. } => "partial_stream",
             })
             .collect();

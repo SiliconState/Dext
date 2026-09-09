@@ -329,6 +329,7 @@ pub(crate) fn tool_input_issue(name: &str, input: &Value) -> Option<String> {
             }
             None
         }
+        "read_image" => None,
         "read_file" => {
             for field in ["offset", "limit"] {
                 if input[field].is_null() {
@@ -2232,8 +2233,8 @@ pub(crate) fn classify_command_risk(name: &str, input: &Value) -> CommandRisk {
         "git_commit" => CommandRisk::Danger,
         "write_file" | "edit_file" | "multi_edit" | "todo_write" => CommandRisk::Write,
         "fd" | "rg" if search_tool_input_exec_escape(name, input) => CommandRisk::Danger,
-        "read_file" | "read_symbol" | "fd" | "rg" | "jq" | "fzf" | "git_diff" | "git_status"
-        | "git_log" | "todo_read" => CommandRisk::Read,
+        "read_file" | "read_image" | "read_symbol" | "fd" | "rg" | "jq" | "fzf" | "git_diff"
+        | "git_status" | "git_log" | "todo_read" => CommandRisk::Read,
         "awk" => {
             let Some(raw_args) = input["args"].as_array() else {
                 return CommandRisk::Danger;
