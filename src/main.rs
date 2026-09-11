@@ -17121,7 +17121,21 @@ impl Agent {
             self.adopt_session_id(saved)?;
         }
 
-        self.model = model;
+        let provider_id = canonical_provider_id(&self.provider_id);
+        let provider_model_env = format!(
+            "DEXT_MODEL_{}",
+            provider_id.replace('-', "_").to_ascii_uppercase()
+        );
+        let explicit_selection = ["DEXT_PROVIDER", "DEXT_MODEL", &provider_model_env]
+            .iter()
+            .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()));
+        if !explicit_selection
+            && !self.session_model_pins.contains_key(&provider_id)
+            && provider_id == canonical_provider_id(&provenance.provider)
+            && self.api_provider == provenance.api_provider
+        {
+            self.model = model;
+        }
         self.refresh_context_window();
         self.system = system;
         self.allowed.clear();
