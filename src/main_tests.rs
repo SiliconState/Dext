@@ -6991,6 +6991,77 @@ fn session_replay_fixture_dedupe_cache_preserves_success_and_error_hits() -> Res
 }
 
 #[test]
+fn resume_preserves_selected_provider_model_and_history() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("resume-provider-model");
+    std::fs::create_dir_all(&root)?;
+    let path = root.join("session.jsonl");
+    let keys = ["DEXT_PROVIDER", "DEXT_MODEL", "DEXT_MODEL_GLM"];
+    let previous = keys.map(std::env::var_os);
+    for key in keys {
+        unsafe { std::env::remove_var(key) };
+    }
+    let result = (|| -> Result<()> {
+        let mut saved = test_agent(&root);
+        saved.provider_id = "chatgpt".to_string();
+        saved.model = "gpt-6-astra".to_string();
+        saved.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "keep this conversation".to_string(),
+            }],
+        });
+        saved.save_session_to_path(&path)?;
+        let mut resumed = test_agent(&root);
+        resumed.provider_id = "glm".to_string();
+        resumed.model = "glm-5.3".to_string();
+        resumed.load_session_from_path(&path)?;
+        assert_eq!(resumed.provider_id, "glm");
+        assert_eq!(resumed.model, "glm-5.3");
+        assert_eq!(
+            serde_json::to_value(&resumed.history)?,
+            serde_json::to_value(&saved.history)?
+        );
+
+        saved.provider_id = "glm".to_string();
+        saved.model = "glm-5.2".to_string();
+        saved.save_session_to_path(&path)?;
+        resumed.load_session_from_path(&path)?;
+        assert_eq!(resumed.model, "glm-5.2");
+        for key in keys {
+            unsafe {
+                std::env::set_var(
+                    key,
+                    if key == "DEXT_PROVIDER" {
+                        "glm"
+                    } else {
+                        "glm-5.3"
+                    },
+                )
+            };
+            resumed.model = "glm-5.3".to_string();
+            resumed.load_session_from_path(&path)?;
+            assert_eq!(resumed.model, "glm-5.3", "{key}");
+            unsafe { std::env::remove_var(key) };
+        }
+        resumed.pin_model_for_provider("glm", "glm-5.3");
+        resumed.load_session_from_path(&path)?;
+        assert_eq!(resumed.model, "glm-5.3");
+        Ok(())
+    })();
+    for (key, value) in keys.into_iter().zip(previous) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+    result
+}
+
+#[test]
 fn latest_session_roundtrip_restores_history_usage_and_sandbox() -> Result<()> {
     let _guard = env_lock();
     let root = temp_test_dir("resume-roundtrip");
@@ -17145,7 +17216,7 @@ fn valid_pack_runtime_restore_commits_prepared_state_after_preflight() -> Result
     }));
     agent.load_session_from_path(&path)?;
     assert_eq!(agent.sandbox_root, saved_root);
-    assert_eq!(agent.model, "restored-model");
+    assert_eq!(agent.model, "test-model");
     let restored = agent
         .active_pack_runtime
         .as_ref()
