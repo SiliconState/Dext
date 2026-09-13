@@ -89,6 +89,14 @@ fn ready_first_then_close_terminates_with_pure_json_stdout() {
     wait_within(&mut child, Duration::from_secs(20));
     assert_eq!(events[0]["event"], "ready", "{events:?}");
     assert_eq!(events[0]["data"]["input"], "ndjson");
+    assert_eq!(events[0]["data"]["ui_protocol"], 1);
+    assert!(
+        events[0]["data"]["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|frame| frame == "ui.response")
+    );
     let acks: Vec<_> = events
         .iter()
         .filter(|e| e["event"] == "input_ack")

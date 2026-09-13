@@ -22,6 +22,7 @@ const RUNTIME_STATE_CAP: usize = 64 * 1024;
 const RUNTIME_CONTENT_CAP: usize = 128 * 1024;
 const RUNTIME_VIEW_CAP: usize = 128 * 1024;
 const RUNTIME_EFFECT_LIMIT: usize = 16;
+const RUNTIME_UI_ROUND_LIMIT: usize = 16;
 const RUNTIME_TOOL_LIMIT: usize = 32;
 const RUNTIME_SCHEMA_CAP: usize = 32 * 1024;
 const RUNTIME_EXECUTABLE_CAP: u64 = 256 * 1024 * 1024;
@@ -68,6 +69,7 @@ pub(crate) struct ActiveRuntime {
     pub(crate) args: Vec<String>,
     pub(crate) timeout: Duration,
     pub(crate) tools: Vec<RuntimeTool>,
+    pub(crate) ui_protocol: Option<u32>,
     pub(crate) manifest_sha256: String,
     pub(crate) state: Value,
     pub(crate) max_continuations: u32,
@@ -90,8 +92,27 @@ pub(crate) struct RuntimeSnapshot {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RuntimeEvent<'a> {
     Activate,
-    Tool { name: &'a str, input: &'a Value },
+    Tool {
+        name: &'a str,
+        input: &'a Value,
+    },
     Idle,
+    UiResponse {
+        request_id: &'a str,
+        method: &'a str,
+        response: &'a crate::events::UiResponse,
+    },
+}
+
+pub(crate) const UI_ROUND_LIMIT: usize = RUNTIME_UI_ROUND_LIMIT;
+
+pub(crate) use crate::events::UiRequest as RuntimeUiRequest;
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeUiResponse<'a> {
+    request_id: &'a str,
+    method: &'a str,
+    response: &'a crate::events::UiResponse,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +121,8 @@ pub(crate) struct RuntimeContext<'a> {
     pub(crate) iteration: u32,
     pub(crate) history_messages: usize,
     pub(crate) compacted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) ui_methods: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -125,6 +148,7 @@ pub(crate) struct RuntimeInvocation {
     pub(crate) is_error: bool,
     pub(crate) state: Option<Value>,
     pub(crate) effects: Vec<RuntimeEffect>,
+    pub(crate) ui_request: Option<RuntimeUiRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +162,8 @@ struct RuntimeManifest {
     timeout_seconds: Option<u64>,
     #[serde(default)]
     tools: Vec<RuntimeToolManifest>,
+    #[serde(default)]
+    ui_protocol: Option<u32>,
     #[serde(default = "default_max_continuations")]
     max_continuations: u32,
 }
@@ -165,6 +191,8 @@ struct RuntimeRequest<'a> {
     tool: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ui: Option<RuntimeUiResponse<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +207,8 @@ struct RuntimeResponse {
     state: Option<Value>,
     #[serde(default)]
     effects: Vec<RuntimeEffect>,
+    #[serde(default)]
+    ui_request: Option<RuntimeUiRequest>,
 }
 
 fn default_max_continuations() -> u32 {
@@ -436,6 +466,9 @@ fn validate_manifest(manifest: &RuntimeManifest, builtin_names: &HashSet<String>
             RUNTIME_PROTOCOL_VERSION
         );
     }
+    if manifest.ui_protocol.is_some_and(|version| version != 1) {
+        bail!("unsupported pack runtime UI protocol; expected 1");
+    }
     if manifest.tools.len() > RUNTIME_TOOL_LIMIT {
         bail!("pack runtime declares more than {RUNTIME_TOOL_LIMIT} tools");
     }
@@ -511,6 +544,7 @@ pub(crate) fn load(
                 risk: tool.risk,
             })
             .collect(),
+        ui_protocol: manifest.ui_protocol,
         manifest_sha256: sha256_hex(&bytes),
         state: Value::Null,
         max_continuations: manifest.max_continuations,
@@ -695,6 +729,9 @@ fn validate_response(response: &RuntimeResponse) -> Result<()> {
     if let Some(state) = &response.state {
         validate_runtime_state(state)?;
     }
+    if let Some(request) = &response.ui_request {
+        validate_ui_request(request)?;
+    }
     for effect in &response.effects {
         match effect {
             RuntimeEffect::Steer { text }
@@ -727,6 +764,14 @@ fn validate_response(response: &RuntimeResponse) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_ui_request(request: &RuntimeUiRequest) -> Result<()> {
+    crate::ui_bridge::validate_request(request).map_err(anyhow::Error::msg)
+}
+
+pub(crate) fn validate_ui_response(response: &crate::events::UiResponse) -> Result<()> {
+    crate::ui_bridge::validate_response(response).map_err(anyhow::Error::msg)
+}
+
 fn runtime_timeout(configured: Option<u64>) -> Result<Duration> {
     if configured.is_some_and(|seconds| !(1..=RUNTIME_MAX_TIMEOUT_SECS).contains(&seconds)) {
         bail!("pack runtime timeout_seconds must be between 1 and {RUNTIME_MAX_TIMEOUT_SECS}");
@@ -751,7 +796,7 @@ pub(crate) async fn invoke(
     event: RuntimeEvent<'_>,
     root: &Path,
     session_id: &str,
-    context: RuntimeContext<'_>,
+    mut context: RuntimeContext<'_>,
     interrupt: Arc<AtomicBool>,
     sandbox_profile: SandboxProfile,
 ) -> Result<RuntimeInvocation> {
@@ -764,17 +809,37 @@ pub(crate) async fn invoke(
     if executable_sha256 != runtime.executable_sha256 {
         bail!("pack runtime executable changed after activation; reactivate the pack to review it");
     }
-    let (event_name, tool, input) = match event {
-        RuntimeEvent::Activate => ("activate", None, None),
+    let (event_name, tool, input, ui) = match event {
+        RuntimeEvent::Activate => ("activate", None, None, None),
         RuntimeEvent::Tool { name, input } => {
             let tool = runtime
                 .tool(name)
                 .with_context(|| format!("pack runtime does not declare tool {name}"))?;
             validate_tool_input(tool, input)?;
-            ("tool", Some(name), Some(input))
+            ("tool", Some(name), Some(input), None)
         }
-        RuntimeEvent::Idle => ("idle", None, None),
+        RuntimeEvent::Idle => ("idle", None, None, None),
+        RuntimeEvent::UiResponse {
+            request_id,
+            method,
+            response,
+        } => {
+            validate_ui_response(response)?;
+            (
+                "ui_response",
+                None,
+                None,
+                Some(RuntimeUiResponse {
+                    request_id,
+                    method,
+                    response,
+                }),
+            )
+        }
     };
+    if runtime.ui_protocol != Some(1) {
+        context.ui_methods.clear();
+    }
     let request = RuntimeRequest {
         version: RUNTIME_PROTOCOL_VERSION,
         event: event_name,
@@ -785,6 +850,7 @@ pub(crate) async fn invoke(
         context,
         tool,
         input,
+        ui,
     };
     let request = serde_json::to_string(&request)?;
     if request.len() > RUNTIME_REQUEST_CAP {
@@ -821,11 +887,15 @@ pub(crate) async fn invoke(
     let response: RuntimeResponse = serde_json::from_str(stdout.trim())
         .context("pack runtime stdout must contain one JSON response object")?;
     validate_response(&response)?;
+    if response.ui_request.is_some() && runtime.ui_protocol != Some(1) {
+        bail!("pack runtime returned ui_request without declaring ui_protocol: 1");
+    }
     Ok(RuntimeInvocation {
         content: response.content,
         is_error: response.is_error,
         state: response.state,
         effects: response.effects,
+        ui_request: response.ui_request,
     })
 }
 
@@ -906,6 +976,58 @@ mod tests {
     }
 
     #[test]
+    fn runtime_ui_protocol_requires_explicit_supported_opt_in() {
+        let parse = |version| {
+            serde_json::from_value::<RuntimeManifest>(json!({
+                "version": 1,
+                "command": "runtime",
+                "ui_protocol": version
+            }))
+            .unwrap()
+        };
+        assert!(validate_manifest(&parse(1), &HashSet::new()).is_ok());
+        assert!(validate_manifest(&parse(2), &HashSet::new()).is_err());
+    }
+
+    #[test]
+    fn ui_payload_validation_covers_keys_values_and_errors() {
+        let safe = RuntimeUiRequest {
+            id: "profile-1".to_string(),
+            method: "form".to_string(),
+            params: json!({"title": "Profile", "fields": [{"id": "name"}]}),
+        };
+        assert!(validate_ui_request(&safe).is_ok());
+
+        for request in [
+            RuntimeUiRequest {
+                id: "bad id".to_string(),
+                ..safe.clone()
+            },
+            RuntimeUiRequest {
+                params: json!({"bad\u{1b}key": "value"}),
+                ..safe.clone()
+            },
+            RuntimeUiRequest {
+                params: json!({"value": "unsafe\u{7}"}),
+                ..safe.clone()
+            },
+            RuntimeUiRequest {
+                params: json!({"value": "x".repeat(64 * 1024)}),
+                ..safe.clone()
+            },
+        ] {
+            assert!(validate_ui_request(&request).is_err(), "{request:?}");
+        }
+        assert!(
+            validate_ui_response(&crate::events::UiResponse::Error {
+                code: "bad code".to_string(),
+                message: "no".to_string(),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     fn runtime_response_effects_are_bounded_and_terminal_safe() {
         let response = RuntimeResponse {
             version: 1,
@@ -916,6 +1038,7 @@ mod tests {
                 prompt: "continue".to_string(),
                 delay_ms: 1,
             }],
+            ui_request: None,
         };
         assert!(validate_response(&response).is_ok());
 
@@ -926,6 +1049,7 @@ mod tests {
                 is_error: false,
                 state: None,
                 effects: Vec::new(),
+                ui_request: None,
             },
             RuntimeResponse {
                 version: 1,
@@ -935,6 +1059,7 @@ mod tests {
                 effects: vec![RuntimeEffect::Steer {
                     text: "unsafe\u{7}".to_string(),
                 }],
+                ui_request: None,
             },
             RuntimeResponse {
                 version: 1,
@@ -945,6 +1070,7 @@ mod tests {
                     title: "unsafe\nview".to_string(),
                     markdown: "safe markdown".to_string(),
                 }],
+                ui_request: None,
             },
         ] {
             assert!(validate_response(&response).is_err(), "{response:?}");
@@ -1015,6 +1141,7 @@ mod tests {
                 iteration: 0,
                 history_messages: 0,
                 compacted: false,
+                ui_methods: Vec::new(),
             },
             Arc::new(AtomicBool::new(false)),
             SandboxProfile::ReadOnly,
@@ -1041,6 +1168,7 @@ mod tests {
                 iteration: 1,
                 history_messages: 0,
                 compacted: false,
+                ui_methods: Vec::new(),
             },
             Arc::new(AtomicBool::new(false)),
             SandboxProfile::ReadOnly,

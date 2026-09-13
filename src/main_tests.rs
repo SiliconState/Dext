@@ -231,6 +231,34 @@ struct RecordingPermissionSink {
     names: Arc<Mutex<Vec<String>>>,
 }
 
+struct FixedUiSink {
+    methods: Vec<String>,
+    response: UiResponse,
+    requests: Arc<Mutex<Vec<(String, UiRequest)>>>,
+}
+
+impl EventSink for FixedUiSink {
+    fn emit(&mut self, _event: AgentEvent) {}
+
+    fn request_permission(&mut self, _name: &str, _input: &Value) -> Choice {
+        Choice::Once
+    }
+
+    fn request_ui(&mut self, pack: &str, request: &UiRequest) -> UiResponse {
+        self.requests
+            .lock()
+            .unwrap()
+            .push((pack.to_string(), request.clone()));
+        self.response.clone()
+    }
+
+    fn ui_methods(&self) -> Vec<String> {
+        self.methods.clone()
+    }
+
+    fn local_auth_prompt(&mut self, _tool: &str, _message: &str) {}
+}
+
 impl EventSink for RecordingPermissionSink {
     fn emit(&mut self, _event: AgentEvent) {}
 
@@ -8067,11 +8095,15 @@ fn ndjson_router_routes_by_type_and_busy_state() {
     let (runtime_control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (steering_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (permission_tx, perm_rx) = std::sync::mpsc::sync_channel::<PermissionReply>(1);
+    let (ui_tx, ui_rx) = std::sync::mpsc::sync_channel::<UiReply>(1);
     let ch = NdjsonChannels {
         input_tx,
         runtime_control_tx,
         steering_tx,
         permission_tx,
+        ui_tx,
+        ui_capabilities: Arc::new(std::sync::RwLock::new(UiCapabilities::default())),
+        pending_ui: Arc::new(PendingUiRequest::default()),
         busy: Arc::new(AtomicBool::new(false)),
         interrupt: Arc::new(AtomicBool::new(false)),
         pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -8144,6 +8176,44 @@ fn ndjson_router_routes_by_type_and_busy_state() {
         "invalid"
     );
 
+    assert_eq!(
+        route(r#"{"type":"ui.capabilities","methods":["form","progress"]}"#),
+        "ui_capabilities_set"
+    );
+    assert!(ch.ui_capabilities.read().unwrap().supports("form"));
+    assert_eq!(
+        route(r#"{"type":"ui.response","id":"ui-1","status":"ok","value":{"name":"Ada"}}"#),
+        "invalid"
+    );
+    ch.pending_ui.begin("ui-1".to_string()).unwrap();
+    assert_eq!(
+        route(
+            r#"{"type":"ui.response","id":"ui-1","status":"error","code":"bad code","message":"no"}"#
+        ),
+        "invalid"
+    );
+    assert_eq!(
+        route(r#"{"type":"ui.response","id":"ui-1","status":"ok","value":{"name":"Ada"}}"#),
+        "ui_response_forwarded"
+    );
+    assert_eq!(
+        ui_rx.try_recv().unwrap(),
+        UiReply {
+            id: "ui-1".into(),
+            response: UiResponse::Ok {
+                value: json!({"name": "Ada"})
+            }
+        }
+    );
+    assert_eq!(
+        route(r#"{"type":"ui.response","id":"ui-1","status":"cancelled"}"#),
+        "invalid"
+    );
+    assert_eq!(
+        route(r#"{"type":"ui.response","id":"ui-2","status":"unknown"}"#),
+        "invalid"
+    );
+
     assert_eq!(route(r#"{"type":"interrupt"}"#), "interrupted");
     assert!(ch.interrupt.load(Ordering::SeqCst));
     assert_eq!(route(r#"{"type":"close"}"#), "close");
@@ -8172,11 +8242,15 @@ fn ndjson_budget_bounds_busy_batches_and_releases_on_consumption() {
     agent.install_runtime_controls(control_rx, runtime_control_tx.clone());
     agent.install_steering(steer_rx, steering_tx.clone());
     let (permission_tx, _permission_rx) = std::sync::mpsc::sync_channel(8);
+    let (ui_tx, _ui_rx) = std::sync::mpsc::sync_channel(8);
     let ch = NdjsonChannels {
         input_tx,
         runtime_control_tx,
         steering_tx,
         permission_tx,
+        ui_tx,
+        ui_capabilities: Arc::new(std::sync::RwLock::new(UiCapabilities::default())),
+        pending_ui: Arc::new(PendingUiRequest::default()),
         busy: Arc::new(AtomicBool::new(false)),
         interrupt: Arc::new(AtomicBool::new(false)),
         pending: pending.clone(),
@@ -16911,6 +16985,7 @@ fn pack_runtime_default_always_profile_does_not_prompt() {
         args: Vec::new(),
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
+        ui_protocol: None,
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -16952,6 +17027,7 @@ fn pack_runtime_always_approval_is_exact_identity_scoped() {
         args: Vec::new(),
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
+        ui_protocol: None,
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -17062,6 +17138,7 @@ fn pack_runtime_activation_is_revoked_when_safety_policy_changes() {
                 input_schema: json!({"type": "object"}),
                 risk: pack_runtime::RuntimeRisk::Write,
             }],
+            ui_protocol: None,
             manifest_sha256: "manifest".to_string(),
             state: Value::Null,
             max_continuations: 2,
@@ -17315,6 +17392,7 @@ fn pack_runtime_invocation_application_is_atomic() {
         args: Vec::new(),
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
+        ui_protocol: None,
         manifest_sha256: "manifest".to_string(),
         state: json!({"old": true}),
         max_continuations: 1,
@@ -17344,6 +17422,7 @@ fn pack_runtime_invocation_application_is_atomic() {
                         delay_ms: 0,
                     },
                 ],
+                ui_request: None,
             },
             false,
         )
@@ -17357,18 +17436,21 @@ fn pack_runtime_invocation_application_is_atomic() {
     assert_eq!(runtime.continuations_used, 0);
     assert!(agent.pending_pack_runtime_prompts.is_empty());
 
-    let content = agent
+    let (content, ui_request, explicit_continuation) = agent
         .apply_pack_runtime_invocation(
             pack_runtime::RuntimeInvocation {
                 content: "idle follow-up".to_string(),
                 is_error: false,
                 state: Some(json!({"new": true})),
                 effects: Vec::new(),
+                ui_request: None,
             },
             true,
         )
         .unwrap();
     assert_eq!(content, "idle follow-up");
+    assert!(ui_request.is_none());
+    assert!(!explicit_continuation);
     let runtime = agent.active_pack_runtime.as_ref().unwrap();
     assert_eq!(runtime.state, json!({"new": true}));
     assert_eq!(runtime.continuations_used, 1);
@@ -17388,6 +17470,7 @@ fn pack_runtime_invocation_application_is_atomic() {
                     prompt: "persist me".to_string(),
                     delay_ms: 10,
                 }],
+                ui_request: None,
             },
             false,
         )
@@ -17399,6 +17482,133 @@ fn pack_runtime_invocation_application_is_atomic() {
         vec![("persist me".to_string(), 10)]
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pack_runtime_ui_round_trip_is_generic_bounded_and_private() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = temp_test_dir("pack-runtime-ui-round-trip");
+    std::fs::write(root.join("PACK.md"), "# Demo\n")?;
+    let helper = root.join("runtime.sh");
+    std::fs::write(
+        &helper,
+        r#"#!/bin/sh
+set -eu
+request=$(cat)
+printf '%s' "$request" | grep -Fq '"event":"ui_response"'
+printf '%s' "$request" | grep -Fq '"request_id":"profile"'
+printf '%s' "$request" | grep -Fq '"method":"form"'
+printf '%s' "$request" | grep -Fq '"status":"ok"'
+printf '%s' "$request" | grep -Fq '"name":"Ada"'
+printf '%s' "$request" | grep -Fq '"ui_methods":["form"]'
+printf '%s\n' '{"version":1,"content":"form accepted","state":{"answered":true},"effects":[]}'
+"#,
+    )?;
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+    let manifest = root.join(pack_runtime::RUNTIME_MANIFEST_NAME);
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "command": "runtime.sh",
+            "ui_protocol": 1,
+            "tools": []
+        }))?,
+    )?;
+    let pack = packs::PackInfo {
+        name: "demo".to_string(),
+        description: "demo".to_string(),
+        path: root.clone(),
+        pack_md_path: root.join("PACK.md"),
+        phooks_path: None,
+        runtime_path: Some(manifest),
+        credential_env: Vec::new(),
+        credential_env_ignored: false,
+        ui: None,
+        source: "user:test".to_string(),
+        shelf: Some("test".to_string()),
+    };
+    let runtime = pack_runtime::load(&pack, &HashSet::new())?.context("runtime")?;
+    let mut agent = test_agent(&root);
+    agent.active_pack_runtime = Some(runtime);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    agent.set_sink(Box::new(FixedUiSink {
+        methods: vec!["form".to_string()],
+        response: UiResponse::Ok {
+            value: json!({"name": "Ada"}),
+        },
+        requests: requests.clone(),
+    }));
+
+    let private_note = [
+        "SERVICE",
+        "_TOKEN='",
+        "abcdefghijklmnopqrstuvwxyz123456",
+        "'",
+    ]
+    .concat();
+    let mut params = json!({
+        "title": "Profile",
+        "note": private_note
+    });
+    params.as_object_mut().unwrap().insert(
+        private_note.clone(),
+        Value::String("key-secret".to_string()),
+    );
+    let (content, request, explicit_continuation) = agent.apply_pack_runtime_invocation(
+        pack_runtime::RuntimeInvocation {
+            content: String::new(),
+            is_error: false,
+            state: None,
+            effects: Vec::new(),
+            ui_request: Some(UiRequest {
+                id: "profile".to_string(),
+                method: "form".to_string(),
+                params,
+            }),
+        },
+        false,
+    )?;
+    assert!(!explicit_continuation);
+    let (content, explicit_continuation) = agent
+        .resolve_pack_runtime_ui(
+            content,
+            request,
+            RuntimeUiChainContext {
+                count_idle_content_as_continuation: true,
+                explicit_continuation: false,
+                turn_id: "turn-1",
+                iteration: 2,
+                compacted: false,
+            },
+        )
+        .await?;
+    assert!(!explicit_continuation);
+    assert_eq!(
+        agent
+            .active_pack_runtime
+            .as_ref()
+            .unwrap()
+            .continuations_used,
+        1
+    );
+    assert_eq!(content, "form accepted");
+    assert_eq!(
+        agent.active_pack_runtime.as_ref().unwrap().state,
+        json!({"answered": true})
+    );
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0, "demo");
+    assert_eq!(captured[0].1.method, "form");
+    let captured_params = captured[0].1.params.to_string();
+    assert!(!captured_params.contains("abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(captured_params.contains("[REDACTED_SECRET]"));
+
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
 }
 
 #[test]
@@ -19941,6 +20151,7 @@ fn slash_allow_and_allowed_include_active_runtime_tools() {
             input_schema: json!({"type":"object"}),
             risk: pack_runtime::RuntimeRisk::Write,
         }],
+        ui_protocol: None,
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -28759,6 +28970,7 @@ fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
             }),
             risk: pack_runtime::RuntimeRisk::Read,
         }],
+        ui_protocol: None,
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -28917,6 +29129,7 @@ fn tool_disabled_models_expose_no_static_or_dynamic_tools() {
             input_schema: json!({"type": "object"}),
             risk: pack_runtime::RuntimeRisk::Read,
         }],
+        ui_protocol: None,
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
