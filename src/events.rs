@@ -1,13 +1,45 @@
 //! The agent event stream: every observable thing a turn does, plus the sink
 //! trait each front end (console, JSON, TUI channel) implements to consume it.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     ApprovalProfile, Choice, ContextMode, LocalAuthSecret, ReasoningMode, ThinkingEffort, Usage,
     orchestrator,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UiRequest {
+    pub(crate) id: String,
+    pub(crate) method: String,
+    #[serde(default)]
+    pub(crate) params: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum UiResponse {
+    Ok {
+        #[serde(default)]
+        value: Value,
+    },
+    Cancelled,
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+impl UiResponse {
+    pub(crate) fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Error {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
 
 #[derive(Serialize, Clone)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
@@ -149,6 +181,15 @@ pub(crate) enum AgentEvent {
 pub(crate) trait EventSink: Send + Sync {
     fn emit(&mut self, event: AgentEvent);
     fn request_permission(&mut self, name: &str, input: &Value) -> Choice;
+    fn request_ui(&mut self, _pack: &str, _request: &UiRequest) -> UiResponse {
+        UiResponse::error(
+            "unsupported",
+            "this frontend does not provide the pack UI channel",
+        )
+    }
+    fn ui_methods(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn local_auth_prompt(&mut self, tool: &str, message: &str);
     fn machine_live_output(&self) -> bool {
         false

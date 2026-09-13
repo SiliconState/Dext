@@ -24,6 +24,7 @@ mod tool_policy;
 mod tool_round;
 mod tools;
 mod tui;
+mod ui_bridge;
 mod usage;
 mod verification;
 
@@ -75,6 +76,9 @@ use tools::{
     Tool, ToolProfile, is_external_process_tool, is_sensitive_read_tool,
     is_side_effect_capable_tool, needs_permission, provider_tool_definitions,
     should_parallelize_builtin_tools,
+};
+use ui_bridge::{
+    PendingUiRequest, UiBridge, UiCapabilities, UiReply, parse_response as parse_ui_response,
 };
 use verification::{CodeLoopState, VerificationRecord};
 
@@ -1688,6 +1692,9 @@ struct NdjsonChannels {
     runtime_control_tx: tokio::sync::mpsc::UnboundedSender<String>,
     steering_tx: tokio::sync::mpsc::UnboundedSender<String>,
     permission_tx: std::sync::mpsc::SyncSender<PermissionReply>,
+    ui_tx: std::sync::mpsc::SyncSender<UiReply>,
+    ui_capabilities: Arc<std::sync::RwLock<UiCapabilities>>,
+    pending_ui: Arc<PendingUiRequest>,
     busy: Arc<AtomicBool>,
     interrupt: Arc<AtomicBool>,
     pending: Arc<std::sync::atomic::AtomicUsize>,
@@ -1696,9 +1703,11 @@ struct NdjsonChannels {
 /// Route one parsed stdin frame; returns the `input_ack` route and detail.
 ///   {"type":"user"|"steer","text":…,"confirm_secret"?:bool}  prompt; steer while busy
 ///   {"type":"control","command":"/effort high"}              slash; runtime control while busy
-///   {"type":"interrupt"}  {"type":"permission","id":…,"choice":"once|always|deny"}  {"type":"close"}
+///   {"type":"interrupt"}  {"type":"permission",…}  {"type":"ui.capabilities",…}
+///   {"type":"ui.response",…}  {"type":"close"}
 /// Idle input shares text-mode confirmation; busy input reserves the entire
-/// destination batch before publishing, without blocking interrupt/permission input.
+/// destination batch before publishing, without blocking interrupt, permission,
+/// or UI-response input.
 fn ndjson_route(frame: &Value, ch: &NdjsonChannels) -> (&'static str, Option<String>) {
     let kind = frame["type"].as_str().unwrap_or("");
     let field = |key: &str| {
@@ -1812,6 +1821,46 @@ fn ndjson_route(frame: &Value, ch: &NdjsonChannels) -> (&'static str, Option<Str
                 "invalid",
                 Some("permission: needs id and choice once|always|deny".to_string()),
             ),
+        },
+        "ui.capabilities" => {
+            let Ok(mut capabilities) = ch.ui_capabilities.write() else {
+                return (
+                    "invalid",
+                    Some("UI capability registry unavailable".to_string()),
+                );
+            };
+            match capabilities.replace_from_frame(frame) {
+                Ok(()) => ("ui_capabilities_set", None),
+                Err(detail) => ("invalid", Some(detail)),
+            }
+        }
+        "ui.response" => match parse_ui_response(frame) {
+            Ok(reply) => {
+                if pack_runtime::validate_ui_response(&reply.response).is_err() {
+                    return (
+                        "invalid",
+                        Some("ui.response: payload exceeds its bounds".to_string()),
+                    );
+                }
+                if !ch.pending_ui.claim(&reply.id) {
+                    return (
+                        "invalid",
+                        Some("ui.response: id is stale or already answered".to_string()),
+                    );
+                }
+                let id = reply.id.clone();
+                match ch.ui_tx.try_send(reply) {
+                    Ok(()) => ("ui_response_forwarded", None),
+                    Err(_) => {
+                        ch.pending_ui.unclaim(&id);
+                        (
+                            "invalid",
+                            Some("UI response queue full or closed".to_string()),
+                        )
+                    }
+                }
+            }
+            Err(detail) => ("invalid", Some(detail)),
         },
         "close" => ("close", None),
         other => ("invalid", Some(format!("unknown type '{other}'"))),
@@ -2058,6 +2107,7 @@ struct JsonSink {
     inner: ConsoleSink,
     stream: OutputStreamState,
     permissions: Option<PermissionBridge>,
+    ui: Option<UiBridge>,
 }
 
 impl JsonSink {
@@ -2067,11 +2117,17 @@ impl JsonSink {
             inner: ConsoleSink::new(pretty, silent),
             stream: OutputStreamState::default(),
             permissions: None,
+            ui: None,
         }
     }
 
     fn with_permission_bridge(mut self, bridge: PermissionBridge) -> Self {
         self.permissions = Some(bridge);
+        self
+    }
+
+    fn with_ui_bridge(mut self, bridge: UiBridge) -> Self {
+        self.ui = Some(bridge);
         self
     }
 
@@ -2172,6 +2228,47 @@ impl EventSink for JsonSink {
             }
         }));
         choice
+    }
+
+    fn request_ui(&mut self, pack: &str, request: &pack_runtime::RuntimeUiRequest) -> UiResponse {
+        if self.mode != OutputMode::StreamJson {
+            return UiResponse::error("unsupported", "pack UI requires the NDJSON host protocol");
+        }
+        let Some(bridge) = self.ui.as_mut() else {
+            return UiResponse::error("unsupported", "pack UI requires the NDJSON host protocol");
+        };
+        if !bridge.supports(&request.method) {
+            return UiResponse::error(
+                "unsupported",
+                format!("host did not advertise UI method '{}'", request.method),
+            );
+        }
+        bridge.next_id += 1;
+        let id = format!("ui-{}-{}", std::process::id(), bridge.next_id);
+        if let Err(message) = bridge.begin(&id) {
+            return UiResponse::error("unavailable", message);
+        }
+        Self::emit_json_line(&json!({
+            "event": "ui.request",
+            "data": {
+                "id": id,
+                "pack": pack,
+                "request_id": request.id,
+                "method": request.method,
+                "params": request.params,
+            }
+        }));
+        bridge.wait(&id)
+    }
+
+    fn ui_methods(&self) -> Vec<String> {
+        let Some(bridge) = &self.ui else {
+            return Vec::new();
+        };
+        let Ok(capabilities) = bridge.capabilities.read() else {
+            return Vec::new();
+        };
+        capabilities.methods()
     }
 
     fn local_auth_prompt(&mut self, tool: &str, message: &str) {
@@ -13528,6 +13625,22 @@ struct Agent {
     last_checkpoint_signature: Option<(usize, usize)>,
 }
 
+fn pack_runtime_invocation_exposes_content(invocation: &pack_runtime::RuntimeInvocation) -> bool {
+    !invocation.content.trim().is_empty()
+        || invocation
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, pack_runtime::RuntimeEffect::Steer { .. }))
+}
+
+struct RuntimeUiChainContext<'a> {
+    count_idle_content_as_continuation: bool,
+    explicit_continuation: bool,
+    turn_id: &'a str,
+    iteration: u32,
+    compacted: bool,
+}
+
 impl Agent {
     fn new() -> Result<Self> {
         Self::new_with_sandbox(None, true, false, context_mode_from_env()?)
@@ -14888,6 +15001,7 @@ impl Agent {
             "runtime": pack.runtime_path.as_ref().map(|path| path.display().to_string()),
             "executable_sha256": &runtime.executable_sha256,
             "tools": runtime.tools.iter().map(|tool| format!("{}:{:?}", tool.name, tool.risk).to_ascii_lowercase()).collect::<Vec<_>>(),
+            "ui_protocol": runtime.ui_protocol,
             "risk": format!(
                 "executes a pack-owned native helper with credentials removed under the current {} sandbox profile; declared write/danger tools retain Git checkpoint controls",
                 self.sandbox_profile.as_str()
@@ -14936,6 +15050,7 @@ impl Agent {
                 iteration: 0,
                 history_messages: self.history.len(),
                 compacted: false,
+                ui_methods: self.sink.ui_methods(),
             },
             self.interrupt.clone(),
             self.sandbox_profile,
@@ -14952,7 +15067,28 @@ impl Agent {
             anyhow::anyhow!(detail)
         })?;
         self.active_pack_runtime = Some(runtime);
-        let content = match self.apply_pack_runtime_invocation(invocation, false) {
+        let (content, ui_request, explicit_continuation) =
+            match self.apply_pack_runtime_invocation(invocation, false) {
+                Ok(applied) => applied,
+                Err(error) => {
+                    self.deactivate_pack_runtime();
+                    return Err(error);
+                }
+            };
+        let (content, _) = match self
+            .resolve_pack_runtime_ui(
+                content,
+                ui_request,
+                RuntimeUiChainContext {
+                    count_idle_content_as_continuation: false,
+                    explicit_continuation,
+                    turn_id: "activation",
+                    iteration: 0,
+                    compacted: false,
+                },
+            )
+            .await
+        {
             Ok(content) => content,
             Err(error) => {
                 self.deactivate_pack_runtime();
@@ -14965,9 +15101,9 @@ impl Agent {
 
     fn apply_pack_runtime_invocation(
         &mut self,
-        invocation: pack_runtime::RuntimeInvocation,
-        count_idle_content_as_continuation: bool,
-    ) -> Result<String> {
+        mut invocation: pack_runtime::RuntimeInvocation,
+        implicit_content_continuation: bool,
+    ) -> Result<(String, Option<pack_runtime::RuntimeUiRequest>, bool)> {
         let mut content = self.privacy.redact_text(&invocation.content).text;
         if invocation.is_error {
             bail!(
@@ -14978,6 +15114,10 @@ impl Agent {
                     format!(": {}", content.trim())
                 }
             );
+        }
+        if let Some(request) = invocation.ui_request.as_mut() {
+            self.privacy.redact_json_for_disclosure(&mut request.params);
+            pack_runtime::validate_ui_request(request)?;
         }
         let pack_name = self
             .active_pack_runtime
@@ -15007,10 +15147,10 @@ impl Agent {
                 }
             }
         }
-        let implicit_continuation = usize::from(
-            count_idle_content_as_continuation && !content.trim().is_empty() && prompts.is_empty(),
-        );
-        let continuations = prompts.len().saturating_add(implicit_continuation);
+        let explicit_continuation = prompts.len();
+        let continuations = explicit_continuation
+            .checked_add(usize::from(implicit_content_continuation))
+            .context("pack runtime continuation counter overflow")?;
         let mut next_pending = self.pending_pack_runtime_prompts.clone();
         next_pending.extend(prompts);
         pack_runtime::validate_pending_continuations(&next_pending)?;
@@ -15048,7 +15188,88 @@ impl Agent {
                 markdown,
             });
         }
-        Ok(content)
+        Ok((content, invocation.ui_request, explicit_continuation > 0))
+    }
+
+    async fn resolve_pack_runtime_ui(
+        &mut self,
+        mut content: String,
+        mut request: Option<pack_runtime::RuntimeUiRequest>,
+        mut context: RuntimeUiChainContext<'_>,
+    ) -> Result<(String, bool)> {
+        let mut rounds = 0usize;
+        while let Some(ui_request) = request {
+            if rounds >= pack_runtime::UI_ROUND_LIMIT {
+                bail!(
+                    "pack runtime requested more than {} UI round trips",
+                    pack_runtime::UI_ROUND_LIMIT
+                );
+            }
+            rounds += 1;
+            let pack_name = self
+                .active_pack_runtime
+                .as_ref()
+                .map(|runtime| runtime.pack_name.clone())
+                .context("pack runtime UI request has no active runtime")?;
+            let response = self.sink.request_ui(&pack_name, &ui_request);
+            if self.interrupt.load(Ordering::SeqCst) {
+                bail!("pack runtime UI request interrupted");
+            }
+            pack_runtime::validate_ui_response(&response)?;
+            let runtime = self
+                .active_pack_runtime
+                .clone()
+                .context("pack runtime UI response has no active runtime")?;
+            let invocation = pack_runtime::invoke(
+                &runtime,
+                pack_runtime::RuntimeEvent::UiResponse {
+                    request_id: &ui_request.id,
+                    method: &ui_request.method,
+                    response: &response,
+                },
+                &self.sandbox_root,
+                &self.session_id,
+                pack_runtime::RuntimeContext {
+                    turn_id: context.turn_id,
+                    iteration: context.iteration,
+                    history_messages: self.history.len(),
+                    compacted: context.compacted,
+                    ui_methods: self.sink.ui_methods(),
+                },
+                self.interrupt.clone(),
+                self.sandbox_profile,
+            )
+            .await
+            .map_err(|error| {
+                let detail = self
+                    .privacy
+                    .redact_text(&format!("pack runtime UI response failed: {error:#}"))
+                    .text;
+                anyhow::anyhow!(detail)
+            })?;
+            let has_ui_request = invocation.ui_request.is_some();
+            let invocation_has_continuation = invocation
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, pack_runtime::RuntimeEffect::Continue { .. }));
+            let implicit_content_continuation = context.count_idle_content_as_continuation
+                && !context.explicit_continuation
+                && !invocation_has_continuation
+                && !has_ui_request
+                && (!content.trim().is_empty()
+                    || pack_runtime_invocation_exposes_content(&invocation));
+            let (next_content, next_request, invocation_has_continuation) =
+                self.apply_pack_runtime_invocation(invocation, implicit_content_continuation)?;
+            context.explicit_continuation |= invocation_has_continuation;
+            if !next_content.trim().is_empty() {
+                if !content.is_empty() {
+                    content.push_str("\n\n");
+                }
+                content.push_str(&next_content);
+            }
+            request = next_request;
+        }
+        Ok((content, context.explicit_continuation))
     }
 
     async fn execute_pack_runtime_tool(
@@ -15073,14 +15294,30 @@ impl Agent {
                 iteration,
                 history_messages: self.history.len(),
                 compacted: false,
+                ui_methods: self.sink.ui_methods(),
             },
             self.interrupt.clone(),
             sandbox_profile,
         )
         .await
         .map_err(|error| format!("{error:#}"))?;
-        self.apply_pack_runtime_invocation(invocation, false)
-            .map_err(|error| format!("{error:#}"))
+        let (content, ui_request, explicit_continuation) = self
+            .apply_pack_runtime_invocation(invocation, false)
+            .map_err(|error| format!("{error:#}"))?;
+        self.resolve_pack_runtime_ui(
+            content,
+            ui_request,
+            RuntimeUiChainContext {
+                count_idle_content_as_continuation: false,
+                explicit_continuation,
+                turn_id,
+                iteration,
+                compacted: false,
+            },
+        )
+        .await
+        .map(|(content, _)| content)
+        .map_err(|error| format!("{error:#}"))
     }
 
     async fn invoke_pack_runtime_idle(
@@ -15102,6 +15339,7 @@ impl Agent {
                 iteration,
                 history_messages: self.history.len(),
                 compacted,
+                ui_methods: self.sink.ui_methods(),
             },
             self.interrupt.clone(),
             self.sandbox_profile,
@@ -15114,7 +15352,29 @@ impl Agent {
                 .text;
             anyhow::anyhow!(detail)
         })?;
-        let content = self.apply_pack_runtime_invocation(invocation, true)?;
+        let has_ui_request = invocation.ui_request.is_some();
+        let invocation_has_continuation = invocation
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, pack_runtime::RuntimeEffect::Continue { .. }));
+        let implicit_content_continuation = !has_ui_request
+            && !invocation_has_continuation
+            && pack_runtime_invocation_exposes_content(&invocation);
+        let (content, ui_request, explicit_continuation) =
+            self.apply_pack_runtime_invocation(invocation, implicit_content_continuation)?;
+        let (content, _) = self
+            .resolve_pack_runtime_ui(
+                content,
+                ui_request,
+                RuntimeUiChainContext {
+                    count_idle_content_as_continuation: true,
+                    explicit_continuation,
+                    turn_id,
+                    iteration,
+                    compacted,
+                },
+            )
+            .await?;
         if !content.trim().is_empty() {
             self.history.push(Message {
                 role: "user".to_string(),
@@ -24507,7 +24767,7 @@ async fn main() -> Result<()> {
         println!("       dext --cd DIR         use DIR as sandbox/cwd");
         println!("       dext --output json|stream-json  emit machine-readable output");
         println!(
-            "       dext --input ndjson   host protocol: stdin frames (user|steer|control|interrupt|permission|close), per-action permission_request events; needs --output stream-json"
+            "       dext --input ndjson   host protocol: stdin frames (user|steer|control|interrupt|permission|ui.capabilities|ui.response|close), permission_request and pack ui.request events; needs --output stream-json"
         );
         println!(
             "       dext --budget CAP     stop before more model calls once CAP is reached ($ or tokens)"
@@ -24575,7 +24835,11 @@ async fn main() -> Result<()> {
     let one_shot_task = read_one_shot_task(&opts, &mut io::stdin())?;
     // Handed to the ndjson stdin reader once the loop starts (ndjson only).
     let mut permission_tx: Option<std::sync::mpsc::SyncSender<PermissionReply>> = None;
+    let mut ui_tx: Option<std::sync::mpsc::SyncSender<UiReply>> = None;
     let mut ndjson_permissions_ready = None;
+    let mut ndjson_ui_ready = None;
+    let mut ndjson_ui_capabilities = None;
+    let mut ndjson_pending_ui = None;
 
     let will_use_tui = opts.pack.is_none()
         && !opts.print
@@ -24636,6 +24900,15 @@ async fn main() -> Result<()> {
             ndjson_permissions_ready = Some(bridge.ready.clone());
             sink = sink.with_permission_bridge(bridge);
             permission_tx = Some(tx);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<UiReply>(1);
+            let bridge = UiBridge::new(rx, agent.interrupt.clone());
+            bridge.ready.store(false, Ordering::SeqCst);
+            ndjson_ui_ready = Some(bridge.ready.clone());
+            ndjson_ui_capabilities = Some(bridge.capabilities.clone());
+            let pending_ui = bridge.pending.clone();
+            sink = sink.with_ui_bridge(bridge);
+            ui_tx = Some(tx);
+            ndjson_pending_ui = Some(pending_ui);
         }
         agent.set_sink(Box::new(sink));
     }
@@ -24837,6 +25110,15 @@ async fn main() -> Result<()> {
             permission_tx: permission_tx
                 .take()
                 .expect("ndjson input always installs a permission bridge"),
+            ui_tx: ui_tx
+                .take()
+                .expect("ndjson input always installs a UI bridge"),
+            ui_capabilities: ndjson_ui_capabilities
+                .take()
+                .expect("ndjson input always installs UI capabilities"),
+            pending_ui: ndjson_pending_ui
+                .take()
+                .expect("ndjson input always installs pending UI state"),
             busy: agent_busy_flag.clone(),
             interrupt: agent.interrupt.clone(),
             pending: pending.clone(),
@@ -24939,10 +25221,14 @@ async fn main() -> Result<()> {
                 "sandbox": agent.sandbox_root.display().to_string(),
                 "thinking_effort": agent.thinking_effort,
                 "approval": agent.approval_profile,
-                "frames": ["user", "steer", "control", "interrupt", "permission", "close"],
+                "frames": ["user", "steer", "control", "interrupt", "permission", "ui.capabilities", "ui.response", "close"],
+                "ui_protocol": 1,
             }
         }));
         if let Some(ready) = ndjson_permissions_ready {
+            ready.store(true, Ordering::SeqCst);
+        }
+        if let Some(ready) = ndjson_ui_ready {
             ready.store(true, Ordering::SeqCst);
         }
         if let Some(start) = ndjson_reader_start.take() {

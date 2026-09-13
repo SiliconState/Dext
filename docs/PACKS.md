@@ -165,6 +165,7 @@ A reviewed pack may add `runtime.json` to expose a small dynamic tool set and li
   "version": 1,
   "command": "bin/my-pack-runtime",
   "args": [],
+  "ui_protocol": 1,
   "max_continuations": 100,
   "tools": [
     {
@@ -183,13 +184,13 @@ A reviewed pack may add `runtime.json` to expose a small dynamic tool set and li
 
 The v1 boundary is fail-closed:
 
-- `runtime.json` is a regular non-symlink file capped at 256 KiB. Unknown manifest fields, unsupported versions, full-native-catalog/active-dynamic/host-approval-operation name collisions, invalid provider tool names, oversized descriptions/schemas/arguments, and malformed or unsupported nested schema keywords are rejected. Protocol v1 schemas require an explicit supported type at every node and implement only `type`, `properties`, `required`, boolean `additionalProperties`, `items`, `enum`, and bounded `description`. Dynamic tool schemas use the session's selected lean/full schema profile on every provider wire; lean removes schema annotation descriptions but retains the runtime tool's top-level action description and argument structure.
+- `runtime.json` is a regular non-symlink file capped at 256 KiB. Unknown manifest fields, unsupported runtime or UI protocol versions, full-native-catalog/active-dynamic/host-approval-operation name collisions, invalid provider tool names, oversized descriptions/schemas/arguments, and malformed or unsupported nested schema keywords are rejected. Protocol v1 schemas require an explicit supported type at every node and implement only `type`, `properties`, `required`, boolean `additionalProperties`, `items`, `enum`, and bounded `description`. Dynamic tool schemas use the session's selected lean/full schema profile on every provider wire; lean removes schema annotation descriptions but retains the runtime tool's top-level action description and argument structure.
 - `command` is a relative path to a regular executable inside the canonical pack root. Symlinked, non-executable, absolute, escaping, or larger-than-256-MiB commands are rejected. Approval identifies the executable SHA-256; Dext rehashes the regular no-follow file before every invocation and requires reactivation if bytes changed.
 - Runtime activation validates executable identity separately from selecting `PACK.md`. Approval `always` proceeds automatically, approval `never` disables it, and prompting-profile `Always` decisions remain exact-identity scoped. Changing approval or sandbox policy revokes the active executable runtime, removes its dynamic grants/denials, and discards queued callbacks; invoking the pack again requires activation under the new policy. Activation, idle, and tool events all use the selected sandbox profile.
 - Every declared tool has `read`, `write`, or `danger` risk (`write` by default). Read tools need no mutation checkpoint. Write/danger tools use durable side-effect fencing and a fail-closed Git checkpoint before execution when a repository is present.
 - Runtime subprocesses inherit no credential-shaped environment values, including pack helper credential declarations and `DEXT_INHERIT_TOOL_CREDENTIALS`. They are one-shot process-group-contained calls, not daemons; timeout defaults to 120 seconds and bounds stdin delivery plus root execution, while output drain after process-tree cleanup has a separate one-second cap. A manifest may set `timeout_seconds` from 1–604800 for long-running helpers, and `DEXT_PACK_RUNTIME_TIMEOUT_SECS` overrides it within the same bound. A present malformed, non-Unicode, zero, or out-of-range override fails closed instead of falling back.
 
-Dext sends one JSON object on stdin for each `activate`, `tool`, or `idle` event:
+Dext sends one JSON object on stdin for each `activate`, `tool`, `idle`, or host-UI-response event:
 
 ```json
 {
@@ -226,7 +227,48 @@ The helper writes exactly one JSON response object to stdout:
 }
 ```
 
-Requests/responses are capped at 256 KiB, content and steering/continuation text at 128 KiB, state at 64 KiB, markdown views at 128 KiB, effects at 16 per call, and continuation delays at 30 seconds. The subprocess capture path preserves the full response ceiling instead of applying ordinary external-tool output caps. Runtime-exposed content, effect text, view titles/Markdown, and queued prompts reject unsafe terminal controls. Compact pack/shelf metadata is bounded and normalized to one safe line before prompt injection; shelf Context bodies preserve ordinary newlines/tabs but normalize terminal controls and Unicode line separators. Response state/effects and continuation accounting are validated and committed atomically. State, used continuation count, and up to 32 queued continuation prompts totaling 64 KiB persist in the owner-private session header; any runtime-bearing session uses format v5 so pre-runtime Dext binaries reject it rather than silently discard executable-runtime state. An interrupt while waiting for a delayed prompt cancels and refunds it. Resume preserves the current-run approval and sandbox policies and discards saved grants. Before changing the live agent, it preflights project-extension trust, the exact saved source plus canonical pack-directory fingerprint, manifest/hash/state accounting, and approval against the current executable digest; a shadowing same-name pack, changed/missing runtime, malformed snapshot, or denied approval cannot partially apply the saved sandbox/model/session state. Runtime content, steering, views, and surfaced activation/idle errors pass through privacy redaction before model, log, or TUI exposure. Opaque structured state is bounded and owner-private but is not rewritten by privacy redaction, so helpers must not place secrets in state. A pack can request at most its declared `max_continuations` (hard cap 1,000) across the saved runtime state. While active, dynamic tools participate in `/allow`, `/revoke`, and `/allowed`; policy changes revoke those grants with the runtime.
+The optional UI round trip uses the same protocol without turning Dext into a widget toolkit. It is available only through `dext --input ndjson --output stream-json`; other front ends report `unsupported` to the runtime. A runtime that can request UI must declare `"ui_protocol": 1` in `runtime.json`; returning `ui_request` without that opt-in fails closed. After `ready`, a host advertises the opaque method names it implements:
+
+```json
+{"type":"ui.capabilities","methods":["form","progress"]}
+```
+
+Each runtime request includes that sorted list as `context.ui_methods`. A helper may then add one request to its response:
+
+```json
+{
+  "version": 1,
+  "content": "",
+  "effects": [],
+  "ui_request": {
+    "id": "profile",
+    "method": "form",
+    "params": {
+      "title": "Profile",
+      "fields": [
+        {"id": "name", "label": "Name", "type": "text", "required": true}
+      ]
+    }
+  }
+}
+```
+
+Dext emits `ui.request {id, pack, request_id, method, params}`. The host correlates with the transport `id` and sends one of:
+
+```json
+{"type":"ui.response","id":"ui-123-1","status":"ok","value":{"name":"Ada"}}
+{"type":"ui.response","id":"ui-123-1","status":"cancelled"}
+{"type":"ui.response","id":"ui-123-1","status":"error","code":"unavailable","message":"No form renderer"}
+```
+
+Dext invokes the same helper again with `event:"ui_response"` and `ui:{request_id,method,response}`. The helper may finish normally or issue the next UI request. A chain is limited to 16 round trips. Portable method conventions are deliberately small:
+
+- `form` params may use `title`, `description`, `submit_label`, and `fields[]`. Fields have stable `id`, `label`, `type` (`text`, `textarea`, `number`, `boolean`, `select`, or `multiselect`), and optional `required`, `default`, `options`, `placeholder`, and `description`; the successful value is an object keyed by id.
+- `progress` params may use stable `id`, `title`, `message`, `current`, `total`, and `state` (`running`, `completed`, or `error`). Repeated ids update the same host presentation and each update is acknowledged with `ok`.
+
+Method params and values are otherwise opaque, so hosts and packs may negotiate richer namespaced methods without a core change. Packs must check `context.ui_methods` and handle a structured `unsupported` response. Dext privacy-redacts object keys and string values, then revalidates the request before emitting it. Only the first response matching the one pending transport id is admitted; early, stale, duplicate, and non-matching responses are refused. Responses are delivered only to the approved local runtime invocation and are not logged, persisted, added to model history, or echoed as events by core; a helper that copies an answer into content, state, effects, or stderr assumes the ordinary exposure rules. Method lists, identifiers, payloads, the one-slot response channel, and waits are bounded; explicit host cancellation, EOF, and timeout become structured responses, while interrupt aborts the active chain.
+
+Requests/responses are capped at 256 KiB, content and steering/continuation text at 128 KiB, state at 64 KiB, UI params and successful values at 64 KiB, markdown views at 128 KiB, effects at 16 per call, and continuation delays at 30 seconds. The subprocess capture path preserves the full response ceiling instead of applying ordinary external-tool output caps. Runtime-exposed content, effect text, view titles/Markdown, queued prompts, and UI strings reject unsafe terminal controls. Compact pack/shelf metadata is bounded and normalized to one safe line before prompt injection; shelf Context bodies preserve ordinary newlines/tabs but normalize terminal controls and Unicode line separators. Response state/effects and continuation accounting are validated and committed atomically. State, used continuation count, and up to 32 queued continuation prompts totaling 64 KiB persist in the owner-private session header; any runtime-bearing session uses format v5 so pre-runtime Dext binaries reject it rather than silently discard executable-runtime state. An interrupt while waiting for a delayed prompt cancels and refunds it. Resume preserves the current-run approval and sandbox policies and discards saved grants. Before changing the live agent, it preflights project-extension trust, the exact saved source plus canonical pack-directory fingerprint, manifest/hash/state accounting, and approval against the current executable digest; a shadowing same-name pack, changed/missing runtime, malformed snapshot, or denied approval cannot partially apply the saved sandbox/model/session state. Runtime content, steering, views, UI request params, and surfaced activation/idle errors pass through privacy redaction before model, log, or frontend exposure. Opaque structured state is bounded and owner-private but is not rewritten by privacy redaction, so helpers must not place secrets in state. A pack can request at most its declared `max_continuations` (hard cap 1,000) across the saved runtime state. While active, dynamic tools participate in `/allow`, `/revoke`, and `/allowed`; policy changes revoke those grants with the runtime.
 
 
 ## Maintain

@@ -44,6 +44,33 @@ fn redact_json_strings(policy: &PrivacyPolicy, value: &mut Value) {
     }
 }
 
+fn redact_json_for_disclosure(policy: &PrivacyPolicy, value: &mut Value) {
+    match value {
+        Value::String(text) => *text = policy.redact_text(text).text,
+        Value::Array(items) => {
+            for item in items {
+                redact_json_for_disclosure(policy, item);
+            }
+        }
+        Value::Object(fields) => {
+            let original = std::mem::take(fields);
+            for (key, mut value) in original {
+                redact_json_for_disclosure(policy, &mut value);
+                let key = policy.redact_text(&key).text;
+                match fields.entry(key) {
+                    serde_json::map::Entry::Vacant(entry) => {
+                        entry.insert(value);
+                    }
+                    serde_json::map::Entry::Occupied(mut entry) => {
+                        entry.insert(Value::Null);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn text_is_potential_local_secret(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -385,6 +412,10 @@ impl PrivacyPolicy {
             _ => unreachable!(),
         }
         true
+    }
+
+    pub(crate) fn redact_json_for_disclosure(&self, value: &mut Value) {
+        redact_json_for_disclosure(self, value);
     }
 
     pub(crate) fn redact_text(&self, text: &str) -> PrivacyRedaction {
