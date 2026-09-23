@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::session::user_home_dir;
 
-pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.251";
+pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.280";
 pub(crate) const CLAUDE_CODE_ENTRYPOINT: &str = "sdk-cli";
 pub(crate) const AGENT_SDK_SYSTEM_PROMPT: &str =
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
@@ -459,21 +459,21 @@ mod tests {
 
     #[test]
     fn billing_header_matches_recovered_prompt_vector() {
-        assert_eq!(version_fingerprint("Reply with exactly: PROBE_OK"), "3e7");
+        assert_eq!(version_fingerprint("Reply with exactly: PROBE_OK"), "022");
         assert_eq!(
             billing_header("Reply with exactly: PROBE_OK"),
-            "x-anthropic-billing-header: cc_version=2.1.251.3e7; cc_entrypoint=sdk-cli; cch=00000;"
+            "x-anthropic-billing-header: cc_version=2.1.280.022; cc_entrypoint=sdk-cli; cch=00000;"
         );
     }
 
     #[test]
     fn cch_matches_recovered_normalized_body_vector() {
-        let body = br#"{"model":"claude-opus-5","messages":[{"role":"user","content":"A"}],"max_tokens":64000,"stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.251.000; cc_entrypoint=sdk-cli; cch=00000;"}]}"#.to_vec();
+        let body = br#"{"model":"claude-opus-5","messages":[{"role":"user","content":"A"}],"max_tokens":64000,"stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280.000; cc_entrypoint=sdk-cli; cch=00000;"}]}"#.to_vec();
         let billing =
-            "x-anthropic-billing-header: cc_version=2.1.251.000; cc_entrypoint=sdk-cli; cch=00000;";
+            "x-anthropic-billing-header: cc_version=2.1.280.000; cc_entrypoint=sdk-cli; cch=00000;";
         let patched =
             String::from_utf8(patch_cch(body, billing).expect("patch cch")).expect("utf8 body");
-        assert!(patched.contains("cch=e40b4"), "{patched}");
+        assert!(patched.contains("cch=5efff"), "{patched}");
     }
 
     #[test]
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn cch_rejects_non_numeric_top_level_max_tokens() {
         let billing =
-            "x-anthropic-billing-header: cc_version=2.1.251.000; cc_entrypoint=sdk-cli; cch=00000;";
+            "x-anthropic-billing-header: cc_version=2.1.280.000; cc_entrypoint=sdk-cli; cch=00000;";
         let body = format!(
             "{{\"model\":\"claude-opus-5\",\"max_tokens\":\"64000\",\"system\":[{{\"type\":\"text\",\"text\":{} }}]}}",
             serde_json::to_string(billing).expect("billing JSON")

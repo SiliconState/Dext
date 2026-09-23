@@ -7,10 +7,10 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::{
     DEFAULT_SYSTEM, LATEST_LOG_ARCHIVE_MAX, LATEST_LOG_CAP, LATEST_SESSION_NAME, LOG_DETAIL_CAP,
-    PACK_RUNTIME_FORMAT_VERSION, ReasoningMode, SEAT_FORMAT_VERSION,
-    SEAT_TRANSITIONAL_FORMAT_VERSION, SESSION_FORMAT_VERSION, SESSION_STATE_LOCK_NAME,
-    SessionHeader, ThinkingEffort, byte_prefix_at_char_boundary, byte_suffix_at_char_boundary,
-    cap_bytes_with_hint,
+    PACK_RUNTIME_FORMAT_VERSION, PROVIDER_REASONING_ROUTE_FORMAT_VERSION, ReasoningMode,
+    SEAT_FORMAT_VERSION, SEAT_TRANSITIONAL_FORMAT_VERSION, SESSION_FORMAT_VERSION,
+    SESSION_STATE_LOCK_NAME, SessionHeader, ThinkingEffort, byte_prefix_at_char_boundary,
+    byte_suffix_at_char_boundary, cap_bytes_with_hint,
 };
 
 pub(crate) fn user_home_dir() -> PathBuf {
@@ -1293,6 +1293,18 @@ pub(crate) fn parse_session_header(line: &str) -> Result<SessionHeader> {
                 && header.context_mode != crate::ContextMode::Standard
             {
                 header.context_mode_explicit = true;
+            }
+            if source_version >= PROVIDER_REASONING_ROUTE_FORMAT_VERSION {
+                let route_hash = header.provenance.provider_route_hash.as_deref().context(
+                    "session provider-reasoning format is missing route-bound provenance",
+                )?;
+                if route_hash.len() != 64
+                    || !route_hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                {
+                    anyhow::bail!("session provider route hash is not lowercase SHA-256");
+                }
             }
             header.version = SESSION_FORMAT_VERSION;
             // A hostile or corrupt id must never become a state-dir name.
