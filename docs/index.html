@@ -856,7 +856,7 @@ dext --frugal --effort off    # low-token mode</code></pre>
 <tr><td><code>Ctrl+C</code></td><td>Interrupt current turn</td></tr>
 <tr><td><code>Up/Down</code></td><td>Navigate input history</td></tr>
 <tr><td><code>Scroll</code></td><td>Navigate transcript</td></tr>
-<tr><td><code>?</code></td><td>Show keymap help</td></tr>
+<tr><td><code>?</code> / <code>F1</code></td><td>Open scrollable keymap help (? with an empty composer, F1 even with a draft); arrows, Page Up/Down, Home/End, or mouse wheel navigate, and Esc, ? or F1 closes without editing the draft</td></tr>
 </table>
 <h3>Status and Active Time</h3>
 <p>The main status row presents the exact <code>main</code> branch label as <code>Main</code>, including <code>Main (dirty)</code> when the working tree is dirty, without renaming the branch or changing any other branch casing. It reserves its right edge for a live cumulative agent-active clock while Dext handles a turn. The clock advances during provider waits, tool calls, permission/auth waits, and in-turn compaction; while Dext is idle awaiting user input, it pauses and is hidden, then resumes on the next turn. It updates through the existing redraw cadence and uses compact forms such as <code>7s</code>, <code>7m 05s</code>, and <code>1h 07m</code> without adding a timer thread.</p>
@@ -1271,7 +1271,7 @@ ui-icon: report
 <tr><td><code>/diagnostics</code></td><td>Run rust-analyzer diagnostics, falling back to cargo check</td></tr>
 <tr><td><code>/save &lt;name&gt;</code></td><td>Save history/config to named JSONL session</td></tr>
 <tr><td><code>/export [html|jsonl] [path]</code></td><td>Export the current session</td></tr>
-<tr><td><code>/resume [name]</code></td><td>Resume latest or named session</td></tr>
+<tr><td><code>/resume [name]</code></td><td>In the interactive TUI, bare <code>/resume</code> opens an asynchronous latest/autosaved/named session picker; invalid headers and incompatible Seat/project sessions are omitted. Enter loads the highlighted file and refreshes workspace, Git, todos, model, reasoning mode, usage and context; Esc cancels. The composer waits while the selected session loads; an invalid session shows an error and returns to ready. Explicit <code>/resume NAME</code> or path retains its direct-load behavior; CLI bare <code>/resume</code> still loads latest.</td></tr>
 <tr><td><code>/sessions ...</code></td><td>List session history in the established session presentation, or analyze/brief/grep/failures/verification/decisions</td></tr>
 <tr><td><code>/budget [cap]</code></td><td>Set/show a dollar, token, or combined cap; <code>off</code> clears it</td></tr>
 <tr><td><code>/pack create|list|inspect|run</code></td><td>Create or use shelf-contained packs</td></tr>
