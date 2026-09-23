@@ -284,6 +284,114 @@ fn tui_smoke_shift_enter_inserts_newline() {
     );
 }
 
+#[test]
+fn tui_resume_picker_loads_selected_saved_session() {
+    let temp = TempDir::new("dext-tui-resume-picker").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    let sessions = temp.path().join("sessions");
+    for dir in [&sandbox, &dext_home, &home, &sessions] {
+        fs::create_dir_all(dir).expect("create directory");
+    }
+    fs::write(
+        sessions.join("alpha.jsonl"),
+        include_str!("fixtures/state/sessions/v1.jsonl"),
+    )
+    .expect("write alpha fixture");
+    fs::write(
+        sessions.join("beta.jsonl"),
+        include_str!("fixtures/state/sessions/v1.jsonl"),
+    )
+    .expect("write beta fixture");
+    fs::write(
+        sessions.join("broken.jsonl"),
+        "{\"model\":\"broken\",\"system\":\"fixture\"}\nnot-json\n",
+    )
+    .expect("write corrupt-history fixture");
+    let mut pty = Pty::open(TUI_NARROW_COLS, TUI_NARROW_ROWS).expect("open pty");
+    let mut child = spawn_dext_with_env(
+        &pty,
+        &sandbox,
+        &dext_home,
+        &home,
+        &[(
+            "DEXT_SESSIONS_DIR",
+            sessions.to_str().expect("utf8 test path"),
+        )],
+    )
+    .expect("spawn dext in pty");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Type a request",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"/resume\r").expect("open picker");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "resume session",
+        Duration::from_secs(5),
+    );
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Named · alpha",
+        Duration::from_secs(3),
+    );
+    pty.write_all_retry(b"\x1b[B")
+        .expect("select second session");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "▸ Named · beta",
+        Duration::from_secs(3),
+    );
+    pty.write_all_retry(b"\r").expect("load selected session");
+    assert_visible(&mut pty, &mut child, "beta.jsonl", Duration::from_secs(5));
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "loaded 1 messages",
+        Duration::from_secs(5),
+    );
+    let before_reopen = pty.capture.len();
+    pty.write_all_retry(b"/resume\r").expect("reopen picker");
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        before_reopen,
+        "broken.jsonl",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"\x1b[F")
+        .expect("select corrupt-history session");
+    pty.pump_for(&mut child, Duration::from_millis(150))
+        .expect("let picker selection settle");
+    pty.write_all_retry(b"\r").expect("attempt corrupt session");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "[resume error]",
+        Duration::from_secs(5),
+    );
+    let before_status = pty.capture.len();
+    pty.write_all_retry(b"/status\r")
+        .expect("submit after failed resume");
+    assert_visible_since(
+        &mut pty,
+        &mut child,
+        before_status,
+        "sandbox:",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"\x04").expect("quit");
+    let status = wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).expect("exit");
+    assert!(status.success(), "{}", tail(&pty.visible_text(), 3000));
+    assert_no_crash_text(&pty.visible_text());
+}
+
 fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
     let temp = TempDir::new("dext-tui-smoke").expect("temp dir");
     let sandbox = temp.path().join("sandbox");
@@ -310,12 +418,26 @@ fn run_tui_smoke(cols: u16, rows: u16, exercise_help: bool) {
     if exercise_help {
         pty.write_all_retry(b"?").expect("send help key");
         assert_visible(&mut pty, &mut child, "keymap", Duration::from_secs(3));
-        assert_visible(&mut pty, &mut child, "Ctrl+O", Duration::from_secs(2));
-        assert_visible(&mut pty, &mut child, "Ctrl+T", Duration::from_secs(2));
         assert_visible(
             &mut pty,
             &mut child,
             "insertnewline",
+            Duration::from_secs(2),
+        );
+        pty.write_all_retry(b"\x1b[F").expect("scroll help to end");
+        assert_visible(
+            &mut pty,
+            &mut child,
+            "Branch(master",
+            Duration::from_secs(2),
+        );
+        pty.write_all_retry(b"\x1b").expect("close help");
+        pty.pump_for(&mut child, Duration::from_millis(250))
+            .expect("allow lone Esc to resolve before Ctrl+D");
+        assert_visible(
+            &mut pty,
+            &mut child,
+            "Type a request",
             Duration::from_secs(2),
         );
     }
@@ -504,6 +626,38 @@ fn terminate_child(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn assert_visible_since(
+    pty: &mut Pty,
+    child: &mut Child,
+    offset: usize,
+    needle: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        pty.read_available()
+            .expect("read PTY while waiting for new output");
+        pty.answer_cursor_position_queries()
+            .expect("answer PTY cursor query");
+        if pty
+            .capture
+            .get(offset..)
+            .is_some_and(|bytes| strip_ansi(&String::from_utf8_lossy(bytes)).contains(needle))
+        {
+            return;
+        }
+        if Instant::now() >= deadline || child.try_wait().expect("query child status").is_some() {
+            let visible = pty.visible_text();
+            terminate_child(child);
+            panic!(
+                "did not see new {needle:?} within {timeout:?}; visible tail:\n{}",
+                tail(&visible, 3000)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn assert_visible(pty: &mut Pty, child: &mut Child, needle: &str, timeout: Duration) {

@@ -24,6 +24,12 @@ TUI and dependency changes must preserve these behaviors:
 
 A dependency update that violates this contract is rejected even if it compiles and unit tests pass.
 
+## Help and saved-session picker
+
+Press `?` with an empty composer, or F1 even with a draft, to open the full keymap in the inline viewport. The keymap scrolls with Up/Down, Page Up/Down, Home/End, and the mouse wheel; `?`, F1, or Esc closes it. Narrow widths stack shortcut labels and descriptions instead of clipping them. While open, typed keys and pastes cannot edit or submit the composer. Ctrl+C/Ctrl+D retain their interrupt/quit behavior. Pending permission and local-auth prompts take precedence.
+
+Enter `/resume` while idle to browse the available latest, autosaved, and named sessions. The picker excludes unreadable headers and, when a Seat is active, sessions with a different Seat, a seated session without sandbox provenance, or a saved sandbox in another project. Selectable rows show category, name, and a path with its useful tail retained; arrow/Page/Home/End keys navigate, Enter loads the selected file through the existing session loader, and Esc cancels without modifying the draft. Selection is by path rather than an ambiguous short name; the loader revalidates the chosen file before restoring. A lookup runs off the render loop; cancelled or superseded results are ignored. On successful load the TUI refreshes the effective workspace, Git status, todo list, model, reasoning mode, usage, and context; Git probes started before the load cannot replace the restored Git status, even when the session stays in the same workspace. Explicit `/resume NAME` and `/resume PATH` retain their existing CLI/TUI behavior; the popup does not affect them. A missing/invalid session produces an error and returns to ready without loading it; while a selected session is being restored, the composer waits instead of submitting another request against partially restored state. Permission and local-auth prompts retain priority, including paste into the masked local-auth prompt, and the backend viewer remains the only alternate-screen surface.
+
 ## Todo view
 
 Press `Ctrl+L` during ordinary idle or busy work to open the current session todo list. Security-critical permission and local-auth prompts intentionally take priority and must be resolved or canceled first. The modal loads the persisted session/project todo state at startup, refreshes after `todo_read` or `todo_write`, and supports arrow, Page Up/Down, Home/End, and mouse-wheel scrolling. Close it with `Ctrl+L`, `Esc`, or `q`.

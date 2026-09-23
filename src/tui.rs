@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -317,15 +318,38 @@ enum ToTui {
         message: String,
         responder: std::sync::mpsc::SyncSender<LocalAuthSecret>,
     },
-    GitSummary(Option<String>),
+    GitSummary {
+        root: PathBuf,
+        epoch: u64,
+        summary: Option<String>,
+    },
+    ResumeLoaded {
+        root: PathBuf,
+        git: Option<String>,
+        todos: Vec<TodoItem>,
+    },
+    ResumeLoadFailed(String),
+    ResumeChoices {
+        request_id: u64,
+        result: std::result::Result<Vec<ResumeChoice>, String>,
+    },
 }
 
 enum FromTui {
-    Submit { text: String, pane_width: u16 },
+    Submit {
+        text: String,
+        pane_width: u16,
+    },
     LoginInput(String),
     LoginCancel,
     CycleEffort(i8),
-    GitContext(Option<String>),
+    GitContext {
+        root: PathBuf,
+        epoch: u64,
+        summary: Option<String>,
+    },
+    ResumeChoices(u64),
+    ResumeSelected(PathBuf),
     Quit,
 }
 
@@ -409,6 +433,17 @@ struct LiveTool {
 struct ExpandableBlock {
     name: String,
     expanded: bool,
+}
+
+struct ResumeChoice {
+    label: String,
+    path: PathBuf,
+}
+
+struct ResumePicker {
+    choices: Vec<ResumeChoice>,
+    selected: usize,
+    scroll: usize,
 }
 
 struct SlashCmd {
@@ -1273,6 +1308,8 @@ struct TuiState {
     model: String,
     context_window_tokens: u64,
     sandbox: String,
+    sandbox_path: PathBuf,
+    git_epoch: u64,
     streaming_text: String,
     streaming_thinking: String,
     active_thinking: Option<ActiveThinking>,
@@ -1299,6 +1336,11 @@ struct TuiState {
     reasoning_mode: ReasoningMode,
     last_expandable: Option<ExpandableBlock>,
     show_help: bool,
+    help_scroll: usize,
+    resume_picker_requested: bool,
+    resume_loading: bool,
+    resume_request_id: u64,
+    resume_picker: Option<ResumePicker>,
     show_todos: bool,
     todo_items: Vec<TodoItem>,
     todo_scroll: usize,
@@ -1405,6 +1447,8 @@ impl TuiState {
             history_chars: 0,
             model,
             context_window_tokens,
+            sandbox_path: PathBuf::from(&sandbox),
+            git_epoch: 0,
             sandbox,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
@@ -1431,6 +1475,11 @@ impl TuiState {
             context_mode: ContextMode::Standard,
             last_expandable: None,
             show_help: false,
+            help_scroll: 0,
+            resume_picker_requested: false,
+            resume_loading: false,
+            resume_request_id: 0,
+            resume_picker: None,
             show_todos: false,
             todo_items: Vec::new(),
             todo_scroll: 0,
@@ -7853,6 +7902,8 @@ fn queue_permission_request(
     let audit_label = permission_audit_label(&name, &input);
     state.show_help = false;
     state.show_todos = false;
+    state.resume_picker_requested = false;
+    state.resume_picker = None;
     state.status = "thinking".to_string();
     if let Some(previous) = state.pending_perm.take() {
         state.queue(Line_::PermissionResult {
@@ -7885,6 +7936,8 @@ fn queue_local_auth_secret_request(
     clear_secret_string(&mut state.local_auth_input);
     state.show_help = false;
     state.show_todos = false;
+    state.resume_picker_requested = false;
+    state.resume_picker = None;
     if let Some(pending) = previous {
         let _ = pending.responder.send(LocalAuthSecret::Canceled);
     }
@@ -7897,7 +7950,155 @@ fn queue_local_auth_secret_request(
     });
 }
 
-fn help_overlay_text() -> Text<'static> {
+fn resume_choices(
+    root: &Path,
+    expected_seat: Option<&str>,
+) -> std::result::Result<Vec<ResumeChoice>, String> {
+    use crate::session::{
+        latest_session_path, list_session_records_for_root, named_sessions_dir_for_root,
+    };
+    let mut choices = Vec::new();
+    let mut seen = HashSet::new();
+    let expected_project_key = expected_seat.map(|_| crate::session::project_key(root));
+    let mut add = |label: String, path: PathBuf| {
+        if !path.is_file() || !seen.insert(path.clone()) {
+            return;
+        }
+        let header = std::fs::File::open(&path)
+            .ok()
+            .and_then(|file| {
+                let mut reader = io::BufReader::new(file);
+                crate::session::read_session_header_line(&mut reader, &path).ok()
+            })
+            .and_then(|line| crate::session::parse_session_header(line.trim_end()).ok());
+        let Some(header) = header else {
+            return;
+        };
+        if let Some(expected) = expected_seat {
+            if header.seat.as_ref().is_some_and(|seat| seat.id != expected) {
+                return;
+            }
+            if let Some(saved_root) = header.sandbox.as_deref() {
+                let Ok(saved_root) = std::fs::canonicalize(saved_root) else {
+                    return;
+                };
+                if expected_project_key.as_deref()
+                    != Some(crate::session::project_key(&saved_root).as_str())
+                {
+                    return;
+                }
+            } else if header.seat.is_some() {
+                return;
+            }
+        }
+        choices.push(ResumeChoice { label, path });
+    };
+    let latest = if let Some(seat) = expected_seat {
+        crate::seats::latest_session_path(root, seat).ok()
+    } else {
+        Some(latest_session_path(root))
+    };
+    if let Some(latest) = latest {
+        add("Latest".to_string(), latest);
+    }
+    let sessions_root = named_sessions_dir_for_root(root);
+    if let Ok(entries) = std::fs::read_dir(&sessions_root) {
+        let mut autosaved = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().to_string(),
+                    entry
+                        .path()
+                        .join(format!("{}.jsonl", crate::LATEST_SESSION_NAME)),
+                )
+            })
+            .filter(|(_, path)| path.is_file())
+            .map(|(name, path)| {
+                let modified = path.metadata().ok().and_then(|meta| meta.modified().ok());
+                (name, path, modified)
+            })
+            .collect::<Vec<_>>();
+        autosaved.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        for (name, path, _) in autosaved {
+            add(format!("Autosaved · {name}"), path);
+        }
+    }
+    let records = list_session_records_for_root(root).map_err(|error| format!("{error:#}"))?;
+    for record in records {
+        add(format!("Named · {}", record.name), record.path);
+    }
+    Ok(choices)
+}
+
+fn render_resume_picker(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect) {
+    let Some(picker) = state.resume_picker.as_mut() else {
+        return;
+    };
+    if picker.choices.is_empty() {
+        return;
+    }
+    let rect = centered_rect(area, 76, area.height.min(10));
+    let visible = rect.height.saturating_sub(2) as usize;
+    if visible == 0 {
+        return;
+    }
+    let selected = picker.selected.min(picker.choices.len().saturating_sub(1));
+    picker.selected = selected;
+    if selected < picker.scroll {
+        picker.scroll = selected;
+    } else if selected >= picker.scroll.saturating_add(visible) {
+        picker.scroll = selected + 1 - visible;
+    }
+    picker.scroll = picker
+        .scroll
+        .min(picker.choices.len().saturating_sub(visible));
+    let width = rect.width.saturating_sub(4) as usize;
+    let mut rows = Vec::new();
+    for (index, choice) in picker
+        .choices
+        .iter()
+        .enumerate()
+        .skip(picker.scroll)
+        .take(visible)
+    {
+        let label = single_line_display_text(&choice.label);
+        let path = single_line_display_text(&choice.path.to_string_lossy());
+        let label_budget = width.saturating_sub(5).min(width / 2);
+        let label = clamp_chars(&label, label_budget);
+        let path_budget = width.saturating_sub(text_width(&label)).saturating_sub(3);
+        let path = truncate_path_for_cells(&path, path_budget);
+        let text = format!("{label} · {path}");
+        let style = if index == selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        rows.push(Line::from(Span::styled(
+            format!("{} {text}", if index == selected { '▸' } else { ' ' }),
+            style,
+        )));
+    }
+    let footer = format!(
+        " {}/{} · Enter load · Esc cancel · ↑↓/Pg scroll ",
+        selected + 1,
+        picker.choices.len()
+    );
+    let widget = Paragraph::new(rows).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" resume session ")
+            .title_bottom(Span::styled(
+                clamp_chars(&footer, rect.width.saturating_sub(2) as usize),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    render_widget_safe(frame, Clear, rect);
+    render_widget_safe(frame, widget, rect);
+}
+
+fn help_overlay_text(width: u16) -> Text<'static> {
     let keymap_rows: &[(&str, &str)] = &[
         ("Enter", "submit prompt"),
         ("Shift+Enter / Alt+Enter", "insert newline"),
@@ -7922,7 +8123,7 @@ fn help_overlay_text() -> Text<'static> {
         ("Ctrl+E", "cycle reasoning depth"),
         ("PgUp / PgDn", "scroll transcript"),
         ("Up / Down", "history (single-line input only)"),
-        ("?", "toggle this help"),
+        ("? / F1", "toggle this help (F1 works with a draft)"),
     ];
     let legend_rows: &[(&str, &str)] = &[
         ("input/new/cache/out", "exact token counters in details"),
@@ -7943,15 +8144,29 @@ fn help_overlay_text() -> Text<'static> {
     )));
     lines.push(Line::from(""));
     for (key, desc) in keymap_rows {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<26}", key),
+        if width < 50 {
+            lines.push(Line::from(Span::styled(
+                format!("  {key}"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled((*desc).to_string(), Style::default()),
-        ]));
+            )));
+            lines.extend(
+                wrap_plain_words_visual(desc, width.saturating_sub(4).max(1) as usize)
+                    .into_iter()
+                    .map(|row| Line::from(format!("    {row}"))),
+            );
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {key:<26}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled((*desc).to_string(), Style::default()),
+            ]));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -7962,17 +8177,75 @@ fn help_overlay_text() -> Text<'static> {
     )));
     lines.push(Line::from(""));
     for (sym, desc) in legend_rows {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:<20}", sym), Style::default().fg(Color::Green)),
-            Span::styled((*desc).to_string(), Style::default()),
-        ]));
+        if width < 50 {
+            lines.push(Line::from(Span::styled(
+                format!("  {sym}"),
+                Style::default().fg(Color::Green),
+            )));
+            lines.extend(
+                wrap_plain_words_visual(desc, width.saturating_sub(4).max(1) as usize)
+                    .into_iter()
+                    .map(|row| Line::from(format!("    {row}"))),
+            );
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {sym:<20}"), Style::default().fg(Color::Green)),
+                Span::styled((*desc).to_string(), Style::default()),
+            ]));
+        }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  press ? or Esc to dismiss",
+        "  ?/Esc close · ↑↓/Pg scroll",
         Style::default().fg(Color::DarkGray),
     )));
     Text::from(lines)
+}
+
+fn help_overlay_layout(area: Rect, help: &Text<'_>) -> (Rect, usize, usize) {
+    let rect = centered_rect(area, 72, area.height);
+    let visible = rect.height.saturating_sub(2) as usize;
+    let total = if visible == 0 {
+        0
+    } else {
+        count_lines_by_width(help, rect.width.saturating_sub(2).max(1))
+    };
+    (rect, visible, total)
+}
+
+fn render_help_overlay(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect) {
+    let help = help_overlay_text(area.width.min(72).saturating_sub(2));
+    let (rect, visible, total) = help_overlay_layout(area, &help);
+    state.help_scroll = state.help_scroll.min(total.saturating_sub(visible));
+    let position = if total > visible {
+        format!(
+            " ↑↓/Pg scroll · {}/{} · Esc close ",
+            state.help_scroll + 1,
+            total.saturating_sub(visible) + 1
+        )
+    } else {
+        " Esc/? close ".to_string()
+    };
+    let widget = Paragraph::new(help)
+        .wrap(Wrap { trim: false })
+        .scroll((state.help_scroll.min(u16::MAX as usize) as u16, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    " help ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .title_bottom(Span::styled(
+                    clamp_chars(&position, rect.width.saturating_sub(2) as usize),
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    render_widget_safe(frame, Clear, rect);
+    render_widget_safe(frame, widget, rect);
 }
 
 fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
@@ -8328,7 +8601,53 @@ fn apply_tui_message(state: &mut TuiState, msg: ToTui) {
             state.close_backend_viewer();
             queue_local_auth_secret_request(state, tool, message, responder);
         }
-        ToTui::GitSummary(summary) => state.apply_git_branch_refresh(summary),
+        ToTui::GitSummary {
+            root,
+            epoch,
+            summary,
+        } => {
+            if root == state.sandbox_path && epoch == state.git_epoch {
+                state.apply_git_branch_refresh(summary);
+            }
+        }
+        ToTui::ResumeLoaded { root, git, todos } => {
+            state.resume_loading = false;
+            state.git_epoch = state.git_epoch.wrapping_add(1);
+            state.sandbox = root.display().to_string();
+            state.sandbox_path = root;
+            state.apply_git_branch_refresh(git);
+            state.set_todo_items(todos);
+        }
+        ToTui::ResumeLoadFailed(error) => {
+            state.resume_loading = false;
+            state.apply_event(AgentEvent::Error(format!("[resume error] {error}")));
+            state.status = "ready".to_string();
+        }
+        ToTui::ResumeChoices { request_id, result } => {
+            if state.resume_picker_requested && state.resume_request_id == request_id {
+                state.resume_picker_requested = false;
+                match result {
+                    Ok(choices) if !choices.is_empty() => {
+                        state.resume_picker = Some(ResumePicker {
+                            choices,
+                            selected: 0,
+                            scroll: 0,
+                        });
+                        state.status = "choose session to resume".to_string();
+                    }
+                    Ok(_) => {
+                        state.queue(Line_::Info(
+                            "no saved sessions; /resume NAME or PATH still works".to_string(),
+                        ));
+                        state.status = "ready".to_string();
+                    }
+                    Err(error) => {
+                        state.queue(Line_::Error(format!("session picker unavailable: {error}")));
+                        state.status = "ready".to_string();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -8783,6 +9102,9 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         && state.pending_perm.is_none()
         && !state.show_help
         && !state.show_todos
+        && state.resume_picker.is_none()
+        && !state.resume_picker_requested
+        && !state.resume_loading
         && input_area.width > 0
         && input_area.height > 0
     {
@@ -8797,25 +9119,15 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     if state.show_todos && state.pending_local_auth.is_none() && state.pending_perm.is_none() {
         render_todo_overlay(frame, state, area);
     }
+    if state.resume_picker.is_some()
+        && state.pending_local_auth.is_none()
+        && state.pending_perm.is_none()
+    {
+        render_resume_picker(frame, state, area);
+    }
 
-    if state.show_help {
-        let help = help_overlay_text();
-        let desired_w = 72u16;
-        let desired_h = (help.lines.len() as u16).saturating_add(2);
-        let rect = centered_rect(area, desired_w, desired_h);
-        let widget = Paragraph::new(help).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    " help ",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
-        render_widget_safe(frame, Clear, rect);
-        render_widget_safe(frame, widget, rect);
+    if state.show_help && state.pending_local_auth.is_none() && state.pending_perm.is_none() {
+        render_help_overlay(frame, state, area);
     }
 
     if state.pending_local_auth.is_some() {
@@ -8824,6 +9136,9 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
 
     if !state.show_help
         && !state.show_todos
+        && state.resume_picker.is_none()
+        && !state.resume_picker_requested
+        && !state.resume_loading
         && state.pending_local_auth.is_none()
         && state.pending_perm.is_none()
         && !state.show_inspector
@@ -8903,11 +9218,6 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
         state.status = "backend viewer open; paste ignored".to_string();
         return;
     }
-    if state.show_todos {
-        clear_secret_string(&mut pasted);
-        state.status = "todo list open; paste ignored".to_string();
-        return;
-    }
     if state.pending_local_auth.is_some() {
         let submit = pasted.ends_with('\n') || pasted.ends_with('\r');
         pasted.retain(|ch| !matches!(ch, '\r' | '\n'));
@@ -8926,6 +9236,17 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
         state.insert_login_input_str(&pasted);
         clear_secret_string(&mut pasted);
         state.status = "login credentials ready · Enter submits locally".to_string();
+        return;
+    }
+    if state.pending_perm.is_some()
+        || state.show_todos
+        || state.show_help
+        || state.resume_picker_requested
+        || state.resume_picker.is_some()
+        || state.resume_loading
+    {
+        clear_secret_string(&mut pasted);
+        state.status = "overlay open; paste ignored".to_string();
         return;
     }
     if state.agent_busy && crate::text_is_potential_local_secret(&pasted) {
@@ -8968,6 +9289,27 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => state.scroll_backend_viewer(1),
             MouseEventKind::ScrollDown => state.scroll_backend_viewer(-1),
+            _ => {}
+        }
+        return;
+    }
+    if let Some(picker) = state.resume_picker.as_mut() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => picker.selected = picker.selected.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                picker.selected = (picker.selected + 1).min(picker.choices.len().saturating_sub(1))
+            }
+            _ => {}
+        }
+        return;
+    }
+    if state.resume_picker_requested || state.resume_loading {
+        return;
+    }
+    if state.show_help {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => state.help_scroll = state.help_scroll.saturating_sub(1),
+            MouseEventKind::ScrollDown => state.help_scroll = state.help_scroll.saturating_add(1),
             _ => {}
         }
         return;
@@ -9241,6 +9583,94 @@ fn handle_backend_viewer_key(state: &mut TuiState, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_resume_picker_key(
+    state: &mut TuiState,
+    key: KeyEvent,
+    agent_input: &tokio::sync::mpsc::UnboundedSender<FromTui>,
+) -> bool {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'd'))
+    {
+        state.resume_picker_requested = false;
+        state.resume_picker = None;
+        return false;
+    }
+    if state.resume_picker_requested {
+        if key.code == KeyCode::Esc {
+            state.resume_picker_requested = false;
+            state.status = "session selection cancelled".to_string();
+        }
+        return true;
+    }
+    let Some(picker) = state.resume_picker.as_mut() else {
+        return false;
+    };
+    if picker.choices.is_empty() {
+        state.resume_picker = None;
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            state.resume_picker = None;
+            state.status = "session selection cancelled".to_string();
+        }
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Down => {
+            picker.selected = picker
+                .selected
+                .saturating_add(1)
+                .min(picker.choices.len() - 1)
+        }
+        KeyCode::PageUp => picker.selected = picker.selected.saturating_sub(6),
+        KeyCode::PageDown => {
+            picker.selected = picker
+                .selected
+                .saturating_add(6)
+                .min(picker.choices.len() - 1)
+        }
+        KeyCode::Home => picker.selected = 0,
+        KeyCode::End => picker.selected = picker.choices.len() - 1,
+        KeyCode::Enter if key.modifiers.is_empty() => {
+            let choice = &picker.choices[picker.selected];
+            let path = choice.path.clone();
+            let label = single_line_display_text(&choice.label);
+            if agent_input.send(FromTui::ResumeSelected(path)).is_ok() {
+                state.queue(Line_::User(format!("/resume [{label}]")));
+                state.clear_input();
+                state.clear_slash_completion_selection();
+                state.resume_picker = None;
+                state.resume_loading = true;
+                state.status = "resuming session".to_string();
+            } else {
+                state.resume_picker = None;
+                state.status = "session selection unavailable".to_string();
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn handle_help_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    if !state.show_help {
+        return false;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && matches!(key.code, KeyCode::Char('c' | 'd')) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('?') | KeyCode::F(1) => state.show_help = false,
+        KeyCode::Up => state.help_scroll = state.help_scroll.saturating_sub(1),
+        KeyCode::Down => state.help_scroll = state.help_scroll.saturating_add(1),
+        KeyCode::PageUp => state.help_scroll = state.help_scroll.saturating_sub(6),
+        KeyCode::PageDown => state.help_scroll = state.help_scroll.saturating_add(6),
+        KeyCode::Home => state.help_scroll = 0,
+        KeyCode::End => state.help_scroll = usize::MAX,
+        _ => {}
+    }
+    true
+}
+
 fn handle_todo_view_key(state: &mut TuiState, key: KeyEvent) -> bool {
     if !state.show_todos {
         return false;
@@ -9339,7 +9769,16 @@ fn handle_key(
         }
         return;
     }
-    if handle_todo_view_key(state, key) {
+    if state.resume_loading
+        && !matches!((key.code, key.modifiers),
+            (KeyCode::Char('c' | 'd'), modifiers) if modifiers.contains(KeyModifiers::CONTROL))
+    {
+        return;
+    }
+    if handle_resume_picker_key(state, key, agent_input)
+        || handle_todo_view_key(state, key)
+        || handle_help_key(state, key)
+    {
         return;
     }
     let is_ctrl = |m: KeyModifiers| {
@@ -9375,12 +9814,18 @@ fn handle_key(
                 let _ = agent_input.send(FromTui::CycleEffort(1));
             }
         }
+        (KeyCode::F(1), _) => {
+            state.show_help = !state.show_help;
+            state.help_scroll = 0;
+            state.show_todos = false;
+        }
         (KeyCode::Char('?'), m)
             if !m.contains(KeyModifiers::CONTROL)
                 && !m.contains(KeyModifiers::ALT)
                 && state.input.is_empty() =>
         {
             state.show_help = !state.show_help;
+            state.help_scroll = 0;
             state.show_todos = false;
         }
         (KeyCode::Char('o'), m) if is_ctrl(m) => {
@@ -9488,6 +9933,19 @@ fn handle_key(
         (KeyCode::Enter, _) => {
             let text = crate::normalize_user_input_path(&state.input);
             if text.trim().is_empty() {
+                return;
+            }
+            if !state.agent_busy && text.trim() == "/resume" {
+                state.resume_request_id = state.resume_request_id.wrapping_add(1);
+                state.resume_picker_requested = true;
+                state.status = "loading saved sessions…".to_string();
+                if agent_input
+                    .send(FromTui::ResumeChoices(state.resume_request_id))
+                    .is_err()
+                {
+                    state.resume_picker_requested = false;
+                    state.status = "session picker unavailable".to_string();
+                }
                 return;
             }
             if state.agent_busy && state.pending_perm.is_none() {
@@ -9942,7 +10400,8 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel::<FromTui>();
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let git_probe_root = agent.sandbox_root.clone();
-    let mut git_probe = tokio::task::spawn_blocking(move || tui_git_summary(&git_probe_root));
+    let probe_root = git_probe_root.clone();
+    let mut git_probe = tokio::task::spawn_blocking(move || tui_git_summary(&probe_root));
     let (git_context, git_probe_pending) =
         match tokio::time::timeout(Duration::from_millis(8), &mut git_probe).await {
             Ok(Ok(summary)) => (summary, false),
@@ -9952,8 +10411,16 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                 let agent_tx = in_tx.clone();
                 tokio::spawn(async move {
                     if let Ok(summary) = git_probe.await {
-                        let _ = ui_tx.send(ToTui::GitSummary(summary.clone()));
-                        let _ = agent_tx.send(FromTui::GitContext(summary));
+                        let _ = ui_tx.send(ToTui::GitSummary {
+                            root: git_probe_root.clone(),
+                            epoch: 0,
+                            summary: summary.clone(),
+                        });
+                        let _ = agent_tx.send(FromTui::GitContext {
+                            root: git_probe_root,
+                            epoch: 0,
+                            summary,
+                        });
                     }
                 });
                 (None, true)
@@ -9993,6 +10460,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     );
     state.context_mode = context_mode;
     state.reasoning_mode = reasoning_mode;
+    state.sandbox_path = agent.sandbox_root.clone();
     agent.git_context = git_context.clone();
     state.git_branch = git_context.clone();
     state.git_refresh_in_flight = git_probe_pending;
@@ -10026,7 +10494,9 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let direct_steer_tx = steer_tx.clone();
     agent.install_runtime_controls(runtime_control_rx, runtime_control_tx.clone());
     agent.install_steering(steer_rx, steer_tx);
+    let picker_tx = ev_tx.clone();
     let handle = tokio::spawn(async move {
+        let mut git_epoch = 0u64;
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 FromTui::Submit { text, pane_width } => {
@@ -10156,8 +10626,60 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                         effort.as_str()
                     )));
                 }
-                FromTui::GitContext(summary) => {
-                    agent.git_context = summary;
+                FromTui::GitContext {
+                    root,
+                    epoch,
+                    summary,
+                } => {
+                    if root == agent.sandbox_root && epoch == git_epoch {
+                        agent.git_context = summary;
+                    }
+                }
+                FromTui::ResumeChoices(request_id) => {
+                    let root = agent.sandbox_root.clone();
+                    let seat = agent.seat.as_ref().map(|seat| seat.id.clone());
+                    let ui_tx = picker_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = resume_choices(&root, seat.as_deref());
+                        let _ = ui_tx.send(ToTui::ResumeChoices { request_id, result });
+                    });
+                }
+                FromTui::ResumeSelected(path) => {
+                    let seat = agent.seat.as_ref().map(|seat| seat.id.clone());
+                    match agent.load_session_from_path_for_seat(&path, seat.as_deref()) {
+                        Ok(loaded) => {
+                            git_epoch = git_epoch.wrapping_add(1);
+                            agent.sink.emit(AgentEvent::Slash(format!(
+                                "loaded {} messages from {}",
+                                agent.history.len(),
+                                loaded.display()
+                            )));
+                            let _ = picker_tx.send(ToTui::ResumeLoaded {
+                                root: agent.sandbox_root.clone(),
+                                git: agent.git_context.clone(),
+                                todos: initial_todo_items(&agent.sandbox_root, &agent.session_id),
+                            });
+                            agent.sink.emit(AgentEvent::ThinkingEffortChanged {
+                                effort: agent.thinking_effort(),
+                            });
+                            agent.sink.emit(AgentEvent::ReasoningModeChanged {
+                                mode: agent.reasoning_mode(),
+                            });
+                            agent.sink.emit(AgentEvent::UsageUpdate {
+                                turn: Usage::default(),
+                                session: agent.session_usage,
+                            });
+                            agent.emit_runtime_provider_state();
+                            agent.sink.emit(AgentEvent::HistoryContextUpdated {
+                                chars: agent.history_chars(),
+                                tokens: Some(agent.estimated_context_tokens_from_history()),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = picker_tx.send(ToTui::ResumeLoadFailed(format!("{error:#}")));
+                        }
+                    }
+                    agent.checkpoint_latest_session("outer_loop_autosave");
                 }
                 FromTui::Quit => break,
             }
@@ -10197,10 +10719,16 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         }
 
         if state.begin_git_branch_refresh() {
-            let root = std::path::PathBuf::from(&state.sandbox);
+            let root = state.sandbox_path.clone();
+            let epoch = state.git_epoch;
             let tx = ev_tx.clone();
             tokio::task::spawn_blocking(move || {
-                let _ = tx.send(ToTui::GitSummary(tui_git_summary(&root)));
+                let summary = tui_git_summary(&root);
+                let _ = tx.send(ToTui::GitSummary {
+                    root,
+                    epoch,
+                    summary,
+                });
             });
         }
         if terminal_has_render_area(&terminal)? {
@@ -11379,6 +11907,478 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn help_overlay_scrolls_to_last_entry_at_narrow_and_normal_widths() {
+        for width in [38, 80] {
+            let mut state = TuiState::new(
+                "test-model".to_string(),
+                8192,
+                ".".to_string(),
+                ApprovalProfile::Ask,
+                ThinkingEffort::Medium,
+            );
+            state.show_help = true;
+            let first = draw_to_lines(width, VIEWPORT_HEIGHT, &mut state).join("\n");
+            assert!(
+                first.contains("keymap") && first.contains("Enter"),
+                "{first}"
+            );
+            state.help_scroll = usize::MAX;
+            let last = draw_to_lines(width, VIEWPORT_HEIGHT, &mut state).join("\n");
+            assert!(
+                last.contains("?/Esc close") && last.contains("Branch(master"),
+                "{last}"
+            );
+            assert!(state.help_scroll > 0);
+            let full = help_overlay_text(width - 2);
+            let (_, visible, total) =
+                help_overlay_layout(Rect::new(0, 0, width, VIEWPORT_HEIGHT), &full);
+            assert_eq!(state.help_scroll, total - visible);
+            let smaller = draw_to_lines(28, VIEWPORT_HEIGHT, &mut state).join("\n");
+            assert!(
+                smaller.contains("help") && state.help_scroll > 0,
+                "{smaller}"
+            );
+            state.help_scroll = usize::MAX;
+            let last_narrow = draw_to_lines(28, VIEWPORT_HEIGHT, &mut state).join("\n");
+            assert!(last_narrow.contains("?/Esc close"), "{last_narrow}");
+        }
+    }
+
+    #[test]
+    fn help_navigation_and_cancel_keep_composer_intact() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            8192,
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "draft".to_string();
+        state.cursor = 5;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime, _) = tokio::sync::mpsc::unbounded_channel();
+        let (steering, _) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()),
+            &tx,
+            &runtime,
+            &steering,
+            &interrupt,
+        );
+        assert!(state.show_help);
+        for code in [KeyCode::PageDown, KeyCode::Char('x'), KeyCode::Enter] {
+            handle_key(
+                &mut state,
+                KeyEvent::new(code, KeyModifiers::empty()),
+                &tx,
+                &runtime,
+                &steering,
+                &interrupt,
+            );
+        }
+        assert_eq!(state.help_scroll, 6);
+        assert_eq!(state.input, "draft");
+        assert!(rx.try_recv().is_err());
+        handle_paste(&mut state, "ignored".to_string());
+        assert_eq!(state.input, "draft");
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &tx,
+            &runtime,
+            &steering,
+            &interrupt,
+        );
+        assert!(!state.show_help);
+        assert_eq!(state.input, "draft");
+    }
+
+    #[test]
+    fn resume_picker_selects_by_path_and_rejects_stale_results() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            8192,
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "/resume".to_string();
+        state.cursor = state.input.len();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime, _) = tokio::sync::mpsc::unbounded_channel();
+        let (steering, _) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let key = |state: &mut TuiState, code| {
+            handle_key(
+                state,
+                KeyEvent::new(code, KeyModifiers::empty()),
+                &tx,
+                &runtime,
+                &steering,
+                &interrupt,
+            )
+        };
+        key(&mut state, KeyCode::Enter);
+        let request_id = match rx.try_recv().expect("picker request") {
+            FromTui::ResumeChoices(id) => id,
+            _ => panic!("unexpected command"),
+        };
+        key(&mut state, KeyCode::Esc);
+        assert_eq!(state.input, "/resume");
+        apply_tui_message(
+            &mut state,
+            ToTui::ResumeChoices {
+                request_id,
+                result: Ok(vec![ResumeChoice {
+                    label: "stale".to_string(),
+                    path: PathBuf::from("stale.jsonl"),
+                }]),
+            },
+        );
+        assert!(state.resume_picker.is_none());
+        key(&mut state, KeyCode::Enter);
+        let fresh_id = match rx.try_recv().expect("new picker request") {
+            FromTui::ResumeChoices(id) => id,
+            _ => panic!("unexpected command"),
+        };
+        assert_ne!(request_id, fresh_id);
+        apply_tui_message(
+            &mut state,
+            ToTui::ResumeChoices {
+                request_id: fresh_id,
+                result: Ok(vec![
+                    ResumeChoice {
+                        label: "Latest".to_string(),
+                        path: PathBuf::from("latest.jsonl"),
+                    },
+                    ResumeChoice {
+                        label: "Named · saved".to_string(),
+                        path: PathBuf::from("saved.jsonl"),
+                    },
+                ]),
+            },
+        );
+        key(&mut state, KeyCode::Down);
+        let rendered = draw_to_lines(76, VIEWPORT_HEIGHT, &mut state).join("\n");
+        assert!(
+            rendered.contains("Named · saved") && rendered.contains("2/2"),
+            "{rendered}"
+        );
+        key(&mut state, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(FromTui::ResumeSelected(path)) if path == Path::new("saved.jsonl"))
+        );
+        assert!(state.resume_picker.is_none() && state.input.is_empty());
+    }
+
+    #[test]
+    fn resume_picker_load_failure_returns_to_ready_and_surfaces_error() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            8192,
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.status = "resuming session".to_string();
+        state.resume_loading = true;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime, _) = tokio::sync::mpsc::unbounded_channel();
+        let (steering, _) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &tx,
+            &runtime,
+            &steering,
+            &interrupt,
+        );
+        handle_paste(&mut state, "unexpected prompt".to_string());
+        assert!(rx.try_recv().is_err());
+        assert!(state.input.is_empty());
+        apply_tui_message(
+            &mut state,
+            ToTui::ResumeLoadFailed("bad message on line 2".to_string()),
+        );
+        assert!(!state.resume_loading);
+        assert_eq!(state.status, "ready");
+        assert!(
+            matches!(state.pending_insert.last(), Some(Line_::Error(error)) if error.contains("bad message on line 2"))
+        );
+    }
+
+    #[test]
+    fn resume_picker_cancel_keeps_draft_and_permission_preempts_it() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            8192,
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "/resume".to_string();
+        state.cursor = state.input.len();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime, _) = tokio::sync::mpsc::unbounded_channel();
+        let (steering, _) = tokio::sync::mpsc::unbounded_channel();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let key = |state: &mut TuiState, code| {
+            handle_key(
+                state,
+                KeyEvent::new(code, KeyModifiers::empty()),
+                &tx,
+                &runtime,
+                &steering,
+                &interrupt,
+            )
+        };
+        key(&mut state, KeyCode::Enter);
+        let request_id = match rx.try_recv().expect("picker request") {
+            FromTui::ResumeChoices(id) => id,
+            _ => panic!("unexpected command"),
+        };
+        apply_tui_message(
+            &mut state,
+            ToTui::ResumeChoices {
+                request_id,
+                result: Ok(vec![ResumeChoice {
+                    label: "Named · saved".to_string(),
+                    path: PathBuf::from("saved.jsonl"),
+                }]),
+            },
+        );
+        key(&mut state, KeyCode::Esc);
+        assert_eq!(state.input, "/resume");
+        assert!(state.resume_picker.is_none() && rx.try_recv().is_err());
+        key(&mut state, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(FromTui::ResumeChoices(_))));
+        let (reply, _) = std::sync::mpsc::sync_channel(0);
+        apply_tui_message(
+            &mut state,
+            ToTui::PermissionRequest {
+                name: "bash".to_string(),
+                input: serde_json::json!({"command":"pwd"}),
+                responder: reply,
+            },
+        );
+        assert!(state.pending_perm.is_some() && !state.resume_picker_requested);
+        assert_eq!(state.input, "/resume");
+    }
+
+    #[test]
+    fn resume_picker_discovers_latest_autosaved_and_named_sessions() {
+        let _guard = env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "dext-tui-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock drift")
+                .as_nanos(),
+        ));
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(sessions.join("autosaved-1")).expect("create sessions");
+        std::fs::create_dir_all(sessions.join("autosaved-2")).expect("create second session");
+        let source = include_str!("../tests/fixtures/state/sessions/v1.jsonl");
+        let foreign_root = root.join("foreign-project");
+        std::fs::create_dir_all(&foreign_root).expect("create foreign project");
+        let seated = |id: &str, sandbox: &Path| {
+            serde_json::json!({
+                "version": 3, "model": "fixture", "system": "fixture-system",
+                "seat": { "id": id }, "sandbox": sandbox,
+            })
+            .to_string()
+        };
+        std::fs::write(sessions.join("seat-good.jsonl"), seated("planner", &root))
+            .expect("write matching seat");
+        std::fs::write(
+            sessions.join("seat-other.jsonl"),
+            seated("different-seat", &root),
+        )
+        .expect("write different seat");
+        std::fs::write(
+            sessions.join("seat-foreign.jsonl"),
+            seated("planner", &foreign_root),
+        )
+        .expect("write foreign project");
+        std::fs::write(sessions.join("_latest.jsonl"), source).expect("write latest");
+        std::fs::write(sessions.join("autosaved-1/_latest.jsonl"), source)
+            .expect("write autosaved");
+        std::fs::write(sessions.join("autosaved-2/_latest.jsonl"), source)
+            .expect("write second autosaved");
+        std::fs::write(sessions.join("saved.jsonl"), source).expect("write named");
+        std::fs::write(sessions.join("broken.jsonl"), "invalid session").expect("write invalid");
+        let previous = std::env::var_os("DEXT_SESSIONS_DIR");
+        unsafe {
+            std::env::set_var("DEXT_SESSIONS_DIR", &sessions);
+        }
+        let choices = resume_choices(&root, None).expect("list sessions");
+        let seat_choices = resume_choices(&root, Some("missing-seat")).expect("list seat sessions");
+        let planner_choices =
+            resume_choices(&root, Some("planner")).expect("list planner sessions");
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("DEXT_SESSIONS_DIR", previous);
+            } else {
+                std::env::remove_var("DEXT_SESSIONS_DIR");
+            }
+        }
+        std::fs::remove_dir_all(&root).expect("remove fixture");
+        assert_eq!(choices.len(), 6);
+        assert_eq!(choices[0].label, "Latest");
+        assert!(choices[1].label.starts_with("Autosaved · "));
+        assert!(choices.iter().any(|choice| choice.label == "Named · saved"));
+        let paths = choices.iter().map(|c| c.path.as_path()).collect::<Vec<_>>();
+        assert_ne!(paths[0], paths[1]);
+        assert_eq!(seat_choices.len(), 3);
+        assert!(seat_choices[0].label.starts_with("Autosaved · "));
+        assert!(seat_choices[1].label.starts_with("Autosaved · "));
+        assert_eq!(seat_choices[2].label, "Named · saved");
+        assert_eq!(planner_choices.len(), 4);
+        assert!(
+            planner_choices
+                .iter()
+                .any(|choice| choice.label == "Named · seat-good")
+        );
+        assert!(
+            !planner_choices
+                .iter()
+                .any(|choice| choice.label.contains("seat-other")
+                    || choice.label.contains("seat-foreign"))
+        );
+    }
+
+    #[test]
+    fn local_auth_paste_precedes_stale_help_or_picker_state() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            8192,
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        queue_local_auth_secret_request(&mut state, "git".to_string(), "git auth".to_string(), tx);
+        state.show_help = true;
+        state.resume_picker_requested = true;
+        handle_paste(&mut state, "local-secret\n".to_string());
+        match rx.try_recv().expect("local auth response") {
+            LocalAuthSecret::Secret(secret) => assert_eq!(secret, "local-secret"),
+            _ => panic!("expected local auth secret"),
+        }
+        assert!(state.pending_local_auth.is_none());
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn pending_permission_paste_does_not_modify_composer() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            8192,
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "draft".to_string();
+        state.cursor = state.input.len();
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        queue_permission_request(
+            &mut state,
+            "bash".to_string(),
+            serde_json::json!({"command":"pwd"}),
+            reply,
+        );
+        handle_paste(&mut state, "not an approval".to_string());
+        assert_eq!(state.input, "draft");
+        assert!(state.pending_perm.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_git_probe_uses_exact_non_utf8_workspace_identity() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let old = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/project-\xff".to_vec()));
+        let new = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/project-\xfe".to_vec()));
+        assert_eq!(old.to_string_lossy(), new.to_string_lossy());
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            8192,
+            old.display().to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.sandbox_path = old.clone();
+        apply_tui_message(
+            &mut state,
+            ToTui::ResumeLoaded {
+                root: new.clone(),
+                git: Some("new-branch".to_string()),
+                todos: vec![],
+            },
+        );
+        let epoch = state.git_epoch;
+        apply_tui_message(
+            &mut state,
+            ToTui::GitSummary {
+                root: old,
+                epoch,
+                summary: Some("old-branch".to_string()),
+            },
+        );
+        assert_eq!(state.sandbox_path, new);
+        assert_eq!(state.git_branch.as_deref(), Some("new-branch"));
+    }
+
+    #[test]
+    fn resume_loaded_updates_workspace_todos_and_rejects_stale_git_probe() {
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            8192,
+            "/old/project".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.git_refresh_in_flight = true;
+        let todo = TodoItem {
+            text: "restored".to_string(),
+            status: TodoItemStatus::InProgress,
+        };
+        apply_tui_message(
+            &mut state,
+            ToTui::ResumeLoaded {
+                root: PathBuf::from("/new/project"),
+                git: Some("main".to_string()),
+                todos: vec![todo],
+            },
+        );
+        apply_tui_message(
+            &mut state,
+            ToTui::GitSummary {
+                root: PathBuf::from("/old/project"),
+                epoch: 0,
+                summary: Some("stale".to_string()),
+            },
+        );
+        apply_tui_message(
+            &mut state,
+            ToTui::GitSummary {
+                root: PathBuf::from("/new/project"),
+                epoch: 0,
+                summary: Some("same-root stale".to_string()),
+            },
+        );
+        assert_eq!(state.sandbox, "/new/project");
+        assert_eq!(state.git_branch.as_deref(), Some("main"));
+        assert_eq!(state.todo_items[0].text, "restored");
+        assert_eq!(state.todo_progress.as_ref().map(|p| p.total), Some(1));
+        assert!(!state.git_refresh_in_flight);
+    }
+
     fn draw_backend_to_lines(width: u16, height: u16, state: &mut TuiState) -> Vec<String> {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -11817,7 +12817,7 @@ mod tests {
             " ❯ Type a request…   @ files · / commands"
         );
 
-        let help = flatten_lines(&help_overlay_text()).join("\n");
+        let help = flatten_lines(&help_overlay_text(70)).join("\n");
         assert!(help.contains("Enter"), "{help}");
         assert!(help.contains("Shift+Enter / Alt+Enter"), "{help}");
         assert!(help.contains("Ctrl+O"), "{help}");
