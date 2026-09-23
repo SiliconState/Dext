@@ -437,6 +437,7 @@ struct ExpandableBlock {
 
 struct ResumeChoice {
     label: String,
+    started: String,
     path: PathBuf,
 }
 
@@ -7991,7 +7992,13 @@ fn resume_choices(
                 return;
             }
         }
-        choices.push(ResumeChoice { label, path });
+        let started = crate::session_started_at_utc(header.session_id.as_deref(), &path)
+            .unwrap_or_else(|| "unknown".to_string());
+        choices.push(ResumeChoice {
+            label,
+            started,
+            path,
+        });
     };
     let latest = if let Some(seat) = expected_seat {
         crate::seats::latest_session_path(root, seat).ok()
@@ -8063,12 +8070,26 @@ fn render_resume_picker(frame: &mut ratatui::Frame, state: &mut TuiState, area: 
         .take(visible)
     {
         let label = single_line_display_text(&choice.label);
+        let started = single_line_display_text(&choice.started);
         let path = single_line_display_text(&choice.path.to_string_lossy());
-        let label_budget = width.saturating_sub(5).min(width / 2);
+        let started = clamp_chars(&started, width);
+        let started_width = text_width(&started);
+        let label_budget = width
+            .saturating_sub(started_width)
+            .saturating_sub(3)
+            .min(width / 3);
         let label = clamp_chars(&label, label_budget);
-        let path_budget = width.saturating_sub(text_width(&label)).saturating_sub(3);
+        let mut text = if label.is_empty() {
+            started
+        } else {
+            format!("{label} · {started}")
+        };
+        let path_budget = width.saturating_sub(text_width(&text)).saturating_sub(3);
         let path = truncate_path_for_cells(&path, path_budget);
-        let text = format!("{label} · {path}");
+        if !path.is_empty() {
+            text.push_str(" · ");
+            text.push_str(&path);
+        }
         let style = if index == selected {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         } else {
@@ -12034,6 +12055,7 @@ mod tests {
                 request_id,
                 result: Ok(vec![ResumeChoice {
                     label: "stale".to_string(),
+                    started: "2023-11-14 22:13:20 UTC".to_string(),
                     path: PathBuf::from("stale.jsonl"),
                 }]),
             },
@@ -12052,10 +12074,12 @@ mod tests {
                 result: Ok(vec![
                     ResumeChoice {
                         label: "Latest".to_string(),
+                        started: "2023-11-14 22:13:20 UTC".to_string(),
                         path: PathBuf::from("latest.jsonl"),
                     },
                     ResumeChoice {
                         label: "Named · saved".to_string(),
+                        started: "2023-11-14 22:13:20 UTC".to_string(),
                         path: PathBuf::from("saved.jsonl"),
                     },
                 ]),
@@ -12064,7 +12088,9 @@ mod tests {
         key(&mut state, KeyCode::Down);
         let rendered = draw_to_lines(76, VIEWPORT_HEIGHT, &mut state).join("\n");
         assert!(
-            rendered.contains("Named · saved") && rendered.contains("2/2"),
+            rendered.contains("Named · saved")
+                && rendered.contains("2023-11-14 22:13:20 UTC")
+                && rendered.contains("2/2"),
             "{rendered}"
         );
         key(&mut state, KeyCode::Enter);
@@ -12147,6 +12173,7 @@ mod tests {
                 request_id,
                 result: Ok(vec![ResumeChoice {
                     label: "Named · saved".to_string(),
+                    started: "2023-11-14 22:13:20 UTC".to_string(),
                     path: PathBuf::from("saved.jsonl"),
                 }]),
             },

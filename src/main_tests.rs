@@ -20043,6 +20043,24 @@ fn prompt_env_values_are_bounded_and_cannot_inject_lines() {
     assert_eq!(utc_date_from_unix_secs(0), "1970-01-01");
     assert_eq!(utc_date_from_unix_secs(86_400), "1970-01-02");
     assert_eq!(utc_date_from_unix_secs(951_782_400), "2000-02-29");
+    assert_eq!(
+        utc_datetime_from_unix_secs(1_700_000_000),
+        "2023-11-14 22:13:20 UTC"
+    );
+    assert_eq!(
+        session_id_unix_secs("1700000000-4242-abcdef012345"),
+        Some(1_700_000_000)
+    );
+    assert_eq!(
+        session_started_at_utc(
+            None,
+            Path::new("/sessions/1700000000-4242-abcdef012345/_latest.jsonl")
+        )
+        .as_deref(),
+        Some("2023-11-14 22:13:20 UTC")
+    );
+    assert_eq!(session_id_unix_secs("1700000000-4242-nothex000000"), None);
+    assert_eq!(session_started_at_utc(None, Path::new("saved.jsonl")), None);
     for cap in 0..32 {
         assert!(
             prompt_env_value(&"\n\u{2028}\u{2029}".repeat(100), cap).len() <= cap,
@@ -31222,6 +31240,7 @@ fn session_listing_shows_header_and_footer() -> Result<()> {
     let result = (|| -> Result<()> {
         let project = std::fs::canonicalize(&project)?;
         let mut agent = test_agent(&project);
+        agent.session_id = "1700000000-4242-abcdef012345".to_string();
         agent.history.push(Message {
             role: "user".to_string(),
             content: vec![Block::Text {
@@ -31235,6 +31254,11 @@ fn session_listing_shows_header_and_footer() -> Result<()> {
             listing.starts_with("Sessions  2 found\nLatest\n  latest\n"),
             "{listing}"
         );
+        assert!(
+            listing.contains("started: 2023-11-14 22:13:20 UTC"),
+            "{listing}"
+        );
+        assert!(!listing.contains("updated:"), "{listing}");
         assert!(listing.contains("\nAutosaved\n"), "{listing}");
         assert!(listing.contains("\nNamed\n"), "{listing}");
         assert!(listing.contains("\nUse:\n  /resume [name]\n"), "{listing}");
