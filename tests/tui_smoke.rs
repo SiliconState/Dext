@@ -294,16 +294,13 @@ fn tui_resume_picker_loads_selected_saved_session() {
     for dir in [&sandbox, &dext_home, &home, &sessions] {
         fs::create_dir_all(dir).expect("create directory");
     }
-    fs::write(
-        sessions.join("alpha.jsonl"),
-        include_str!("fixtures/state/sessions/v1.jsonl"),
-    )
-    .expect("write alpha fixture");
-    fs::write(
-        sessions.join("beta.jsonl"),
-        include_str!("fixtures/state/sessions/v1.jsonl"),
-    )
-    .expect("write beta fixture");
+    let fixture = include_str!("fixtures/state/sessions/v1.jsonl").replacen(
+        '{',
+        "{\"session_id\":\"1700000000-4242-abcdef012345\",",
+        1,
+    );
+    fs::write(sessions.join("alpha.jsonl"), &fixture).expect("write alpha fixture");
+    fs::write(sessions.join("beta.jsonl"), &fixture).expect("write beta fixture");
     fs::write(
         sessions.join("broken.jsonl"),
         "{\"model\":\"broken\",\"system\":\"fixture\"}\nnot-json\n",
@@ -338,6 +335,12 @@ fn tui_resume_picker_loads_selected_saved_session() {
         &mut pty,
         &mut child,
         "Named · alpha",
+        Duration::from_secs(3),
+    );
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "2023-11-14 22:13:20 UTC",
         Duration::from_secs(3),
     );
     pty.write_all_retry(b"\x1b[B")

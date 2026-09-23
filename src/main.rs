@@ -10060,6 +10060,50 @@ fn utc_date_from_unix_secs(timestamp: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+fn utc_datetime_from_unix_secs(timestamp: u64) -> String {
+    let date = utc_date_from_unix_secs(timestamp);
+    let seconds = timestamp % 86_400;
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    format!("{date} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+fn session_id_unix_secs(session_id: &str) -> Option<u64> {
+    if !is_valid_session_id(session_id) {
+        return None;
+    }
+    let mut parts = session_id.split('-');
+    let timestamp = parts.next()?;
+    let pid = parts.next()?;
+    let random = parts.next()?;
+    if parts.next().is_some()
+        || timestamp.is_empty()
+        || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+        || pid.parse::<u32>().is_err()
+        || random.len() != 12
+        || !random.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    timestamp.parse().ok()
+}
+
+fn session_started_at_utc(session_id: Option<&str>, path: &Path) -> Option<String> {
+    let timestamp = session_id.and_then(session_id_unix_secs).or_else(|| {
+        path.file_stem()
+            .and_then(|part| part.to_str())
+            .and_then(session_id_unix_secs)
+            .or_else(|| {
+                path.parent()
+                    .and_then(Path::file_name)
+                    .and_then(|part| part.to_str())
+                    .and_then(session_id_unix_secs)
+            })
+    });
+    timestamp.map(utc_datetime_from_unix_secs)
+}
+
 fn prompt_env_value(raw: &str, max_bytes: usize) -> String {
     if max_bytes == 0 {
         return String::new();
@@ -19894,12 +19938,6 @@ fn html_escape(raw: &str) -> String {
     out
 }
 
-fn system_time_unix_secs(time: std::time::SystemTime) -> Option<u64> {
-    time.duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
-}
-
 fn persisted_session_source_version(line: &str) -> Result<u32> {
     let value: Value = serde_json::from_str(line).context("bad session header")?;
     match value.get("version") {
@@ -19952,16 +19990,15 @@ fn read_session_jsonl(path: &Path) -> Result<(SessionHeader, Vec<Message>)> {
 fn render_session_entry(
     path: &Path,
     name: &str,
-    modified: Option<std::time::SystemTime>,
     opts: &list_render::ListOptions,
     root: &Path,
 ) -> String {
-    let updated = modified
-        .and_then(system_time_unix_secs)
-        .map(|secs| format!("updated {secs}"))
-        .unwrap_or_else(|| "updated unknown".to_string());
-    let (messages, model) = match read_session_jsonl(path) {
-        Ok((header, history)) => (history.len(), header.model),
+    let (messages, model, started) = match read_session_jsonl(path) {
+        Ok((header, history)) => {
+            let started = session_started_at_utc(header.session_id.as_deref(), path)
+                .unwrap_or_else(|| "unknown".to_string());
+            (history.len(), header.model, started)
+        }
         Err(e) => {
             let meta = vec![("path", list_render::display_path(path, opts, root))];
             return list_render::render_entry(name, &format!("unreadable ({e:#})"), &meta, opts);
@@ -19970,7 +20007,7 @@ fn render_session_entry(
     let meta = vec![
         ("msgs", messages.to_string()),
         ("model", model),
-        ("updated", updated),
+        ("started", started),
         ("path", list_render::display_path(path, opts, root)),
     ];
     list_render::render_entry(name, "", &meta, opts)
@@ -20019,14 +20056,7 @@ fn render_session_listing_width(root: &Path, width: Option<usize>) -> String {
 
     out.push_str(&list_render::render_section_header("Latest", &opts));
     if latest_exists {
-        let modified = latest_path.metadata().ok().and_then(|m| m.modified().ok());
-        out.push_str(&render_session_entry(
-            &latest_path,
-            "latest",
-            modified,
-            &opts,
-            root,
-        ));
+        out.push_str(&render_session_entry(&latest_path, "latest", &opts, root));
     } else {
         list_render::write_wrapped(
             &mut out,
@@ -20052,8 +20082,8 @@ fn render_session_listing_width(root: &Path, width: Option<usize>) -> String {
             opts.effective_width(),
         );
     } else {
-        for (name, path, modified) in autosaved_sessions.iter().take(SLASH_LIST_LIMIT) {
-            out.push_str(&render_session_entry(path, name, *modified, &opts, root));
+        for (name, path, _) in autosaved_sessions.iter().take(SLASH_LIST_LIMIT) {
+            out.push_str(&render_session_entry(path, name, &opts, root));
         }
         if autosaved_sessions.len() > SLASH_LIST_LIMIT {
             list_render::write_wrapped(
@@ -20087,7 +20117,6 @@ fn render_session_listing_width(root: &Path, width: Option<usize>) -> String {
                 out.push_str(&render_session_entry(
                     &record.path,
                     &record.name,
-                    record.modified,
                     &opts,
                     root,
                 ));

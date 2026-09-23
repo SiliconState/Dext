@@ -1128,7 +1128,6 @@ pub(crate) fn named_session_path_for_root(root: &Path, name: &str) -> Result<Pat
 pub(crate) struct SessionRecord {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
-    pub(crate) modified: Option<std::time::SystemTime>,
 }
 
 pub(crate) fn list_session_records_for_dir(dir: &Path) -> Result<Vec<SessionRecord>> {
@@ -1146,11 +1145,9 @@ pub(crate) fn list_session_records_for_dir(dir: &Path) -> Result<Vec<SessionReco
             if name == LATEST_SESSION_NAME {
                 return None;
             }
-            let modified = e.metadata().ok().and_then(|m| m.modified().ok());
             Some(SessionRecord {
                 name: name.to_string(),
                 path,
-                modified,
             })
         })
         .collect();
