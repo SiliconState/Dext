@@ -48,14 +48,16 @@ use provider::{
     build_chatgpt_request, build_chatgpt_summary_request, build_openai_responses_request,
     built_in_provider_profiles, cancel_pending_oauth_login, canonical_provider_id,
     effective_request_contract, extract_oauth_code_from_callback, find_provider_profile,
-    handle_auth_cli, is_gpt_5_6_model, is_official_anthropic_profile, is_official_kimi_profile,
-    list_models_for_available_providers, list_models_for_provider, load_auth_store,
-    load_provider_catalog, login_provider, logout_provider, looks_like_login_secret_input,
-    normalize_provider_model_value, official_openai_gpt_5_6_responses, provider_auth_status,
-    provider_catalog_path, provider_id_from_selector, provider_request_url,
-    refresh_local_llama_context_window, render_provider_list, render_provider_picker,
-    request_contract_for_profile, resolve_active_provider_id, resolve_model_spec,
-    resolve_provider_model_selection, resolve_runtime_provider, set_active_provider_in_catalog,
+    handle_auth_cli, is_claude_fable_5_1_model, is_claude_opus_5_5_model, is_gpt_5_6_model,
+    is_gpt_6_model, is_gpt_6_sol_or_luna_model, is_official_anthropic_profile,
+    is_official_kimi_profile, is_openai_responses_model, list_models_for_available_providers,
+    list_models_for_provider, load_auth_store, load_provider_catalog, login_provider,
+    logout_provider, looks_like_login_secret_input, normalize_provider_model_value,
+    official_openai_responses_model, provider_auth_status, provider_catalog_path,
+    provider_id_from_selector, provider_request_url, refresh_local_llama_context_window,
+    render_provider_list, render_provider_picker, request_contract_for_profile,
+    resolve_active_provider_id, resolve_model_spec, resolve_provider_model_selection,
+    resolve_runtime_provider, set_active_provider_in_catalog,
     set_provider_default_model_in_catalog, try_complete_oauth_from_callback,
 };
 #[cfg(unix)]
@@ -2504,6 +2506,32 @@ fn empty_tool_result_metadata() -> ToolResultMetadata {
     ToolResultMetadata::default()
 }
 
+const PROVIDER_ROUTE_CONTINUATION_PREFIX: &str = "[provider-route continuation]";
+
+fn has_provider_bound_reasoning(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                Block::Thinking { .. }
+                    | Block::RedactedThinking { .. }
+                    | Block::ResponsesReasoning { .. }
+            )
+        })
+    })
+}
+
+fn resume_requires_reasoning_replay_boundary(
+    saved_route_hash: Option<&str>,
+    current_route_hash: &str,
+    history: &[Message],
+) -> bool {
+    saved_route_hash.map_or_else(
+        || has_provider_bound_reasoning(history),
+        |saved| saved != current_route_hash,
+    )
+}
+
 /// A user message that represents a fresh prompt (not tool results and not a
 /// runtime-injected note). Used as the current-turn boundary when deciding
 /// which thinking blocks must still be sent back to the provider.
@@ -2574,6 +2602,7 @@ fn sanitize_anthropic_messages(
                         }
                         Block::RedactedThinking { data } => (preserve_thinking && !data.is_empty())
                             .then_some(Block::RedactedThinking { data: data.clone() }),
+                        Block::ResponsesReasoning { .. } => None,
                         other => Some(other.clone()),
                     })
                     .collect(),
@@ -2926,6 +2955,17 @@ fn openai_responses_reasoning_effort(effort: ThinkingEffort) -> &'static str {
 }
 
 fn openai_reasoning_effort(model: &str, effort: ThinkingEffort) -> Option<&'static str> {
+    if is_gpt_6_model(model) {
+        return match effort {
+            ThinkingEffort::Off if is_gpt_6_sol_or_luna_model(model) => Some("none"),
+            ThinkingEffort::Off => None,
+            ThinkingEffort::Minimal | ThinkingEffort::Low => Some("low"),
+            ThinkingEffort::Medium => Some("medium"),
+            ThinkingEffort::High => Some("high"),
+            ThinkingEffort::XHigh => Some("xhigh"),
+            ThinkingEffort::Max => Some("max"),
+        };
+    }
     if is_gpt_5_6_model(model) {
         return Some(match effort {
             ThinkingEffort::Off => "none",
@@ -3071,7 +3111,46 @@ fn provider_model_output_config_effort(
         .and_then(|levels| map_effort_to_provider_levels(&levels, effort))
 }
 
+fn anthropic_always_adaptive_effort(model: &str, effort: ThinkingEffort) -> Option<String> {
+    let always_adaptive = is_claude_opus_5_5_model(model) || is_claude_fable_5_1_model(model);
+    if !always_adaptive {
+        return None;
+    }
+    Some(
+        match effort {
+            ThinkingEffort::Off | ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
+            ThinkingEffort::Medium => "medium",
+            ThinkingEffort::High | ThinkingEffort::XHigh => "high",
+            ThinkingEffort::Max => "max",
+        }
+        .to_string(),
+    )
+}
+
+fn looks_like_claude_model(model: &str) -> bool {
+    model
+        .trim()
+        .to_ascii_lowercase()
+        .rsplit('/')
+        .next()
+        .is_some_and(|model| model.starts_with("claude-"))
+}
+
+fn anthropic_required_adaptive_effort(
+    provider_id: &str,
+    model: &str,
+    effort: ThinkingEffort,
+) -> Option<String> {
+    let provider_id = canonical_provider_id(provider_id);
+    (provider_id == "anthropic" || looks_like_claude_model(model))
+        .then(|| anthropic_always_adaptive_effort(model, effort))
+        .flatten()
+}
+
 fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option<String> {
+    if let Some(effort) = anthropic_always_adaptive_effort(model, effort) {
+        return Some(effort);
+    }
     let effort = match effort {
         ThinkingEffort::Off => return None,
         ThinkingEffort::Minimal | ThinkingEffort::Low => "low",
@@ -3095,11 +3174,14 @@ fn anthropic_output_config_effort(model: &str, effort: ThinkingEffort) -> Option
     Some(effort.to_string())
 }
 
-// Effort availability follows the official effort doc: `xhigh` exists on
-// Sonnet 5, Opus 4.7/4.8, Opus 5, and Fable 5; `max` additionally covers the
-// 4.6 generation.
+// Effort availability follows the official effort doc: Opus 5.5 and Fable 5.1
+// support low/medium/high/max; `xhigh` exists on Sonnet 5, Opus 4.7/4.8,
+// Opus 5, and Fable 5; `max` additionally covers the 4.6 generation.
 fn anthropic_model_supports_xhigh_effort(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
+    if anthropic_always_adaptive_effort(&model, ThinkingEffort::XHigh).is_some() {
+        return false;
+    }
     model.contains("opus-4-7")
         || model.contains("opus-4.7")
         || model.contains("opus-4-8")
@@ -3115,6 +3197,7 @@ fn anthropic_model_supports_xhigh_effort(model: &str) -> bool {
 fn anthropic_model_supports_max_effort(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
     anthropic_model_supports_xhigh_effort(&model)
+        || anthropic_always_adaptive_effort(&model, ThinkingEffort::Max).is_some()
         || model.contains("opus-4-6")
         || model.contains("opus-4.6")
         || model.contains("sonnet-4-6")
@@ -3144,8 +3227,7 @@ fn uses_anthropic_adaptive_thinking(provider_id: &str, model: &str) -> bool {
     if provider_id == "glm" {
         return false;
     }
-    let is_anthropic =
-        provider_id == "anthropic" || model.trim().to_ascii_lowercase().starts_with("claude-");
+    let is_anthropic = provider_id == "anthropic" || looks_like_claude_model(model);
     is_anthropic && anthropic_model_supports_adaptive_thinking(model)
 }
 
@@ -3169,7 +3251,7 @@ fn anthropic_prompt_cache_supported(provider_id: &str, model: &str) -> bool {
         return enabled;
     }
     let provider_id = canonical_provider_id(provider_id);
-    provider_id == "anthropic" || model.trim().to_ascii_lowercase().starts_with("claude-")
+    provider_id == "anthropic" || looks_like_claude_model(model)
 }
 
 fn system_blocks_with_cache_control<'a>(
@@ -3241,6 +3323,9 @@ struct AnthropicOutputConfig {
 }
 
 fn openai_uses_max_completion_tokens(provider_id: &str, model: &str) -> bool {
+    if is_gpt_6_model(model) {
+        return true;
+    }
     if canonical_provider_id(provider_id) != "openai" {
         return false;
     }
@@ -11070,7 +11155,8 @@ const SEAT_TRANSITIONAL_FORMAT_VERSION: u32 = 3;
 const SEAT_FORMAT_VERSION: u32 = 4;
 const PACK_RUNTIME_FORMAT_VERSION: u32 = 5;
 const IMAGE_REFERENCE_FORMAT_VERSION: u32 = 6;
-const SESSION_FORMAT_VERSION: u32 = 6;
+const PROVIDER_REASONING_ROUTE_FORMAT_VERSION: u32 = 7;
+const SESSION_FORMAT_VERSION: u32 = 7;
 
 fn default_context_mode_for_provider(
     provider_id: &str,
@@ -11629,6 +11715,8 @@ struct SessionProvenance {
     provider: String,
     api_provider: ApiProvider,
     model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_route_hash: Option<String>,
     thinking_effort: ThinkingEffort,
     #[serde(default)]
     reasoning_mode: ReasoningMode,
@@ -11647,6 +11735,28 @@ struct SessionProvenance {
 fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn provider_route_hash(
+    provider_id: &str,
+    contract: RequestContract,
+    base_url: &str,
+    model: &str,
+    auth_kind: RuntimeAuthKind,
+) -> String {
+    let auth_kind = match auth_kind {
+        RuntimeAuthKind::None => "none",
+        RuntimeAuthKind::ApiKey => "api-key",
+        RuntimeAuthKind::OAuth => "oauth",
+    };
+    let identity = json!([
+        canonical_provider_id(provider_id),
+        contract.as_str(),
+        base_url.trim().trim_end_matches('/'),
+        model.trim(),
+        auth_kind,
+    ]);
+    sha256_hex_bytes(identity.to_string().as_bytes())
 }
 
 fn sha256_hex_str(s: &str) -> String {
@@ -11735,7 +11845,7 @@ struct SessionHeader {
 impl Default for SessionHeader {
     fn default() -> Self {
         Self {
-            version: SESSION_FORMAT_VERSION,
+            version: SEAT_TRANSITIONAL_FORMAT_VERSION,
             model: String::new(),
             system: DEFAULT_SYSTEM.to_string(),
             composed_system: None,
@@ -12545,6 +12655,15 @@ fn apply_runtime_model_command(agent: &mut Agent, arg: &str) -> Result<String> {
             agent.model, agent.provider_id
         ));
     }
+    let previous_provider = agent.provider_id.clone();
+    let previous_model = agent.model.clone();
+    let previous_route_hash = provider_route_hash(
+        &agent.provider_id,
+        agent.request_contract(),
+        &agent.base_url,
+        &agent.model,
+        agent.auth_kind,
+    );
     let selection = load_provider_catalog().and_then(|catalog| {
         let store = load_auth_store()?;
         resolve_provider_model_selection(&catalog, &store, &agent.provider_id, arg)
@@ -12555,11 +12674,21 @@ fn apply_runtime_model_command(agent: &mut Agent, arg: &str) -> Result<String> {
     let target_model = selection.model.clone();
     if provider_changed {
         set_active_provider_in_catalog(&target_provider)?;
-        agent.reload_provider(Some(&target_provider), false)?;
+        agent.reload_provider_unfenced(Some(&target_provider), false)?;
     }
-    agent.model = target_model.clone();
-    let detected_window = agent.refresh_context_window();
-    agent.pin_model_for_provider(&target_provider, &target_model);
+    let detected_window = agent.note_runtime_model_change(&target_model);
+    if !agent.history.is_empty()
+        && previous_route_hash
+            != provider_route_hash(
+                &agent.provider_id,
+                agent.request_contract(),
+                &agent.base_url,
+                &agent.model,
+                agent.auth_kind,
+            )
+    {
+        agent.push_reasoning_replay_boundary(&previous_provider, &previous_model);
+    }
     let context_note = detected_window
         .map(|tokens| format!("; detected llama.cpp context {tokens} tokens"))
         .unwrap_or_default();
@@ -12717,9 +12846,9 @@ fn finish_active_runtime_controls(
         }
         if handled {
             applied.commands += 1;
-            if (agent.provider_id.as_str(), agent.model.as_str())
-                != (before_model.0.as_str(), before_model.1.as_str())
-            {
+            let model_changed = (agent.provider_id.as_str(), agent.model.as_str())
+                != (before_model.0.as_str(), before_model.1.as_str());
+            if model_changed {
                 applied.changed_model = true;
             }
             if agent.thinking_effort() != before_effort {
@@ -14028,6 +14157,29 @@ impl Agent {
         }
     }
 
+    fn provider_route_identity(&self) -> String {
+        provider_route_hash(
+            &self.provider_id,
+            self.request_contract(),
+            &self.base_url,
+            &self.model,
+            self.auth_kind,
+        )
+    }
+
+    fn fence_changed_provider_route(
+        &mut self,
+        previous_provider: &str,
+        previous_model: &str,
+        previous_route: &str,
+    ) -> bool {
+        if self.history.is_empty() || previous_route == self.provider_route_identity() {
+            return false;
+        }
+        self.push_reasoning_replay_boundary(previous_provider, previous_model);
+        true
+    }
+
     fn anthropic_subscription_active(&self) -> bool {
         self.auth_kind == RuntimeAuthKind::OAuth
             && self
@@ -14335,6 +14487,9 @@ impl Agent {
         if self.auth_kind != RuntimeAuthKind::OAuth {
             return Ok(());
         }
+        let previous_provider = self.provider_id.clone();
+        let previous_model = self.model.clone();
+        let previous_route = self.provider_route_identity();
         let provider_id = self.provider_id.clone();
         let resolved = tokio::task::spawn_blocking(move || {
             resolve_runtime_provider(Some(&provider_id), false)
@@ -14343,13 +14498,27 @@ impl Agent {
         .context("join provider credential refresh")??;
         self.apply_runtime_provider(resolved);
         self.refresh_tools_for_context();
+        self.fence_changed_provider_route(&previous_provider, &previous_model, &previous_route);
+        Ok(())
+    }
+
+    fn reload_provider_unfenced(
+        &mut self,
+        selected: Option<&str>,
+        require_credentials: bool,
+    ) -> Result<()> {
+        let resolved = resolve_runtime_provider(selected, require_credentials)?;
+        self.apply_runtime_provider(resolved);
+        self.refresh_tools_for_context();
         Ok(())
     }
 
     fn reload_provider(&mut self, selected: Option<&str>, require_credentials: bool) -> Result<()> {
-        let resolved = resolve_runtime_provider(selected, require_credentials)?;
-        self.apply_runtime_provider(resolved);
-        self.refresh_tools_for_context();
+        let previous_provider = self.provider_id.clone();
+        let previous_model = self.model.clone();
+        let previous_route = self.provider_route_identity();
+        self.reload_provider_unfenced(selected, require_credentials)?;
+        self.fence_changed_provider_route(&previous_provider, &previous_model, &previous_route);
         Ok(())
     }
 
@@ -14514,12 +14683,25 @@ impl Agent {
         self.budget_exhausted = false;
     }
 
-    fn note_runtime_model_change(&mut self, model: &str) {
+    fn push_reasoning_replay_boundary(&mut self, previous_provider: &str, previous_model: &str) {
+        self.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: format!(
+                    "{PROVIDER_ROUTE_CONTINUATION_PREFIX} The runtime provider route changed from {previous_provider}/{previous_model} to {}/{}. Continue from the visible conversation and completed tool results. Provider-bound reasoning from the previous route is intentionally not replayed.",
+                    self.provider_id, self.model
+                ),
+            }],
+        });
+    }
+
+    fn note_runtime_model_change(&mut self, model: &str) -> Option<u64> {
         self.model = model.to_string();
         let provider_id = self.provider_id.clone();
         self.pin_model_for_provider(&provider_id, model);
-        self.refresh_context_window();
+        let detected_window = self.refresh_context_window();
         self.refresh_tools_for_context();
+        detected_window
     }
 
     fn apply_implementation_phase_model_mitigation(&mut self) -> Option<String> {
@@ -14571,7 +14753,10 @@ impl Agent {
         {
             return None;
         }
-        self.note_runtime_model_change(&target);
+        let previous_provider = self.provider_id.clone();
+        let previous_model = self.model.clone();
+        let _ = self.note_runtime_model_change(&target);
+        self.push_reasoning_replay_boundary(&previous_provider, &previous_model);
         Some(format!(
             "runtime model fallback: action contract is still unresolved after repeated no-mutation turns; switched model to {target} for the next request."
         ))
@@ -14717,7 +14902,7 @@ impl Agent {
         let profile = self.provider_profile.as_ref()?;
         let spec = resolve_model_spec(profile, model);
         (self.request_contract_for_model(model) == RequestContract::OpenAiResponses
-            && official_openai_gpt_5_6_responses(profile, &self.base_url, model)
+            && official_openai_responses_model(profile, &self.base_url, model)
             && spec.reasoning
             && spec
                 .reasoning_modes
@@ -16765,7 +16950,7 @@ impl Agent {
                 let tools = self.wire_tools_openai_responses();
                 let include_encrypted_content = !tools.is_empty()
                     && self.provider_profile.as_ref().is_some_and(|profile| {
-                        official_openai_gpt_5_6_responses(profile, &self.base_url, &self.model)
+                        official_openai_responses_model(profile, &self.base_url, &self.model)
                     });
                 let reasoning_effort =
                     self.responses_reasoning_effort_for_model(&self.model, effort);
@@ -16825,7 +17010,12 @@ impl Agent {
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
-                let reasoning_effort = self.oai_chat_reasoning_effort(effort);
+                let reasoning_effort =
+                    if !oai_tools.is_empty() && is_gpt_6_sol_or_luna_model(&self.model) {
+                        Some("none".to_string())
+                    } else {
+                        self.oai_chat_reasoning_effort(effort)
+                    };
                 let local_llama = provider::is_local_llama_provider(
                     &self.provider_id,
                     self.route_api_provider(),
@@ -16888,7 +17078,17 @@ impl Agent {
                             })
                             .flatten()
                         });
-                let (thinking, output_config) = if let Some(effort) = configured_effort {
+                let required_adaptive_effort =
+                    anthropic_required_adaptive_effort(&self.provider_id, &self.model, effort);
+                let (thinking, output_config) = if let Some(effort) = required_adaptive_effort {
+                    (
+                        Some(AnthropicThinking {
+                            kind: "adaptive",
+                            budget_tokens: None,
+                        }),
+                        Some(AnthropicOutputConfig { effort }),
+                    )
+                } else if let Some(effort) = configured_effort {
                     let kimi_adaptive = self.kimi_model_uses_adaptive_thinking();
                     (
                         Some(AnthropicThinking {
@@ -17017,7 +17217,9 @@ impl Agent {
             .collect();
         auto_approved_tools.sort();
         SessionHeader {
-            version: if self
+            version: if has_provider_bound_reasoning(&self.history) {
+                PROVIDER_REASONING_ROUTE_FORMAT_VERSION
+            } else if self
                 .history
                 .iter()
                 .flat_map(|message| &message.content)
@@ -17094,6 +17296,15 @@ impl Agent {
             provider: self.provider_id.clone(),
             api_provider: self.route_api_provider(),
             model: self.model.clone(),
+            provider_route_hash: has_provider_bound_reasoning(&self.history).then(|| {
+                provider_route_hash(
+                    &self.provider_id,
+                    self.request_contract(),
+                    &self.base_url,
+                    &self.model,
+                    self.auth_kind,
+                )
+            }),
             thinking_effort: self.thinking_effort,
             reasoning_mode: self.reasoning_mode,
             approval_profile: self.approval_profile,
@@ -17300,7 +17511,7 @@ impl Agent {
         if provenance.api_provider == ApiProvider::ChatGpt
             || (provenance.api_provider == ApiProvider::OpenAi
                 && canonical_provider_id(&provenance.provider) == "openai"
-                && is_gpt_5_6_model(&model))
+                && is_openai_responses_model(&model))
         {
             normalize_restored_chatgpt_reasoning(&mut hist);
         }
@@ -17381,17 +17592,25 @@ impl Agent {
             self.adopt_session_id(saved)?;
         }
 
+        let saved_model = model.clone();
+        let saved_provider_id = canonical_provider_id(&provenance.provider);
         let provider_id = canonical_provider_id(&self.provider_id);
         let provider_model_env = format!(
             "DEXT_MODEL_{}",
             provider_id.replace('-', "_").to_ascii_uppercase()
         );
-        let explicit_selection = ["DEXT_PROVIDER", "DEXT_MODEL", &provider_model_env]
-            .iter()
-            .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()));
+        let explicit_selection = [
+            "DEXT_PROVIDER",
+            "DEXT_PROFILE",
+            "DEXT_API_PROVIDER",
+            "DEXT_MODEL",
+            &provider_model_env,
+        ]
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()));
         if !explicit_selection
             && !self.session_model_pins.contains_key(&provider_id)
-            && provider_id == canonical_provider_id(&provenance.provider)
+            && provider_id == saved_provider_id
             && self.api_provider == provenance.api_provider
         {
             self.model = model;
@@ -17449,6 +17668,29 @@ impl Agent {
             current_approval_policy_source,
         );
         self.history = hist;
+        let current_route_hash = provider_route_hash(
+            &self.provider_id,
+            self.request_contract(),
+            &self.base_url,
+            &self.model,
+            self.auth_kind,
+        );
+        let saved_route_hash = (source_version >= PROVIDER_REASONING_ROUTE_FORMAT_VERSION)
+            .then_some(provenance.provider_route_hash.as_deref())
+            .flatten();
+        let route_changed = resume_requires_reasoning_replay_boundary(
+            saved_route_hash,
+            &current_route_hash,
+            &self.history,
+        );
+        if route_changed && !self.history.is_empty() {
+            let saved_provider = if provenance.provider.trim().is_empty() {
+                "saved-provider"
+            } else {
+                provenance.provider.as_str()
+            };
+            self.push_reasoning_replay_boundary(saved_provider, &saved_model);
+        }
         self.clear_pending_login();
         if recovery.total() > 0 {
             let warning = recovery.warning();
@@ -17816,12 +18058,26 @@ impl Agent {
             text: COMPACT_SYSTEM,
             cache_control: None,
         }];
+        let required_adaptive_effort =
+            anthropic_required_adaptive_effort(&self.provider_id, model, ThinkingEffort::Low);
         let effort = glm_forced_thinking_effort(&self.provider_id, model, ThinkingEffort::Low);
-        let thinking = effort.as_ref().map(|_| AnthropicThinking {
-            kind: "enabled",
-            budget_tokens: None,
-        });
-        let output_config = effort.map(|effort| AnthropicOutputConfig { effort });
+        let (thinking, output_config) = if let Some(effort) = required_adaptive_effort {
+            (
+                Some(AnthropicThinking {
+                    kind: "adaptive",
+                    budget_tokens: None,
+                }),
+                Some(AnthropicOutputConfig { effort }),
+            )
+        } else {
+            (
+                effort.as_ref().map(|_| AnthropicThinking {
+                    kind: "enabled",
+                    budget_tokens: None,
+                }),
+                effort.map(|effort| AnthropicOutputConfig { effort }),
+            )
+        };
         let body = Request {
             model,
             max_tokens,
@@ -17916,7 +18172,13 @@ impl Agent {
             .flatten();
         let summary_reasoning_enabled = summary_reasoning_effort.is_some()
             || glm_forced_thinking_effort(&self.provider_id, &summary_model, ThinkingEffort::Low)
-                .is_some();
+                .is_some()
+            || anthropic_required_adaptive_effort(
+                &self.provider_id,
+                &summary_model,
+                ThinkingEffort::Low,
+            )
+            .is_some();
         let summary_max_tokens =
             compact_summary_max_tokens(self.thinking_effort, summary_reasoning_enabled);
         let summary_reasoning_mode = self.reasoning_mode_for_model(&summary_model);

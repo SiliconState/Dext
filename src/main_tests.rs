@@ -7024,7 +7024,13 @@ fn resume_preserves_selected_provider_model_and_history() -> Result<()> {
     let root = temp_test_dir("resume-provider-model");
     std::fs::create_dir_all(&root)?;
     let path = root.join("session.jsonl");
-    let keys = ["DEXT_PROVIDER", "DEXT_MODEL", "DEXT_MODEL_GLM"];
+    let keys = [
+        "DEXT_PROVIDER",
+        "DEXT_PROFILE",
+        "DEXT_API_PROVIDER",
+        "DEXT_MODEL",
+        "DEXT_MODEL_GLM",
+    ];
     let previous = keys.map(std::env::var_os);
     for key in keys {
         unsafe { std::env::remove_var(key) };
@@ -7039,6 +7045,17 @@ fn resume_preserves_selected_provider_model_and_history() -> Result<()> {
                 text: "keep this conversation".to_string(),
             }],
         });
+        saved.history.push(Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ResponsesReasoning {
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs_saved_model",
+                    "encrypted_content": "enc-saved-model",
+                    "summary": [],
+                }),
+            }],
+        });
         saved.save_session_to_path(&path)?;
         let mut resumed = test_agent(&root);
         resumed.provider_id = "glm".to_string();
@@ -7047,8 +7064,23 @@ fn resume_preserves_selected_provider_model_and_history() -> Result<()> {
         assert_eq!(resumed.provider_id, "glm");
         assert_eq!(resumed.model, "glm-5.3");
         assert_eq!(
-            serde_json::to_value(&resumed.history)?,
+            serde_json::to_value(&resumed.history[..saved.history.len()])?,
             serde_json::to_value(&saved.history)?
+        );
+        assert!(
+            matches!(
+                resumed.history.last(),
+                Some(Message { role, content })
+                    if role == "user"
+                        && content.iter().any(|block| matches!(block, Block::Text { text } if text.starts_with("[provider-route continuation]") && text.contains("chatgpt/gpt-6-astra") && text.contains("glm/glm-5.3")))
+            ),
+            "missing resume provider-route continuation"
+        );
+        assert!(
+            !resumed
+                .history_to_openai_responses_input()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
         );
 
         saved.provider_id = "glm".to_string();
@@ -7060,7 +7092,7 @@ fn resume_preserves_selected_provider_model_and_history() -> Result<()> {
             unsafe {
                 std::env::set_var(
                     key,
-                    if key == "DEXT_PROVIDER" {
+                    if matches!(key, "DEXT_PROVIDER" | "DEXT_PROFILE" | "DEXT_API_PROVIDER") {
                         "glm"
                     } else {
                         "glm-5.3"
@@ -7084,6 +7116,112 @@ fn resume_preserves_selected_provider_model_and_history() -> Result<()> {
                 None => std::env::remove_var(key),
             }
         }
+    }
+    let _ = std::fs::remove_dir_all(root);
+    result
+}
+
+#[test]
+fn resume_fences_persisted_provider_reasoning_before_first_request() -> Result<()> {
+    let _guard = env_lock();
+    let root = temp_test_dir("resume-provider-route-fence");
+    let path = root.join("session.jsonl");
+    let keys = [
+        "DEXT_PROVIDER",
+        "DEXT_PROFILE",
+        "DEXT_API_PROVIDER",
+        "DEXT_MODEL",
+        "DEXT_MODEL_OPENAI",
+    ];
+    let previous = keys.map(std::env::var_os);
+    for key in keys {
+        unsafe { std::env::remove_var(key) };
+    }
+
+    let result = (|| -> Result<()> {
+        let profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "openai")
+            .context("OpenAI profile")?;
+        let mut saved = test_agent(&root);
+        saved.provider_id = "openai".to_string();
+        saved.provider_profile = Some(profile.clone());
+        saved.api_provider = ApiProvider::OpenAi;
+        saved.base_url = "https://api.openai.com".to_string();
+        saved.model = "gpt-6-sol".to_string();
+        saved.history = vec![
+            Message {
+                role: "user".to_string(),
+                content: vec![Block::Text {
+                    text: "continue this tool turn".to_string(),
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![Block::ResponsesReasoning {
+                    item: json!({
+                        "type": "reasoning",
+                        "id": "rs_route_bound",
+                        "encrypted_content": "enc-route-bound",
+                        "summary": [],
+                    }),
+                }],
+            },
+        ];
+        let saved_header = saved.session_header();
+        assert_eq!(
+            saved_header.version, PROVIDER_REASONING_ROUTE_FORMAT_VERSION,
+            "reasoning-bearing sessions must reject downgrade to pre-fence binaries"
+        );
+        assert!(saved_header.provenance.provider_route_hash.is_some());
+        saved.save_session_to_path(&path)?;
+
+        let mut same_route = test_agent(&root);
+        same_route.provider_id = "openai".to_string();
+        same_route.provider_profile = Some(profile.clone());
+        same_route.api_provider = ApiProvider::OpenAi;
+        same_route.base_url = "https://api.openai.com".to_string();
+        same_route.model = "gpt-6-sol".to_string();
+        same_route.load_session_from_path(&path)?;
+        assert_eq!(same_route.history.len(), saved.history.len());
+        assert!(
+            same_route
+                .history_to_openai_responses_input()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
+        );
+        drop(same_route);
+
+        let mut changed_profile = profile;
+        changed_profile.request_contract = Some(RequestContract::OpenAiResponses);
+        changed_profile.base_url = "https://gateway.example.test/v1".to_string();
+        let mut changed_route = test_agent(&root);
+        changed_route.provider_id = "openai".to_string();
+        changed_route.provider_profile = Some(changed_profile);
+        changed_route.api_provider = ApiProvider::OpenAi;
+        changed_route.base_url = "https://gateway.example.test/v1".to_string();
+        changed_route.model = "gpt-6-sol".to_string();
+        changed_route.load_session_from_path(&path)?;
+        assert!(
+            matches!(
+                changed_route.history.last(),
+                Some(Message { role, content })
+                    if role == "user"
+                        && content.iter().any(|block| matches!(block, Block::Text { text } if text.starts_with("[provider-route continuation]") && text.contains("openai/gpt-6-sol")))
+            ),
+            "missing resumed-session replay fence after endpoint change"
+        );
+        assert!(
+            !changed_route
+                .history_to_openai_responses_input()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
+        );
+        Ok(())
+    })();
+
+    for (key, value) in keys.into_iter().zip(previous) {
+        restore_env_var(key, value);
     }
     let _ = std::fs::remove_dir_all(root);
     result
@@ -12373,7 +12511,10 @@ fn doctor_reports_bounded_latest_state_without_executing_auth_references() -> Re
             report.contains("approval policy: never (source DEXT_APPROVAL)"),
             "{report}"
         );
-        assert!(report.contains("provider catalog: valid v2"), "{report}");
+        assert!(
+            report.contains("provider catalog: valid legacy v2; migrates in memory"),
+            "{report}"
+        );
         assert!(report.contains("active provider: local"), "{report}");
         assert!(report.contains("auth store: valid v1"), "{report}");
         #[cfg(unix)]
@@ -17203,6 +17344,7 @@ fn failed_pack_runtime_restore_does_not_partially_apply_session_state() -> Resul
     let saved_root = std::fs::canonicalize(saved_root)?;
     let path = root.join("missing-runtime-pack.jsonl");
     let header = SessionHeader {
+        version: PACK_RUNTIME_FORMAT_VERSION,
         model: "must-not-apply".to_string(),
         sandbox: Some(saved_root.display().to_string()),
         active_pack_runtimes: vec![pack_runtime::RuntimeSnapshot {
@@ -17278,6 +17420,7 @@ fn valid_pack_runtime_restore_commits_prepared_state_after_preflight() -> Result
     let snapshot = runtime.snapshot(&pending);
     let path = root.join("valid-runtime.jsonl");
     let header = SessionHeader {
+        version: PACK_RUNTIME_FORMAT_VERSION,
         model: "restored-model".to_string(),
         sandbox: Some(saved_root.display().to_string()),
         active_pack_runtimes: vec![snapshot],
@@ -17360,6 +17503,7 @@ fn pack_runtime_restore_uses_exact_saved_source_despite_name_shadowing() -> Resu
     write_pack(&project_pack, "project")?;
     let path = root.join("shadow-runtime.jsonl");
     let header = SessionHeader {
+        version: PACK_RUNTIME_FORMAT_VERSION,
         sandbox: Some(root.display().to_string()),
         active_pack_runtimes: vec![runtime.snapshot(&[])],
         ..SessionHeader::default()
@@ -18189,21 +18333,43 @@ fn runtime_control_model_switch_updates_next_request_material() -> Result<()> {
 
         let mut agent = test_agent(&root);
         agent.reload_provider(Some("glm"), false)?;
-        let mut out = Vec::new();
+        agent.history = vec![Message {
+            role: "assistant".to_string(),
+            content: vec![Block::ResponsesReasoning {
+                item: json!({
+                    "type": "reasoning",
+                    "id": "rs_old_model",
+                    "encrypted_content": "enc-old-model",
+                    "summary": [],
+                }),
+            }],
+        }];
+        let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+        agent.install_runtime_controls(control_rx, control_tx);
 
-        let handled =
-            apply_runtime_control_command(&mut agent, "/model deepseek/deepseek-reasoner", |msg| {
-                out.push(msg)
-            });
-        assert!(handled);
+        let applied = finish_active_runtime_controls(
+            &mut agent,
+            vec!["/model deepseek/deepseek-reasoner".to_string()],
+            true,
+        );
+        assert!(applied.changed_model);
+        assert!(applied.aborted_stream);
         assert_eq!(agent.provider_id, "deepseek");
         assert_eq!(agent.model, "deepseek-reasoner");
         assert_eq!(agent.api_provider, ApiProvider::OpenAi);
         assert!(
-            out.iter().any(
-                |msg| msg.contains("applies immediately") && msg.contains("next model request")
-            ),
-            "{out:?}"
+            agent.history.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(block, Block::Text { text } if text.starts_with("[provider-route continuation]") && text.contains("glm/") && text.contains("deepseek/deepseek-reasoner"))
+                })
+            }),
+            "provider-route continuation missing"
+        );
+        assert!(
+            !agent
+                .history_to_openai_responses_input()
+                .iter()
+                .any(|item| item["type"] == "reasoning")
         );
 
         let chatgpt_session_id = "test-session";
@@ -18413,10 +18579,66 @@ fn gpt_5_6_openai_request_uses_responses_pro_mode_and_true_max_effort() -> Resul
         chatgpt_reasoning_effort("gpt-5.6-sol", ThinkingEffort::Max),
         Some("xhigh")
     );
-    assert_eq!(
-        chatgpt_reasoning_effort("gpt-5.6-preview", ThinkingEffort::Max),
-        Some("max")
-    );
+    agent.model = "gpt-6-sol".to_string();
+    agent.thinking_effort = ThinkingEffort::Max;
+    agent.reasoning_mode = ReasoningMode::Pro;
+    let (url, body) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(url, "https://api.openai.com/v1/responses");
+    assert_eq!(body["reasoning"]["effort"], "max", "{body}");
+    assert!(body["reasoning"].get("mode").is_none(), "{body}");
+    assert_eq!(body["max_output_tokens"], 128_000, "{body}");
+
+    agent.model = "gpt-6-astra".to_string();
+    agent.thinking_effort = ThinkingEffort::Off;
+    let (_, body) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+    let body: Value = serde_json::from_slice(&body)?;
+    assert!(body.get("reasoning").is_none(), "{body}");
+
+    Ok(())
+}
+
+#[test]
+fn gpt_6_sol_and_luna_chat_completions_tool_calls_force_none_effort() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("openai profile");
+    profile.request_contract = Some(RequestContract::OpenAiChatCompletions);
+    profile.base_url = "https://example.test".to_string();
+
+    let mut agent = test_agent(&root);
+    agent.provider_id = "openai".to_string();
+    agent.provider_profile = Some(profile);
+    agent.api_provider = ApiProvider::OpenAi;
+    agent.base_url = "https://example.test".to_string();
+    agent.thinking_effort = ThinkingEffort::Max;
+
+    for model in ["gpt-6-sol", "gpt-6-luna"] {
+        agent.model = model.to_string();
+        let (url, body) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+        let body: Value = serde_json::from_slice(&body)?;
+        assert_eq!(url, "https://example.test/v1/chat/completions");
+        assert_eq!(body["reasoning_effort"], "none", "{model}: {body}");
+        assert_eq!(body["max_completion_tokens"], 128_000, "{model}: {body}");
+        assert!(body.get("max_tokens").is_none(), "{model}: {body}");
+        assert!(
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{model}: {body}"
+        );
+    }
+
+    agent.tools.clear();
+    for model in ["gpt-6-sol", "gpt-6-luna"] {
+        agent.model = model.to_string();
+        let (_, body) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+        let body: Value = serde_json::from_slice(&body)?;
+        assert_eq!(body["reasoning_effort"], "max", "{model}: {body}");
+        assert!(body.get("tools").is_none(), "{model}: {body}");
+    }
 
     Ok(())
 }
@@ -20446,7 +20668,7 @@ fn session_state_fixtures_migrate_v1_v2_and_preserve_v3_semantics() -> Result<()
         .expect("future session fixture must fail")
         .to_string();
     assert!(
-        error.contains("unsupported session format version 7"),
+        error.contains("unsupported session format version 8"),
         "{error}"
     );
     assert_eq!(std::fs::read(&future_path)?, future_before);
@@ -20510,12 +20732,45 @@ fn session_header_versions_migrate_in_memory_and_future_versions_fail() {
     .expect("parse v6 image-reference-capable session header");
     assert_eq!(image_v6.version, SESSION_FORMAT_VERSION);
 
-    let error = parse_session_header(r#"{"version":7,"model":"future","system":"system"}"#)
+    let reasoning_v7 = serde_json::to_string(&SessionHeader {
+        version: 7,
+        model: "v7".to_string(),
+        provenance: SessionProvenance {
+            provider_route_hash: Some("a".repeat(64)),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .expect("serialize v7 reasoning-bound header");
+    let reasoning_v7 = parse_session_header(&reasoning_v7)
+        .expect("parse v7 provider-reasoning-capable session header");
+    assert_eq!(reasoning_v7.version, SESSION_FORMAT_VERSION);
+    assert_eq!(
+        reasoning_v7.provenance.provider_route_hash.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+    assert!(
+        parse_session_header(r#"{"version":7,"model":"bad","system":"system"}"#).is_err(),
+        "v7 must require route-bound provenance"
+    );
+    for invalid_hash in [
+        "short",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ] {
+        let mut invalid = serde_json::to_value(&reasoning_v7).expect("serialize invalid v7 case");
+        invalid["provenance"]["provider_route_hash"] = json!(invalid_hash);
+        assert!(
+            parse_session_header(&invalid.to_string()).is_err(),
+            "v7 accepted invalid route hash {invalid_hash}"
+        );
+    }
+
+    let error = parse_session_header(r#"{"version":8,"model":"future","system":"system"}"#)
         .err()
         .expect("future session format must fail")
         .to_string();
     assert!(
-        error.contains("unsupported session format version 7"),
+        error.contains("unsupported session format version 8"),
         "{error}"
     );
     assert!(parse_session_header(r#"{"version":"3"}"#).is_err());
@@ -20974,7 +21229,15 @@ fn model_context_window_uses_builtin_chatgpt_profile_when_catalog_isolated() -> 
 
     let result = {
         assert_eq!(model_context_window("gpt-5.4"), 272_000);
-        for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        for model in [
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
             assert_eq!(model_context_window(model), 1_050_000, "{model}");
         }
         Ok(())
@@ -21004,6 +21267,7 @@ fn model_context_window_uses_builtin_anthropic_profile_when_catalog_isolated() -
     let result = {
         for model in [
             "claude-sonnet-5",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-fable-5-1",
             "claude-fable-5",
@@ -21201,6 +21465,87 @@ fn builtin_provider_merge_preserves_context_window_overrides() {
     assert_eq!(
         merged.model_context_windows.get("gpt-5.4-mini"),
         Some(&180_000)
+    );
+}
+
+#[test]
+fn builtin_anthropic_catalog_v2_refreshes_retired_prices_and_v3_preserves_overrides() {
+    let builtin = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "anthropic")
+        .expect("anthropic profile");
+    let mut stored = builtin.clone();
+    stored
+        .model_specs
+        .get_mut("claude-fable-5-1")
+        .expect("Fable 5.1 spec")
+        .pricing = Some(ModelPricing {
+        input_usd_per_mtok: 10.0,
+        output_usd_per_mtok: 50.0,
+        cache_read_usd_per_mtok: 1.0,
+        cache_create_usd_per_mtok: 12.5,
+    });
+    stored
+        .model_specs
+        .get_mut("claude-opus-4-8")
+        .expect("Opus 4.8 spec")
+        .pricing = Some(ModelPricing {
+        input_usd_per_mtok: 15.0,
+        output_usd_per_mtok: 75.0,
+        cache_read_usd_per_mtok: 1.5,
+        cache_create_usd_per_mtok: 18.75,
+    });
+    stored
+        .model_specs
+        .get_mut("claude-opus-5")
+        .expect("Opus 5 spec")
+        .pricing = Some(ModelPricing {
+        input_usd_per_mtok: 9.0,
+        output_usd_per_mtok: 45.0,
+        cache_read_usd_per_mtok: 0.9,
+        cache_create_usd_per_mtok: 11.25,
+    });
+
+    let migrated = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: 2,
+        active_provider: "anthropic".to_string(),
+        providers: vec![stored.clone()],
+    })
+    .expect("v2 Anthropic catalog migration");
+    let migrated = find_provider_profile(&migrated, "anthropic").expect("migrated Anthropic");
+    let fable = resolve_model_spec(&migrated, "claude-fable-5-1")
+        .pricing
+        .expect("Fable pricing");
+    assert_eq!(fable.cache_read_usd_per_mtok, 0.25);
+    let opus_4_8 = resolve_model_spec(&migrated, "claude-opus-4-8")
+        .pricing
+        .expect("Opus 4.8 pricing");
+    assert_eq!(opus_4_8.input_usd_per_mtok, 5.0);
+    let opus_5 = resolve_model_spec(&migrated, "claude-opus-5")
+        .pricing
+        .expect("Opus 5 pricing");
+    assert_eq!(opus_5.input_usd_per_mtok, 9.0);
+
+    let current = crate::provider::normalize_provider_catalog(ProviderCatalog {
+        version: crate::provider::default_provider_catalog_version(),
+        active_provider: "anthropic".to_string(),
+        providers: vec![stored],
+    })
+    .expect("current Anthropic catalog normalization");
+    let current = find_provider_profile(&current, "anthropic").expect("current Anthropic");
+    assert_eq!(
+        resolve_model_spec(&current, "claude-fable-5-1")
+            .pricing
+            .expect("current Fable pricing")
+            .cache_read_usd_per_mtok,
+        1.0
+    );
+    assert_eq!(
+        resolve_model_spec(&current, "claude-opus-4-8")
+            .pricing
+            .expect("current Opus 4.8 pricing")
+            .input_usd_per_mtok,
+        15.0
     );
 }
 
@@ -22458,7 +22803,7 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
 }
 
 #[test]
-fn gpt_5_6_pricing_applies_documented_long_context_tier() {
+fn openai_responses_pricing_applies_documented_long_context_tier() {
     let usage = Usage {
         input: 300_000,
         output: 100_000,
@@ -22467,6 +22812,9 @@ fn gpt_5_6_pricing_applies_documented_long_context_tier() {
         cost_usd: None,
     };
     for (model, expected) in [
+        ("gpt-6-astra", 13.5),
+        ("gpt-6-sol", 2.7),
+        ("gpt-6-luna", 0.135),
         ("gpt-5.6-sol", 7.5),
         ("gpt-5.6-terra", 3.75),
         ("gpt-5.6-luna", 1.5),
@@ -22477,9 +22825,8 @@ fn gpt_5_6_pricing_applies_documented_long_context_tier() {
             "https://api.openai.com",
             model,
         );
-        let pricing = gpt_5_6_long_context_pricing_with_override_state(
-            "openai", model, usage, pricing, false,
-        );
+        let pricing =
+            openai_long_context_pricing_with_override_state("openai", model, usage, pricing, false);
         assert_eq!(pricing.estimate(usage), expected, "{model}");
     }
     let unknown_model = "gpt-5.6-preview";
@@ -22489,7 +22836,7 @@ fn gpt_5_6_pricing_applies_documented_long_context_tier() {
         "https://api.openai.com",
         unknown_model,
     );
-    let unknown_pricing = gpt_5_6_long_context_pricing_with_override_state(
+    let unknown_pricing = openai_long_context_pricing_with_override_state(
         "openai",
         unknown_model,
         usage,
@@ -22510,7 +22857,7 @@ fn gpt_5_6_pricing_applies_documented_long_context_tier() {
         "https://api.openai.com",
         threshold_model,
     );
-    let threshold_pricing = gpt_5_6_long_context_pricing_with_override_state(
+    let threshold_pricing = openai_long_context_pricing_with_override_state(
         "openai",
         threshold_model,
         threshold_usage,
@@ -22562,14 +22909,19 @@ fn anthropic_generation_pricing_matches_published_rates() {
     };
     for (model, input, output, cache_read, cache_create) in [
         ("claude-sonnet-5", 2.0, 10.0, 0.2, 2.5),
+        ("claude-opus-5-5", 4.0, 20.0, 0.2, 5.0),
+        ("claude-opus-5.5", 4.0, 20.0, 0.2, 5.0),
         ("claude-opus-5", 5.0, 25.0, 0.5, 6.25),
         ("claude-opus-4-8", 5.0, 25.0, 0.5, 6.25),
         ("claude-opus-4-6", 5.0, 25.0, 0.5, 6.25),
         ("claude-opus-4-5-20251101", 5.0, 25.0, 0.5, 6.25),
         ("claude-opus-4-1", 15.0, 75.0, 1.5, 18.75),
         ("claude-sonnet-4-6", 3.0, 15.0, 0.3, 3.75),
-        ("claude-fable-5-1", 10.0, 50.0, 1.0, 12.5),
+        ("claude-fable-5-1", 10.0, 50.0, 0.25, 12.5),
+        ("claude-fable-5.1", 10.0, 50.0, 0.25, 12.5),
         ("claude-fable-5", 10.0, 50.0, 1.0, 12.5),
+        ("claude-opus-5-50", 5.0, 25.0, 0.5, 6.25),
+        ("claude-fable-5-10", 10.0, 50.0, 1.0, 12.5),
     ] {
         let pricing = for_model(model);
         assert_eq!(
@@ -22604,7 +22956,7 @@ fn anthropic_wire_cost_is_repriced_for_supported_claude_models() {
     agent.finalize_usage_metrics(&mut usage);
 
     assert!(
-        (usage.estimated_cost_usd() - 4.9736735).abs() < 0.0001,
+        (usage.estimated_cost_usd() - 4.77733775).abs() < 0.0001,
         "expected Anthropic model pricing to override stale wire/default cost, got ${:.8}",
         usage.estimated_cost_usd()
     );
@@ -24392,7 +24744,7 @@ fn provider_and_auth_state_fixtures_normalize_and_reject_without_rewrite() -> Re
     let result = (|| -> Result<()> {
         let provider_path = provider_catalog_path();
         std::fs::create_dir_all(provider_path.parent().unwrap_or(Path::new(".")))?;
-        for fixture in ["v1.json", "v2.json"] {
+        for fixture in ["v1.json", "v2.json", "v3.json"] {
             let source = state_fixture_path("providers", fixture);
             let bytes = std::fs::read(&source)?;
             std::fs::write(&provider_path, &bytes)?;
@@ -24459,13 +24811,13 @@ fn provider_and_auth_future_versions_fail_without_rewriting_source() -> Result<(
     let result = (|| -> Result<()> {
         let provider_path = provider_catalog_path();
         std::fs::create_dir_all(provider_path.parent().unwrap_or(Path::new(".")))?;
-        let provider_bytes = br#"{"version":3,"active_provider":"glm","providers":[]}"#;
+        let provider_bytes = br#"{"version":4,"active_provider":"glm","providers":[]}"#;
         std::fs::write(&provider_path, provider_bytes)?;
         let error = load_provider_catalog()
             .expect_err("future provider catalog must fail")
             .to_string();
         assert!(
-            error.contains("unsupported provider catalog version 3"),
+            error.contains("unsupported provider catalog version 4"),
             "{error}"
         );
         assert_eq!(std::fs::read(&provider_path)?, provider_bytes);
@@ -25350,7 +25702,7 @@ fn anthropic_subscription_headers_use_bearer_and_api_keys_do_not() -> Result<()>
     assert!(
         subscription.headers()["user-agent"]
             .to_str()?
-            .starts_with("claude-cli/2.1.251")
+            .starts_with("claude-cli/2.1.280")
     );
 
     let second = apply_provider_headers(
@@ -25610,7 +25962,7 @@ fn anthropic_subscription_body_is_scoped_and_preserves_adaptive_fields() -> Resu
     assert!(
         body["system"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.contains("cc_version=2.1.251.3e7"))
+            .is_some_and(|text| text.contains("cc_version=2.1.280.022"))
     );
     assert_eq!(
         body["system"][1]["text"],
@@ -25679,6 +26031,28 @@ fn anthropic_subscription_body_is_scoped_and_preserves_adaptive_fields() -> Resu
         claude_subscription::AGENT_SDK_SYSTEM_PROMPT
     );
     assert_eq!(summary["system"][2]["text"], COMPACT_SYSTEM);
+
+    let opus_5_5_summary = agent.build_anthropic_summary_request(
+        "claude-opus-5-5",
+        "Summarize this context",
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+    )?;
+    let opus_5_5_summary: Value = serde_json::from_slice(&opus_5_5_summary)?;
+    assert_eq!(opus_5_5_summary["thinking"]["type"], "adaptive");
+    assert_eq!(opus_5_5_summary["output_config"]["effort"], "low");
+    assert_eq!(
+        opus_5_5_summary["max_tokens"],
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING
+    );
+
+    let fable_5_1_summary = agent.build_anthropic_summary_request(
+        "claude-fable-5-1",
+        "Summarize this context",
+        COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+    )?;
+    let fable_5_1_summary: Value = serde_json::from_slice(&fable_5_1_summary)?;
+    assert_eq!(fable_5_1_summary["thinking"]["type"], "adaptive");
+    assert_eq!(fable_5_1_summary["output_config"]["effort"], "low");
 
     agent.base_url = "https://example.test".to_string();
     let (_, custom_body) =
@@ -25864,12 +26238,31 @@ fn handle_slash_model_switches_provider_when_model_belongs_elsewhere() -> Result
 
         let mut agent = test_agent(&root);
         agent.reload_provider(Some("glm"), false)?;
+        agent.history.push(Message {
+            role: "user".to_string(),
+            content: vec![Block::Text {
+                text: "preserve this conversation".to_string(),
+            }],
+        });
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         agent.set_sink(Box::new(ChannelSink { tx }));
 
         assert_eq!(handle_slash("/model gpt-4o", &mut agent), Some(true));
         assert_eq!(agent.provider_id, "chatgpt");
         assert_eq!(agent.model, "gpt-4o");
+        assert_eq!(
+            agent
+                .history
+                .iter()
+                .filter(|message| {
+                    message.content.iter().any(|block| {
+                        matches!(block, Block::Text { text } if text.starts_with(PROVIDER_ROUTE_CONTINUATION_PREFIX))
+                    })
+                })
+                .count(),
+            1,
+            "cross-provider /model must add exactly one replay boundary"
+        );
 
         let mut slash = String::new();
         let mut diagnostics = None;
@@ -25893,6 +26286,19 @@ fn handle_slash_model_switches_provider_when_model_belongs_elsewhere() -> Result
         assert_eq!(handle_slash("/model glm 5.1", &mut agent), Some(true));
         assert_eq!(agent.provider_id, "glm");
         assert_eq!(agent.model, "glm-5.1");
+        assert_eq!(
+            agent
+                .history
+                .iter()
+                .filter(|message| {
+                    message.content.iter().any(|block| {
+                        matches!(block, Block::Text { text } if text.starts_with(PROVIDER_ROUTE_CONTINUATION_PREFIX))
+                    })
+                })
+                .count(),
+            2,
+            "each cross-provider /model switch must add one replay boundary"
+        );
         Ok(())
     })();
 
@@ -25958,10 +26364,13 @@ fn normalize_chatgpt_model_slug_accepts_compact_aliases() {
     assert_eq!(normalize_chatgpt_model_slug("gpt56"), "gpt-5.6-sol");
     assert_eq!(normalize_chatgpt_model_slug("gpt56terra"), "gpt-5.6-terra");
     assert_eq!(normalize_chatgpt_model_slug("GPT 5 6 LUNA"), "gpt-5.6-luna");
+    assert_eq!(normalize_chatgpt_model_slug("gpt6astra"), "gpt-6-astra");
+    assert_eq!(normalize_chatgpt_model_slug("GPT 6 SOL"), "gpt-6-sol");
+    assert_eq!(normalize_chatgpt_model_slug("gpt6luna"), "gpt-6-luna");
 }
 
 #[test]
-fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
+fn provider_catalog_v1_migrates_builtin_metadata_and_current_overrides_it() {
     let chatgpt = built_in_provider_profiles()
         .into_iter()
         .find(|profile| profile.id == "chatgpt")
@@ -25991,7 +26400,55 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         normalize_provider_model_value(&openai, "gpt56luna"),
         "gpt-5.6-luna"
     );
+    assert_eq!(
+        normalize_provider_model_value(&openai, "gpt6astra"),
+        "gpt-6-astra"
+    );
+    assert_eq!(
+        normalize_provider_model_value(&openai, "gpt6sol"),
+        "gpt-6-sol"
+    );
+    assert_eq!(
+        normalize_provider_model_value(&openai, "gpt6luna"),
+        "gpt-6-luna"
+    );
     for profile in [&chatgpt, &openai] {
+        for (model, efforts, input, cached, output) in [
+            (
+                "gpt-6-astra",
+                &["low", "medium", "high", "xhigh", "max"][..],
+                10.0,
+                1.0,
+                50.0,
+            ),
+            (
+                "gpt-6-sol",
+                &["none", "low", "medium", "high", "xhigh", "max"][..],
+                2.0,
+                0.2,
+                10.0,
+            ),
+            (
+                "gpt-6-luna",
+                &["none", "low", "medium", "high", "xhigh", "max"][..],
+                0.1,
+                0.01,
+                0.5,
+            ),
+        ] {
+            assert!(profile.models.iter().any(|candidate| candidate == model));
+            let spec = resolve_model_spec(profile, model);
+            assert_eq!(spec.context_window, Some(1_050_000), "{model}");
+            assert_eq!(spec.max_output_tokens, Some(128_000), "{model}");
+            assert!(spec.tools && spec.reasoning && spec.image_input && spec.prompt_cache);
+            assert_eq!(spec.effort_levels, efforts, "{model}");
+            assert!(spec.reasoning_modes.is_empty(), "{model}");
+            let pricing = spec.pricing.expect("GPT-6 pricing");
+            assert_eq!(pricing.input_usd_per_mtok, input, "{model}");
+            assert_eq!(pricing.cache_read_usd_per_mtok, cached, "{model}");
+            assert_eq!(pricing.output_usd_per_mtok, output, "{model}");
+            assert_eq!(pricing.cache_create_usd_per_mtok, input * 1.25, "{model}");
+        }
         for (model, input, cached, output) in [
             ("gpt-5.6-sol", 5.0, 0.5, 30.0),
             ("gpt-5.6-terra", 2.5, 0.25, 15.0),
@@ -26074,7 +26531,7 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
         },
     );
     let normalized = crate::provider::normalize_provider_catalog(ProviderCatalog {
-        version: 2,
+        version: crate::provider::default_provider_catalog_version(),
         active_provider: "chatgpt".to_string(),
         providers: vec![explicit],
     })
@@ -26099,7 +26556,7 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_v2_overrides_it() {
 }
 
 #[test]
-fn gpt_5_6_responses_routing_is_official_openai_only() -> Result<()> {
+fn openai_responses_routing_is_official_openai_only() -> Result<()> {
     let profiles = built_in_provider_profiles();
     for profile in &profiles {
         let configured = request_contract_for_profile(profile);
@@ -26125,7 +26582,15 @@ fn gpt_5_6_responses_routing_is_official_openai_only() -> Result<()> {
         .iter()
         .find(|profile| profile.id == "openai")
         .expect("openai profile");
-    for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+    for model in [
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ] {
         assert_eq!(
             effective_request_contract(openai, "https://api.openai.com/v1", model),
             RequestContract::OpenAiResponses,
@@ -26137,6 +26602,8 @@ fn gpt_5_6_responses_routing_is_official_openai_only() -> Result<()> {
         ("https://api.openai.com", "gpt-5.60"),
         ("https://api.openai.com", "gpt-5.6-preview"),
         ("https://api.openai.com", "gpt-5.6-terrra"),
+        ("https://api.openai.com", "gpt-6-preview"),
+        ("https://api.openai.com", "gpt-6-terra"),
         ("http://api.openai.com", "gpt-5.6"),
         ("https://api.openai.com/v2", "gpt-5.6"),
         ("https://api.openai.com/v1?proxy=1", "gpt-5.6"),
@@ -27028,9 +27495,16 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
         ("claude-opus-4-6", ThinkingEffort::Max, "max"),
         ("claude-opus-4-7", ThinkingEffort::XHigh, "xhigh"),
         ("claude-opus-4-8", ThinkingEffort::XHigh, "xhigh"),
+        ("claude-opus-5-5", ThinkingEffort::Off, "low"),
+        ("claude-opus-5.5", ThinkingEffort::Off, "low"),
+        ("claude-opus-5-5", ThinkingEffort::XHigh, "high"),
+        ("claude-opus-5-5", ThinkingEffort::Max, "max"),
+        ("claude-fable-5-1", ThinkingEffort::Off, "low"),
+        ("claude-fable-5.1", ThinkingEffort::Off, "low"),
+        ("claude-fable-5-1", ThinkingEffort::XHigh, "high"),
+        ("claude-fable-5-1", ThinkingEffort::Max, "max"),
         ("claude-opus-5", ThinkingEffort::XHigh, "xhigh"),
         ("claude-opus-5", ThinkingEffort::Max, "max"),
-        ("claude-fable-5-1", ThinkingEffort::Max, "max"),
         ("claude-fable-5", ThinkingEffort::Max, "max"),
     ] {
         agent.model = model.to_string();
@@ -27049,8 +27523,28 @@ fn claude_anthropic_streaming_request_uses_adaptive_thinking_output_config() -> 
         assert_eq!(value["output_config"]["effort"], provider_effort, "{model}");
     }
 
-    agent.model = "claude-opus-4-1".to_string();
+    for near_match in ["claude-opus-5-50", "claude-fable-5-10"] {
+        agent.model = near_match.to_string();
+        agent.thinking_effort = ThinkingEffort::Off;
+        let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+        let value: Value = serde_json::from_slice(&body)?;
+        assert!(value.get("thinking").is_none(), "{near_match}: {value}");
+        assert!(
+            value.get("output_config").is_none(),
+            "{near_match}: {value}"
+        );
+    }
+
+    agent.provider_id = "custom-anthropic".to_string();
+    agent.model = "opus-5-5".to_string();
     agent.thinking_effort = ThinkingEffort::Off;
+    let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
+    let value: Value = serde_json::from_slice(&body)?;
+    assert!(value.get("thinking").is_none(), "{value}");
+    assert!(value.get("output_config").is_none(), "{value}");
+
+    agent.provider_id = "anthropic".to_string();
+    agent.model = "claude-opus-4-1".to_string();
     let (_, body) = agent.build_streaming_request("sys", "env", &sys_blocks, &[], "unused")?;
     let value: Value = serde_json::from_slice(&body)?;
     assert!(value.get("thinking").is_none(), "{value}");
@@ -27069,6 +27563,7 @@ fn anthropic_builtin_catalog_lists_generation_5_models() {
     assert_eq!(profile.default_model, "claude-sonnet-4-6");
     for model in [
         "claude-sonnet-5",
+        "claude-opus-5-5",
         "claude-opus-5",
         "claude-fable-5-1",
         "claude-fable-5",
@@ -27082,6 +27577,17 @@ fn anthropic_builtin_catalog_lists_generation_5_models() {
             Some(&1_000_000),
             "{model}"
         );
+        if matches!(
+            model,
+            "claude-sonnet-5" | "claude-opus-5-5" | "claude-fable-5-1"
+        ) {
+            let spec = resolve_model_spec(&profile, model);
+            assert_eq!(spec.max_output_tokens, Some(128_000), "{model}");
+        }
+        if matches!(model, "claude-opus-5-5" | "claude-fable-5-1") {
+            let spec = resolve_model_spec(&profile, model);
+            assert_eq!(spec.effort_levels, ["low", "medium", "high", "max"]);
+        }
     }
 }
 
