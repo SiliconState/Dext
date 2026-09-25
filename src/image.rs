@@ -441,8 +441,13 @@ mod tests {
 
     #[test]
     fn validates_persisted_reference_shape() {
+        let absolute = if cfg!(windows) {
+            r"C:\workspace\image.png"
+        } else {
+            "/workspace/image.png"
+        };
         let valid = ImageReference {
-            path: "/workspace/image.png".to_string(),
+            path: absolute.to_string(),
             media_type: "image/jpeg".to_string(),
             width: 10,
             height: 20,
