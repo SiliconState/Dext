@@ -720,12 +720,15 @@ fn copy_regular_file(source: &Path, target: &Path, budget: &mut PackCopyBudget) 
         return Ok(());
     }
 
-    let mut permissions = metadata.permissions();
     #[cfg(unix)]
-    {
+    let permissions = {
         use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = metadata.permissions();
         permissions.set_mode(permissions.mode() & 0o777);
-    }
+        permissions
+    };
+    #[cfg(not(unix))]
+    let permissions = metadata.permissions();
     crate::session::atomic_write_bytes_with_permissions(target, &bytes, &permissions)
         .with_context(|| format!("copying {} to {}", source.display(), target.display()))?;
     Ok(())

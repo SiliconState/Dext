@@ -268,7 +268,10 @@ pub(crate) fn prepare_if_unchanged(reference: &ImageReference) -> Result<Prepare
 fn workspace_path(root: &Path, input: &serde_json::Value) -> Result<PathBuf, String> {
     let raw = input["path"].as_str().ok_or("missing path")?;
     let path = crate::canonical_read_path(root, raw)?;
-    if !path.starts_with(root) {
+    // Compare against the canonical root: symlinked ancestors (for example
+    // macOS TMPDIR under /var) must match canonical_read_path output.
+    let root = crate::session::canonicalize_or_clone(root);
+    if !path.starts_with(&root) {
         return Err(format!(
             "read_image only sends images from the active workspace {}; copy the image into the workspace first",
             root.display()
