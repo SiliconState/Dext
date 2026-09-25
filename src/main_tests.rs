@@ -231,12 +231,14 @@ struct RecordingPermissionSink {
     names: Arc<Mutex<Vec<String>>>,
 }
 
+#[cfg(unix)]
 struct FixedUiSink {
     methods: Vec<String>,
     response: UiResponse,
     requests: Arc<Mutex<Vec<(String, UiRequest)>>>,
 }
 
+#[cfg(unix)]
 impl EventSink for FixedUiSink {
     fn emit(&mut self, _event: AgentEvent) {}
 
