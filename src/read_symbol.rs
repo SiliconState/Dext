@@ -63,6 +63,16 @@ pub(crate) fn read(
             return Err("symbol selector contains control characters".to_string());
         }
     }
+    // rustc normalizes CRLF when loading sources but the parser here does
+    // not; Windows checkouts would otherwise reject backslash-newline
+    // string continuations as unknown character escapes.
+    let normalized;
+    let content = if content.contains("\r\n") {
+        normalized = content.replace("\r\n", "\n");
+        normalized.as_str()
+    } else {
+        content
+    };
     let starts = line_starts(content)?;
     if starts.is_empty() {
         return Err(format!("{display_path} is empty"));
@@ -980,6 +990,13 @@ impl Second { fn new() { /* } */ } }
         let source = include_str!("read_symbol.rs");
         let output = rust(source, Selector::Symbol("RustIndex::new")).unwrap();
         assert!(output.contains("fn new"), "{output}");
+    }
+
+    #[test]
+    fn parses_crlf_sources_with_backslash_newline_continuations() {
+        let crlf = "const X: &str = \"\\\r\ncontinued\";\r\nfn target() {}\r\n";
+        let output = rust(crlf, Selector::Symbol("target")).unwrap();
+        assert!(output.contains("fn target()"), "{output}");
     }
 
     #[test]
