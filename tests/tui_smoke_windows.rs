@@ -67,6 +67,31 @@ fn tui_smoke_launches_real_binary_in_conpty_and_restores_terminal() {
 }
 
 #[test]
+fn tui_path_picker_opens_in_conpty_and_cancels_without_submitting() {
+    let temp = TempDir::new("dext-conpty-path-picker").expect("temp directory");
+    let sandbox = temp.path.join("sandbox");
+    let dext_home = temp.path.join("dext-home");
+    let home = temp.path.join("home");
+    for dir in [&sandbox, &dext_home, &home] {
+        std::fs::create_dir_all(dir).expect("create test directory");
+    }
+    std::fs::write(sandbox.join("sample.rs"), "fixture").expect("create project file");
+    let mut conpty = ConPty::spawn(&sandbox, &dext_home, &home).expect("spawn Dext in ConPTY");
+    conpty.wait_for("Dext", TIMEOUT).expect("read banner");
+    conpty.write_all(b"draft\x10").expect("open picker");
+    conpty
+        .wait_for("project paths", TIMEOUT)
+        .expect("read picker");
+    conpty.write_all(b"sample").expect("filter paths");
+    conpty
+        .wait_for("sample.rs", TIMEOUT)
+        .expect("read selected file");
+    conpty.write_all(b"\x1b").expect("cancel picker");
+    conpty.write_all(b"\x04").expect("quit");
+    assert_eq!(conpty.wait_for_exit(TIMEOUT).expect("clean exit"), 0);
+}
+
+#[test]
 fn conpty_harness_selfcheck_echoes_through_pseudoconsole() {
     let temp = TempDir::new("dext-conpty-selfcheck").expect("temp directory");
     let comspec = std::env::var_os("COMSPEC")
