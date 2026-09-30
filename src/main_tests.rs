@@ -18601,6 +18601,159 @@ fn gpt_5_6_openai_request_uses_responses_pro_mode_and_true_max_effort() -> Resul
 }
 
 #[test]
+fn gpt_6_1_sol_requests_preserve_provider_contracts() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    for id in ["openai", "chatgpt"] {
+        let profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == id)
+            .expect("built-in profile");
+        let mut agent = test_agent(&root);
+        agent.provider_id = id.to_string();
+        agent.api_provider = profile.api_provider;
+        agent.base_url = profile.base_url.clone();
+        agent.provider_profile = Some(profile);
+        agent.model = "gpt-6.1-sol".to_string();
+        agent.reasoning_mode = ReasoningMode::Pro;
+        for (effort, expected) in [
+            (ThinkingEffort::Off, None),
+            (ThinkingEffort::Minimal, Some("low")),
+            (ThinkingEffort::Low, Some("low")),
+            (ThinkingEffort::Medium, Some("medium")),
+            (ThinkingEffort::High, Some("high")),
+            (ThinkingEffort::XHigh, Some("xhigh")),
+            (ThinkingEffort::Max, Some("max")),
+        ] {
+            agent.thinking_effort = effort;
+            let (url, bytes) =
+                agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+            let body: Value = serde_json::from_slice(&bytes)?;
+            assert!(url.ends_with("/responses"), "{url}");
+            assert_eq!(
+                body["reasoning"]["effort"].as_str(),
+                expected,
+                "{id}: {body}"
+            );
+            assert!(body["reasoning"].get("mode").is_none(), "{body}");
+            assert_eq!(body["store"], false, "{body}");
+            assert!(!body["tools"].as_array().expect("tools").is_empty());
+            if id == "openai" {
+                assert_eq!(body["max_output_tokens"], 128_000);
+                assert_eq!(body["include"][0], "reasoning.encrypted_content");
+            } else {
+                assert!(body.get("max_output_tokens").is_none());
+            }
+            let summary = build_responses_summary_body(
+                agent.request_contract_for_model(&agent.model),
+                &agent.model,
+                "summarize",
+                agent
+                    .responses_reasoning_effort_for_model(&agent.model, effort)
+                    .as_deref(),
+                agent.reasoning_mode_for_model(&agent.model),
+                COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+            );
+            assert_eq!(summary["reasoning"]["effort"].as_str(), expected);
+            assert!(summary["reasoning"].get("mode").is_none());
+        }
+        if id == "openai" {
+            agent.base_url = "https://example.test".to_string();
+            assert!(
+                agent
+                    .build_streaming_request("sys", "env", &[], &[], "session-key")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires the Responses API")
+            );
+            agent.tools.clear();
+            let (url, bytes) =
+                agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+            let body: Value = serde_json::from_slice(&bytes)?;
+            assert!(url.ends_with("/chat/completions"));
+            assert_eq!(body["reasoning_effort"], "max");
+            assert_eq!(body["max_completion_tokens"], 128_000);
+            assert!(body.get("tools").is_none());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn responses_encrypted_reasoning_respects_route_at_off() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut agent = test_agent(&root);
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("OpenAI profile");
+    profile.request_contract = Some(RequestContract::OpenAiResponses);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.provider_profile = Some(profile);
+    for model in ["gpt-6.1-sol", "gpt-6-astra"] {
+        agent.model = model.to_string();
+        for effort in [ThinkingEffort::Off, ThinkingEffort::Max] {
+            agent.thinking_effort = effort;
+            for (base, included) in [
+                ("https://api.openai.com", true),
+                ("https://example.test", false),
+            ] {
+                agent.base_url = base.to_string();
+                let (_, bytes) =
+                    agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+                let body: Value = serde_json::from_slice(&bytes)?;
+                assert_eq!(
+                    body.get("include").is_some(),
+                    included,
+                    "{model} {effort:?}: {body}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gpt_6_1_sol_custom_profile_without_metadata_uses_valid_effort() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("OpenAI profile");
+    profile.id = "custom-sol".to_string();
+    profile.models.clear();
+    profile.model_specs.clear();
+    profile.request_contract = Some(RequestContract::OpenAiResponses);
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = "https://example.test".to_string();
+    agent.provider_profile = Some(profile);
+    agent.model = "GPT-6.1-SOL".to_string();
+    for (effort, expected) in [
+        (ThinkingEffort::Off, None),
+        (ThinkingEffort::Minimal, Some("low")),
+        (ThinkingEffort::Max, Some("max")),
+    ] {
+        agent.thinking_effort = effort;
+        let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+        let body: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(body["reasoning"]["effort"].as_str(), expected);
+        assert!(body.get("include").is_none());
+    }
+    agent.provider_profile.as_mut().unwrap().request_contract =
+        Some(RequestContract::OpenAiChatCompletions);
+    assert!(
+        agent
+            .build_streaming_request("sys", "env", &[], &[], "session-key")
+            .unwrap_err()
+            .to_string()
+            .contains("requires the Responses API")
+    );
+    Ok(())
+}
+
+#[test]
 fn gpt_6_sol_and_luna_chat_completions_tool_calls_force_none_effort() -> Result<()> {
     let root = std::env::current_dir()?.canonicalize()?;
     let mut profile = built_in_provider_profiles()
@@ -18684,6 +18837,22 @@ fn compact_model_alias_uses_its_own_responses_mode_and_pricing() -> Result<()> {
         usage.cost_usd
     );
 
+    unsafe { std::env::set_var("DEXT_COMPACT_MODEL", "gpt61sol") };
+    let summary_model = agent.compact_summary_model();
+    assert_eq!(summary_model, "gpt-6.1-sol");
+    assert_eq!(
+        agent.request_contract_for_model(&summary_model),
+        RequestContract::OpenAiResponses
+    );
+    assert_eq!(agent.reasoning_mode_for_model(&summary_model), None);
+    let mut usage = Usage {
+        input: 100_000,
+        cache_read: 100_000,
+        output: 10_000,
+        ..Usage::default()
+    };
+    agent.finalize_usage_metrics_for_model(&mut usage, &summary_model);
+    assert!((usage.cost_usd.expect("Sol 6.1 summary cost") - 0.31).abs() < 1e-12);
     restore_env_var("DEXT_COMPACT_MODEL", old_compact_model);
     Ok(())
 }
@@ -19574,6 +19743,17 @@ fn steering_updates_turn_policy_note() {
     agent.update_turn_policy_from_steering("also fix the typo in the docs");
     assert_eq!(agent.turn_policy_note, None);
 
+    agent.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+    agent.update_turn_policy_from_steering("Sure go. Also review the process.");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(IMPLEMENTATION_TURN_RUNTIME_NOTE)
+    );
+    agent.update_turn_policy_from_steering("review the workflow for asking me to go");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(IMPLEMENTATION_TURN_RUNTIME_NOTE)
+    );
     agent.update_turn_policy_from_steering("actually don't change anything yet");
     assert_eq!(agent.turn_policy_note, Some(ADVISORY_TURN_RUNTIME_NOTE));
 
@@ -19584,6 +19764,12 @@ fn steering_updates_turn_policy_note() {
         "neutral steering must leave the policy untouched"
     );
 
+    agent.update_turn_policy_from_steering("Can you configure the model?");
+    assert_eq!(agent.turn_policy_note, None);
+    agent.update_turn_policy_from_steering("Go, but don't change anything yet");
+    assert_eq!(agent.turn_policy_note, Some(ADVISORY_TURN_RUNTIME_NOTE));
+    agent.update_turn_policy_from_steering("The prompt says \"go ahead\"; review it");
+    assert_eq!(agent.turn_policy_note, Some(ADVISORY_TURN_RUNTIME_NOTE));
     agent.update_turn_policy_from_steering("should I go ahead?");
     assert_eq!(
         agent.turn_policy_note,
@@ -22823,6 +23009,41 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
 }
 
 #[test]
+fn gpt_6_1_sol_cached_pricing_and_tier_boundary() {
+    let pricing = usage_pricing_default_for(
+        "openai",
+        ApiProvider::OpenAi,
+        "https://api.openai.com",
+        "gpt-6.1-sol",
+    );
+    for provider in ["openai", "chatgpt"] {
+        for (cached, multiplier) in [(272_000, 1.0), (272_001, 2.0)] {
+            let usage = Usage {
+                cache_read: cached,
+                ..Usage::default()
+            };
+            let tier = openai_long_context_pricing_with_override_state(
+                provider,
+                "gpt-6.1-sol",
+                usage,
+                pricing,
+                false,
+            );
+            let expected = cached as f64 / 1_000_000.0 * 0.1 * multiplier;
+            assert!((tier.estimate(usage) - expected).abs() < 1e-12);
+            let override_tier = openai_long_context_pricing_with_override_state(
+                provider,
+                "gpt-6.1-sol",
+                usage,
+                pricing,
+                true,
+            );
+            assert_eq!(override_tier.estimate(usage), pricing.estimate(usage));
+        }
+    }
+}
+
+#[test]
 fn openai_responses_pricing_applies_documented_long_context_tier() {
     let usage = Usage {
         input: 300_000,
@@ -22832,6 +23053,7 @@ fn openai_responses_pricing_applies_documented_long_context_tier() {
         cost_usd: None,
     };
     for (model, expected) in [
+        ("gpt-6.1-sol", 2.7),
         ("gpt-6-astra", 13.5),
         ("gpt-6-sol", 2.7),
         ("gpt-6-luna", 0.135),
@@ -26384,6 +26606,8 @@ fn normalize_chatgpt_model_slug_accepts_compact_aliases() {
     assert_eq!(normalize_chatgpt_model_slug("gpt56"), "gpt-5.6-sol");
     assert_eq!(normalize_chatgpt_model_slug("gpt56terra"), "gpt-5.6-terra");
     assert_eq!(normalize_chatgpt_model_slug("GPT 5 6 LUNA"), "gpt-5.6-luna");
+    assert_eq!(normalize_chatgpt_model_slug("gpt61sol"), "gpt-6.1-sol");
+    assert_eq!(normalize_chatgpt_model_slug("GPT 6.1 SOL"), "gpt-6.1-sol");
     assert_eq!(normalize_chatgpt_model_slug("gpt6astra"), "gpt-6-astra");
     assert_eq!(normalize_chatgpt_model_slug("GPT 6 SOL"), "gpt-6-sol");
     assert_eq!(normalize_chatgpt_model_slug("gpt6luna"), "gpt-6-luna");
@@ -26433,7 +26657,18 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_current_overrides_it() {
         "gpt-6-luna"
     );
     for profile in [&chatgpt, &openai] {
+        assert_eq!(
+            normalize_provider_model_value(profile, "gpt61sol"),
+            "gpt-6.1-sol"
+        );
         for (model, efforts, input, cached, output) in [
+            (
+                "gpt-6.1-sol",
+                &["low", "medium", "high", "xhigh", "max"][..],
+                2.0,
+                0.1,
+                10.0,
+            ),
             (
                 "gpt-6-astra",
                 &["low", "medium", "high", "xhigh", "max"][..],
@@ -26603,6 +26838,7 @@ fn openai_responses_routing_is_official_openai_only() -> Result<()> {
         .find(|profile| profile.id == "openai")
         .expect("openai profile");
     for model in [
+        "gpt-6.1-sol",
         "gpt-6-astra",
         "gpt-6-sol",
         "gpt-6-luna",
@@ -26622,6 +26858,8 @@ fn openai_responses_routing_is_official_openai_only() -> Result<()> {
         ("https://api.openai.com", "gpt-5.60"),
         ("https://api.openai.com", "gpt-5.6-preview"),
         ("https://api.openai.com", "gpt-5.6-terrra"),
+        ("https://api.openai.com", "gpt-6.1-sol-preview"),
+        ("https://api.openai.com", "gpt-6.10-sol"),
         ("https://api.openai.com", "gpt-6-preview"),
         ("https://api.openai.com", "gpt-6-terra"),
         ("http://api.openai.com", "gpt-5.6"),

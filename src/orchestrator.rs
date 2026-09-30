@@ -445,6 +445,58 @@ fn contains_word_sequence(text: &str, sequence: &[&str]) -> bool {
         .any(|window| window == sequence)
 }
 
+fn intent_text(input: &str) -> String {
+    let mut text = String::with_capacity(input.len());
+    let mut closing_quote = None;
+    let mut previous = ' ';
+    for ch in input.chars() {
+        if let Some(quote) = closing_quote {
+            if ch == quote {
+                closing_quote = None;
+            }
+            text.push(if ch == '\n' { '\n' } else { ' ' });
+        } else {
+            closing_quote = match ch {
+                '"' | '`' => Some(ch),
+                '\'' if !previous.is_alphanumeric() => Some('\''),
+                '“' => Some('”'),
+                '‘' if !previous.is_alphanumeric() => Some('’'),
+                _ => None,
+            };
+            text.push(if closing_quote.is_some() { ' ' } else { ch });
+        }
+        previous = ch;
+    }
+    text.to_ascii_lowercase()
+}
+
+fn non_negated_at(words: &[&str], index: usize) -> bool {
+    !words[index.saturating_sub(4)..index]
+        .iter()
+        .any(|previous| {
+            matches!(
+                *previous,
+                "not"
+                    | "don"
+                    | "dont"
+                    | "never"
+                    | "no"
+                    | "without"
+                    | "cannot"
+                    | "cant"
+                    | "isn"
+                    | "wasn"
+                    | "weren"
+                    | "hasn"
+                    | "haven"
+                    | "hadn"
+                    | "didn"
+                    | "couldn"
+                    | "wouldn"
+            )
+        })
+}
+
 fn contains_non_negated_sequence(text: &str, sequence: &[&str]) -> bool {
     if sequence.is_empty() {
         return false;
@@ -453,31 +505,7 @@ fn contains_non_negated_sequence(text: &str, sequence: &[&str]) -> bool {
     words
         .windows(sequence.len())
         .enumerate()
-        .any(|(index, window)| {
-            window == sequence
-                && !words[index.saturating_sub(4)..index]
-                    .iter()
-                    .any(|previous| {
-                        matches!(
-                            *previous,
-                            "not"
-                                | "never"
-                                | "no"
-                                | "without"
-                                | "cannot"
-                                | "cant"
-                                | "isn"
-                                | "wasn"
-                                | "weren"
-                                | "hasn"
-                                | "haven"
-                                | "hadn"
-                                | "didn"
-                                | "couldn"
-                                | "wouldn"
-                        )
-                    })
-        })
+        .any(|(index, window)| window == sequence && non_negated_at(&words, index))
 }
 
 fn any_word_starts_with(words: &[&str], prefixes: &[&str]) -> bool {
@@ -549,44 +577,60 @@ fn commit_requested_as_action(words: &[&str]) -> bool {
 }
 
 fn explicit_implementation_requested(lowered: &str) -> bool {
-    [
-        &["apply", "fix"][..],
-        &["apply", "fixes"],
-        &["apply", "the", "fix"],
-        &["apply", "the", "fixes"],
-        &["fix", "it"],
-        &["fix", "them"],
-        &["fix", "this"],
-        &["fix", "the"],
-        &["fix", "anything"],
-        &["fix", "any"],
-        &["fix", "issues"],
-        &["fix", "errors"],
-        &["fix", "bugs"],
-        &["fix", "problems"],
-        &["fix", "whatever"],
-        &["implement"],
-        &["execute", "the", "plan"],
-        &["execute", "that", "plan"],
-        &["start", "implementation"],
-        &["proceed", "with", "implementation"],
-        &["proceed", "with", "the", "plan"],
-        &["go", "ahead"],
-        &["rip", "it", "out"],
-        &["rip", "out"],
-        &["patch"],
-        &["merge"],
-        &["go", "for", "it"],
-        &["handle", "my", "todo"],
-        &["make", "changes"],
-        &["update", "the", "code"],
-        &["update", "docs"],
-        &["update", "documentation"],
-        &["update", "tests"],
-        &["do", "it"],
-    ]
-    .iter()
-    .any(|sequence| contains_non_negated_sequence(lowered, sequence))
+    let words = normalized_words(lowered);
+    let configure = words.iter().enumerate().any(|(index, word)| {
+        *word == "configure"
+            && non_negated_at(&words, index)
+            && (index == 0
+                || (index >= 2
+                    && matches!(words[index - 2], "can" | "could" | "would")
+                    && words[index - 1] == "you")
+                || matches!(
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| words.get(previous)),
+                    Some(&"and" | &"then" | &"please" | &"also")
+                ))
+    });
+    configure
+        || [
+            &["apply", "fix"][..],
+            &["apply", "fixes"],
+            &["apply", "the", "fix"],
+            &["apply", "the", "fixes"],
+            &["fix", "it"],
+            &["fix", "them"],
+            &["fix", "this"],
+            &["fix", "the"],
+            &["fix", "anything"],
+            &["fix", "any"],
+            &["fix", "issues"],
+            &["fix", "errors"],
+            &["fix", "bugs"],
+            &["fix", "problems"],
+            &["fix", "whatever"],
+            &["implement"],
+            &["execute", "the", "plan"],
+            &["execute", "that", "plan"],
+            &["start", "implementation"],
+            &["proceed", "with", "implementation"],
+            &["proceed", "with", "the", "plan"],
+            &["go", "ahead"],
+            &["rip", "it", "out"],
+            &["rip", "out"],
+            &["patch"],
+            &["merge"],
+            &["go", "for", "it"],
+            &["handle", "my", "todo"],
+            &["make", "changes"],
+            &["update", "the", "code"],
+            &["update", "docs"],
+            &["update", "documentation"],
+            &["update", "tests"],
+            &["do", "it"],
+        ]
+        .iter()
+        .any(|sequence| contains_non_negated_sequence(lowered, sequence))
 }
 
 fn planning_requested_as_action(words: &[&str]) -> bool {
@@ -657,6 +701,8 @@ fn planning_requested_as_action(words: &[&str]) -> bool {
 fn explicit_no_mutation_requested(lowered: &str) -> bool {
     [
         &["plan", "only"][..],
+        &["analysis", "only"],
+        &["review", "only"],
         &["only", "plan"],
         &["just", "plan"],
         &["do", "not", "implement"],
@@ -691,12 +737,51 @@ fn explicit_no_mutation_requested(lowered: &str) -> bool {
     .any(|sequence| contains_word_sequence(lowered, sequence))
 }
 
-fn planned_execution_requested(lowered: &str) -> bool {
+fn global_hold_off_requested(lowered: &str) -> bool {
     let words = normalized_words(lowered);
-    if matches!(
-        words.as_slice(),
-        ["go"] | ["proceed"] | ["approved"] | ["ship", "it"] | ["continue", "work"]
-    ) {
+    [
+        &["analysis", "only"][..],
+        &["review", "only"],
+        &["no", "changes", "yet"],
+        &["no", "edits", "yet"],
+        &["do", "not", "change", "anything"],
+        &["do", "not", "edit", "anything"],
+        &["do", "not", "modify", "anything"],
+        &["don", "t", "change", "anything"],
+        &["don", "t", "edit", "anything"],
+        &["dont", "change", "anything"],
+        &["dont", "edit", "anything"],
+    ]
+    .iter()
+    .any(|sequence| {
+        words
+            .windows(sequence.len())
+            .enumerate()
+            .any(|(index, window)| {
+                window == *sequence
+                    && !matches!(words.get(index + sequence.len()), Some(&"else" | &"other"))
+            })
+    })
+}
+
+fn planned_execution_requested(lowered: &str) -> bool {
+    let first_clause = lowered
+        .split(['.', '!', '\n', ','])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let words = normalized_words(first_clause);
+    if !first_clause.contains(['\'', '"', '`', '?'])
+        && matches!(
+            words.as_slice(),
+            ["go"]
+                | ["proceed"]
+                | ["approved"]
+                | ["ship", "it"]
+                | ["continue", "work"]
+                | ["sure" | "yes" | "okay" | "ok", "go" | "proceed"]
+        )
+    {
         return true;
     }
     [
@@ -739,25 +824,27 @@ impl ObjectiveTracker {
             };
         }
 
-        let lowered = compact.to_ascii_lowercase();
+        let lowered = intent_text(input);
         let words = normalized_words(&lowered);
         let cleanup_requested = cleanup_requested_as_action(&words);
         let commit_requested = commit_requested_as_action(&words);
-        let implementation_requested = explicit_implementation_requested(&lowered);
-        // A trailing question mark means the user is asking about proceeding,
-        // not granting approval; never inject the implementation policy for it.
+        let hold_off = global_hold_off_requested(&lowered);
+        let question = lowered.trim_end().ends_with('?')
+            && !matches!(words.as_slice(), ["can" | "could" | "would", "you", ..]);
+        let implementation_requested =
+            !hold_off && !question && explicit_implementation_requested(&lowered);
         let plan_execution_requested =
-            !compact.ends_with('?') && planned_execution_requested(&lowered);
-        let apply_fixes_requested =
-            explicit_apply_fixes_requested(&lowered) || plan_execution_requested;
+            !hold_off && !question && planned_execution_requested(&lowered);
+        let apply_fixes_requested = !hold_off
+            && !question
+            && (explicit_apply_fixes_requested(&lowered) || plan_execution_requested);
         let planning_requested = planning_requested_as_action(&words);
         let analysis_requested = any_word_starts_with(&words, &["analy", "review"]);
         // Explicit mutation intent wins: a "don't touch X" scoping clause inside
         // a fix request must not demote the turn to advisory.
-        let advisory_only_requested = !apply_fixes_requested
-            && (explicit_no_mutation_requested(&lowered)
-                || planning_requested
-                || analysis_requested);
+        let advisory_only_requested = hold_off
+            || (!apply_fixes_requested
+                && (explicit_no_mutation_requested(&lowered) || planning_requested));
         let mut checkpoints: Vec<String> = Vec::new();
 
         if planning_requested {
@@ -769,10 +856,10 @@ impl ObjectiveTracker {
         if implementation_requested {
             checkpoints.push("implement requested changes".to_string());
         }
-        if cleanup_requested {
+        if cleanup_requested && apply_fixes_requested {
             checkpoints.push("clean up repository".to_string());
         }
-        if commit_requested {
+        if commit_requested && apply_fixes_requested {
             checkpoints.push("commit requested changes".to_string());
         }
         if words.iter().any(|word| {
@@ -1943,9 +2030,11 @@ mod tests {
             "plan the auth refactor",
             "please plan the migration first",
             "plan the removal, do not implement",
+            "analysis only: examine provider behavior",
+            "review only: inspect the change",
             "let's plan how to restructure the session store",
             "give me a plan for the upgrade",
-            "review dext for bugs",
+            "review dext for bugs, don't change anything",
             "analyze the resize flicker, no changes yet",
             "how does compaction work? don't change anything",
         ] {
@@ -1961,6 +2050,8 @@ mod tests {
             "review the flow, then apply fixes",
             "review plan mode and rip it out",
             "update docs for the new flag",
+            "Review Dext and configure openai's latest gpt-6.1-sol model. Pull the documentation.",
+            "SUre go. and I dont like this workflow of doing things, then asking me for a go. Unless dangerous, I think we can just get shit done. So lets also add this into our review of the process for dext. Need to be smarter",
         ] {
             let tracker = ObjectiveTracker::from_user_prompt(mutating);
             assert!(!tracker.advisory_only(), "{mutating}");
@@ -1975,6 +2066,8 @@ mod tests {
             "go ahead",
             "proceed with the plan",
             "execute the plan",
+            "Sure go. Also review the process.",
+            "go, fix the bug as well",
         ] {
             let tracker = ObjectiveTracker::from_user_prompt(approval);
             assert!(tracker.planned_execution(), "{approval}");
@@ -1990,10 +2083,90 @@ mod tests {
             "should I go ahead?",
             "how should I go ahead with this?",
             "execute the plan?",
+            "review dext for bugs",
+            "review the workflow for asking me to go",
+            "analyze provider behavior",
+            "'go'. Is the word shown in the prompt",
+            "do not go",
+            "don't configure the model",
+            "do not review and configure the model",
         ] {
             let tracker = ObjectiveTracker::from_user_prompt(neutral);
             assert!(!tracker.planned_execution(), "{neutral}");
             assert!(!tracker.advisory_only(), "{neutral}");
+        }
+        for withheld in [
+            "don't configure the model",
+            "do not review and configure the model",
+            "review the workflow for asking me to go",
+            "'go'. Is the word shown in the prompt",
+        ] {
+            assert!(
+                !ObjectiveTracker::from_user_prompt(withheld).apply_fixes_allowed(),
+                "{withheld}"
+            );
+        }
+    }
+
+    #[test]
+    fn intent_review_regressions() {
+        for approval in [
+            "Sure go\nAlso review the process",
+            "go\nConfigure the model",
+        ] {
+            assert!(
+                ObjectiveTracker::from_user_prompt(approval).planned_execution(),
+                "{approval}"
+            );
+        }
+        for withheld in [
+            "Go, but don't change anything yet",
+            "Go ahead, but no changes yet",
+            "The prompt says \"go ahead\"; review it",
+            "The prompt says `do it`; review it",
+            "Review ‘go ahead’ in the prompt",
+            "Should I go ahead?",
+            "How should I configure the model?",
+            "Do not review and configure the model. Explain how users configure their tools",
+        ] {
+            let objective = ObjectiveTracker::from_user_prompt(withheld);
+            assert!(!objective.planned_execution(), "{withheld}");
+            assert!(!objective.apply_fixes_allowed(), "{withheld}");
+        }
+        for withheld in [
+            "Should I commit the changes?",
+            "Commit the changes, but no changes yet",
+        ] {
+            let objective = ObjectiveTracker::from_user_prompt(withheld);
+            assert!(!objective.apply_fixes_allowed(), "{withheld}");
+            assert!(
+                !objective
+                    .checkpoints
+                    .iter()
+                    .any(|item| item == "commit requested changes"),
+                "{withheld}"
+            );
+        }
+        for held in [
+            "Go, but don't change anything yet",
+            "Go ahead, but no changes yet",
+        ] {
+            assert!(
+                ObjectiveTracker::from_user_prompt(held).advisory_only(),
+                "{held}"
+            );
+        }
+        for request in [
+            "Please configure the model",
+            "Can you configure the model?",
+            "Fix the bug but don't change anything else",
+            "Configure 'gpt-6.1-sol'",
+            "Review and configure OpenAI's model",
+        ] {
+            assert!(
+                ObjectiveTracker::from_user_prompt(request).apply_fixes_allowed(),
+                "{request}"
+            );
         }
     }
 

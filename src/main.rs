@@ -10605,7 +10605,7 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
 
-const ADVISORY_TURN_RUNTIME_NOTE: &str = "advisory_only=true — the user asked for planning/analysis, not changes. Use read-only tools (read_file, read_symbol, fd, rg, git_diff, todo_read); do not call write_file/edit_file/multi_edit/git_commit/todo_write, mutating bash, or network tools this turn. Finish with sections: Goal, Findings, Steps (numbered), Risks (omit if none) — then stop. Implementation begins only after explicit user approval (e.g. 'go').";
+const ADVISORY_TURN_RUNTIME_NOTE: &str = "advisory_only=true — the user requested a plan or explicitly deferred changes. Use read-only tools (read_file, read_symbol, fd, rg, git_diff, todo_read) and requested read-only documentation research, subject to normal tool permissions. Do not edit code or change external state unless the user's current instruction authorizes it. This heuristic is not a separate approval gate: explicit implementation requests and conversational approvals take precedence; do not ask for another 'go' when execution is already authorized. Answer in the format the task needs.";
 
 const IMPLEMENTATION_TURN_RUNTIME_NOTE: &str = "implementation_authorized=true — the user approved execution. If the recent conversation contains an agreed plan, first record its steps with todo_write, then execute them in order: read before editing, keep todo status current, verify after changes.";
 
@@ -14365,6 +14365,9 @@ impl Agent {
             return map_effort_to_provider_levels(&spec.effort_levels, effort);
         }
         match self.request_contract_for_model(model) {
+            RequestContract::OpenAiResponses if is_gpt_6_model(model) => {
+                openai_reasoning_effort(model, effort).map(str::to_string)
+            }
             RequestContract::OpenAiResponses => {
                 Some(openai_responses_reasoning_effort(effort).to_string())
             }
@@ -16388,12 +16391,9 @@ impl Agent {
     // advisory note immediately, and a new hold-off must reinstate one.
     fn update_turn_policy_from_steering(&mut self, steering_text: &str) {
         let objective = orchestrator::ObjectiveTracker::from_user_prompt(steering_text);
-        // A question asks about proceeding; it neither grants nor revokes
-        // approval, so it must not clear an active advisory policy.
-        let question = steering_text.trim_end().ends_with('?');
         if objective.planned_execution() {
             self.turn_policy_note = Some(IMPLEMENTATION_TURN_RUNTIME_NOTE);
-        } else if objective.apply_fixes_allowed() && !question {
+        } else if objective.apply_fixes_allowed() {
             self.turn_policy_note = None;
         } else if objective.advisory_only() {
             self.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
@@ -17015,6 +17015,9 @@ impl Agent {
                     tools,
                     max_output_tokens,
                 );
+                if include_encrypted_content {
+                    body["include"] = json!(["reasoning.encrypted_content"]);
+                }
                 if !self.model_supports_prompt_cache()
                     && let Some(object) = body.as_object_mut()
                 {
@@ -17054,6 +17057,11 @@ impl Agent {
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
+                if self.model.trim().eq_ignore_ascii_case("gpt-6.1-sol") && !oai_tools.is_empty() {
+                    anyhow::bail!(
+                        "gpt-6.1-sol tool calling requires the Responses API; configure this provider with the openai-responses request contract"
+                    );
+                }
                 let reasoning_effort =
                     if !oai_tools.is_empty() && is_gpt_6_sol_or_luna_model(&self.model) {
                         Some("none".to_string())
