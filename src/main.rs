@@ -15203,7 +15203,7 @@ impl Agent {
     fn deactivate_pack_runtime(&mut self) -> usize {
         let mut removed_grants = 0usize;
         if let Some(previous) = self.active_pack_runtime.take() {
-            for tool in previous.tools {
+            for tool in previous.all_tools() {
                 removed_grants += usize::from(self.allowed.remove(&tool.name));
                 self.deny_tools.remove(&tool.name);
             }
@@ -15232,8 +15232,9 @@ impl Agent {
             "operation": format!("activate executable pack runtime '{}'", pack.name),
             "runtime": pack.runtime_path.as_ref().map(|path| path.display().to_string()),
             "executable_sha256": &runtime.executable_sha256,
-            "tools": runtime.tools.iter().map(|tool| format!("{}:{:?}", tool.name, tool.risk).to_ascii_lowercase()).collect::<Vec<_>>(),
+            "tools": runtime.all_tools().map(|tool| format!("{}:{:?}", tool.name, tool.risk).to_ascii_lowercase()).collect::<Vec<_>>(),
             "ui_protocol": runtime.ui_protocol,
+            "tool_protocol": runtime.tool_protocol,
             "risk": format!(
                 "executes a pack-owned native helper with credentials removed under the current {} sandbox profile; declared write/danger tools retain Git checkpoint controls",
                 self.sandbox_profile.as_str()
@@ -15358,6 +15359,7 @@ impl Agent {
             .context("pack runtime invocation has no active runtime")?;
         let mut prompts = Vec::new();
         let mut views = Vec::new();
+        let mut proposed_tools = Vec::new();
         for effect in invocation.effects {
             match effect {
                 pack_runtime::RuntimeEffect::Steer { text } => {
@@ -15370,6 +15372,20 @@ impl Agent {
                 }
                 pack_runtime::RuntimeEffect::Continue { prompt, delay_ms } => {
                     prompts.push((self.privacy.redact_text(&prompt).text, delay_ms));
+                }
+                pack_runtime::RuntimeEffect::Tools { mut tools } => {
+                    for tool in &mut tools {
+                        tool.description = self.privacy.redact_text(&tool.description).text;
+                        let original_schema = tool.input_schema.clone();
+                        self.privacy
+                            .redact_json_for_disclosure(&mut tool.input_schema);
+                        if tool.input_schema != original_schema {
+                            bail!(
+                                "pack runtime tool schema contains private data; promotion refused without changing its contract"
+                            );
+                        }
+                    }
+                    proposed_tools.extend(tools);
                 }
                 pack_runtime::RuntimeEffect::View { title, markdown } => {
                     views.push((
@@ -15404,10 +15420,48 @@ impl Agent {
             );
         }
 
+        let next_tools = if proposed_tools.is_empty() {
+            None
+        } else {
+            Some(runtime.proposed_tools(&proposed_tools, &pack_runtime_occupied_names())?)
+        };
+        if let Some(next) = &next_tools
+            && *next != runtime.promoted_tools
+        {
+            let approval_input = json!({
+                "operation": "promote pack runtime tools",
+                "pack": runtime.pack_name,
+                "manifest_sha256": runtime.manifest_sha256,
+                "executable_sha256": runtime.executable_sha256,
+                "tools": proposed_tools,
+                "risk": "exposes new session-local tools; each call retains its declared approval, sandbox, and checkpoint policy"
+            });
+            let approved = match self.approval_profile {
+                ApprovalProfile::Always => true,
+                ApprovalProfile::Never => false,
+                _ => !matches!(
+                    self.sink
+                        .request_permission(PACK_RUNTIME_APPROVAL_NAME, &approval_input),
+                    Choice::Deny
+                ),
+            };
+            if !approved || self.interrupt.load(Ordering::SeqCst) {
+                bail!("pack runtime tool promotion was not approved");
+            }
+        }
         let runtime = self
             .active_pack_runtime
             .as_mut()
             .context("pack runtime invocation has no active runtime")?;
+        if let Some(next) = next_tools {
+            for tool in &next {
+                if runtime.tool(&tool.name).is_none() {
+                    self.allowed.remove(&tool.name);
+                    self.deny_tools.remove(&tool.name);
+                }
+            }
+            runtime.promoted_tools = next;
+        }
         if let Some(state) = invocation.state {
             runtime.state = state;
         }
@@ -16572,7 +16626,7 @@ impl Agent {
             .collect();
         let mut exposed: HashSet<&str> = self.tools.iter().map(|t| t.name).collect();
         if let Some(runtime) = &self.active_pack_runtime {
-            exposed.extend(runtime.tools.iter().map(|tool| tool.name.as_str()));
+            exposed.extend(runtime.all_tools().map(|tool| tool.name.as_str()));
         }
         self.allowed.retain(|name| exposed.contains(name.as_str()));
         self.deny_tools
@@ -16590,7 +16644,7 @@ impl Agent {
         let mut neutral = tools::provider_neutral_tools(&self.tools, self.wire_tool_profile());
         if let Some(runtime) = &self.active_pack_runtime {
             let profile = self.wire_tool_profile();
-            neutral.extend(runtime.tools.iter().map(|tool| tools::ProviderNeutralTool {
+            neutral.extend(runtime.all_tools().map(|tool| tools::ProviderNeutralTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 schema: tools::schema_for_profile(&tool.input_schema, profile),
@@ -17249,7 +17303,7 @@ impl Agent {
         let mut exposed_tools: Vec<String> =
             self.tools.iter().map(|t| t.name.to_string()).collect();
         if let Some(runtime) = &self.active_pack_runtime {
-            exposed_tools.extend(runtime.tools.iter().map(|tool| tool.name.clone()));
+            exposed_tools.extend(runtime.all_tools().map(|tool| tool.name.clone()));
         }
         exposed_tools.sort();
         exposed_tools.dedup();

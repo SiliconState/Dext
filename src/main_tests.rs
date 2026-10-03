@@ -17111,6 +17111,156 @@ fn stream_error_classification_retries_chunked_eof() {
 }
 
 #[test]
+fn pack_runtime_tool_promotion_is_opted_in_atomic_and_policy_fenced() {
+    let root = temp_test_dir("pack-runtime-promotion");
+    let mut agent = test_agent(&root);
+    agent.active_pack_runtime = Some(pack_runtime::ActiveRuntime {
+        pack_name: "demo".into(),
+        pack_source: "test".into(),
+        executable: root.join("runtime"),
+        executable_sha256: "digest".into(),
+        args: Vec::new(),
+        timeout: std::time::Duration::from_secs(1),
+        tools: Vec::new(),
+        ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
+        manifest_sha256: "manifest".into(),
+        state: json!({"old":true}),
+        max_continuations: 0,
+        continuations_used: 0,
+    });
+    let tool = pack_runtime::RuntimeTool {
+        name: "demo_lookup".into(),
+        description: "Lookup".into(),
+        input_schema: json!({"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}),
+        risk: pack_runtime::RuntimeRisk::Write,
+    };
+    let invocation = |tools| pack_runtime::RuntimeInvocation {
+        content: "discovered".into(),
+        is_error: false,
+        state: Some(json!({"new":true})),
+        effects: vec![pack_runtime::RuntimeEffect::Tools { tools }],
+        ui_request: None,
+    };
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![tool.clone()]), false)
+            .is_err()
+    );
+    agent.active_pack_runtime.as_mut().unwrap().tool_protocol = Some(1);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    // Policy changes revoke runtimes; rebuild the test instance after the transition.
+    if agent.active_pack_runtime.is_none() {
+        agent.active_pack_runtime = Some(pack_runtime::ActiveRuntime {
+            pack_name: "demo".into(),
+            pack_source: "test".into(),
+            executable: root.join("runtime"),
+            executable_sha256: "digest".into(),
+            args: Vec::new(),
+            timeout: std::time::Duration::from_secs(1),
+            tools: Vec::new(),
+            ui_protocol: None,
+            tool_protocol: Some(1),
+            promoted_tools: Vec::new(),
+            manifest_sha256: "manifest".into(),
+            state: json!({"old":true}),
+            max_continuations: 0,
+            continuations_used: 0,
+        });
+    }
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: requests.clone(),
+    }));
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![tool.clone()]), false)
+            .is_err()
+    );
+    assert_eq!(
+        agent.active_pack_runtime.as_ref().unwrap().state,
+        json!({"old":true})
+    );
+    assert!(agent.active_runtime_tool("demo_lookup").is_none());
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
+    agent.allowed.insert("demo_lookup".into());
+    agent
+        .apply_pack_runtime_invocation(invocation(vec![tool.clone()]), false)
+        .unwrap();
+    assert!(!agent.allowed.contains("demo_lookup"));
+    assert!(agent.tool_needs_permission("demo_lookup"));
+    assert!(
+        agent
+            .provider_neutral_tools()
+            .iter()
+            .any(|t| t.name == "demo_lookup")
+    );
+    assert!(
+        agent
+            .validate_active_tool_input("demo_lookup", &json!({}))
+            .is_err()
+    );
+    let before = requests.load(Ordering::SeqCst);
+    agent
+        .apply_pack_runtime_invocation(invocation(vec![tool.clone()]), false)
+        .unwrap();
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        before,
+        "identical definitions are idempotent"
+    );
+    let mut changed = tool.clone();
+    changed.risk = pack_runtime::RuntimeRisk::Read;
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![changed]), false)
+            .is_err()
+    );
+    let mut collision = tool.clone();
+    collision.name = "bash".into();
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![collision]), false)
+            .is_err()
+    );
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![tool.clone(), tool.clone()]), false)
+            .is_err()
+    );
+    let snapshot = agent.active_pack_runtime.as_ref().unwrap().snapshot(&[]);
+    let mut private = tool.clone();
+    private.name = "private_contract".into();
+    private.input_schema["properties"]["key"]["enum"] =
+        json!([format!("SERVICE_TOKEN={}", "a".repeat(40))]);
+    let state_before = agent.active_pack_runtime.as_ref().unwrap().state.clone();
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![private]), false)
+            .is_err()
+    );
+    assert_eq!(
+        agent.active_pack_runtime.as_ref().unwrap().state,
+        state_before
+    );
+    assert!(agent.active_runtime_tool("private_contract").is_none());
+    let mut restored = agent.active_pack_runtime.as_ref().unwrap().clone();
+    restored.promoted_tools.clear();
+    restored.restore_state(&snapshot).unwrap();
+    assert!(restored.tool("demo_lookup").is_none());
+    agent.allowed.insert("demo_lookup".into());
+    agent.set_sandbox_profile(SandboxProfile::ReadOnly);
+    assert!(agent.active_pack_runtime.is_none());
+    assert!(!agent.allowed.contains("demo_lookup"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn pack_runtime_default_always_profile_does_not_prompt() {
     let root = temp_test_dir("pack-runtime-default-always");
     let mut agent = test_agent(&root);
@@ -17129,6 +17279,8 @@ fn pack_runtime_default_always_profile_does_not_prompt() {
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -17171,6 +17323,8 @@ fn pack_runtime_always_approval_is_exact_identity_scoped() {
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -17282,6 +17436,8 @@ fn pack_runtime_activation_is_revoked_when_safety_policy_changes() {
                 risk: pack_runtime::RuntimeRisk::Write,
             }],
             ui_protocol: None,
+            tool_protocol: None,
+            promoted_tools: Vec::new(),
             manifest_sha256: "manifest".to_string(),
             state: Value::Null,
             max_continuations: 2,
@@ -17539,6 +17695,8 @@ fn pack_runtime_invocation_application_is_atomic() {
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: json!({"old": true}),
         max_continuations: 1,
@@ -20580,6 +20738,8 @@ fn slash_allow_and_allowed_include_active_runtime_tools() {
             risk: pack_runtime::RuntimeRisk::Write,
         }],
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -29735,6 +29895,8 @@ fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
             risk: pack_runtime::RuntimeRisk::Read,
         }],
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -29894,6 +30056,8 @@ fn tool_disabled_models_expose_no_static_or_dynamic_tools() {
             risk: pack_runtime::RuntimeRisk::Read,
         }],
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,

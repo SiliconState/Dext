@@ -44,11 +44,13 @@ pub(crate) enum RuntimeRisk {
     Danger,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeTool {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) input_schema: Value,
+    #[serde(default)]
     pub(crate) risk: RuntimeRisk,
 }
 
@@ -70,6 +72,8 @@ pub(crate) struct ActiveRuntime {
     pub(crate) timeout: Duration,
     pub(crate) tools: Vec<RuntimeTool>,
     pub(crate) ui_protocol: Option<u32>,
+    pub(crate) tool_protocol: Option<u32>,
+    pub(crate) promoted_tools: Vec<RuntimeTool>,
     pub(crate) manifest_sha256: String,
     pub(crate) state: Value,
     pub(crate) max_continuations: u32,
@@ -140,6 +144,9 @@ pub(crate) enum RuntimeEffect {
         title: String,
         markdown: String,
     },
+    Tools {
+        tools: Vec<RuntimeTool>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -164,19 +171,13 @@ struct RuntimeManifest {
     tools: Vec<RuntimeToolManifest>,
     #[serde(default)]
     ui_protocol: Option<u32>,
+    #[serde(default)]
+    tool_protocol: Option<u32>,
     #[serde(default = "default_max_continuations")]
     max_continuations: u32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RuntimeToolManifest {
-    name: String,
-    description: String,
-    input_schema: Value,
-    #[serde(default)]
-    risk: RuntimeRisk,
-}
+type RuntimeToolManifest = RuntimeTool;
 
 #[derive(Serialize)]
 struct RuntimeRequest<'a> {
@@ -384,8 +385,10 @@ fn validate_schema_node(schema: &Value, path: &str, depth: usize) -> Result<()> 
         let description = description
             .as_str()
             .with_context(|| format!("{path} schema description must be a string"))?;
-        if description.len() > 2_000 {
-            bail!("{path} schema description exceeds 2000 bytes");
+        if description.len() > 2_000 || contains_unsafe_runtime_control(description, true) {
+            bail!(
+                "{path} schema description must be at most 2000 bytes without control characters"
+            );
         }
     }
     if let Some(values) = object.get("enum") {
@@ -469,9 +472,10 @@ fn validate_manifest(manifest: &RuntimeManifest, builtin_names: &HashSet<String>
     if manifest.ui_protocol.is_some_and(|version| version != 1) {
         bail!("unsupported pack runtime UI protocol; expected 1");
     }
-    if manifest.tools.len() > RUNTIME_TOOL_LIMIT {
-        bail!("pack runtime declares more than {RUNTIME_TOOL_LIMIT} tools");
+    if manifest.tool_protocol.is_some_and(|version| version != 1) {
+        bail!("unsupported pack runtime tool protocol; expected 1");
     }
+    validate_tools(&manifest.tools, builtin_names)?;
     if manifest.max_continuations > RUNTIME_MAX_CONTINUATIONS {
         bail!("pack runtime max_continuations exceeds {RUNTIME_MAX_CONTINUATIONS}");
     }
@@ -483,23 +487,39 @@ fn validate_manifest(manifest: &RuntimeManifest, builtin_names: &HashSet<String>
     {
         bail!("pack runtime args exceed their count or size limit");
     }
+    Ok(())
+}
+
+pub(crate) fn validate_tools(
+    tools: &[RuntimeTool],
+    occupied_names: &HashSet<String>,
+) -> Result<()> {
+    if tools.len() > RUNTIME_TOOL_LIMIT {
+        bail!("pack runtime declares more than {RUNTIME_TOOL_LIMIT} tools");
+    }
+    if serde_json::to_vec(tools)?.len() > RUNTIME_STATE_CAP {
+        bail!("pack runtime tool catalog exceeds {RUNTIME_STATE_CAP} bytes");
+    }
     let mut names = HashSet::new();
-    for tool in &manifest.tools {
+    for tool in tools {
         if !valid_tool_name(&tool.name) {
             bail!(
                 "pack runtime tool names must be 1-64 ASCII letters, digits, or underscores and start with a letter: {}",
                 tool.name
             );
         }
-        if builtin_names.contains(&tool.name) || !names.insert(tool.name.clone()) {
+        if occupied_names.contains(&tool.name) || !names.insert(tool.name.clone()) {
             bail!(
                 "pack runtime tool name collides with an exposed tool: {}",
                 tool.name
             );
         }
-        if tool.description.trim().is_empty() || tool.description.len() > 2_000 {
+        if tool.description.trim().is_empty()
+            || tool.description.len() > 2_000
+            || contains_unsafe_runtime_control(&tool.description, true)
+        {
             bail!(
-                "pack runtime tool description must be 1-2000 bytes: {}",
+                "pack runtime tool description must be 1-2000 bytes without control characters: {}",
                 tool.name
             );
         }
@@ -545,6 +565,8 @@ pub(crate) fn load(
             })
             .collect(),
         ui_protocol: manifest.ui_protocol,
+        tool_protocol: manifest.tool_protocol,
+        promoted_tools: Vec::new(),
         manifest_sha256: sha256_hex(&bytes),
         state: Value::Null,
         max_continuations: manifest.max_continuations,
@@ -573,8 +595,39 @@ impl ActiveRuntime {
         }
     }
 
+    pub(crate) fn all_tools(&self) -> impl Iterator<Item = &RuntimeTool> {
+        self.tools.iter().chain(&self.promoted_tools)
+    }
+
     pub(crate) fn tool(&self, name: &str) -> Option<&RuntimeTool> {
-        self.tools.iter().find(|tool| tool.name == name)
+        self.all_tools().find(|tool| tool.name == name)
+    }
+
+    pub(crate) fn proposed_tools(
+        &self,
+        tools: &[RuntimeTool],
+        occupied_names: &HashSet<String>,
+    ) -> Result<Vec<RuntimeTool>> {
+        if self.tool_protocol != Some(1) {
+            bail!("pack runtime tools effect requires tool_protocol: 1");
+        }
+        validate_tools(tools, occupied_names)?;
+        let mut next = self.promoted_tools.clone();
+        for tool in tools {
+            if let Some(previous) = self.tool(&tool.name) {
+                if previous != tool {
+                    bail!(
+                        "pack runtime tool definition changed; reactivate the pack: {}",
+                        tool.name
+                    );
+                }
+            } else {
+                next.push(tool.clone());
+            }
+        }
+        let catalog: Vec<_> = self.tools.iter().chain(&next).cloned().collect();
+        validate_tools(&catalog, occupied_names)?;
+        Ok(next)
     }
 
     pub(crate) fn restore_state(&mut self, snapshot: &RuntimeSnapshot) -> Result<()> {
@@ -591,6 +644,7 @@ impl ActiveRuntime {
         {
             bail!("pack runtime continuation snapshot exceeds its declared budget");
         }
+        self.promoted_tools.clear();
         self.state = snapshot.state.clone();
         self.continuations_used = snapshot.continuations_used;
         Ok(())
@@ -758,6 +812,7 @@ fn validate_response(response: &RuntimeResponse) -> Result<()> {
             {
                 bail!("pack runtime view effect exceeds its size limit");
             }
+            RuntimeEffect::Tools { tools } => validate_tools(tools, &HashSet::new())?,
             _ => {}
         }
     }
@@ -887,6 +942,14 @@ pub(crate) async fn invoke(
     let response: RuntimeResponse = serde_json::from_str(stdout.trim())
         .context("pack runtime stdout must contain one JSON response object")?;
     validate_response(&response)?;
+    if response
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, RuntimeEffect::Tools { .. }))
+        && runtime.tool_protocol != Some(1)
+    {
+        bail!("pack runtime tools effect requires tool_protocol: 1");
+    }
     if response.ui_request.is_some() && runtime.ui_protocol != Some(1) {
         bail!("pack runtime returned ui_request without declaring ui_protocol: 1");
     }
@@ -973,6 +1036,33 @@ mod tests {
                 None => std::env::remove_var("DEXT_PACK_RUNTIME_TIMEOUT_SECS"),
             }
         }
+    }
+
+    #[test]
+    fn runtime_promotion_catalog_limits_are_fail_closed() {
+        let parse = |version| {
+            serde_json::from_value::<RuntimeManifest>(json!({
+                "version": 1, "command": "runtime", "tool_protocol": version
+            }))
+            .unwrap()
+        };
+        assert!(validate_manifest(&parse(1), &HashSet::new()).is_ok());
+        assert!(validate_manifest(&parse(2), &HashSet::new()).is_err());
+        let mut tools = Vec::new();
+        for i in 0..33 {
+            let mut t = tool();
+            t.name = format!("tool_{i}");
+            tools.push(t);
+        }
+        assert!(validate_tools(&tools, &HashSet::new()).is_err());
+        tools.pop();
+        for t in &mut tools {
+            t.description = "d".repeat(2_000);
+        }
+        assert!(validate_tools(&tools, &HashSet::new()).is_err());
+        let mut t = tool();
+        t.input_schema["properties"]["name"]["description"] = json!("unsafe\u{1b}");
+        assert!(validate_tools(&[t], &HashSet::new()).is_err());
     }
 
     #[test]
