@@ -87,6 +87,8 @@ fn tui_path_picker_opens_in_conpty_and_cancels_without_submitting() {
         .wait_for("sample.rs", TIMEOUT)
         .expect("read selected file");
     conpty.write_all(b"\x1b").expect("cancel picker");
+    // ConPTY can combine adjacent Escape and Ctrl+D bytes into an Alt-modified key.
+    std::thread::sleep(Duration::from_millis(150));
     conpty.write_all(b"\x04").expect("quit");
     assert_eq!(conpty.wait_for_exit(TIMEOUT).expect("clean exit"), 0);
 }
