@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Maintenance
+
+- Consolidated reviewed dependency updates: anyhow 1.0.104, bitflags 2.13.1, unicode-segmentation 1.13.3, hashbrown 0.17.1, serde 1.0.229, thiserror 2.0.20, futures-util 0.3.33, and Tokio 1.53.1, plus compatible transitive resolution. Kept exact terminal versions and immutable upstream Ratatui pins unchanged; compact_str 0.10 and Ratatui's itertools 0.15 were already supplied by the vendor removal.
+- Fixed a resize race that could defer transcript reconstruction after display clear/scrollback purge. Each replay now holds one validated geometry snapshot through reconstruction, then releases it so subsequent frames rebuild for newer sizes; failure cleanup and mid-replay resize have focused regression coverage.
+- Refreshed immutable GitHub Actions pins for checkout, release artifacts/provenance, and Pages to their reviewed releases, preserving artifact names, archive wrapping, checksums, independent attestation verification, credential policy, and bounded Pages deployment.
+
 ### Added
 
 - Optional independent cloud/local total provider-request deadlines (`DEXT_PROVIDER_TOTAL_TIMEOUT_SECS` and `DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS`), disabled by default, bound inference and compaction HTTP attempts through body completion even when peers keep trickling chunks. Invalid settings fail before sending; retries get fresh budgets rather than a whole-turn limit.

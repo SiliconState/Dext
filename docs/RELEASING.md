@@ -63,6 +63,8 @@ The tag workflow must:
 - publish four archives, one CycloneDX JSON SBOM (`dext.cdx.json`), and one sorted, verified `SHA256SUMS` covering every asset;
 - generate and verify GitHub build-provenance attestations for every checksummed asset before creating the release.
 
+Workflow dependencies are reviewed immutable pins: Checkout 7.0.1, Upload Artifact 7.0.1, Download Artifact 8.0.1, and Attest Build Provenance 4.2.2. The actions target current GitHub-hosted runners with Node 24 support. Uploads retain default archive wrapping and explicit names; downloads retain `pattern: release-*` and merged extraction, and digest mismatches fail by default. The provenance wrapper preserves `subject-checksums` and the separate CLI verification step. Pages uses Configure Pages 6.0.0, Upload Pages Artifact 5.0.0, and Deploy Pages 5.0.1 with the existing deployment deadline.
+
 Monitor every matrix job and inspect the release assets. If publication or later verification fails, mark the release affected or withdraw it and publish a new patch version. Do not move the tag or overwrite release assets.
 
 ## Verify published assets
