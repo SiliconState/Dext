@@ -44,13 +44,13 @@ cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
 cargo deny check licenses
-cargo test -p ratatui-core --lib --locked
+cargo test --release --locked --bin dext tui::tests::
 cargo bench --no-run --locked
 cargo build --release --locked
 cargo test --release --locked
 ```
 
-If `src/tui.rs`, a terminal dependency, or the vendored Ratatui patch changed:
+If `src/tui.rs` or a terminal dependency changed:
 
 ```bash
 cargo test --release --locked --test tui_smoke -- --nocapture

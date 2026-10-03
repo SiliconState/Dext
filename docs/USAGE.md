@@ -225,7 +225,7 @@ Useful slash commands:
 
 The interactive interface uses an inline Ratatui viewport in the regular terminal buffer, preserving native scrollback. Enter submits; Shift+Enter or Alt+Enter inserts a newline; Ctrl+D quits; `?` opens the complete keymap when the input is empty. Input remains editable while a turn streams.
 
-Dext pins the terminal stack exactly and carries a narrow vendored `ratatui-core` compatibility patch to avoid synchronous cursor-query stalls and whole-display clears during inline resize. See [`TUI.md`](TUI.md) for the behavior contract, dependency versions, regression coverage, and patch maintenance procedure.
+Dext pins the terminal stack and uses unmodified upstream Ratatui core and Crossterm backend at revision `7767679c138b383933fef4227e7fbf077b7cfeca`, containing the merged cursor-save and inline-resize fixes. There is no vendored dependency source; transcript reset/replay uses a Dext-owned backend adapter and public Ratatui APIs. See [`TUI.md`](TUI.md) for the behavior contract, source-pin tradeoff, regression coverage, and release migration procedure.
 
 ## One-shot and automation
 
@@ -587,7 +587,7 @@ DEXT_EVAL_TIMEOUT_SECS=15
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
-cargo test -p ratatui-core --lib --locked
+cargo test --release --locked --bin dext tui::tests::
 cargo build --release --locked
 cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture

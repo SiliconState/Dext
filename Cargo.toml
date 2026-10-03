@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace]
-members = ["vendor/ratatui-core"]
+members = ["."]
 default-members = ["."]
 resolver = "2"
 
@@ -55,7 +55,8 @@ name = "dext_bench"
 harness = false
 
 [patch.crates-io]
-ratatui-core = { path = "vendor/ratatui-core" }
+ratatui-core = { git = "https://github.com/ratatui/ratatui", rev = "7767679c138b383933fef4227e7fbf077b7cfeca" }
+ratatui-crossterm = { git = "https://github.com/ratatui/ratatui", rev = "7767679c138b383933fef4227e7fbf077b7cfeca" }
 
 [profile.release]
 lto = false

@@ -113,7 +113,7 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 - `src/tui.rs`
   - Inline Ratatui UI in the regular terminal buffer; transactional thinking history uses per-line decoding without newline-proportional temporary batches, bounded open/sealed display units, and suffix-only inspector rendering.
   - Transcript rendering, input box, status/live areas, permission prompts, slash completions, and the read-only `Ctrl+L` todo modal; todo state loading shares the 256 KiB runtime bound.
-  - See [`TUI.md`](TUI.md) for the renderer contract, exact dependency stack, compatibility patch, and PTY gate.
+  - See [`TUI.md`](TUI.md) for the renderer contract, exact dependency stack, upstream integration, and PTY gate.
 
 - `src/pack_runtime.rs`
   - Optional pack-owned executable runtime protocol (`runtime.json` v1), dynamic tool schemas/risk, one-shot JSON request/response execution, bounded state/effects, and manifest identity checks.
@@ -153,10 +153,10 @@ Dext is a Rust terminal agent packaged as one binary. Most behavior is still int
 - `src/secret_redactor.rs`
   - Streaming credential scrubbing for child-process output, holding back only enough tail bytes to catch a pattern split across reads.
 
-- `vendor/ratatui-core/`
-  - Exact upstream `ratatui-core 0.1.2` source selected through `[patch.crates-io]`.
-  - Narrow inline-terminal fixes that avoid synchronous cursor-query stalls and extra whole-display clears before Dext's owned resize replay, plus an origin-reset primitive that clears the visible display before stale-width scrollback is purged so complete transcript reconstruction replays the intro exactly once.
-  - Hunk rationale and refresh instructions in `vendor/ratatui-core/DEXT_PATCH.md`.
+- Ratatui integration in `src/tui.rs`
+  - Unmodified upstream core and Crossterm backend at immutable revision `7767679c138b383933fef4227e7fbf077b7cfeca`; no vendored source.
+  - `ReplayBackend` supplies the known origin only during Dext-owned display reset; public resize/buffer APIs reset rendering state before scrollback purge and full transcript replay.
+  - Dependency source selection, upstream fixes, and regression contract in `docs/TUI.md`.
 
 ## Tool model
 
@@ -297,7 +297,7 @@ cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
 cargo deny check licenses
-cargo test -p ratatui-core --lib --locked
+cargo test --release --locked --bin dext tui::tests::
 cargo bench --no-run --locked
 cargo build --release --locked
 cargo test --release --locked

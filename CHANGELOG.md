@@ -64,8 +64,11 @@
   so padded auth headers and typed/query values are not misclassified.
 - Upgraded the terminal stack to exact Ratatui 0.30.2, ratatui-core 0.1.2,
   tui-markdown 0.3.8, Crossterm 0.29.0, and unicode-width 0.2.2 versions.
-  Dext carries a narrow exact-source ratatui-core compatibility patch for its
-  inline viewport; the real-PTY suite now starts each child with a controlling
+  Dext now uses unmodified upstream core and Crossterm backend at revision
+  `7767679c138b383933fef4227e7fbf077b7cfeca`, including merged cursor-save and
+  inline-resize fixes, instead of vendored source. Transcript reset/replay stays
+  in Dext through public APIs. The mandatory workspace-core test gate is replaced
+  by Dext TUI integration tests. The real-PTY suite starts each child with a controlling
   terminal and gates streaming input, populated resize bursts, whole-screen
   clears, cursor-query counts, replay bounds, and a bounded completion wait
   that tolerates slower macOS CI hosts.

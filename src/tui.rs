@@ -7660,41 +7660,148 @@ fn insert_transcript_items<B: Backend>(
     flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)
 }
 
+struct ReplayBackend<B> {
+    inner: B,
+    resetting: bool,
+}
+
+impl<B> ReplayBackend<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner,
+            resetting: false,
+        }
+    }
+}
+
+impl<B: Backend> Backend for ReplayBackend<B> {
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), B::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, n: u16) -> Result<(), B::Error> {
+        if self.resetting {
+            Ok(())
+        } else {
+            self.inner.append_lines(n)
+        }
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), B::Error> {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> Result<(), B::Error> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, B::Error> {
+        if self.resetting {
+            Ok(ratatui::layout::Position::ORIGIN)
+        } else {
+            self.inner.get_cursor_position()
+        }
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> Result<(), B::Error> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn save_cursor_position(&mut self) -> Result<bool, B::Error> {
+        self.inner.save_cursor_position()
+    }
+    fn restore_cursor_position(&mut self) -> Result<(), B::Error> {
+        self.inner.restore_cursor_position()
+    }
+    fn clear(&mut self) -> Result<(), B::Error> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> Result<(), B::Error> {
+        if self.resetting && clear_type == ratatui::backend::ClearType::AfterCursor {
+            Ok(())
+        } else {
+            self.inner.clear_region(clear_type)
+        }
+    }
+    fn size(&self) -> Result<ratatui::layout::Size, B::Error> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, B::Error> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> Result<(), B::Error> {
+        self.inner.flush()
+    }
+}
+
+fn reset_transcript_viewport<B: Backend>(
+    terminal: &mut Terminal<ReplayBackend<B>>,
+) -> Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.set_cursor_position(ratatui::layout::Position::ORIGIN)?;
+    terminal
+        .backend_mut()
+        .clear_region(ratatui::backend::ClearType::All)?;
+    // After the owned display clear, resize can reanchor at the known origin without
+    // querying the input reader or appending reservation lines into scrollback.
+    terminal.backend_mut().resetting = true;
+    let resized = terminal.resize(size.into());
+    terminal.backend_mut().resetting = false;
+    resized?;
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    terminal.backend_mut().flush()
+}
+
 #[cfg(test)]
-fn rebuild_transcript_from_origin<B: Backend>(
-    terminal: &mut Terminal<B>,
+fn rebuild_transcript_from_origin(
+    terminal: &mut Terminal<ReplayBackend<ratatui::backend::TestBackend>>,
     state: &mut TuiState,
     width: u16,
-) -> Result<(), B::Error> {
-    terminal.reset_inline_viewport()?;
+) -> Result<(), std::convert::Infallible> {
+    if transcript_chunk_rows(terminal, state, width)?.is_none() {
+        state.transcript_needs_rebuild = true;
+        return Ok(());
+    }
+    reset_transcript_viewport(terminal)?;
+    let size = terminal.size()?;
+    // A fresh test surface models the production clear-then-scrollback-purge sequence.
+    terminal.backend_mut().inner = ratatui::backend::TestBackend::new(size.width, size.height);
     rebuild_transcript(terminal, state, width)
 }
 
 fn purge_and_rebuild_transcript_inner<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
+    terminal: &mut Terminal<ReplayBackend<CrosstermBackend<W>>>,
     state: &mut TuiState,
     width: u16,
 ) -> io::Result<()> {
-    if renderable_transcript_chunk_rows(terminal, state, width)?.is_none() {
+    if transcript_chunk_rows(terminal, state, width)?.is_none() {
         state.transcript_needs_rebuild = true;
         return Ok(());
     }
-    terminal.reset_inline_viewport()?;
+    reset_transcript_viewport(terminal)?;
     crossterm::execute!(
-        terminal.backend_mut(),
+        terminal.backend_mut().inner,
         CrosstermClear(CrosstermClearType::Purge)
     )?;
     rebuild_transcript(terminal, state, width)
 }
 
 fn purge_and_rebuild_transcript<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
+    terminal: &mut Terminal<ReplayBackend<CrosstermBackend<W>>>,
     state: &mut TuiState,
     width: u16,
 ) -> io::Result<()> {
-    crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    crossterm::execute!(terminal.backend_mut().inner, BeginSynchronizedUpdate)?;
     let rebuild = purge_and_rebuild_transcript_inner(terminal, state, width);
-    let end = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    let end = crossterm::execute!(terminal.backend_mut().inner, EndSynchronizedUpdate);
     rebuild.and(end)
 }
 
@@ -7748,10 +7855,18 @@ fn renderable_transcript_chunk_rows<B: Backend>(
     state: &TuiState,
     expected_width: u16,
 ) -> Result<Option<u16>, B::Error> {
-    if expected_width == 0 {
+    if transcript_chunk_rows(terminal, state, expected_width)?.is_none() {
         return Ok(None);
     }
     terminal.autoresize()?;
+    transcript_chunk_rows(terminal, state, expected_width)
+}
+
+fn transcript_chunk_rows<B: Backend>(
+    terminal: &Terminal<B>,
+    state: &TuiState,
+    expected_width: u16,
+) -> Result<Option<u16>, B::Error> {
     let size = terminal.size()?;
     let current_width = transcript_pane_width(size.width, size.height, state);
     if size.width == 0 || size.height == 0 || current_width == 0 || current_width != expected_width
@@ -10925,7 +11040,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let auto_approved_count = agent.auto_approved_privileged_tool_count();
     let _guard = TerminalGuard::new()?;
     let stdout = io::stdout();
-    let backend = CrosstermBackend::new(stdout);
+    let backend = ReplayBackend::new(CrosstermBackend::new(stdout));
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -11303,7 +11418,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         if terminal_has_render_area(&terminal)? {
             let width = current_transcript_pane_width(&mut terminal, &state)?;
             if state.thinking_visual_transaction_pending && width > 0 {
-                crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+                crossterm::execute!(terminal.backend_mut().inner, BeginSynchronizedUpdate)?;
                 let update = (|| {
                     if transcript_requires_rebuild(&state, width) {
                         purge_and_rebuild_transcript_inner(&mut terminal, &mut state, width)?;
@@ -11314,7 +11429,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                     terminal.draw(|f| draw(f, &mut state))?;
                     Ok::<(), io::Error>(())
                 })();
-                let end = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+                let end = crossterm::execute!(terminal.backend_mut().inner, EndSynchronizedUpdate);
                 update.and(end)?;
                 state.thinking_visual_transaction_pending = false;
             } else {
@@ -11477,6 +11592,186 @@ mod tests {
     use super::*;
     use crate::provider::StoredCredential;
     use std::sync::atomic::AtomicBool;
+
+    struct ReplayProbe {
+        inner: ratatui::backend::TestBackend,
+        queries: usize,
+        appended: u16,
+        clears: Vec<ratatui::backend::ClearType>,
+        moves_until_failure: Option<usize>,
+    }
+
+    impl Backend for ReplayProbe {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content).map_err(|error| match error {})
+        }
+        fn append_lines(&mut self, n: u16) -> io::Result<()> {
+            self.appended += n;
+            self.inner.append_lines(n).map_err(|error| match error {})
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor().map_err(|error| match error {})
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor().map_err(|error| match error {})
+        }
+        fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+            self.queries += 1;
+            self.inner
+                .get_cursor_position()
+                .map_err(|error| match error {})
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> io::Result<()> {
+            if let Some(remaining) = self.moves_until_failure.as_mut() {
+                if *remaining == 0 {
+                    self.moves_until_failure = None;
+                    return Err(io::Error::other("injected resize cursor failure"));
+                }
+                *remaining -= 1;
+            }
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|error| match error {})
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            self.clear_region(ratatui::backend::ClearType::All)
+        }
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+            self.clears.push(clear_type);
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|error| match error {})
+        }
+        fn size(&self) -> io::Result<ratatui::layout::Size> {
+            self.inner.size().map_err(|error| match error {})
+        }
+        fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size().map_err(|error| match error {})
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush().map_err(|error| match error {})
+        }
+    }
+
+    fn replay_probe_terminal() -> Terminal<ReplayBackend<ReplayProbe>> {
+        Terminal::with_options(
+            ReplayBackend::new(ReplayProbe {
+                inner: ratatui::backend::TestBackend::new(30, 10),
+                queries: 0,
+                appended: 0,
+                clears: Vec::new(),
+                moves_until_failure: None,
+            }),
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replay_reset_uses_known_origin_and_invalidates_both_buffers() {
+        let mut terminal = replay_probe_terminal();
+        terminal
+            .insert_before(3, |buf| {
+                buf.set_string(0, 0, "history", Style::default());
+            })
+            .unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("live"), frame.area()))
+            .unwrap();
+        terminal
+            .current_buffer_mut()
+            .set_string(0, 3, "stale", Style::default());
+        let queries = terminal.backend().inner.queries;
+        let appended = terminal.backend().inner.appended;
+        terminal.backend_mut().inner.clears.clear();
+        reset_transcript_viewport(&mut terminal).unwrap();
+        assert!(!terminal.backend().resetting);
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 30, 4));
+        let backend = &terminal.backend().inner;
+        assert_eq!(backend.queries, queries);
+        assert_eq!(backend.appended, appended);
+        assert_eq!(backend.clears, [ratatui::backend::ClearType::All]);
+        assert_eq!(
+            backend.inner.cursor_position(),
+            ratatui::layout::Position::ORIGIN
+        );
+        for _ in 0..2 {
+            let buffer = terminal.current_buffer_mut();
+            assert_eq!(*buffer, ratatui::buffer::Buffer::empty(buffer.area));
+            terminal.swap_buffers();
+        }
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("live"), frame.area()))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().inner.inner.buffer()[(0, 0)].symbol(),
+            "l"
+        );
+        terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(terminal.backend().inner.queries, queries + 1);
+        terminal.backend_mut().append_lines(1).unwrap();
+        assert_eq!(terminal.backend().inner.appended, appended + 1);
+    }
+
+    #[test]
+    fn replay_reset_restores_backend_delegation_after_resize_failure() {
+        let mut terminal = replay_probe_terminal();
+        for moves in [0, 1, 2] {
+            terminal.backend_mut().inner.moves_until_failure = Some(moves);
+            assert!(reset_transcript_viewport(&mut terminal).is_err());
+            assert!(!terminal.backend().resetting);
+            let queries = terminal.backend().inner.queries;
+            terminal.backend_mut().get_cursor_position().unwrap();
+            assert_eq!(terminal.backend().inner.queries, queries + 1);
+            reset_transcript_viewport(&mut terminal).unwrap();
+            assert!(!terminal.backend().resetting);
+        }
+    }
+
+    #[test]
+    fn transcript_geometry_guard_defers_before_autoresize_side_effects() {
+        let state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        for (width, height) in [(30, 0), (0, 10), (30, 1), (20, 10)] {
+            let mut terminal = replay_probe_terminal();
+            let expected_width = current_transcript_pane_width(&mut terminal, &state).unwrap();
+            let area = terminal.get_frame().area();
+            let queries = terminal.backend().inner.queries;
+            let appended = terminal.backend().inner.appended;
+            terminal.backend_mut().inner.clears.clear();
+            terminal.backend_mut().inner.inner.resize(width, height);
+
+            assert_eq!(
+                renderable_transcript_chunk_rows(&mut terminal, &state, expected_width).unwrap(),
+                None
+            );
+            assert_eq!(terminal.get_frame().area(), area);
+            assert_eq!(terminal.backend().inner.queries, queries);
+            assert_eq!(terminal.backend().inner.appended, appended);
+            assert!(terminal.backend().inner.clears.is_empty());
+
+            terminal.backend_mut().inner.inner.resize(30, 10);
+            assert_eq!(
+                renderable_transcript_chunk_rows(&mut terminal, &state, expected_width).unwrap(),
+                Some(10)
+            );
+        }
+    }
 
     #[test]
     fn path_picker_fuzzy_search_and_cursor_insertion() {
@@ -12289,7 +12584,7 @@ mod tests {
         use ratatui::{TerminalOptions, Viewport};
 
         let mut terminal = Terminal::with_options(
-            TestBackend::new(80, 12),
+            ReplayBackend::new(TestBackend::new(80, 12)),
             TerminalOptions {
                 viewport: Viewport::Inline(4),
             },
@@ -12309,22 +12604,22 @@ mod tests {
         state.apply_thinking_delta("discarded-thinking\n".repeat(30));
         let width = current_transcript_pane_width(&mut terminal, &state).unwrap();
         flush_pending_insert(&mut terminal, &mut state, width).unwrap();
-        assert!(terminal.backend().scrollback().area.height > 0);
+        assert!(terminal.backend().inner.scrollback().area.height > 0);
         state.apply_event(AgentEvent::ThinkingPreviewDiscarded);
         assert!(transcript_requires_rebuild(&state, width));
         state.queue(Line_::Assistant {
             text: "surviving-after".to_string(),
             dim_prefix: false,
         });
-        terminal.backend_mut().purge_scrollback();
         rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
         flush_pending_insert(&mut terminal, &mut state, width).unwrap();
         let rendered = terminal
             .backend()
+            .inner
             .scrollback()
             .content
             .iter()
-            .chain(terminal.backend().buffer().content.iter())
+            .chain(terminal.backend().inner.buffer().content.iter())
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("discarded-thinking"), "{rendered}");
@@ -18229,7 +18524,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::with_options(
-            backend,
+            ReplayBackend::new(backend),
             TerminalOptions {
                 viewport: Viewport::Inline(8),
             },
@@ -18250,7 +18545,7 @@ mod tests {
         flush_pending_insert(&mut terminal, &mut state, width).expect("initial flush");
         state.transcript_needs_rebuild = true;
 
-        terminal.backend_mut().resize(80, 0);
+        terminal.backend_mut().inner.resize(80, 0);
         rebuild_transcript_from_origin(&mut terminal, &mut state, width)
             .expect("zero-height replay must defer");
 
@@ -18259,7 +18554,7 @@ mod tests {
         assert!(transcript_requires_rebuild(&state, width));
         assert_eq!(state.transcript.len(), 1);
 
-        terminal.backend_mut().resize(80, 20);
+        terminal.backend_mut().inner.resize(80, 20);
         terminal.autoresize().expect("restore terminal size");
         rebuild_transcript_from_origin(&mut terminal, &mut state, width).expect("restored replay");
         assert!(!state.transcript_needs_rebuild);
@@ -18386,7 +18681,7 @@ mod tests {
 
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::with_options(
-            backend,
+            ReplayBackend::new(backend),
             TerminalOptions {
                 viewport: Viewport::Inline(8),
             },
@@ -18409,10 +18704,10 @@ mod tests {
         }
         let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
         flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
-        assert!(terminal.backend().scrollback().area.height > 0);
+        assert!(terminal.backend().inner.scrollback().area.height > 0);
         let logical_blocks = state.transcript.len();
 
-        terminal.backend_mut().resize(52, 20);
+        terminal.backend_mut().inner.resize(52, 20);
         let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
         assert!(transcript_requires_rebuild(&state, narrow));
         state.queue(Line_::Assistant {
@@ -18420,7 +18715,6 @@ mod tests {
             dim_prefix: false,
         });
 
-        terminal.backend_mut().purge_scrollback();
         rebuild_transcript_from_origin(&mut terminal, &mut state, narrow)
             .expect("full narrow rebuild");
         flush_pending_insert(&mut terminal, &mut state, narrow).expect("pending narrow flush");
@@ -18431,10 +18725,11 @@ mod tests {
         assert_eq!(state.transcript.len(), logical_blocks + 2);
         let rendered = terminal
             .backend()
+            .inner
             .scrollback()
             .content
             .iter()
-            .chain(terminal.backend().buffer().content.iter())
+            .chain(terminal.backend().inner.buffer().content.iter())
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("block 0"), "{rendered}");
@@ -18451,7 +18746,7 @@ mod tests {
 
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::with_options(
-            backend,
+            ReplayBackend::new(backend),
             TerminalOptions {
                 viewport: Viewport::Inline(8),
             },
@@ -18474,10 +18769,9 @@ mod tests {
         flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
         let logical_len = state.transcript.len();
 
-        terminal.backend_mut().resize(36, 6);
+        terminal.backend_mut().inner.resize(36, 6);
         let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
         assert!(transcript_requires_rebuild(&state, narrow));
-        terminal.backend_mut().purge_scrollback();
         rebuild_transcript_from_origin(&mut terminal, &mut state, narrow)
             .expect("full-screen rebuild");
 
@@ -18485,13 +18779,14 @@ mod tests {
         assert_eq!(state.transcript_rendered_width, narrow);
         assert_eq!(terminal.get_frame().area().top(), 0);
         assert_eq!(terminal.get_frame().area().height, 6);
-        assert!(terminal.backend().scrollback().area.height > 0);
+        assert!(terminal.backend().inner.scrollback().area.height > 0);
         let rendered = terminal
             .backend()
+            .inner
             .scrollback()
             .content
             .iter()
-            .chain(terminal.backend().buffer().content.iter())
+            .chain(terminal.backend().inner.buffer().content.iter())
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("block 00"), "{rendered}");

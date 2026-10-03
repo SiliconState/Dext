@@ -18,7 +18,7 @@ Releases are owner-triggered by an annotated version tag. The workflow does not 
    cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
    cargo audit --deny warnings
    cargo deny check licenses
-   cargo test -p ratatui-core --lib --locked
+   cargo test --release --locked --bin dext tui::tests::
    cargo bench --no-run --locked
    cargo build --release --locked
    cargo test --release --locked
@@ -57,7 +57,7 @@ git push origin vX.Y.Z
 The tag workflow must:
 
 - reject a lightweight tag, a tag commit not contained in `origin/main`, or a tag/version that differs from the `Cargo.toml` package version;
-- run the Linux quality gate: formatting, Clippy with warnings denied, vendored `ratatui-core` tests, benchmark compilation, vulnerability auditing, and dependency-license checks;
+- run the Linux quality gate: formatting, Clippy with warnings denied, Dext TUI integration tests, benchmark compilation, vulnerability auditing, and dependency-license checks;
 - build and test Linux x86_64 GNU, macOS x86_64, macOS arm64, and Windows x86_64 MSVC with `--release --locked`;
 - run each packaged binary with `--version`;
 - publish four archives, one CycloneDX JSON SBOM (`dext.cdx.json`), and one sorted, verified `SHA256SUMS` covering every asset;

@@ -17,7 +17,7 @@ pub(crate) const REQUIRED_GATES: &[&str] = &[
     "clippy",
     "audit",
     "deny",
-    "ratatui",
+    "tui",
     "build-release",
     "test-release",
 ];
@@ -278,7 +278,15 @@ fn verification_scope(words: &[&str]) -> Option<&'static str> {
         ] => Some("clippy"),
         ["cargo", "audit", "--deny", "warnings"] => Some("audit"),
         ["cargo", "deny", "check", "licenses"] => Some("deny"),
-        ["cargo", "test", "-p", "ratatui-core", "--lib", "--locked"] => Some("ratatui"),
+        [
+            "cargo",
+            "test",
+            "--release",
+            "--locked",
+            "--bin",
+            "dext",
+            "tui::tests::",
+        ] => Some("tui"),
         ["cargo", "build", "--release", "--locked"] => Some("build-release"),
         ["cargo", "test", "--release", "--locked"] => Some("test-release"),
         ["cargo", "install", "--path", ".", "--force", "--locked"] => Some("install"),
@@ -744,7 +752,10 @@ mod tests {
             ),
             ("cargo audit --deny warnings", "audit"),
             ("cargo deny check licenses", "deny"),
-            ("cargo test -p ratatui-core --lib --locked", "ratatui"),
+            (
+                "cargo test --release --locked --bin dext tui::tests::",
+                "tui",
+            ),
             ("cargo build --release --locked", "build-release"),
             ("cargo test --release --locked", "test-release"),
         ];
@@ -761,8 +772,8 @@ mod tests {
             ("cargo audit --help", "audit"),
             ("cargo deny check", "deny"),
             (
-                "cargo test -p ratatui-core --lib --locked one_test",
-                "ratatui",
+                "cargo test --release --locked --bin dext tui::tests::one_test",
+                "tui",
             ),
             ("cargo build --release", "build-release"),
             (

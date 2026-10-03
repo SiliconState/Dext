@@ -377,7 +377,7 @@ const CANONICAL_REQUIRED_GATES_COMMAND: &str = concat!(
     "cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings\n",
     "cargo audit --deny warnings\n",
     "cargo deny check licenses\n",
-    "cargo test -p ratatui-core --lib --locked\n",
+    "cargo test --release --locked --bin dext tui::tests::\n",
     "cargo build --release --locked\n",
     "cargo test --release --locked",
 );
