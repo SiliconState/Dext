@@ -399,6 +399,15 @@ fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
     }
 }
 
+fn provider_body_chunk_err(error: reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow::Error::new(error)
+            .context("provider total request timeout while reading response body")
+    } else {
+        stream_chunk_err(error)
+    }
+}
+
 #[derive(Debug)]
 struct ParsedProviderStream {
     blocks: Vec<Block>,
@@ -440,6 +449,12 @@ impl ProviderTransportError {
 impl std::fmt::Display for ProviderTransportError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Request(error) if error.is_timeout() => {
+                write!(
+                    formatter,
+                    "provider connect or total request timeout: {error}"
+                )
+            }
             Self::Request(error) => write!(formatter, "{error}"),
             Self::FirstByteTimeout(timeout) => write!(
                 formatter,
@@ -484,7 +499,7 @@ async fn read_provider_body_limited(
         let Some(chunk) = next else {
             return Ok((body, false));
         };
-        let chunk = chunk.map_err(stream_chunk_err)?;
+        let chunk = chunk.map_err(provider_body_chunk_err)?;
         let remaining = cap.saturating_sub(body.len());
         if chunk.len() > remaining {
             body.extend_from_slice(&chunk[..remaining]);
@@ -4690,6 +4705,25 @@ fn provider_stream_idle_timeout(local: bool) -> std::time::Duration {
             PROVIDER_STREAM_IDLE_TIMEOUT_SECS
         },
     )
+}
+
+fn provider_total_request_timeout(local: bool) -> Result<Option<Duration>> {
+    let var = if local {
+        "DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS"
+    } else {
+        "DEXT_PROVIDER_TOTAL_TIMEOUT_SECS"
+    };
+    let value = match std::env::var(var) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => anyhow::bail!("{var} must be an integer from 0 to 86400 seconds"),
+    };
+    let seconds = value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= 86400)
+        .with_context(|| format!("{var} must be an integer from 0 to 86400 seconds"))?;
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 fn build_provider_http_client() -> reqwest::Client {
@@ -15053,6 +15087,15 @@ impl Agent {
         self.client.get_or_init(build_provider_http_client)
     }
 
+    fn provider_post(&self, url: impl reqwest::IntoUrl) -> Result<reqwest::RequestBuilder> {
+        let timeout = provider_total_request_timeout(self.local_provider_transport())?;
+        let request = self.http_client().post(url);
+        Ok(match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        })
+    }
+
     fn local_provider_transport(&self) -> bool {
         provider::is_local_llama_provider(
             &self.provider_id,
@@ -18215,8 +18258,7 @@ impl Agent {
         let url = provider_request_url(&self.base_url, contract);
         let bytes = serde_json::to_vec(body).map_err(|error| anyhow::anyhow!(error))?;
         let req = apply_provider_headers(
-            self.http_client()
-                .post(&url)
+            self.provider_post(&url)?
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
                 .body(bytes),
@@ -18234,7 +18276,7 @@ impl Agent {
         if !status.is_success() {
             let text = read_provider_error_body(resp, self.stream_idle_timeout())
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|error| format!("[provider error body unavailable: {error}]"));
             anyhow::bail!("summary {}", http_status_error(status, &text));
         }
         Ok(resp)
@@ -18342,8 +18384,7 @@ impl Agent {
                 ),
             };
             let mut req = self
-                .http_client()
-                .post(provider_request_url(&self.base_url, summary_contract))
+                .provider_post(provider_request_url(&self.base_url, summary_contract))?
                 .header("content-type", "application/json")
                 .json(&body);
             if !self.api_key.trim().is_empty() {
@@ -18361,8 +18402,7 @@ impl Agent {
                 summary_max_tokens,
             )?;
             let req = apply_provider_headers(
-                self.http_client()
-                    .post(provider_request_url(&self.base_url, summary_contract))
+                self.provider_post(provider_request_url(&self.base_url, summary_contract))?
                     .header("content-type", "application/json")
                     .body(bytes),
                 summary_contract,
@@ -18384,7 +18424,7 @@ impl Agent {
         if !status.is_success() {
             let text = read_provider_error_body(resp, self.stream_idle_timeout())
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|error| format!("[provider error body unavailable: {error}]"));
             anyhow::bail!("summary {}", http_status_error(status, &text));
         }
 
@@ -18920,8 +18960,7 @@ impl Agent {
                 let resp = loop {
                     attempt += 1;
                     let builder = self
-                        .http_client()
-                        .post(&url)
+                        .provider_post(&url)?
                         .header("content-type", "application/json")
                         .header("accept", "text/event-stream");
                     let extended_anthropic_cache = self.request_contract()
@@ -18993,7 +19032,9 @@ impl Agent {
                                 .and_then(|s| s.parse::<u64>().ok());
                             let text = read_provider_error_body(r, self.stream_idle_timeout())
                                 .await
-                                .unwrap_or_default();
+                                .unwrap_or_else(|error| {
+                                    format!("[provider error body unavailable: {error}]")
+                                });
                             self.record_provider_http_failure(status, &text, retry_after);
                             let plan = orchestrator::classify_http_failure(code, &text);
 
@@ -19719,7 +19760,7 @@ impl Agent {
                 chunk = stream.next() => {
                     return match chunk {
                         Some(Ok(chunk)) => Ok(Some(chunk)),
-                        Some(Err(e)) => Err(stream_chunk_err(e)),
+                        Some(Err(e)) => Err(provider_body_chunk_err(e)),
                         None => Ok(None),
                     };
                 }

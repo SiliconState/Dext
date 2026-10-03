@@ -4,6 +4,8 @@
 
 ### Added
 
+- Optional independent cloud/local total provider-request deadlines (`DEXT_PROVIDER_TOTAL_TIMEOUT_SECS` and `DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS`), disabled by default, bound inference and compaction HTTP attempts through body completion even when peers keep trickling chunks. Invalid settings fail before sending; retries get fresh budgets rather than a whole-turn limit.
+
 - `dext --input ndjson --output stream-json`: a long-lived host protocol over stdin/stdout (`user`/`steer`/`control`/`interrupt`/`permission`/`ui.capabilities`/`ui.response`/`close` frames, `ready` before input processing, one `input_ack` per frame, per-action `permission_request`/`permission_resolved`, stdout pure JSON). Bounded: 256 KiB per frame, 32 shared pending prompt/steering/control slots, an 8-entry permission channel, and one matching pending UI response; EOF or `close` drains accepted prompts and ends the process. Optional host-advertised UI methods let approved pack runtimes issue bounded, privacy-redacted `ui.request` events and consume correlated structured responses through the same one-shot protocol, without a DextUI dependency or core widget registry. Startup approvals and UI requests fail closed before the reader is available; incompatible one-shot flags fail without reading stdin. Spec in `docs/HOST_PROTOCOL.md`.
 - `--resume` restores the saved `session_id`, so session-scoped state (todos, git-auth, logs) survives process restarts for one-shot hosts.
 - `dext auth login <provider>` reads the credential from stdin when it is not a TTY (keeps secrets off argv); `dext auth status|providers|models --json`.

@@ -499,6 +499,11 @@ DEXT_API_KEY=...
 DEXT_PROVIDER_CONNECT_TIMEOUT_SECS=15
 DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS=180
 DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS=90
+# Optional total time per inference/compaction HTTP attempt, including body reads.
+# Independent cloud/local settings; unset or 0 disables. Range: 0..86400 seconds.
+# Invalid values reject the request. Retries get fresh budgets; not a turn deadline.
+DEXT_PROVIDER_TOTAL_TIMEOUT_SECS=0
+DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS=0
 # ChatGPT/Codex only: model to switch to when a codex implementation model
 # stalls on repeated no-mutation turns (default: the provider's default model).
 DEXT_IMPL_FALLBACK_MODEL=gpt-5.4

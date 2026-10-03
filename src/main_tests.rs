@@ -13253,6 +13253,164 @@ fn provider_transport_timeouts_use_local_defaults_and_valid_overrides() {
     }
 }
 
+#[test]
+fn provider_total_timeout_is_opt_in_independent_and_validated_per_request() {
+    let _guard = env_lock();
+    let vars = [
+        "DEXT_PROVIDER_TOTAL_TIMEOUT_SECS",
+        "DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS",
+    ];
+    let old_values = vars.map(std::env::var_os);
+    for var in vars {
+        unsafe { std::env::remove_var(var) };
+    }
+    let mut agent = test_agent(Path::new("."));
+    let timeout = |agent: &Agent| {
+        agent
+            .provider_post("http://localhost/test")
+            .unwrap()
+            .build()
+            .unwrap()
+            .timeout()
+            .copied()
+    };
+    assert_eq!(timeout(&agent), None);
+    unsafe { std::env::set_var(vars[0], "12") };
+    assert_eq!(timeout(&agent), Some(Duration::from_secs(12)));
+    configure_local_openai_agent(&mut agent, "http://localhost".to_string());
+    assert_eq!(timeout(&agent), None);
+    unsafe { std::env::set_var(vars[1], "86400") };
+    assert_eq!(timeout(&agent), Some(Duration::from_secs(86400)));
+    for local in [false, true] {
+        let var = vars[usize::from(local)];
+        for value in ["", "invalid", "-1", "1.5", "86401", "18446744073709551615"] {
+            unsafe { std::env::set_var(var, value) };
+            let error = provider_total_request_timeout(local).unwrap_err();
+            assert!(error.to_string().contains(var), "{error}");
+        }
+        unsafe { std::env::set_var(var, "0") };
+        assert_eq!(provider_total_request_timeout(local).unwrap(), None);
+    }
+    assert_eq!(timeout(&agent), None);
+    unsafe { std::env::set_var(vars[1], "invalid") };
+    assert!(agent.provider_post("http://localhost/test").is_err());
+    for (var, value) in vars.into_iter().zip(old_values) {
+        restore_env_var(var, value);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
+    for mode in ["headers", "json", "sse", "error"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (mut agent, request) = {
+            let _guard = env_lock();
+            let mut agent = test_agent(Path::new("."));
+            agent.quiet_stream_events = true;
+            let request = agent
+                .provider_post(format!("http://{address}"))
+                .unwrap()
+                .timeout(Duration::from_millis(250));
+            (agent, request)
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let chunks_sent = Arc::new(AtomicUsize::new(0));
+        let server_chunks = Arc::clone(&chunks_sent);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) => request.extend_from_slice(&buffer[..count]),
+                }
+            }
+            if mode == "headers" {
+                std::thread::sleep(Duration::from_millis(600));
+                return;
+            }
+            let status = if mode == "error" {
+                "500 Internal Server Error"
+            } else {
+                "200 OK"
+            };
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            let chunk = if mode == "sse" {
+                ": keepalive\n\n"
+            } else {
+                " "
+            };
+            let frame = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+            while Instant::now() < deadline && !server_stop.load(Ordering::SeqCst) {
+                if stream.write_all(frame.as_bytes()).is_err() {
+                    return;
+                }
+                server_chunks.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let response = send_provider_request(request, Duration::from_secs(2)).await;
+        let error = if mode == "headers" {
+            response.unwrap_err()
+        } else {
+            let response = response.expect("headers arrive before total timeout");
+            if mode == "sse" {
+                agent
+                    .read_provider_stream(response, RequestContract::OpenAiChatCompletions)
+                    .await
+                    .unwrap_err()
+            } else if mode == "error" {
+                assert_eq!(response.status().as_u16(), 500);
+                read_provider_error_body(response, Duration::from_secs(2))
+                    .await
+                    .unwrap_err()
+            } else {
+                read_provider_json_body(response, Duration::from_secs(2))
+                    .await
+                    .unwrap_err()
+            }
+        };
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            error.to_string().contains("total request timeout"),
+            "{mode}: {error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "{mode}");
+        if mode != "headers" {
+            assert!(chunks_sent.load(Ordering::SeqCst) > 1, "{mode}: no trickle");
+        }
+        server.join().unwrap();
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn provider_body_reader_enforces_idle_timeout_after_headers() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
