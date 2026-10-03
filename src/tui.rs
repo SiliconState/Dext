@@ -7663,6 +7663,7 @@ fn insert_transcript_items<B: Backend>(
 struct ReplayBackend<B> {
     inner: B,
     resetting: bool,
+    replay_size: Option<ratatui::layout::Size>,
 }
 
 impl<B> ReplayBackend<B> {
@@ -7670,6 +7671,7 @@ impl<B> ReplayBackend<B> {
         Self {
             inner,
             resetting: false,
+            replay_size: None,
         }
     }
 }
@@ -7731,7 +7733,10 @@ impl<B: Backend> Backend for ReplayBackend<B> {
         }
     }
     fn size(&self) -> Result<ratatui::layout::Size, B::Error> {
-        self.inner.size()
+        match self.replay_size {
+            Some(size) => Ok(size),
+            None => self.inner.size(),
+        }
     }
     fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, B::Error> {
         self.inner.window_size()
@@ -7760,21 +7765,44 @@ fn reset_transcript_viewport<B: Backend>(
     terminal.backend_mut().flush()
 }
 
+fn with_transcript_replay_geometry<B: Backend>(
+    terminal: &mut Terminal<ReplayBackend<B>>,
+    state: &mut TuiState,
+    width: u16,
+    replay: impl FnOnce(&mut Terminal<ReplayBackend<B>>, &mut TuiState, u16) -> Result<(), B::Error>,
+) -> Result<(), B::Error> {
+    let size = terminal.size()?;
+    if size.width == 0
+        || size.height == 0
+        || width == 0
+        || transcript_pane_width(size.width, size.height, state) != width
+    {
+        state.transcript_needs_rebuild = true;
+        return Ok(());
+    }
+    // Once clear/purge begins, a later OS resize must not defer the paired replay.
+    terminal.backend_mut().replay_size = Some(size);
+    let result = replay(terminal, state, width);
+    terminal.backend_mut().replay_size = None;
+    if result.is_err() {
+        state.transcript_needs_rebuild = true;
+    }
+    result
+}
+
 #[cfg(test)]
 fn rebuild_transcript_from_origin(
     terminal: &mut Terminal<ReplayBackend<ratatui::backend::TestBackend>>,
     state: &mut TuiState,
     width: u16,
 ) -> Result<(), std::convert::Infallible> {
-    if transcript_chunk_rows(terminal, state, width)?.is_none() {
-        state.transcript_needs_rebuild = true;
-        return Ok(());
-    }
-    reset_transcript_viewport(terminal)?;
-    let size = terminal.size()?;
-    // A fresh test surface models the production clear-then-scrollback-purge sequence.
-    terminal.backend_mut().inner = ratatui::backend::TestBackend::new(size.width, size.height);
-    rebuild_transcript(terminal, state, width)
+    with_transcript_replay_geometry(terminal, state, width, |terminal, state, width| {
+        reset_transcript_viewport(terminal)?;
+        let size = terminal.size()?;
+        // A fresh test surface models the production clear-then-scrollback-purge sequence.
+        terminal.backend_mut().inner = ratatui::backend::TestBackend::new(size.width, size.height);
+        rebuild_transcript(terminal, state, width)
+    })
 }
 
 fn purge_and_rebuild_transcript_inner<W: Write>(
@@ -7782,16 +7810,14 @@ fn purge_and_rebuild_transcript_inner<W: Write>(
     state: &mut TuiState,
     width: u16,
 ) -> io::Result<()> {
-    if transcript_chunk_rows(terminal, state, width)?.is_none() {
-        state.transcript_needs_rebuild = true;
-        return Ok(());
-    }
-    reset_transcript_viewport(terminal)?;
-    crossterm::execute!(
-        terminal.backend_mut().inner,
-        CrosstermClear(CrosstermClearType::Purge)
-    )?;
-    rebuild_transcript(terminal, state, width)
+    with_transcript_replay_geometry(terminal, state, width, |terminal, state, width| {
+        reset_transcript_viewport(terminal)?;
+        crossterm::execute!(
+            terminal.backend_mut().inner,
+            CrosstermClear(CrosstermClearType::Purge)
+        )?;
+        rebuild_transcript(terminal, state, width)
+    })
 }
 
 fn purge_and_rebuild_transcript<W: Write>(
@@ -11771,6 +11797,79 @@ mod tests {
                 Some(10)
             );
         }
+    }
+
+    #[test]
+    fn transcript_replay_geometry_survives_resize_after_reset() {
+        let mut terminal = replay_probe_terminal();
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.transcript.push(Line_::Assistant {
+            text: "history survives".to_string(),
+            dim_prefix: false,
+        });
+        let width = current_transcript_pane_width(&mut terminal, &state).unwrap();
+        with_transcript_replay_geometry(
+            &mut terminal,
+            &mut state,
+            width,
+            |terminal, state, width| {
+                reset_transcript_viewport(terminal)?;
+                // The OS size changes between display reset and the first replay chunk.
+                terminal.backend_mut().inner.inner.resize(40, 10);
+                rebuild_transcript(terminal, state, width)
+            },
+        )
+        .unwrap();
+        assert!(terminal.backend().replay_size.is_none());
+        assert_eq!(terminal.size().unwrap(), ratatui::layout::Size::new(40, 10));
+        assert_eq!(state.transcript_rendered_width, width);
+        assert!(!state.transcript_needs_rebuild);
+        let rendered = terminal
+            .backend()
+            .inner
+            .inner
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("history survives"), "{rendered}");
+        let changed_width = current_transcript_pane_width(&mut terminal, &state).unwrap();
+        assert!(transcript_requires_rebuild(&state, changed_width));
+    }
+
+    #[test]
+    fn transcript_replay_geometry_releases_snapshot_after_failure_or_deferral() {
+        let mut terminal = replay_probe_terminal();
+        let mut state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        let width = current_transcript_pane_width(&mut terminal, &state).unwrap();
+        let result =
+            with_transcript_replay_geometry(&mut terminal, &mut state, width, |terminal, _, _| {
+                terminal.backend_mut().inner.inner.resize(20, 10);
+                Err(io::Error::other("injected replay failure"))
+            });
+        assert!(result.is_err());
+        assert!(terminal.backend().replay_size.is_none());
+        assert!(state.transcript_needs_rebuild);
+        assert_eq!(terminal.size().unwrap(), ratatui::layout::Size::new(20, 10));
+        with_transcript_replay_geometry(&mut terminal, &mut state, width, |_, _, _| {
+            panic!("stale geometry must defer before reset")
+        })
+        .unwrap();
+        assert!(terminal.backend().replay_size.is_none());
+        assert!(state.transcript_needs_rebuild);
     }
 
     #[test]
