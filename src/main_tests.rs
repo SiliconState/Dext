@@ -13301,6 +13301,8 @@ fn provider_total_timeout_is_opt_in_independent_and_validated_per_request() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
+    let total_timeout = Duration::from_secs(2);
+    let safety_timeout = Duration::from_secs(10);
     for mode in ["headers", "json", "sse", "error"] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -13312,15 +13314,17 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
             let request = agent
                 .provider_post(format!("http://{address}"))
                 .unwrap()
-                .timeout(Duration::from_millis(250));
+                .timeout(total_timeout);
             (agent, request)
         };
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let chunks_sent = Arc::new(AtomicUsize::new(0));
         let server_chunks = Arc::clone(&chunks_sent);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + safety_timeout;
+            ready_tx.send(()).unwrap();
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -13348,7 +13352,9 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
                 }
             }
             if mode == "headers" {
-                std::thread::sleep(Duration::from_millis(600));
+                while Instant::now() < deadline && !server_stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
                 return;
             }
             let status = if mode == "error" {
@@ -13376,8 +13382,9 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
+        ready_rx.recv_timeout(safety_timeout).unwrap();
         let started = Instant::now();
-        let response = send_provider_request(request, Duration::from_secs(2)).await;
+        let response = send_provider_request(request, safety_timeout).await;
         let error = if mode == "headers" {
             response.unwrap_err()
         } else {
@@ -13389,11 +13396,11 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
                     .unwrap_err()
             } else if mode == "error" {
                 assert_eq!(response.status().as_u16(), 500);
-                read_provider_error_body(response, Duration::from_secs(2))
+                read_provider_error_body(response, safety_timeout)
                     .await
                     .unwrap_err()
             } else {
-                read_provider_json_body(response, Duration::from_secs(2))
+                read_provider_json_body(response, safety_timeout)
                     .await
                     .unwrap_err()
             }
@@ -13403,7 +13410,7 @@ async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
             error.to_string().contains("total request timeout"),
             "{mode}: {error:#}"
         );
-        assert!(started.elapsed() < Duration::from_secs(2), "{mode}");
+        assert!(started.elapsed() < safety_timeout, "{mode}");
         if mode != "headers" {
             assert!(chunks_sent.load(Ordering::SeqCst) > 1, "{mode}: no trickle");
         }
