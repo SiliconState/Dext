@@ -4,6 +4,8 @@
 
 ### Added
 
+- Optional independent cloud/local total provider-request deadlines (`DEXT_PROVIDER_TOTAL_TIMEOUT_SECS` and `DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS`), disabled by default, bound inference and compaction HTTP attempts through body completion even when peers keep trickling chunks. Invalid settings fail before sending; retries get fresh budgets rather than a whole-turn limit.
+
 - `dext --input ndjson --output stream-json`: a long-lived host protocol over stdin/stdout (`user`/`steer`/`control`/`interrupt`/`permission`/`ui.capabilities`/`ui.response`/`close` frames, `ready` before input processing, one `input_ack` per frame, per-action `permission_request`/`permission_resolved`, stdout pure JSON). Bounded: 256 KiB per frame, 32 shared pending prompt/steering/control slots, an 8-entry permission channel, and one matching pending UI response; EOF or `close` drains accepted prompts and ends the process. Optional host-advertised UI methods let approved pack runtimes issue bounded, privacy-redacted `ui.request` events and consume correlated structured responses through the same one-shot protocol, without a DextUI dependency or core widget registry. Startup approvals and UI requests fail closed before the reader is available; incompatible one-shot flags fail without reading stdin. Spec in `docs/HOST_PROTOCOL.md`.
 - `--resume` restores the saved `session_id`, so session-scoped state (todos, git-auth, logs) survives process restarts for one-shot hosts.
 - `dext auth login <provider>` reads the credential from stdin when it is not a TTY (keeps secrets off argv); `dext auth status|providers|models --json`.
@@ -64,8 +66,11 @@
   so padded auth headers and typed/query values are not misclassified.
 - Upgraded the terminal stack to exact Ratatui 0.30.2, ratatui-core 0.1.2,
   tui-markdown 0.3.8, Crossterm 0.29.0, and unicode-width 0.2.2 versions.
-  Dext carries a narrow exact-source ratatui-core compatibility patch for its
-  inline viewport; the real-PTY suite now starts each child with a controlling
+  Dext now uses unmodified upstream core and Crossterm backend at revision
+  `7767679c138b383933fef4227e7fbf077b7cfeca`, including merged cursor-save and
+  inline-resize fixes, instead of vendored source. Transcript reset/replay stays
+  in Dext through public APIs. The mandatory workspace-core test gate is replaced
+  by Dext TUI integration tests. The real-PTY suite starts each child with a controlling
   terminal and gates streaming input, populated resize bursts, whole-screen
   clears, cursor-query counts, replay bounds, and a bounded completion wait
   that tolerates slower macOS CI hosts.

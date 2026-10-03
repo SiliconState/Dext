@@ -134,9 +134,11 @@ Credentials are stored in Dext state, not in the repository. Do not commit proje
 
 The built-in GLM catalog includes `glm-5.3-flash` and the Coding Plan spelling `glm-5.3-flash[1m]`. Both declare a 1,000,000-token context window, a 131,072-token output limit, model-specific multimodal capability metadata, stable list pricing, and `low`/`high`/`max` reasoning metadata. Vision-capable models expose the explicit `read_image(path)` tool described below; text-only models receive a local capability error rather than a malformed multimodal request. They remain on Dext's ZAI Anthropic-compatible route and always send enabled thinking: Dext Off/Minimal/Low map to `low`, Medium/High to `high`, and XHigh/Max to `max`. Compaction summaries use enabled low-effort thinking because this model rejects thinking-disabled requests. The GLM 5.2 variants retain their existing 1M context metadata and remain the default.
 
+GPT-6.1 Sol is available as `gpt-6.1-sol` (alias `gpt61sol`) on both providers: `/model openai/gpt-6.1-sol` selects Platform API authentication; `/model chatgpt/gpt-6.1-sol` retains ChatGPT authentication. Provider defaults and credentials are unchanged. The model supports text/image input, 1,050,000 context tokens, 922,000 maximum input tokens, and 128,000 output tokens. Dext retains its existing compaction budgeting; the separate input ceiling is provider-enforced. Supported efforts are low/medium/high/xhigh/max; Minimal maps to low and Off omits reasoning, leaving the provider default active rather than disabling it. Tool calling requires Responses: custom Chat Completions routes reject tool-bearing requests instead of sending unsupported tools or `none` effort. Main and summary requests omit GPT-5.6 reasoning mode. Standard input/cached-input/cache-write/output prices are $2/$0.10/$2.50/$10 per million tokens, with the documented >272K long-context multipliers. Fast/regional/batch/flex pricing is not automatically inferred. Sources checked September 30, 2026: [OpenAI model reference](https://developers.openai.com/api/docs/models/gpt-6.1-sol) and [Codex models](https://developers.openai.com/codex/models).
+
 The built-in ChatGPT and OpenAI API catalogs include `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` alongside `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; OpenAI also retains the official unsuffixed `gpt-5.6` Sol id, while ChatGPT normalizes it to `gpt-5.6-sol`. GPT-6 shorthands are `gpt6astra`, `gpt6sol`, and `gpt6luna`; GPT-5.6 shorthands remain `gpt56`/`gpt56sol`, `gpt56terra`, and `gpt56luna`. Every listed GPT-6 and GPT-5.6 variant declares a 1,050,000-token context window and 128,000-token output metadata.
 
-On the official API-key `openai` provider at `api.openai.com`, the three listed GPT-6 ids and four listed GPT-5.6 ids use `/v1/responses`; unknown suffixes do not silently inherit that route. GPT-6 Sol and Luna advertise `none`, `low`, `medium`, `high`, `xhigh`, and native `max` effort; Astra advertises `low` through `max`, so Dext Off omits its reasoning object rather than sending an unsupported `none`. If a custom endpoint keeps Sol or Luna on Chat Completions, tool-bearing requests force `reasoning_effort:none` as required by the model contract; tool-free requests retain the selected supported effort and use `max_completion_tokens`. GPT-5.6 keeps its existing `none` through `max` effort and independent Standard/Pro execution mode. Normal requests and compaction summaries use the selected model's resolved effort metadata and `max_output_tokens`; only GPT-5.6 sends `reasoning.mode`. Function tools use the flat Responses shape with `strict:false`, and tool-bearing stateless requests ask the provider for opaque `reasoning.encrypted_content` so Dext can replay it within the current tool turn. Content-filter terminals discard visible output, function calls, and opaque reasoning state instead of replaying it. `DEXT_COMPACT_MODEL` is normalized through the active provider; its request contract, reasoning capability, effort levels, mode, and usage pricing are based on the resolved summary model rather than the main conversation model.
+On the official API-key `openai` provider at `api.openai.com`, the three listed GPT-6 ids and four listed GPT-5.6 ids use `/v1/responses`; unknown suffixes do not silently inherit that route. GPT-6 Sol and Luna advertise `none`, `low`, `medium`, `high`, `xhigh`, and native `max` effort; Astra advertises `low` through `max`, so Dext Off omits its reasoning object rather than sending an unsupported `none`. If a custom endpoint keeps Sol or Luna on Chat Completions, tool-bearing requests force `reasoning_effort:none` as required by the model contract; tool-free requests retain the selected supported effort and use `max_completion_tokens`. GPT-5.6 keeps its existing `none` through `max` effort and independent Standard/Pro execution mode. Normal requests and compaction summaries use the selected model's resolved effort metadata and `max_output_tokens`; only GPT-5.6 sends `reasoning.mode`. Function tools use the flat Responses shape with `strict:false`, and tool-bearing stateless requests on the official OpenAI route request opaque `reasoning.encrypted_content` even at Off so Dext can replay it within the current tool turn. Custom Responses routes do not inherit that include flag. GPT-6 fallback efforts remain valid without custom per-model metadata, and GPT-6.1 Sol's Chat Completions tool guard is case-insensitive. Content-filter terminals discard visible output, function calls, and opaque reasoning state instead of replaying it. `DEXT_COMPACT_MODEL` is normalized through the active provider; its request contract, reasoning capability, effort levels, mode, and usage pricing are based on the resolved summary model rather than the main conversation model.
 
 The OAuth-backed `chatgpt` provider remains on the Codex Responses contract. Catalog metadata advertises the documented GPT-6 efforts, including native `max`; GPT-5.6 retains `none`, `low`, `medium`, `high`, and `xhigh`, with Dext `max` mapping to `xhigh`. Dext does not send the Platform-only GPT-5.6 `reasoning.mode` or any `max_output_tokens` field to that backend. A selected reasoning mode remains visible but inactive after switching to ChatGPT, GPT-6, a non-GPT-5.6 model, a custom endpoint, or any other provider.
 
@@ -189,7 +191,7 @@ Start Dext:
 dext
 ```
 
-Planning is conversational, not a mode. Ask for a plan (“plan the refactor”, “review this for bugs, don’t change anything”) and Dext applies an advisory-only turn policy: read-only tools and a structured Goal/Findings/Steps/Risks answer. Revise the plan in the same thread, then approve it (“go”, “proceed with the plan”) and Dext converts the agreed steps into todos and executes them. The policy steers the model; approval prompts and `/sandbox-profile read-only` remain the hard enforcement layers.
+Planning is conversational, not a mode. A request for a plan or an explicit hold-off (“review this for bugs, don’t change anything”) adds advisory guidance; merely mentioning review or analysis does not lock the turn. Requested read-only documentation research remains available under ordinary tool permissions. Direct implementation requests, including “review and configure”, proceed without a second conversational approval. Approvals such as “Sure go. Also review the process” remain approvals even with additional instructions, including when queued during work. Dext records agreed steps as todos and executes them. Advisory guidance does not impose an answer template or override clear user authorization; actual tool permissions and `/sandbox-profile read-only` remain the enforcement layers. Classification preserves multiline approval boundaries and ignores quoted command text. Global hold-offs (“go, but no changes yet”) override approvals without overriding scoped requests (“fix it but don’t change anything else”). Polite implementation requests (“Can you configure the model?”) work identically in normal input and queued steering; advice questions alone do not authorize edits.
 
 Useful slash commands:
 
@@ -223,7 +225,7 @@ Useful slash commands:
 
 The interactive interface uses an inline Ratatui viewport in the regular terminal buffer, preserving native scrollback. Enter submits; Shift+Enter or Alt+Enter inserts a newline; Ctrl+D quits; `?` opens the complete keymap when the input is empty. Input remains editable while a turn streams.
 
-Dext pins the terminal stack exactly and carries a narrow vendored `ratatui-core` compatibility patch to avoid synchronous cursor-query stalls and whole-display clears during inline resize. See [`TUI.md`](TUI.md) for the behavior contract, dependency versions, regression coverage, and patch maintenance procedure.
+Dext pins the terminal stack and uses unmodified upstream Ratatui core and Crossterm backend at revision `7767679c138b383933fef4227e7fbf077b7cfeca`, containing the merged cursor-save and inline-resize fixes. There is no vendored dependency source; transcript reset/replay uses a Dext-owned backend adapter and public Ratatui APIs. See [`TUI.md`](TUI.md) for the behavior contract, source-pin tradeoff, regression coverage, and release migration procedure.
 
 ## One-shot and automation
 
@@ -497,6 +499,11 @@ DEXT_API_KEY=...
 DEXT_PROVIDER_CONNECT_TIMEOUT_SECS=15
 DEXT_PROVIDER_FIRST_BYTE_TIMEOUT_SECS=180
 DEXT_PROVIDER_STREAM_IDLE_TIMEOUT_SECS=90
+# Optional total time per inference/compaction HTTP attempt, including body reads.
+# Independent cloud/local settings; unset or 0 disables. Range: 0..86400 seconds.
+# Invalid values reject the request. Retries get fresh budgets; not a turn deadline.
+DEXT_PROVIDER_TOTAL_TIMEOUT_SECS=0
+DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS=0
 # ChatGPT/Codex only: model to switch to when a codex implementation model
 # stalls on repeated no-mutation turns (default: the provider's default model).
 DEXT_IMPL_FALLBACK_MODEL=gpt-5.4
@@ -585,7 +592,7 @@ DEXT_EVAL_TIMEOUT_SECS=15
 cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
-cargo test -p ratatui-core --lib --locked
+cargo test --release --locked --bin dext tui::tests::
 cargo build --release --locked
 cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture

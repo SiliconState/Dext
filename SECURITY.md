@@ -64,7 +64,7 @@ cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
 cargo deny check licenses
-cargo test -p ratatui-core --lib --locked
+cargo test --release --locked --bin dext tui::tests::
 cargo build --release --locked
 cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture

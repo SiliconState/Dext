@@ -380,7 +380,9 @@ pub(crate) fn normalize_price_model(model: &str) -> String {
 }
 
 pub(crate) fn openai_pricing(model: &str) -> Option<UsagePricing> {
-    if model == "gpt-6-astra" {
+    if model == "gpt-6.1-sol" {
+        Some(UsagePricing::new(2.0, 10.0, 0.1, 2.5))
+    } else if model == "gpt-6-astra" {
         Some(UsagePricing::new(10.0, 50.0, 1.0, 12.5))
     } else if model == "gpt-6-sol" {
         Some(UsagePricing::new(2.0, 10.0, 0.2, 2.5))

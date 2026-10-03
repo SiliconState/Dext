@@ -42,6 +42,9 @@ use crate::{
 };
 
 const INPUT_HISTORY_MAX: usize = 200;
+const PATH_SCAN_LIMIT: usize = 20_000;
+const PATH_RESULT_LIMIT: usize = 100;
+const PATH_DEPTH_LIMIT: usize = 16;
 const RENDER_CACHE_MAX_ENTRIES: usize = 2048;
 const RENDER_CACHE_MAX_WIDTHS_PER_ENTRY: usize = 2;
 const RENDER_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -329,6 +332,14 @@ enum ToTui {
         todos: Vec<TodoItem>,
     },
     ResumeLoadFailed(String),
+    RootChanged(PathBuf),
+    PathChoices {
+        request_id: u64,
+        root: PathBuf,
+        directory: PathBuf,
+        choices: Vec<PathChoice>,
+        truncated: bool,
+    },
     ResumeChoices {
         request_id: u64,
         result: std::result::Result<Vec<ResumeChoice>, String>,
@@ -445,6 +456,198 @@ struct ResumePicker {
     choices: Vec<ResumeChoice>,
     selected: usize,
     scroll: usize,
+}
+
+struct PathChoice {
+    path: PathBuf,
+    directory: bool,
+}
+
+struct PathPicker {
+    root: PathBuf,
+    directory: PathBuf,
+    request_id: u64,
+    loading: bool,
+    scan_started: bool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    truncated: bool,
+    choices: Vec<PathChoice>,
+    matches: Vec<usize>,
+    match_count: usize,
+    query: String,
+    selected: usize,
+    scroll: usize,
+}
+
+fn path_within_picker_root(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for part in relative.components() {
+        current.push(part);
+        if !current
+            .symlink_metadata()
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+        {
+            return false;
+        }
+    }
+    path.canonicalize()
+        .is_ok_and(|resolved| resolved.starts_with(root))
+}
+
+fn path_query_label(path: &Path) -> Option<Cow<'_, str>> {
+    let label = path.to_str()?;
+    #[cfg(windows)]
+    {
+        Some(Cow::Owned(label.replace('\\', "/")))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(Cow::Borrowed(label))
+    }
+}
+
+fn scan_paths(
+    root: &Path,
+    directory: &Path,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> (Vec<PathChoice>, bool) {
+    let mut found = Vec::new();
+    let mut visited = 0;
+    let mut pending = VecDeque::from([(directory.to_path_buf(), 0)]);
+    let mut truncated = false;
+    while let Some((current, depth)) = pending.pop_front() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        if !path_within_picker_root(root, &current) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            if visited >= PATH_SCAN_LIMIT {
+                truncated = true;
+                break;
+            }
+            visited += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() || !(kind.is_dir() || kind.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.chars().any(|ch| {
+                ch.is_control()
+                    || is_bidi_format_control(ch)
+                    || matches!(ch, '\u{2028}' | '\u{2029}')
+            }) || path.as_os_str().len() > 4096
+            {
+                continue;
+            }
+            if kind.is_dir()
+                && depth < PATH_DEPTH_LIMIT
+                && !name.starts_with('.')
+                && !matches!(name, "target" | "node_modules" | ".git")
+            {
+                pending.push_back((path.clone(), depth + 1));
+            } else if kind.is_dir() && depth >= PATH_DEPTH_LIMIT {
+                truncated = true;
+            }
+            found.push(PathChoice {
+                path,
+                directory: kind.is_dir(),
+            });
+        }
+        if truncated && visited >= PATH_SCAN_LIMIT {
+            break;
+        }
+    }
+    if !cancelled.load(Ordering::Relaxed) {
+        found.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    }
+    (found, truncated)
+}
+
+impl Drop for PathPicker {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+fn fuzzy_path_score(path: &str, query: &str) -> Option<i64> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let path = path.to_lowercase();
+    let query = query.to_lowercase();
+    let mut wanted = query.chars();
+    let mut next = wanted.next()?;
+    let mut score = 0;
+    let mut previous = None;
+    let mut last_match: Option<usize> = None;
+    for (index, ch) in path.chars().enumerate() {
+        if ch == next {
+            score += 10;
+            if previous.is_none_or(|c| matches!(c, '/' | '_' | '-' | '.')) {
+                score += 8;
+            }
+            if last_match.is_some_and(|last| last + 1 == index) {
+                score += 5;
+            }
+            last_match = Some(index);
+            if let Some(ch) = wanted.next() {
+                next = ch;
+            } else {
+                return Some(score - index as i64 / 8);
+            }
+        }
+        previous = Some(ch);
+    }
+    None
+}
+
+impl PathPicker {
+    fn filter(&mut self) {
+        let mut ranked: Vec<_> = self
+            .choices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, choice)| {
+                let path = choice.path.strip_prefix(&self.directory).ok()?;
+                let label = path_query_label(path)?;
+                let score = fuzzy_path_score(&label, &self.query)?;
+                let top = path.components().next()?.as_os_str().to_string_lossy();
+                let generated =
+                    top.starts_with('.') || matches!(top.as_ref(), "target" | "node_modules");
+                Some((index, score, generated, path.components().count()))
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| (a.2, a.3).cmp(&(b.2, b.3)))
+                .then_with(|| self.choices[a.0].path.cmp(&self.choices[b.0].path))
+        });
+        self.match_count = ranked.len();
+        ranked.truncate(PATH_RESULT_LIMIT);
+        self.matches = ranked.into_iter().map(|(index, _, _, _)| index).collect();
+        self.selected = 0;
+        self.scroll = 0;
+    }
 }
 
 struct SlashCmd {
@@ -1342,6 +1545,8 @@ struct TuiState {
     resume_loading: bool,
     resume_request_id: u64,
     resume_picker: Option<ResumePicker>,
+    path_picker: Option<PathPicker>,
+    path_request_id: u64,
     show_todos: bool,
     todo_items: Vec<TodoItem>,
     todo_scroll: usize,
@@ -1481,6 +1686,8 @@ impl TuiState {
             resume_loading: false,
             resume_request_id: 0,
             resume_picker: None,
+            path_picker: None,
+            path_request_id: 0,
             show_todos: false,
             todo_items: Vec::new(),
             todo_scroll: 0,
@@ -2695,6 +2902,7 @@ impl TuiState {
                 self.queue(Line_::LocalAuth { tool, message });
             }
             AgentEvent::LoginInputMode { provider } => {
+                self.path_picker = None;
                 self.clear_login_input();
                 clear_secret_string(&mut self.input);
                 self.cursor = 0;
@@ -7452,41 +7660,148 @@ fn insert_transcript_items<B: Backend>(
     flush_prepared_transcript(terminal, &mut chunk, render_width, &mut chunk_height)
 }
 
+struct ReplayBackend<B> {
+    inner: B,
+    resetting: bool,
+}
+
+impl<B> ReplayBackend<B> {
+    fn new(inner: B) -> Self {
+        Self {
+            inner,
+            resetting: false,
+        }
+    }
+}
+
+impl<B: Backend> Backend for ReplayBackend<B> {
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), B::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, n: u16) -> Result<(), B::Error> {
+        if self.resetting {
+            Ok(())
+        } else {
+            self.inner.append_lines(n)
+        }
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), B::Error> {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> Result<(), B::Error> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, B::Error> {
+        if self.resetting {
+            Ok(ratatui::layout::Position::ORIGIN)
+        } else {
+            self.inner.get_cursor_position()
+        }
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> Result<(), B::Error> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn save_cursor_position(&mut self) -> Result<bool, B::Error> {
+        self.inner.save_cursor_position()
+    }
+    fn restore_cursor_position(&mut self) -> Result<(), B::Error> {
+        self.inner.restore_cursor_position()
+    }
+    fn clear(&mut self) -> Result<(), B::Error> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> Result<(), B::Error> {
+        if self.resetting && clear_type == ratatui::backend::ClearType::AfterCursor {
+            Ok(())
+        } else {
+            self.inner.clear_region(clear_type)
+        }
+    }
+    fn size(&self) -> Result<ratatui::layout::Size, B::Error> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, B::Error> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> Result<(), B::Error> {
+        self.inner.flush()
+    }
+}
+
+fn reset_transcript_viewport<B: Backend>(
+    terminal: &mut Terminal<ReplayBackend<B>>,
+) -> Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.set_cursor_position(ratatui::layout::Position::ORIGIN)?;
+    terminal
+        .backend_mut()
+        .clear_region(ratatui::backend::ClearType::All)?;
+    // After the owned display clear, resize can reanchor at the known origin without
+    // querying the input reader or appending reservation lines into scrollback.
+    terminal.backend_mut().resetting = true;
+    let resized = terminal.resize(size.into());
+    terminal.backend_mut().resetting = false;
+    resized?;
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    terminal.backend_mut().flush()
+}
+
 #[cfg(test)]
-fn rebuild_transcript_from_origin<B: Backend>(
-    terminal: &mut Terminal<B>,
+fn rebuild_transcript_from_origin(
+    terminal: &mut Terminal<ReplayBackend<ratatui::backend::TestBackend>>,
     state: &mut TuiState,
     width: u16,
-) -> Result<(), B::Error> {
-    terminal.reset_inline_viewport()?;
+) -> Result<(), std::convert::Infallible> {
+    if transcript_chunk_rows(terminal, state, width)?.is_none() {
+        state.transcript_needs_rebuild = true;
+        return Ok(());
+    }
+    reset_transcript_viewport(terminal)?;
+    let size = terminal.size()?;
+    // A fresh test surface models the production clear-then-scrollback-purge sequence.
+    terminal.backend_mut().inner = ratatui::backend::TestBackend::new(size.width, size.height);
     rebuild_transcript(terminal, state, width)
 }
 
 fn purge_and_rebuild_transcript_inner<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
+    terminal: &mut Terminal<ReplayBackend<CrosstermBackend<W>>>,
     state: &mut TuiState,
     width: u16,
 ) -> io::Result<()> {
-    if renderable_transcript_chunk_rows(terminal, state, width)?.is_none() {
+    if transcript_chunk_rows(terminal, state, width)?.is_none() {
         state.transcript_needs_rebuild = true;
         return Ok(());
     }
-    terminal.reset_inline_viewport()?;
+    reset_transcript_viewport(terminal)?;
     crossterm::execute!(
-        terminal.backend_mut(),
+        terminal.backend_mut().inner,
         CrosstermClear(CrosstermClearType::Purge)
     )?;
     rebuild_transcript(terminal, state, width)
 }
 
 fn purge_and_rebuild_transcript<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
+    terminal: &mut Terminal<ReplayBackend<CrosstermBackend<W>>>,
     state: &mut TuiState,
     width: u16,
 ) -> io::Result<()> {
-    crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    crossterm::execute!(terminal.backend_mut().inner, BeginSynchronizedUpdate)?;
     let rebuild = purge_and_rebuild_transcript_inner(terminal, state, width);
-    let end = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    let end = crossterm::execute!(terminal.backend_mut().inner, EndSynchronizedUpdate);
     rebuild.and(end)
 }
 
@@ -7540,10 +7855,18 @@ fn renderable_transcript_chunk_rows<B: Backend>(
     state: &TuiState,
     expected_width: u16,
 ) -> Result<Option<u16>, B::Error> {
-    if expected_width == 0 {
+    if transcript_chunk_rows(terminal, state, expected_width)?.is_none() {
         return Ok(None);
     }
     terminal.autoresize()?;
+    transcript_chunk_rows(terminal, state, expected_width)
+}
+
+fn transcript_chunk_rows<B: Backend>(
+    terminal: &Terminal<B>,
+    state: &TuiState,
+    expected_width: u16,
+) -> Result<Option<u16>, B::Error> {
     let size = terminal.size()?;
     let current_width = transcript_pane_width(size.width, size.height, state);
     if size.width == 0 || size.height == 0 || current_width == 0 || current_width != expected_width
@@ -7905,6 +8228,7 @@ fn queue_permission_request(
     state.show_todos = false;
     state.resume_picker_requested = false;
     state.resume_picker = None;
+    state.path_picker = None;
     state.status = "thinking".to_string();
     if let Some(previous) = state.pending_perm.take() {
         state.queue(Line_::PermissionResult {
@@ -7939,6 +8263,7 @@ fn queue_local_auth_secret_request(
     state.show_todos = false;
     state.resume_picker_requested = false;
     state.resume_picker = None;
+    state.path_picker = None;
     if let Some(pending) = previous {
         let _ = pending.responder.send(LocalAuthSecret::Canceled);
     }
@@ -8038,6 +8363,109 @@ fn resume_choices(
     Ok(choices)
 }
 
+fn render_path_picker(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect) {
+    let Some(picker) = state.path_picker.as_mut() else {
+        return;
+    };
+    let rect = centered_rect(area, 80, area.height.min(12));
+    if rect.width < 12 || rect.height < 5 {
+        return;
+    }
+    let visible = rect.height.saturating_sub(4) as usize;
+    let selected = picker.selected.min(picker.matches.len().saturating_sub(1));
+    picker.selected = selected;
+    if selected < picker.scroll {
+        picker.scroll = selected;
+    } else if selected >= picker.scroll + visible {
+        picker.scroll = selected + 1 - visible;
+    }
+    let progress = if picker.loading {
+        " · scanning…".to_string()
+    } else {
+        format!(
+            " · {}/{}{}",
+            picker.matches.len(),
+            picker.match_count,
+            if picker.truncated {
+                " · scan limited"
+            } else {
+                ""
+            }
+        )
+    };
+    let query = clamp_chars(
+        &sanitize_display_text(&picker.query),
+        (rect.width as usize).saturating_sub(8 + text_width(&progress)),
+    );
+    let mut lines = vec![Line::from(format!(" find: {query}{progress}"))];
+    lines.push(Line::from(format!(
+        " in: {}",
+        truncate_path_for_cells(
+            &single_line_display_text(
+                &path_query_label(
+                    picker
+                        .directory
+                        .strip_prefix(&picker.root)
+                        .unwrap_or(Path::new(".")),
+                )
+                .unwrap_or_else(|| picker.directory.to_string_lossy()),
+            ),
+            rect.width.saturating_sub(7) as usize,
+        )
+    )));
+    if picker.matches.is_empty() && !picker.loading {
+        lines.push(Line::from(" no matches · Left to go up"));
+    }
+    for (row, &index) in picker
+        .matches
+        .iter()
+        .enumerate()
+        .skip(picker.scroll)
+        .take(visible)
+    {
+        let choice = &picker.choices[index];
+        let relative = choice
+            .path
+            .strip_prefix(&picker.directory)
+            .unwrap_or(&choice.path);
+        let label = path_query_label(relative).unwrap_or_else(|| relative.to_string_lossy());
+        let label = sanitize_display_text(&label);
+        let label = truncate_path_for_cells(&label, rect.width.saturating_sub(6) as usize);
+        let text = format!(
+            " {} {}{}",
+            if row == selected { '▸' } else { ' ' },
+            label,
+            if choice.directory { "/" } else { "" }
+        );
+        let style = if row == selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    let footer = format!(
+        " Enter insert · → browse · ← parent · Esc cancel{} ",
+        if picker.truncated {
+            " · scan limited"
+        } else {
+            ""
+        }
+    );
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" project paths ")
+            .title_bottom(Span::styled(
+                clamp_chars(&footer, rect.width.saturating_sub(2) as usize),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    render_widget_safe(frame, Clear, rect);
+    render_widget_safe(frame, widget, rect);
+}
+
 fn render_resume_picker(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect) {
     let Some(picker) = state.resume_picker.as_mut() else {
         return;
@@ -8125,6 +8553,7 @@ fn help_overlay_text(width: u16) -> Text<'static> {
         ("Shift+Enter / Alt+Enter", "insert newline"),
         ("Ctrl+B", "open backend output viewer while bash runs"),
         ("Ctrl+L", "show the current todo list (read-only)"),
+        ("Ctrl+P", "find a project path and insert it into the draft"),
         ("Ctrl+O", "toggle last tool output"),
         ("Ctrl+T", "toggle token/status details"),
         ("Paste", "multi-line paste is inserted without auto-submit"),
@@ -8636,8 +9065,37 @@ fn apply_tui_message(state: &mut TuiState, msg: ToTui) {
             state.git_epoch = state.git_epoch.wrapping_add(1);
             state.sandbox = root.display().to_string();
             state.sandbox_path = root;
+            state.path_picker = None;
             state.apply_git_branch_refresh(git);
             state.set_todo_items(todos);
+        }
+        ToTui::RootChanged(root) => {
+            state.sandbox = root.display().to_string();
+            state.sandbox_path = root;
+            state.path_picker = None;
+            state.git_epoch = state.git_epoch.wrapping_add(1);
+            state.git_branch_refreshed = None;
+            state.git_refresh_in_flight = false;
+            state.git_branch = None;
+        }
+        ToTui::PathChoices {
+            request_id,
+            root,
+            directory,
+            choices,
+            truncated,
+        } => {
+            if let Some(picker) = state.path_picker.as_mut()
+                && picker.request_id == request_id
+                && picker.root == root
+                && picker.directory == directory
+                && state.sandbox_path == root
+            {
+                picker.choices = choices;
+                picker.truncated = truncated;
+                picker.loading = false;
+                picker.filter();
+            }
         }
         ToTui::ResumeLoadFailed(error) => {
             state.resume_loading = false;
@@ -9124,6 +9582,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
         && !state.show_help
         && !state.show_todos
         && state.resume_picker.is_none()
+        && state.path_picker.is_none()
         && !state.resume_picker_requested
         && !state.resume_loading
         && input_area.width > 0
@@ -9139,6 +9598,12 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
 
     if state.show_todos && state.pending_local_auth.is_none() && state.pending_perm.is_none() {
         render_todo_overlay(frame, state, area);
+    }
+    if state.path_picker.is_some()
+        && state.pending_local_auth.is_none()
+        && state.pending_perm.is_none()
+    {
+        render_path_picker(frame, state, area);
     }
     if state.resume_picker.is_some()
         && state.pending_local_auth.is_none()
@@ -9158,6 +9623,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut TuiState) {
     if !state.show_help
         && !state.show_todos
         && state.resume_picker.is_none()
+        && state.path_picker.is_none()
         && !state.resume_picker_requested
         && !state.resume_loading
         && state.pending_local_auth.is_none()
@@ -9230,6 +9696,153 @@ fn local_auth_input_status(_state: &TuiState) -> String {
     "local auth input updated; Enter submits".to_string()
 }
 
+fn start_path_picker(state: &mut TuiState) {
+    state.path_request_id = state.path_request_id.wrapping_add(1);
+    let root = state.sandbox_path.clone();
+    state.show_help = false;
+    state.show_todos = false;
+    state.path_picker = Some(PathPicker {
+        directory: root.clone(),
+        root,
+        request_id: state.path_request_id,
+        loading: true,
+        scan_started: false,
+        cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        truncated: false,
+        choices: Vec::new(),
+        matches: Vec::new(),
+        match_count: 0,
+        query: String::new(),
+        selected: 0,
+        scroll: 0,
+    });
+}
+
+fn browse_path_picker(state: &mut TuiState, directory: PathBuf) {
+    state.path_request_id = state.path_request_id.wrapping_add(1);
+    if let Some(picker) = state.path_picker.as_mut() {
+        picker.cancelled.store(true, Ordering::Relaxed);
+        picker.cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        picker.directory = directory;
+        picker.request_id = state.path_request_id;
+        picker.loading = true;
+        picker.scan_started = false;
+        picker.truncated = false;
+        picker.query.clear();
+        picker.choices.clear();
+        picker.matches.clear();
+        picker.match_count = 0;
+        picker.selected = 0;
+        picker.scroll = 0;
+    }
+}
+
+fn insert_picked_path(state: &mut TuiState, path: &Path) {
+    if !path_within_picker_root(&state.sandbox_path, path) {
+        state.status = "path changed or no longer within the project".to_string();
+        return;
+    }
+    let Ok(relative) = path.strip_prefix(&state.sandbox_path) else {
+        return;
+    };
+    let Some(raw) = relative.to_str() else {
+        return;
+    };
+    #[cfg(not(windows))]
+    let raw = raw.to_owned();
+    #[cfg(windows)]
+    let raw = raw.replace('\\', "/");
+    let text = if raw.chars().any(char::is_whitespace) || raw.contains('`') {
+        let marker = "`".repeat(raw.chars().filter(|c| *c == '`').count() + 1);
+        format!("{marker}{raw}{marker}")
+    } else {
+        raw
+    };
+    state.insert_input_str(&text);
+    state.refresh_input_display_override();
+    state.reset_slash_completion_selection();
+    state.path_picker = None;
+    state.status = "path inserted · draft not sent".to_string();
+}
+
+fn handle_path_picker_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    let Some(picker) = state.path_picker.as_mut() else {
+        return false;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META);
+    if ctrl && matches!(key.code, KeyCode::Char('c' | 'd')) {
+        state.path_picker = None;
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => state.path_picker = None,
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Down => {
+            picker.selected = (picker.selected + 1).min(picker.matches.len().saturating_sub(1))
+        }
+        KeyCode::PageUp => picker.selected = picker.selected.saturating_sub(6),
+        KeyCode::PageDown => {
+            picker.selected = (picker.selected + 6).min(picker.matches.len().saturating_sub(1))
+        }
+        KeyCode::Home => picker.selected = 0,
+        KeyCode::End => picker.selected = picker.matches.len().saturating_sub(1),
+        KeyCode::Left => {
+            if picker.directory != picker.root {
+                let parent = picker.directory.parent().map(Path::to_path_buf);
+                if let Some(parent) = parent.filter(|path| path.starts_with(&picker.root)) {
+                    browse_path_picker(state, parent);
+                }
+            }
+        }
+        KeyCode::Right if !picker.loading => {
+            let path = picker
+                .matches
+                .get(picker.selected)
+                .and_then(|&index| picker.choices.get(index))
+                .filter(|choice| choice.directory)
+                .map(|choice| choice.path.clone());
+            if let Some(path) = path {
+                if path_within_picker_root(&picker.root, &path) && path.is_dir() {
+                    browse_path_picker(state, path);
+                } else {
+                    state.status = "directory changed; choose another".to_string();
+                }
+            }
+        }
+        KeyCode::Enter if !picker.loading && key.modifiers.is_empty() => {
+            let path = picker
+                .matches
+                .get(picker.selected)
+                .and_then(|&index| picker.choices.get(index))
+                .map(|choice| choice.path.clone());
+            if let Some(path) = path {
+                insert_picked_path(state, &path);
+            }
+        }
+        KeyCode::Backspace => {
+            picker.query.pop();
+            picker.filter();
+        }
+        KeyCode::Char(ch)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::META,
+            ) && !ch.is_control()
+                && picker.query.len() < 256 =>
+        {
+            picker.query.push(ch);
+            picker.filter();
+        }
+        _ => {}
+    }
+    true
+}
+
 fn handle_paste(state: &mut TuiState, mut pasted: String) {
     if pasted.is_empty() {
         return;
@@ -9264,6 +9877,7 @@ fn handle_paste(state: &mut TuiState, mut pasted: String) {
         || state.show_help
         || state.resume_picker_requested
         || state.resume_picker.is_some()
+        || state.path_picker.is_some()
         || state.resume_loading
     {
         clear_secret_string(&mut pasted);
@@ -9310,6 +9924,16 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => state.scroll_backend_viewer(1),
             MouseEventKind::ScrollDown => state.scroll_backend_viewer(-1),
+            _ => {}
+        }
+        return;
+    }
+    if let Some(picker) = state.path_picker.as_mut() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => picker.selected = picker.selected.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                picker.selected = (picker.selected + 1).min(picker.matches.len().saturating_sub(1))
+            }
             _ => {}
         }
         return;
@@ -9796,7 +10420,8 @@ fn handle_key(
     {
         return;
     }
-    if handle_resume_picker_key(state, key, agent_input)
+    if handle_path_picker_key(state, key)
+        || handle_resume_picker_key(state, key, agent_input)
         || handle_todo_view_key(state, key)
         || handle_help_key(state, key)
     {
@@ -9827,6 +10452,14 @@ fn handle_key(
         (KeyCode::Char('d'), m) if is_ctrl(m) => {
             state.quit = true;
             let _ = agent_input.send(FromTui::Quit);
+        }
+        (KeyCode::Char('p'), m) if is_ctrl(m) => {
+            if !state.resume_picker_requested
+                && !state.resume_loading
+                && state.resume_picker.is_none()
+            {
+                start_path_picker(state);
+            }
         }
         (KeyCode::Char('e'), m) if is_ctrl(m) => {
             if state.agent_busy {
@@ -10407,7 +11040,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let auto_approved_count = agent.auto_approved_privileged_tool_count();
     let _guard = TerminalGuard::new()?;
     let stdout = io::stdout();
-    let backend = CrosstermBackend::new(stdout);
+    let backend = ReplayBackend::new(CrosstermBackend::new(stdout));
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -10518,6 +11151,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let picker_tx = ev_tx.clone();
     let handle = tokio::spawn(async move {
         let mut git_epoch = 0u64;
+        let mut picker_root = agent.sandbox_root.clone();
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 FromTui::Submit { text, pane_width } => {
@@ -10599,6 +11233,11 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                             }
                         }
                     }
+                    if agent.sandbox_root != picker_root {
+                        picker_root = agent.sandbox_root.clone();
+                        git_epoch = git_epoch.wrapping_add(1);
+                        let _ = picker_tx.send(ToTui::RootChanged(picker_root.clone()));
+                    }
                     agent.checkpoint_latest_session("outer_loop_autosave");
                 }
                 FromTui::LoginInput(mut text) => {
@@ -10670,6 +11309,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                     match agent.load_session_from_path_for_seat(&path, seat.as_deref()) {
                         Ok(loaded) => {
                             git_epoch = git_epoch.wrapping_add(1);
+                            picker_root = agent.sandbox_root.clone();
                             agent.sink.emit(AgentEvent::Slash(format!(
                                 "loaded {} messages from {}",
                                 agent.history.len(),
@@ -10721,6 +11361,29 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
     let mut last_tick = Instant::now();
 
     while !state.quit {
+        if let Some(picker) = state.path_picker.as_mut()
+            && picker.loading
+            && !picker.scan_started
+        {
+            picker.scan_started = true;
+            let root = picker.root.clone();
+            let directory = picker.directory.clone();
+            let cancelled = picker.cancelled.clone();
+            let request_id = picker.request_id;
+            let tx = ev_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let (choices, truncated) = scan_paths(&root, &directory, &cancelled);
+                if !cancelled.load(Ordering::Relaxed) {
+                    let _ = tx.send(ToTui::PathChoices {
+                        request_id,
+                        root,
+                        directory,
+                        choices,
+                        truncated,
+                    });
+                }
+            });
+        }
         if state.backend_viewer_open {
             Backend::flush(terminal.backend_mut())?;
             run_backend_viewer(
@@ -10755,7 +11418,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
         if terminal_has_render_area(&terminal)? {
             let width = current_transcript_pane_width(&mut terminal, &state)?;
             if state.thinking_visual_transaction_pending && width > 0 {
-                crossterm::execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+                crossterm::execute!(terminal.backend_mut().inner, BeginSynchronizedUpdate)?;
                 let update = (|| {
                     if transcript_requires_rebuild(&state, width) {
                         purge_and_rebuild_transcript_inner(&mut terminal, &mut state, width)?;
@@ -10766,7 +11429,7 @@ pub async fn run(mut agent: Agent, initial_task: Option<String>) -> Result<()> {
                     terminal.draw(|f| draw(f, &mut state))?;
                     Ok::<(), io::Error>(())
                 })();
-                let end = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+                let end = crossterm::execute!(terminal.backend_mut().inner, EndSynchronizedUpdate);
                 update.and(end)?;
                 state.thinking_visual_transaction_pending = false;
             } else {
@@ -10929,6 +11592,531 @@ mod tests {
     use super::*;
     use crate::provider::StoredCredential;
     use std::sync::atomic::AtomicBool;
+
+    struct ReplayProbe {
+        inner: ratatui::backend::TestBackend,
+        queries: usize,
+        appended: u16,
+        clears: Vec<ratatui::backend::ClearType>,
+        moves_until_failure: Option<usize>,
+    }
+
+    impl Backend for ReplayProbe {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            self.inner.draw(content).map_err(|error| match error {})
+        }
+        fn append_lines(&mut self, n: u16) -> io::Result<()> {
+            self.appended += n;
+            self.inner.append_lines(n).map_err(|error| match error {})
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor().map_err(|error| match error {})
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor().map_err(|error| match error {})
+        }
+        fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+            self.queries += 1;
+            self.inner
+                .get_cursor_position()
+                .map_err(|error| match error {})
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> io::Result<()> {
+            if let Some(remaining) = self.moves_until_failure.as_mut() {
+                if *remaining == 0 {
+                    self.moves_until_failure = None;
+                    return Err(io::Error::other("injected resize cursor failure"));
+                }
+                *remaining -= 1;
+            }
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|error| match error {})
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            self.clear_region(ratatui::backend::ClearType::All)
+        }
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+            self.clears.push(clear_type);
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|error| match error {})
+        }
+        fn size(&self) -> io::Result<ratatui::layout::Size> {
+            self.inner.size().map_err(|error| match error {})
+        }
+        fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size().map_err(|error| match error {})
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush().map_err(|error| match error {})
+        }
+    }
+
+    fn replay_probe_terminal() -> Terminal<ReplayBackend<ReplayProbe>> {
+        Terminal::with_options(
+            ReplayBackend::new(ReplayProbe {
+                inner: ratatui::backend::TestBackend::new(30, 10),
+                queries: 0,
+                appended: 0,
+                clears: Vec::new(),
+                moves_until_failure: None,
+            }),
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn replay_reset_uses_known_origin_and_invalidates_both_buffers() {
+        let mut terminal = replay_probe_terminal();
+        terminal
+            .insert_before(3, |buf| {
+                buf.set_string(0, 0, "history", Style::default());
+            })
+            .unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("live"), frame.area()))
+            .unwrap();
+        terminal
+            .current_buffer_mut()
+            .set_string(0, 3, "stale", Style::default());
+        let queries = terminal.backend().inner.queries;
+        let appended = terminal.backend().inner.appended;
+        terminal.backend_mut().inner.clears.clear();
+        reset_transcript_viewport(&mut terminal).unwrap();
+        assert!(!terminal.backend().resetting);
+        assert_eq!(terminal.get_frame().area(), Rect::new(0, 0, 30, 4));
+        let backend = &terminal.backend().inner;
+        assert_eq!(backend.queries, queries);
+        assert_eq!(backend.appended, appended);
+        assert_eq!(backend.clears, [ratatui::backend::ClearType::All]);
+        assert_eq!(
+            backend.inner.cursor_position(),
+            ratatui::layout::Position::ORIGIN
+        );
+        for _ in 0..2 {
+            let buffer = terminal.current_buffer_mut();
+            assert_eq!(*buffer, ratatui::buffer::Buffer::empty(buffer.area));
+            terminal.swap_buffers();
+        }
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("live"), frame.area()))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().inner.inner.buffer()[(0, 0)].symbol(),
+            "l"
+        );
+        terminal.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(terminal.backend().inner.queries, queries + 1);
+        terminal.backend_mut().append_lines(1).unwrap();
+        assert_eq!(terminal.backend().inner.appended, appended + 1);
+    }
+
+    #[test]
+    fn replay_reset_restores_backend_delegation_after_resize_failure() {
+        let mut terminal = replay_probe_terminal();
+        for moves in [0, 1, 2] {
+            terminal.backend_mut().inner.moves_until_failure = Some(moves);
+            assert!(reset_transcript_viewport(&mut terminal).is_err());
+            assert!(!terminal.backend().resetting);
+            let queries = terminal.backend().inner.queries;
+            terminal.backend_mut().get_cursor_position().unwrap();
+            assert_eq!(terminal.backend().inner.queries, queries + 1);
+            reset_transcript_viewport(&mut terminal).unwrap();
+            assert!(!terminal.backend().resetting);
+        }
+    }
+
+    #[test]
+    fn transcript_geometry_guard_defers_before_autoresize_side_effects() {
+        let state = TuiState::new(
+            "test-model".to_string(),
+            model_context_window("test-model"),
+            ".".to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        for (width, height) in [(30, 0), (0, 10), (30, 1), (20, 10)] {
+            let mut terminal = replay_probe_terminal();
+            let expected_width = current_transcript_pane_width(&mut terminal, &state).unwrap();
+            let area = terminal.get_frame().area();
+            let queries = terminal.backend().inner.queries;
+            let appended = terminal.backend().inner.appended;
+            terminal.backend_mut().inner.clears.clear();
+            terminal.backend_mut().inner.inner.resize(width, height);
+
+            assert_eq!(
+                renderable_transcript_chunk_rows(&mut terminal, &state, expected_width).unwrap(),
+                None
+            );
+            assert_eq!(terminal.get_frame().area(), area);
+            assert_eq!(terminal.backend().inner.queries, queries);
+            assert_eq!(terminal.backend().inner.appended, appended);
+            assert!(terminal.backend().inner.clears.is_empty());
+
+            terminal.backend_mut().inner.inner.resize(30, 10);
+            assert_eq!(
+                renderable_transcript_chunk_rows(&mut terminal, &state, expected_width).unwrap(),
+                Some(10)
+            );
+        }
+    }
+
+    #[test]
+    fn path_picker_fuzzy_search_and_cursor_insertion() {
+        let root = std::env::temp_dir().join(format!(
+            "dext-path-picker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/hello world.rs"), "test").unwrap();
+        std::fs::write(root.join("src/other.rs"), "test").unwrap();
+        std::fs::write(root.join("src/bidi\u{202e}.rs"), "test").unwrap();
+        std::fs::write(root.join("src/line\u{2028}break.rs"), "test").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/hidden"), "test").unwrap();
+        let root = root.canonicalize().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let (choices, limited) = scan_paths(&root, &root, &cancelled);
+        assert!(!limited);
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.path == root.join("src/hello world.rs"))
+        );
+        assert!(
+            !choices
+                .iter()
+                .any(|choice| choice.path == root.join(".git/hidden"))
+        );
+        assert!(!choices.iter().any(|choice| {
+            choice.path == root.join("src/bidi\u{202e}.rs")
+                || choice.path == root.join("src/line\u{2028}break.rs")
+        }));
+        let mut state = TuiState::new(
+            "test-model".into(),
+            8192,
+            root.display().to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "check  today".into();
+        state.cursor = "check ".len();
+        start_path_picker(&mut state);
+        let request_id = state.path_picker.as_ref().unwrap().request_id;
+        apply_tui_message(
+            &mut state,
+            ToTui::PathChoices {
+                request_id,
+                root: root.clone(),
+                directory: root.clone(),
+                choices,
+                truncated: false,
+            },
+        );
+        let picker = state.path_picker.as_mut().unwrap();
+        picker.query = "hwr".into();
+        picker.filter();
+        assert_eq!(picker.matches.len(), 1);
+        assert_eq!(
+            picker.choices[picker.matches[0]].path,
+            root.join("src/hello world.rs")
+        );
+        picker.query = "hello world".into();
+        picker.filter();
+        assert_eq!(picker.matches.len(), 1);
+        picker.query = "src/hello".into();
+        picker.filter();
+        assert_eq!(picker.matches.len(), 1);
+        let path = picker.choices[picker.matches[0]].path.clone();
+        insert_picked_path(&mut state, &path);
+        assert_eq!(state.input, "check `src/hello world.rs` today");
+        assert_eq!(state.cursor, "check `src/hello world.rs`".len());
+        assert!(state.path_picker.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn path_picker_cancel_and_stale_result_preserve_draft() {
+        let mut state = TuiState::new(
+            "test-model".into(),
+            8192,
+            ".".into(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "draft".into();
+        state.cursor = 2;
+        start_path_picker(&mut state);
+        let request_id = state.path_picker.as_ref().unwrap().request_id;
+        handle_path_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+        );
+        handle_paste(&mut state, "ignore".into());
+        assert_eq!(state.input, "draft");
+        handle_path_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        apply_tui_message(
+            &mut state,
+            ToTui::PathChoices {
+                request_id,
+                root: PathBuf::from("."),
+                directory: PathBuf::from("."),
+                choices: vec![],
+                truncated: false,
+            },
+        );
+        assert!(state.path_picker.is_none());
+        assert_eq!(state.cursor, 2);
+        start_path_picker(&mut state);
+        assert!(state.path_picker.is_some());
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        queue_permission_request(
+            &mut state,
+            "bash".into(),
+            serde_json::json!({"command":"ls"}),
+            reply,
+        );
+        assert!(state.path_picker.is_none());
+        state.pending_perm = None;
+        start_path_picker(&mut state);
+        state.apply_event(AgentEvent::LoginInputMode {
+            provider: Some("fixture".into()),
+        });
+        assert!(state.path_picker.is_none());
+    }
+
+    #[test]
+    fn path_picker_navigation_and_root_change_reject_old_results() {
+        let temp = std::env::temp_dir().join(format!(
+            "dext-path-nav-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp.join("src")).unwrap();
+        let root = temp.canonicalize().unwrap();
+        let mut state = TuiState::new(
+            "test-model".into(),
+            8192,
+            root.display().to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        start_path_picker(&mut state);
+        let old_id = state.path_request_id;
+        apply_tui_message(
+            &mut state,
+            ToTui::PathChoices {
+                request_id: old_id,
+                root: root.clone(),
+                directory: root.clone(),
+                choices: vec![PathChoice {
+                    path: root.join("src"),
+                    directory: true,
+                }],
+                truncated: false,
+            },
+        );
+        assert!(handle_path_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::empty())
+        ));
+        assert_eq!(
+            state.path_picker.as_ref().unwrap().directory,
+            root.join("src")
+        );
+        apply_tui_message(
+            &mut state,
+            ToTui::PathChoices {
+                request_id: old_id,
+                root: root.clone(),
+                directory: root.clone(),
+                choices: vec![],
+                truncated: false,
+            },
+        );
+        assert!(state.path_picker.as_ref().unwrap().loading);
+        assert!(handle_path_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty())
+        ));
+        assert_eq!(state.path_picker.as_ref().unwrap().directory, root);
+        apply_tui_message(
+            &mut state,
+            ToTui::RootChanged(PathBuf::from("/tmp/another")),
+        );
+        assert!(state.path_picker.is_none());
+        assert_eq!(state.sandbox_path, PathBuf::from("/tmp/another"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn path_picker_ranking_caps_results_and_reports_full_count() {
+        let root = PathBuf::from("/project");
+        let mut state = TuiState::new(
+            "test-model".into(),
+            8192,
+            root.display().to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        start_path_picker(&mut state);
+        let request_id = state.path_request_id;
+        let choices = (0..PATH_RESULT_LIMIT + 5)
+            .map(|index| PathChoice {
+                path: root.join(format!("file-{index:03}.rs")),
+                directory: false,
+            })
+            .collect();
+        apply_tui_message(
+            &mut state,
+            ToTui::PathChoices {
+                request_id,
+                root: root.clone(),
+                directory: root,
+                choices,
+                truncated: false,
+            },
+        );
+        let picker = state.path_picker.as_mut().unwrap();
+        assert_eq!(picker.match_count, PATH_RESULT_LIMIT + 5);
+        assert_eq!(picker.matches.len(), PATH_RESULT_LIMIT);
+        picker.query = "not-here".into();
+        picker.filter();
+        assert_eq!(picker.match_count, 0);
+        assert!(picker.matches.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_picker_rejects_directory_replaced_by_symlink() {
+        let root = std::env::temp_dir().join(format!(
+            "dext-path-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let root = root.canonicalize().unwrap();
+        let nested = root.join("nested");
+        let elsewhere = root.join("elsewhere");
+        std::fs::write(nested.join("file.rs"), "fixture").unwrap();
+        std::fs::write(elsewhere.join("file.rs"), "fixture").unwrap();
+        let (choices, _) = scan_paths(&root, &root, &AtomicBool::new(false));
+        let mut state = TuiState::new(
+            "test-model".into(),
+            8192,
+            root.display().to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "draft".into();
+        state.cursor = state.input.len();
+        start_path_picker(&mut state);
+        let request_id = state.path_request_id;
+        apply_tui_message(
+            &mut state,
+            ToTui::PathChoices {
+                request_id,
+                root: root.clone(),
+                directory: root.clone(),
+                choices,
+                truncated: false,
+            },
+        );
+        std::fs::remove_dir_all(&nested).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &nested).unwrap();
+        let path = nested.join("file.rs");
+        assert!(!path_within_picker_root(&root, &path));
+        insert_picked_path(&mut state, &path);
+        assert_eq!(state.input, "draft");
+        assert!(state.path_picker.is_some());
+        let picker = state.path_picker.as_mut().unwrap();
+        picker.query = "nested".into();
+        picker.filter();
+        assert!(handle_path_picker_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::empty())
+        ));
+        assert_eq!(state.path_picker.as_ref().unwrap().directory, root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_picker_query_uses_forward_slashes_on_windows() {
+        assert_eq!(
+            path_query_label(Path::new(r"src\nested\file.rs")).as_deref(),
+            Some("src/nested/file.rs")
+        );
+        assert!(fuzzy_path_score("src/nested/file.rs", "src/nf").is_some());
+    }
+
+    #[test]
+    fn path_picker_skips_symlinks_and_refuses_removed_files() {
+        let root = std::env::temp_dir().join(format!(
+            "dext-path-safety-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let file = root.join("gone.rs");
+        std::fs::write(&file, "example").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&file, root.join("alias.rs")).unwrap();
+            let (choices, _) = scan_paths(&root, &root, &AtomicBool::new(false));
+            assert!(
+                !choices
+                    .iter()
+                    .any(|choice| choice.path == root.join("alias.rs"))
+            );
+        }
+        let mut state = TuiState::new(
+            "test-model".into(),
+            8192,
+            root.display().to_string(),
+            ApprovalProfile::Ask,
+            ThinkingEffort::Medium,
+        );
+        state.input = "draft".into();
+        state.cursor = state.input.len();
+        start_path_picker(&mut state);
+        std::fs::remove_file(&file).unwrap();
+        insert_picked_path(&mut state, &file);
+        assert_eq!(state.input, "draft");
+        assert!(state.path_picker.is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_env_lock()
@@ -11396,7 +12584,7 @@ mod tests {
         use ratatui::{TerminalOptions, Viewport};
 
         let mut terminal = Terminal::with_options(
-            TestBackend::new(80, 12),
+            ReplayBackend::new(TestBackend::new(80, 12)),
             TerminalOptions {
                 viewport: Viewport::Inline(4),
             },
@@ -11416,22 +12604,22 @@ mod tests {
         state.apply_thinking_delta("discarded-thinking\n".repeat(30));
         let width = current_transcript_pane_width(&mut terminal, &state).unwrap();
         flush_pending_insert(&mut terminal, &mut state, width).unwrap();
-        assert!(terminal.backend().scrollback().area.height > 0);
+        assert!(terminal.backend().inner.scrollback().area.height > 0);
         state.apply_event(AgentEvent::ThinkingPreviewDiscarded);
         assert!(transcript_requires_rebuild(&state, width));
         state.queue(Line_::Assistant {
             text: "surviving-after".to_string(),
             dim_prefix: false,
         });
-        terminal.backend_mut().purge_scrollback();
         rebuild_transcript_from_origin(&mut terminal, &mut state, width).unwrap();
         flush_pending_insert(&mut terminal, &mut state, width).unwrap();
         let rendered = terminal
             .backend()
+            .inner
             .scrollback()
             .content
             .iter()
-            .chain(terminal.backend().buffer().content.iter())
+            .chain(terminal.backend().inner.buffer().content.iter())
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("discarded-thinking"), "{rendered}");
@@ -17336,7 +18524,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::with_options(
-            backend,
+            ReplayBackend::new(backend),
             TerminalOptions {
                 viewport: Viewport::Inline(8),
             },
@@ -17357,7 +18545,7 @@ mod tests {
         flush_pending_insert(&mut terminal, &mut state, width).expect("initial flush");
         state.transcript_needs_rebuild = true;
 
-        terminal.backend_mut().resize(80, 0);
+        terminal.backend_mut().inner.resize(80, 0);
         rebuild_transcript_from_origin(&mut terminal, &mut state, width)
             .expect("zero-height replay must defer");
 
@@ -17366,7 +18554,7 @@ mod tests {
         assert!(transcript_requires_rebuild(&state, width));
         assert_eq!(state.transcript.len(), 1);
 
-        terminal.backend_mut().resize(80, 20);
+        terminal.backend_mut().inner.resize(80, 20);
         terminal.autoresize().expect("restore terminal size");
         rebuild_transcript_from_origin(&mut terminal, &mut state, width).expect("restored replay");
         assert!(!state.transcript_needs_rebuild);
@@ -17493,7 +18681,7 @@ mod tests {
 
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::with_options(
-            backend,
+            ReplayBackend::new(backend),
             TerminalOptions {
                 viewport: Viewport::Inline(8),
             },
@@ -17516,10 +18704,10 @@ mod tests {
         }
         let wide = current_transcript_pane_width(&mut terminal, &state).expect("wide width");
         flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
-        assert!(terminal.backend().scrollback().area.height > 0);
+        assert!(terminal.backend().inner.scrollback().area.height > 0);
         let logical_blocks = state.transcript.len();
 
-        terminal.backend_mut().resize(52, 20);
+        terminal.backend_mut().inner.resize(52, 20);
         let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
         assert!(transcript_requires_rebuild(&state, narrow));
         state.queue(Line_::Assistant {
@@ -17527,7 +18715,6 @@ mod tests {
             dim_prefix: false,
         });
 
-        terminal.backend_mut().purge_scrollback();
         rebuild_transcript_from_origin(&mut terminal, &mut state, narrow)
             .expect("full narrow rebuild");
         flush_pending_insert(&mut terminal, &mut state, narrow).expect("pending narrow flush");
@@ -17538,10 +18725,11 @@ mod tests {
         assert_eq!(state.transcript.len(), logical_blocks + 2);
         let rendered = terminal
             .backend()
+            .inner
             .scrollback()
             .content
             .iter()
-            .chain(terminal.backend().buffer().content.iter())
+            .chain(terminal.backend().inner.buffer().content.iter())
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("block 0"), "{rendered}");
@@ -17558,7 +18746,7 @@ mod tests {
 
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::with_options(
-            backend,
+            ReplayBackend::new(backend),
             TerminalOptions {
                 viewport: Viewport::Inline(8),
             },
@@ -17581,10 +18769,9 @@ mod tests {
         flush_pending_insert(&mut terminal, &mut state, wide).expect("wide flush");
         let logical_len = state.transcript.len();
 
-        terminal.backend_mut().resize(36, 6);
+        terminal.backend_mut().inner.resize(36, 6);
         let narrow = current_transcript_pane_width(&mut terminal, &state).expect("narrow width");
         assert!(transcript_requires_rebuild(&state, narrow));
-        terminal.backend_mut().purge_scrollback();
         rebuild_transcript_from_origin(&mut terminal, &mut state, narrow)
             .expect("full-screen rebuild");
 
@@ -17592,13 +18779,14 @@ mod tests {
         assert_eq!(state.transcript_rendered_width, narrow);
         assert_eq!(terminal.get_frame().area().top(), 0);
         assert_eq!(terminal.get_frame().area().height, 6);
-        assert!(terminal.backend().scrollback().area.height > 0);
+        assert!(terminal.backend().inner.scrollback().area.height > 0);
         let rendered = terminal
             .backend()
+            .inner
             .scrollback()
             .content
             .iter()
-            .chain(terminal.backend().buffer().content.iter())
+            .chain(terminal.backend().inner.buffer().content.iter())
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("block 00"), "{rendered}");

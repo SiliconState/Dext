@@ -377,7 +377,7 @@ const CANONICAL_REQUIRED_GATES_COMMAND: &str = concat!(
     "cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings\n",
     "cargo audit --deny warnings\n",
     "cargo deny check licenses\n",
-    "cargo test -p ratatui-core --lib --locked\n",
+    "cargo test --release --locked --bin dext tui::tests::\n",
     "cargo build --release --locked\n",
     "cargo test --release --locked",
 );
@@ -13253,6 +13253,171 @@ fn provider_transport_timeouts_use_local_defaults_and_valid_overrides() {
     }
 }
 
+#[test]
+fn provider_total_timeout_is_opt_in_independent_and_validated_per_request() {
+    let _guard = env_lock();
+    let vars = [
+        "DEXT_PROVIDER_TOTAL_TIMEOUT_SECS",
+        "DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS",
+    ];
+    let old_values = vars.map(std::env::var_os);
+    for var in vars {
+        unsafe { std::env::remove_var(var) };
+    }
+    let mut agent = test_agent(Path::new("."));
+    let timeout = |agent: &Agent| {
+        agent
+            .provider_post("http://localhost/test")
+            .unwrap()
+            .build()
+            .unwrap()
+            .timeout()
+            .copied()
+    };
+    assert_eq!(timeout(&agent), None);
+    unsafe { std::env::set_var(vars[0], "12") };
+    assert_eq!(timeout(&agent), Some(Duration::from_secs(12)));
+    configure_local_openai_agent(&mut agent, "http://localhost".to_string());
+    assert_eq!(timeout(&agent), None);
+    unsafe { std::env::set_var(vars[1], "86400") };
+    assert_eq!(timeout(&agent), Some(Duration::from_secs(86400)));
+    for local in [false, true] {
+        let var = vars[usize::from(local)];
+        for value in ["", "invalid", "-1", "1.5", "86401", "18446744073709551615"] {
+            unsafe { std::env::set_var(var, value) };
+            let error = provider_total_request_timeout(local).unwrap_err();
+            assert!(error.to_string().contains(var), "{error}");
+        }
+        unsafe { std::env::set_var(var, "0") };
+        assert_eq!(provider_total_request_timeout(local).unwrap(), None);
+    }
+    assert_eq!(timeout(&agent), None);
+    unsafe { std::env::set_var(vars[1], "invalid") };
+    assert!(agent.provider_post("http://localhost/test").is_err());
+    for (var, value) in vars.into_iter().zip(old_values) {
+        restore_env_var(var, value);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_total_timeout_bounds_headers_and_trickling_bodies() {
+    let total_timeout = Duration::from_secs(2);
+    let safety_timeout = Duration::from_secs(10);
+    for mode in ["headers", "json", "sse", "error"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (mut agent, request) = {
+            let _guard = env_lock();
+            let mut agent = test_agent(Path::new("."));
+            agent.quiet_stream_events = true;
+            let request = agent
+                .provider_post(format!("http://{address}"))
+                .unwrap()
+                .timeout(total_timeout);
+            (agent, request)
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let chunks_sent = Arc::new(AtomicUsize::new(0));
+        let server_chunks = Arc::clone(&chunks_sent);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + safety_timeout;
+            ready_tx.send(()).unwrap();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(count) => request.extend_from_slice(&buffer[..count]),
+                }
+            }
+            if mode == "headers" {
+                while Instant::now() < deadline && !server_stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                return;
+            }
+            let status = if mode == "error" {
+                "500 Internal Server Error"
+            } else {
+                "200 OK"
+            };
+            let headers = format!(
+                "HTTP/1.1 {status}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            let chunk = if mode == "sse" {
+                ": keepalive\n\n"
+            } else {
+                " "
+            };
+            let frame = format!("{:x}\r\n{chunk}\r\n", chunk.len());
+            while Instant::now() < deadline && !server_stop.load(Ordering::SeqCst) {
+                if stream.write_all(frame.as_bytes()).is_err() {
+                    return;
+                }
+                server_chunks.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        ready_rx.recv_timeout(safety_timeout).unwrap();
+        let started = Instant::now();
+        let response = send_provider_request(request, safety_timeout).await;
+        let error = if mode == "headers" {
+            response.unwrap_err()
+        } else {
+            let response = response.expect("headers arrive before total timeout");
+            if mode == "sse" {
+                agent
+                    .read_provider_stream(response, RequestContract::OpenAiChatCompletions)
+                    .await
+                    .unwrap_err()
+            } else if mode == "error" {
+                assert_eq!(response.status().as_u16(), 500);
+                read_provider_error_body(response, safety_timeout)
+                    .await
+                    .unwrap_err()
+            } else {
+                read_provider_json_body(response, safety_timeout)
+                    .await
+                    .unwrap_err()
+            }
+        };
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            error.to_string().contains("total request timeout"),
+            "{mode}: {error:#}"
+        );
+        assert!(started.elapsed() < safety_timeout, "{mode}");
+        if mode != "headers" {
+            assert!(chunks_sent.load(Ordering::SeqCst) > 1, "{mode}: no trickle");
+        }
+        server.join().unwrap();
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn provider_body_reader_enforces_idle_timeout_after_headers() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -17111,6 +17276,156 @@ fn stream_error_classification_retries_chunked_eof() {
 }
 
 #[test]
+fn pack_runtime_tool_promotion_is_opted_in_atomic_and_policy_fenced() {
+    let root = temp_test_dir("pack-runtime-promotion");
+    let mut agent = test_agent(&root);
+    agent.active_pack_runtime = Some(pack_runtime::ActiveRuntime {
+        pack_name: "demo".into(),
+        pack_source: "test".into(),
+        executable: root.join("runtime"),
+        executable_sha256: "digest".into(),
+        args: Vec::new(),
+        timeout: std::time::Duration::from_secs(1),
+        tools: Vec::new(),
+        ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
+        manifest_sha256: "manifest".into(),
+        state: json!({"old":true}),
+        max_continuations: 0,
+        continuations_used: 0,
+    });
+    let tool = pack_runtime::RuntimeTool {
+        name: "demo_lookup".into(),
+        description: "Lookup".into(),
+        input_schema: json!({"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}),
+        risk: pack_runtime::RuntimeRisk::Write,
+    };
+    let invocation = |tools| pack_runtime::RuntimeInvocation {
+        content: "discovered".into(),
+        is_error: false,
+        state: Some(json!({"new":true})),
+        effects: vec![pack_runtime::RuntimeEffect::Tools { tools }],
+        ui_request: None,
+    };
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![tool.clone()]), false)
+            .is_err()
+    );
+    agent.active_pack_runtime.as_mut().unwrap().tool_protocol = Some(1);
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    agent.set_approval_profile(ApprovalProfile::Ask);
+    // Policy changes revoke runtimes; rebuild the test instance after the transition.
+    if agent.active_pack_runtime.is_none() {
+        agent.active_pack_runtime = Some(pack_runtime::ActiveRuntime {
+            pack_name: "demo".into(),
+            pack_source: "test".into(),
+            executable: root.join("runtime"),
+            executable_sha256: "digest".into(),
+            args: Vec::new(),
+            timeout: std::time::Duration::from_secs(1),
+            tools: Vec::new(),
+            ui_protocol: None,
+            tool_protocol: Some(1),
+            promoted_tools: Vec::new(),
+            manifest_sha256: "manifest".into(),
+            state: json!({"old":true}),
+            max_continuations: 0,
+            continuations_used: 0,
+        });
+    }
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Deny,
+        requests: requests.clone(),
+    }));
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![tool.clone()]), false)
+            .is_err()
+    );
+    assert_eq!(
+        agent.active_pack_runtime.as_ref().unwrap().state,
+        json!({"old":true})
+    );
+    assert!(agent.active_runtime_tool("demo_lookup").is_none());
+    agent.set_sink(Box::new(FixedPermissionSink {
+        choice: Choice::Once,
+        requests: requests.clone(),
+    }));
+    agent.allowed.insert("demo_lookup".into());
+    agent
+        .apply_pack_runtime_invocation(invocation(vec![tool.clone()]), false)
+        .unwrap();
+    assert!(!agent.allowed.contains("demo_lookup"));
+    assert!(agent.tool_needs_permission("demo_lookup"));
+    assert!(
+        agent
+            .provider_neutral_tools()
+            .iter()
+            .any(|t| t.name == "demo_lookup")
+    );
+    assert!(
+        agent
+            .validate_active_tool_input("demo_lookup", &json!({}))
+            .is_err()
+    );
+    let before = requests.load(Ordering::SeqCst);
+    agent
+        .apply_pack_runtime_invocation(invocation(vec![tool.clone()]), false)
+        .unwrap();
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        before,
+        "identical definitions are idempotent"
+    );
+    let mut changed = tool.clone();
+    changed.risk = pack_runtime::RuntimeRisk::Read;
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![changed]), false)
+            .is_err()
+    );
+    let mut collision = tool.clone();
+    collision.name = "bash".into();
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![collision]), false)
+            .is_err()
+    );
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![tool.clone(), tool.clone()]), false)
+            .is_err()
+    );
+    let snapshot = agent.active_pack_runtime.as_ref().unwrap().snapshot(&[]);
+    let mut private = tool.clone();
+    private.name = "private_contract".into();
+    private.input_schema["properties"]["key"]["enum"] =
+        json!([format!("SERVICE_TOKEN={}", "a".repeat(40))]);
+    let state_before = agent.active_pack_runtime.as_ref().unwrap().state.clone();
+    assert!(
+        agent
+            .apply_pack_runtime_invocation(invocation(vec![private]), false)
+            .is_err()
+    );
+    assert_eq!(
+        agent.active_pack_runtime.as_ref().unwrap().state,
+        state_before
+    );
+    assert!(agent.active_runtime_tool("private_contract").is_none());
+    let mut restored = agent.active_pack_runtime.as_ref().unwrap().clone();
+    restored.promoted_tools.clear();
+    restored.restore_state(&snapshot).unwrap();
+    assert!(restored.tool("demo_lookup").is_none());
+    agent.allowed.insert("demo_lookup".into());
+    agent.set_sandbox_profile(SandboxProfile::ReadOnly);
+    assert!(agent.active_pack_runtime.is_none());
+    assert!(!agent.allowed.contains("demo_lookup"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn pack_runtime_default_always_profile_does_not_prompt() {
     let root = temp_test_dir("pack-runtime-default-always");
     let mut agent = test_agent(&root);
@@ -17129,6 +17444,8 @@ fn pack_runtime_default_always_profile_does_not_prompt() {
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -17171,6 +17488,8 @@ fn pack_runtime_always_approval_is_exact_identity_scoped() {
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -17282,6 +17601,8 @@ fn pack_runtime_activation_is_revoked_when_safety_policy_changes() {
                 risk: pack_runtime::RuntimeRisk::Write,
             }],
             ui_protocol: None,
+            tool_protocol: None,
+            promoted_tools: Vec::new(),
             manifest_sha256: "manifest".to_string(),
             state: Value::Null,
             max_continuations: 2,
@@ -17539,6 +17860,8 @@ fn pack_runtime_invocation_application_is_atomic() {
         timeout: std::time::Duration::from_secs(1),
         tools: Vec::new(),
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: json!({"old": true}),
         max_continuations: 1,
@@ -18601,6 +18924,159 @@ fn gpt_5_6_openai_request_uses_responses_pro_mode_and_true_max_effort() -> Resul
 }
 
 #[test]
+fn gpt_6_1_sol_requests_preserve_provider_contracts() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    for id in ["openai", "chatgpt"] {
+        let profile = built_in_provider_profiles()
+            .into_iter()
+            .find(|profile| profile.id == id)
+            .expect("built-in profile");
+        let mut agent = test_agent(&root);
+        agent.provider_id = id.to_string();
+        agent.api_provider = profile.api_provider;
+        agent.base_url = profile.base_url.clone();
+        agent.provider_profile = Some(profile);
+        agent.model = "gpt-6.1-sol".to_string();
+        agent.reasoning_mode = ReasoningMode::Pro;
+        for (effort, expected) in [
+            (ThinkingEffort::Off, None),
+            (ThinkingEffort::Minimal, Some("low")),
+            (ThinkingEffort::Low, Some("low")),
+            (ThinkingEffort::Medium, Some("medium")),
+            (ThinkingEffort::High, Some("high")),
+            (ThinkingEffort::XHigh, Some("xhigh")),
+            (ThinkingEffort::Max, Some("max")),
+        ] {
+            agent.thinking_effort = effort;
+            let (url, bytes) =
+                agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+            let body: Value = serde_json::from_slice(&bytes)?;
+            assert!(url.ends_with("/responses"), "{url}");
+            assert_eq!(
+                body["reasoning"]["effort"].as_str(),
+                expected,
+                "{id}: {body}"
+            );
+            assert!(body["reasoning"].get("mode").is_none(), "{body}");
+            assert_eq!(body["store"], false, "{body}");
+            assert!(!body["tools"].as_array().expect("tools").is_empty());
+            if id == "openai" {
+                assert_eq!(body["max_output_tokens"], 128_000);
+                assert_eq!(body["include"][0], "reasoning.encrypted_content");
+            } else {
+                assert!(body.get("max_output_tokens").is_none());
+            }
+            let summary = build_responses_summary_body(
+                agent.request_contract_for_model(&agent.model),
+                &agent.model,
+                "summarize",
+                agent
+                    .responses_reasoning_effort_for_model(&agent.model, effort)
+                    .as_deref(),
+                agent.reasoning_mode_for_model(&agent.model),
+                COMPACT_SUMMARY_MAX_TOKENS_THINKING,
+            );
+            assert_eq!(summary["reasoning"]["effort"].as_str(), expected);
+            assert!(summary["reasoning"].get("mode").is_none());
+        }
+        if id == "openai" {
+            agent.base_url = "https://example.test".to_string();
+            assert!(
+                agent
+                    .build_streaming_request("sys", "env", &[], &[], "session-key")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires the Responses API")
+            );
+            agent.tools.clear();
+            let (url, bytes) =
+                agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+            let body: Value = serde_json::from_slice(&bytes)?;
+            assert!(url.ends_with("/chat/completions"));
+            assert_eq!(body["reasoning_effort"], "max");
+            assert_eq!(body["max_completion_tokens"], 128_000);
+            assert!(body.get("tools").is_none());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn responses_encrypted_reasoning_respects_route_at_off() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut agent = test_agent(&root);
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("OpenAI profile");
+    profile.request_contract = Some(RequestContract::OpenAiResponses);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.provider_profile = Some(profile);
+    for model in ["gpt-6.1-sol", "gpt-6-astra"] {
+        agent.model = model.to_string();
+        for effort in [ThinkingEffort::Off, ThinkingEffort::Max] {
+            agent.thinking_effort = effort;
+            for (base, included) in [
+                ("https://api.openai.com", true),
+                ("https://example.test", false),
+            ] {
+                agent.base_url = base.to_string();
+                let (_, bytes) =
+                    agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+                let body: Value = serde_json::from_slice(&bytes)?;
+                assert_eq!(
+                    body.get("include").is_some(),
+                    included,
+                    "{model} {effort:?}: {body}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gpt_6_1_sol_custom_profile_without_metadata_uses_valid_effort() -> Result<()> {
+    let root = std::env::current_dir()?.canonicalize()?;
+    let mut profile = built_in_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.id == "openai")
+        .expect("OpenAI profile");
+    profile.id = "custom-sol".to_string();
+    profile.models.clear();
+    profile.model_specs.clear();
+    profile.request_contract = Some(RequestContract::OpenAiResponses);
+    let mut agent = test_agent(&root);
+    agent.provider_id = profile.id.clone();
+    agent.api_provider = profile.api_provider;
+    agent.base_url = "https://example.test".to_string();
+    agent.provider_profile = Some(profile);
+    agent.model = "GPT-6.1-SOL".to_string();
+    for (effort, expected) in [
+        (ThinkingEffort::Off, None),
+        (ThinkingEffort::Minimal, Some("low")),
+        (ThinkingEffort::Max, Some("max")),
+    ] {
+        agent.thinking_effort = effort;
+        let (_, bytes) = agent.build_streaming_request("sys", "env", &[], &[], "session-key")?;
+        let body: Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(body["reasoning"]["effort"].as_str(), expected);
+        assert!(body.get("include").is_none());
+    }
+    agent.provider_profile.as_mut().unwrap().request_contract =
+        Some(RequestContract::OpenAiChatCompletions);
+    assert!(
+        agent
+            .build_streaming_request("sys", "env", &[], &[], "session-key")
+            .unwrap_err()
+            .to_string()
+            .contains("requires the Responses API")
+    );
+    Ok(())
+}
+
+#[test]
 fn gpt_6_sol_and_luna_chat_completions_tool_calls_force_none_effort() -> Result<()> {
     let root = std::env::current_dir()?.canonicalize()?;
     let mut profile = built_in_provider_profiles()
@@ -18684,6 +19160,22 @@ fn compact_model_alias_uses_its_own_responses_mode_and_pricing() -> Result<()> {
         usage.cost_usd
     );
 
+    unsafe { std::env::set_var("DEXT_COMPACT_MODEL", "gpt61sol") };
+    let summary_model = agent.compact_summary_model();
+    assert_eq!(summary_model, "gpt-6.1-sol");
+    assert_eq!(
+        agent.request_contract_for_model(&summary_model),
+        RequestContract::OpenAiResponses
+    );
+    assert_eq!(agent.reasoning_mode_for_model(&summary_model), None);
+    let mut usage = Usage {
+        input: 100_000,
+        cache_read: 100_000,
+        output: 10_000,
+        ..Usage::default()
+    };
+    agent.finalize_usage_metrics_for_model(&mut usage, &summary_model);
+    assert!((usage.cost_usd.expect("Sol 6.1 summary cost") - 0.31).abs() < 1e-12);
     restore_env_var("DEXT_COMPACT_MODEL", old_compact_model);
     Ok(())
 }
@@ -19574,6 +20066,17 @@ fn steering_updates_turn_policy_note() {
     agent.update_turn_policy_from_steering("also fix the typo in the docs");
     assert_eq!(agent.turn_policy_note, None);
 
+    agent.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
+    agent.update_turn_policy_from_steering("Sure go. Also review the process.");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(IMPLEMENTATION_TURN_RUNTIME_NOTE)
+    );
+    agent.update_turn_policy_from_steering("review the workflow for asking me to go");
+    assert_eq!(
+        agent.turn_policy_note,
+        Some(IMPLEMENTATION_TURN_RUNTIME_NOTE)
+    );
     agent.update_turn_policy_from_steering("actually don't change anything yet");
     assert_eq!(agent.turn_policy_note, Some(ADVISORY_TURN_RUNTIME_NOTE));
 
@@ -19584,6 +20087,12 @@ fn steering_updates_turn_policy_note() {
         "neutral steering must leave the policy untouched"
     );
 
+    agent.update_turn_policy_from_steering("Can you configure the model?");
+    assert_eq!(agent.turn_policy_note, None);
+    agent.update_turn_policy_from_steering("Go, but don't change anything yet");
+    assert_eq!(agent.turn_policy_note, Some(ADVISORY_TURN_RUNTIME_NOTE));
+    agent.update_turn_policy_from_steering("The prompt says \"go ahead\"; review it");
+    assert_eq!(agent.turn_policy_note, Some(ADVISORY_TURN_RUNTIME_NOTE));
     agent.update_turn_policy_from_steering("should I go ahead?");
     assert_eq!(
         agent.turn_policy_note,
@@ -20394,6 +20903,8 @@ fn slash_allow_and_allowed_include_active_runtime_tools() {
             risk: pack_runtime::RuntimeRisk::Write,
         }],
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -22823,6 +23334,41 @@ fn usage_pricing_for_local_provider_is_zero_cost() {
 }
 
 #[test]
+fn gpt_6_1_sol_cached_pricing_and_tier_boundary() {
+    let pricing = usage_pricing_default_for(
+        "openai",
+        ApiProvider::OpenAi,
+        "https://api.openai.com",
+        "gpt-6.1-sol",
+    );
+    for provider in ["openai", "chatgpt"] {
+        for (cached, multiplier) in [(272_000, 1.0), (272_001, 2.0)] {
+            let usage = Usage {
+                cache_read: cached,
+                ..Usage::default()
+            };
+            let tier = openai_long_context_pricing_with_override_state(
+                provider,
+                "gpt-6.1-sol",
+                usage,
+                pricing,
+                false,
+            );
+            let expected = cached as f64 / 1_000_000.0 * 0.1 * multiplier;
+            assert!((tier.estimate(usage) - expected).abs() < 1e-12);
+            let override_tier = openai_long_context_pricing_with_override_state(
+                provider,
+                "gpt-6.1-sol",
+                usage,
+                pricing,
+                true,
+            );
+            assert_eq!(override_tier.estimate(usage), pricing.estimate(usage));
+        }
+    }
+}
+
+#[test]
 fn openai_responses_pricing_applies_documented_long_context_tier() {
     let usage = Usage {
         input: 300_000,
@@ -22832,6 +23378,7 @@ fn openai_responses_pricing_applies_documented_long_context_tier() {
         cost_usd: None,
     };
     for (model, expected) in [
+        ("gpt-6.1-sol", 2.7),
         ("gpt-6-astra", 13.5),
         ("gpt-6-sol", 2.7),
         ("gpt-6-luna", 0.135),
@@ -26384,6 +26931,8 @@ fn normalize_chatgpt_model_slug_accepts_compact_aliases() {
     assert_eq!(normalize_chatgpt_model_slug("gpt56"), "gpt-5.6-sol");
     assert_eq!(normalize_chatgpt_model_slug("gpt56terra"), "gpt-5.6-terra");
     assert_eq!(normalize_chatgpt_model_slug("GPT 5 6 LUNA"), "gpt-5.6-luna");
+    assert_eq!(normalize_chatgpt_model_slug("gpt61sol"), "gpt-6.1-sol");
+    assert_eq!(normalize_chatgpt_model_slug("GPT 6.1 SOL"), "gpt-6.1-sol");
     assert_eq!(normalize_chatgpt_model_slug("gpt6astra"), "gpt-6-astra");
     assert_eq!(normalize_chatgpt_model_slug("GPT 6 SOL"), "gpt-6-sol");
     assert_eq!(normalize_chatgpt_model_slug("gpt6luna"), "gpt-6-luna");
@@ -26433,7 +26982,18 @@ fn provider_catalog_v1_migrates_builtin_metadata_and_current_overrides_it() {
         "gpt-6-luna"
     );
     for profile in [&chatgpt, &openai] {
+        assert_eq!(
+            normalize_provider_model_value(profile, "gpt61sol"),
+            "gpt-6.1-sol"
+        );
         for (model, efforts, input, cached, output) in [
+            (
+                "gpt-6.1-sol",
+                &["low", "medium", "high", "xhigh", "max"][..],
+                2.0,
+                0.1,
+                10.0,
+            ),
             (
                 "gpt-6-astra",
                 &["low", "medium", "high", "xhigh", "max"][..],
@@ -26603,6 +27163,7 @@ fn openai_responses_routing_is_official_openai_only() -> Result<()> {
         .find(|profile| profile.id == "openai")
         .expect("openai profile");
     for model in [
+        "gpt-6.1-sol",
         "gpt-6-astra",
         "gpt-6-sol",
         "gpt-6-luna",
@@ -26622,6 +27183,8 @@ fn openai_responses_routing_is_official_openai_only() -> Result<()> {
         ("https://api.openai.com", "gpt-5.60"),
         ("https://api.openai.com", "gpt-5.6-preview"),
         ("https://api.openai.com", "gpt-5.6-terrra"),
+        ("https://api.openai.com", "gpt-6.1-sol-preview"),
+        ("https://api.openai.com", "gpt-6.10-sol"),
         ("https://api.openai.com", "gpt-6-preview"),
         ("https://api.openai.com", "gpt-6-terra"),
         ("http://api.openai.com", "gpt-5.6"),
@@ -29497,6 +30060,8 @@ fn all_provider_tool_wrappers_preserve_dynamic_tool_semantics() {
             risk: pack_runtime::RuntimeRisk::Read,
         }],
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,
@@ -29656,6 +30221,8 @@ fn tool_disabled_models_expose_no_static_or_dynamic_tools() {
             risk: pack_runtime::RuntimeRisk::Read,
         }],
         ui_protocol: None,
+        tool_protocol: None,
+        promoted_tools: Vec::new(),
         manifest_sha256: "manifest".to_string(),
         state: Value::Null,
         max_continuations: 1,

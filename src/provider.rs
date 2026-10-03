@@ -473,6 +473,14 @@ fn openai_responses_model_specs(
     );
     let mut specs = HashMap::from([
         (
+            "gpt-6.1-sol".to_string(),
+            spec(
+                &["low", "medium", "high", "xhigh", "max"],
+                &[],
+                model_pricing(2.0, 10.0, 0.1, 2.5),
+            ),
+        ),
+        (
             "gpt-6-astra".to_string(),
             spec(
                 &["low", "medium", "high", "xhigh", "max"],
@@ -578,6 +586,7 @@ fn builtin_model_pricing(provider_id: &str, model: &str) -> Option<ModelPricing>
         "openai" | "chatgpt" if model == "gpt-6-astra" => {
             Some(model_pricing(10.0, 50.0, 1.0, 12.5))
         }
+        "openai" | "chatgpt" if model == "gpt-6.1-sol" => Some(model_pricing(2.0, 10.0, 0.1, 2.5)),
         "openai" | "chatgpt" if model == "gpt-6-sol" => Some(model_pricing(2.0, 10.0, 0.2, 2.5)),
         "openai" | "chatgpt" if model == "gpt-6-luna" => Some(model_pricing(0.1, 0.5, 0.01, 0.125)),
         "openai" | "chatgpt" if model == "gpt-5.6-sol" => Some(model_pricing(5.0, 30.0, 0.5, 6.25)),
@@ -755,6 +764,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
             default_model: "gpt-5.4".to_string(),
             models: vec![
+                "gpt-6.1-sol".to_string(),
                 "gpt-6-astra".to_string(),
                 "gpt-6-sol".to_string(),
                 "gpt-6-luna".to_string(),
@@ -818,6 +828,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
             base_url: "https://api.openai.com".to_string(),
             default_model: "gpt-5".to_string(),
             models: vec![
+                "gpt-6.1-sol".to_string(),
                 "gpt-6-astra".to_string(),
                 "gpt-6-sol".to_string(),
                 "gpt-6-luna".to_string(),
@@ -859,6 +870,7 @@ pub(crate) fn built_in_provider_profiles() -> Vec<ProviderProfile> {
                 ("gpt56sol".to_string(), "gpt-5.6-sol".to_string()),
                 ("gpt56terra".to_string(), "gpt-5.6-terra".to_string()),
                 ("gpt56luna".to_string(), "gpt-5.6-luna".to_string()),
+                ("gpt61sol".to_string(), "gpt-6.1-sol".to_string()),
                 ("gpt6astra".to_string(), "gpt-6-astra".to_string()),
                 ("gpt6sol".to_string(), "gpt-6-sol".to_string()),
                 ("gpt6luna".to_string(), "gpt-6-luna".to_string()),
@@ -2351,7 +2363,7 @@ pub(crate) fn is_gpt_5_6_model(model: &str) -> bool {
 pub(crate) fn is_gpt_6_model(model: &str) -> bool {
     matches!(
         model.trim().to_ascii_lowercase().as_str(),
-        "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
+        "gpt-6.1-sol" | "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna"
     )
 }
 
@@ -2736,6 +2748,7 @@ pub(crate) fn normalize_chatgpt_model_slug(model: &str) -> String {
         "gpt56" | "gpt56sol" => "gpt-5.6-sol".to_string(),
         "gpt56terra" => "gpt-5.6-terra".to_string(),
         "gpt56luna" => "gpt-5.6-luna".to_string(),
+        "gpt61sol" => "gpt-6.1-sol".to_string(),
         "gpt6astra" => "gpt-6-astra".to_string(),
         "gpt6sol" => "gpt-6-sol".to_string(),
         "gpt6luna" => "gpt-6-luna".to_string(),

@@ -399,6 +399,15 @@ fn stream_chunk_err(e: reqwest::Error) -> anyhow::Error {
     }
 }
 
+fn provider_body_chunk_err(error: reqwest::Error) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow::Error::new(error)
+            .context("provider total request timeout while reading response body")
+    } else {
+        stream_chunk_err(error)
+    }
+}
+
 #[derive(Debug)]
 struct ParsedProviderStream {
     blocks: Vec<Block>,
@@ -440,6 +449,12 @@ impl ProviderTransportError {
 impl std::fmt::Display for ProviderTransportError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Request(error) if error.is_timeout() => {
+                write!(
+                    formatter,
+                    "provider connect or total request timeout: {error}"
+                )
+            }
             Self::Request(error) => write!(formatter, "{error}"),
             Self::FirstByteTimeout(timeout) => write!(
                 formatter,
@@ -484,7 +499,7 @@ async fn read_provider_body_limited(
         let Some(chunk) = next else {
             return Ok((body, false));
         };
-        let chunk = chunk.map_err(stream_chunk_err)?;
+        let chunk = chunk.map_err(provider_body_chunk_err)?;
         let remaining = cap.saturating_sub(body.len());
         if chunk.len() > remaining {
             body.extend_from_slice(&chunk[..remaining]);
@@ -4690,6 +4705,25 @@ fn provider_stream_idle_timeout(local: bool) -> std::time::Duration {
             PROVIDER_STREAM_IDLE_TIMEOUT_SECS
         },
     )
+}
+
+fn provider_total_request_timeout(local: bool) -> Result<Option<Duration>> {
+    let var = if local {
+        "DEXT_LOCAL_PROVIDER_TOTAL_TIMEOUT_SECS"
+    } else {
+        "DEXT_PROVIDER_TOTAL_TIMEOUT_SECS"
+    };
+    let value = match std::env::var(var) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => anyhow::bail!("{var} must be an integer from 0 to 86400 seconds"),
+    };
+    let seconds = value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= 86400)
+        .with_context(|| format!("{var} must be an integer from 0 to 86400 seconds"))?;
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 fn build_provider_http_client() -> reqwest::Client {
@@ -10605,7 +10639,7 @@ const DEFAULT_SYSTEM: &str = "You are dext, a terse coding CLI agent running loc
 
 const FRUGAL_TOOL_PROTOCOL_NOTE: &str = "Frugal workflow: never try to prefill the TUI input/composer. For nontrivial work, define small steps by required input and observable output; run independent reads in parallel, reuse verified results, and repair only the failed step.";
 
-const ADVISORY_TURN_RUNTIME_NOTE: &str = "advisory_only=true — the user asked for planning/analysis, not changes. Use read-only tools (read_file, read_symbol, fd, rg, git_diff, todo_read); do not call write_file/edit_file/multi_edit/git_commit/todo_write, mutating bash, or network tools this turn. Finish with sections: Goal, Findings, Steps (numbered), Risks (omit if none) — then stop. Implementation begins only after explicit user approval (e.g. 'go').";
+const ADVISORY_TURN_RUNTIME_NOTE: &str = "advisory_only=true — the user requested a plan or explicitly deferred changes. Use read-only tools (read_file, read_symbol, fd, rg, git_diff, todo_read) and requested read-only documentation research, subject to normal tool permissions. Do not edit code or change external state unless the user's current instruction authorizes it. This heuristic is not a separate approval gate: explicit implementation requests and conversational approvals take precedence; do not ask for another 'go' when execution is already authorized. Answer in the format the task needs.";
 
 const IMPLEMENTATION_TURN_RUNTIME_NOTE: &str = "implementation_authorized=true — the user approved execution. If the recent conversation contains an agreed plan, first record its steps with todo_write, then execute them in order: read before editing, keep todo status current, verify after changes.";
 
@@ -14365,6 +14399,9 @@ impl Agent {
             return map_effort_to_provider_levels(&spec.effort_levels, effort);
         }
         match self.request_contract_for_model(model) {
+            RequestContract::OpenAiResponses if is_gpt_6_model(model) => {
+                openai_reasoning_effort(model, effort).map(str::to_string)
+            }
             RequestContract::OpenAiResponses => {
                 Some(openai_responses_reasoning_effort(effort).to_string())
             }
@@ -15050,6 +15087,15 @@ impl Agent {
         self.client.get_or_init(build_provider_http_client)
     }
 
+    fn provider_post(&self, url: impl reqwest::IntoUrl) -> Result<reqwest::RequestBuilder> {
+        let timeout = provider_total_request_timeout(self.local_provider_transport())?;
+        let request = self.http_client().post(url);
+        Ok(match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        })
+    }
+
     fn local_provider_transport(&self) -> bool {
         provider::is_local_llama_provider(
             &self.provider_id,
@@ -15200,7 +15246,7 @@ impl Agent {
     fn deactivate_pack_runtime(&mut self) -> usize {
         let mut removed_grants = 0usize;
         if let Some(previous) = self.active_pack_runtime.take() {
-            for tool in previous.tools {
+            for tool in previous.all_tools() {
                 removed_grants += usize::from(self.allowed.remove(&tool.name));
                 self.deny_tools.remove(&tool.name);
             }
@@ -15229,8 +15275,9 @@ impl Agent {
             "operation": format!("activate executable pack runtime '{}'", pack.name),
             "runtime": pack.runtime_path.as_ref().map(|path| path.display().to_string()),
             "executable_sha256": &runtime.executable_sha256,
-            "tools": runtime.tools.iter().map(|tool| format!("{}:{:?}", tool.name, tool.risk).to_ascii_lowercase()).collect::<Vec<_>>(),
+            "tools": runtime.all_tools().map(|tool| format!("{}:{:?}", tool.name, tool.risk).to_ascii_lowercase()).collect::<Vec<_>>(),
             "ui_protocol": runtime.ui_protocol,
+            "tool_protocol": runtime.tool_protocol,
             "risk": format!(
                 "executes a pack-owned native helper with credentials removed under the current {} sandbox profile; declared write/danger tools retain Git checkpoint controls",
                 self.sandbox_profile.as_str()
@@ -15355,6 +15402,7 @@ impl Agent {
             .context("pack runtime invocation has no active runtime")?;
         let mut prompts = Vec::new();
         let mut views = Vec::new();
+        let mut proposed_tools = Vec::new();
         for effect in invocation.effects {
             match effect {
                 pack_runtime::RuntimeEffect::Steer { text } => {
@@ -15367,6 +15415,20 @@ impl Agent {
                 }
                 pack_runtime::RuntimeEffect::Continue { prompt, delay_ms } => {
                     prompts.push((self.privacy.redact_text(&prompt).text, delay_ms));
+                }
+                pack_runtime::RuntimeEffect::Tools { mut tools } => {
+                    for tool in &mut tools {
+                        tool.description = self.privacy.redact_text(&tool.description).text;
+                        let original_schema = tool.input_schema.clone();
+                        self.privacy
+                            .redact_json_for_disclosure(&mut tool.input_schema);
+                        if tool.input_schema != original_schema {
+                            bail!(
+                                "pack runtime tool schema contains private data; promotion refused without changing its contract"
+                            );
+                        }
+                    }
+                    proposed_tools.extend(tools);
                 }
                 pack_runtime::RuntimeEffect::View { title, markdown } => {
                     views.push((
@@ -15401,10 +15463,48 @@ impl Agent {
             );
         }
 
+        let next_tools = if proposed_tools.is_empty() {
+            None
+        } else {
+            Some(runtime.proposed_tools(&proposed_tools, &pack_runtime_occupied_names())?)
+        };
+        if let Some(next) = &next_tools
+            && *next != runtime.promoted_tools
+        {
+            let approval_input = json!({
+                "operation": "promote pack runtime tools",
+                "pack": runtime.pack_name,
+                "manifest_sha256": runtime.manifest_sha256,
+                "executable_sha256": runtime.executable_sha256,
+                "tools": proposed_tools,
+                "risk": "exposes new session-local tools; each call retains its declared approval, sandbox, and checkpoint policy"
+            });
+            let approved = match self.approval_profile {
+                ApprovalProfile::Always => true,
+                ApprovalProfile::Never => false,
+                _ => !matches!(
+                    self.sink
+                        .request_permission(PACK_RUNTIME_APPROVAL_NAME, &approval_input),
+                    Choice::Deny
+                ),
+            };
+            if !approved || self.interrupt.load(Ordering::SeqCst) {
+                bail!("pack runtime tool promotion was not approved");
+            }
+        }
         let runtime = self
             .active_pack_runtime
             .as_mut()
             .context("pack runtime invocation has no active runtime")?;
+        if let Some(next) = next_tools {
+            for tool in &next {
+                if runtime.tool(&tool.name).is_none() {
+                    self.allowed.remove(&tool.name);
+                    self.deny_tools.remove(&tool.name);
+                }
+            }
+            runtime.promoted_tools = next;
+        }
         if let Some(state) = invocation.state {
             runtime.state = state;
         }
@@ -16388,12 +16488,9 @@ impl Agent {
     // advisory note immediately, and a new hold-off must reinstate one.
     fn update_turn_policy_from_steering(&mut self, steering_text: &str) {
         let objective = orchestrator::ObjectiveTracker::from_user_prompt(steering_text);
-        // A question asks about proceeding; it neither grants nor revokes
-        // approval, so it must not clear an active advisory policy.
-        let question = steering_text.trim_end().ends_with('?');
         if objective.planned_execution() {
             self.turn_policy_note = Some(IMPLEMENTATION_TURN_RUNTIME_NOTE);
-        } else if objective.apply_fixes_allowed() && !question {
+        } else if objective.apply_fixes_allowed() {
             self.turn_policy_note = None;
         } else if objective.advisory_only() {
             self.turn_policy_note = Some(ADVISORY_TURN_RUNTIME_NOTE);
@@ -16572,7 +16669,7 @@ impl Agent {
             .collect();
         let mut exposed: HashSet<&str> = self.tools.iter().map(|t| t.name).collect();
         if let Some(runtime) = &self.active_pack_runtime {
-            exposed.extend(runtime.tools.iter().map(|tool| tool.name.as_str()));
+            exposed.extend(runtime.all_tools().map(|tool| tool.name.as_str()));
         }
         self.allowed.retain(|name| exposed.contains(name.as_str()));
         self.deny_tools
@@ -16590,7 +16687,7 @@ impl Agent {
         let mut neutral = tools::provider_neutral_tools(&self.tools, self.wire_tool_profile());
         if let Some(runtime) = &self.active_pack_runtime {
             let profile = self.wire_tool_profile();
-            neutral.extend(runtime.tools.iter().map(|tool| tools::ProviderNeutralTool {
+            neutral.extend(runtime.all_tools().map(|tool| tools::ProviderNeutralTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 schema: tools::schema_for_profile(&tool.input_schema, profile),
@@ -17015,6 +17112,9 @@ impl Agent {
                     tools,
                     max_output_tokens,
                 );
+                if include_encrypted_content {
+                    body["include"] = json!(["reasoning.encrypted_content"]);
+                }
                 if !self.model_supports_prompt_cache()
                     && let Some(object) = body.as_object_mut()
                 {
@@ -17054,6 +17154,11 @@ impl Agent {
                 let mut oai_msgs = self.history_to_oai_messages(sys_stable);
                 push_runtime_env_oai_message(&mut oai_msgs, sys_env);
                 let oai_tools = self.wire_tools_oai();
+                if self.model.trim().eq_ignore_ascii_case("gpt-6.1-sol") && !oai_tools.is_empty() {
+                    anyhow::bail!(
+                        "gpt-6.1-sol tool calling requires the Responses API; configure this provider with the openai-responses request contract"
+                    );
+                }
                 let reasoning_effort =
                     if !oai_tools.is_empty() && is_gpt_6_sol_or_luna_model(&self.model) {
                         Some("none".to_string())
@@ -17241,7 +17346,7 @@ impl Agent {
         let mut exposed_tools: Vec<String> =
             self.tools.iter().map(|t| t.name.to_string()).collect();
         if let Some(runtime) = &self.active_pack_runtime {
-            exposed_tools.extend(runtime.tools.iter().map(|tool| tool.name.clone()));
+            exposed_tools.extend(runtime.all_tools().map(|tool| tool.name.clone()));
         }
         exposed_tools.sort();
         exposed_tools.dedup();
@@ -18153,8 +18258,7 @@ impl Agent {
         let url = provider_request_url(&self.base_url, contract);
         let bytes = serde_json::to_vec(body).map_err(|error| anyhow::anyhow!(error))?;
         let req = apply_provider_headers(
-            self.http_client()
-                .post(&url)
+            self.provider_post(&url)?
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
                 .body(bytes),
@@ -18172,7 +18276,7 @@ impl Agent {
         if !status.is_success() {
             let text = read_provider_error_body(resp, self.stream_idle_timeout())
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|error| format!("[provider error body unavailable: {error}]"));
             anyhow::bail!("summary {}", http_status_error(status, &text));
         }
         Ok(resp)
@@ -18280,8 +18384,7 @@ impl Agent {
                 ),
             };
             let mut req = self
-                .http_client()
-                .post(provider_request_url(&self.base_url, summary_contract))
+                .provider_post(provider_request_url(&self.base_url, summary_contract))?
                 .header("content-type", "application/json")
                 .json(&body);
             if !self.api_key.trim().is_empty() {
@@ -18299,8 +18402,7 @@ impl Agent {
                 summary_max_tokens,
             )?;
             let req = apply_provider_headers(
-                self.http_client()
-                    .post(provider_request_url(&self.base_url, summary_contract))
+                self.provider_post(provider_request_url(&self.base_url, summary_contract))?
                     .header("content-type", "application/json")
                     .body(bytes),
                 summary_contract,
@@ -18322,7 +18424,7 @@ impl Agent {
         if !status.is_success() {
             let text = read_provider_error_body(resp, self.stream_idle_timeout())
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|error| format!("[provider error body unavailable: {error}]"));
             anyhow::bail!("summary {}", http_status_error(status, &text));
         }
 
@@ -18858,8 +18960,7 @@ impl Agent {
                 let resp = loop {
                     attempt += 1;
                     let builder = self
-                        .http_client()
-                        .post(&url)
+                        .provider_post(&url)?
                         .header("content-type", "application/json")
                         .header("accept", "text/event-stream");
                     let extended_anthropic_cache = self.request_contract()
@@ -18931,7 +19032,9 @@ impl Agent {
                                 .and_then(|s| s.parse::<u64>().ok());
                             let text = read_provider_error_body(r, self.stream_idle_timeout())
                                 .await
-                                .unwrap_or_default();
+                                .unwrap_or_else(|error| {
+                                    format!("[provider error body unavailable: {error}]")
+                                });
                             self.record_provider_http_failure(status, &text, retry_after);
                             let plan = orchestrator::classify_http_failure(code, &text);
 
@@ -19657,7 +19760,7 @@ impl Agent {
                 chunk = stream.next() => {
                     return match chunk {
                         Some(Ok(chunk)) => Ok(Some(chunk)),
-                        Some(Err(e)) => Err(stream_chunk_err(e)),
+                        Some(Err(e)) => Err(provider_body_chunk_err(e)),
                         None => Ok(None),
                     };
                 }

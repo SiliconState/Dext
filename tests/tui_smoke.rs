@@ -285,6 +285,67 @@ fn tui_smoke_shift_enter_inserts_newline() {
 }
 
 #[test]
+fn tui_path_picker_inserts_without_submitting_and_preserves_draft_on_cancel() {
+    let temp = TempDir::new("dext-tui-path-picker").expect("temp dir");
+    let sandbox = temp.path().join("sandbox");
+    let dext_home = temp.path().join("dext-home");
+    let home = temp.path().join("home");
+    for dir in [&sandbox, &dext_home, &home] {
+        fs::create_dir_all(dir).expect("create directory");
+    }
+    fs::create_dir_all(sandbox.join("src")).expect("create project directory");
+    fs::write(sandbox.join("src/hello world.rs"), "fixture").expect("create project file");
+    let mut pty = Pty::open(TUI_COLS, TUI_ROWS).expect("open pty");
+    let mut child =
+        spawn_dext_with_env(&pty, &sandbox, &dext_home, &home, &[]).expect("spawn dext in pty");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "Type a request",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"check ").expect("type draft");
+    pty.write_all_retry(b"\x10")
+        .expect("open picker with Ctrl+P");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "project paths",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"hwr").expect("filter project paths");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "hello world.rs",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"\r").expect("insert chosen path");
+    assert_visible(&mut pty, &mut child, "`src/hello", Duration::from_secs(5));
+    assert_visible(&mut pty, &mut child, "world.rs`", Duration::from_secs(5));
+    pty.write_all_retry(b"\x10").expect("reopen picker");
+    assert_visible(
+        &mut pty,
+        &mut child,
+        "project paths",
+        Duration::from_secs(5),
+    );
+    pty.write_all_retry(b"\x1b").expect("cancel picker");
+    pty.pump_for(&mut child, Duration::from_millis(150))
+        .expect("redraw draft");
+    assert!(!pty.visible_text().contains("[error]"));
+    pty.write_all_retry(b"\x04")
+        .expect("quit without sending draft");
+    let status =
+        wait_for_exit(&mut child, Duration::from_secs(5), &mut pty).expect("wait for dext exit");
+    assert!(
+        status.success(),
+        "visible tail:\n{}",
+        tail(&pty.visible_text(), 3000)
+    );
+}
+
+#[test]
 fn tui_resume_picker_loads_selected_saved_session() {
     let temp = TempDir::new("dext-tui-resume-picker").expect("temp dir");
     let sandbox = temp.path().join("sandbox");

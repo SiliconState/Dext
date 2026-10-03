@@ -30,6 +30,12 @@ Press `?` with an empty composer, or F1 even with a draft, to open the full keym
 
 Enter `/resume` while idle to browse the available latest, autosaved, and named sessions. Each selectable row shows its category/name, human-readable UTC start date/time, and the useful tail of its path. The start time is decoded from the timestamp already embedded in the persisted session ID (or ID-shaped session path); Dext does not create another clock value, and legacy sessions without that data show `unknown`. The picker excludes unreadable headers and, when a Seat is active, sessions with a different Seat, a seated session without sandbox provenance, or a saved sandbox in another project. Selectable rows show category, name, and a path with its useful tail retained; arrow/Page/Home/End keys navigate, Enter loads the selected file through the existing session loader, and Esc cancels without modifying the draft. Selection is by path rather than an ambiguous short name; the loader revalidates the chosen file before restoring. A lookup runs off the render loop; cancelled or superseded results are ignored. On successful load the TUI refreshes the effective workspace, Git status, todo list, model, reasoning mode, usage, and context; Git probes started before the load cannot replace the restored Git status, even when the session stays in the same workspace. Explicit `/resume NAME` and `/resume PATH` retain their existing CLI/TUI behavior; the popup does not affect them. A missing/invalid session produces an error and returns to ready without loading it; while a selected session is being restored, the composer waits instead of submitting another request against partially restored state. Permission and local-auth prompts retain priority, including paste into the masked local-auth prompt, and the backend viewer remains the only alternate-screen surface.
 
+## Project path picker
+
+Press `Ctrl+P` while Dext owns the terminal to open the inline, read-only project path picker. Type to fuzzy-filter names and relative paths; arrows, Page Up/Down, Home/End and the mouse wheel move the selection. Right enters a selected directory; Left returns toward the project root. Enter inserts the selected file or directory path at the draft cursor, without submitting the draft; Esc cancels without editing it. Spaces and backticks are wrapped in Markdown code delimiters. Paths are plain prompt text, not file attachments or shell-quoted arguments. Tab retains slash completion/reasoning controls outside the picker.
+
+The picker searches from the current sandbox root, scanning at most 20,000 entries and 16 directory levels in a background task; the header shows how many matches are displayed out of the matching scanned entries, with at most 100 ranked results shown and an explicit scan-limit indicator. Descending into a directory starts a fresh scan there. Hidden and generated directories are shown but not descended into automatically; symlinks are neither traversed nor selected, including a directory replaced by a symlink after the scan. Unreadable directories are skipped. Scan work is canceled on navigation, dismissal, or root change, and late results are ignored. On Windows the visible/queryable path uses `/` even though filesystem paths use `\`. `/sandbox` and resumed sessions update the root. Permission, local-auth, and login-input prompts close the picker and retain priority; paste while the picker is open is ignored, not inserted into the draft. The backend viewer retains its alternate-screen input ownership.
+
 ## Todo view
 
 Press `Ctrl+L` during ordinary idle or busy work to open the current session todo list. Security-critical permission and local-auth prompts intentionally take priority and must be resolved or canceled first. The modal loads the persisted session/project todo state at startup, refreshes after `todo_read` or `todo_write`, and supports arrow, Page Up/Down, Home/End, and mouse-wheel scrolling. Close it with `Ctrl+L`, `Esc`, or `q`.
@@ -51,25 +57,20 @@ The main status row reserves its right edge for a live cumulative agent-active c
 The renderer dependencies are exact so unrelated lockfile refreshes cannot change terminal behavior. The lockfile also pins Ratatui's transitive `lru` cache to patched `0.18.2`:
 
 - `ratatui = 0.30.2`
-- `ratatui-core = 0.1.2`
+- `ratatui-core` and `ratatui-crossterm` from unmodified upstream revision `7767679c138b383933fef4227e7fbf077b7cfeca` (both report `0.1.2`)
 - `tui-markdown = 0.3.8`
 - `crossterm = 0.29.0`
 - `unicode-width = 0.2.2`
 
-## Ratatui compatibility patch
+## Unmodified upstream integration
 
-Unmodified Ratatui 0.30.2 regressed Dext's inline experience. Its fallback `insert_before` path called the public `Terminal::clear`, which synchronously queried the terminal cursor. Crossterm serves that query through the same global event reader used by Dext's input thread, multiplying terminal round trips during transcript insertion and resize. Horizontal shrink also cleared the entire visible display, exposing replay as a flash.
+Dext carries no vendored Ratatui source or local dependency patch. Cargo's `[patch.crates-io]` section selects unmodified upstream core and Crossterm backend crates at one immutable Git revision until a published release contains the required fixes. The override also unifies transitive users such as `tui-markdown`; it is a source selection, not a fork. Source builds require access to that revision or a populated Cargo cache.
 
-Enabling Ratatui's `scrolling-regions` feature was rejected because it changed settled rendering and expanded the backend dependency graph.
+Upstream [#2694](https://github.com/ratatui/ratatui/pull/2694) preserves the real cursor using terminal save/restore rather than an input-reading cursor query on Crossterm. Both core and backend must include that change. Upstream [#2670](https://github.com/ratatui/ratatui/pull/2670) preserves output above inline viewports on horizontal shrink. Dext leaves upstream `clear` and `insert_before` unchanged. The `scrolling-regions` feature remains disabled.
 
-Dext patches the exact upstream `ratatui-core 0.1.2` source through `[patch.crates-io]`. The patch is limited to four inline-terminal corrections:
+Transcript purge/replay remains Dext-owned behavior in `src/tui.rs`. `ReplayBackend` delegates ordinary backend operations, including cursor save/restore. Only during an explicit reset after clearing the display does it supply the known cursor origin and suppress reservation lines and the redundant viewport clear. Public `Terminal::resize` reanchors the inline viewport; two buffer swaps reset both diff buffers. The reset flag is cleared even when resize returns an error. Production then purges scrollback and replays the logical transcript inside a synchronized update. Geometry checks defer replay when minimized or when the expected pane width has changed, before attempting autoresize.
 
-1. `Terminal::clear` preserves Ratatui's tracked cursor position instead of synchronously querying the backend.
-2. Fallback `insert_before` clears the viewport directly rather than calling the cursor-preserving public clear.
-3. Horizontal shrink avoids `ClearType::All` for inline viewports; the normal viewport clear and full next draw remain in place.
-4. `Terminal::reset_inline_viewport` clears the visible display, resets both diff buffers, and anchors an inline viewport at the terminal origin without querying the cursor. On every effective transcript-pane width change, Dext calls it before Crossterm purges stale-width scrollback, then replays its complete logical transcript once at the observed width.
-
-The vendored source and hunk-level rationale live under `vendor/ratatui-core/`. This is a narrow compatibility patch, not a renderer fork. Remove it when a released upstream version satisfies the same regression gate without changing settled behavior.
+The integration gate is `cargo test --release --locked --bin dext tui::tests::`, replacing the former workspace-only vendored-core test command. The real-PTY suite remains mandatory for terminal changes. Neither a passing upstream unit suite nor removal of vendoring alone proves terminal compatibility.
 
 ## Regression coverage
 
@@ -80,7 +81,7 @@ cargo fmt --all -- --check
 cargo clippy -p dext --all-targets --all-features --locked --no-deps -- -D warnings
 cargo audit --deny warnings
 cargo deny check licenses
-cargo test -p ratatui-core --lib --locked
+cargo test --release --locked --bin dext tui::tests::
 cargo build --release --locked
 cargo test --release --locked
 cargo test --release --locked --test tui_smoke -- --nocapture
@@ -98,6 +99,8 @@ The TUI regression coverage combines the real Unix PTY smoke suite with focused 
 
 Focused state/render tests additionally require:
 
+- reset failures at every cursor-move stage restore backend delegation, including the final cursor restore;
+- zero-sized, status-only, and stale-width geometry defers before autoresize can query the cursor, append reservation lines, clear the viewport, or change its area, and rendering resumes after geometry recovery;
 - provisional thinking lines seal in order without duplication, use one bullet per blank-line-delimited section, keep the open tail in the live tip, and render the same rows/styles before and after sealing;
 - empty completion, stream restart, interrupt, and active verbose-hide rollback remove tagged pending/retry/transcript units and force a full replay when real scrollback may already contain them;
 - withheld completion tails append once, mismatched completions replace streamed units and surface the inspector counter, and split CRLF/whitespace boundaries do not seal early;
@@ -106,18 +109,18 @@ Focused state/render tests additionally require:
 - cap-boundary open previews agree with sealed units, newline-flood decoding avoids line-batch allocation, and bounded inspector-tail rendering matches the full-render suffix;
 - backend scrollback replay after a thinking discard removes stale units without duplicating surviving prose;
 
-Windows CI and release workflows also run `tests/tui_smoke_windows.rs`, a native ConPTY real-binary smoke test that submits `/status`, verifies the default `approval=always` and `sandbox=danger-full-access` policy, exits through `/quit`, and requires clean termination. The harness forces null std handles so the child binds pseudoconsole stdio even under redirected test capture, and companion self-check tests validate the pseudoconsole plumbing itself with `cmd.exe` and a non-interactive `dext --version` run. This addresses the previous Windows interactive-test gap without adding a runtime dependency.
+Windows CI and release workflows also run `tests/tui_smoke_windows.rs`, a native ConPTY real-binary smoke test that submits `/status`, verifies the default `approval=always` and `sandbox=danger-full-access` policy, exits through `/quit`, and requires clean termination. The path-picker ConPTY fixture separates Escape cancellation from Ctrl+D with a 150 ms input gap, matching the Unix fixture, so adjacent bytes are not interpreted as an Alt-modified control key. The harness forces null std handles so the child binds pseudoconsole stdio even under redirected test capture, and companion self-check tests validate the pseudoconsole plumbing itself with `cmd.exe` and a non-interactive `dext --version` run. This addresses the previous Windows interactive-test gap without adding a runtime dependency.
 
 Before releasing a renderer/backend update, also perform a live WSL2 check because ConPTY latency and perceptual flicker cannot be fully modeled by automated smoke tests. Resize a populated streaming session repeatedly and reject any crash, input stall, mixed-width or duplicate history, unexpected scrollback loss outside the documented full-ownership rebuild, or mode-switching change. Full replay during each observed width change and loss of pre-Dext shell scrollback are documented tradeoffs, not regressions. Native Linux and tmux checks are also recommended when terminal behavior changes.
 
 ## Dependency maintenance
 
-1. Change only the TUI dependency set and lockfile.
-2. Run the unmodified stack against the focused PTY resize test.
-3. If it fails, identify the smallest upstream boundary; do not compensate with a UI redesign.
-4. Prefer a released upstream fix. Otherwise refresh the exact vendored crate and reapply only the still-required patch.
+1. Review the upstream diff and update only the terminal dependency set and lockfile; never follow a floating Git branch.
+2. Keep core and backend cursor capabilities aligned and verify there is one resolved core with `cargo tree -i ratatui-core`.
+3. Run Dext's focused TUI tests and real-PTY resize test without modifying dependency source.
+4. If behavior regresses, retain the last verified pin and report the smallest upstream issue; do not compensate with a UI redesign.
 5. Run the complete renderer gate and live terminal checks.
-6. Compare the vendored patch with upstream and document each remaining hunk in `vendor/ratatui-core/DEXT_PATCH.md`.
-7. Remove obsolete patch hunks immediately when upstream behavior passes the gate.
+6. When a published release includes the required fixes and passes those gates, replace the Git source overrides with exact registry versions.
+7. Keep Dext-specific transcript ownership and replay tests in Dext rather than adding APIs to a dependency fork.
 
 Performance changes such as stream burst coalescing require measured CPU/output evidence and must preserve immediate first paint after idle. They are separate from dependency maintenance.
